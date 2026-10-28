@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_final_parameters.dart:41-84`
 /// — a parameter marked `final` reports at the keyword, except:
@@ -55,9 +55,7 @@ fn check(c: &mut Check<'_>) {
             continue;
         }
         let receiver = c
-            .payload(param)
-            .first()
-            .copied()
+            .field(param, PayloadField::Receiver)
             .unwrap_or(crate::rules::NONE_TOKEN);
         if receiver != crate::rules::NONE_TOKEN {
             continue;

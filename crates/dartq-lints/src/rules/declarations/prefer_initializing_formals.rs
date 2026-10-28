@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, container_name_token};
+use super::{PayloadField, Check, NodeKind, RuleSpec, container_name_token};
 use crate::rules::{NONE_TOKEN, token_seq_equal};
 use dartq_semantic::model::Ty;
 
@@ -90,11 +90,10 @@ fn constructor_params<'a>(c: &Check<'a>, params_node: u32) -> Vec<(&'a str, Opti
         if c.kind(param) != NodeKind::FormalParameter {
             continue;
         }
-        let payload = c.payload(param);
-        if payload.first().copied().unwrap_or(NONE_TOKEN) != NONE_TOKEN {
+        if c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN) != NONE_TOKEN {
             continue; // this.x / super.x formal
         }
-        let Some(&name) = payload.get(1) else {
+        let Some(name) = c.field(param, PayloadField::Name) else {
             continue;
         };
         if name == NONE_TOKEN {
@@ -131,8 +130,8 @@ fn class_fields<'a>(c: &Check<'a>) -> Vec<(&'a str, Option<u32>)> {
     };
     for member in c.children(class_row).start..=class_row {
         if c.kind(member) != NodeKind::Fields
-            || c.payload(member).first()
-                != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            || c.field(member, PayloadField::MemberKind)
+                != Some(dartq_parser::MemberKind::NonStaticField as u32)
         {
             continue;
         }
@@ -196,7 +195,7 @@ fn face_initializers<'a>(
         }
         let entry = window.end - 1;
         if c.kind(entry) != NodeKind::Assignment
-            || c.payload_word(entry, 0).map(|op| c.lexeme(op)) != Some("=")
+            || c.field_token(entry, PayloadField::Operator).map(|op| c.lexeme(op)) != Some("=")
         {
             continue;
         }
@@ -250,7 +249,10 @@ fn face_body<'a>(c: &Check<'a>, body: u32, out: &mut Vec<(&'a str, &'a str, u32,
     for container in containers {
         for assignment in c.collect_direct(container) {
             if c.kind(assignment) != NodeKind::Assignment
-                || c.payload_word(assignment, 0).map(|op| c.lexeme(op)) != Some("=")
+                || c
+                    .field_token(assignment, PayloadField::Operator)
+                    .map(|op| c.lexeme(op))
+                    != Some("=")
             {
                 continue;
             }
@@ -442,7 +444,7 @@ fn constructor_selector(c: &Check<'_>, ctor: u32) -> Option<String> {
     c.collect_direct(ctor)
         .into_iter()
         .find(|&kid| {
-            c.kind(kid) == NodeKind::Identifier && c.payload(kid).first().copied() == Some(ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         })
         .map(|kid| c.lexeme(c.head_token(kid)).to_string())
 }
@@ -550,7 +552,7 @@ fn count_expression_refs(c: &Check<'_>, root: u32, name: &str, initializer_face:
     let assignment_ops: Vec<u32> = if initializer_face {
         (window.start..window.end)
             .filter(|&piece| c.kind(piece) == NodeKind::Assignment)
-            .filter_map(|piece| c.payload(piece).first().copied())
+            .filter_map(|piece| c.field(piece, PayloadField::Operator))
             .filter(|&op| op != NONE_TOKEN)
             .filter_map(|op| c.unit.tokens.get(op as usize).map(|t| t.utf16_offset))
             .collect()
@@ -563,7 +565,7 @@ fn count_expression_refs(c: &Check<'_>, root: u32, name: &str, initializer_face:
     let mut count = 0;
     for id in window.start..window.end {
         if c.kind(id) != NodeKind::Identifier
-            || c.payload(id).first() != Some(&expression_ctx)
+            || c.field(id, PayloadField::Context) != Some(expression_ctx)
             || c.lexeme(c.head_token(id)) != name
         {
             continue;

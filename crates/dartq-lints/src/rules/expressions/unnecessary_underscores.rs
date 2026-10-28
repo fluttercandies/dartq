@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, RuleSpec};
+use super::{Check, PayloadField, RuleSpec};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -70,10 +70,10 @@ fn parameters(c: &mut Check<'_>) {
         }
         // A receiver formal (`this.__` / `super.__`) declares or
         // forwards a member — never a plain parameter (:60-62).
-        if c.payload(param).first().copied() != Some(crate::rules::NONE_TOKEN) {
+        if c.field(param, PayloadField::Receiver) != Some(crate::rules::NONE_TOKEN) {
             continue;
         }
-        let Some(&name) = c.payload(param).get(1) else {
+        let Some(name) = c.field(param, PayloadField::Name) else {
             continue;
         };
         if !is_multi_underscore(c, name) || referenced(c, owner_row, name, owner_head, true) {

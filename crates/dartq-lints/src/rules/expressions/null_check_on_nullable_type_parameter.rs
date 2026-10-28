@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice, switch_scrutinee_read, written_type_sibling};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, switch_scrutinee_read, written_type_sibling};
 use crate::rules::utf16_token_span;
 
 /// Official: `pkg/linter/lib/src/rules/null_check_on_nullable_type_parameter.dart`
@@ -117,7 +117,7 @@ fn check(c: &mut Check<'_>) {
 /// completion pair pulled back to the left run. Returns `(left,
 /// right)`.
 fn assignment_operands(c: &Check<'_>, assignment: u32) -> Option<(Vec<u32>, Vec<u32>)> {
-    let op_token = c.payload(assignment).first().copied()?;
+    let op_token = c.field(assignment, PayloadField::Operator)?;
     let op_start = c.unit.tokens.get(op_token as usize)?.byte_offset as usize;
     let window = c.children(assignment);
     let parent = c.unit.ast.parent(assignment)?;
@@ -144,7 +144,7 @@ fn assignment_operands(c: &Check<'_>, assignment: u32) -> Option<(Vec<u32>, Vec<
     let mut right = rows[split..].to_vec();
     if let Some(marker) = right.iter().position(|&piece| {
         c.kind(piece) == NodeKind::DotAccess
-            && c.payload(piece).first().is_some_and(|&dot| {
+            && c.field(piece, PayloadField::Operator).is_some_and(|dot| {
                 c.unit
                     .tokens
                     .get(dot as usize)
@@ -229,7 +229,8 @@ fn in_scope_type_parameter_names<'a>(c: &'a Check<'_>) -> Vec<&'a str> {
         c.collect_direct(variables)
             .into_iter()
             .filter(|&kid| {
-                c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+                c.kind(kid) == NodeKind::Identifier
+                    && c.field(kid, PayloadField::Context) == Some(ctx)
             })
             .map(|name| c.lexeme(c.head_token(name)))
             .collect()
@@ -294,7 +295,8 @@ fn class_type_parameter_names<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<&'a s
         .collect_direct(variables)
         .into_iter()
         .filter(|&kid| {
-            c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+            c.kind(kid) == NodeKind::Identifier
+                && c.field(kid, PayloadField::Context) == Some(ctx)
         })
         .map(|name| c.lexeme(c.head_token(name)))
         .collect();
@@ -507,7 +509,7 @@ fn written_return_type<'a>(c: &'a Check<'_>, function: u32) -> Option<(&'a str, 
     let is_declaration_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
                         || ctx

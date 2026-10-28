@@ -1205,6 +1205,20 @@ pub enum SemanticCode {
     /// (`definitely_unassigned_late_local_variable`, diagnostic.g.dart;
     /// type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`).
     DefinitelyUnassignedLateLocalVariable,
+    /// `The non-nullable local variable '{0}' must be assigned before it
+    /// can be used.` — a non-late, non-final local variable with a
+    /// potentially non-nullable type, read while not definitely assigned
+    /// (`not_assigned_potentially_non_nullable_local_variable`,
+    /// diagnostic.g.dart; type_analyzer.dart
+    /// `_checkReadOfNotAssignedLocalVariable`, :5016-5023).
+    NotAssignedPotentiallyNonNullableLocalVariable,
+    /// `The final variable '{0}' can't be read because it's potentially
+    /// unassigned at this point.` — a non-late `final` local variable read
+    /// while not definitely assigned
+    /// (`read_potentially_unassigned_final`, diagnostic.g.dart;
+    /// type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`,
+    /// :5008-5013).
+    ReadPotentiallyUnassignedFinal,
     /// `A value of type '{0}' can't be assigned to a parameter of type
     /// '{1}' in a const constructor.` — a constant constructor
     /// invocation's argument whose runtime value does not match the
@@ -1935,6 +1949,14 @@ impl SemanticCode {
             Self::DefinitelyUnassignedLateLocalVariable => (
                 "definitely_unassigned_late_local_variable",
                 "DEFINITELY_UNASSIGNED_LATE_LOCAL_VARIABLE",
+            ),
+            Self::NotAssignedPotentiallyNonNullableLocalVariable => (
+                "not_assigned_potentially_non_nullable_local_variable",
+                "NOT_ASSIGNED_POTENTIALLY_NON_NULLABLE_LOCAL_VARIABLE",
+            ),
+            Self::ReadPotentiallyUnassignedFinal => (
+                "read_potentially_unassigned_final",
+                "READ_POTENTIALLY_UNASSIGNED_FINAL",
             ),
             Self::ConstConstructorParamTypeMismatch => (
                 "const_constructor_param_type_mismatch",
@@ -2775,6 +2797,12 @@ impl SemanticCode {
             Self::DefinitelyUnassignedLateLocalVariable => format!(
                 "The late local variable '{a0}' is definitely unassigned at this point."
             ),
+            Self::NotAssignedPotentiallyNonNullableLocalVariable => format!(
+                "The non-nullable local variable '{a0}' must be assigned before it can be used."
+            ),
+            Self::ReadPotentiallyUnassignedFinal => format!(
+                "The final variable '{a0}' can't be read because it's potentially unassigned at this point."
+            ),
             Self::ConstConstructorParamTypeMismatch => format!(
                 "A value of type '{a0}' can't be assigned to a parameter of type '{a1}' in a const constructor."
             ),
@@ -3412,6 +3440,17 @@ impl SemanticCode {
             // `definitely_unassigned_late_local_variable`'s correction
             // (diagnostic.g.dart :3734).
             Self::DefinitelyUnassignedLateLocalVariable => Some(
+                "Ensure that it is assigned on necessary execution paths.".to_string(),
+            ),
+            // `not_assigned_potentially_non_nullable_local_variable`'s
+            // verbatim correctionMessage (analyzer-codes.tsv).
+            Self::NotAssignedPotentiallyNonNullableLocalVariable => Some(
+                "Try giving it an initializer expression, or ensure that it's assigned on every execution path."
+                    .to_string(),
+            ),
+            // `read_potentially_unassigned_final`'s verbatim
+            // correctionMessage (analyzer-codes.tsv).
+            Self::ReadPotentiallyUnassignedFinal => Some(
                 "Ensure that it is assigned on necessary execution paths.".to_string(),
             ),
             // `const_constructor_param_type_mismatch`'s verbatim
@@ -4523,6 +4562,8 @@ mod tests {
             | SemanticCode::ImplicitThisReferenceInInitializer
             | SemanticCode::ListElementTypeNotAssignable
             | SemanticCode::DefinitelyUnassignedLateLocalVariable
+            | SemanticCode::NotAssignedPotentiallyNonNullableLocalVariable
+            | SemanticCode::ReadPotentiallyUnassignedFinal
             | SemanticCode::TypeTestWithUndefinedName
             | SemanticCode::CastToNonType
             | SemanticCode::ClassUsedAsMixin

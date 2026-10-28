@@ -1,4 +1,4 @@
-use super::{AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows};
+use super::{PayloadField, AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows};
 use crate::rules::{NONE_TOKEN, body_members, variables_declaration_keyword};
 use dartq_ast::mod_flags;
 
@@ -40,9 +40,11 @@ fn check_fields(c: &mut Check<'_>) {
     if mod_flags(c.unit.ast, node) & AUGMENT_MEMBER_BIT != 0 {
         return; // `node.isAugmentation` (:88)
     }
-    // `node.isStatic` (:89) — the `Fields` payload word 0 is the
-    // `MemberKind` discriminant.
-    if c.payload(node).first() == Some(&(dartq_parser::MemberKind::StaticField as u32)) {
+    // `node.isStatic` (:89) — the `Fields` row's `MemberKind` word is
+    // the discriminant.
+    if c.field(node, PayloadField::MemberKind)
+        == Some(dartq_parser::MemberKind::StaticField as u32)
+    {
         return;
     }
     // The face requires a class owner (:93).
@@ -63,7 +65,7 @@ fn check_fields(c: &mut Check<'_>) {
         .map(|primary| {
             formal_parameter_rows(c, primary)
                 .into_iter()
-                .filter_map(|row| c.payload(row).get(1).copied())
+                .filter_map(|row| c.field(row, PayloadField::Name))
                 .filter(|&token| token != NONE_TOKEN)
                 .map(|token| str::to_owned(c.lexeme(token)))
                 .collect()
@@ -126,9 +128,7 @@ fn check_initializer(c: &mut Check<'_>) {
                 return;
             };
             (
-                c.payload(primary)
-                    .get(1)
-                    .copied()
+                c.field(primary, PayloadField::ConstKeyword)
                     .is_some_and(|token| token != NONE_TOKEN),
                 formal_parameter_rows(c, primary),
             )
@@ -144,7 +144,7 @@ fn check_initializer(c: &mut Check<'_>) {
     }
     let names: Vec<&str> = params
         .into_iter()
-        .filter_map(|row| c.payload(row).get(1).copied())
+        .filter_map(|row| c.field(row, PayloadField::Name))
         .filter(|&token| token != NONE_TOKEN)
         .map(|token| c.lexeme(token))
         .collect();
@@ -169,9 +169,7 @@ fn class_has_const_constructor(c: &Check<'_>, class_row: u32) -> bool {
     }
     c.collect_direct(class_row).into_iter().any(|kid| {
         c.kind(kid) == NodeKind::PrimaryConstructor
-            && c.payload(kid)
-                .get(1)
-                .copied()
+            && c.field(kid, PayloadField::ConstKeyword)
                 .is_some_and(|token| token != NONE_TOKEN)
     })
 }

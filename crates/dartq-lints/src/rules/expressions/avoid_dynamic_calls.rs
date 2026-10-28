@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces, value_run_end};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces, value_run_end};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -197,7 +197,7 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 /// (`=`, `??=` exempt) over a `dynamic` read reports at the
 /// assignment.
 fn assignment_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
-    let Some(&op) = c.payload(c.node()).first() else {
+    let Some(op) = c.field(c.node(), PayloadField::Operator) else {
         return;
     };
     if matches!(c.lexeme(op), "=" | "??=") {
@@ -229,7 +229,7 @@ fn assignment_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 /// exempt) over a `dynamic` left operand reports at the operator
 /// expression; the right operand is an implicit cast, not a call.
 fn binary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
-    let Some(&op) = c.payload(c.node()).first() else {
+    let Some(op) = c.field(c.node(), PayloadField::Operator) else {
         return;
     };
     let operator = c.lexeme(op);

@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_constructor_name.dart`
 /// — a written `.new` constructor name reports at the name token. Faces
@@ -45,7 +45,7 @@ fn check(c: &mut Check<'_>) {
 fn constructor_name(c: &Check<'_>, node: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
     c.direct_children(node).iter().copied().find(|&kid| {
-        c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
     })
 }
 
@@ -54,7 +54,7 @@ fn constructor_name(c: &Check<'_>, node: u32) -> Option<u32> {
 fn primary_name(c: &Check<'_>, node: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
     c.direct_children(node).iter().copied().find(|&kid| {
-        c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
     })
 }
 

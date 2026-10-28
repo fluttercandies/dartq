@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{NONE_TOKEN, byte_span_of_token, first_child, last_child};
 
 const PROBLEM: &str = "Don't return 'null' from a function with a return type of 'void'.";
@@ -120,7 +120,9 @@ fn report(c: &mut Check<'_>, node: u32, function: u32, type_row: Option<u32>, pr
     // arrow otherwise.
     let range = c.utf16_span(node);
     let range = if c.kind(node) == NodeKind::ExpressionBody {
-        let async_kw = c.payload(node).get(2).copied().unwrap_or(NONE_TOKEN);
+        let async_kw = c
+            .field(node, PayloadField::AsyncKeyword)
+            .unwrap_or(NONE_TOKEN);
         if async_kw == NONE_TOKEN {
             range
         } else {
@@ -141,8 +143,9 @@ fn body_is_async(c: &Check<'_>, function: u32) -> bool {
         return false;
     };
     let async_kw = match c.kind(body) {
-        NodeKind::ExpressionBody => c.payload(body).get(2).copied(),
-        NodeKind::BlockBody => c.payload(body).first().copied(),
+        NodeKind::ExpressionBody | NodeKind::BlockBody => {
+            c.field(body, PayloadField::AsyncKeyword)
+        }
         _ => Some(NONE_TOKEN),
     }
     .unwrap_or(NONE_TOKEN);
@@ -204,10 +207,11 @@ fn context_type(c: &Check<'_>, closure: u32) -> Option<u32> {
                 return None;
             }
             // `f = () { … };` — the bare-identifier target's written
-            // type governs (the `Assignment` payload word 0 is the
-            // operator; the target is the identifier token before it).
+            // type governs (the `Assignment` row's `Operator` word is
+            // the operator; the target is the identifier token before
+            // it).
             NodeKind::Assignment => {
-                let &eq = c.payload(ancestor).first()?;
+                let eq = c.field(ancestor, PayloadField::Operator)?;
                 let target_is_identifier = eq.checked_sub(1).is_some_and(|target| {
                     c.unit
                         .tokens

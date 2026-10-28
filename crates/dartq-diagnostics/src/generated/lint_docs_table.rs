@@ -1,8 +1,9 @@
 // GENERATED lint documentation rows — DO NOT EDIT.
 // Regenerate with:
-//   cargo run -p upstream-gen --bin linter-meta-gen -- --sdk-src <dart-sdk-tree> --lints-src <lints-tree>
+//   DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen
+// SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable) — conformance/pin.toml (verified by --check).
 // Source: hasPublishedDocs of pkg/linter/messages.yaml (the pinned
-// SDK checkout), one row per first-party linter rule name.
+// SDK checkout, dart 3.13.7, stable), one row per first-party linter rule name.
 &[
     ("always_declare_return_types", true),
     ("always_put_control_body_on_new_line", true),
@@ -18,7 +19,6 @@
     ("analyzer_public_api_experimental_inconsistency", false),
     ("analyzer_public_api_exports_non_public_name", false),
     ("analyzer_public_api_impl_in_public_api", false),
-    ("analyzer_to_be_deprecated_use", false),
     ("annotate_overrides", true),
     ("annotate_redeclares", true),
     ("async_return_with_no_await", true),
@@ -95,10 +95,9 @@
     ("enable_null_safety", false),
     ("eol_at_end_of_file", false),
     ("erase_dart_type_extension_types", false),
-    ("exhaustive_cases", true),
+    ("exhaustive_cases", false),
     ("file_names", true),
     ("flutter_style_todos", false),
-    ("future_sync_value", true),
     ("hash_and_equals", true),
     ("implementation_imports", true),
     ("implicit_call_tearoffs", true),
@@ -122,7 +121,7 @@
     ("missing_code_block_language_in_doc_comment", false),
     ("missing_whitespace_between_adjacent_strings", true),
     ("no_adjacent_strings_in_list", true),
-    ("no_default_cases", true),
+    ("no_default_cases", false),
     ("no_duplicate_case_values", true),
     ("no_dynamic_casts", false),
     ("no_leading_underscores_for_library_prefixes", true),
@@ -172,7 +171,7 @@
     ("prefer_foreach", true),
     ("prefer_function_declarations_over_variables", true),
     ("prefer_generic_function_type_aliases", true),
-    ("prefer_if_elements_to_conditional_expressions", true),
+    ("prefer_if_elements_to_conditional_expressions", false),
     ("prefer_if_null_operators", true),
     ("prefer_initializing_formals", true),
     ("prefer_inlined_adds", true),
@@ -187,7 +186,7 @@
     ("prefer_null_aware_operators", true),
     ("prefer_relative_imports", true),
     ("prefer_single_quotes", true),
-    ("prefer_spread_collections", true),
+    ("prefer_spread_collections", false),
     ("prefer_typing_uninitialized_variables", true),
     ("prefer_void_to_null", true),
     ("provide_deprecation_message", true),
@@ -246,12 +245,11 @@
     ("unnecessary_string_escapes", true),
     ("unnecessary_string_interpolations", true),
     ("unnecessary_this", true),
-    ("unnecessary_this_alias", false),
     ("unnecessary_to_list_in_spreads", true),
     ("unnecessary_type_name_in_constructor", true),
     ("unnecessary_unawaited", true),
     ("unnecessary_underscores", true),
-    ("unreachable_from_main", true),
+    ("unreachable_from_main", false),
     ("unrelated_type_equality_checks", true),
     ("unsafe_html", false),
     ("unsafe_variance", true),
@@ -263,7 +261,7 @@
     ("use_full_hex_values_for_flutter_colors", true),
     ("use_function_type_syntax_for_parameters", true),
     ("use_if_null_to_convert_nulls_to_bools", true),
-    ("use_is_even_rather_than_modulo", true),
+    ("use_is_even_rather_than_modulo", false),
     ("use_key_in_widget_constructors", true),
     ("use_late_for_private_fields_and_variables", true),
     ("use_named_constants", true),

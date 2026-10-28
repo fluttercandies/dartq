@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, RuleSpec};
+use super::{PayloadField, Check, RuleSpec};
 use core::ops::Range;
 
 /// Official: `upstream Dart SDK source,
@@ -172,7 +172,7 @@ fn assignment_target(c: &Check<'_>, owner: u32, statement: u32) -> Option<Target
         NodeKind::Assignment => {
             // The LHS completes before the RHS (operands×2 contract);
             // the operator byte splits the run.
-            let operator = c.payload(root).first().copied()?;
+            let operator = c.field(root, PayloadField::Operator)?;
             let operator_byte = c
                 .unit
                 .tokens

@@ -1,6 +1,6 @@
 use dartq_semantic::{BindingKind, model::Ty};
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::{body_members, type_face};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_int_literals.dart`
@@ -217,7 +217,7 @@ fn same_file_callable(c: &Check<'_>, name: &str) -> Option<u32> {
             }
             let named = c.collect_direct(decl).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.payload(kid).first() == Some(&ctx)
+                    && c.field(kid, PayloadField::Context) == Some(ctx)
                     && c.lexeme(c.head_token(kid)) == name
             });
             if named {
@@ -280,10 +280,10 @@ fn formal_row_is_double(c: &Check<'_>, params: u32, query: FormalQuery<'_>) -> O
                     if c.kind(inner) != NodeKind::FormalParameter {
                         continue;
                     }
-                    let named_kind = c.payload(inner).get(4)
-                        == Some(&(dartq_parser::FormalParameterKind::OptionalNamed as u32));
+                    let named_kind = c.field(inner, PayloadField::FormalParameterKind)
+                        == Some(dartq_parser::FormalParameterKind::OptionalNamed as u32);
                     if named_kind {
-                        let formal = c.payload(inner).get(1).copied()?;
+                        let formal = c.field(inner, PayloadField::Name)?;
                         named.push((c.lexeme(formal), inner));
                     } else {
                         positional.push(inner);

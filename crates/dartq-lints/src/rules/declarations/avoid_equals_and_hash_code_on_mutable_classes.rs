@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, operator_name};
+use super::{Check, NodeKind, PayloadField, RuleSpec, operator_name};
 use crate::rules::{member_name, same_file_declaration, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_equals_and_hash_code_on_mutable_classes.dart:43-58`
@@ -59,7 +59,7 @@ fn equality_or_hash_code(c: &Check<'_>, node: u32) -> Option<&'static str> {
     // sibling inside `DeclarationBody`, not as a child — read it through
     // [`operator_name`] which covers both faces.
     if let Some(op_row) = operator_name(c, node)
-        && c.payload_word(op_row, 0)
+        && c.field_token(op_row, PayloadField::Name)
             .is_some_and(|t| c.lexeme(t) == "==")
     {
         return Some("==");

@@ -1,37 +1,21 @@
 # Vendored copy of dart-lang/sdk `tools/experimental_features.yaml`.
 #
-# ERA PIN (2026-10-09): this snapshot is pinned to the measurement oracle,
-# dart 3.13.1 stable (the corpus expansion plan oracle lock), NOT to
-# a live SDK main. Source: dart-lang/sdk tag `3.13.1`,
-# `tools/experimental_features.yaml` (`current-version: '3.13.0'`), fetched
-# 2026-10-09 and cross-checked against the locked pub artifacts
-# analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 (version-skew note:
-# both are older 3.11-dev generated snapshots that lag the 3.13.1 tag — they
-# still carry `declaring-constructors` (shipped by the 3.13.1 tag as
-# `primary-constructors`) and lack `this-promotion` / `anonymous-methods`,
-# which the 3.13.1 tag already lists as experiments). Measured anchor: the
-# oracle rejects `// @dart` overrides above 3.13 with
-# "latest known language version: 3.13". To update, re-vendor from the oracle-era SDK
-# tag and bump the oracle lock first; do not hand-edit entries.
+# SDK pin (conformance/pin.toml): dart 3.13.7 stable, revision
+# 416e33b0ffaef062a60ec966bb8c82ed2b83f128. Re-vendoring = copy the pinned
+# tree's tools/experimental_features.yaml under this header; the only
+# hand-edit is rewording the upstream process-notes pointer (a planning-doc
+# path tracked files must not reference).
 #
-# Rows changed relative to the previous 3.15-main snapshot
-# (e6f4207adef69106d7519a79144efdb5c1acc4d0):
-#   - current-version: '3.15.0' -> '3.13.0'
-#   - removed `receiver-type-inference` (absent from the 3.13.1 tag)
-#   - removed `single-combinators` (absent from the 3.13.1 tag)
-#   - removed `promotion-chain-intersection-join` (absent from the 3.13.1 tag)
-#   Every other row was diffed against the 3.13.1 tag and is identical.
-#
-# This file is the single source of truth for dartq's feature registry: it is
-# parsed by this crate's `build.rs` at compile time and turned into the
+# This file is the single source of truth for dartq's feature registry: it
+# is parsed by this crate's `build.rs` at compile time and turned into the
 # `Feature` enum and the static `FEATURES` metadata table.
 #
-# ---------------------------------------------------------------------------
 # Copyright (c) 2019, the Dart project authors. Please see the AUTHORS file
 # for details. All rights reserved. Use of this source code is governed by a
 # BSD-style license that can be found in the LICENSE file.
 
-# Experimental features are described in the upstream Dart SDK's experimental-flags process notes
+# Experimental features are described in the upstream Dart SDK's
+# experimental-flags process notes
 #
 # Despite the name, they are not limited to experiments, and are often
 # used to enable new features or enhancements that are being

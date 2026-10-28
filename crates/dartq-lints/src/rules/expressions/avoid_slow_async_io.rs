@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
 use crate::rules::{same_file_declaration, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -133,7 +133,7 @@ fn extension_type_row(c: &Check<'_>, name: &str) -> Option<u32> {
     c.collect_direct(root).into_iter().find_map(|top| {
         c.collect_direct(top).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::ExtensionTypeDeclaration
-                && c.payload(kid).get(2).copied().is_some_and(|token| {
+                && c.field(kid, PayloadField::Name).is_some_and(|token| {
                     token != crate::rules::NONE_TOKEN && c.lexeme(token) == name
                 })
         })

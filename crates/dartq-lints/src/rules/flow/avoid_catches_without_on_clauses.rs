@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, last_child};
+use super::{PayloadField, Check, NodeKind, RuleSpec, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_catches_without_on_clauses.dart:30-104`
 /// — a bare `catch` clause (no `on`) reports at the `catch` keyword
@@ -35,9 +35,7 @@ fn check(c: &mut Check<'_>) {
     }
     // `catchKeyword == null` (:86-88).
     let Some(catch_kw) = c
-        .payload(node)
-        .first()
-        .copied()
+        .field(node, PayloadField::CatchKeyword)
         .filter(|&kw| kw != super::NONE_TOKEN)
     else {
         return;
@@ -53,10 +51,9 @@ fn check(c: &mut Check<'_>) {
         return;
     };
     let Some(name) = c
-        .payload(exception)
-        .get(1)
-        .filter(|&&tok| tok != super::NONE_TOKEN)
-        .map(|&tok| c.lexeme(tok))
+        .field(exception, PayloadField::Name)
+        .filter(|&tok| tok != super::NONE_TOKEN)
+        .map(|tok| c.lexeme(tok))
     else {
         return;
     };
@@ -175,7 +172,7 @@ fn shadowed_by_nearer_binder(c: &Check<'_>, row: u32, catch_clause: u32, name: &
             NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
                 c.collect_direct(next).into_iter().any(|kid| {
                     c.kind(kid) == NodeKind::DeclaredVariablePattern
-                        && c.payload(kid).first().is_some_and(|&v| {
+                        && c.field(kid, PayloadField::Variable).is_some_and(|v| {
                             v != crate::rules::NONE_TOKEN && c.lexeme(v) == name
                         })
                 })
@@ -208,9 +205,9 @@ fn statement_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
         }
         NodeKind::PatternVarDeclStatement => c.children(stmt).any(|descendant| {
             c.kind(descendant) == NodeKind::DeclaredVariablePattern
-                && c.payload(descendant)
-                    .first()
-                    .is_some_and(|&v| v != crate::rules::NONE_TOKEN && c.lexeme(v) == name)
+                && c
+                    .field(descendant, PayloadField::Variable)
+                    .is_some_and(|v| v != crate::rules::NONE_TOKEN && c.lexeme(v) == name)
         }),
         NodeKind::LabeledStatement => c
             .collect_direct(stmt)
@@ -235,10 +232,9 @@ fn parameters_bind(c: &Check<'_>, params: u32, name: &str) -> bool {
         .into_iter()
         .any(|param| match c.kind(param) {
             NodeKind::FormalParameter => c
-                .payload(param)
-                .get(1)
-                .filter(|&&tok| tok != crate::rules::NONE_TOKEN)
-                .is_some_and(|&tok| c.lexeme(tok) == name),
+                .field(param, PayloadField::Name)
+                .filter(|&tok| tok != crate::rules::NONE_TOKEN)
+                .is_some_and(|tok| c.lexeme(tok) == name),
             NodeKind::FunctionTypedFormalParameter => c
                 .collect_direct(param)
                 .into_iter()
@@ -258,16 +254,15 @@ fn for_in_binds(c: &Check<'_>, scope: u32, name: &str) -> bool {
         .iter()
         .copied()
         .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
-        .and_then(|parts| c.payload(parts).get(3).copied())
+        .and_then(|parts| c.field(parts, PayloadField::InKeyword))
         .filter(|&token| token != crate::rules::NONE_TOKEN)
     else {
         return false;
     };
     kids.into_iter().any(|kid| match c.kind(kid) {
         NodeKind::DeclaredVariablePattern => c
-            .payload(kid)
-            .first()
-            .is_some_and(|&v| v < in_token && c.lexeme(v) == name),
+            .field(kid, PayloadField::Variable)
+            .is_some_and(|v| v < in_token && c.lexeme(v) == name),
         // The `var x` form tiles as a `VariablesDeclaration` completing
         // before the `ForInParts` row (its `InitializedIdentifier`
         // carries the loop-variable name on its span head).

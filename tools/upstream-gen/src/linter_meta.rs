@@ -676,18 +676,20 @@ fn group_camel(group: &str) -> &'static str {
 }
 
 /// Renders `crates/dartq-lints/src/generated/rule_meta.rs` — a pure
-/// function of the rows, the fold counts, and the SDK version stamp, so
-/// regeneration is byte-reproducible for identical inputs.
+/// function of the rows, the fold counts, and the pin stamps, so
+/// regeneration is byte-reproducible for identical inputs. `pin_line` is
+/// the `SDK pin: <revision> (<checkout stamp>)` line `--check` verifies.
 #[must_use]
-pub fn render_rule_meta(rows: &[RuleRow], const_count: usize, sdk_version: &str) -> String {
-    const REGEN: &str = "cargo run -p upstream-gen --bin linter-meta-gen -- --sdk-src <dart-sdk-tree> --lints-src <lints-tree>";
+pub fn render_rule_meta(rows: &[RuleRow], const_count: usize, pin_line: &str, checkout_stamp: &str) -> String {
+    const REGEN: &str = "DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen";
     let mut out = String::with_capacity(4096 + rows.len() * 192);
     out.push_str("//! GENERATED lint rule metadata — DO NOT EDIT.\n");
     out.push_str("//! Regenerate with:\n");
     let _ = writeln!(out, "//!   {REGEN}");
+    let _ = writeln!(out, "//! {pin_line} — conformance/pin.toml (verified by --check).");
     let _ = writeln!(
         out,
-        "//! Source: pkg/linter/messages.yaml of the pinned SDK checkout ({sdk_version}),"
+        "//! Source: pkg/linter/messages.yaml of the pinned SDK checkout ({checkout_stamp}),"
     );
     out.push_str("//!   canonical code selection from the pkg/linter/lib/src/rules/*.dart\n");
     out.push_str("//!   registrations, group sets from the pinned package:lints snapshot\n");
@@ -830,15 +832,17 @@ const fn str_eq(a: &str, b: &str) -> bool {{
 
 /// Renders `crates/dartq-diagnostics/src/generated/lint_docs_table.rs` —
 /// the `("name", published)` row slice `lint_docs.rs` includes into its
-/// table (a single expression, the shape `include!` requires).
+/// table (a single expression, the shape `include!` requires). `pin_line`
+/// is the `SDK pin:` stamp `--check` verifies.
 #[must_use]
-pub fn render_lint_docs_rows(rows: &[RuleRow]) -> String {
+pub fn render_lint_docs_rows(rows: &[RuleRow], pin_line: &str, checkout_stamp: &str) -> String {
     let mut out = String::with_capacity(rows.len() * 40 + 256);
     out.push_str("// GENERATED lint documentation rows — DO NOT EDIT.\n");
     out.push_str("// Regenerate with:\n");
-    out.push_str("//   cargo run -p upstream-gen --bin linter-meta-gen -- --sdk-src <dart-sdk-tree> --lints-src <lints-tree>\n");
+    out.push_str("//   DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen\n");
+    let _ = writeln!(out, "// {pin_line} — conformance/pin.toml (verified by --check).");
     out.push_str("// Source: hasPublishedDocs of pkg/linter/messages.yaml (the pinned\n");
-    out.push_str("// SDK checkout), one row per first-party linter rule name.\n");
+    let _ = writeln!(out, "// SDK checkout, {checkout_stamp}), one row per first-party linter rule name.");
     out.push_str("&[\n");
     for row in rows {
         let _ = writeln!(out, "    (\"{}\", {}),", row.name, row.published);
@@ -1050,14 +1054,26 @@ mod tests {
             since: None,
             published: true,
         }];
-        let doc = render_rule_meta(&rows, 1, "dart 3.15.0 (main channel)");
+        let doc = render_rule_meta(
+            &rows,
+            1,
+            "SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)",
+            "dart 3.13.7, stable",
+        );
         assert!(doc.contains("pub static RULE_META: &[RuleMeta] = TABLE;"));
         assert!(
             doc.contains("RuleMeta { name: \"avoid_empty_else\", group: Group::Core, problem: \"Empty else block.\", correction: \"\", state: MetaState::Stable, docs_published: true },")
         );
         assert!(doc.contains("pub(crate) const fn meta_group"));
         assert!(doc.contains("1 consts fold to 1 name rows"));
-        let docs = render_lint_docs_rows(&rows);
+        assert!(
+            doc.contains("//! SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)")
+        );
+        let docs = render_lint_docs_rows(
+            &rows,
+            "SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)",
+            "dart 3.13.7, stable",
+        );
         assert!(docs.contains("(\"avoid_empty_else\", true),"));
         assert!(docs.starts_with("// GENERATED"));
     }

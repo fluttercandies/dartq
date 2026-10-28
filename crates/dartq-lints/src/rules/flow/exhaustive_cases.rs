@@ -36,7 +36,7 @@
 use dartq_ast::{NodeKind, mod_flags};
 use dartq_scanner::{KeywordStyle, TokenKind};
 
-use super::{NONE_TOKEN, RuleSpec, first_child};
+use super::{PayloadField, NONE_TOKEN, RuleSpec, first_child};
 use crate::engine::Check;
 use crate::rules::{SupertypeClause, class_declaration_name, initialized_identifier_name, member_annotations, rows_with_parent, supertypes, utf16_token_span, variables_declaration_keyword};
 
@@ -203,11 +203,11 @@ fn class_like_named(c: &Check<'_>, name: &str, kinds: &[NodeKind]) -> Option<(u3
 
 /// The written name of a class-like declaration row: the sibling
 /// identifier for the class family (`class_declaration_name`), the
-/// name-token payload word for an extension type (bridge
+/// `Name` word for an extension type (bridge
 /// `begin_extension_type_declaration`).
 fn declaration_name<'a>(c: &'a Check<'_>, row: u32) -> Option<&'a str> {
     if c.kind(row) == NodeKind::ExtensionTypeDeclaration {
-        let name = c.payload(row).get(2).copied()?;
+        let name = c.field(row, PayloadField::Name)?;
         return (name != NONE_TOKEN).then(|| c.lexeme(name));
     }
     class_declaration_name(c, row)
@@ -229,7 +229,7 @@ fn constructor_face(c: &Check<'_>, candidate_row: u32) -> Vec<(bool, bool)> {
         // A primary constructor names through `._` (private) or not at
         // all (the public type-named form).
         NodeKind::PrimaryConstructor => {
-            ctors.push((c.payload(row).get(2) == Some(&1), true));
+            ctors.push((c.field(row, PayloadField::HasConstructorName) == Some(1), true));
         }
         _ => {}
     };
@@ -384,8 +384,8 @@ fn class_const_fields<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<ConstFieldFac
     let mut fields = Vec::new();
     for member in rows_with_parent(c, body) {
         if c.kind(member) != NodeKind::Fields
-            || c.payload(member).first()
-                != Some(&(dartq_parser::MemberKind::StaticField as u32))
+            || c.field(member, PayloadField::MemberKind)
+                != Some(dartq_parser::MemberKind::StaticField as u32)
         {
             continue;
         }
@@ -531,7 +531,7 @@ fn member_face(
     field_faces: &[ConstFieldFace<'_>],
     case: u32,
 ) -> SwitchMember {
-    let is_default = c.payload(case).first().copied() != Some(NONE_TOKEN);
+    let is_default = c.field(case, PayloadField::DefaultKeyword) != Some(NONE_TOKEN);
     let mut covers = None;
     if !is_default {
         // The first case head only — the official reads

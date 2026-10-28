@@ -19,7 +19,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 use dartq_scanner::TokenKind;
 
 use crate::engine::Check;
@@ -2136,7 +2136,7 @@ pub(crate) mod use_raw_strings {
 }
 
 pub(crate) mod use_string_buffers {
-    use super::{Check, NodeKind, RuleSpec, TokenKind};
+    use super::{PayloadField, Check, NodeKind, RuleSpec, TokenKind};
     use crate::rules::slice::parameter_assignments::{parameter_name, parameter_rows};
     use crate::rules::{NONE_TOKEN, initialized_identifier_name, type_face, type_face_of_field};
 
@@ -2181,9 +2181,7 @@ pub(crate) mod use_string_buffers {
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         let Some(op) = c
-            .payload(node)
-            .first()
-            .copied()
+            .field(node, PayloadField::Operator)
             .filter(|&token| token != NONE_TOKEN)
         else {
             return;
@@ -2604,9 +2602,7 @@ pub(crate) mod use_string_buffers {
                 .next()
                 .is_some_and(|kid| prefix_writes_target(c, kid, name)),
             NodeKind::BinaryExpression => {
-                c.payload(node)
-                    .first()
-                    .copied()
+                c.field(node, PayloadField::Operator)
                     .is_some_and(|op| c.lexeme(op) == "+")
                     && c.collect_direct(node)
                         .into_iter()

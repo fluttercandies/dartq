@@ -54,6 +54,11 @@ pub enum FlowFact {
         /// `definitely_unassigned` read is also `!assigned` — the bits are
         /// exclusive (model.rs `PromotionModel` invariant).
         definitely_unassigned: bool,
+        /// Whether the declared type is potentially non-nullable at the
+        /// name level (official `isPotentiallyNonNullable`,
+        /// type_analyzer.dart:5016 — nullable, `dynamic`, `Null`, and
+        /// unknown heads suppress the report).
+        potentially_non_nullable: bool,
         /// The variable's declared type, when the declaration carried one.
         declared_type: Option<dartq_source::SourceRange>,
     },

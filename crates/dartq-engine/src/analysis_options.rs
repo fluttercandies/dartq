@@ -3918,7 +3918,6 @@ mod known_error_codes {
         ("abstract_super_member_reference", Severity::Error),
         ("address_position", Severity::Error),
         ("address_receiver", Severity::Error),
-        ("ambiguous_comment_reference", Severity::Warning),
         ("ambiguous_export", Severity::Error),
         ("ambiguous_extension_member_access", Severity::Error),
         ("ambiguous_import", Severity::Error),
@@ -4009,10 +4008,6 @@ mod known_error_codes {
         ("augmentation_type_parameter_bound", Severity::Error),
         ("augmentation_type_parameter_count", Severity::Error),
         ("augmentation_type_parameter_name", Severity::Error),
-        (
-            "augmentation_variable_different_getter_setter_types",
-            Severity::Error,
-        ),
         ("augmentation_without_declaration", Severity::Error),
         ("augmented_expression_is_not_setter", Severity::Error),
         ("augmented_expression_is_setter", Severity::Error),
@@ -4169,13 +4164,10 @@ mod known_error_codes {
         ("deprecated_lint_with_replacement", Severity::Warning),
         ("deprecated_member_use", Severity::Info),
         ("deprecated_mixin", Severity::Warning),
+        ("deprecated_new_in_comment_reference", Severity::Warning),
         ("deprecated_optional", Severity::Warning),
         ("deprecated_subclass", Severity::Warning),
         ("deprecated_subtype_of_function", Severity::Warning),
-        (
-            "different_inherited_getter_and_setter_types",
-            Severity::Error,
-        ),
         ("directive_after_declaration", Severity::Error),
         ("disallowed_type_instantiation_expression", Severity::Error),
         ("doc_directive_argument_wrong_format", Severity::Warning),
@@ -4190,8 +4182,9 @@ mod known_error_codes {
         ("doc_directive_missing_opening_tag", Severity::Warning),
         ("doc_directive_unknown", Severity::Warning),
         ("doc_import_cannot_be_deferred", Severity::Warning),
+        ("doc_import_cannot_have_combinators", Severity::Warning),
         ("doc_import_cannot_have_configurations", Severity::Warning),
-        ("doc_import_in_part_file", Severity::Warning),
+        ("doc_import_cannot_have_prefix", Severity::Warning),
         ("dot_shorthand_missing_context", Severity::Error),
         ("dot_shorthand_undefined_member", Severity::Error),
         ("duplicate_constructor", Severity::Error),
@@ -4238,7 +4231,6 @@ mod known_error_codes {
         ("equal_keys_in_map", Severity::Warning),
         ("equal_keys_in_map_pattern", Severity::Error),
         ("equality_cannot_be_equality_operand", Severity::Error),
-        ("exclude_invalid_glob", Severity::Warning),
         ("expected_body", Severity::Error),
         ("expected_case_or_default", Severity::Error),
         ("expected_class_member", Severity::Error),
@@ -4268,7 +4260,6 @@ mod known_error_codes {
         ("extends_non_class", Severity::Error),
         ("extension_as_expression", Severity::Error),
         ("extension_augmentation_has_on_clause", Severity::Error),
-        ("extension_augmentation_without_name", Severity::Error),
         ("extension_conflicting_static_and_instance", Severity::Error),
         ("extension_declares_abstract_member", Severity::Error),
         ("extension_declares_constructor", Severity::Error),
@@ -4462,7 +4453,6 @@ mod known_error_codes {
         ("included_file_parse_error", Severity::Error),
         ("included_file_warning", Severity::Warning),
         ("incompatible_lint", Severity::Warning),
-        ("incompatible_plugin_source", Severity::Warning),
         ("inconsistent_inheritance", Severity::Error),
         (
             "inconsistent_inheritance_getter_and_method",
@@ -4645,10 +4635,6 @@ mod known_error_codes {
         ("invocation_of_extension_without_call", Severity::Error),
         ("invocation_of_non_function", Severity::Error),
         ("invocation_of_non_function_expression", Severity::Error),
-        (
-            "js_interop_extension_constructor_js_annotation_has_no_effect",
-            Severity::Error,
-        ),
         ("label_in_outer_scope", Severity::Error),
         ("label_undefined", Severity::Error),
         ("late_final_field_with_const_constructor", Severity::Error),
@@ -4733,7 +4719,6 @@ mod known_error_codes {
             "mixin_application_not_implemented_interface",
             Severity::Error,
         ),
-        ("mixin_augmentation_has_on_clause", Severity::Error),
         (
             "mixin_class_declaration_extends_not_object",
             Severity::Error,
@@ -4826,6 +4811,7 @@ mod known_error_codes {
         ("non_const_call_to_literal_constructor", Severity::Warning),
         ("non_const_generative_enum_constructor", Severity::Error),
         ("non_const_map_as_expression_statement", Severity::Error),
+        ("non_constant_annotation_constructor", Severity::Error),
         ("non_constant_case_expression", Severity::Error),
         (
             "non_constant_case_expression_from_deferred_library",
@@ -4938,6 +4924,7 @@ mod known_error_codes {
         ),
         ("permission_implies_unsupported_hardware", Severity::Warning),
         ("platform_value_disallowed", Severity::Warning),
+        ("plugins_in_inner_options", Severity::Warning),
         ("positional_after_named_argument", Severity::Error),
         ("positional_field_in_object_pattern", Severity::Error),
         ("positional_parameter_outside_group", Severity::Error),
@@ -5110,6 +5097,7 @@ mod known_error_codes {
         ("typedef_in_class", Severity::Error),
         ("unawaited_return_in_try_block", Severity::Warning),
         ("unchecked_use_of_nullable_value", Severity::Error),
+        ("undefined_annotation", Severity::Error),
         ("undefined_class", Severity::Error),
         ("undefined_constructor_in_initializer", Severity::Error),
         ("undefined_enum_constant", Severity::Error),
@@ -5253,8 +5241,6 @@ mod known_error_codes {
     /// the same spelling is rejected in `analyzer.errors`.
     pub const UNIQUE_NAME_ALIASES: &[(&str, &str)] = &[
         ("abstract_field_constructor_initializer", "abstract_field_initializer"),
-        ("ambiguous_comment_reference_name", "ambiguous_comment_reference"),
-        ("ambiguous_comment_reference_prefix", "ambiguous_comment_reference"),
         ("ambiguous_extension_member_access_three_or_more", "ambiguous_extension_member_access"),
         ("ambiguous_extension_member_access_two", "ambiguous_extension_member_access"),
         ("analysis_option_deprecated_with_replacement", "analysis_option_deprecated"),
@@ -5544,12 +5530,10 @@ mod known_error_codes {
 /// The registry names that existed but were removed, still accepted as
 /// `analyzer.errors` keys so existing options files keep working
 /// (`removedCodeNames`, parse_model:66-76 — "we don't want to report these,
-/// this breaks clients").
-const REMOVED_ERROR_CODES: [&str; 3] = [
-    "missing_return",
-    "plugins_in_inner_options",
-    "undefined_annotation",
-];
+/// this breaks clients"). Exactly the 3.13.7 pin's set; the two names the
+/// 3.15-main face carried here (`plugins_in_inner_options`,
+/// `undefined_annotation`) are live registry codes of the pin.
+const REMOVED_ERROR_CODES: [&str; 1] = ["missing_return"];
 
 /// Whether `name` — an `analyzer.errors` key in its written spelling — names
 /// a diagnostic code the pinned registry knows (the `name`-field universe of
@@ -5580,13 +5564,15 @@ mod unique_name_alias_pins {
 
     /// The alias table walks clean against its upstream derivation: sorted
     /// by the `uniqueName` column (the `canonical_name` binary search's
-    /// precondition), row count pinned at the registry's 225 divergent
-    /// constants, and every canonical `name` resolves in the severity
-    /// table's name column — an alias into a dead name would admit
-    /// citations for codes the registry never declared.
+    /// precondition), row count pinned at the registry's divergent
+    /// constants (the 3.13.7 pin dropped the two
+    /// `ambiguous_comment_reference` spellings with their code), and every
+    /// canonical `name` resolves in the severity table's name column — an
+    /// alias into a dead name would admit citations for codes the
+    /// registry never declared.
     #[test]
     fn the_unique_name_alias_table_walks_upstream_clean() {
-        assert_eq!(UNIQUE_NAME_ALIASES.len(), 225);
+        assert_eq!(UNIQUE_NAME_ALIASES.len(), 223);
         let mut names = SEVERITIES.iter().map(|&(name, _)| name).collect::<Vec<_>>();
         names.sort_unstable();
         for window in UNIQUE_NAME_ALIASES.windows(2) {

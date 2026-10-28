@@ -639,7 +639,13 @@ pub(crate) fn remove_keyword_across_comments(
         return None;
     }
     let run = trivia_run(rest);
-    let length = u32::try_from(word.len() + run).ok()?;
+    // The run counts bytes; the edit is UTF-16 — a comment in the run
+    // may carry multi-byte characters, so the run converts before it
+    // adds (the keyword itself is ASCII).
+    let run16 = utf16_count(rest.get(..run)?);
+    // The keyword itself is ASCII — its bytes are its UTF-16 units; the
+    // checked add keeps the pair in the u32 edit-length domain.
+    let length = u32::try_from(word.len()).ok()?.checked_add(run16)?;
     Some((offset16, length, String::new()))
 }
 

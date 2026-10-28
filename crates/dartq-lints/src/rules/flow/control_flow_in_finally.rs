@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, last_child};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/control_flow_in_finally.dart:24-107`
 /// — `break`/`continue`/`return` inside a `finally` block reports, unless
@@ -48,9 +48,9 @@ fn check(c: &mut Check<'_>) {
         return;
     };
     let try_node = c.path[try_idx];
-    // `finallyBlock == null` bails (:48-54): payload word 0 is the
-    // `finally` token (`TryStatementEnd`).
-    if c.payload(try_node).first() == Some(&NONE_TOKEN) {
+    // `finallyBlock == null` bails (:48-54): the `FinallyKeyword`
+    // word is the `finally` token (`TryStatementEnd`).
+    if c.field(try_node, PayloadField::FinallyKeyword) == Some(NONE_TOKEN) {
         return;
     }
     // The node must be inside the finally block — the try's last child
@@ -102,11 +102,16 @@ fn check(c: &mut Check<'_>) {
 }
 
 /// The UTF-16 end of the statement's `;` when the token follows the
-/// node's span (past a targeted jump's label, the payload `has_target`
+/// node's span (past a targeted jump's label, the payload `HasTarget`
 /// bit), `None` otherwise.
 fn semicolon_end(c: &Check<'_>, node: u32) -> Option<u32> {
     let mut probe = c.unit.ast.token_range(node).end;
-    if c.payload(node).first().copied().unwrap_or(0) != 0 {
+    // `HasTarget` is a `Break`/`Continue` field only — `ReturnStatement`
+    // has an empty payload (fields.rs), so its raw slot always read 0
+    // (no label to skip past).
+    let targeted = matches!(c.kind(node), NodeKind::Break | NodeKind::Continue)
+        && c.field(node, PayloadField::HasTarget).is_some_and(|bit| bit != 0);
+    if targeted {
         probe += 1;
     }
     let token = c.unit.tokens.get(probe as usize)?;
@@ -120,11 +125,11 @@ fn semicolon_end(c: &Check<'_>, node: u32) -> Option<u32> {
 /// `target == null` face (`_lookupBreakOrContinueTarget`,
 /// `scope_analyzer.dart:1042-1093`).
 fn jump_target(c: &Check<'_>, node: u32, node_idx: usize) -> Option<u32> {
-    // The payload carries only the `has_target` bit (a childless
+    // The payload carries only the `HasTarget` bit (a childless
     // `BreakStatementHandle`); the label identifier is the token after the
     // `break`/`continue` keyword, and a synthetic recovery token never
     // names a label.
-    if c.payload(node).first().copied().unwrap_or(0) != 0 {
+    if c.field(node, PayloadField::HasTarget).unwrap_or(0) != 0 {
         let label_token = c.head_token(node) + 1;
         if c.token_is_synthetic(label_token) {
             return None;

@@ -1,7 +1,7 @@
 use crate::rules::last_child;
 
 use super::same_file::{BindingScope, binding};
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_double_and_int_checks.dart:28-59`
 /// — an else-if chain whose branches test the same simple identifier —
@@ -157,9 +157,7 @@ fn same_file_typedef_alias<'a>(c: &'a Check<'_>, name: &str) -> Option<&'a str> 
                 continue;
             }
             let eq = c
-                .payload(inner)
-                .get(1)
-                .copied()
+                .field(inner, PayloadField::Equals)
                 .unwrap_or(crate::rules::NONE_TOKEN);
             if eq == crate::rules::NONE_TOKEN {
                 continue;
@@ -185,11 +183,9 @@ fn prefix_admits(c: &Check<'_>, prefix: &str, name: &str) -> bool {
             if c.kind(inner) != NodeKind::Import {
                 continue;
             }
-            // The `as` prefix word is payload word 0.
+            // The `AsKeyword` word carries the prefix.
             let prefix_token = c
-                .payload(inner)
-                .first()
-                .copied()
+                .field(inner, PayloadField::AsKeyword)
                 .unwrap_or(crate::rules::NONE_TOKEN);
             if prefix_token == crate::rules::NONE_TOKEN || c.lexeme(prefix_token) != prefix {
                 continue;

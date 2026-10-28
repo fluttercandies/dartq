@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, annotation_names, constructor_name_part, container_members, ctor_header_has_const, is_identifier_token, range_has_const, top_level_annotations};
+use super::{PayloadField, Check, NodeKind, RuleSpec, annotation_names, constructor_name_part, container_members, ctor_header_has_const, is_identifier_token, range_has_const, top_level_annotations};
 use crate::rules::{NONE_TOKEN, SupertypeClause, last_child, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span, variables_declaration_keyword};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_const_constructors_in_immutables.dart:41-133`
@@ -220,7 +220,8 @@ fn fields_all_final(c: &Check<'_>, class_row: u32) -> bool {
         if c.kind(member) != NodeKind::Fields {
             continue;
         }
-        if c.payload(member).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+        if c.field(member, PayloadField::MemberKind)
+            != Some(dartq_parser::MemberKind::NonStaticField as u32)
         {
             continue;
         }
@@ -228,7 +229,7 @@ fn fields_all_final(c: &Check<'_>, class_row: u32) -> bool {
             if c.kind(decl) != NodeKind::VariablesDeclaration {
                 continue;
             }
-            if c.payload(decl).first().copied().unwrap_or(NONE_TOKEN) != NONE_TOKEN {
+            if c.field(decl, PayloadField::LateKeyword).unwrap_or(NONE_TOKEN) != NONE_TOKEN {
                 return false; // `late` blocks const construction
             }
             if !variables_declaration_keyword(c, decl)

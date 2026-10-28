@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, modifier_keyword};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, modifier_keyword};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_const_in_enum_constructor.dart`
 /// — an explicit `const` on an enum constructor reports at the keyword
@@ -40,12 +40,12 @@ fn check(c: &mut Check<'_>) {
             modifier_keyword(c, node, "const")
         }
         NodeKind::PrimaryConstructor => {
-            if c.payload(node).first() != Some(&(dartq_parser::DeclarationKind::Enum as u32)) {
+            if c.field(node, PayloadField::DeclarationKind)
+                != Some(dartq_parser::DeclarationKind::Enum as u32)
+            {
                 return; // the EnumDeclaration parent face (:39-46)
             }
-            c.payload(node)
-                .get(1)
-                .copied()
+            c.field(node, PayloadField::ConstKeyword)
                 .filter(|&token| token != NONE_TOKEN)
         }
         _ => None,

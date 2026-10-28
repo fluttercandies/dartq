@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, RuleSpec};
+use super::{Check, PayloadField, RuleSpec};
 use crate::rules::NONE_TOKEN;
 
 /// Official: `upstream Dart SDK source,
@@ -67,9 +67,8 @@ fn scrutinee_rows(c: &Check<'_>) -> Option<Vec<u32>> {
                 .iter()
                 .position(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)?;
             let container = kids[position];
-            if c.payload(container)
-                .first()
-                .is_some_and(|&case| case != NONE_TOKEN)
+            if c.field(container, PayloadField::CaseKeyword)
+                .is_some_and(|case| case != NONE_TOKEN)
             {
                 return None;
             }
@@ -109,7 +108,7 @@ fn type_scrutinee(c: &Check<'_>, rows: &[u32]) -> bool {
         if c.kind(case) != NodeKind::SwitchExpressionCase {
             continue;
         }
-        let Some(&arrow) = c.payload(case).get(1) else {
+        let Some(arrow) = c.field(case, PayloadField::Arrow) else {
             continue;
         };
         if arrow == NONE_TOKEN {
@@ -140,12 +139,10 @@ fn walk(c: &Check<'_>, rows: &[u32]) -> bool {
     // The `+` concatenation face: both operand runs walk (:95-104).
     if let Some(position) = rows.iter().rposition(|&row| {
         c.kind(row) == NodeKind::BinaryExpression
-            && c.lexeme(c.payload(row).first().copied().unwrap_or(NONE_TOKEN)) == "+"
+            && c.lexeme(c.field(row, PayloadField::Operator).unwrap_or(NONE_TOKEN)) == "+"
     }) {
         let operator = c
-            .payload(rows[position])
-            .first()
-            .copied()
+            .field(rows[position], PayloadField::Operator)
             .unwrap_or(NONE_TOKEN);
         let operator_byte = token_byte(c, operator);
         let split = rows.partition_point(|&row| c.byte_span(row).end <= operator_byte);

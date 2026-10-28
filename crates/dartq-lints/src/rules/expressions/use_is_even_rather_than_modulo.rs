@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, same_file, slice, value_run_end};
+use super::{Check, NodeKind, PayloadField, RuleSpec, same_file, slice, value_run_end};
 use crate::rules::in_const_context;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/use_is_even_rather_than_modulo.dart`
@@ -27,7 +27,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 fn check(c: &mut Check<'_>) {
     let node = c.node();
     // The operator gate (:40).
-    let Some(&op) = c.payload(node).first() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if c.lexeme(op) != "==" {
@@ -104,7 +104,7 @@ fn modulo_root(c: &Check<'_>, left: &[u32]) -> Option<u32> {
                 }
             })
     })?;
-    let &op = c.payload(root).first()?;
+    let op = c.field(root, PayloadField::Operator)?;
     (c.lexeme(op) == "%").then_some(root)
 }
 
@@ -115,7 +115,7 @@ fn modulo_root(c: &Check<'_>, left: &[u32]) -> Option<u32> {
 /// window), and a member or compound operand carries extra rows and
 /// stays silent (the documented face).
 fn modulo_operands(c: &Check<'_>, modulo: u32) -> Option<(u32, u32)> {
-    let &op = c.payload(modulo).first()?;
+    let op = c.field(modulo, PayloadField::Operator)?;
     let mut rows: Vec<u32> = c.collect_direct(modulo);
     let window = c.children(modulo);
     rows.extend(window.start..window.end);

@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
 use crate::rules::in_const_context;
 
 const USE_IS_EMPTY_PROBLEM: &str =
@@ -44,7 +44,7 @@ fn check(c: &mut Check<'_>) {
     let Some((left, right)) = slice::binary_operands(c) else {
         return;
     };
-    let Some(op_token) = c.payload_word(node, 0) else {
+    let Some(op_token) = c.field_token(node, PayloadField::Operator) else {
         return;
     };
     let op = c.lexeme(op_token);

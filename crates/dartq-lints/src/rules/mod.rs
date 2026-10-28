@@ -449,9 +449,7 @@ pub(crate) fn is_field_name_shortcut(c: &Check<'_>, pattern: u32) -> bool {
     field.is_some_and(|field| {
         // NONE marks a positional field, a label identifier names the
         // field — only the `:` token itself is the shortcut face.
-        c.payload(field)
-            .first()
-            .copied()
+        c.field(field, PayloadField::Colon)
             .is_some_and(|colon| colon != NONE_TOKEN && c.lexeme(colon) == ":")
     })
 }

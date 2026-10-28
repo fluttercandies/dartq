@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{NONE_TOKEN, same_file_declaration};
 use dartq_ast::mod_flags;
 use dartq_parser::IdentifierContext;
@@ -31,18 +31,20 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    // The `with` clause keyword: payload word 2 on both dispatch kinds
-    // (bridge.rs `handle_class_with_clause` /
-    // `handle_named_mixin_application_with_clause`); word 3 bounds the
-    // clause at a trailing `implements`.
-    let payload = c.payload(node);
-    let Some(&with_kw) = payload.get(2) else {
+    // The `with` clause keyword: the `WithKeyword` word on both
+    // dispatch kinds (bridge.rs `handle_class_with_clause` /
+    // `handle_named_mixin_application_with_clause`); the
+    // `ImplementsKeyword` word bounds the clause at a trailing
+    // `implements`.
+    let Some(with_kw) = c.field(node, PayloadField::WithKeyword) else {
         return;
     };
     if with_kw == NONE_TOKEN {
         return;
     }
-    let implements_kw = payload.get(3).copied().unwrap_or(NONE_TOKEN);
+    let implements_kw = c
+        .field(node, PayloadField::ImplementsKeyword)
+        .unwrap_or(NONE_TOKEN);
     for kid in c.collect_direct(node) {
         if c.kind(kid) == NodeKind::DeclarationBody {
             break;
@@ -104,15 +106,15 @@ fn alias_target<'a>(c: &'a Check<'_>, name: &str) -> Option<&'a str> {
     let root = c.unit.ast.root()?;
     for row in c.unit.ast.children(root) {
         if c.kind(row) != NodeKind::Typedef
-            || c.payload(row).get(1).copied().unwrap_or(NONE_TOKEN) == NONE_TOKEN
+            || c.field(row, PayloadField::Equals).unwrap_or(NONE_TOKEN) == NONE_TOKEN
         {
             continue;
         }
         let kids = c.collect_direct(row);
         let named = kids.iter().any(|&kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first()
-                    == Some(&(IdentifierContext::TypedefDeclaration as u32))
+                && c.field(kid, PayloadField::Context)
+                    == Some(IdentifierContext::TypedefDeclaration as u32)
                 && c.lexeme(c.head_token(kid)) == name
         });
         if !named {

@@ -3062,6 +3062,37 @@ pub(crate) struct Engine<'a> {
     /// the property-promotion substitution and the condition-face's
     /// property-access anchor both key on this record.
     pub(crate) member_reads: Vec<MemberRead>,
+    /// [`Engine::member_reads`] keyed by member-token END offset (last
+    /// insert wins, matching the old reverse scan's highest-offset match):
+    /// the chain walk's O(1) hop lookup. A cascade of N sections walks N
+    /// hops, and the linear scan per hop made that O(N²) — unbounded time
+    /// on a bounded input (#41983's 20k-section cascade).
+    pub(crate) member_read_ends: FxHashMap<u32, u32>,
+    /// The pass-2 memo of [`Engine::recv_expression_ty`] answers, keyed by
+    /// read-span offset. Active only across the `resolve_rows` row loop
+    /// (every table the answer reads — `rebound_locals`,
+    /// `init_derived_types`, the flow read types — is frozen by then), it
+    /// collapses the per-row chain re-derivation to one walk per node:
+    /// source order resolves each receiver before its members, so every
+    /// walk bottoms out at the first memoized ancestor. Interior mutability
+    /// because the walk runs through `&self`.
+    pub(crate) recv_memo: RefCell<FxHashMap<u32, Option<Ty>>>,
+    /// Whether [`Engine::recv_memo`] may be consulted (the `resolve_rows`
+    /// row loop only; see the field's staleness contract).
+    pub(crate) recv_memo_active: bool,
+    /// The cascade streak index: every section selector's offset keyed to
+    /// the recv_span of its cascade's first contiguous section (the record
+    /// that carries the target's own span). Built once per unit in
+    /// `resolve_rows` — the per-row walk-back it replaces paid O(N²) on a
+    /// 20k-section cascade (#41983).
+    pub(crate) cascade_first_spans: FxHashMap<u32, SourceRange>,
+    /// The live [`Engine::recv_expression_ty`] recursion depth (interior
+    /// mutability — the walk runs through `&self`). The walk descends one
+    /// member token per hop; a pathological chain longer than
+    /// `RECV_WALK_DEPTH_CAP` (row_resolution.rs) degrades to the record's
+    /// classified receiver instead of recursing toward a worker-thread
+    /// stack overflow.
+    pub(crate) recv_walk_depth: Cell<u32>,
     /// The local receivers whose member merge classified as `Unknown`
     /// (#2521): the receiver's static type at the fold (a function value,
     /// a record, a `dynamic` — the shapes that name no container), keyed

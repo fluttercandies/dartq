@@ -1551,6 +1551,14 @@ pub struct Container {
     /// reads it (`unused_local_elements_verifier.dart:780-792` walks every
     /// formal list, constructors included).
     pub ctor_formals: NameMap<Box<Formals>>,
+    /// Factory-declaration formals by the same lookup spelling as
+    /// [`Self::ctor_formals`]: a redirecting factory's OWN written
+    /// parameter list (`factory $Result.data(ValueT state) = $ResultData;`),
+    /// which the plain table never carries (a factory declares no body
+    /// constructor). Read by the argument-check pairing only — the other
+    /// formal consumers (the closure-formal solver's substitution chains
+    /// especially) keep the under-report the plain table preserves.
+    pub factory_formals: NameMap<Box<Formals>>,
     /// The declaration's metadata, in written order (name-level,
     /// [`Annotation`]). The meta-getter recognition (`crate::annotation`)
     /// reads it; members' own metadata is not part of the container face.

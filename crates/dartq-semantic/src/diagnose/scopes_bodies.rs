@@ -2567,7 +2567,7 @@ impl<'a> Engine<'a> {
     /// apply: the foreign-pool projection and the field-type patch
     /// (same-file only; a foreign class's unannotated field formal stays
     /// `Unknown` and the schema stays silent — the under-report posture).
-    fn ctor_schema_formals(&self, class: StringId, selector: StringId) -> Option<Formals> {
+    pub(crate) fn ctor_schema_formals(&self, class: StringId, selector: StringId) -> Option<Formals> {
         let (container, owner) = resolve_container(
             self.graph,
             self.namespaces,
@@ -2577,6 +2577,30 @@ impl<'a> Engine<'a> {
             class,
         )?;
         let mut formals = (**container.ctor_formals.get(&selector)?).clone();
+        self.project_formals(owner, &mut formals);
+        self.patch_field_formals(class, &mut formals);
+        Some(formals)
+    }
+
+    /// The factory-declaration formals lane ([`Container::factory_formals`]):
+    /// the same resolution and projection as
+    /// [`Self::ctor_schema_formals`] over the factory-only table — a
+    /// redirecting factory's own written parameter list, served to the
+    /// argument-check pairing alone.
+    pub(crate) fn factory_ctor_formals(
+        &self,
+        class: StringId,
+        selector: StringId,
+    ) -> Option<Formals> {
+        let (container, owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            class,
+        )?;
+        let mut formals = (**container.factory_formals.get(&selector)?).clone();
         self.project_formals(owner, &mut formals);
         self.patch_field_formals(class, &mut formals);
         Some(formals)

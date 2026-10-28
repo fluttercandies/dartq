@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, query_site, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice};
 use crate::rules::{NONE_TOKEN, get_set_token, variables_declaration_keyword};
 use dartq_semantic::model::{ArgListId, Formal, Formals, Ty};
 use dartq_semantic::{Analysis, FnSig};
@@ -302,7 +302,7 @@ fn check_invocation(
     // marker in the run's chain.
     if run
         .iter()
-        .any(|&row| c.kind(row) == NodeKind::DotAccess && c.payload(row).get(1) == Some(&1))
+        .any(|&row| c.kind(row) == NodeKind::DotAccess && c.field(row, PayloadField::IsNullAware) == Some(1))
     {
         return;
     }
@@ -691,9 +691,7 @@ fn lambda_formals<'a>(c: &'a Check<'_>, lambda: u32) -> Vec<LambdaFormal<'a>> {
             && let Some(name) = parameter_name(c, row)
         {
             let kind = c
-                .payload(row)
-                .get(4)
-                .copied()
+                .field(row, PayloadField::FormalParameterKind)
                 .unwrap_or(dartq_parser::FormalParameterKind::RequiredPositional as u32);
             formals.push(LambdaFormal { name, row, kind });
         }
@@ -710,9 +708,9 @@ fn lambda_formals<'a>(c: &'a Check<'_>, lambda: u32) -> Vec<LambdaFormal<'a>> {
     formals
 }
 
-/// The name token of a formal parameter (payload word 1).
+/// The name token of a formal parameter (the row's `Name` word).
 fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
-    let &token = c.payload(parameter).get(1)?;
+    let token = c.field(parameter, PayloadField::Name)?;
     (token != NONE_TOKEN).then(|| c.lexeme(token))
 }
 
@@ -836,7 +834,7 @@ fn resolves_to_lambda_parameter(
                 let ctx = dartq_parser::IdentifierContext::CatchParameter as u32;
                 if c.children(current).any(|row| {
                     c.kind(row) == NodeKind::Identifier
-                        && c.payload(row).first() == Some(&ctx)
+                        && c.field(row, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(row)) == name
                 }) {
                     return false;
@@ -878,7 +876,7 @@ fn block_binds(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Optio
                     .find(|&piece| c.kind(piece) == NodeKind::Identifier)
             };
             name_row.is_some_and(|row| {
-                c.payload(row).first() == Some(&ctx)
+                c.field(row, PayloadField::Context) == Some(ctx)
                     && c.lexeme(c.head_token(row)) == name
                     && c.byte_span(row).start < use_start
             })
@@ -920,7 +918,7 @@ fn binding_finality(c: &Check<'_>, use_row: u32, name: &str) -> Finality {
                 let ctx = dartq_parser::IdentifierContext::CatchParameter as u32;
                 if c.children(current).any(|row| {
                     c.kind(row) == NodeKind::Identifier
-                        && c.payload(row).first() == Some(&ctx)
+                        && c.field(row, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(row)) == name
                 }) {
                     return Finality::NotFinal;
@@ -1054,7 +1052,8 @@ fn fields_finality(c: &Check<'_>, fields: u32, name: &str) -> Option<Finality> {
     };
     let binds = c.collect_direct(fields).into_iter().any(|kid| {
         if c.kind(kid) == NodeKind::Identifier {
-            return c.payload(kid).first() == Some(&ctx) && c.lexeme(c.head_token(kid)) == name;
+            return c.field(kid, PayloadField::Context) == Some(ctx)
+                && c.lexeme(c.head_token(kid)) == name;
         }
         if c.kind(kid) != NodeKind::VariablesDeclaration {
             return false;
@@ -1068,7 +1067,8 @@ fn fields_finality(c: &Check<'_>, fields: u32, name: &str) -> Option<Finality> {
                     .find(|&piece| c.kind(piece) == NodeKind::Identifier)
             };
             name_row.is_some_and(|row| {
-                c.payload(row).first() == Some(&ctx) && c.lexeme(c.head_token(row)) == name
+                c.field(row, PayloadField::Context) == Some(ctx)
+                    && c.lexeme(c.head_token(row)) == name
             })
         })
     });

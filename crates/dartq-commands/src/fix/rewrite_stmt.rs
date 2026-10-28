@@ -516,15 +516,41 @@ pub(crate) fn drop_span_statement(text: &str, range: &core::ops::Range<u32>) -> 
 
 /// `unnecessary_breaks`: the trailing `break;` of a multi-statement case
 /// leaves (the official `RemoveBreak` deletes the statement's lines
-/// range, [`drop_span_statement`]'s shape). The reported statement span
-/// must slice to `break` + whitespace + `;` before anything is cut.
+/// range, [`drop_span_statement`]'s shape). The rule reports the `break`
+/// KEYWORD token alone, so the keyword face extends the span through the
+/// statement's `;` (the trivia run between them included) before the
+/// cut; a span already slicing `break;` verifies as-is.
 pub(crate) fn drop_break_statement(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
-    let slice = slice16(input.text, &input.range)?;
+    let text = input.text;
+    let slice = slice16(text, &input.range)?;
     let body = slice.trim_matches([' ', '\t']);
+    if body == "break" {
+        // The keyword report: the `;` terminating the statement joins
+        // the cut (the official deletes the whole statement's lines).
+        // The trivia run counts bytes; the edit is UTF-16 — a comment
+        // between `break` and `;` may carry multi-byte characters, so
+        // the run converts before it adds.
+        let start = utf16_offset_to_byte(text, input.range.end);
+        let rest = text.get(start..)?;
+        let run = trivia_run(rest);
+        let after_run = rest.get(run..)?;
+        if !after_run.starts_with(';') {
+            return None;
+        }
+        let run16 = utf16_count(rest.get(..run)?);
+        let end16 = input.range.end + run16 + 1;
+        return drop_span_statement(
+            text,
+            &core::ops::Range {
+                start: input.range.start,
+                end: end16,
+            },
+        );
+    }
     if body != "break;" {
         return None;
     }
-    drop_span_statement(input.text, &input.range)
+    drop_span_statement(text, &input.range)
 }
 
 /// `unnecessary_library_directive`: the bare `library` directive's line

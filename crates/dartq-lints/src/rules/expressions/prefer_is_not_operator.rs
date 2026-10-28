@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_is_not_operator.dart:33-55`
 /// — `!(x is T)` (the `is` expression wrapped in parentheses under a
@@ -27,9 +27,9 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    // `node.notOperator != null` bails (:39-42): payload word 0 is the
-    // `not` flag of the `IsExpression` payload.
-    if c.payload(node).first().copied().unwrap_or(0) != 0 {
+    // `node.notOperator != null` bails (:39-42): the `IsNegated` word
+    // of the `IsExpression` row.
+    if c.field(node, PayloadField::IsNegated).unwrap_or(0) != 0 {
         return;
     }
     let Some(paren) = c.ancestor(1) else {

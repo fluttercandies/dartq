@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/type_init_formals.dart:37-64`
 /// — an initializing formal (`this.x` / `super.x`) written with a type
@@ -36,7 +36,7 @@ fn check(c: &mut Check<'_>) {
     let node = c.node();
     // `nodeType == null` bails (:38-39); `this.`/`super.` makes the
     // parameter an initializing formal by grammar.
-    let Some(&receiver) = c.payload(node).first() else {
+    let Some(receiver) = c.field(node, PayloadField::Receiver) else {
         return;
     };
     if receiver == NONE_TOKEN {
@@ -68,9 +68,7 @@ fn check(c: &mut Check<'_>) {
     // The field-formal gate (:41-46): the field exists as a non-static
     // instance field of this class and the written types are equal.
     let Some(name) = c
-        .payload(node)
-        .get(1)
-        .copied()
+        .field(node, PayloadField::Name)
         .filter(|&name| name != NONE_TOKEN)
     else {
         return;

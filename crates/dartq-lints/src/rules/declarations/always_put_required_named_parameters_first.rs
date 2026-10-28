@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, narrow_u32};
+use super::{PayloadField, Check, NodeKind, RuleSpec, narrow_u32};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/always_put_required_named_parameters_first.dart:31-92`
 /// — a required named parameter written after a non-required named
@@ -37,7 +37,9 @@ fn check(c: &mut Check<'_>) {
         if c.kind(param) != NodeKind::FormalParameter {
             continue;
         }
-        let kind = c.payload(param).get(4).copied().unwrap_or(u32::MAX);
+        let kind = c
+            .field(param, PayloadField::FormalParameterKind)
+            .unwrap_or(u32::MAX);
         let required_kind = kind == dartq_parser::FormalParameterKind::RequiredNamed as u32;
         let named =
             required_kind || kind == dartq_parser::FormalParameterKind::OptionalNamed as u32;
@@ -46,7 +48,7 @@ fn check(c: &mut Check<'_>) {
         }
         let required = required_kind || has_required_annotation(c, node, param);
         if required {
-            if non_required_seen && let Some(&name) = c.payload(param).get(1) {
+            if non_required_seen && let Some(name) = c.field(param, PayloadField::Name) {
                 let Some(start) = c.utf16_of_token(name) else {
                     continue;
                 };
@@ -73,13 +75,13 @@ fn super_parameters_are_in_order(c: &Check<'_>, list: u32) -> bool {
         })
         .filter(|&param| {
             matches!(
-                c.payload(param).get(4).copied(),
+                c.field(param, PayloadField::FormalParameterKind),
                 Some(k)
                     if k == dartq_parser::FormalParameterKind::RequiredNamed as u32
                         || k == dartq_parser::FormalParameterKind::OptionalNamed as u32
             )
         })
-        .filter_map(|param| c.payload(param).get(1).copied())
+        .filter_map(|param| c.field(param, PayloadField::Name))
         .filter(|&token| token != crate::rules::NONE_TOKEN)
         .map(|token| c.lexeme(token))
         .collect();
@@ -155,12 +157,11 @@ fn super_formal_positions(c: &Check<'_>, names: &[&str]) -> Option<Vec<Option<us
     )
 }
 
-/// The `super` receiver word (the `FormalParameter` payload's first word).
+/// The `super` receiver word (the `FormalParameter` row's `Receiver`
+/// word).
 fn is_super_formal(c: &Check<'_>, param: u32) -> bool {
     let receiver = c
-        .payload(param)
-        .first()
-        .copied()
+        .field(param, PayloadField::Receiver)
         .unwrap_or(crate::rules::NONE_TOKEN);
     receiver != crate::rules::NONE_TOKEN && c.lexeme(receiver) == "super"
 }

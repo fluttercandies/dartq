@@ -23,7 +23,7 @@
 //! (`f(a.b)`) tiles beyond the four-piece group and counts piece-wise; the
 //! validated walkers accept that divergence, and so does this module.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::RuleSpec;
@@ -129,7 +129,7 @@ pub(crate) fn binary_operands(c: &Check<'_>) -> Option<(Vec<u32>, Vec<u32>)> {
 /// operands must be read off the production tiling while the dispatch
 /// node is elsewhere (`parameter_assignments`'s earlier-`??=` scan).
 pub(crate) fn binary_operands_at(c: &Check<'_>, node: u32) -> Option<(Vec<u32>, Vec<u32>)> {
-    let op_token = c.payload(node).first().copied()?;
+    let op_token = c.field(node, PayloadField::Operator)?;
     let op_start = c.unit.tokens.get(op_token as usize)?.byte_offset as usize;
     let window = c.children(node);
     let parent = c.unit.ast.parent(node)?;
@@ -174,7 +174,7 @@ pub(crate) fn binary_operands_at(c: &Check<'_>, node: u32) -> Option<(Vec<u32>, 
     // runs ascending.
     if let Some(marker) = right.iter().position(|&piece| {
         c.kind(piece) == NodeKind::DotAccess
-            && c.payload(piece).first().is_some_and(|&dot| {
+            && c.field(piece, PayloadField::Operator).is_some_and(|dot| {
                 c.unit
                     .tokens
                     .get(dot as usize)
@@ -659,7 +659,7 @@ pub(crate) fn arguments(c: &Check<'_>, pieces: &[u32]) -> Vec<core::ops::Range<u
 }
 
 pub(crate) mod no_self_assignments {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/no_self_assignments.dart`
     /// — an `=` assignment whose both sides are identifiers with the same
@@ -689,9 +689,9 @@ pub(crate) mod no_self_assignments {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        if c.payload(node)
-            .first()
-            .is_none_or(|&op| c.lexeme(op) != "=")
+        if c
+            .field(node, PayloadField::Operator)
+            .is_none_or(|op| c.lexeme(op) != "=")
         {
             return;
         }
@@ -848,7 +848,7 @@ pub(crate) mod no_self_assignments {
 }
 
 pub(crate) mod parameter_assignments {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::{NONE_TOKEN, initialized_identifier_name};
     use dartq_scanner::TokenKind;
 
@@ -921,7 +921,7 @@ pub(crate) mod parameter_assignments {
     /// identifier is the written name.
     fn assignment(c: &mut Check<'_>) {
         let node = c.node();
-        let Some(op) = c.payload(node).first().copied() else {
+        let Some(op) = c.field(node, PayloadField::Operator) else {
             return;
         };
         let Some((lhs, name)) = assignment_lhs(c, node) else {
@@ -1047,7 +1047,7 @@ pub(crate) mod parameter_assignments {
             if c.kind(id) != NodeKind::Assignment {
                 continue;
             }
-            let Some(op) = c.payload(id).first().copied() else {
+            let Some(op) = c.field(id, PayloadField::Operator) else {
                 continue;
             };
             if c.lexeme(op) == "??=" && assignment_lhs(c, id).is_some_and(|(_, n)| n == name) {
@@ -1097,12 +1097,12 @@ pub(crate) mod parameter_assignments {
     /// The pattern-assignment face: every assigned-variable row naming a
     /// parameter reports at the pattern (the official reports per matching
     /// field at `node.pattern`). The childless marker anchors over the
-    /// `=` (payload word 0); the pattern's pieces are the owner siblings
+    /// `=` (the row's `Equals` word); the pattern's pieces are the owner siblings
     /// before it, up to the `=` byte — the statement run bounded at the
     /// previous statement row.
     fn pattern(c: &mut Check<'_>) {
         let node = c.node();
-        let Some(equals) = c.payload(node).first().copied() else {
+        let Some(equals) = c.field(node, PayloadField::Equals) else {
             return;
         };
         let Some(eq_start) = c
@@ -1327,13 +1327,13 @@ pub(crate) mod parameter_assignments {
     pub(crate) fn parameter_name<'a>(c: &'a Check<'a>, parameter: u32) -> Option<&'a str> {
         match c.kind(parameter) {
             NodeKind::FormalParameter => {
-                let name = c.payload(parameter).get(1).copied()?;
+                let name = c.field(parameter, PayloadField::Name)?;
                 (name != NONE_TOKEN).then(|| c.lexeme(name))
             }
             NodeKind::FunctionTypedFormalParameter => {
                 let name_row = c.collect_direct(parameter).into_iter().find(|&kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first().copied()
+                        && c.field(kid, PayloadField::Context)
                             != Some(dartq_parser::IdentifierContext::TypeReference as u32)
                 });
                 Some(c.lexeme(
@@ -1345,12 +1345,12 @@ pub(crate) mod parameter_assignments {
     }
 
     /// Whether the parameter carries a default clause (`= init`; the
-    /// bridge keeps the init words as payload words 2-3).
+    /// bridge keeps the default clause extent in the row's
+    /// `InitializerStart`/`InitializerEnd` words).
     fn has_default_clause(c: &Check<'_>, parameter: u32) -> bool {
         c.kind(parameter) == NodeKind::FormalParameter
-            && c.payload(parameter)
-                .get(2)
-                .copied()
+            && c
+                .field(parameter, PayloadField::InitializerStart)
                 .is_some_and(|token| token != NONE_TOKEN)
     }
 

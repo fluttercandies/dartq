@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, container_members, ctor_header_has_const, fields_written_type, is_identifier_token, range_has_const};
+use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, ctor_header_has_const, fields_written_type, is_identifier_token, range_has_const};
 use crate::rules::{initialized_identifier_name, utf16_token_span};
 
 const STATIC_FIELD: u32 = dartq_parser::MemberKind::StaticField as u32;
@@ -55,7 +55,7 @@ fn check(c: &mut Check<'_>) {
             Some(&row) => match c.kind(row) {
                 NodeKind::EnumDeclaration => return,
                 NodeKind::ExtensionTypeDeclaration => {
-                    if c.payload(node).first() != Some(&STATIC_FIELD) {
+                    if c.field(node, PayloadField::MemberKind) != Some(STATIC_FIELD) {
                         return;
                     }
                 }
@@ -80,10 +80,8 @@ fn check(c: &mut Check<'_>) {
         if c.kind(member) != NodeKind::VariablesDeclaration {
             continue;
         }
-        // `variable.isLate` (:226) — the row's `late` payload word.
-        if c.payload(member)
-            .first()
-            .copied()
+        // `variable.isLate` (:226) — the row's `LateKeyword` word.
+        if c.field(member, PayloadField::LateKeyword)
             .unwrap_or(crate::rules::NONE_TOKEN)
             != crate::rules::NONE_TOKEN
         {

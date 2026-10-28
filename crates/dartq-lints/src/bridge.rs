@@ -3408,7 +3408,8 @@ mod tests {
     fn real_parse_reports_unnecessary_new() {
         let hits = hits("var x = new Object();\n", "unnecessary_new");
         assert_eq!(hits.len(), 1);
-        // The official reports at the keyword with a zero-width span.
+        // The official reports covering the `new` keyword's span
+        // (`8..11` — the keyword itself, not zero-width).
         assert_eq!(hits[0].range, 8..11);
     }
 

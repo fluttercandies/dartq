@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, for_in_binds, parameters_bind, statement_binds};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, for_in_binds, parameters_bind, statement_binds};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_parameters.dart` —
 /// a parameter that is neither `final`/`const` nor reassigned in its
@@ -66,14 +66,14 @@ fn check(c: &mut Check<'_>) {
             continue;
         }
         // A field/super formal is final without the modifier (:67-70).
-        let receiver = c.payload(param).first().copied().unwrap_or(NONE_TOKEN);
+        let receiver = c
+            .field(param, PayloadField::Receiver)
+            .unwrap_or(NONE_TOKEN);
         if receiver != NONE_TOKEN {
             continue;
         }
         let Some(name) = c
-            .payload(param)
-            .get(1)
-            .copied()
+            .field(param, PayloadField::Name)
             .filter(|&token| token != NONE_TOKEN)
         else {
             continue;
@@ -162,7 +162,7 @@ fn mutates(c: &Check<'_>, node: u32, name: &str) -> bool {
             // The bare-name lhs: the identifier immediately before the
             // operator token (a member-write target's `.name` tokens sit
             // between the receiver identifier and the operator).
-            let op = c.payload(node).first().copied();
+            let op = c.field(node, PayloadField::Operator);
             // `this.x = …` is a *qualified* field write — the scope
             // analyzer's `_recordUnqualifiedWrite` only counts the bare
             // name. The left run can carry earlier siblings' rows (a
@@ -214,11 +214,11 @@ fn mutates(c: &Check<'_>, node: u32, name: &str) -> bool {
                 && c.lexeme(c.head_token(siblings[start])) == name
         }
         NodeKind::PatternAssignment => {
-            // The childless marker anchors over the `=` (payload word
-            // 0); the target pattern's pieces are the owner siblings
+            // The childless marker anchors over the `=` (the row's
+            // `Equals` word); the target pattern's pieces are the owner siblings
             // before it, up to the `=` byte — the statement run
             // bounded at the previous statement row.
-            let Some(equals) = c.payload(node).first().copied() else {
+            let Some(equals) = c.field(node, PayloadField::Equals) else {
                 return false;
             };
             let Some(eq_start) = c
@@ -298,9 +298,8 @@ fn mutates(c: &Check<'_>, node: u32, name: &str) -> bool {
         NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
             let binds = c.collect_direct(node).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::DeclaredVariablePattern
-                    && c.payload(kid)
-                        .first()
-                        .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+                    && c.field(kid, PayloadField::Variable)
+                        .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
             });
             !binds
                 && c.collect_direct(node)

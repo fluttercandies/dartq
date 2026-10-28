@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/type_literal_in_constant_pattern.dart:40-63`
 /// — a constant pattern whose expression's static type is the `Type`
@@ -276,7 +276,7 @@ fn enclosing_static_declares(c: &Check<'_>, name: &str) -> bool {
                             NodeKind::Fields if static_member => {
                                 if c.collect_direct(member).into_iter().any(|kid| {
                                     c.kind(kid) == NodeKind::Identifier
-                                        && c.payload(kid).first() == Some(&field_ctx)
+                                        && c.field(kid, PayloadField::Context) == Some(field_ctx)
                                         && c.lexeme(c.head_token(kid)) == name
                                 }) {
                                     return true;
@@ -357,15 +357,14 @@ fn pattern_field_is_type(c: &Check<'_>) -> bool {
         return false;
     };
     // A prefixed container (`prefix.A(...)`) resolves outside the file.
-    let words = c.payload(object);
-    let Some(&class_tok) = words.first() else {
+    let Some(class_tok) = c.field(object, PayloadField::FirstName) else {
         return false;
     };
-    if class_tok == NONE_TOKEN || words.get(1).copied() != Some(NONE_TOKEN) {
+    if class_tok == NONE_TOKEN || c.field(object, PayloadField::Period) != Some(NONE_TOKEN) {
         return false;
     }
     // The name-less field face carries the colon token, not a name.
-    let Some(&name_tok) = c.payload(field).first() else {
+    let Some(name_tok) = c.field(field, PayloadField::Colon) else {
         return false;
     };
     if name_tok == NONE_TOKEN || c.lexeme(name_tok) == ":" {
@@ -414,8 +413,8 @@ fn instance_field_is_type(c: &Check<'_>, class_row: u32, field: &str) -> bool {
         .unwrap_or(class_row);
     for member in crate::rules::rows_with_parent(c, body) {
         if c.kind(member) != NodeKind::Fields
-            || c.payload(member).first()
-                != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            || c.field(member, PayloadField::MemberKind)
+                != Some(dartq_parser::MemberKind::NonStaticField as u32)
         {
             continue;
         }

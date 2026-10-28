@@ -296,10 +296,12 @@ pub fn fold(entries: &[Entry], classes: &BTreeMap<String, String>) -> Result<Vec
 }
 
 /// Renders the full TSV document (header comments + rows) — a pure
-/// function of `rows`, the SDK version stamp, and the registry entry
-/// count, so regeneration is byte-reproducible for identical inputs.
+/// function of `rows`, the pin stamps, and the registry entry count, so
+/// regeneration is byte-reproducible for identical inputs. `pin_line` is
+/// the `SDK pin: <revision> (<checkout stamp>)` line `--check` verifies;
+/// `checkout_stamp` spells the checkout identity in the source prose.
 #[must_use]
-pub fn render_tsv(rows: &[Row], registry_entries: usize, sdk_version: &str) -> String {
+pub fn render_tsv(rows: &[Row], registry_entries: usize, pin_line: &str, checkout_stamp: &str) -> String {
     let mut out = String::with_capacity(4096 + rows.len() * 128);
     let _ = writeln!(
         out,
@@ -307,14 +309,12 @@ pub fn render_tsv(rows: &[Row], registry_entries: usize, sdk_version: &str) -> S
     );
     out.push_str("# DO NOT EDIT: regenerate with\n");
     out.push_str(
-        "#   cargo run -p upstream-gen --bin analyzer-codes-gen -- --sdk-src <dart-sdk-tree>\n",
+        "#   DARTQ_SDK_SRC=<dart-sdk-tree> cargo run -p upstream-gen --bin analyzer-codes-gen\n",
     );
     out.push_str("# Content pin: crates/dartq-diagnostics/tests/analyzer_codes_tsv.rs (blake3).\n");
+    let _ = writeln!(out, "# {pin_line} — conformance/pin.toml (verified by --check).");
     out.push_str("# Source: pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart of the pinned\n");
-    let _ = writeln!(
-        out,
-        "#   SDK checkout ({sdk_version}), generated upstream from"
-    );
+    let _ = writeln!(out, "#   SDK checkout ({checkout_stamp}), generated upstream from");
     out.push_str("#   pkg/analyzer/messages.yaml (class groups) plus\n");
     out.push_str("#   pkg/_fe_analyzer_shared/messages.yaml (shared parser codes; their\n");
     out.push_str("#   class column spells `_fe_analyzer_shared`).\n");
@@ -333,10 +333,10 @@ pub fn render_tsv(rows: &[Row], registry_entries: usize, sdk_version: &str) -> S
     out.push_str("#   keep the first registry entry; hasPublishedDocs folds any-variant —\n");
     out.push_str("#   upstream has no name with mixed flags, verified on every run).\n");
     out.push_str("# Rows are sorted by name. The syntax tier (data/syntax-codes.tsv) is\n");
-    out.push_str("#   oracle-locked to dart 3.13.1 and OVERRIDES these rows for its 259\n");
-    out.push_str("#   names in build.rs: 3.15 recast field_initializer_outside_constructor\n");
-    out.push_str("#   to COMPILE_TIME_ERROR and moved two templates — the pinned table\n");
-    out.push_str("#   wins for the acceptance set.\n");
+    out.push_str("#   oracle-locked (its own header names the lock) and OVERRIDES these rows\n");
+    out.push_str("#   for its names in build.rs — the syntax snapshot wins for its\n");
+    out.push_str("#   acceptance set; a handful of this table's rows legitimately differ\n");
+    out.push_str("#   there (patch-level upstream rewordings), so the override stays.\n");
     for row in rows {
         let _ = write!(
             out,
@@ -557,14 +557,24 @@ LocatableDiagnostic _withArgumentsSampleTwo({
             correction: Some("fix\tit".to_owned()),
             variants: 1,
         }];
-        let doc = render_tsv(&rows, 1, "dart 3.15.0 (main channel)");
+        let doc = render_tsv(
+            &rows,
+            1,
+            "SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)",
+            "dart 3.13.7, stable",
+        );
         let data_line = doc.lines().find(|l| !l.starts_with('#')).expect("one row");
         assert_eq!(
             data_line,
             "ParserErrorCode\tsample_one\tSAMPLE_ONE\tSYNTACTIC_ERROR\tERROR\ttrue\ttab\\there\\nnewline back\\\\slash\tfix\\tit"
         );
         assert!(doc.contains("1 registry consts fold to 1 name rows"));
-        assert!(doc.contains("dart 3.15.0 (main channel)"));
+        assert!(doc.contains("dart 3.13.7, stable"));
+        assert!(
+            doc.contains(
+                "# SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)"
+            )
+        );
     }
 
     #[test]

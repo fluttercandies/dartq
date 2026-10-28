@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, constructor_name_part, container_members, container_name_node, initializer_expression, modifier_keyword, parameter_name, parameter_rows};
+use super::{PayloadField, Check, NodeKind, RuleSpec, constructor_name_part, container_members, container_name_node, initializer_expression, modifier_keyword, parameter_name, parameter_rows};
 use crate::rules::{NONE_TOKEN, SupertypeClause, initialized_identifier_name, supertypes, utf16_token_span, variables_declaration_keyword};
 use dartq_ast::mod_flags;
 use dartq_language::LanguageVersion;
@@ -105,19 +105,19 @@ fn check(c: &mut Check<'_>) {
 }
 
 /// The primary-constructor face (:153-168): the header `const`
-/// (payload word 1, bridge.rs `end_primary_constructor`), the
+/// (the row's `ConstKeyword` word, bridge.rs `end_primary_constructor`), the
 /// public-class naming gate (:158-161 — the name must be written and
 /// private), and no `hashCode`/`index`/`values` parameter (:162-167).
 fn primary_ok(c: &Check<'_>, primary: u32, public: bool) -> bool {
-    if c.payload(primary).get(1).copied().unwrap_or(NONE_TOKEN) == NONE_TOKEN {
+    if c.field(primary, PayloadField::ConstKeyword).unwrap_or(NONE_TOKEN) == NONE_TOKEN {
         return false;
     }
     if public {
-        let named = c.payload(primary).get(2).copied().unwrap_or(0) != 0;
+        let named = c.field(primary, PayloadField::HasConstructorName).unwrap_or(0) != 0;
         let name = c.collect_direct(primary).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first()
-                    == Some(&(IdentifierContext::PrimaryConstructorDeclaration as u32))
+                && c.field(kid, PayloadField::Context)
+                    == Some(IdentifierContext::PrimaryConstructorDeclaration as u32)
         });
         let private = name.is_some_and(|n| c.lexeme(c.head_token(n)).starts_with('_'));
         if !named || !private {
@@ -166,7 +166,9 @@ fn member_walk(
                     return false;
                 }
                 // `member.isStatic` (:184).
-                if c.payload(*member).first() != Some(&(MemberKind::StaticField as u32)) {
+                if c.field(*member, PayloadField::MemberKind)
+                    != Some(MemberKind::StaticField as u32)
+                {
                     continue;
                 }
                 collect_candidates(c, class_name, *member, ctors, candidates);
@@ -220,7 +222,7 @@ fn method_disqualifies(c: &Check<'_>, member: u32) -> bool {
     let ctx = IdentifierContext::MethodDeclaration as u32;
     let is_name = |kid: u32| {
         c.kind(kid) == NodeKind::OperatorName
-            || (c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx))
+            || (c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
     };
     let name = c
         .collect_direct(member)
@@ -239,9 +241,7 @@ fn method_disqualifies(c: &Check<'_>, member: u32) -> bool {
     name.is_some_and(|name| {
         let spelled = match c.kind(name) {
             NodeKind::OperatorName => c
-                .payload(name)
-                .first()
-                .copied()
+                .field(name, PayloadField::Name)
                 .map_or("", |token| c.lexeme(token)),
             _ => c.lexeme(c.head_token(name)),
         };
@@ -312,11 +312,11 @@ fn generative_ctor_names<'a>(
         if c.kind(kid) != NodeKind::PrimaryConstructor {
             continue;
         }
-        let has_name = c.payload(kid).get(2).copied().unwrap_or(0) != 0;
+        let has_name = c.field(kid, PayloadField::HasConstructorName).unwrap_or(0) != 0;
         let name = c.collect_direct(kid).into_iter().find(|&inner| {
             c.kind(inner) == NodeKind::Identifier
-                && c.payload(inner).first()
-                    == Some(&(IdentifierContext::PrimaryConstructorDeclaration as u32))
+                && c.field(inner, PayloadField::Context)
+                    == Some(IdentifierContext::PrimaryConstructorDeclaration as u32)
         });
         names.push(match (has_name, name) {
             (true, Some(name)) => Some(c.lexeme(c.head_token(name))),
@@ -469,10 +469,10 @@ fn structured_creation(
     selector_resolves(ctors, selector)
 }
 
-/// The name an access marker spells (payload word 0 is the dot; the
-/// name follows it — the `const_ability::selector_name` read).
+/// The name an access marker spells (the dot rides the row's `Operator`
+/// word; the name follows it — the `const_ability::selector_name` read).
 fn selector_lexeme<'a>(c: &'a Check<'a>, marker: u32) -> &'a str {
-    let dot = c.payload(marker).first().copied().unwrap_or(NONE_TOKEN);
+    let dot = c.field(marker, PayloadField::Operator).unwrap_or(NONE_TOKEN);
     if dot == NONE_TOKEN {
         ""
     } else {

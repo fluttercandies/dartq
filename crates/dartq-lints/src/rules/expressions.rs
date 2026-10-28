@@ -5,7 +5,7 @@
 //! `prefer_conditional_assignment`, `prefer_if_null_operators`,
 //! `prefer_null_aware_operators`.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::{Check, narrow_u32};
 use crate::registry::{Group, RuleSpec};

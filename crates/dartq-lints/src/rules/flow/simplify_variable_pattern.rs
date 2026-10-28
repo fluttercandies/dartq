@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, RuleSpec};
+use super::{PayloadField, Check, RuleSpec};
 use crate::rules::{MemberQuery, NONE_TOKEN, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -45,12 +45,12 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     let node = c.node();
-    // `node.name == null` skips (:44). Payload word 0 carries the
-    // field-name token for the named face (the parser hands the
+    // `node.name == null` skips (:44). The row's `Colon` word carries
+    // the field-name token for the named face (the parser hands the
     // `ensureIdentifier` token, patterns.rs object-pattern rest), the
     // colon itself for the name-less `(: sub)` form, and NONE_TOKEN
     // for a positional field — the name reads straight off the word.
-    let Some(&name) = c.payload(node).first() else {
+    let Some(name) = c.field(node, PayloadField::Colon) else {
         return;
     };
     if name == NONE_TOKEN || c.lexeme(name) == ":" {
@@ -61,7 +61,7 @@ fn check(c: &mut Check<'_>) {
         return;
     };
     // The variable name equals the field name (:44-45).
-    let Some(&variable) = c.payload(pattern).first() else {
+    let Some(variable) = c.field(pattern, PayloadField::Variable) else {
         return;
     };
     if c.lexeme(variable) != lexeme {
@@ -163,12 +163,14 @@ fn accessor(c: &Check<'_>, container: u32, name: &str) -> Option<&'static str> {
 /// member (the official lookUp bail, :99-104); an unresolvable type —
 /// dynamic, a typedef, a type parameter, an import — answers getter.
 fn object_member_kind(c: &Check<'_>, object: u32, name: &str) -> Option<&'static str> {
-    let words = c.payload(object);
-    let &head = words.first()?;
-    // A prefixed container (`prefix.A(...)`, payload word 1) resolves
-    // outside the file.
-    let type_name = if words.get(1).is_some_and(|&dot| dot != NONE_TOKEN) {
-        words.get(2).copied().unwrap_or(head)
+    let head = c.field(object, PayloadField::FirstName)?;
+    // A prefixed container (`prefix.A(...)`, the `Period` word set)
+    // resolves outside the file.
+    let type_name = if c
+        .field(object, PayloadField::Period)
+        .is_some_and(|dot| dot != NONE_TOKEN)
+    {
+        c.field(object, PayloadField::SecondName).unwrap_or(head)
     } else {
         head
     };

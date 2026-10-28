@@ -2144,7 +2144,9 @@ fn initializing_formals_reports_a_this_assignment() {
     );
     assert_eq!(
         lints[0].correction.as_deref(),
-        Some("Try using an initializing formal ('this.x') to initialize the field.")
+        // The 3.13.7 pin's upstream wording ("initialing" is verbatim
+        // upstream — pkg/linter/messages.yaml of the pin).
+        Some("Try using an initialing formal ('this.x') to initialize the field.")
     );
     let this = tok(&f.source, &f.tokens, "this", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, this));

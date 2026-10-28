@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// The `external` `ModSet` bit (bridge `mod_bits`, member family).
 const EXTERNAL_BIT: u16 = 1 << 2;
@@ -172,16 +172,14 @@ fn report_unused(c: &mut Check<'_>, params: Vec<u32>, scans: &[core::ops::Range<
         }
         // Field/super formals are the initializer faces (:50-51); a
         // declaring primary parameter (`var`/`final`) declares a field.
-        let receiver = c.payload(param).first().copied();
+        let receiver = c.field(param, PayloadField::Receiver);
         if receiver.is_some_and(|tok| tok != super::NONE_TOKEN)
             || dartq_ast::mod_flags(c.unit.ast, param) & VAR_FINAL_OR_CONST_BIT != 0
         {
             continue;
         }
         let Some(name_token) = c
-            .payload(param)
-            .get(1)
-            .copied()
+            .field(param, PayloadField::Name)
             .filter(|&tok| tok != super::NONE_TOKEN)
         else {
             continue;

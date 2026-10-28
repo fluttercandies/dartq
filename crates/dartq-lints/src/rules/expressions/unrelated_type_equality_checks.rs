@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, switch_scrutinee_read};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, switch_scrutinee_read};
 use crate::rules::utf16_token_span;
 
 /// The pattern-face problem text (`unrelatedTypeEqualityChecksInPattern`,
@@ -48,7 +48,7 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     let node = c.node();
-    let Some(op) = c.payload(node).first().copied() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if !matches!(c.lexeme(op), "==" | "!=") {
@@ -90,7 +90,7 @@ fn check(c: &mut Check<'_>) {
 /// so the report runs from the operator through the row end).
 fn pattern_face(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(op) = c.payload(node).first().copied() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if !matches!(c.lexeme(op), "==" | "!=") {
@@ -293,8 +293,8 @@ fn operand_type<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
                 .into_iter()
                 .find(|&kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first()
-                            == Some(&(dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration as u32))
+                        && c.field(kid, PayloadField::Context)
+                            == Some(dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration as u32)
                 })?;
             Some(c.lexeme(c.head_token(name)))
         }

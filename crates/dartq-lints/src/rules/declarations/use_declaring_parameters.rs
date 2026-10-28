@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows, same_class_field_type};
+use super::{PayloadField, Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows, same_class_field_type};
 use crate::rules::{NONE_TOKEN, body_members, initialized_identifier_name};
 use dartq_ast::mod_flags;
 
@@ -48,8 +48,8 @@ fn check(c: &mut Check<'_>) {
         .into_iter()
         .find(|&member| c.kind(member) == NodeKind::PrimaryConstructorBody);
     for param in formal_parameter_rows(c, node) {
-        // The receiver word answers the field/super formal split.
-        let receiver = c.payload(param).first().copied().unwrap_or(NONE_TOKEN);
+        // The `Receiver` word answers the field/super formal split.
+        let receiver = c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
         if receiver != NONE_TOKEN {
             if c.lexeme(receiver) == "this" {
                 check_field_formal(c, param, class_row);
@@ -73,7 +73,7 @@ fn check(c: &mut Check<'_>) {
 /// element is the parameter's by construction when the spellings
 /// match, and the `field != null` gate skips unknown names).
 fn check_field_formal(c: &mut Check<'_>, param: u32, class_row: u32) {
-    let Some(&name) = c.payload(param).get(1) else {
+    let Some(name) = c.field(param, PayloadField::Name) else {
         return;
     };
     if name == NONE_TOKEN {
@@ -95,7 +95,7 @@ fn check_field_formal(c: &mut Check<'_>, param: u32, class_row: u32) {
 /// `_checkNonDeclaringParameter` (:76-94): the parameter assigned to a
 /// same-named field by a body initializer or a body-block assignment.
 fn check_non_declaring(c: &mut Check<'_>, param: u32, body: u32, class_row: u32) {
-    let Some(&name_token) = c.payload(param).get(1) else {
+    let Some(name_token) = c.field(param, PayloadField::Name) else {
         return;
     };
     if name_token == NONE_TOKEN {

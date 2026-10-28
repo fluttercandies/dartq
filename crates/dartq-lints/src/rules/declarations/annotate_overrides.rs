@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, formal_parameter_rows};
+use super::{PayloadField, Check, NodeKind, RuleSpec, formal_parameter_rows};
 use crate::rules::{MemberQuery, has_override_annotation, member_matches, same_file_ancestors};
 
 /// Official: `pkg/linter/lib/src/rules/annotate_overrides.dart` — an
@@ -96,9 +96,7 @@ fn check(c: &mut Check<'_>) {
         // the `operator` keyword). The official report anchors at the
         // name token.
         let name_token = if c.kind(name_row) == NodeKind::OperatorName {
-            c.payload(name_row)
-                .first()
-                .copied()
+            c.field(name_row, PayloadField::Name)
                 .unwrap_or_else(|| c.head_token(name_row))
         } else {
             c.head_token(name_row)
@@ -145,8 +143,8 @@ fn check_primary(c: &mut Check<'_>) {
     }
     let ancestors = same_file_ancestors(c, owner, false);
     for param in formal_parameter_rows(c, node) {
-        // The formal's payload word 1 is its name token.
-        let Some(&name_token) = c.payload(param).get(1) else {
+        // The formal's `Name` word is its name token.
+        let Some(name_token) = c.field(param, PayloadField::Name) else {
             continue;
         };
         if name_token == crate::rules::NONE_TOKEN {
@@ -252,9 +250,8 @@ fn inherited_member(
                 && c.kind(member) == NodeKind::Method
                 && super::get_set_token(c, member).is_none()
                 && super::operator_name(c, member).is_some_and(|op_row| {
-                    c.payload(op_row)
-                        .first()
-                        .is_some_and(|&token| c.lexeme(token) == name)
+                    c.field(op_row, PayloadField::Name)
+                        .is_some_and(|token| c.lexeme(token) == name)
                 })
         })
 }
@@ -267,7 +264,8 @@ fn is_instance_member(c: &Check<'_>, node: u32) -> bool {
     const STATIC_BIT: u16 = 1 << 3;
     match c.kind(node) {
         NodeKind::Fields => {
-            c.payload(node).first() == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            c.field(node, PayloadField::MemberKind)
+                == Some(dartq_parser::MemberKind::NonStaticField as u32)
                 && !in_extension_type(c)
         }
         NodeKind::Method => {
@@ -309,8 +307,8 @@ fn member_names(c: &Check<'_>, node: u32) -> Vec<u32> {
             .into_iter()
             .filter(|&kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.payload(kid).first()
-                        == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+                    && c.field(kid, PayloadField::Context)
+                        == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32)
             })
             .collect();
         if let Some(op_row) = super::adjacent_operator_name(c, node) {

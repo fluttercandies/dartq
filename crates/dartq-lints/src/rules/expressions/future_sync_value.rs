@@ -30,15 +30,23 @@ use crate::rules::{same_file_declaration, utf16_token_span};
 /// implicit-creation face; cross-file callee types the faces cannot
 /// read report through the null-type posture. Message:
 /// `diagnostic.g.dart` `futureSyncValue`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "future_sync_value",
-    &[
+/// The spec is a hand-written literal: the 3.13.7 conformance pin's
+/// linter does not carry this rule (it exists only in newer upstream
+/// mains), so the generated metadata table has no row to resolve — the
+/// same posture as the [`crate::registry`] `META_EXEMPT` faces. The
+/// texts are the rule's established messages, kept byte-identical.
+pub(crate) static SPEC: RuleSpec = RuleSpec {
+    name: "future_sync_value",
+    group: crate::registry::Group::Standalone,
+    problem: "For synchronous values, `Future.syncValue` is more performant.",
+    correction: "Try replacing `Future.value` with `Future.syncValue`.",
+    kinds: &[
         NodeKind::NewExpression,
         NodeKind::ImplicitCreation,
         NodeKind::Send,
     ],
     check,
-);
+};
 
 fn check(c: &mut Check<'_>) {
     // `constructorSince = Version(3, 10, 0)`: the effective library

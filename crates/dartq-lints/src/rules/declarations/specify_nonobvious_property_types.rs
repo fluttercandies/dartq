@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, fields_written_type, obvious_spelling};
+use super::{PayloadField, Check, NodeKind, RuleSpec, fields_written_type, obvious_spelling};
 use crate::rules::{MemberQuery, last_child, member_matches, same_file_ancestors, same_file_declaration, supertypes};
 
 /// Official: `pkg/linter/lib/src/rules/specify_nonobvious_property_types.dart:47-120`
@@ -35,8 +35,8 @@ fn check(c: &mut Check<'_>) {
     }
     // The instance face: `!node.isStatic` (:52).
     let instance = c.kind(parent) == NodeKind::Fields
-        && c.payload(parent).first()
-            == Some(&(dartq_parser::MemberKind::NonStaticField as u32));
+        && c.field(parent, PayloadField::MemberKind)
+            == Some(dartq_parser::MemberKind::NonStaticField as u32);
     let container = c.path.iter().rev().find(|&&row| {
         matches!(
             c.kind(row),

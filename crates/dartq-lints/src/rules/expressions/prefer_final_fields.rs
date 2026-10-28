@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, same_file, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, same_file, slice};
 use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_file_ancestors};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_fields.dart` — a
@@ -390,9 +390,9 @@ fn scope_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
         NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
             c.collect_direct(node).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::DeclaredVariablePattern
-                    && c.payload(kid)
-                        .first()
-                        .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+                    && c
+                        .field(kid, PayloadField::Variable)
+                        .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
             })
         }
         _ => false,
@@ -431,29 +431,29 @@ fn function_name_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
         .is_some_and(|n| c.lexeme(c.head_token(n)) == name)
 }
 
-/// Whether a pattern subtree declares `name` (`DeclaredVariablePattern`
-/// payload word 0 carries the variable token).
+/// Whether a pattern subtree declares `name` (the
+/// `DeclaredVariablePattern` row's `Variable` word carries the variable
+/// token).
 fn pattern_binds(c: &Check<'_>, pattern: u32, name: &str) -> bool {
     c.children(pattern).any(|descendant| {
         c.kind(descendant) == NodeKind::DeclaredVariablePattern
-            && c.payload(descendant)
-                .first()
-                .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+            && c
+                .field(descendant, PayloadField::Variable)
+                .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
     })
 }
 
 /// Whether a formal-parameter list declares a plain `name` formal: the
 /// name is payload word 1, and a `this.x`/`super.x` receiver formal
-/// (payload word 0) names the field itself — it never captures a bare
+/// (the `Receiver` word) names the field itself — it never captures a bare
 /// write (a constructor body's `_x = 1` beside `C(this._x)` writes the
 /// field, whose `writeElement` upstream is the field).
 fn parameters_bind(c: &Check<'_>, params: u32, name: &str) -> bool {
     c.collect_direct(params).into_iter().any(|param| {
         c.kind(param) == NodeKind::FormalParameter
-            && c.payload(param).first().copied().unwrap_or(NONE_TOKEN) == NONE_TOKEN
-            && c.payload(param)
-                .get(1)
-                .copied()
+            && c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN) == NONE_TOKEN
+            && c
+                .field(param, PayloadField::Name)
                 .is_some_and(|tok| tok != NONE_TOKEN && c.lexeme(tok) == name)
     })
 }
@@ -467,16 +467,15 @@ fn for_in_binds(c: &Check<'_>, scope: u32, name: &str) -> bool {
         .iter()
         .copied()
         .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
-        .and_then(|parts| c.payload(parts).get(3).copied())
+        .and_then(|parts| c.field(parts, PayloadField::InKeyword))
         .filter(|&token| token != NONE_TOKEN)
     else {
         return false;
     };
     kids.into_iter().any(|kid| match c.kind(kid) {
         NodeKind::DeclaredVariablePattern => c
-            .payload(kid)
-            .first()
-            .is_some_and(|&v| v < in_token && c.lexeme(v) == name),
+            .field(kid, PayloadField::Variable)
+            .is_some_and(|v| v < in_token && c.lexeme(v) == name),
         NodeKind::Identifier => {
             c.unit.ast.token_range(kid).end <= in_token && c.lexeme(c.head_token(kid)) == name
         }
@@ -496,9 +495,8 @@ fn if_case_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
         return false;
     };
     let has_case = c
-        .payload(kids[cond_pos])
-        .first()
-        .is_some_and(|&case| case != NONE_TOKEN);
+        .field(kids[cond_pos], PayloadField::CaseKeyword)
+        .is_some_and(|case| case != NONE_TOKEN);
     has_case
         && kids[..=cond_pos]
             .iter()
@@ -525,12 +523,12 @@ fn sets_field(c: &Check<'_>, ctor: u32, name: &str) -> bool {
     let window = c.children(ctor);
     (window.start..window.end).any(|id| match c.kind(id) {
         NodeKind::FormalParameter => {
-            let receiver = c.payload(id).first().copied().unwrap_or(NONE_TOKEN);
+            let receiver = c.field(id, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
             receiver != NONE_TOKEN
                 && c.lexeme(receiver) == "this"
-                && c.payload(id)
-                    .get(1)
-                    .is_some_and(|&name_token| c.lexeme(name_token) == name)
+                && c
+                    .field(id, PayloadField::Name)
+                    .is_some_and(|name_token| c.lexeme(name_token) == name)
         }
         NodeKind::Initializer => initializer_set_name(c, id) == Some(name),
         _ => false,

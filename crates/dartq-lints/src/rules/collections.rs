@@ -11,7 +11,7 @@
 //! A cascaded section send's owner is therefore the cascade itself, and the
 //! first section is the piece run before the marker.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::RuleSpec;
@@ -891,7 +891,7 @@ pub(crate) mod unnecessary_to_list_in_spreads {
 }
 
 pub(crate) mod prefer_iterable_where_type {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::{NONE_TOKEN, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_iterable_whereType.dart:31-83`
@@ -1086,7 +1086,7 @@ pub(crate) mod prefer_iterable_where_type {
         }
         let expression = rows[root];
         // `expression.notOperator == null` (:71).
-        if c.payload(expression).first().copied().unwrap_or(0) != 0 {
+        if c.field(expression, PayloadField::IsNegated).unwrap_or(0) != 0 {
             return false;
         }
         // The tested expression tiles before the `is` token (the type rows
@@ -1104,12 +1104,13 @@ pub(crate) mod prefer_iterable_where_type {
             && c.lexeme(c.head_token(tested[0])) == param_name
     }
 
-    /// A simple formal parameter's name (`FormalParameter` payload word 1).
+    /// A simple formal parameter's name (the `FormalParameter` row's
+    /// `Name` word).
     fn parameter_name<'a>(c: &'a Check<'a>, parameter: u32) -> Option<&'a str> {
         if c.kind(parameter) != NodeKind::FormalParameter {
             return None;
         }
-        let name = c.payload(parameter).get(1).copied()?;
+        let name = c.field(parameter, PayloadField::Name)?;
         (name != NONE_TOKEN).then(|| c.lexeme(name))
     }
 }
@@ -1392,7 +1393,7 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
 }
 
 pub(crate) mod collection_methods_unrelated_type {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::{TypeFace, slice, type_face_of_field, written_type_face};
 
     /// Official: `pkg/linter/lib/src/rules/collection_methods_unrelated_type.dart`
@@ -1577,11 +1578,11 @@ pub(crate) mod collection_methods_unrelated_type {
             .rposition(|&row| crate::rules::is_statement_row(c, row))
             .map_or(0, |i| i + 1);
         let kids = &kids[start..pos];
-        // The extent: the span head is the `?` of `a?[k]` (payload word 0)
-        // or the `[`; the `]` is the span's last token. The byte offsets
-        // bound the key scan.
+        // The extent: the span head is the `?` of `a?[k]` (the row's
+        // `Question` word) or the `[`; the `]` is the span's last token.
+        // The byte offsets bound the key scan.
         let range = c.unit.ast.token_range(node);
-        let open = if c.payload(node).first().copied() == Some(crate::rules::NONE_TOKEN) {
+        let open = if c.field(node, PayloadField::Question) == Some(crate::rules::NONE_TOKEN) {
             range.start
         } else {
             range.start + 1
@@ -3494,7 +3495,7 @@ void f(x) {
 }
 
 pub(crate) mod prefer_if_elements_to_conditional_expressions {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/prefer_if_elements_to_conditional_expressions.dart`
@@ -3568,7 +3569,9 @@ pub(crate) mod prefer_if_elements_to_conditional_expressions {
             // A list element always reports (:40-41).
             NodeKind::ListLiteral => true,
             // The set face: `parent.isSet` through the parser shape bit.
-            NodeKind::SetOrMapLiteral => c.payload(parent).get(1).copied().unwrap_or(0) != 0,
+            NodeKind::SetOrMapLiteral => {
+                c.field(parent, PayloadField::HasSetEntry).unwrap_or(0) != 0
+            }
             // The then/else branches report; the condition position (ahead
             // of the then marker) never does (:42-46). `in_condition`
             // stays as a recovery-tiling guard: a conditional inside the
@@ -3582,13 +3585,13 @@ pub(crate) mod prefer_if_elements_to_conditional_expressions {
                         && c.byte_span(r).start <= err_span.start
                         && c.byte_span(r).end >= err_span.end
                 });
-                !in_condition
-                    && (window.start..error_node).any(|r| {
-                        matches!(
-                            c.kind(r),
-                            NodeKind::ThenControlFlow | NodeKind::ElseControlFlow
-                        )
-                    })
+                let marker = (window.start..error_node).any(|r| {
+                    matches!(
+                        c.kind(r),
+                        NodeKind::ThenControlFlow | NodeKind::ElseControlFlow
+                    )
+                });
+                !in_condition && marker
             }
             // The body reports; a conditional inside the loop parts (e.g.
             // the iterable) does not (:47-50). The parts row is the member
@@ -3752,7 +3755,7 @@ pub(crate) mod prefer_if_elements_to_conditional_expressions {
 /// The null-aware-element family: an if-element null check the `?` marker
 /// spells shorter.
 pub(crate) mod use_null_aware_elements {
-    use dartq_ast::NodeKind;
+    use dartq_ast::{NodeKind, PayloadField};
 
     use super::{Check, RuleSpec, slice};
     use crate::rules::{MemberQuery, utf16_token_span};
@@ -3846,14 +3849,15 @@ pub(crate) mod use_null_aware_elements {
                 continue;
             }
             // The `when` guard kills the pattern face (:65).
-            let words = c.payload(container);
-            if words
-                .get(1)
-                .is_some_and(|&when| when != crate::rules::NONE_TOKEN)
+            if c
+                .field(container, PayloadField::WhenKeyword)
+                .is_some_and(|when| when != crate::rules::NONE_TOKEN)
             {
                 continue;
             }
-            let case = words.first().copied().unwrap_or(crate::rules::NONE_TOKEN);
+            let case = c
+                .field(container, PayloadField::CaseKeyword)
+                .unwrap_or(crate::rules::NONE_TOKEN);
             if case != crate::rules::NONE_TOKEN {
                 // `x case var y?` — the declared variable is the target
                 // (:61-67), definitionally promotable. Upstream requires
@@ -3878,9 +3882,7 @@ pub(crate) mod use_null_aware_elements {
                 if c.kind(declared) != NodeKind::DeclaredVariablePattern {
                     return None;
                 }
-                return Some(Target::Bare(
-                    c.lexeme(c.payload(declared).first().copied()?),
-                ));
+                return Some(Target::Bare(c.lexeme(c.field(declared, PayloadField::Variable)?)));
             }
             let rows: Vec<u32> = c.children(container).collect();
             // `x != null` / `null != x` — the non-null operand is the
@@ -3891,7 +3893,7 @@ pub(crate) mod use_null_aware_elements {
                 if c.kind(row) != NodeKind::BinaryExpression {
                     continue;
                 }
-                let operator = c.lexeme(c.payload(row).first().copied()?);
+                let operator = c.lexeme(c.field(row, PayloadField::Operator)?);
                 if operator != "!=" {
                     continue;
                 }
@@ -4017,10 +4019,10 @@ pub(crate) mod use_null_aware_elements {
                 }
                 if c.collect_direct(decl).into_iter().any(|kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first()
+                        && c.field(kid, PayloadField::Context)
                             == Some(
-                                &(dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
-                                    as u32),
+                                dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
+                                    as u32,
                             )
                         && c.lexeme(c.head_token(kid)) == name
                 }) {
@@ -4077,8 +4079,9 @@ pub(crate) mod use_null_aware_elements {
             // the last completed node's head, so `token_range(marker).start`
             // is NEVER the key head and never the entry's source start. The
             // key and value tile in source order ahead of the marker as
-            // preceding siblings, split exactly at the colon (payload[0] —
-            // the upstream arms read `key`/`value` as whole expressions,
+            // preceding siblings, split exactly at the colon (the row's
+            // `Colon` word — the upstream arms read `key`/`value` as whole
+            // expressions,
             // :107-133): the key side's rows all end at or before the token
             // right after the colon (a send group's trailing markers absorb
             // the colon and may sit a row past it), and every value row
@@ -4086,7 +4089,7 @@ pub(crate) mod use_null_aware_elements {
             // key/value boundary. A name merely contained in a larger side —
             // a member chain's receiver prefix, a binary's operand — is
             // never the side itself.
-            let colon = c.payload(marker).first().copied().unwrap_or(0);
+            let colon = c.field(marker, PayloadField::Colon).unwrap_or(0);
             let split = sides.partition_point(|&row| c.unit.ast.token_range(row).end <= colon + 1);
             return element_reports(c, &sides[..split], target, name, false)
                 || element_reports(c, &sides[split..], target, name, false);
@@ -4129,7 +4132,7 @@ pub(crate) mod use_null_aware_elements {
         }
         // Value positions only: a named-argument label or a member-access
         // selector is never the then-element.
-        let context = c.payload(*head).first().copied();
+        let context = c.field(*head, PayloadField::Context);
         if context != Some(dartq_parser::IdentifierContext::Expression as u32)
             && context != Some(dartq_parser::IdentifierContext::ExpressionContinuation as u32)
         {

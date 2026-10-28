@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, same_file, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, same_file, slice};
 
 const USE_CONTAINS_PROBLEM: &str = "Unnecessary use of 'indexOf' to test for containment.";
 const USE_CONTAINS_CORRECTION: &str = "Try using 'contains'.";
@@ -34,7 +34,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(op_token) = c.payload_word(node, 0) else {
+    let Some(op_token) = c.field_token(node, PayloadField::Operator) else {
         return;
     };
     let op = c.lexeme(op_token);

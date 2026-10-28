@@ -130,12 +130,19 @@ pub(crate) use spec;
 /// codes and the `unnecessary_type_check` pair — which are analyzer
 /// codes, not `LinterLintCode` entries of `pkg/linter/messages.yaml`
 /// (their specs hand-write the analyzer messages; the pin test's
-/// `OFFICIAL_DIAGNOSTIC_MIRRORS` holds the same four).
+/// `OFFICIAL_DIAGNOSTIC_MIRRORS` holds the same four), and the three
+/// rules the 3.13.7 conformance pin's linter does not define (they exist
+/// only in newer upstream mains; their implementations stay mounted with
+/// hand-written spec literals so the behavior is not silently deleted —
+/// a later conformance wave rules their mounting against the oracle).
 const META_EXEMPT: &[&str] = &[
     "path_does_not_exist",
     "path_not_posix",
     "path_pubspec_does_not_exist",
     "unnecessary_type_check",
+    "analyzer_to_be_deprecated_use",
+    "future_sync_value",
+    "unnecessary_this_alias",
 ];
 
 /// The frozen registry skeleton: all rules through the #586 standard-set

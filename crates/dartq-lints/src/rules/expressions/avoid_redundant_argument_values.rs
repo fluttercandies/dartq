@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, narrow_u32, slice, static_type_faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, narrow_u32, slice, static_type_faces};
 use crate::rules::{body_members, same_file_declaration};
 
 /// Official: `upstream Dart SDK source,
@@ -205,12 +205,12 @@ fn check_argument(
     }
 }
 
-/// The parameter's default-clause tokens (payload words 2-3 — the
-/// bridge init words: word 2 opens the expression, word 3 is the peek
-/// after it — exclusive).
+/// The parameter's default-clause tokens (the `InitializerStart`/
+/// `InitializerEnd` words — `InitializerStart` opens the expression,
+/// `InitializerEnd` is the peek after it — exclusive).
 fn default_clause(c: &Check<'_>, param: u32) -> Option<(u32, u32)> {
-    let start = c.payload(param).get(2).copied()?;
-    let end = c.payload(param).get(3).copied()?;
+    let start = c.field(param, PayloadField::InitializerStart)?;
+    let end = c.field(param, PayloadField::InitializerEnd)?;
     if start == crate::rules::NONE_TOKEN || end == crate::rules::NONE_TOKEN || end <= start {
         return None;
     }
@@ -258,17 +258,16 @@ fn constants_equal(
     }
 }
 
-/// The formal's kind word (bridge `end_formal_parameter` payload 4).
+/// The formal's kind word (the `FormalParameterKind` word, bridge
+/// `end_formal_parameter`).
 fn formal_kind(c: &Check<'_>, param: u32) -> u32 {
-    c.payload(param)
-        .get(4)
-        .copied()
+    c.field(param, PayloadField::FormalParameterKind)
         .unwrap_or(dartq_parser::FormalParameterKind::RequiredPositional as u32)
 }
 
-/// The formal's declared name (payload word 1).
+/// The formal's declared name (the `Name` word).
 fn formal_name<'a>(c: &Check<'a>, param: u32) -> Option<&'a str> {
-    let name = c.payload(param).get(1).copied()?;
+    let name = c.field(param, PayloadField::Name)?;
     (name != crate::rules::NONE_TOKEN).then(|| c.lexeme(name))
 }
 
@@ -420,7 +419,7 @@ fn top_level_function_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'
             }
             let named = c.collect_direct(decl).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.payload(kid).first() == Some(&ctx)
+                    && c.field(kid, PayloadField::Context) == Some(ctx)
                     && c.lexeme(c.head_token(kid)) == name
             });
             if named {
@@ -772,10 +771,8 @@ fn constructor_formals<'a>(
 fn primary_ctor_matches(c: &Check<'_>, primary: u32, selector: Option<&str>) -> bool {
     let named = c.collect_direct(primary).into_iter().find(|&kid| {
         c.kind(kid) == NodeKind::Identifier
-            && c.payload(kid).first()
-                == Some(
-                    &(dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32),
-                )
+            && c.field(kid, PayloadField::Context)
+                == Some(dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32)
     });
     match (selector, named.map(|kid| c.lexeme(c.head_token(kid)))) {
         (None, None | Some("new")) => true,
@@ -798,10 +795,8 @@ fn constructor_matches(
     }
     let part = c.collect_direct(ctor).into_iter().find(|&kid| {
         c.kind(kid) == NodeKind::Identifier
-            && c.payload(kid).first()
-                == Some(
-                    &(dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32),
-                )
+            && c.field(kid, PayloadField::Context)
+                == Some(dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32)
     });
     match (selector, part.map(|p| c.lexeme(c.head_token(p)))) {
         (None, None | Some("new")) => true,

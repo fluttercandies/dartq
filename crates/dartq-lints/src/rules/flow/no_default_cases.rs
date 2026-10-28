@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, NONE_TOKEN, RuleSpec, last_child};
+use super::{PayloadField, Check, NONE_TOKEN, RuleSpec, last_child};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -55,10 +55,11 @@ fn check(c: &mut Check<'_>) {
     };
     let container = kids[position];
     // A `case` clause in the switch head is not the lint's face (the
-    // container payload word 0 carries the `case` token when present).
-    if c.payload(container)
-        .first()
-        .is_some_and(|&case| case != NONE_TOKEN)
+    // container's `CaseKeyword` word carries the `case` token when
+    // present).
+    if c
+        .field(container, PayloadField::CaseKeyword)
+        .is_some_and(|case| case != NONE_TOKEN)
     {
         return;
     }
@@ -100,11 +101,11 @@ fn check(c: &mut Check<'_>) {
         .into_iter()
         .find(|&member| {
             c.kind(member) == NodeKind::SwitchCase
-                && c.payload(member)
-                    .first()
-                    .is_some_and(|&kw| kw != NONE_TOKEN)
+                && c
+                    .field(member, PayloadField::DefaultKeyword)
+                    .is_some_and(|kw| kw != NONE_TOKEN)
         })
-        .and_then(|member| c.payload(member).first().copied())
+        .and_then(|member| c.field(member, PayloadField::DefaultKeyword))
     else {
         return;
     };

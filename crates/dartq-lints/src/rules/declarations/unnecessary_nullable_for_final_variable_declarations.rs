@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::expressions::{query_site, static_type_faces as faces};
 use crate::rules::first_child;
 use dartq_parser::MemberKind;
@@ -88,7 +88,8 @@ fn check(c: &mut Check<'_>) {
         .is_some_and(|parent| c.kind(parent) == NodeKind::Fields);
     if is_field {
         let parent = c.ancestor(1).expect("checked above");
-        let is_static = c.payload(parent).first() == Some(&(MemberKind::StaticField as u32));
+        let is_static =
+            c.field(parent, PayloadField::MemberKind) == Some(MemberKind::StaticField as u32);
         let is_private = c
             .collect_direct(node)
             .iter()
@@ -159,12 +160,12 @@ fn initializer_non_nullable(c: &Check<'_>, head: Option<u32>, run: &[u32]) -> bo
         // A trailing `DotAccess` marker roots a bare member access
         // (`c.v`) — the shared `expr_type` face reads its selector off
         // the marker's span tail, but the production marker's window
-        // swallows the `;`, so the name answers off the payload's dot
-        // token instead (`payload[0] + 1` is the member name). The
+        // swallows the `;`, so the name answers off the row's `Operator`
+        // dot token instead (`operator + 1` is the member name). The
         // receiver run ends at the dot — the selector's own tear-off
         // group tiles before the marker and must not join it.
         NodeKind::DotAccess => (|| {
-            let dot = c.payload(root).first().copied()?;
+            let dot = c.field(root, PayloadField::Operator)?;
             let selector = dot + 1;
             let receiver_run: Vec<u32> = run[..run.len() - 1]
                 .iter()

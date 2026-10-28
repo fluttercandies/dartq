@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, query_site, slice};
+use super::{PayloadField, Check, NodeKind, query_site, slice};
 
 /// `ModSet` member family: static is bit 3 (`mod_bits` in
 /// the bridge; [`dartq_ast::mod_flags`] reads the header bits back).
@@ -116,7 +116,7 @@ fn build(c: &Check<'_>) -> Decls {
                     } as u32;
                     for kid in c.collect_direct(inner) {
                         if c.kind(kid) == NodeKind::Identifier
-                            && c.payload(kid).first() == Some(&ctx)
+                            && c.field(kid, PayloadField::Context) == Some(ctx)
                         {
                             decls.values.push(c.head_token(kid));
                         }
@@ -450,7 +450,7 @@ pub(crate) fn local_const_initializer(
                 // row's span head is the name.
                 let binds = c.collect_direct(var).into_iter().any(|piece| {
                     c.kind(piece) == NodeKind::Identifier
-                        && c.payload(piece).first() == Some(&ctx)
+                        && c.field(piece, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(piece)) == name
                         && c.byte_span(piece).start < use_start
                 }) || (crate::rules::initialized_identifier_name(c, var)
@@ -701,13 +701,13 @@ fn block_binding(
                 // production declaration tiling).
                 let binds = c.collect_direct(kid).into_iter().any(|var| {
                     (c.kind(var) == NodeKind::Identifier
-                        && c.payload(var).first() == Some(&ctx)
+                        && c.field(var, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(var)) == name
                         && c.byte_span(var).start < use_start)
                         || (c.kind(var) == NodeKind::InitializedIdentifier
                             && c.collect_direct(var).into_iter().any(|piece| {
                                 c.kind(piece) == NodeKind::Identifier
-                                    && c.payload(piece).first() == Some(&ctx)
+                                    && c.field(piece, PayloadField::Context) == Some(ctx)
                                     && c.lexeme(c.head_token(piece)) == name
                                     && c.byte_span(piece).start < use_start
                             }))
@@ -735,9 +735,7 @@ fn parameter_binding(c: &Check<'_>, params: u32, name: &str) -> Option<Option<u3
             continue;
         }
         let named = c
-            .payload(kid)
-            .get(1)
-            .copied()
+            .field(kid, PayloadField::Name)
             .filter(|&tok| tok != crate::rules::NONE_TOKEN)
             .is_some_and(|tok| c.lexeme(tok) == name);
         if !named {
@@ -811,7 +809,7 @@ fn fields_binding(c: &Check<'_>, fields: u32, name: &str) -> Option<Option<u32>>
         match c.kind(kid) {
             NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => written = Some(kid),
             NodeKind::Identifier
-                if c.payload(kid).first() == Some(&ctx)
+                if c.field(kid, PayloadField::Context) == Some(ctx)
                     && c.lexeme(c.head_token(kid)) == name =>
             {
                 return Some(written);
@@ -825,18 +823,11 @@ fn fields_binding(c: &Check<'_>, fields: u32, name: &str) -> Option<Option<u32>>
 /// One class-like declaration's shape: the name token plus the clause
 /// name tokens (read off the header payload words as token bounds).
 fn class_decl(c: &Check<'_>, top: u32, inner: u32) -> Option<ClassDecl> {
-    let payload = c.payload(inner);
     let none = crate::rules::NONE_TOKEN;
-    let token_at = |word: usize| {
-        payload
-            .get(word)
-            .copied()
-            .unwrap_or(crate::rules::NONE_TOKEN)
-    };
-    // Extension types name through word 2; the other families through
-    // the wrapper's first Identifier.
+    // Extension types name through the row's `Name` word; the other
+    // families through the wrapper's first Identifier.
     let name = if c.kind(inner) == NodeKind::ExtensionTypeDeclaration {
-        let tok = token_at(2);
+        let tok = c.field(inner, PayloadField::Name).unwrap_or(none);
         (tok != none).then_some(tok)?
     } else {
         let id = c
@@ -876,13 +867,27 @@ fn class_decl(c: &Check<'_>, top: u32, inner: u32) -> Option<ClassDecl> {
     }
     let (supers_kw, clauses) = match c.kind(inner) {
         // `class P = Q with R implements S` shares the class shape: Q
-        // is the superclass.
-        NodeKind::ClassDeclaration | NodeKind::NamedMixinApplication => {
-            (token_at(1), (token_at(2), token_at(3)))
-        }
+        // is the superclass (the `=` bounds its run).
+        NodeKind::ClassDeclaration => (
+            c.field(inner, PayloadField::ExtendsKeyword).unwrap_or(none),
+            (
+                c.field(inner, PayloadField::WithKeyword).unwrap_or(none),
+                c.field(inner, PayloadField::ImplementsKeyword).unwrap_or(none),
+            ),
+        ),
+        NodeKind::NamedMixinApplication => (
+            c.field(inner, PayloadField::Equals).unwrap_or(none),
+            (
+                c.field(inner, PayloadField::WithKeyword).unwrap_or(none),
+                c.field(inner, PayloadField::ImplementsKeyword).unwrap_or(none),
+            ),
+        ),
         // `mixin M on A with B`: the on-clause is a superclass
         // constraint; the with-clause an interface face.
-        NodeKind::MixinDeclaration => (token_at(1), (token_at(2), none)),
+        NodeKind::MixinDeclaration => (
+            c.field(inner, PayloadField::OnKeyword).unwrap_or(none),
+            (c.field(inner, PayloadField::WithKeyword).unwrap_or(none), none),
+        ),
         _ => return None,
     };
     if supers_kw != none {
@@ -938,7 +943,7 @@ fn extension_decl(c: &Check<'_>, inner: u32) -> ExtensionDecl {
                 NodeKind::Method => {
                     if let Some(name) = c.collect_direct(row).into_iter().find(|&kid| {
                         c.kind(kid) == NodeKind::Identifier
-                            && c.payload(kid).first() == Some(&method_ctx)
+                            && c.field(kid, PayloadField::Context) == Some(method_ctx)
                     }) {
                         members.push(c.head_token(name));
                     }
@@ -946,7 +951,7 @@ fn extension_decl(c: &Check<'_>, inner: u32) -> ExtensionDecl {
                 NodeKind::Fields => {
                     for kid in c.collect_direct(row) {
                         if c.kind(kid) == NodeKind::Identifier
-                            && c.payload(kid).first() == Some(&field_ctx)
+                            && c.field(kid, PayloadField::Context) == Some(field_ctx)
                         {
                             members.push(c.head_token(kid));
                         }

@@ -1626,27 +1626,38 @@ static FIX_TABLE: &[FixSpec] = &[
         needs_tokens: true,
         action: FixAction::Rewrite(expression_function_body),
     },
+    // The variable's own row is the report — name-anchored (width-0
+    // without an initializer, through the initializer's end with one) —
+    // so the declaration head is found by walking the token stream back
+    // from the name (official `MakeFinal`); the row pays the shared
+    // parse.
     FixSpec {
         code: "prefer_final_fields",
         source: FixSource::Lint,
-        needs_tokens: false,
+        needs_tokens: true,
         action: FixAction::Rewrite(make_declaration_final),
     },
     // `final ` lands at the for-each variable's first content token, a
     // `var` swapping in place (official `MakeFinal`'s parameter faces).
+    // The rule reports the variable's NAME token, so the head is found
+    // by walking the token stream back from the name — the row pays the
+    // shared parse.
     FixSpec {
         code: "prefer_final_in_for_each",
         source: FixSource::Lint,
-        needs_tokens: false,
+        needs_tokens: true,
         action: FixAction::Rewrite(make_parameter_final),
     },
     // The `var` keyword becomes `final`, or the written type gains
     // `final ` — single-declarator lists only (official `MakeFinal`'s
-    // declaration faces).
+    // declaration faces); a name-anchored report walks the tokens back
+    // to the declaration's head, and the single-variable gate reads
+    // tokens (a string initializer may carry a comma) — the row pays the
+    // shared parse.
     FixSpec {
         code: "prefer_final_locals",
         source: FixSource::Lint,
-        needs_tokens: false,
+        needs_tokens: true,
         action: FixAction::Rewrite(make_declaration_final),
     },
     // `final ` lands at the parameter's first content token, a `var`
@@ -2127,10 +2138,13 @@ static FIX_TABLE: &[FixSpec] = &[
         action: FixAction::Rewrite(field_public),
     },
     // The stale ignore comment's line goes (official `RemoveComment`).
+    // The epilogue reports the citation's NAME token; the enclosing
+    // comment is scanned in the hit's trivia window between code tokens
+    // — the row pays the shared parse.
     FixSpec {
         code: "unnecessary_ignore",
         source: FixSource::Lint,
-        needs_tokens: false,
+        needs_tokens: true,
         action: FixAction::Rewrite(remove_ignore_comment),
     },
     // The lambda reduces to its callee's tear-off — `(x) => f(x)` →

@@ -2051,6 +2051,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         self.may_parse_function_expressions = false;
         let mut count = 0usize;
         let mut last_end = begin;
+        let mut last_real = self.cursor.real_pos();
         loop {
             if self.is_bailed() {
                 // Terminal bailout: unwind without consumption (see
@@ -2064,6 +2065,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // (`assert(`, `this`/`super` + `(`/`.`, `name =`) — a comma
                 // went missing; report and insert one.
                 if self.initializer_head_continues() {
+                    // No-progress guard (the structural-termination
+                    // invariant): an entry that leaves the real stream
+                    // parked with an empty queue would re-parse the same
+                    // head forever — the `super.foo;` recovery's synthetic
+                    // parens land AHEAD of the `super` head, so the
+                    // expression re-read returns without consuming it, and
+                    // each turn re-reported and re-queued its tokens
+                    // (unbounded diagnostics, GBs of RSS). The member loop
+                    // owns the stall from here.
+                    let real = self.cursor.real_pos();
+                    if real == last_real && self.cursor.progress() == real as u64 * 2 {
+                        break;
+                    }
+                    last_real = real;
                     self.report(msg::expected_after_but_got(","), last_end);
                     let at = self.peek_span().range.offset;
                     self.synthetic(TokenKind::Comma, at);
@@ -2072,6 +2087,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 }
                 break;
             }
+            last_real = self.cursor.real_pos();
             self.cursor.advance();
         }
         self.may_parse_function_expressions = saved;

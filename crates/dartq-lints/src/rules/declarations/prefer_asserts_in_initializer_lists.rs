@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, formal_parameter_rows, modifier_keyword};
+use super::{Check, NodeKind, PayloadField, RuleSpec, formal_parameter_rows, modifier_keyword};
 use crate::rules::last_child;
 
 /// Official:
@@ -103,7 +103,7 @@ fn need_instance(c: &Check<'_>, assert_row: u32, params: &[&str]) -> bool {
 /// The written parameter names of the formal rows.
 fn parameter_names<'a>(c: &Check<'a>, rows: Vec<u32>) -> Vec<&'a str> {
     rows.into_iter()
-        .filter_map(|row| c.payload(row).get(1).copied())
+        .filter_map(|row| c.field(row, PayloadField::Name))
         .filter(|&token| token != crate::rules::NONE_TOKEN)
         .map(|token| c.lexeme(token))
         .collect()

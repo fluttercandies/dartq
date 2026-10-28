@@ -50,22 +50,22 @@ mod tests {
     use super::{LINT_DOCS, lint_doc_prefix};
 
     /// The capture invariants: sorted (binary search's contract), the
-    /// universe size (every first-party linter rule of the pinned tree —
-    /// the yaml carries 322 consts folding to these names), and the pinned
-    /// prefix decisions — a published core lint and `unnecessary_ignore`
-    /// take the diagnostics page, an unpublished code takes the lint page,
-    /// an unknown/plugin code takes none. The 14 rows over the old
-    /// hand-copied table are the #2676 find: `future_sync_value` and
-    /// `unnecessary_this_alias` (base codes the old capture skipped) and
-    /// the 12 internal-universe rules — every LinterLintCode carries a URL
-    /// upstream.
+    /// universe size (the 3.13.7 pin's yaml carries 315 consts folding to
+    /// these names), and the pinned prefix decisions — a published core
+    /// lint and `unnecessary_ignore` take the diagnostics page, an
+    /// unpublished code takes the lint page, an unknown/plugin code takes
+    /// none. The three rules dartq keeps mounted beyond the pin's registry
+    /// (`future_sync_value`, `unnecessary_this_alias`,
+    /// `analyzer_to_be_deprecated_use` — newer-upstream-only, see the
+    /// lints registry's `META_EXEMPT`) have no rows here: the oracle of
+    /// the pin never emits them, so their rows take no documentation URL.
     #[test]
     fn lint_doc_prefix_decides_by_table_membership() {
         assert!(
             LINT_DOCS.windows(2).all(|pair| pair[0].0 < pair[1].0),
             "sorted: binary search's contract"
         );
-        assert_eq!(LINT_DOCS.len(), 278);
+        assert_eq!(LINT_DOCS.len(), 275);
         assert_eq!(
             lint_doc_prefix("avoid_empty_else"),
             Some("https://dart.dev/diagnostics/")
@@ -76,8 +76,8 @@ mod tests {
         );
         assert_eq!(
             lint_doc_prefix("future_sync_value"),
-            Some("https://dart.dev/diagnostics/"),
-            "the row the hand-copied table missed"
+            None,
+            "mounted beyond the 3.13.7 pin's registry — no upstream URL face"
         );
         // `always_require_non_null_named_parameters` is a removed rule with
         // no published docs page upstream.

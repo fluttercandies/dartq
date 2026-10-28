@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, same_file};
+use super::{PayloadField, Check, NodeKind, RuleSpec, same_file};
 use crate::rules::{NONE_TOKEN, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_this.dart` — a `this.`
@@ -97,9 +97,9 @@ fn check_this(c: &mut Check<'_>) {
         }
         stack.extend(c.collect_direct(row));
     };
-    // `!parent.isNullAware` (:49/:53) — the payload word is the
-    // `is_null_aware` bool of the `DotAccess` payload.
-    if c.payload(access).get(1).copied().unwrap_or(0) != 0 {
+    // `!parent.isNullAware` (:49/:53) — the `IsNullAware` bool word
+    // of the `DotAccess` row.
+    if c.field(access, PayloadField::IsNullAware).unwrap_or(0) != 0 {
         return;
     }
     let name_lexeme = c.lexeme(c.head_token(selector));
@@ -194,7 +194,7 @@ fn block_declares_before(c: &Check<'_>, block: u32, use_start: usize, name: &str
             NodeKind::VariablesDeclaration => {
                 if c.collect_direct(decl).into_iter().any(|kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first() == Some(&ctx)
+                        && c.field(kid, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(kid)) == name
                         && c.byte_span(kid).start < use_start
                 }) {
@@ -243,7 +243,7 @@ fn collect_member_parameters<'a>(c: &'a Check<'a>, member: u32) -> Vec<&'a str> 
         .into_iter()
         .filter(|&param| c.kind(param) == NodeKind::FormalParameter)
         .filter_map(|param| {
-            let name = c.payload(param).get(1).copied()?;
+            let name = c.field(param, PayloadField::Name)?;
             (name != NONE_TOKEN).then(|| c.lexeme(name))
         })
         .collect()

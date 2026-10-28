@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, same_file, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, same_file, slice};
 use crate::rules::{byte_span_of_token, initialized_identifier_name, is_statement_row, variables_declaration_keyword};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/cascade_invocations.dart`
@@ -82,9 +82,9 @@ fn check(c: &mut Check<'_>) {
             .filter(|&row| is_statement_row(c, row))
             .collect(),
         // The member's statements tile after the matched expressions
-        // (payload word 2) and the optional `when` clause.
+        // (the `ExpressionCount` word) and the optional `when` clause.
         NodeKind::SwitchCase => {
-            let expressions = c.payload(node).get(2).copied().unwrap_or(0) as usize;
+            let expressions = c.field(node, PayloadField::ExpressionCount).unwrap_or(0) as usize;
             let kids = c.collect_direct(node);
             let mut start = expressions;
             if kids
@@ -329,7 +329,7 @@ fn assignment_box<'a>(c: &Check<'a>, assign: u32) -> CascadeBox<'a> {
     let Some((left, right)) = slice::binary_operands_at(c, assign) else {
         return CascadeBox::null();
     };
-    let Some(&op) = c.payload(assign).first() else {
+    let Some(op) = c.field(assign, PayloadField::Operator) else {
         return CascadeBox::null();
     };
     let receives = c.lexeme(op) != "??=";
@@ -357,10 +357,10 @@ fn assignment_box<'a>(c: &Check<'a>, assign: u32) -> CascadeBox<'a> {
     };
     // The setter face: the plain-dot prefix must bind to a same-file
     // value (the upstream non-static variable gate). The marker's
-    // payload word 0 is the access-operator token.
-    if c.payload(marker)
-        .first()
-        .is_none_or(|&dot| c.lexeme(dot) != ".")
+    // `Operator` word is the access-operator token.
+    if c
+        .field(marker, PayloadField::Operator)
+        .is_none_or(|dot| c.lexeme(dot) != ".")
     {
         return CascadeBox::null();
     }
@@ -401,14 +401,14 @@ fn invocation_box<'a>(c: &Check<'a>, stmt: u32, kids: &[u32], pos: usize) -> Cas
         return CascadeBox::null();
     }
     // The plain-operator gate (:69-70): a null-aware access stays out.
-    // The marker's payload word 0 is the access-operator token.
+    // The marker's `Operator` word is the access-operator token.
     if let Some(marker) = kids
         .iter()
         .copied()
         .find(|&row| c.kind(row) == NodeKind::DotAccess)
-        && c.payload(marker)
-            .first()
-            .is_some_and(|&dot| c.lexeme(dot) != ".")
+        && c
+            .field(marker, PayloadField::Operator)
+            .is_some_and(|dot| c.lexeme(dot) != ".")
     {
         return CascadeBox::null();
     }
@@ -472,9 +472,9 @@ fn property_box<'a>(c: &Check<'a>, kids: &[u32]) -> CascadeBox<'a> {
     else {
         return CascadeBox::null();
     };
-    if c.payload(marker)
-        .first()
-        .is_none_or(|&dot| c.lexeme(dot) != ".")
+    if c
+        .field(marker, PayloadField::Operator)
+        .is_none_or(|dot| c.lexeme(dot) != ".")
     {
         return CascadeBox::null();
     }

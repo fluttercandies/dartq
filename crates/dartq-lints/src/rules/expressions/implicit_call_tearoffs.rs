@@ -1,6 +1,8 @@
 use dartq_semantic::model::MemberKind;
 
-use super::{Check, NodeKind, RuleSpec, query_site, value_run_end, written_type_sibling};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, value_run_end, written_type_sibling,
+};
 use crate::rules::{TypeFace, slice};
 
 /// Official: `pkg/linter/lib/src/rules/implicit_call_tearoffs.dart` —
@@ -69,7 +71,7 @@ fn context_face(c: &mut Check<'_>) {
             decl.is_some_and(|decl| written_row_is_function(c, declaration_type_row(c, decl)))
         }
         NodeKind::Assignment => {
-            let Some(op) = c.payload(node).first().copied() else {
+            let Some(op) = c.field(node, PayloadField::Operator) else {
                 return;
             };
             if c.lexeme(op) != "=" {
@@ -280,7 +282,7 @@ fn top_level_function_row(c: &Check<'_>, name: &str) -> Option<u32> {
             }
             let named = c.collect_direct(kid).into_iter().any(|k| {
                 c.kind(k) == NodeKind::Identifier
-                    && c.payload(k).first() == Some(&ctx)
+                    && c.field(k, PayloadField::Context) == Some(ctx)
                     && c.lexeme(c.head_token(k)) == name
             });
             if named {

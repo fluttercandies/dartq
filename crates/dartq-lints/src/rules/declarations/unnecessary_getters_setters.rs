@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, get_set_token, is_identifier_token, parameter_name, parameters_bind};
+use super::{PayloadField, Check, NodeKind, RuleSpec, get_set_token, is_identifier_token, parameter_name, parameters_bind};
 use crate::rules::expressions::static_type_faces as faces;
 use dartq_semantic::model::Ty;
 
@@ -155,9 +155,8 @@ fn body_expression_tokens(c: &Check<'_>, kids: &[u32]) -> Option<(u32, u32)> {
         .iter()
         .find(|&&kid| c.kind(kid) == NodeKind::ExpressionBody)
     {
-        let payload = c.payload(body);
-        let arrow = payload.first().copied()?;
-        let end = match payload.get(1).copied() {
+        let arrow = c.field(body, PayloadField::Arrow)?;
+        let end = match c.field(body, PayloadField::Semicolon) {
             Some(semi) if semi != crate::rules::NONE_TOKEN => semi,
             _ => c.unit.ast.token_range(body).end.checked_sub(1)?,
         };
@@ -274,7 +273,7 @@ fn is_simple_setter(
     else {
         return false;
     };
-    let Some(&op) = c.payload(assignment).first() else {
+    let Some(op) = c.field(assignment, PayloadField::Operator) else {
         return false;
     };
     if c.lexeme(op) != "=" {

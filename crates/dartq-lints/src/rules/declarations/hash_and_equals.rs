@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
+use super::{PayloadField, Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
 
 /// Official: `pkg/linter/lib/src/rules/hash_and_equals.dart:45-80` — a
 /// class defining exactly one of `==` / `hashCode` reports at the
@@ -62,7 +62,10 @@ fn check(c: &mut Check<'_>) {
 fn is_equals(c: &Check<'_>, member: u32) -> bool {
     c.kind(member) == NodeKind::Method
         && operator_name(c, member)
-            .is_some_and(|name| c.payload_word(name, 0).is_none_or(|t| c.lexeme(t) == "=="))
+            .is_some_and(|name| {
+                c.field_token(name, PayloadField::Name)
+                    .is_none_or(|t| c.lexeme(t) == "==")
+            })
 }
 
 /// `isHashCode` (`ast.dart`): a `Method` named `hashCode` or a `Fields`
@@ -102,7 +105,7 @@ fn member_or_field_name(c: &Check<'_>, member: u32) -> Option<u32> {
 /// whole).
 fn report_at(c: &mut Check<'_>, name: u32, args: &[&str]) {
     let token = if c.kind(name) == NodeKind::OperatorName {
-        let Some(token) = c.payload_word(name, 0) else {
+        let Some(token) = c.field_token(name, PayloadField::Name) else {
             return;
         };
         token

@@ -1,6 +1,6 @@
 use dartq_scanner::TokenKind;
 
-use super::{Check, NodeKind, RuleSpec, same_file, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, same_file, slice};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_interpolation_to_compose_strings.dart:32-88`
 /// — an adjacent `(literal, value)` pair in a `+` chain reports over the
@@ -36,12 +36,15 @@ fn check(c: &mut Check<'_>) {
     let node = c.node();
     // Only the chain root flattens (the official `chainedAdditions` walk
     // re-reports from every inner node; once per chain is the anchor).
-    if c.payload_word(node, 0).map(|op| c.lexeme(op)) != Some("+") {
+    if c.field_token(node, PayloadField::Operator)
+        .map(|op| c.lexeme(op))
+        != Some("+")
+    {
         return;
     }
     let is_inner_plus = c.ancestor(1).is_some_and(|parent| {
         c.kind(parent) == NodeKind::BinaryExpression
-            && c.payload_word(parent, 0)
+            && c.field_token(parent, PayloadField::Operator)
                 .is_none_or(|op| c.lexeme(op) == "+")
     });
     if is_inner_plus {
@@ -56,7 +59,9 @@ fn check(c: &mut Check<'_>) {
     let mut pieces = Vec::with_capacity(left.len() + right.len());
     for &kid in &left {
         if c.kind(kid) == NodeKind::BinaryExpression
-            && c.payload_word(kid, 0).map(|op| c.lexeme(op)) == Some("+")
+            && c.field_token(kid, PayloadField::Operator)
+                .map(|op| c.lexeme(op))
+                == Some("+")
         {
             chain_pieces(c, kid, &mut pieces);
         } else {
@@ -117,7 +122,9 @@ fn check(c: &mut Check<'_>) {
 fn chain_pieces(c: &Check<'_>, node: u32, out: &mut Vec<u32>) {
     for kid in c.collect_direct(node) {
         if c.kind(kid) == NodeKind::BinaryExpression
-            && c.payload_word(kid, 0).map(|op| c.lexeme(op)) == Some("+")
+            && c.field_token(kid, PayloadField::Operator)
+                .map(|op| c.lexeme(op))
+                == Some("+")
         {
             chain_pieces(c, kid, out);
         } else {
@@ -294,14 +301,12 @@ fn same_file_declares_plus(c: &Check<'_>) -> bool {
 /// [`NodeKind::OperatorName`] marker tiles beside its `Method` in the
 /// declaration body's completion window (the production bridge keeps
 /// it out of the method's own children), so the window scan reads the
-/// marker's operator token (payload word 0) directly.
+/// marker's `Name` word directly.
 fn class_declares_plus(c: &Check<'_>, decl: u32) -> bool {
     for member in c.children(decl) {
         if c.kind(member) == NodeKind::OperatorName
             && c.lexeme(
-                c.payload(member)
-                    .first()
-                    .copied()
+                c.field(member, PayloadField::Name)
                     .unwrap_or(crate::rules::NONE_TOKEN),
             ) == "+"
         {

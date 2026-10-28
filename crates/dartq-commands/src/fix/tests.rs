@@ -1645,19 +1645,44 @@
     }
 
     /// The official options-less posture at the fix face: no
-    /// `analysis_options.yaml` in the target's ancestry is the empty lint
+    /// `analysis_options.yaml` in the target's ancestry is the empty LINT
     /// set — a fixable shape in the file produces no lint-driven rows (the
     /// #936 ruling; the fix face enables nothing on its own).
+    ///
+    /// The engine pass is a separate posture: with an SDK root available
+    /// the pass answers the file's real compile diagnostics (`B` is
+    /// undefined) — their ignore offers and any engine-table fixes are
+    /// legitimate rows. The #936 invariant is precisely the LINT stage:
+    /// without options no row is a lint-stage code change (`BUILTIN_SOURCE`
+    /// provenance with the `Primary` role). Both engine postures assert
+    /// deterministically: a clean file answers empty either way; the
+    /// undefined-`B` file never answers a lint-driven Primary.
     #[test]
     fn collect_set_options_less_runs_no_lints() {
         let root = std::env::temp_dir().join(format!("dq_fix_bare_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mkdir");
-        std::fs::write(root.join("a.dart"), "void f() { var a = new B(); }\n").expect("write");
+        std::fs::write(root.join("clean.dart"), "void f() {}\n").expect("write");
 
         let mut hosts = PluginHosts::empty();
         let sets = collect_set(std::slice::from_ref(&root), &mut hosts, None).expect("collect");
-        assert!(sets.is_empty(), "no governing options, no lint rows");
+        assert!(
+            sets.is_empty(),
+            "a clean options-less file answers no rows, SDK or not: {sets:?}",
+        );
+        assert_eq!(hosts.take_errors(), Vec::new());
+
+        std::fs::write(root.join("a.dart"), "void f() { var a = new B(); }\n").expect("write");
+        let sets = collect_set(std::slice::from_ref(&root), &mut hosts, None).expect("collect");
+        for set in &sets {
+            for fix in &set.fixes {
+                assert!(
+                    !(fix.source == BUILTIN_SOURCE && fix.role == FixRole::Primary),
+                    "options-less run carries no lint-driven code change: {}",
+                    set.path,
+                );
+            }
+        }
         assert_eq!(hosts.take_errors(), Vec::new());
 
         std::fs::remove_dir_all(&root).ok();
@@ -2535,6 +2560,17 @@
         );
         // Anything but a bare `break;` span drops.
         assert_no_fix("unnecessary_breaks", "switch (n) { case 1: x(); }", 20..24);
+        // The keyword report with a multi-byte comment before the `;`:
+        // the trivia run converts to UTF-16 before the cut — phantom
+        // units would eat the closing brace on the shared line.
+        let source = "void f(int x) { switch (x) { case 1: g(); break /* ü 🙂 */; } }";
+        let at_break = at(source, "break");
+        assert_rewrite(
+            "unnecessary_breaks",
+            source,
+            at_break..at_break + 5,
+            "void f(int x) { switch (x) { case 1: g(); } }",
+        );
     }
 
     /// The redundant `library;` directive loses its line (official
@@ -5135,6 +5171,16 @@
             int_at..int_at + 3,
             "class C {\n  int x;\n  C(this.x);\n}\n",
         );
+        // A parameter named `Function` is the name, never a function-
+        // type suffix — the annotation drops, the name stays (official
+        // `RemoveTypeAnnotation` removes the annotation only).
+        let source = "void f(dynamic Function) {}\n";
+        assert_rewrite(
+            "avoid_annotating_with_dynamic",
+            source,
+            full_span(source, "dynamic Function"),
+            "void f(Function) {}\n",
+        );
     }
 
     /// The boolean-conditional faces: equal arms keep one literal, an arm
@@ -5222,6 +5268,63 @@
             source,
             full_span(source, "b ? c : d"),
         );
+        // The wrapper face: the report climbs the parentheses, and the
+        // replacement carries them (official `nodeToReplace`).
+        let source = "var l = [(b ? c : d)];\n";
+        assert_rewrite(
+            "prefer_if_elements_to_conditional_expressions",
+            source,
+            full_span(source, "(b ? c : d)"),
+            "var l = [if (b) c else d];\n",
+        );
+        // The if-element branch face: the conditional inside a then
+        // branch folds into a nested if-element (the `else` flank and
+        // the control head's `)` are branch boundaries).
+        let source = "var l = [if (p) q ? a : b else r];\n";
+        assert_rewrite(
+            "prefer_if_elements_to_conditional_expressions",
+            source,
+            full_span(source, "? a : b"),
+            "var l = [if (p) if (q) a else b else r];\n",
+        );
+        // The else branch folds the same way — the backwards walk stops
+        // at the `else` keyword (`else` never occurs inside a condition
+        // expression), so the condition is the branch's own expression.
+        let source = "var l = [if (p) a else q ? b : c];\n";
+        assert_rewrite(
+            "prefer_if_elements_to_conditional_expressions",
+            source,
+            full_span(source, "? b : c"),
+            "var l = [if (p) a else if (q) b else c];\n",
+        );
+        // The bridge's branch-position spans swallow the token following
+        // the conditional (the enclosing `else`, the collection's `]`) —
+        // the tail is re-derived from the `:`, the edit stays on the
+        // conditional's own extent.
+        let source = "var l = [if (p) q ? a : b else r];\n";
+        assert_rewrite(
+            "prefer_if_elements_to_conditional_expressions",
+            source,
+            full_span(source, "? a : b else"),
+            "var l = [if (p) if (q) a else b else r];\n",
+        );
+        let source = "var l = [if (p) a else q ? b : c];\n";
+        assert_rewrite(
+            "prefer_if_elements_to_conditional_expressions",
+            source,
+            full_span(source, "? b : c]"),
+            "var l = [if (p) a else if (q) b else c];\n",
+        );
+        // A swallowed tail must not truncate an expression that itself
+        // ends in a group — the inner `]` survives, the outer one is the
+        // swallow.
+        let source = "var l = [if (p) a else q ? b : c[0]];\n";
+        assert_rewrite(
+            "prefer_if_elements_to_conditional_expressions",
+            source,
+            full_span(source, "? b : c[0]]"),
+            "var l = [if (p) a else if (q) b else c[0]];\n",
+        );
     }
 
     /// The hex padding faces: a value re-render, in-place separator
@@ -5276,6 +5379,15 @@
             source,
             full_span(source, "var"),
             "void f() {\n  final x = 1;\n}\n",
+        );
+        // A string initializer carrying a comma is one declarator — the
+        // gate reads tokens, so the raw text's comma never splits it.
+        let source = "void f() {\n  var s = 'a,b';\n}\n";
+        assert_rewrite(
+            "prefer_final_locals",
+            source,
+            full_span(source, "var s = 'a,b'"),
+            "void f() {\n  final s = 'a,b';\n}\n",
         );
         let source = "void f() {\n  int x = 1;\n}\n";
         assert_rewrite(
@@ -5496,6 +5608,49 @@
             source,
             full_span(source, "// ignore: unused_local_variable"),
             "var x = 1;\n",
+        );
+        // The name-token report inside a block comment — no `//`
+        // anywhere ahead of it, and a URL's `//` inside the block never
+        // opens the line face (the enclosing comment is scanned in the
+        // hit's trivia window between code tokens).
+        let source = "void f() {}\n/* see http://x — ignore: avoid_print */\n";
+        let name_at = at(source, "avoid_print");
+        assert_rewrite(
+            "unnecessary_ignore",
+            source,
+            name_at..name_at + 11,
+            "void f() {}\n",
+        );
+        // A block closed before the hit never encloses it — the citation
+        // sits in the later line comment, whose line goes.
+        let source = "void f() {}\n/* closed */\n// ignore: avoid_print\nvar x = 1;\n";
+        let name_at = at(source, "avoid_print");
+        assert_rewrite(
+            "unnecessary_ignore",
+            source,
+            name_at..name_at + 11,
+            "void f() {}\n/* closed */\nvar x = 1;\n",
+        );
+        // A block comment with code after it on its line deletes the
+        // comment and the space/tab run behind it — the official's
+        // `[comment.offset, getLineContentEnd(comment.end))`: the
+        // indent before stays, the code after stays, the trailing run
+        // goes with the comment.
+        let source = "void f() {} /* ignore: avoid_print */ g();\n";
+        let name_at = at(source, "avoid_print");
+        assert_rewrite(
+            "unnecessary_ignore",
+            source,
+            name_at..name_at + 11,
+            "void f() {} g();\n",
+        );
+        let source = "void f() {} /* ignore: avoid_print */\t\tg();\n";
+        let name_at = at(source, "avoid_print");
+        assert_rewrite(
+            "unnecessary_ignore",
+            source,
+            name_at..name_at + 11,
+            "void f() {} g();\n",
         );
     }
 

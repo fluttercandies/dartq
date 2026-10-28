@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, same_file, slice, value_run_end};
+use super::{Check, NodeKind, PayloadField, RuleSpec, same_file, slice, value_run_end};
 use crate::rules::type_face;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/use_if_null_to_convert_nulls_to_bools.dart`
@@ -20,7 +20,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(&op) = c.payload(node).first() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     let wanted = match c.lexeme(op) {

@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
 use crate::rules::utf16_token_span;
 
 /// Official: `pkg/linter/lib/src/rules/await_only_futures.dart:38-56` —
@@ -309,7 +309,7 @@ fn collection_display(
             }
             let run = &rows[run_start..index];
             run_start = index + 1;
-            let Some(colon) = c.payload(row).first().copied() else {
+            let Some(colon) = c.field(row, PayloadField::Colon) else {
                 continue;
             };
             let split = run.partition_point(|&r| c.unit.ast.token_range(r).end <= colon + 1);

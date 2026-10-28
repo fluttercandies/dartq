@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::{MemberQuery, body_members, type_face, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -72,9 +72,7 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         return;
     }
     let dot = c
-        .payload(c.node())
-        .first()
-        .copied()
+        .field(c.node(), PayloadField::Operator)
         .filter(|&dot| c.lexeme(dot) == "?.");
     let Some(selector) = c.unit.ast.token_range(c.node()).next_back() else {
         return;
@@ -87,7 +85,7 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 
 /// The marker's access token, `None` unless null-aware (`?.`).
 fn null_aware_dot(c: &Check<'_>, marker: u32) -> Option<u32> {
-    let &dot = c.payload(marker).first()?;
+    let dot = c.field(marker, PayloadField::Operator)?;
     (c.lexeme(dot) == "?.").then_some(dot)
 }
 

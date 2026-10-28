@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, annotation_names, container_members, fields_declare, member_declaration_name};
+use super::{PayloadField, Check, NodeKind, RuleSpec, annotation_names, container_members, fields_declare, member_declaration_name};
 use crate::rules::{MemberQuery, member_annotations, member_matches, same_file_ancestors, utf16_token_span};
 
 const STATIC_BIT: u16 = 1 << 3;
@@ -70,7 +70,7 @@ fn member_name_token(c: &Check<'_>, member: u32) -> Option<u32> {
     let name_row = member_declaration_name(c, member)?;
     match c.kind(name_row) {
         NodeKind::OperatorName => {
-            let token = c.payload(name_row).first().copied()?;
+            let token = c.field(name_row, PayloadField::Name)?;
             (token != crate::rules::NONE_TOKEN).then_some(token)
         }
         _ => Some(c.head_token(name_row)),

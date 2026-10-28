@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, query_site, slice};
+use super::{PayloadField, Check, NodeKind, query_site, slice};
 
 /// Reads through transparent `(...)` wrappers to the expression root
 /// row (the content is the wrapper window's last row).
@@ -122,11 +122,11 @@ fn access_type(
     let pos = run
         .iter()
         .rposition(|&row| c.kind(row) == NodeKind::DotAccess)?;
-    // The whole-access marker's payload word 0 is the dot token; the
+    // The whole-access marker's `Operator` word is the dot token; the
     // member name is the token right after it (the trailing piece rides
     // `name.`'s close, so `token_range.next_back` lands on the dot, not
     // the name).
-    let selector = c.payload(run[pos]).first().copied()? + 1;
+    let selector = c.field(run[pos], PayloadField::Operator)? + 1;
     let receiver = single_receiver(c, &run[..pos], selector)?;
     let name = analysis.strings().intern(c.lexeme(selector));
     analysis.member_type(query_site(c, receiver), name)

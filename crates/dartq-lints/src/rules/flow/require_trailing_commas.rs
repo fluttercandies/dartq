@@ -1,6 +1,6 @@
 use dartq_parser::AssertKind;
 
-use super::{Check, NodeKind, RuleSpec, last_child, narrow_u32};
+use super::{Check, NodeKind, PayloadField, RuleSpec, last_child, narrow_u32};
 
 /// Official: `pkg/linter/lib/src/rules/require_trailing_commas.dart` —
 /// every multi-line argument, parameter, assert, and collection-literal
@@ -56,9 +56,9 @@ fn check(c: &mut Check<'_>) {
         NodeKind::Assert => {
             // Upstream registers the statement and initializer visitors
             // only (:58-71); the expression position (a recovery shape)
-            // is outside the lint. Payload word 0 is the kind, word 1
-            // the open paren (the `Assert` payload).
-            let kind = c.payload(node).first().copied();
+            // is outside the lint. The `AssertKind` word is the kind,
+            // the `LeftParen` word the open paren.
+            let kind = c.field(node, PayloadField::AssertKind);
             if kind != Some(AssertKind::Statement as u32)
                 && kind != Some(AssertKind::Initializer as u32)
             {
@@ -68,9 +68,7 @@ fn check(c: &mut Check<'_>) {
                 return;
             };
             let open = c
-                .payload(node)
-                .get(1)
-                .copied()
+                .field(node, PayloadField::LeftParen)
                 .filter(|&t| t != super::NONE_TOKEN)
                 .unwrap_or(span.start);
             check_group(c, open, span.end - 1, last, span.end - 1);

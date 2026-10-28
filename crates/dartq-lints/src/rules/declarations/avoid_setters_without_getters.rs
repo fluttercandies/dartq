@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, container_members, fields_declare, name_row_token};
+use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, fields_declare, name_row_token};
 use crate::rules::{MemberQuery, get_set_token, has_override_annotation, member_matches, member_name, same_file_ancestors, utf16_token_span};
 
 const STATIC_BIT: u16 = 1 << 3;
@@ -101,8 +101,8 @@ fn has_getter(c: &Check<'_>, container: u32, name: &str) -> bool {
                             && dartq_ast::mod_flags(c.unit.ast, member) & STATIC_BIT == 0
                     }
                     NodeKind::Fields
-                        if c.payload(member).first()
-                            == Some(&(dartq_parser::MemberKind::NonStaticField as u32)) =>
+                        if c.field(member, PayloadField::MemberKind)
+                            == Some(dartq_parser::MemberKind::NonStaticField as u32) =>
                     {
                         fields_declare(c, member, name)
                     }

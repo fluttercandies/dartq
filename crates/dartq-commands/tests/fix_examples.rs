@@ -54,16 +54,20 @@ const DATA_DIR: &str = "tests/data/fix_examples";
 ///   (`dartq_lints::SEMANTIC_RULES`), which the fix face's lint stage
 ///   never mounts (`ParsedUnit::unit` carries no fold) — verified silent
 ///   on honest trigger shapes.
-/// - `wrong-fix`: the lint fires but the row's rewrite produces
-///   non-official (or invalid) text — production-gap finding, reported
-///   to the fix lane.
-/// - `drops`: the lint fires but the row's rewrite verification drops
-///   the candidate — the production pipeline answers no fix at all.
+/// - `no-emitter`: the engine's diagnose face carries no report site for
+///   the code (name-collapse table entries only) — no diagnostic row can
+///   reach the executor, whatever the span.
+/// - `registry-only`: the parser never emits the code today (the table's
+///   own pin notes it).
+/// - `drops`: the diagnostic fires but the row's rewrite never
+///   materializes — the production pipeline answers no fix.
 /// - `silent`: no honest trigger shape fires the rule through the fix
 ///   face's engine-free stage (typed or package context it cannot see).
 /// - `posture`: the rule registers only under a language posture the
 ///   fix face cannot reach (its per-file version comes from the package
 ///   table alone; `@dart` pins are not consulted).
+/// - `multi-file`: the report needs a file the single example pair
+///   cannot carry.
 const NO_EXAMPLE_YET: &[(&str, &str)] = &[
     ("abstract_static_method", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
     ("annotate_overrides", "fold"),
@@ -72,7 +76,6 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
     ("extension_augmentation_has_on_clause", "silent: augmentation declarations parse to `expected_token` today; this code never emits (probe-verified)"),
     ("extension_type_declares_member_of_object", "silent: the Object-member extension-type trigger produces no diagnostic rows through the engine pass (probe-verified)"),
     ("getter_constructor", "silent: `int get C => 1;` parses without any diagnostic through the engine pass (probe-verified)"),
-    ("avoid_annotating_with_dynamic", "wrong-fix: deletes the whole parameter (`void f(dynamic x) {}` becomes `void f() {}`), not the annotation"),
     ("avoid_bool_literals_in_conditional_expressions", "fold"),
     ("avoid_final_parameters", "posture: registers only without primary constructors; the fix face parses every file at its package posture"),
     ("avoid_print", "fold"),
@@ -81,31 +84,23 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
     ("avoid_types_on_closure_parameters", "fold"),
     ("await_only_futures", "fold"),
     ("cast_nullable_to_non_nullable", "fold"),
-    ("empty_catches", "drops: lint fires on an empty catch but the comment-insert rewrite never materializes"),
     ("future_sync_value", "posture: the rule name is outside the options-known lint universe, so no options file can enable it"),
     ("final_constructor", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
     ("final_method", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
     ("implicit_call_tearoffs", "fold"),
-    ("initialize_in_field_declaration", "drops: fires on primary-constructor initializer lists but the multi-edit fix goes stale mid-apply"),
     ("invalid_constant", "silent: const-list non-constant-element triggers emit `non_constant_list_element` instead; no shape found producing this code (probe-verified)"),
     ("leading_newlines_in_multiline_strings", "silent: the upstream-verbatim trigger does not fire through the fix face's parse posture"),
     ("library_annotations", "silent: `@pragma` shapes do not fire through the engine-free stage"),
-    ("mixin_super_class_constraint_non_interface", "drops: the multi-edit candidate goes half-stale on the two-constraint shape (patched text still verified by hand)"),
     ("import_of_non_library", "multi-file: the report needs a part file distinct from the importing library, one example file per pair today"),
     ("non_const_call_to_literal_constructor", "silent: `new Map()` emits `unused_local_variable` only; the literal-constructor code never fires (probe-verified)"),
     ("non_constant_map_element", "silent: const-map non-constant-value triggers produce no diagnostic rows (probe-verified)"),
     ("no_duplicate_case_values", "silent: typed duplicate-case distinctness is invisible to the engine-free stage"),
     ("noop_primitive_operations", "fold"),
-    ("omit_local_variable_types", "wrong-fix: produces `varx = 1;` (separator eaten) instead of `var x = 1;`"),
     ("prefer_collection_literals", "fold"),
     ("prefer_const_literals_to_create_immutables", "silent: `@immutable`-annotated typed list does not fire through the engine-free stage"),
     ("prefer_contains", "fold"),
-    ("prefer_final_fields", "drops: lint fires on a never-reassigned private field but the rewrite never materializes"),
     ("prefer_final_parameters", "posture: alias of `avoid_final_parameters`, which registers only without primary constructors; the fix face parses every file at its package posture"),
-    ("prefer_final_in_for_each", "wrong-fix: produces invalid `for (var final e …)` instead of swapping `var` for `final`"),
     ("prefer_for_elements_to_map_fromiterable", "fold"),
-    ("prefer_foreach", "wrong-fix: leaves a stray semicolon (`it.forEach(f);;`)"),
-    ("prefer_if_elements_to_conditional_expressions", "drops: lint fires on a conditional element but the rewrite never materializes"),
     ("prefer_initializing_formals", "fold"),
     ("prefer_int_literals", "fold"),
     ("representation_field_trailing_comma", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
@@ -115,28 +110,25 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
     ("sized_box_for_whitespace", "fold"),
     ("static_getter_without_body", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
     ("static_setter_without_body", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
-    ("type_check_with_null", "drops: the engine emits the code (ignore rows only) but the `UseEqEqNull` rewrite never materializes a primary (probe-verified)"),
+    ("type_check_with_null", "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `UseEqEqNull` rewrite"),
     ("unawaited_futures", "silent: async-context typing is invisible to the engine-free stage"),
     ("unchecked_use_of_nullable_value", "drops: the null-check family's primary insert never materializes through the engine pass (probe-verified)"),
     ("unnecessary_await_in_return", "silent: written-Future shapes do not fire through the engine-free stage"),
-    ("unnecessary_breaks", "drops: lint fires on a trailing member `break` but the rewrite never materializes"),
-    ("unnecessary_ignore", "drops: lint fires on a stale ignore comment but the line-drop rewrite never materializes"),
     ("unnecessary_lambdas", "fold"),
-    ("unnecessary_nan_comparison", "drops: the engine emits the code (ignore rows only) but the `RemoveComparison` rewrite never materializes a primary (probe-verified)"),
+    ("unnecessary_nan_comparison", "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `RemoveComparison` rewrite"),
     ("unnecessary_null_aware_operator_on_extension_on_nullable", "fold"),
     ("unnecessary_null_checks", "fold"),
-    ("unnecessary_null_comparison", "drops: the engine emits the code (ignore rows only) but the `RemoveComparison` rewrite never materializes a primary (probe-verified)"),
+    ("unnecessary_null_comparison", "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `RemoveComparison` rewrite"),
     ("unnecessary_type_check", "silent: `is`-check-comparison shapes emit no rows through the engine pass (probe-verified)"),
     ("unnecessary_string_interpolations", "fold"),
     ("unnecessary_unawaited", "fold"),
     ("unrelated_type_equality_checks", "fold"),
     ("unreachable_switch_case", "silent: case-after-default emits `dead_code` instead; no shape found producing this code (probe-verified)"),
     ("use_colored_box", "fold"),
-    ("use_null_aware_elements", "drops: lint fires on `[if (a != null) a]` but the rewrite never materializes"),
     ("use_truncating_division", "fold"),
     ("unused_catch_clause", "silent: an unused catch variable produces no diagnostic rows through the engine pass (probe-verified)"),
     ("unused_element_parameter", "silent: the unused callback-parameter trigger produces no diagnostic rows (probe-verified)"),
-    ("var_and_type", "drops: the engine emits the code (ignore rows only) but the `RemoveVar` rewrite never materializes a primary (probe-verified)"),
+    ("var_and_type", "drops: probe-verified that no primary materializes through the engine pass, though the commands wiring reads clean (the parser fires the code, `is_engine_fix_code` passes it, `RemoveLexeme` anchors at the span start) — the drop sits in the engine pass's row set; needs an SDK-run attribution"),
     ("var_with_no_type_annotation", "posture: registers only without primary constructors; the fix face parses every file at its package posture"),
 ];
 

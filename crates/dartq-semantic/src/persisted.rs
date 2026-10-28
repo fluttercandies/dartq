@@ -270,6 +270,11 @@ pub struct PersistedContainer {
     #[serde(default)]
     pub ctor_formals: Vec<(u32, Box<PersistedFormals>)>,
     /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode with no factory formals (the #539
+    /// additive-field discipline; the #2687 factory lane).
+    #[serde(default)]
+    pub factory_formals: Vec<(u32, Box<PersistedFormals>)>,
+    /// Additive after the format shipped: `default` so payloads persisted
     /// before the field existed decode with no declaration metadata (the
     /// #539 additive-field discipline; the #705 annotation substrate).
     #[serde(default)]
@@ -870,6 +875,11 @@ impl PersistedContainer {
                 .iter()
                 .map(|(name, formals)| (s.id(*name), Box::new(s.formals(formals))))
                 .collect(),
+            factory_formals: container
+                .factory_formals
+                .iter()
+                .map(|(name, formals)| (s.id(*name), Box::new(s.formals(formals))))
+                .collect(),
             annotations: s.annotations(&container.annotations),
         }
     }
@@ -953,6 +963,16 @@ impl PersistedContainer {
             has_const_constructor: self.has_const_constructor,
             ctor_formals: self
                 .ctor_formals
+                .into_iter()
+                .map(|(at, formals)| {
+                    (
+                        ids[at as usize],
+                        Box::new(into_formals(*formals, ids, pool)),
+                    )
+                })
+                .collect(),
+            factory_formals: self
+                .factory_formals
                 .into_iter()
                 .map(|(at, formals)| {
                     (
@@ -1215,6 +1235,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                factory_formals: [].into_iter().collect(),
                 annotations: Box::new([Annotation {
                     name: name("sealed"),
                     range: SourceRange {
@@ -1378,6 +1399,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                factory_formals: [].into_iter().collect(),
                 annotations: Box::new([]),
             },
         )]

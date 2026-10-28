@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, container_members, is_deprecated_metadata, narrow_u32, top_level_annotations};
+use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, is_deprecated_metadata, narrow_u32, top_level_annotations};
 use crate::rules::initialized_identifier_name;
 use std::path::{Path, PathBuf};
 
@@ -88,7 +88,7 @@ fn check(c: &mut Check<'_>) {
     let mut hits: Vec<(u32, Option<String>)> = Vec::new();
     for row in 0..len {
         if c.kind(row) == NodeKind::Identifier {
-            let Some(&context) = c.payload(row).first() else {
+            let Some(context) = c.field(row, PayloadField::Context) else {
                 continue;
             };
             if !is_reference_context(context) {
@@ -693,8 +693,8 @@ fn push_decl<'a>(
             .into_iter()
             .filter(|&kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.payload(kid).first()
-                        == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+                    && c.field(kid, PayloadField::Context)
+                        == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32)
             })
             .map(|kid| c.lexeme(c.head_token(kid)))
             .collect(),
@@ -703,10 +703,9 @@ fn push_decl<'a>(
             .into_iter()
             .filter(|&kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.payload(kid).first()
+                    && c.field(kid, PayloadField::Context)
                         == Some(
-                            &(dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
-                                as u32),
+                            dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32,
                         )
             })
             .map(|kid| c.lexeme(c.head_token(kid)))
@@ -726,7 +725,7 @@ fn push_decl<'a>(
                     let pos = siblings.iter().position(|&s| s == row)?;
                     siblings[..pos].iter().rev().copied().find(|&kid| {
                         c.kind(kid) == NodeKind::Identifier
-                            && c.payload(kid).first().copied()
+                            && c.field(kid, PayloadField::Context)
                                 == Some(
                                     dartq_parser::IdentifierContext::
                                         ClassOrMixinOrExtensionDeclaration as u32,

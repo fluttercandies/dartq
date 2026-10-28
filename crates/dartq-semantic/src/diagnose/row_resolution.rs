@@ -1,5 +1,12 @@
 use super::*;
 
+/// The receiver-expression walk's recursion cap (see
+/// `Engine::recv_walk_depth`): past it a hop degrades to the record's
+/// classified receiver instead of recursing toward a worker-thread stack
+/// overflow. ~1 MB of walk frames at four small frames per hop — safely
+/// inside rayon's 2 MB worker stacks; real chains are tens of links.
+const RECV_WALK_DEPTH_CAP: u32 = 1024;
+
 /// The `dart:async` class face the member tables lack: `Stream`'s own
 /// declared instance surface (upstream Dart SDK source,
 /// sdk/lib/async/stream.dart — `map`/`where`/`listen`/`first`/…; the
@@ -830,6 +837,34 @@ impl<'a> Engine<'a> {
         self.apply_deferred_closure_formals(unsolved);
         // The fold-deferred rows interleave by offset: their emissions keep
         // the report's source order (later merges assume it).
+        // The cascade streak index: every section's cascade-first recv_span
+        // in one linear pass (pairwise `;` probes over adjacent sections —
+        // the gaps sum to the source size). The per-row walk-back it feeds
+        // was O(N²) over a 20k-section cascade (#41983).
+        if !self.cascade_sections.is_empty() {
+            let mut index = FxHashMap::default();
+            index.reserve(self.cascade_sections.len());
+            let mut first: Option<SourceRange> = None;
+            let mut prev: Option<u32> = None;
+            for read in &self.member_reads {
+                if !self.cascade_sections.contains(&read.offset) {
+                    continue;
+                }
+                if prev.is_some_and(|offset| self.semicolon_between(offset, read.offset)) {
+                    first = None;
+                }
+                let span = first.unwrap_or(read.recv_span);
+                first = Some(span);
+                index.insert(read.offset, span);
+                prev = Some(read.offset);
+            }
+            self.cascade_first_spans = index;
+        }
+        // The row loop runs with the receiver-expression memo armed: every
+        // table the walk reads is frozen past this point (the rebind, init
+        // and closure-formal passes above were the last writers), so each
+        // span's chain answer is derived once.
+        self.recv_memo_active = true;
         let mut index = 0usize;
         for row in &rows {
             // The conditional-URI face: rows sourced inside an `if (...)`
@@ -860,6 +895,8 @@ impl<'a> Engine<'a> {
                 self.resolve_row(promotions, deferred_row, &cascade_targets);
             }
         }
+        self.recv_memo_active = false;
+        self.recv_memo.borrow_mut().clear();
     }
 
     /// One row's pass-2 dispatch (shared by the main stack and the
@@ -1031,24 +1068,15 @@ impl<'a> Engine<'a> {
             // face when one stands (`if (v != null) v..m()`: the oracle
             // resolves every section against `cascade.target2`'s
             // flow-promoted type, type_analyzer.dart's `cascadeReceiver`).
-            // The promotion face alone substitutes — same head, null
+            // The promotion face alone substitutes — same head, nullability
             // stripped — never a rename or a widening (a `?..` section's
             // target read stays nullable and keeps the latched face). Only
             // the FIRST section's record carries the target's own span —
             // a later section's recv_span is the previous section's RHS —
-            // so the scan walks back over this cascade's contiguous
-            // sections (the `;` boundary ends it) to the first one.
-            let mut target_span = None;
-            for read in self.member_reads.iter().rev() {
-                if read.offset > row.range.offset || !self.cascade_sections.contains(&read.offset)
-                {
-                    continue;
-                }
-                if self.semicolon_between(read.offset, row.range.offset) {
-                    break;
-                }
-                target_span = Some(read.recv_span);
-            }
+            // so the answer reads the precomputed streak index (the old
+            // per-row walk-back over the cascade's sections was O(N²) on
+            // a 20k-section cascade, #41983).
+            let target_span = self.cascade_first_spans.get(&row.range.offset).copied();
             if let Some(span) = target_span
                 && let Receiver::Typed {
                     ty:
@@ -1077,9 +1105,19 @@ impl<'a> Engine<'a> {
             }
             return recv;
         }
-        let Some(src) = self.member_reads.iter().rev().find(|read| {
-            read.offset < row.range.offset && self.cascade_sections.contains(&read.offset)
-        }) else {
+        // The newest cascade section strictly below the row: binary-search
+        // the offset-sorted records, then walk back over the interleaved
+        // non-section reads (an RHS's own reads — a handful). The old
+        // reverse scan over the whole vector paid O(N) per row.
+        let below = self
+            .member_reads
+            .partition_point(|read| read.offset < row.range.offset);
+        let Some(src) = self.member_reads[..below]
+            .iter()
+            .rev()
+            .find(|read| self.cascade_sections.contains(&read.offset))
+            .copied()
+        else {
             return recv;
         };
         if self.semicolon_between(src.offset, row.range.offset) || src.recv != recv {
@@ -2181,8 +2219,22 @@ impl<'a> Engine<'a> {
     /// earlier token, so the walk descends the chain monotonically and
     /// terminates.
     pub(crate) fn recv_expression_ty(&self, read_span: SourceRange) -> Option<Ty> {
-        self.recv_expression_face(read_span)
-            .map(|ty| self.null_asserted_after(read_span, ty))
+        // The pass-2 memo (`recv_memo`'s contract): consult and populate
+        // only while the resolve loop holds the tables the answer reads
+        // frozen. The chain walk re-derives a receiver chain once per
+        // node, so a cascade's N sections cost N hops total, not N²/2.
+        if self.recv_memo_active
+            && let Some(hit) = self.recv_memo.borrow().get(&read_span.offset)
+        {
+            return *hit;
+        }
+        let ty = self
+            .recv_expression_face(read_span)
+            .map(|ty| self.null_asserted_after(read_span, ty));
+        if self.recv_memo_active {
+            self.recv_memo.borrow_mut().insert(read_span.offset, ty);
+        }
+        ty
     }
 
     /// [`Self::recv_expression_ty`] before the trailing null-assert: the
@@ -2238,11 +2290,17 @@ impl<'a> Engine<'a> {
         // through its receiver expression's re-derived face — the fold's
         // push-time result read the unpromoted receiver. Each hop names a
         // strictly earlier span (the receiver precedes its `]`), so the
-        // walk terminates.
+        // walk terminates; the depth cap keeps a flat 20k-bracket chain
+        // from exhausting the worker stack (past it the answer degrades
+        // to the outer fallbacks).
         if let Some(&(indexed, null_aware)) = self.index_result_recvs.get(&read_span.offset)
             && indexed.offset < read_span.offset
+            && self.recv_walk_depth.get() < RECV_WALK_DEPTH_CAP
         {
-            let recv_ty = self.recv_expression_ty(indexed)?;
+            self.recv_walk_depth.set(self.recv_walk_depth.get() + 1);
+            let recv_ty = self.recv_expression_ty(indexed);
+            self.recv_walk_depth.set(self.recv_walk_depth.get() - 1);
+            let recv_ty = recv_ty?;
             return match self.index_result_ty(recv_ty) {
                 Ty::Unknown => None,
                 ty if null_aware => Some(Self::nullable_form(ty)),
@@ -2255,25 +2313,30 @@ impl<'a> Engine<'a> {
 
     /// The staged member-read record whose member token ENDS the span — the
     /// chain node `read_span` names (`skip_bang`: past a trailing `!`).
+    /// O(1) through [`Engine::member_read_ends`]; the old reverse scan
+    /// cost O(N) per hop, quadratic over a whole chain walk.
     pub(crate) fn chain_node_read(&self, read_span: SourceRange, skip_bang: bool) -> Option<&MemberRead> {
         let mut end = read_span.offset + read_span.length;
         let src = self.source.as_bytes();
         while skip_bang && end > read_span.offset && src.get(end as usize - 1) == Some(&b'!') {
             end -= 1;
         }
-        let token_end = |read: &MemberRead| {
-            let name = self.strings.resolve(read.name);
-            let units: usize = if name.is_ascii() {
-                name.len()
-            } else {
-                name.chars().map(char::len_utf16).sum()
-            };
-            read.offset as usize + units == end as usize
-        };
-        self.member_reads
-            .iter()
-            .rev()
-            .find(|read| read.offset >= read_span.offset && token_end(read))
+        let read = self
+            .member_read_ends
+            .get(&end)
+            .map(|&index| &self.member_reads[index as usize])?;
+        (read.offset >= read_span.offset).then_some(read)
+    }
+
+    /// A member token's UTF-16 length (the token-end arithmetic
+    /// [`Engine::chain_node_read`] and the staged-join key share).
+    pub(crate) fn member_name_units(&self, name: StringId) -> u32 {
+        let name = self.strings.resolve(name);
+        if name.is_ascii() {
+            name.len() as u32
+        } else {
+            name.chars().map(char::len_utf16).sum::<usize>() as u32
+        }
     }
 
     /// Whether a member read types as the oracle's `InvalidType`: its
@@ -2319,7 +2382,27 @@ impl<'a> Engine<'a> {
         // own member verdict runs on — re-types it first. The record's
         // classified receiver remains the fallback for the shapes the flow
         // layer cannot spell (`this`, a created receiver).
-        let recv_ty = self.recv_expression_ty(read.recv_span).or(match &read.recv {
+        // The hop re-derives only when the receiver starts strictly before
+        // the member token — the documented "strictly earlier span"
+        // descent, now enforced rather than assumed. Recovery-staged
+        // records can name their own member token as the receiver (`x.(…)`'s
+        // degenerate `recv_span`, the anonymous-method cascade folds), and
+        // without the guard the hop cycles on the same span forever
+        // (issue 29943 / the anonymous-method cascades' stack overflow);
+        // the classified receiver answers instead. The depth cap bounds
+        // legitimately deep chains before they exhaust a worker thread's
+        // stack — past the cap the record's classified receiver answers.
+        let recv_ty = if read.recv_span.offset < read.offset
+            && self.recv_walk_depth.get() < RECV_WALK_DEPTH_CAP
+        {
+            self.recv_walk_depth.set(self.recv_walk_depth.get() + 1);
+            let ty = self.recv_expression_ty(read.recv_span);
+            self.recv_walk_depth.set(self.recv_walk_depth.get() - 1);
+            ty
+        } else {
+            None
+        }
+        .or(match &read.recv {
             Receiver::Typed { ty, .. } => Some(*ty),
             Receiver::This {
                 container, kind, ..
@@ -2364,12 +2447,7 @@ impl<'a> Engine<'a> {
         // `call` method's return — never the accessor's own declared
         // type (`entry.key(context)` reads `XPathSequence` through
         // `XPathExpression.call`, not the `key` field's own class).
-        let name = self.strings.resolve(read.name);
-        let units: u32 = if name.is_ascii() {
-            name.len() as u32
-        } else {
-            name.chars().map(char::len_utf16).sum::<usize>() as u32
-        };
+        let units = self.member_name_units(read.name);
         let invoked = self.byte_at(read.offset + units) == Some(b'(');
         // An applied extension METHOD's send types as its instantiated
         // return (`l.elementAtOrNull(0)` reads `Tk?`), no implicit call.

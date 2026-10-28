@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT};
 
 /// Official: `pkg/linter/lib/src/rules/var_with_no_type_annotation.dart`
 /// — a parameter whose storage keyword is `var` with no type reports at
@@ -43,7 +43,7 @@ fn check(c: &mut Check<'_>) {
         // The `case _` skip (:57): super formals are a
         // compile-time-error family; the receiver word's lexeme
         // decides (field formals carry `this`).
-        let receiver = c.payload(param).first().copied().unwrap_or(NONE_TOKEN);
+        let receiver = c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
         if receiver != NONE_TOKEN && c.lexeme(receiver) == "super" {
             continue;
         }

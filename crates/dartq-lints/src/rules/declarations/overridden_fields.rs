@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{MemberQuery, class_declaration_name, member_matches, same_file_ancestors};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/overridden_fields.dart` — an
@@ -40,7 +40,9 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     // `node.isStatic` (:40).
-    if c.payload(node).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32)) {
+    if c.field(node, PayloadField::MemberKind)
+        != Some(dartq_parser::MemberKind::NonStaticField as u32)
+    {
         return;
     }
     let Some(&class_row) = c.path.iter().rev().find(|&&a| {
@@ -91,11 +93,11 @@ fn check_primary(c: &mut Check<'_>) {
     for param in crate::rules::types::leak_formal_rows(c, node) {
         // `parameter is! FieldFormalParameter` (:53) — the `this.x`
         // receiver formal.
-        let receiver = c.payload(param).first().copied();
+        let receiver = c.field(param, PayloadField::Receiver);
         if receiver.is_some_and(|token| token != crate::rules::NONE_TOKEN) {
             continue;
         }
-        let Some(&name_token) = c.payload(param).get(1) else {
+        let Some(name_token) = c.field(param, PayloadField::Name) else {
             continue;
         };
         if name_token == crate::rules::NONE_TOKEN {

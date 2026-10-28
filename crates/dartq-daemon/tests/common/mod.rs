@@ -278,7 +278,14 @@ fn start(session: Session) -> Harness {
         let output = output.clone();
         thread::Builder::new()
             .name("dartq-daemon-test-server".into())
-            .spawn(move || run(std::io::BufReader::new(reader), output, &mut { session }, None))
+            .spawn(move || {
+                run(
+                    std::io::BufReader::new(reader),
+                    output,
+                    &mut { session },
+                    None,
+                )
+            })
             .expect("server thread spawns")
     };
     let mut harness = Harness {
@@ -296,16 +303,37 @@ fn start(session: Session) -> Harness {
 }
 
 impl Harness {
-    /// Sends one message and waits until the server has fully processed it:
-    /// `expect` new transcript frames, or a probe answer for a frame-less
-    /// step.
+    /// Sends one message and waits until the server has fully processed
+    /// it: `expect` new transcript frames, or a probe answer for a
+    /// frame-less notification. A request settles only when the frame
+    /// growth has arrived AND its own answer is in the transcript — a
+    /// growth satisfied by an unrelated async frame (a deferred
+    /// diagnostics push landing inside the step's window) must not
+    /// release the step.
     pub fn step(&mut self, message: &Value, expect: usize) {
         let before = self.transcript().len();
         self.client.send(framed(message)).expect("client send");
-        if expect == 0 {
-            self.probe_step();
-        } else {
-            self.settle(before + expect);
+        let Some(id) = message.get("id") else {
+            if expect == 0 {
+                self.probe_step();
+            } else {
+                self.settle(before + expect);
+            }
+            return;
+        };
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let transcript = self.transcript();
+            if request_settled(&transcript, before, expect, id) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "request {id} never settled (want {} frames and the answer); \
+                 transcript: {transcript:?}",
+                before + expect,
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -357,7 +385,7 @@ impl Harness {
             "server did not end; transcript: {:?}",
             frames(&output.0.lock().expect("output lock"))
         );
-        let transcript = frames(&output.0.lock().expect("output lock"));
+        let transcript = frames_complete(&output.0.lock().expect("output lock"));
         let code = server
             .join()
             .expect("server thread does not panic")
@@ -434,21 +462,100 @@ impl Harness {
     }
 }
 
-/// Decodes the framed transcript back into JSON values.
+/// The frame header marker and the header/body separator, as written by
+/// the codec's `write_frame`.
+const HEADER: &[u8] = b"Content-Length: ";
+const SEPARATOR: &[u8] = b"\r\n\r\n";
+
+fn find(bytes: &[u8], pattern: &[u8]) -> Option<usize> {
+    bytes
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+}
+
+/// One decode pass over a transcript snapshot: the complete frames plus
+/// the offset where the pending tail starts. Snapshots are taken while the
+/// server writes (`write_frame` emits the header and the body as separate
+/// writes), so a tail that is a strict prefix of the next frame is pending
+/// — the pollers retry — while anything else (garbage, a complete but
+/// malformed frame) fails with the raw bytes.
+fn decode(bytes: &[u8]) -> (Vec<Value>, usize) {
+    let mut values = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if !rest.starts_with(HEADER) {
+            assert!(
+                HEADER.starts_with(rest),
+                "transcript garbage before a frame: {rest:?}"
+            );
+            break;
+        }
+        let after = &rest[HEADER.len()..];
+        let Some(line_end) = find(after, b"\r\n") else {
+            break;
+        };
+        let length: usize = std::str::from_utf8(&after[..line_end])
+            .ok()
+            .and_then(|line| line.parse().ok())
+            .unwrap_or_else(|| panic!("bad Content-Length: {rest:?}"));
+        let separator_end = line_end + SEPARATOR.len();
+        if after.len() < separator_end {
+            assert!(
+                SEPARATOR.starts_with(&after[line_end..]),
+                "transcript garbage after the length: {rest:?}"
+            );
+            break;
+        }
+        assert!(
+            &after[line_end..separator_end] == SEPARATOR,
+            "transcript garbage after the length: {rest:?}"
+        );
+        // A length that overflows the byte offset can never be satisfied by
+        // any snapshot: it is a malformed length, not a pending body.
+        let Some(body_end) = separator_end.checked_add(length) else {
+            panic!("bad Content-Length: {rest:?}");
+        };
+        if after.len() < body_end {
+            break;
+        }
+        values.push(
+            serde_json::from_slice(&after[separator_end..body_end])
+                .unwrap_or_else(|error| panic!("bad frame body ({error}): {rest:?}")),
+        );
+        rest = &after[body_end..];
+    }
+    (values, bytes.len() - rest.len())
+}
+
+/// The transcript's complete frames; a partially-written trailing frame
+/// is left for the next poll.
 #[must_use]
 pub fn frames(bytes: &[u8]) -> Vec<Value> {
-    let mut values = Vec::new();
-    let mut rest: &str = std::str::from_utf8(bytes).expect("transcript is UTF-8");
-    while let Some(position) = rest.find("Content-Length: ") {
-        let after = &rest[position + "Content-Length: ".len()..];
-        let line_end = after.find("\r\n").expect("header terminator");
-        let length: usize = after[..line_end].parse().expect("Content-Length value");
-        let body_start = line_end + "\r\n\r\n".len();
-        let body = &after[body_start..body_start + length];
-        values.push(serde_json::from_str(body).expect("frame body is JSON"));
-        rest = &after[body_start + length..];
-    }
+    decode(bytes).0
+}
+
+/// [`frames`] once the server has finished writing: a pending tail means
+/// the session ended mid-frame and fails with the raw tail.
+pub fn frames_complete(bytes: &[u8]) -> Vec<Value> {
+    let (values, complete) = decode(bytes);
+    assert!(
+        complete == bytes.len(),
+        "transcript ends mid-frame ({} complete frames), raw tail: {:?}",
+        values.len(),
+        &bytes[complete..]
+    );
     values
+}
+
+/// A request step's settle condition: the transcript has grown by the
+/// step's full frame count AND holds the request's answer. The count
+/// alone can be satisfied by an unrelated async frame — a deferred
+/// diagnostics push landing inside the step's window while the answer is
+/// still unwritten — which must not release the step.
+#[must_use]
+pub fn request_settled(transcript: &[Value], before: usize, expect: usize, id: &Value) -> bool {
+    transcript.len() >= before + expect
+        && transcript.iter().any(|frame| frame.get("id") == Some(id))
 }
 
 /// The transcript's request answers, client-issued ids only (probe ids run

@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice, static_type_faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, slice, static_type_faces};
 use crate::rules::{body_members, in_const_context, member_annotations, same_file_declaration};
 
 /// Official: `upstream Dart SDK source,
@@ -439,10 +439,9 @@ fn ctor_has_literal(c: &Check<'_>, class_name: &str, selector: Option<&str>) -> 
         }
         let part = c.collect_direct(member).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first()
+                && c.field(kid, PayloadField::Context)
                     == Some(
-                        &(dartq_parser::IdentifierContext::MethodDeclarationContinuation
-                            as u32),
+                        dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32,
                     )
         });
         let matches = match (unnamed, part.map(|p| c.lexeme(c.head_token(p)))) {

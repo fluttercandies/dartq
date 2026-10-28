@@ -1,6 +1,6 @@
 use rustc_hash::FxHashSet;
 
-use super::{Check, RuleSpec, container_name_token};
+use super::{PayloadField, Check, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
 use crate::rules::{initialized_identifier_name, member_name, rows_with_parent, utf16_token_span};
 use dartq_ast::NodeKind;
@@ -242,9 +242,7 @@ fn judge_container(
                 // An operator names through its `OperatorName` payload
                 // token (the head would hit the `operator` keyword).
                 let name = if c.kind(name) == NodeKind::OperatorName {
-                    c.payload(name)
-                        .first()
-                        .copied()
+                    c.field(name, PayloadField::Name)
                         .unwrap_or_else(|| c.head_token(name))
                 } else {
                     c.head_token(name)
@@ -406,9 +404,7 @@ fn name_token_of(c: &Check<'_>, wrapper: u32, row: u32) -> Option<u32> {
         .find(|&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::OperatorName))
     {
         return Some(if c.kind(name) == NodeKind::OperatorName {
-            c.payload(name)
-                .first()
-                .copied()
+            c.field(name, PayloadField::Name)
                 .unwrap_or_else(|| c.head_token(name))
         } else {
             c.head_token(name)
@@ -433,7 +429,7 @@ fn name_token_of(c: &Check<'_>, wrapper: u32, row: u32) -> Option<u32> {
 fn constructor_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
     c.collect_direct(row).into_iter().find(|&kid| {
-        c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
     })
 }
 

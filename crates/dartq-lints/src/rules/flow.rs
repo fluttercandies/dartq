@@ -3,7 +3,7 @@
 //! `use_rethrow_when_possible`, `avoid_returning_null_for_void`,
 //! `use_test_throws_matchers`.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::{Check, narrow_u32};
 use crate::registry::RuleSpec;
@@ -94,7 +94,7 @@ fn check_body(c: &mut Check<'_>, body: u32, where_: &str) {
 }
 
 fn check_if(c: &mut Check<'_>, node: u32) {
-    let else_present = c.payload(node).first().copied() != Some(NONE_TOKEN);
+    let else_present = c.field(node, PayloadField::ElseKeyword) != Some(NONE_TOKEN);
     // The arms are selected structurally, never by fixed child index: a
     // production parse tiles the condition into fragment rows ahead of the
     // arms (the head `Identifier`, the `NoTypeArguments`/`NoArguments`
@@ -125,12 +125,12 @@ fn check_if(c: &mut Check<'_>, node: u32) {
 /// `ExpressionStatement` leaves, so arena adjacency (the row before the
 /// else subtree) can land on the else side's spilled head. The selection is
 /// geometric instead: among the window rows closing before the `else`
-/// keyword (payload word 0), the one sealing last is the then arm — the
+/// keyword (the row's `ElseKeyword` word), the one sealing last is the then arm — the
 /// arm's own statement leaf seals after its inner fragments. `None` when
 /// the else subtree opens at the statement window's head (no recovered then
 /// arm).
 fn then_arm(c: &Check<'_>, if_stmt: u32, else_stmt: u32) -> Option<u32> {
-    let else_token = c.payload(if_stmt).first().copied()?;
+    let else_token = c.field(if_stmt, PayloadField::ElseKeyword)?;
     let else_start = utf16_token_span(c, else_token).start;
     let mut best: Option<u32> = None;
     let mut best_end = 0;
@@ -157,7 +157,7 @@ fn then_arm(c: &Check<'_>, if_stmt: u32, else_stmt: u32) -> Option<u32> {
 fn check_if_without_else(c: &mut Check<'_>, node: u32, then: u32) {
     if let Some(parent) = c.ancestor(1)
         && c.kind(parent) == NodeKind::IfStatement
-        && c.payload(parent).first().copied() != Some(NONE_TOKEN)
+        && c.field(parent, PayloadField::ElseKeyword) != Some(NONE_TOKEN)
         && last_child(c, parent) == Some(node)
     {
         check_body(c, then, "an if");

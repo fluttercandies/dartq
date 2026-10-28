@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_single_cascade_in_expression_statements.dart:39-61`
 /// — an expression statement consisting of a single-section cascade
@@ -64,7 +64,7 @@ fn check(c: &mut Check<'_>) {
     }
     // The section's cascade operator decides the message argument
     // (avoid_single_cascade...dart:40-51): `?..` prints as `?.`.
-    let operator = if c.payload(*section).get(1).copied().unwrap_or(0) != 0 {
+    let operator = if c.field(*section, PayloadField::IsNullAware).unwrap_or(0) != 0 {
         "?."
     } else {
         "."

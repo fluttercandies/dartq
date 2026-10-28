@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{const_ability, utf16_token_span, variables_declaration_keyword};
 use dartq_parser::MemberKind;
 
@@ -45,7 +45,7 @@ fn check(c: &mut Check<'_>) {
     };
     match c.kind(parent) {
         NodeKind::Fields => {
-            if c.payload(parent).first() != Some(&(MemberKind::StaticField as u32)) {
+            if c.field(parent, PayloadField::MemberKind) != Some(MemberKind::StaticField as u32) {
                 return;
             }
         }

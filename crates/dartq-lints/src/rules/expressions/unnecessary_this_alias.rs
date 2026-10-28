@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, query_site};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site};
 use crate::rules::{class_declaration_name, initialized_identifier_name, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -39,11 +39,19 @@ use crate::rules::{class_declaration_name, initialized_identifier_name, utf16_to
 /// experiment) is not tiled into the scan, and `catch (self)`
 /// parameters do not rebinder-exclude. Message: `diagnostic.g.dart`
 /// `unnecessaryThisAlias`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_this_alias",
-    &[NodeKind::InitializedIdentifier],
+/// The spec is a hand-written literal: the 3.13.7 conformance pin's
+/// linter does not carry this rule (it exists only in newer upstream
+/// mains), so the generated metadata table has no row to resolve — the
+/// same posture as the [`crate::registry`] `META_EXEMPT` faces. The
+/// texts are the rule's established messages, kept byte-identical.
+pub(crate) static SPEC: RuleSpec = RuleSpec {
+    name: "unnecessary_this_alias",
+    group: crate::registry::Group::Standalone,
+    problem: "Unnecessary 'this' alias.",
+    correction: "Try removing the variable and using 'this' directly.",
+    kinds: &[NodeKind::InitializedIdentifier],
     check,
-);
+};
 
 #[expect(
     clippy::too_many_lines,
@@ -91,13 +99,12 @@ fn check(c: &mut Check<'_>) {
     let Some(decl_row) = c.unit.ast.parent(var) else {
         return;
     };
-    // `late`: real parses store the token in payload word 0 (the
-    // keyword reader answers var/final/const only); the name-anchored
-    // local face recovers it as the token before the answered keyword.
+    // `late`: real parses store the token in the row's `LateKeyword`
+    // word (the keyword reader answers var/final/const only); the
+    // name-anchored local face recovers it as the token before the
+    // answered keyword.
     let stored = c
-        .payload(decl_row)
-        .first()
-        .copied()
+        .field(decl_row, PayloadField::LateKeyword)
         .unwrap_or(crate::rules::NONE_TOKEN);
     let declares_late = (stored != crate::rules::NONE_TOKEN && c.lexeme(stored) == "late")
         || crate::rules::variables_declaration_keyword(c, decl_row).is_some_and(|keyword| {
@@ -266,9 +273,18 @@ fn declares_parameter(c: &Check<'_>, owner: u32, name: &str) -> bool {
                 matches!(
                     c.kind(param),
                     NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
-                ) && c.payload(param).get(1).copied().is_some_and(|name_token| {
-                    name_token != crate::rules::NONE_TOKEN && c.lexeme(name_token) == name
-                })
+                ) && match c.kind(param) {
+                    NodeKind::FormalParameter => {
+                        c.field(param, PayloadField::Name)
+                            .is_some_and(|name_token| {
+                                name_token != crate::rules::NONE_TOKEN
+                                    && c.lexeme(name_token) == name
+                            })
+                    }
+                    // A function-typed formal's name is not a payload
+                    // word of its row.
+                    _ => false,
+                }
             })
     })
 }
@@ -339,15 +355,13 @@ fn is_promotion_usage(c: &Check<'_>, row: u32) -> bool {
                     // `self!` — the production bridge tiles the `!`
                     // postfix as its own kind.
                     NodeKind::NonNullAssert | NodeKind::UnaryPostfix => Some(true),
-                    // `self?[0]` — the payload carries the `?`.
+                    // `self?[0]` — the row's `Question` word carries the `?`.
                     NodeKind::Indexed => Some(
-                        c.payload(op)
-                            .first()
-                            .copied()
+                        c.field(op, PayloadField::Question)
                             .is_some_and(|question| question != crate::rules::NONE_TOKEN),
                     ),
                     // `self?.m()` / `self?.x` — the marker's null-aware bit.
-                    NodeKind::DotAccess => Some(c.payload(op).get(1).copied() == Some(1)),
+                    NodeKind::DotAccess => Some(c.field(op, PayloadField::IsNullAware) == Some(1)),
                     _ => None,
                 }
             };
@@ -396,7 +410,7 @@ fn is_promotion_usage(c: &Check<'_>, row: u32) -> bool {
 /// `==`/`!=` and the other operand (unparenthesized) is `null`.
 fn binary_null_test(c: &Check<'_>, binary: u32, operand: u32) -> bool {
     if !matches!(
-        c.lexeme(c.payload(binary).first().copied().unwrap_or(0)),
+        c.lexeme(c.field(binary, PayloadField::Operator).unwrap_or(0)),
         "==" | "!="
     ) {
         return false;

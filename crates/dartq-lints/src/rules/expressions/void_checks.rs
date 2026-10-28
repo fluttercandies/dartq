@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, value_run_end};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, value_run_end};
 use crate::rules::{TypeFace, type_face, type_face_of_field};
 /// Official: `pkg/linter/lib/src/rules/void_checks.dart` — a value
 /// written where `void` (or `FutureOr<void>`) is expected reports
@@ -63,7 +63,7 @@ fn check(c: &mut Check<'_>) {
 /// runs the wider acceptability set (:40-53).
 fn assignment_face(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(op) = c.payload(node).first().copied() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if c.lexeme(op) != "=" {
@@ -329,7 +329,7 @@ pub(crate) fn written_return_face<'a>(c: &'a Check<'_>, function: u32) -> Option
     let is_declaration_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
                         || ctx

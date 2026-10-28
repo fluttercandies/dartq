@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{MemberQuery, class_declaration_name, has_doc_comment, member_is_concrete, member_matches, same_file_ancestors, utf16_token_span};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_renaming_method_parameters.dart`
@@ -81,8 +81,8 @@ fn check(c: &mut Check<'_>) {
     // checked like any method).
     let name_row = c.collect_direct(node).into_iter().find(|&kid| {
         c.kind(kid) == NodeKind::Identifier
-            && c.payload(kid).first()
-                == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+            && c.field(kid, PayloadField::Context)
+                == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32)
     });
     let op_row = if name_row.is_none() {
         super::adjacent_operator_name(c, node)
@@ -92,9 +92,7 @@ fn check(c: &mut Check<'_>) {
     let name_token = match (name_row, op_row) {
         (Some(name_row), _) => c.head_token(name_row),
         (_, Some(op_row)) => c
-            .payload(op_row)
-            .first()
-            .copied()
+            .field(op_row, PayloadField::Name)
             .unwrap_or_else(|| c.head_token(op_row)),
         _ => return,
     };
@@ -182,8 +180,7 @@ fn positional_params(c: &Check<'_>, params: u32) -> Vec<(u32, u32)> {
 /// A formal's `(receiver, name)` tokens (receiver formals keep their
 /// written name — `this.x` names `x`).
 fn param_pair(c: &Check<'_>, param: u32) -> Option<(u32, u32)> {
-    let payload = c.payload(param);
-    let name = payload.get(1).copied()?;
+    let name = c.field(param, PayloadField::Name)?;
     (name != crate::rules::NONE_TOKEN).then_some((0, name))
 }
 

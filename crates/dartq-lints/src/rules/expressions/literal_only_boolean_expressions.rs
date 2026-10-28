@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, query_site};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, query_site};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/literal_only_boolean_expressions.dart`
 /// — a `do`/`for`/`if`/`while` condition (or a `when` guard) composed
@@ -63,8 +63,11 @@ fn check(c: &mut Check<'_>) {
                 return;
             }
             // The case-clause skip (:86): `if (e case p)` carries the
-            // clause keyword in the condition row's payload word 0.
-            if c.payload(node).first().is_some_and(|&kw| kw != NONE_TOKEN) {
+            // clause keyword in the condition row's `CaseKeyword` word.
+            if c
+                .field(node, PayloadField::CaseKeyword)
+                .is_some_and(|kw| kw != NONE_TOKEN)
+            {
                 return;
             }
             let run = c.collect_direct(node);
@@ -159,9 +162,8 @@ fn only_literals(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[
                 return false;
             };
             let op = c
-                .payload(only)
-                .first()
-                .map(|&op| c.lexeme(op))
+                .field(only, PayloadField::Operator)
+                .map(|op| c.lexeme(op))
                 .unwrap_or_default();
             // `??` recurses into the left operand alone (:23-25).
             if op == "??" {
@@ -299,7 +301,7 @@ fn is_type_resolves(
 /// literal stays inside its literal's subtree and never pollutes the
 /// operand split.
 fn binary_operand_runs(c: &Check<'_>, binary: u32) -> Option<(Vec<u32>, Vec<u32>)> {
-    let op_token = c.payload(binary).first().copied()?;
+    let op_token = c.field(binary, PayloadField::Operator)?;
     let op_start = c.unit.tokens.get(op_token as usize)?.byte_offset as usize;
     let rows = c.collect_direct(binary);
     let split = rows.partition_point(|&row| c.byte_span(row).end <= op_start);
@@ -369,11 +371,10 @@ fn unary_operand(c: &Check<'_>, marker: u32) -> Option<u32> {
 /// direct rows for the pieces whose byte spans sit inside the
 /// separator window.
 fn for_parts_condition(c: &Check<'_>, parts: u32) -> Vec<u32> {
-    let payload = c.payload(parts);
-    let Some(&left_sep) = payload.get(1) else {
+    let Some(left_sep) = c.field(parts, PayloadField::LeftSeparator) else {
         return Vec::new();
     };
-    let Some(&right_sep) = payload.get(2) else {
+    let Some(right_sep) = c.field(parts, PayloadField::RightSeparator) else {
         return Vec::new();
     };
     let (Some(left_end), Some(right_start)) = (

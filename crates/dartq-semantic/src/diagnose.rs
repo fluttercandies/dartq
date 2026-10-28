@@ -309,7 +309,7 @@
 //! rides the sets the pass already kept (zero hot-path cost); the
 //! per-file diagnostic behavior is unchanged.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use dartq_diagnostics::{
@@ -1301,24 +1301,40 @@ pub fn fold_unit_with_ops<'t>(
             }
             // The definite-unassignment face (#746): the cast join reads it
             // after the fold, when the promotions are complete too.
-            // A `late` local read while definitely unassigned reports
-            // `definitely_unassigned_late_local_variable` at the read
-            // (type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`:
-            // the late arm gates on `isDefinitelyUnassigned` alone).
+            // The full official gate (`_checkReadOfNotAssignedLocalVariable`,
+            // type_analyzer.dart:4990-5030): a `late` local read while
+            // definitely unassigned reports
+            // `definitely_unassigned_late_local_variable`; a non-late
+            // `final` read while `!assigned` reports
+            // `read_potentially_unassigned_final`; a non-late, non-final
+            // read whose declared type is potentially non-nullable reports
+            // `not_assigned_potentially_non_nullable_local_variable`. The
+            // fact only fires under `!assigned`, so this arm IS the
+            // `!assigned` branch of the official decision.
             FlowFact::UnassignedRead {
                 span,
                 is_late,
+                is_final,
                 definitely_unassigned,
+                potentially_non_nullable,
                 ..
             } => {
-                if is_late && definitely_unassigned {
-                    let range = span.range;
-                    // The span is UTF-16; the slice reads source bytes —
-                    // convert so a wide char upstream cannot cut a character
-                    // in half (#2594).
-                    let name = &source[engine.byte_of(range.offset)
-                        ..engine.byte_of(range.end()).min(source.len())];
-                    let code = SemanticCode::DefinitelyUnassignedLateLocalVariable;
+                let range = span.range;
+                // The span is UTF-16; the slice reads source bytes —
+                // convert so a wide char upstream cannot cut a character
+                // in half (#2594).
+                let name = &source[engine.byte_of(range.offset)
+                    ..engine.byte_of(range.end()).min(source.len())];
+                let code = if is_late {
+                    (definitely_unassigned)
+                        .then_some(SemanticCode::DefinitelyUnassignedLateLocalVariable)
+                } else if is_final {
+                    Some(SemanticCode::ReadPotentiallyUnassignedFinal)
+                } else {
+                    (potentially_non_nullable)
+                        .then_some(SemanticCode::NotAssignedPotentiallyNonNullableLocalVariable)
+                };
+                if let Some(code) = code {
                     flow_diagnostics.push(Diagnostic::new(
                         code.severity(),
                         code.code_info(),
@@ -4947,6 +4963,15 @@ mod ticket_2570_tests;
 /// declaration and the intent-derived kind.
 #[cfg(test)]
 mod ticket_2618_tests;
+
+/// The #2687 pins: the creation-inference stack — an unresolved
+/// superclass leaves a generic creation's slots unconstrainable (the
+/// unsolved fill is the exact instantiation), the assignment write
+/// context types the RHS factory's parameter downward, a redirecting
+/// factory's own formals are the invocation's checked parameters, and an
+/// in-scope type parameter is never inference residue.
+#[cfg(test)]
+mod ticket_2687_tests;
 
 
 /// The operand-face pins: the numeric refinement reads an operand the

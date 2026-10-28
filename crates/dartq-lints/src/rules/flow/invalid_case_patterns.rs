@@ -2,7 +2,7 @@ use core::ops::Range;
 
 use dartq_ast::NodeKind;
 
-use super::{Check, RuleSpec};
+use super::{PayloadField, Check, RuleSpec};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/invalid_case_patterns.dart` — a legacy
@@ -38,9 +38,11 @@ fn check(c: &mut Check<'_>) {
     if c.unit.features.patterns {
         return;
     }
-    // Expressions precede the statements (`SwitchCaseEnd`
-    // layout: word 2 counts them; the Label prefix reads off).
-    let count = c.payload(c.node()).get(2).copied().unwrap_or(0) as usize;
+    // Expressions precede the statements (the `SwitchCase` row's
+    // `ExpressionCount` word counts them; the Label prefix reads off).
+    let count = c
+        .field(c.node(), PayloadField::ExpressionCount)
+        .unwrap_or(0) as usize;
     if count == 0 {
         return;
     }
@@ -102,16 +104,10 @@ fn operand_root(c: &Check<'_>, wrapper: u32, extent: Range<usize>) -> Option<(u3
             NodeKind::ParenthesizedExpression
             | NodeKind::ParenthesizedPattern
             | NodeKind::ConstantPattern => {
-                if c.kind(last) == NodeKind::ConstantPattern
-                    && c.payload(last)
-                        .first()
-                        .is_some_and(|&token| token != super::NONE_TOKEN)
-                {
-                    // The explicit `const` operand: the official
-                    // const-literal face (:52-59, :78-81 —
-                    // `constKeyword != null` skips).
-                    return None;
-                }
+                // The `ConstantPattern` row is payload-free — the
+                // explicit-const skip (:52-59, :78-81) had no word to
+                // read and never fired, so a const operand peels like
+                // any parenthesized wrapper (the pinned behavior).
                 run.pop();
             }
             _ => return Some((last, run)),
@@ -159,9 +155,8 @@ fn is_invalid(c: &Check<'_>, run: &[u32], operand: u32) -> bool {
         // `identical(...)` (:60-63) — the name-level dart:core face
         // over the object-pattern spelling of the call.
         NodeKind::ObjectPattern => c
-            .payload(operand)
-            .first()
-            .is_some_and(|&head| c.lexeme(head) == "identical"),
+            .field(operand, PayloadField::FirstName)
+            .is_some_and(|head| c.lexeme(head) == "identical"),
         // `.length` (:72-75) — the name-level dart:core face.
         NodeKind::DotAccess => c.lexeme(c.head_token(operand)) == "length",
         // The bare `_` identifier (:82-87) — the wildcard spelling

@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, query_site, slice, static_type_faces as faces};
+use super::{PayloadField, Check, NodeKind, query_site, slice, static_type_faces as faces};
 use crate::rules::{NONE_TOKEN, same_file_declaration, utf16_token_span};
 
 // The official message templates (`diagnostic.g.dart`): the Future
@@ -74,21 +74,16 @@ pub(super) fn check(c: &mut Check<'_>, want_async: bool) {
 }
 
 /// Whether the nearest enclosing function body carries `async` (the
-/// official `thisOrAncestorOfType<FunctionBody>()` walk): the
-/// `BlockBody`/`ExpressionBody` payload holds the modifier words
-/// (block `[async, star]`, expression `[arrow, end, async, star]` —
-/// the `async_words` layout, the absent word stored as
-/// [`NONE_TOKEN`]), and `sync*` is a synchronous body.
+/// official `thisOrAncestorOfType<FunctionBody>()` walk): both body
+/// rows carry their `async` modifier in the `AsyncKeyword` word (the
+/// absent word stored as [`NONE_TOKEN`]), and `sync*` is a
+/// synchronous body.
 fn enclosing_body_is_async(c: &Check<'_>) -> Option<bool> {
     let body =
         c.path.iter().rev().copied().find(|&row| {
             matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody)
         })?;
-    let slot = match c.kind(body) {
-        NodeKind::BlockBody => 0,
-        _ => 2,
-    };
-    let kw = c.payload(body).get(slot).copied().unwrap_or(NONE_TOKEN);
+    let kw = c.field(body, PayloadField::AsyncKeyword).unwrap_or(NONE_TOKEN);
     Some(kw != NONE_TOKEN && c.lexeme(kw) == "async")
 }
 

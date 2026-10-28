@@ -353,9 +353,12 @@ mod tests {
     /// The family table is the registry's own class column: same name set
     /// as `OFFICIAL_CODES` (both derive from the one TSV parse, so an
     /// official code never misses), table order strictly name-sorted (the
-    /// binary search's precondition), every variant populated, and a miss
-    /// is exactly the non-registry population — lint codes, plugin rows,
-    /// and the dartq-own namespace.
+    /// binary search's precondition), every variant the pin's registry
+    /// carries is populated (the 3.13.7 pin has no `JsInteropCode` rows —
+    /// the variant stays for the upstream class universe and the
+    /// dartq-ai explain face — and is the one unpopulated family), and a
+    /// miss is exactly the non-registry population — lint codes, plugin
+    /// rows, and the dartq-own namespace.
     #[test]
     fn family_table_covers_the_official_registry() {
         assert_eq!(CODE_FAMILIES.len(), OFFICIAL_CODES.len());
@@ -376,8 +379,9 @@ mod tests {
             CODE_FAMILIES.iter().map(|(_, f)| *f).collect();
         assert_eq!(
             distinct.len(),
-            14,
-            "every CodeFamily variant is populated by the registry"
+            13,
+            "every CodeFamily variant the pin's registry carries is populated \
+             (JsInteropCode is the 3.13.7-empty one)"
         );
         for name in ["prefer_single_quotes", "dartq/internal_error", "plug_lint"] {
             assert_eq!(family(name), None, "{name}: non-registry code");

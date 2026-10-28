@@ -59,6 +59,8 @@
 //! entity); a `constEval*` fault keeps its own span and code through
 //! enclosing nodes.
 
+use std::rc::Rc;
+
 use dartq_source::{SourceRange, StringId};
 
 /// A compile-time constant value (the Rust-native stand-in for the
@@ -92,21 +94,28 @@ pub enum ConstantValue {
     /// (the upstream `SymbolState`).
     Symbol(StringId),
     /// A const list by its element values — structural equality, the
-    /// upstream `ListState`.
-    List(Box<[ConstantValue]>),
+    /// upstream `ListState`. Shared (`Rc`): a const referenced twice
+    /// (`list1_n = [list1_{n-1}, list1_{n-1}]`) clones in O(1), not by
+    /// deep-copying the subtree — the deep clone doubled per level and
+    /// blew past 9 GB on the SDK's own 44-level sharing test
+    /// (canonicalize/hashing_memoize_array_test).
+    List(Rc<[ConstantValue]>),
     /// A const set by its element values in source order (the upstream
     /// `SetState` equality is order-insensitive; source order is the
-    /// written order every observed duplicate shares).
-    Set(Box<[ConstantValue]>),
+    /// written order every observed duplicate shares). Shared like
+    /// [`ConstantValue::List`].
+    Set(Rc<[ConstantValue]>),
     /// A const map by its key/value pairs in source order (the upstream
-    /// `MapState` equality is order-insensitive).
-    Map(Box<[(ConstantValue, ConstantValue)]>),
+    /// `MapState` equality is order-insensitive). Shared like
+    /// [`ConstantValue::List`].
+    Map(Rc<[(ConstantValue, ConstantValue)]>),
     /// A const record by its fields — positional first, named pairs
     /// sorted by label so label order does not decide equality (the
-    /// upstream `RecordState`: shape then per-field equality).
+    /// upstream `RecordState`: shape then per-field equality). Shared
+    /// like [`ConstantValue::List`].
     Record {
-        positional: Box<[ConstantValue]>,
-        named: Box<[(StringId, ConstantValue)]>,
+        positional: Rc<[ConstantValue]>,
+        named: Rc<[(StringId, ConstantValue)]>,
     },
     /// An opaque constant instance whose identity no M2 diagnostic
     /// observes.
@@ -804,7 +813,7 @@ fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth
         // positional.
         InstanceKind::Record => ConstantValue::Record {
             positional: values.into(),
-            named: Box::default(),
+            named: Rc::default(),
         },
         _ => ConstantValue::Instance(kind),
     })

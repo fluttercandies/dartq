@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, async_words, member_declaration_name, override_annotation};
+use super::{PayloadField, Check, NodeKind, RuleSpec, async_words, member_declaration_name, override_annotation};
 use crate::rules::{NONE_TOKEN, is_statement_row, last_child, type_before, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_async.dart:100-203`
@@ -166,12 +166,13 @@ fn scan_body(c: &Check<'_>, owner: u32) -> BodyScan {
             NodeKind::ForIn => {
                 // `visitForStatement`/`visitForElement` await keyword
                 // (:62-71): `await for` — the parts' head is the
-                // `await` token (payload word 0 present).
+                // `await` token (the `AwaitKeyword` word present).
                 if c.collect_direct(row)
                     .into_iter()
                     .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
                     .is_some_and(|parts| {
-                        c.payload(parts).first().copied().unwrap_or(NONE_TOKEN) != NONE_TOKEN
+                        c.field(parts, PayloadField::AwaitKeyword).unwrap_or(NONE_TOKEN)
+                            != NONE_TOKEN
                     })
                 {
                     scan.has_await = true;
@@ -192,8 +193,8 @@ fn scan_body(c: &Check<'_>, owner: u32) -> BodyScan {
             NodeKind::ExpressionBody => {
                 // `visitExpressionFunctionBody` (:56-59): the `=>`
                 // value face reads the token interior.
-                let arrow = c.payload(row).first().copied().unwrap_or(NONE_TOKEN);
-                let semi = c.payload(row).get(1).copied().unwrap_or(NONE_TOKEN);
+                let arrow = c.field(row, PayloadField::Arrow).unwrap_or(NONE_TOKEN);
+                let semi = c.field(row, PayloadField::Semicolon).unwrap_or(NONE_TOKEN);
                 if semi == NONE_TOKEN || !future_headed(c, arrow + 1) {
                     scan.returns_only_future = false;
                 }

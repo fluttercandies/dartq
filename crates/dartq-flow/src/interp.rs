@@ -2239,6 +2239,15 @@ impl<'o> Interp<'o> {
                 is_late: meta.late,
                 is_final: meta.is_final,
                 definitely_unassigned: model.unassigned,
+                // `isPotentiallyNonNullable(element.type)` at the name level
+                // (type_analyzer.dart:5016): nullable, `dynamic`, `Null`,
+                // and unknown heads are the nullable-equivalent faces that
+                // suppress the report.
+                potentially_non_nullable: !meta.ty.nullable
+                    && !matches!(
+                        meta.ty.base,
+                        crate::ty::Base::Dynamic | crate::ty::Base::Unknown | crate::ty::Base::Null
+                    ),
                 declared_type: meta.decl_span,
             });
         }

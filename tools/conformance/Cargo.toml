@@ -1,0 +1,16 @@
+[package]
+name = "conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "Conformance corpus tool: extracts per-entry test cases from a pinned Dart SDK source tree."
+
+[dependencies]
+blake3 = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

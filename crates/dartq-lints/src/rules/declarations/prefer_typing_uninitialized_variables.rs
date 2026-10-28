@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_typing_uninitialized_variables.dart:31-51`
 /// — an untyped declaration (`node.type == null`) with an uninitialized
@@ -19,12 +19,12 @@ fn check(c: &mut Check<'_>) {
     // (`ForEachParts.loopVariable`), never a `VariableDeclarationList`,
     // so its production row never reports. The row tiles inside the
     // for node: the sealed `ForIn` statement face, or the element
-    // face's `ForControlFlow` with the for-in flag in payload word 1
-    // (`end_for_in_control_flow` patches 1; a classic `for` element
-    // patches 0 and its init row keeps reporting).
+    // face's `ForControlFlow` with the for-in flag in the
+    // `IsForIn` word (`end_for_in_control_flow` patches 1; a classic
+    // `for` element patches 0 and its init row keeps reporting).
     let is_for_each = c.ancestor(1).is_some_and(|parent| match c.kind(parent) {
         NodeKind::ForIn => true,
-        NodeKind::ForControlFlow => c.payload(parent).get(1) == Some(&1),
+        NodeKind::ForControlFlow => c.field(parent, PayloadField::IsForIn) == Some(1),
         _ => false,
     });
     if is_for_each {

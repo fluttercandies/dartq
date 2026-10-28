@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, constructor_name_part, container_members, is_deprecated_metadata, top_level_annotations, type_name_echo};
+use super::{PayloadField, Check, NodeKind, RuleSpec, constructor_name_part, container_members, is_deprecated_metadata, top_level_annotations, type_name_echo};
 use crate::rules::{NONE_TOKEN, initialized_identifier_name, member_annotations, tail_token, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/deprecated_consistency.dart:41-102`
@@ -84,11 +84,13 @@ fn check_parameter(c: &mut Check<'_>) {
     let node = c.node();
     // `declaredElement is FieldFormalParameterElement` (:70): the
     // `this.` receiver face (`super.x` is a super formal).
-    let receiver = c.payload(node).first().copied().unwrap_or(NONE_TOKEN);
+    let receiver = c
+        .field(node, PayloadField::Receiver)
+        .unwrap_or(NONE_TOKEN);
     if receiver == NONE_TOKEN || c.lexeme(receiver) != "this" {
         return;
     }
-    let Some(&name_token) = c.payload(node).get(1) else {
+    let Some(name_token) = c.field(node, PayloadField::Name) else {
         return;
     };
     if name_token == NONE_TOKEN {

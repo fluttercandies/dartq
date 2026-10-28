@@ -557,6 +557,7 @@ impl<'a> Face<'a> {
             has_unnamed_constructor,
             has_const_constructor,
             ctor_formals,
+            factory_formals,
             annotations,
         } = container;
         self.field("container");
@@ -665,6 +666,14 @@ impl<'a> Face<'a> {
             let ctor_name = self.inner[j];
             self.name(ctor_name);
             self.formals(&ctor_formals[&ctor_name]);
+        }
+        // The factory lane's own formals (the #2687 argument-check face):
+        // the same sorted-map encoding.
+        Self::sorted(self.strings, &mut self.inner, factory_formals.keys().copied());
+        for j in 0..self.inner.len() {
+            let ctor_name = self.inner[j];
+            self.name(ctor_name);
+            self.formals(&factory_formals[&ctor_name]);
         }
         // Member names are a hash map: sort by text, then render each
         // member's full executable shape. The nested level sorts into the

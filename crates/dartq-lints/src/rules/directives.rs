@@ -11,7 +11,7 @@
 //! opens declaration nodes after `parseMetadataStar`), so `library_annotations`
 //! reads the annotated node as the star's next sibling.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::RuleSpec;
@@ -33,11 +33,6 @@ fn behind_prelude(c: &Check<'_>, node: u32) -> u32 {
         return node;
     }
     c.collect_direct(node).first().copied().unwrap_or(node)
-}
-
-/// The payload bool word (`bool as u32`; a missing word reads false).
-fn payload_flag(c: &Check<'_>, node: u32, word: usize) -> bool {
-    c.payload(node).get(word).copied().unwrap_or(0) != 0
 }
 
 /// The import prefix identifier — the only direct [`NodeKind::Identifier`]
@@ -75,13 +70,10 @@ pub(crate) fn prefixed_dart_core_name(c: &Check<'_>, prefix: &str, name: &str) -
         if c.lexeme(c.head_token(prefix_row)) != prefix {
             continue;
         }
-        // Word 1 is the `deferred` keyword token (`TOKEN_NONE` when the
-        // import is not deferred) — a deferred import's constants never
-        // load.
-        if c.payload(row)
-            .get(1)
-            .copied()
-            .unwrap_or(crate::rules::NONE_TOKEN)
+        // The `DeferredKeyword` word carries the `deferred` keyword token
+        // (`TOKEN_NONE` when the import is not deferred) — a deferred
+        // import's constants never load.
+        if c.field(row, PayloadField::DeferredKeyword).unwrap_or(crate::rules::NONE_TOKEN)
             != crate::rules::NONE_TOKEN
         {
             continue;
@@ -128,7 +120,11 @@ fn metadata_name_face(c: &Check<'_>, meta: u32) -> Option<(Option<u32>, u32)> {
         .collect();
     match names.as_slice() {
         [name] => Some((None, *name)),
-        [prefix, name] if payload_flag(c, meta, 0) => Some((Some(*prefix), *name)),
+        [prefix, name]
+            if c.field(meta, PayloadField::PeriodBeforeName).unwrap_or(0) != 0 =>
+        {
+            Some((Some(*prefix), *name))
+        }
         _ => None,
     }
 }
@@ -779,7 +775,7 @@ pub(crate) mod unnecessary_library_directive {
 }
 
 pub(crate) mod unnecessary_library_name {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_library_name.dart:28-44`
     /// — a named `library` directive reports at the name. The rule registers
@@ -798,7 +794,7 @@ pub(crate) mod unnecessary_library_name {
         if !c.unit.features.unnamed_libraries {
             return;
         }
-        if !super::payload_flag(c, c.node(), 0) {
+        if c.field(c.node(), PayloadField::HasName).unwrap_or(0) == 0 {
             return;
         }
         // The name is the node's first child (Identifier or Qualified).
@@ -811,7 +807,7 @@ pub(crate) mod unnecessary_library_name {
 }
 
 pub(crate) mod use_string_in_part_of_directives {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/use_string_in_part_of_directives.dart:29-47`
     /// — a `part of` in the dotted-name form reports at the directive. The
@@ -830,7 +826,7 @@ pub(crate) mod use_string_in_part_of_directives {
         if c.unit.features.enhanced_parts {
             return;
         }
-        if !super::payload_flag(c, c.node(), 1) {
+        if c.field(c.node(), PayloadField::HasName).unwrap_or(0) == 0 {
             return;
         }
         let range = c.utf16_span(c.node());
@@ -1068,7 +1064,7 @@ pub(crate) mod directives_ordering {
 }
 
 pub(crate) mod library_names {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/library_names.dart:28-46` — a
     /// named `library` directive whose name is not
@@ -1084,7 +1080,7 @@ pub(crate) mod library_names {
 );
 
     fn check(c: &mut Check<'_>) {
-        if !super::payload_flag(c, c.node(), 0) {
+        if c.field(c.node(), PayloadField::HasName).unwrap_or(0) == 0 {
             return;
         }
         // The name pieces are the node's children — the identifiers plus

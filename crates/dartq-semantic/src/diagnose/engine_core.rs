@@ -332,6 +332,11 @@ impl<'a> Engine<'a> {
             extension_nullable_resolved: FxHashSet::default(),
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
+            member_read_ends: FxHashMap::default(),
+            recv_memo: RefCell::new(FxHashMap::default()),
+            recv_memo_active: false,
+            cascade_first_spans: FxHashMap::default(),
+            recv_walk_depth: Cell::new(0),
             member_recv_tys: FxHashMap::default(),
             index_result_recvs: FxHashMap::default(),
             call_ends: Vec::new(),
@@ -1420,6 +1425,7 @@ impl<'a> Engine<'a> {
         self.pattern_group_open = None;
         let mark = self.frame_local_marks.pop().unwrap_or(self.locals.len());
         if mark >= self.locals.len() {
+            self.drop_stale_local_hits(mark);
             self.locals.truncate(mark);
             return;
         }
@@ -1508,7 +1514,24 @@ impl<'a> Engine<'a> {
             };
             self.stage_usage(code, range, &name);
         }
+        self.drop_stale_local_hits(mark);
         self.locals.truncate(mark);
+    }
+
+    /// The `local_hits` pairing invariant: every entry's index must point
+    /// into the live `locals` range. A read credited inside a frame can
+    /// outlive it — parser recovery re-walks tokens after the frame's body
+    /// closed (the `for`-body double walk), so a write-intent conversion
+    /// may consume the entry after `locals` truncated. Dropping the
+    /// truncated range's entries keeps the read's `uses` credit (the
+    /// declaration is gone — no verdict reads it) and turns the
+    /// conversion's `remove` into a miss instead of an out-of-bounds
+    /// index (`parser_recovery_04`'s `x.(…)` face).
+    fn drop_stale_local_hits(&mut self, mark: usize) {
+        if self.local_hits.is_empty() {
+            return;
+        }
+        self.local_hits.retain(|_, hit| (*hit as usize) < mark);
     }
 
     /// Stages one usage-cluster diagnostic (merged into the report at the

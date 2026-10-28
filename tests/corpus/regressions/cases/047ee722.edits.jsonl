@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/error_recovery/period_missing_name.dart","length":120,"line":1,"new_text":"void f(a) {\n  a.();\n  a.(0);\n  a.(0, b: 1);\n  a?.(0);\n  a.b.(0).c;\n  a..b.(0);\n  a.[0];\n  a.<int>[];\n  a.{};\n  a.\"s\";\n}\n"}

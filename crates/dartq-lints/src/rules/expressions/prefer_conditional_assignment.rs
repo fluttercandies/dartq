@@ -1,5 +1,5 @@
 use super::prefer_null_aware_method_calls::then_branch_run;
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_conditional_assignment.dart`
 /// — an `if` without `else` (`visitIfStatement` :70-79) whose condition
@@ -29,7 +29,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 fn check(c: &mut Check<'_>) {
     let node = c.node();
     // `node.elseStatement != null` bails (:71-73).
-    if c.payload(node).first().copied() != Some(NONE_TOKEN) {
+    if c.field(node, PayloadField::ElseKeyword) != Some(NONE_TOKEN) {
         return;
     }
     let kids = c.collect_direct(node);
@@ -41,7 +41,7 @@ fn check(c: &mut Check<'_>) {
     };
     // `if (expr case pattern)` — the pattern face has no expression
     // condition to test.
-    if c.payload(kids[cond_pos]).first().copied() != Some(NONE_TOKEN) {
+    if c.field(kids[cond_pos], PayloadField::CaseKeyword) != Some(NONE_TOKEN) {
         return;
     }
     // The condition binary: the adopted condition's tail row, peeling
@@ -58,7 +58,7 @@ fn check(c: &mut Check<'_>) {
     if c.kind(condition) != NodeKind::BinaryExpression {
         return;
     }
-    let Some(op) = c.payload_word(condition, 0) else {
+    let Some(op) = c.field_token(condition, PayloadField::Operator) else {
         return;
     };
     // `operator.type == TokenType.EQ_EQ` (:40) — `!=` never fires.
@@ -154,7 +154,7 @@ fn check(c: &mut Check<'_>) {
         return;
     };
     let assign = branch[assign_pos];
-    let Some(assign_op) = c.payload_word(assign, 0) else {
+    let Some(assign_op) = c.field_token(assign, PayloadField::Operator) else {
         return;
     };
     // `expression.leftHandSide`: the owner-side pieces before the
@@ -238,7 +238,7 @@ fn chain_names(
                 }
             }
             NodeKind::DotAccess => {
-                let dot = c.payload(row).first().copied()?;
+                let dot = c.field(row, PayloadField::Operator)?;
                 let selector = c.unit.tokens.get(dot as usize + 1)?;
                 let name = c.unit.tokens.lexeme(c.unit.source, dot as usize + 1);
                 if !row_tokens.contains(&(dot + 1)) {

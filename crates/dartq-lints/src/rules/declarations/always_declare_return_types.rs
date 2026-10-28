@@ -1,6 +1,6 @@
 use std::path::Component;
 
-use super::{Check, NodeKind, RuleSpec, get_set_token, narrow_u32, type_before};
+use super::{PayloadField, Check, NodeKind, RuleSpec, get_set_token, narrow_u32, type_before};
 
 /// Official: `pkg/linter/lib/src/rules/always_declare_return_types.dart:38-85`
 /// — a function, method, getter, or old-form `typedef` written without a
@@ -99,7 +99,7 @@ fn check(c: &mut Check<'_>) {
         NodeKind::Typedef => {
             // The generic alias form (`typedef F = ...`) is a different
             // official node (:57-63 fires only on `FunctionTypeAlias`).
-            if c.payload(node).get(1).copied() != Some(crate::rules::NONE_TOKEN) {
+            if c.field(node, PayloadField::Equals) != Some(crate::rules::NONE_TOKEN) {
                 return;
             }
             // The name carries the `TypedefDeclaration` context; the
@@ -112,7 +112,7 @@ fn check(c: &mut Check<'_>) {
                 .copied()
                 .find(|&kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first().copied()
+                        && c.field(kid, PayloadField::Context)
                             == Some(dartq_parser::IdentifierContext::TypedefDeclaration as u32)
                 })
                 .or_else(|| {
@@ -139,7 +139,7 @@ fn check(c: &mut Check<'_>) {
 /// ([`type_before`] on the enclosing window — the operator name is a
 /// sibling of the `Method` row, not a child).
 fn report_untyped_operator(c: &mut Check<'_>, node: u32, op_row: u32) {
-    let Some(op_token) = c.payload_word(op_row, 0) else {
+    let Some(op_token) = c.field_token(op_row, PayloadField::Name) else {
         return;
     };
     // `operator []=` skips (:70; `TokenType.INDEX_EQ`).
@@ -198,7 +198,7 @@ fn report_name(c: &Check<'_>, node: u32) -> Option<u32> {
     if let Some(name) = kids.iter().copied().find(|&kid| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
                         || ctx

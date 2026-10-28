@@ -52,13 +52,155 @@ pub(crate) fn await_return_entry(input: &FixInput<'_>) -> Option<(u32, u32, Stri
 /// `avoid_return_types_on_setters`, `avoid_types_on_closure_parameters`,
 /// `type_init_formals`): the reported type goes with the whitespace run to
 /// the next token (`range.startStart(type, next)`).
+///
+/// Two report postures reach this face: the type node alone
+/// (`avoid_return_types_on_setters` reports `utf16_span(type)` — the
+/// slice is exactly the type) and the whole parameter
+/// (`avoid_annotating_with_dynamic` reports `utf16_span(parameter)` —
+/// the slice carries the parameter's modifiers, the type, and the
+/// trailing name). The type run is re-derived from the slice's head:
+/// after any leading modifier words the first type grammar run
+/// (`ident`, `<…>` arguments, `.`-links) is the type; a single
+/// identifier (or `this.`/`super.` prefixed) name following it to the
+/// slice's end confirms the parameter-wide posture, and the deletion
+/// then starts at the type, never at the parameter.
 pub(crate) fn remove_reported_type(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let slice = slice16(input.text, &input.range)?;
     let first = slice.chars().next()?;
     if !(first.is_ascii_alphabetic() || first == '_' || first == '$' || first == '<') {
         return None;
     }
-    remove_keyword(input.text, input.range.start, slice)
+    let type_len = parameter_type_run(slice)?;
+    if type_len == slice.len() {
+        return remove_keyword(input.text, input.range.start, slice);
+    }
+    let prefix = &slice[..type_len];
+    remove_keyword(input.text, input.range.start, prefix)
+}
+
+/// The byte length of the parameter slice's type run: leading modifier
+/// words (`final`/`var`/`const`/`covariant`/`required`), then the type
+/// grammar head — identifier, `<…>` arguments, `.`-links, an optional
+/// `?` tail, and a `Function(…)` suffix. `None` unless the run reaches
+/// the slice's end (the type-node posture) or what follows is the
+/// parameter's own name tail (a lone identifier, or `this.x`/`super.x`)
+/// — the parameter-node posture the cut then anchors inside.
+fn parameter_type_run(slice: &str) -> Option<usize> {
+    let bytes = slice.as_bytes();
+    let mut at = 0usize;
+    loop {
+        let word_end = bytes[at..]
+            .iter()
+            .position(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'$')
+            .map_or(bytes.len(), |i| at + i);
+        let word = &slice[at..word_end];
+        if matches!(word, "final" | "var" | "const" | "covariant" | "required")
+            && word_end < bytes.len()
+            && matches!(bytes[word_end], b' ' | b'\t')
+        {
+            at = word_end + 1;
+            continue;
+        }
+        break;
+    }
+    let mut end = at
+        + bytes[at..]
+            .iter()
+            .position(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'$')
+            .map_or(bytes.len() - at, |i| i);
+    if end == at {
+        return None;
+    }
+    loop {
+        match bytes.get(end) {
+            Some(b'<') => end = balanced_group(bytes, end, b'<', b'>')?,
+            Some(b'.') => {
+                let next = end + 1;
+                let name_end = bytes[next..]
+                    .iter()
+                    .position(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'$')
+                    .map_or(bytes.len(), |i| next + i);
+                if name_end == next {
+                    return None;
+                }
+                end = name_end;
+            }
+            _ => break,
+        }
+    }
+    if bytes.get(end) == Some(&b'?') {
+        end += 1;
+    }
+    // The `T Function(…)` suffix of a written function type: the word
+    // after the run's whitespace must be exactly `Function`, and a real
+    // function type always carries one of `(`/`<`/`?` behind it — a
+    // bare `Function` is the parameter's own NAME (`void f(dynamic
+    // Function) {}` names the parameter `Function`), never a suffix.
+    let ws = bytes[end..]
+        .iter()
+        .take_while(|&&b| matches!(b, b' ' | b'\t'))
+        .count();
+    if slice[end + ws..].starts_with("Function")
+        && !matches!(
+            bytes.get(end + ws + 8),
+            Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$'
+        )
+        && matches!(
+            bytes.get(end + ws + 8),
+            Some(b'(' | b'<' | b'?')
+        )
+    {
+        end += ws + 8;
+        if bytes.get(end) == Some(&b'<') {
+            end = balanced_group(bytes, end, b'<', b'>')?;
+        }
+        if bytes.get(end) == Some(&b'(') {
+            end = balanced_group(bytes, end, b'(', b')')?;
+        }
+        if bytes.get(end) == Some(&b'?') {
+            end += 1;
+        }
+    }
+    if end == bytes.len() {
+        return Some(end);
+    }
+    // The parameter posture's tail: whitespace then the name alone to
+    // the end (`dynamic x`, `final List<int> this.x`).
+    let tail = slice[end..].trim_start_matches([' ', '\t']);
+    let name_len = tail
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if name_len == tail.len() && name_len > 0 {
+        return Some(end);
+    }
+    let dotted = tail
+        .strip_prefix("this.")
+        .or_else(|| tail.strip_prefix("super."));
+    dotted
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        })
+        .then_some(end)
+}
+
+/// The byte index just past the balanced `open`/`close` group starting
+/// at `at` (`None` on unbalanced input — a shape this face refuses).
+fn balanced_group(bytes: &[u8], at: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    for (cursor, &byte) in bytes.iter().enumerate().skip(at) {
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(cursor + 1);
+            }
+        }
+    }
+    None
 }
 
 /// `omit_local_variable_types` / `omit_obvious_local_variable_types` /
@@ -69,6 +211,14 @@ pub(crate) fn remove_reported_type(input: &FixInput<'_>) -> Option<(u32, u32, St
 /// moves `<…>` into the initializer as a second edit — and so does a
 /// `{…}` initializer (the official ambiguity guard: `var x = {}` changes
 /// the literal's meaning).
+///
+/// Two report postures reach the face: the token-run span
+/// (`omit_obvious_*` report the type's own tokens) and the
+/// type-through-name span (`omit_local_variable_types` reports
+/// `startStart(type, firstVariable)` — the type plus the whitespace run
+/// to the first name). The slice's trailing whitespace is normalized
+/// away first: `var` replaces the type text alone, keeping the gap the
+/// name needs (`int x` and `int ` both become `var x`).
 pub(crate) fn omit_type_with_var(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let text = input.text;
     let slice = slice16(text, &input.range)?;
@@ -77,6 +227,10 @@ pub(crate) fn omit_type_with_var(input: &FixInput<'_>) -> Option<(u32, u32, Stri
             .chars()
             .any(|c| matches!(c, ',' | '=' | ';' | '<' | '>' | '(' | ')'))
     {
+        return None;
+    }
+    let trimmed = slice.trim_end_matches([' ', '\t']);
+    if trimmed.is_empty() {
         return None;
     }
     let rest = text.get(utf16_offset_to_byte(text, input.range.end)..)?;
@@ -90,37 +244,41 @@ pub(crate) fn omit_type_with_var(input: &FixInput<'_>) -> Option<(u32, u32, Stri
         return None;
     }
     let after_name = after_ws[name_len..].trim_start_matches([' ', '\t']);
+    let carries_gap = slice.len() != trimmed.len();
+    let type_len16 = input.range.end - input.range.start
+        - u32::try_from(slice.len() - trimmed.len()).ok()?;
     if after_name.starts_with('=') {
         let initializer = after_name[1..].trim_start_matches([' ', '\t']);
         if initializer.starts_with('{') {
             return None;
         }
+        return Some((input.range.start, type_len16, "var".to_owned()));
+    }
+    if after_name.starts_with(',') {
+        // Multi-declarator: `var ` replaces the type through the first
+        // name's start (the official `startStart(type, firstVariable)`).
+        // The gap rides the span in the type-through-name posture and
+        // the text past the span's end in the token-run posture.
+        if !carries_gap {
+            let cut_bytes = rest.len() - after_ws.len()
+                + name_len
+                + (after_ws[name_len..].len() - after_name.len());
+            let start = utf16_offset_to_byte(text, input.range.start);
+            let end = utf16_offset_to_byte(text, input.range.end);
+            return Some((
+                input.range.start,
+                utf16_count(text.get(start..end + cut_bytes)?),
+                "var ".to_owned(),
+            ));
+        }
         return Some((
             input.range.start,
             input.range.end - input.range.start,
-            "var".to_owned(),
-        ));
-    }
-    if after_name.starts_with(',') {
-        // Multi-declarator: `var ` replaces the type plus the whitespace
-        // before the first name.
-        let cut_bytes = rest.len() - after_ws.len()
-            + name_len
-            + (after_ws[name_len..].len() - after_name.len());
-        let start = utf16_offset_to_byte(text, input.range.start);
-        let end = utf16_offset_to_byte(text, input.range.end);
-        return Some((
-            input.range.start,
-            utf16_count(text.get(start..end + cut_bytes)?),
             "var ".to_owned(),
         ));
     }
     if after_name.starts_with("in") && !after_name[2..].starts_with(is_identifier_char) {
-        return Some((
-            input.range.start,
-            input.range.end - input.range.start,
-            "var".to_owned(),
-        ));
+        return Some((input.range.start, type_len16, "var".to_owned()));
     }
     None
 }
@@ -128,7 +286,17 @@ pub(crate) fn omit_type_with_var(input: &FixInput<'_>) -> Option<(u32, u32, Stri
 /// `prefer_final_locals` / `prefer_final_fields`: the reported `var`
 /// keyword becomes `final` (the official `MakeFinal` keyword face), the
 /// written type gains `final ` (the type face). A multi-variable list
-/// drops — the official bails unless the list holds exactly one variable.
+/// drops — the official bails unless the list holds exactly one
+/// variable.
+///
+/// `prefer_final_fields` reports the variable's own row — name-anchored,
+/// width-0 without an initializer, through the initializer's end with
+/// one — so the token face walks back from the hit token to the
+/// declaration list's head: a `var` keyword swaps whole, a `late` head
+/// inserts ` final` after the keyword (the official `lateKeyword` face),
+/// and a written type takes `final ` at its head — after the
+/// field-level modifiers (`static`/`external`/`covariant`/`abstract`),
+/// where the official's `list.offset` sits.
 pub(crate) fn make_declaration_final(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let text = input.text;
     let slice = slice16(text, &input.range)?;
@@ -139,14 +307,161 @@ pub(crate) fn make_declaration_final(input: &FixInput<'_>) -> Option<(u32, u32, 
             "final".to_owned(),
         ));
     }
-    if !slice.is_empty() && slice.chars().next()?.is_ascii_alphabetic() {
-        return single_declarator_follows(text, input.range.end).then_some((
-            input.range.start,
-            0,
-            "final ".to_owned(),
-        ));
+    if let Some(rest) = slice.strip_prefix("var")
+        && rest.starts_with([' ', '\t'])
+    {
+        // The declaration-list posture (`var x = 1` reported whole): the
+        // keyword swaps in place; a second declarator refuses. The gate
+        // reads tokens when the run parsed one (a string initializer may
+        // carry a comma — `var s = 'a,b'` — the AST list never splits
+        // on it), the raw slice otherwise.
+        if let Some(tokens) = input.tokens {
+            let head = token_at(tokens, input.range.start)?;
+            if !single_declarator_ahead(tokens, head) {
+                return None;
+            }
+        } else if !single_declarator_list(slice) {
+            return None;
+        }
+        return Some((input.range.start, 3, "final".to_owned()));
     }
-    None
+    if !slice.is_empty()
+        && !slice.contains('=')
+        && slice.chars().next()?.is_ascii_alphabetic()
+    {
+        // The type face: `final ` lands at the head. The single-variable
+        // gate reads the declarators the slice already carries when the
+        // report is the whole list, the text past the span's end when it
+        // is the type alone — over tokens when the run parsed one (a
+        // string initializer may carry a comma), the raw slice
+        // otherwise.
+        let single = if slice.contains(' ') {
+            match input.tokens {
+                Some(tokens) => {
+                    let head = token_at(tokens, input.range.start)?;
+                    single_declarator_ahead(tokens, head)
+                }
+                None => single_declarator_list(slice),
+            }
+        } else {
+            single_declarator_follows(text, input.range.end)
+        };
+        if !single {
+            return None;
+        }
+        return Some((input.range.start, 0, "final ".to_owned()));
+    }
+    // The name-anchored report (`prefer_final_fields`): the head comes
+    // from the token stream behind the hit token. Without tokens the
+    // face refuses — the span alone cannot place the insertion.
+    let tokens = input.tokens?;
+    let hit = token_at(tokens, input.range.start)?;
+    if !single_declarator_ahead(tokens, hit) {
+        return None;
+    }
+    let Some(prev) = hit.checked_sub(1) else {
+        return None;
+    };
+    match kind_of(tokens, prev)? {
+        TokenKind::Keyword(Keyword::Var) => {
+            let start = tokens.get(prev)?.utf16_offset;
+            Some((start, 3, "final".to_owned()))
+        }
+        TokenKind::Keyword(Keyword::Late) => {
+            let at = utf16_end(tokens, text, prev)?;
+            Some((at, 0, " final".to_owned()))
+        }
+        TokenKind::Identifier | TokenKind::Keyword(_) | TokenKind::Gt | TokenKind::GtGt
+        | TokenKind::GtGtGt => {
+            let head = field_declaration_head(tokens, prev)?;
+            let start = tokens.get(head)?.utf16_offset;
+            Some((start, 0, "final ".to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// The first token of a field declaration's written-type run, walking
+/// back from the run's tail: `>`-tails jump their angle group, group
+/// tails their opener, `.`-links their head atom. The field-level
+/// modifier keywords (`static`/`external`/`covariant`/`abstract`/`late`)
+/// end the walk — the official inserts at the list's own head, behind
+/// them.
+fn field_declaration_head(tokens: &TokenTable, tail: usize) -> Option<usize> {
+    let mut head = tail;
+    if matches!(
+        kind_of(tokens, head),
+        Some(TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt)
+    ) {
+        head = angle_group_start(tokens, head)?.checked_sub(1)?;
+    }
+    loop {
+        let prev = head.checked_sub(1)?;
+        match kind_of(tokens, prev)? {
+            TokenKind::Period | TokenKind::QuestionPeriod => {
+                head = prev.checked_sub(1)?;
+            }
+            close @ (TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly) => {
+                head = matching_open(tokens, prev, close)?;
+            }
+            TokenKind::Keyword(
+                Keyword::Static
+                | Keyword::External
+                | Keyword::Covariant
+                | Keyword::Abstract
+                | Keyword::Late,
+            ) => return Some(head),
+            TokenKind::Identifier | TokenKind::Keyword(_) => head = prev,
+            _ => return Some(head),
+        }
+    }
+}
+
+/// The official `MakeFinal` single-variable gate over the tokens ahead
+/// of `from` (the hit's own token): no depth-0 `,` before the
+/// declaration's `;` — commas inside brackets bind their own lists.
+fn single_declarator_ahead(tokens: &TokenTable, from: usize) -> bool {
+    let mut depth = 0u32;
+    let mut cursor = from;
+    loop {
+        match kind_of(tokens, cursor) {
+            Some(TokenKind::Comma) if depth == 0 => return false,
+            Some(TokenKind::Semicolon | TokenKind::Eof) => return true,
+            Some(
+                TokenKind::OpenParen
+                | TokenKind::OpenSquare
+                | TokenKind::OpenCurly
+                | TokenKind::StringInterpolationExpression,
+            ) => depth += 1,
+            Some(
+                TokenKind::CloseParen
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+                | TokenKind::StringInterpolationIdentifier,
+            ) => depth = depth.saturating_sub(1),
+            None => return false,
+            _ => {}
+        }
+        cursor += 1;
+    }
+}
+
+/// The official `MakeFinal` single-variable gate over a declaration-list
+/// slice: exactly one declarator — no depth-0 `,` (the only separators a
+/// declaration slice carries at depth 0 are declarator commas; type
+/// arguments, argument lists, and collection literals bind their own
+/// brackets).
+fn single_declarator_list(slice: &str) -> bool {
+    let mut depth = 0usize;
+    for c in slice.chars() {
+        match c {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Whether `name =` (one declarator with an initializer) follows the
@@ -176,6 +491,14 @@ pub(crate) fn single_declarator_follows(text: &str, end16: u32) -> bool {
 /// at the parameter's (or for-each variable's) first content token; a
 /// leading `var` swaps to `final` and a `covariant` modifier keeps its
 /// head position (the official `MakeFinal` faces).
+///
+/// `prefer_final_in_for_each` reports the variable's NAME token (the
+/// official `reportAtToken(name)`), so the token-stream face walks back
+/// from the name to the declaration's head: a `var` keyword swaps whole
+/// (the official `range.token(keyword)` replacement — `for (var e …)`
+/// becomes `final e`), a written type takes `final ` at its head (the
+/// official keyword-null insertion at the `DeclaredIdentifier`'s start),
+/// and a bare name takes it at the name itself (`for (e …)`).
 pub(crate) fn make_parameter_final(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let slice = slice16(input.text, &input.range)?;
     if slice == "var" {
@@ -197,9 +520,67 @@ pub(crate) fn make_parameter_final(input: &FixInput<'_>) -> Option<(u32, u32, St
     }
     let first = slice.chars().next()?;
     if first.is_ascii_alphabetic() || first == '_' || first == '$' {
-        return Some((input.range.start, 0, "final ".to_owned()));
+        // The name-token report: the declaration's head stands behind
+        // the name in the token stream. Without tokens (the parameter
+        // spans' posture), `final ` lands at the hit start as before.
+        let Some(tokens) = input.tokens else {
+            return Some((input.range.start, 0, "final ".to_owned()));
+        };
+        let name = token_at(tokens, input.range.start)?;
+        let Some(prev) = name.checked_sub(1) else {
+            return None;
+        };
+        let name_is_head = tokens
+            .get(name)
+            .is_some_and(|token| token.utf16_offset == input.range.start);
+        return match kind_of(tokens, prev)? {
+            TokenKind::Keyword(Keyword::Var) => {
+                let start = tokens.get(prev)?.utf16_offset;
+                Some((start, 3, "final".to_owned()))
+            }
+            TokenKind::OpenParen => Some((input.range.start, 0, "final ".to_owned())),
+            TokenKind::Identifier
+            | TokenKind::Keyword(_)
+            | TokenKind::Gt
+            | TokenKind::GtGt
+            | TokenKind::GtGtGt
+                if name_is_head =>
+            {
+                let head = declaration_type_head(tokens, prev)?;
+                let start = tokens.get(head)?.utf16_offset;
+                Some((start, 0, "final ".to_owned()))
+            }
+            _ => None,
+        };
     }
     None
+}
+
+/// The first token of the type run ending at `tail` (a parameter's or
+/// for-each variable's written type): `>`-tails jump their angle group,
+/// then the type's `.`-linked head atoms walk back — identifier chains
+/// and balanced group tails alike.
+fn declaration_type_head(tokens: &TokenTable, tail: usize) -> Option<usize> {
+    let mut head = tail;
+    if matches!(
+        kind_of(tokens, head),
+        Some(TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt)
+    ) {
+        head = angle_group_start(tokens, head)?.checked_sub(1)?;
+    }
+    loop {
+        let prev = head.checked_sub(1)?;
+        match kind_of(tokens, prev)? {
+            TokenKind::Period | TokenKind::QuestionPeriod => {
+                head = prev.checked_sub(1)?;
+            }
+            close @ (TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly) => {
+                head = matching_open(tokens, prev, close)?;
+            }
+            TokenKind::Identifier | TokenKind::Keyword(_) => head = prev,
+            _ => return Some(head),
+        }
+    }
 }
 
 /// `prefer_const_constructors` / `prefer_const_constructors_in_immutables`
@@ -370,14 +751,153 @@ pub(crate) fn add_leading_newline(input: &FixInput<'_>) -> Option<(u32, u32, Str
 }
 
 /// `unnecessary_ignore`: the ignore comment's line goes (the official
-/// `RemoveComment` deletes the comment's lines range — [`drop_span_statement`]'s
-/// shape).
+/// `RemoveComment.ignore` finds the comment covering the diagnostic and
+/// deletes its lines range — [`drop_span_statement`]'s shape).
+///
+/// The engine's epilogue reports the citation's NAME token, not the
+/// comment; the name-token face finds the comment in the hit's own
+/// trivia window — the gap between the two code tokens bracketing the
+/// hit, where only whitespace and comments live (a `//` in a URL string
+/// is inside a STRING token, never in a window). A comment with code
+/// after it on its line (a block comment's only shape) deletes exactly
+/// the comment — the official's `start = comment.offset` case,
+/// preserving the indent before and the trailing code after; the whole
+/// comment always goes, sibling cited codes included (the official has
+/// no per-code list surgery).
 pub(crate) fn remove_ignore_comment(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
-    let slice = slice16(input.text, &input.range)?;
-    if !slice.starts_with("//") || !slice.contains("ignore") {
-        return None;
+    let text = input.text;
+    let start = utf16_offset_to_byte(text, input.range.start);
+    let end = utf16_offset_to_byte(text, input.range.end);
+    let (comment_start, comment_end, has_trailing) =
+        if text[start..].starts_with("//") {
+            // The comment itself is the report: its own bounds, to the
+            // line's end.
+            let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i);
+            text[start..line_end]
+                .contains("ignore")
+                .then_some((start, line_end, false))?
+        } else if text[start..].starts_with("/*") {
+            let close = start + text[start..].find("*/").map_or(text.len() - start, |i| i + 2);
+            text[start..close]
+                .contains("ignore")
+                .then_some((start, close, trailing_code_on_line(text, close)))?
+        } else {
+            // The name-token citation: the enclosing comment, scanned in
+            // the hit's trivia window (block comments nest, a line
+            // comment ends at its newline).
+            let tokens = input.tokens?;
+            let window = trivia_window(tokens, text, input.range.start)?;
+            let (open, close) = enclosing_comment(text, window, start)?;
+            text[open..close]
+                .contains("ignore")
+                .then_some((open, close, trailing_code_on_line(text, close)))?
+        };
+    if has_trailing {
+        // The official's trailing-content case: the cut starts at the
+        // comment's own offset — the indent before stays — and its end
+        // is `getLineContentEnd(comment.end)`: the space/tab run after
+        // the comment is eaten with it (the analyzer `IntExtension`
+        // contract — `isSpace` is 0x20/0x09, and the loop breaks on
+        // EOL, so the scan never crosses the line); the code that
+        // follows stays.
+        let mut cut_end = comment_end;
+        let bytes = text.as_bytes();
+        while matches!(bytes.get(cut_end), Some(b' ') | Some(b'\t')) {
+            cut_end += 1;
+        }
+        let start16 = utf16_count(&text[..comment_start]);
+        let end16 = utf16_count(&text[..cut_end]);
+        return Some((start16, end16 - start16, String::new()));
     }
-    drop_span_statement(input.text, &input.range)
+    let range = core::ops::Range {
+        start: utf16_count(&text[..comment_start]),
+        end: utf16_count(&text[..comment_end]),
+    };
+    drop_span_statement(text, &range)
+}
+
+/// The trivia window bracketing `hit16` — the byte gap between the last
+/// code token ending before the hit and the first code token starting
+/// after it (the file's head and tail serve when the hit leads or
+/// trails every token). Comments and whitespace are all a window holds:
+/// the scanner emits no comment tokens, and any `//`/`/*` inside a
+/// string literal sits inside that string's own token.
+fn trivia_window(
+    tokens: &TokenTable,
+    text: &str,
+    hit16: u32,
+) -> Option<(usize, usize)> {
+    let mut start = 0usize;
+    let mut end = text.len();
+    for token in tokens.as_slice() {
+        if token.utf16_offset >= hit16 {
+            end = token.byte_offset as usize;
+            break;
+        }
+        start = (token.byte_offset + token.byte_len) as usize;
+    }
+    Some((start, end))
+}
+
+/// The comment inside the trivia window `(from, to)` containing the
+/// byte offset `hit`: the window's comments in order — a `//` comment
+/// to its newline, a `/* … */` comment to its matching closer (block
+/// comments nest) — the first whose interval covers the hit.
+fn enclosing_comment(
+    text: &str,
+    window: (usize, usize),
+    hit: usize,
+) -> Option<(usize, usize)> {
+    let (from, to) = window;
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while at < to {
+        match bytes.get(at) {
+            Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => at += 1,
+            Some(b'/') if bytes.get(at + 1) == Some(&b'/') => {
+                let close = text[at..to].find('\n').map_or(to, |i| at + i);
+                if at <= hit && hit < close {
+                    return Some((at, close));
+                }
+                at = close + 1;
+            }
+            Some(b'/') if bytes.get(at + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                let mut cursor = at + 2;
+                while cursor < to {
+                    if bytes[cursor..].starts_with(b"/*") {
+                        depth += 1;
+                        cursor += 2;
+                    } else if bytes[cursor..].starts_with(b"*/") {
+                        depth -= 1;
+                        cursor += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                let close = cursor.min(to);
+                if at <= hit && hit < close {
+                    return Some((at, close));
+                }
+                at = close;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether non-whitespace code follows `at` on its line.
+fn trailing_code_on_line(text: &str, at: usize) -> bool {
+    let to_eol = text[at..]
+        .find('\n')
+        .map_or(text.len(), |i| at + i);
+    !text[at..to_eol]
+        .bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
 }
 
 /// `unnecessary_library_name`: the name between the `library` keyword and
@@ -978,16 +1498,23 @@ pub(crate) fn is_bool_literal_pair(tokens: &TokenTable, text: &str, range: core:
 /// `ConvertNullCheckToNullAwareElementOrEntry`'s element faces; the
 /// map-entry faces need the canonical-element resolution and are not
 /// served).
+///
+/// The rule reports the `if` KEYWORD token, so the element's extent is
+/// rebuilt structurally from the header: the then-element runs from the
+/// header's `)` to the collection's own depth-0 boundary — the next
+/// `,` or the enclosing closer — never past the hit's span.
 pub(crate) fn null_aware_element(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
-    let (first, last) = hit_tokens(tokens, &input.range)?;
+    let (first, _last) = hit_tokens(tokens, &input.range)?;
     if !word_at(tokens, text, first, "if") {
         return None;
     }
     let lparen = first + 1;
     let rparen = tokens.matching_end(lparen)?;
-    if depth0_find(tokens, text, rparen + 1, last + 1, |kind, lexeme| {
+    let element_end = if_element_end(tokens, rparen, first)?;
+    let last = element_end.checked_sub(1)?;
+    if depth0_find(tokens, text, rparen + 1, element_end, |kind, lexeme| {
         kind == TokenKind::Keyword(Keyword::Else) || lexeme == "case"
     })
     .is_some()
@@ -1016,7 +1543,7 @@ pub(crate) fn null_aware_element(input: &FixInput<'_>) -> Option<(u32, u32, Stri
     }
     // The then element: the checked identifier bare, spread, or
     // bang-postfixed.
-    let element = rparen + 1..last + 1;
+    let element = rparen + 1..element_end;
     let (spread, head) = match kind_of(tokens, element.start)? {
         TokenKind::PeriodPeriodPeriod => (true, element.start + 1),
         _ => (false, element.start),
@@ -1034,11 +1561,44 @@ pub(crate) fn null_aware_element(input: &FixInput<'_>) -> Option<(u32, u32, Stri
         return None;
     }
     let marker = if spread { "...?" } else { "?" };
+    let end16 = utf16_end(tokens, text, last)?;
     Some((
         input.range.start,
-        input.range.end - input.range.start,
+        end16.checked_sub(input.range.start)?,
         format!("{marker}{name}"),
     ))
+}
+
+/// The exclusive token index ending an if-element's then-segment: the
+/// collection's own depth-0 `,` or the closer whose opener precedes the
+/// `if` token (the enclosing collection); nested brackets ride at their
+/// own depth.
+fn if_element_end(tokens: &TokenTable, rparen: usize, if_kw: usize) -> Option<usize> {
+    let mut depth = 0u32;
+    let mut cursor = rparen + 1;
+    loop {
+        match kind_of(tokens, cursor)? {
+            TokenKind::Comma if depth == 0 => return Some(cursor),
+            close @ (TokenKind::CloseSquare | TokenKind::CloseCurly) if depth == 0 => {
+                // A closer whose opener precedes the `if` token ends the
+                // enclosing collection; any other closer belongs to a
+                // nested bracket the element itself opened (and would
+                // have raised the depth).
+                if matching_open(tokens, cursor, close)? < if_kw {
+                    return Some(cursor);
+                }
+                return None;
+            }
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen => depth = depth.checked_sub(1)?,
+            TokenKind::Eof => return None,
+            _ => {}
+        }
+        cursor += 1;
+    }
 }
 
 /// `use_truncating_division`: the parenthesized division's `.truncate()`
@@ -1391,22 +1951,85 @@ pub(crate) fn bool_conditional(input: &FixInput<'_>) -> Option<(u32, u32, String
 /// (the official `ConvertConditionalExpressionToIfElement` writes the
 /// unparenthesized branches into the reported element; only list/set
 /// element positions serve, never a map entry or an argument).
+///
+/// The rule reports the `Conditional` node, whose span OPENS at the `?`
+/// (the bridge seals the node from the question token), so the condition
+/// is rebuilt backwards from the `?` to its element boundary — the
+/// token walk mirrors the forwards shape: balanced groups with their
+/// head atoms, `.`-links, angle tails, and binary operators all belong
+/// to the condition; a `,`/`[`/`{`/`(` boundary (or a control head's
+/// `)`) closes it. The replacement then spans the condition's head
+/// through the else branch's end, wrapper parentheses included.
 pub(crate) fn conditional_to_if_element(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
-    let (first, last) = hit_tokens(tokens, &input.range)?;
+    let (mut first, mut last) = hit_tokens(tokens, &input.range)?;
+    // The wrapper face: the report may carry its wrapping parentheses
+    // (the rule's error node climbs them) — a span opening at `(` and
+    // closing at its match. The ternary sits inside, so the pair hops
+    // before the split (the depth-0 scan would count the wrapper).
+    if kind_of(tokens, first) == Some(TokenKind::OpenParen)
+        && tokens.matching_end(first) == Some(last)
+        && first + 1 < last
+    {
+        first += 1;
+        last -= 1;
+    }
     let (question, colon) = ternary_split(tokens, text, first, last)?;
-    let start_b = utf16_offset_to_byte(text, input.range.start);
-    let end_b = utf16_offset_to_byte(text, input.range.end);
-    let before = text.get(..start_b)?.trim_end();
-    let after = text.get(end_b..)?.trim_start();
-    // The reported element's neighbours: a list/set element, an if-element
-    // branch, or a for-element body opens at `[`/`{`/`,`/`)` and closes at
-    // `,`/`]`/`}` — a spread, a map separator, or an argument never does.
-    if !matches!(before.as_bytes().last(), Some(b'[' | b'{' | b',' | b')')) {
+    // The condition: the token run closing at the `?`, rebuilt from the
+    // element's left boundary.
+    let cond_start = condition_start(tokens, question)?;
+    if cond_start == question {
         return None;
     }
-    if !matches!(after.as_bytes().first(), Some(b',' | b']' | b'}')) {
+    // The report's tail: in an if-element's branch positions the node
+    // span swallows the token following the conditional (the enclosing
+    // `else`, the collection's `]`), so the last hit token may not be
+    // the conditional's own. The true tail is re-derived from the `:`
+    // before the flanks are judged.
+    let mut last = else_expression_end(tokens, colon, last)?;
+    // The element's flanks: the collection's own separators — a
+    // `,`/`[`/`{` behind the condition, a `(` wrapping the whole
+    // conditional (span-inclusive or closing one token past the span),
+    // or a control head's `)` (an if-element branch or a for-element
+    // body); and a `,`/`]`/`}`/`else` after the else branch — never an
+    // argument's `)` or a statement's `;`.
+    //
+    // A wrapper `(` past the span also extends the replacement: the
+    // official replaces `nodeToReplace` — the conditional with its
+    // wrapping parens.
+    let mut wrapper_close = None;
+    let boundary = cond_start
+        .checked_sub(1)
+        .and_then(|i| kind_of(tokens, i));
+    match boundary {
+        Some(TokenKind::Comma | TokenKind::OpenSquare | TokenKind::OpenCurly) => {}
+        Some(TokenKind::OpenParen) => {
+            let close = tokens.matching_end(cond_start - 1)?;
+            if close == last {
+                // The span already carries the wrapper.
+            } else if close == last + 1 {
+                wrapper_close = Some(close);
+            } else {
+                // An argument list's `(` — not an element position.
+                return None;
+            }
+        }
+        Some(TokenKind::CloseParen)
+            if is_control_head_close(tokens, cond_start - 1) => {}
+        Some(TokenKind::Keyword(Keyword::Else)) => {}
+        _ => return None,
+    }
+    let after = wrapper_close.map_or(last + 1, |close| close + 1);
+    if !matches!(
+        kind_of(tokens, after),
+        Some(
+            TokenKind::Comma
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+                | TokenKind::Keyword(Keyword::Else)
+        )
+    ) {
         return None;
     }
     let unparen = |mut a: usize, mut b: usize| -> (usize, usize) {
@@ -1420,17 +2043,156 @@ pub(crate) fn conditional_to_if_element(input: &FixInput<'_>) -> Option<(u32, u3
         }
         (a, b)
     };
-    let (cf, cl) = unparen(first, question - 1);
+    let (cf, cl) = unparen(cond_start, question - 1);
     let (tf, tl) = unparen(question + 1, colon - 1);
     let (ef, el) = unparen(colon + 1, last);
     let cond = token_text(tokens, text, cf..cl + 1)?;
     let then = token_text(tokens, text, tf..tl + 1)?;
     let els = token_text(tokens, text, ef..el + 1)?;
+    // The replacement opens at the earliest of the span's head, the
+    // condition's head, and any wrapper `(` behind the condition, and
+    // closes at the wrapper's `)` when the span left it out.
+    let mut start16 = tokens
+        .get(first)?
+        .utf16_offset
+        .min(tokens.get(cond_start)?.utf16_offset);
+    if let Some(close) = wrapper_close {
+        start16 = start16.min(tokens.get(cond_start - 1)?.utf16_offset);
+        last = close;
+    }
+    let end16 = utf16_end(tokens, text, last)?;
     Some((
-        input.range.start,
-        input.range.end - input.range.start,
+        start16,
+        end16.checked_sub(start16)?,
         format!("if ({cond}) {then} else {els}"),
     ))
+}
+
+/// Whether the `)` at `close` ends a control head — its matching `(`
+/// sits behind an `if`/`for`/`while`/`switch` keyword (the boundary a
+/// conditional inside an if-element branch or a for-element body walks
+/// back to).
+fn is_control_head_close(tokens: &TokenTable, close: usize) -> bool {
+    let Some(open) = matching_open(tokens, close, TokenKind::CloseParen) else {
+        return false;
+    };
+    matches!(
+        open.checked_sub(1).and_then(|i| kind_of(tokens, i)),
+        Some(TokenKind::Keyword(
+            Keyword::If | Keyword::For | Keyword::While | Keyword::Switch
+        ))
+    )
+}
+
+/// The condition's head token of the ternary whose `?` sits at
+/// `question`: the backwards walk over the condition's own tokens. The
+/// run behind the head is the element's boundary — the caller gates the
+/// boundary's kind.
+fn condition_start(tokens: &TokenTable, question: usize) -> Option<usize> {
+    let mut cursor = question;
+    loop {
+        cursor = cursor.checked_sub(1)?;
+        match kind_of(tokens, cursor)? {
+            close @ (TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly) => {
+                let open = matching_open(tokens, cursor, close)?;
+                // A control head's group — `if (c) x ? … : …` — closes at
+                // the `)`: the condition starts behind it.
+                if matches!(
+                    open.checked_sub(1).and_then(|i| kind_of(tokens, i)),
+                    Some(TokenKind::Keyword(
+                        Keyword::If | Keyword::For | Keyword::While | Keyword::Switch
+                    ))
+                ) {
+                    return Some(cursor + 1);
+                }
+                cursor = open;
+            }
+            TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                // A type-argument tail jumps its group; an unmatched `>`
+                // is a comparison operator inside the condition —
+                // consumed like any other operator, the walk continues.
+                if let Some(lt) = angle_group_start(tokens, cursor) {
+                    cursor = lt;
+                }
+            }
+            TokenKind::Keyword(Keyword::Else) => {
+                // An else-branch conditional's condition starts behind
+                // the `else` keyword — `else` never occurs inside a
+                // condition expression, so the walk stops here.
+                return Some(cursor + 1);
+            }
+            TokenKind::Identifier
+            | TokenKind::Keyword(_)
+            | TokenKind::Int
+            | TokenKind::Double
+            | TokenKind::Hexadecimal
+            | TokenKind::String
+            | TokenKind::Period
+            | TokenKind::QuestionPeriod
+            | TokenKind::Bang => {}
+            other => {
+                // The operators that bind the condition's own operands.
+                if !condition_operator(other) {
+                    return Some(cursor + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `kind` is a binary/prefix operator token a condition may
+/// carry between its operands (the walk consumes it and keeps going).
+fn condition_operator(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::GtEq
+            | TokenKind::LtEq
+            | TokenKind::Ampersand
+            | TokenKind::AmpersandAmpersand
+            | TokenKind::Bar
+            | TokenKind::BarBar
+            | TokenKind::Caret
+            | TokenKind::Tilde
+            | TokenKind::QuestionQuestion
+    )
+}
+
+/// The last token of the else-expression opening at `colon + 1` — the
+/// forward mirror of [`condition_start`]'s walk: balanced groups stay
+/// inside the run, and the first token the expression cannot own ends
+/// it — a group close whose opener sits outside the run, or a depth-0
+/// `,`/`;`/`else`. `None` when the run is empty (no head at all).
+fn else_expression_end(tokens: &TokenTable, colon: usize, last: usize) -> Option<usize> {
+    let mut depth = 0u32;
+    let mut end = None;
+    for index in colon + 1..=last {
+        match kind_of(tokens, index)? {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            TokenKind::Comma | TokenKind::Semicolon | TokenKind::Keyword(Keyword::Else)
+                if depth == 0 => break,
+            _ => {}
+        }
+        end = Some(index);
+    }
+    end
 }
 
 /// `use_full_hex_values_for_flutter_colors`: the short hex literal is

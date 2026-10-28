@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 
 /// The `late` `ModSet` bit (bridge `mod_bits`, member family).
 const LATE_BIT: u16 = 1 << 5;
@@ -92,7 +92,7 @@ fn primary_formal_names<'a>(c: &'a Check<'_>, primary: u32) -> Vec<&'a str> {
         }
         for kid in c.collect_direct(params) {
             if c.kind(kid) == NodeKind::FormalParameter
-                && let Some(&name) = c.payload(kid).get(1)
+                && let Some(name) = c.field(kid, PayloadField::Name)
                 && name != super::NONE_TOKEN
             {
                 names.push(c.lexeme(name));

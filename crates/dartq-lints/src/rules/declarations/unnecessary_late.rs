@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use dartq_parser::MemberKind;
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_late.dart:36-55` —
@@ -28,9 +28,9 @@ fn check(c: &mut Check<'_>) {
     match c.kind(parent) {
         NodeKind::TopLevelFields => {}
         NodeKind::Fields => {
-            // Fields payload word 0 is the `MemberKind` discriminant:
+            // The Fields row's `MemberKind` word is the discriminant:
             // only the static kind reports.
-            if c.payload(parent).first() != Some(&(MemberKind::StaticField as u32)) {
+            if c.field(parent, PayloadField::MemberKind) != Some(MemberKind::StaticField as u32) {
                 return;
             }
         }

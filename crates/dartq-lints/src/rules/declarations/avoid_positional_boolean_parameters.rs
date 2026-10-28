@@ -1,5 +1,5 @@
 use super::constructor_name_part;
-use super::{AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, formal_parameter_rows, member_declaration_name, same_class_field_type};
+use super::{PayloadField, AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, formal_parameter_rows, member_declaration_name, same_class_field_type};
 use crate::rules::{MemberQuery, NONE_TOKEN, body_members, get_set_token, member_matches, member_name, same_file_ancestors};
 use dartq_ast::mod_flags;
 
@@ -98,10 +98,11 @@ fn check_params(c: &mut Check<'_>, owner: u32, class_row: Option<u32>) {
 }
 
 /// `p.isPositional` — the required-positional and optional-positional
-/// parameter kinds (payload word 4, bridge `end_formal_parameter`).
+/// parameter kinds (the row's `FormalParameterKind` word, bridge
+/// `end_formal_parameter`).
 fn positional(c: &Check<'_>, param: u32) -> bool {
     matches!(
-        c.payload(param).get(4).copied(),
+        c.field(param, PayloadField::FormalParameterKind),
         Some(kind)
             if kind == dartq_parser::FormalParameterKind::RequiredPositional as u32
                 || kind == dartq_parser::FormalParameterKind::OptionalPositional as u32
@@ -121,11 +122,11 @@ fn bool_typed(c: &Check<'_>, param: u32, class_row: Option<u32>) -> bool {
     if let Some(t) = written {
         return &c.unit.source[c.byte_span(t)] == "bool";
     }
-    let receiver = c.payload(param).first().copied().unwrap_or(NONE_TOKEN);
+    let receiver = c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
     if receiver == NONE_TOKEN || c.lexeme(receiver) != "this" {
         return false;
     }
-    let Some(&name) = c.payload(param).get(1) else {
+    let Some(name) = c.field(param, PayloadField::Name) else {
         return false;
     };
     if name == NONE_TOKEN {
@@ -156,7 +157,7 @@ fn primary_is_private(c: &Check<'_>, primary: u32) -> bool {
     let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
     c.collect_direct(primary).into_iter().any(|kid| {
         c.kind(kid) == NodeKind::Identifier
-            && c.payload(kid).first() == Some(&ctx)
+            && c.field(kid, PayloadField::Context) == Some(ctx)
             && c.lexeme(c.head_token(kid)).starts_with('_')
     })
 }

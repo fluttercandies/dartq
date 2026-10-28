@@ -162,6 +162,7 @@ struct OpenContainer {
     /// selector for `A.named`, the container's name for `A()`); flushed
     /// into the finished [`Container::ctor_formals`].
     ctor_formals: NameMapBuilder<Box<Formals>>,
+    factory_formals: NameMapBuilder<Box<Formals>>,
     /// The declaration's metadata star (`crate::model::Annotation`),
     /// drained from the builder's pending buffer at the open.
     annotations: Vec<Annotation>,
@@ -1413,6 +1414,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ctor_declared: 0,
             ctor_const: false,
             ctor_formals: NameMapBuilder::default(),
+            factory_formals: NameMapBuilder::default(),
             annotations,
         });
         // The `extends` head latches on class-family declarations only
@@ -1508,6 +1510,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 has_unnamed_constructor,
                 has_const_constructor: open.ctor_const,
                 ctor_formals: open.ctor_formals.finish(),
+                factory_formals: open.factory_formals.finish(),
                 annotations: open.annotations.into_boxed_slice(),
             });
         }
@@ -3145,6 +3148,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             open.ctor_declared += 1;
             open.ctor_const |= _const_keyword.is_some();
         }
+        // The factory's own parameter group joins the constructor formal
+        // table under the same lookup spelling a body constructor uses
+        // (the class name — the unnamed face's key — rewritten to the
+        // `.name` selector at the continuation event): a redirecting
+        // factory's written formals are the invocation's checked
+        // parameters (`factory $Result.data(ValueT state) = $ResultData;`
+        // answers `$Result.data(x)`'s argument checks).
+        if let Some(open) = builder.containers.last()
+            && let Some((name, _)) = open.name
+        {
+            builder.pending_ctor_formals = Some((name, None));
+        }
         builder.factory_ctor_open = true;
         builder.factory_ctor_head = None;
     }
@@ -3171,6 +3186,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // continuation already registered its own selector, so the
                 // head fallback only fires on the undotted shape.
                 named.push(head);
+                // The formal table's key follows the same selector.
+                if let Some((key, _)) = &mut builder.pending_ctor_formals {
+                    *key = head;
+                }
             }
             for name in named {
                 if !open.ctor_named.contains(&name) {
@@ -3178,6 +3197,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 }
             }
             open.ctor_has_unnamed |= capture.has_unnamed;
+        }
+        // The captured formal table joins the container's FACTORY formals
+        // (the separate lane: the plain ctor table's other consumers —
+        // the closure-formal solver's substitution chains especially —
+        // keep the under-report; only the argument-check pairing reads
+        // this one).
+        if let Some((key, formals)) = builder.pending_ctor_formals.take()
+            && let Some(formals) = formals
+            && let Some(open) = builder.containers.last_mut()
+        {
+            open.factory_formals.insert(key, formals);
         }
         builder.factory_ctor_head = None;
     }

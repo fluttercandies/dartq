@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{first_child, slice};
 
 /// The source-head row of the paren's inner expression (the outermost
@@ -175,16 +175,10 @@ fn check(c: &mut Check<'_>) {
                 return;
             }
         }
-        // `(p)!` (:93-95).
-        if owner_kids
-            .get(pos + 1)
-            .is_some_and(|&piece| c.kind(piece) == NodeKind::UnaryPostfix)
-            && c.payload(owner_kids[pos + 1])
-                .first()
-                .is_some_and(|&op| c.lexeme(op) == "!")
-        {
-            return;
-        }
+        // `(p)!` (:93-95) is inert: the `UnaryPostfix` row carries no
+        // payload words, so an operator-word bail could never match and
+        // this shape always fell through to the report (the pinned
+        // behavior).
         report(c, node);
         return;
     }
@@ -208,9 +202,8 @@ fn check(c: &mut Check<'_>) {
     if inner_head(c, node) == Some(NodeKind::BinaryExpression) {
         let binary = first_child(c, node).expect("the head kind matched above");
         let op = c
-            .payload(binary)
-            .first()
-            .map(|&op| c.lexeme(op))
+            .field(binary, PayloadField::Operator)
+            .map(|op| c.lexeme(op))
             .unwrap_or_default();
         if matches!(op, "==" | "!=")
             && (matches!(
@@ -421,7 +414,7 @@ fn same_file_top_level_function(c: &Check<'_>, name: &str) -> Option<u32> {
             if c.kind(inner) == NodeKind::TopLevelMethod
                 && c.collect_direct(inner).into_iter().any(|kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first() == Some(&ctx)
+                        && c.field(kid, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(kid)) == name
                 })
             {

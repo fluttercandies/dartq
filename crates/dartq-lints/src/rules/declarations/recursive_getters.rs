@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, get_set_token, path_shadowed};
+use super::{PayloadField, Check, NodeKind, RuleSpec, get_set_token, path_shadowed};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/recursive_getters.dart:31-95`
 /// — a getter (no parameter list) whose body references itself reports
@@ -23,7 +23,7 @@ fn check(c: &mut Check<'_>) {
     let node = c.node();
     // Reads only (the official flags `SimpleIdentifier` references; a
     // declaration or label position never reads the getter).
-    let Some(&ctx) = c.payload(node).first() else {
+    let Some(ctx) = c.field(node, PayloadField::Context) else {
         return;
     };
     if ctx != dartq_parser::IdentifierContext::Expression as u32 {

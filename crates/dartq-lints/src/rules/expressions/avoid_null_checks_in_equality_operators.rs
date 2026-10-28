@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice, value_run_end};
+use super::{PayloadField, Check, NodeKind, RuleSpec, slice, value_run_end};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_null_checks_in_equality_operators.dart`
 /// — inside an `operator ==` whose single parameter is nullable, the
@@ -69,9 +69,7 @@ fn equality_parameter(c: &Check<'_>) -> Option<(u32, String)> {
         let is_equals = pos > 0
             && c.kind(kids[pos - 1]) == NodeKind::OperatorName
             && c.lexeme(
-                c.payload(kids[pos - 1])
-                    .first()
-                    .copied()
+                c.field(kids[pos - 1], PayloadField::Name)
                     .unwrap_or(crate::rules::NONE_TOKEN),
             ) == "==";
         if !is_equals {
@@ -90,9 +88,10 @@ fn equality_parameter(c: &Check<'_>) -> Option<(u32, String)> {
         let [parameter] = parameters[..] else {
             return None;
         };
-        // The parameter name: payload word 1 (the `parameter_binding` face).
-        let name_token = c.payload(parameter).get(1)?;
-        if *name_token == crate::rules::NONE_TOKEN {
+        // The parameter name: the `Name` word (the `parameter_binding`
+        // face).
+        let name_token = c.field(parameter, PayloadField::Name)?;
+        if name_token == crate::rules::NONE_TOKEN {
             return None;
         }
         // The nullability gate (:69-73): the written type carries a `?`
@@ -104,7 +103,7 @@ fn equality_parameter(c: &Check<'_>) -> Option<(u32, String)> {
         if !crate::rules::type_face(c, written).nullable {
             return None;
         }
-        return Some((method, c.lexeme(*name_token).to_owned()));
+        return Some((method, c.lexeme(name_token).to_owned()));
     }
     None
 }
@@ -115,7 +114,7 @@ fn equality_parameter(c: &Check<'_>) -> Option<(u32, String)> {
 /// `reportAtNode(node)`).
 fn check_binary(c: &mut Check<'_>, method: u32, param: &str) {
     let node = c.node();
-    let Some(op) = c.payload(node).first().copied() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     // The operand runs of the flattened container (:52-59).
@@ -152,8 +151,9 @@ fn check_binary(c: &mut Check<'_>, method: u32, param: &str) {
 /// `other?.foo` alone).
 fn check_dot(c: &mut Check<'_>, method: u32, param: &str) {
     let node = c.node();
-    // The bridge's null-aware flag (payload word 1) is the `?.` gate.
-    if c.payload(node).get(1) != Some(&1) {
+    // The bridge's null-aware flag (the `IsNullAware` word) is the
+    // `?.` gate.
+    if c.field(node, PayloadField::IsNullAware) != Some(1) {
         return;
     }
     // The receiver run: the pieces before the marker in the owner
@@ -294,7 +294,7 @@ fn resolves_to_parameter(c: &Check<'_>, use_row: u32, method: u32, param_name: &
                 let ctx = dartq_parser::IdentifierContext::CatchParameter as u32;
                 if c.children(current).any(|row| {
                     c.kind(row) == NodeKind::Identifier
-                        && c.payload(row).first() == Some(&ctx)
+                        && c.field(row, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(row)) == param_name
                 }) {
                     return false;
@@ -324,7 +324,7 @@ fn block_shadows(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> boo
                         .find(|&piece| c.kind(piece) == NodeKind::Identifier)
                 };
                 name_row.is_some_and(|row| {
-                    c.payload(row).first() == Some(&ctx)
+                    c.field(row, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(row)) == name
                         && c.byte_span(row).start < use_start
                 })
@@ -341,9 +341,8 @@ fn params_contain(c: &Check<'_>, owner: u32, name: &str) -> bool {
         .any(|params| {
             c.collect_direct(params).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::FormalParameter
-                    && c.payload(kid)
-                        .get(1)
-                        .copied()
+                    && c
+                        .field(kid, PayloadField::Name)
                         .filter(|&tok| tok != crate::rules::NONE_TOKEN)
                         .is_some_and(|tok| c.lexeme(tok) == name)
             })

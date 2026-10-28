@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{NONE_TOKEN, first_child};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_init_to_null.dart:59-88`
@@ -57,7 +57,7 @@ fn check_variable(c: &mut Check<'_>) {
     // keyword is the VariablesDeclaration `modifier` word;
     // a written type (no keyword) initializes the same way.
     if c.kind(parent) == NodeKind::VariablesDeclaration
-        && let Some(&keyword) = c.payload(parent).first()
+        && let Some(keyword) = c.field(parent, PayloadField::LateKeyword)
         && keyword != NONE_TOKEN
         && matches!(c.lexeme(keyword), "final" | "const")
     {
@@ -78,16 +78,17 @@ fn check_variable(c: &mut Check<'_>) {
 
 fn check_parameter(c: &mut Check<'_>) {
     // `{int x = null}` — the default value is delimited by the
-    // `init_start`/`init_end` payload words);
+    // `InitializerStart`/`InitializerEnd` words;
     // exactly the `null` token qualifies under either end convention.
-    let payload = c.payload(c.node());
-    let Some(&start) = payload.get(2) else {
+    let Some(start) = c.field(c.node(), PayloadField::InitializerStart) else {
         return;
     };
     if start == NONE_TOKEN {
         return;
     }
-    let end = payload.get(3).copied().unwrap_or(start);
+    let end = c
+        .field(c.node(), PayloadField::InitializerEnd)
+        .unwrap_or(start);
     if c.lexeme(start) != "null" || end.saturating_sub(start) > 1 {
         return;
     }
@@ -107,13 +108,13 @@ fn check_parameter(c: &mut Check<'_>) {
     // `reportAtNode` on the parameter reports `name..default end`
     // (upstream highlight `[!x = null!]` / `[!this.a = null!]` — the
     // written type is excluded, the `this`/`super` receiver word
-    // included): payload[0] = receiver, [1] = name, [2..3] = the
-    // default's init range (end-exclusive).
-    let name_or_receiver = payload
-        .first()
-        .copied()
+    // included): the `Receiver` word when written, else the `Name`
+    // word — the default's init range is the `InitializerStart`/
+    // `InitializerEnd` pair (end-exclusive).
+    let name_or_receiver = c
+        .field(c.node(), PayloadField::Receiver)
         .filter(|&token| token != NONE_TOKEN)
-        .or_else(|| payload.get(1).copied())
+        .or_else(|| c.field(c.node(), PayloadField::Name))
         .unwrap_or(start);
     let end_byte = c
         .unit

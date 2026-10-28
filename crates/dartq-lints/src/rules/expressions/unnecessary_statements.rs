@@ -1,6 +1,6 @@
 use dartq_semantic::model::MemberKind;
 
-use super::{Check, NodeKind, RuleSpec, query_site, same_file};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file};
 use crate::rules::{body_members, get_set_token, same_file_declaration, slice, type_face};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_statements.dart`
@@ -163,9 +163,8 @@ fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32])
         // (:72-83); every other binary reports at the whole expression.
         NodeKind::BinaryExpression => {
             let controls = c
-                .payload(root)
-                .first()
-                .is_some_and(|&op| matches!(c.lexeme(op), "??" | "||" | "&&"));
+                .field(root, PayloadField::Operator)
+                .is_some_and(|op| matches!(c.lexeme(op), "??" | "||" | "&&"));
             if controls {
                 let right = binary_right_run(c, run, root);
                 walk(c, analysis, &right);
@@ -496,8 +495,8 @@ fn class_member(c: &Check<'_>, class_row: u32, name: &str) -> Option<Member> {
                 for kid in c.collect_direct(member) {
                     if c.kind(kid) == NodeKind::Identifier
                         && c.lexeme(c.head_token(kid)) == name
-                        && c.payload(kid).first()
-                            == Some(&(dartq_parser::IdentifierContext::FieldDeclaration as u32))
+                        && c.field(kid, PayloadField::Context)
+                            == Some(dartq_parser::IdentifierContext::FieldDeclaration as u32)
                     {
                         return Some(Member::Field);
                     }
@@ -529,7 +528,7 @@ fn is_same_file_getter(c: &Check<'_>, use_node: u32, name: &str) -> bool {
                 }
                 let found = c.collect_direct(inner).into_iter().any(|kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first() == Some(&ctx)
+                        && c.field(kid, PayloadField::Context) == Some(ctx)
                         && c.lexeme(c.head_token(kid)) == name
                 });
                 if found {
@@ -574,11 +573,10 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     else {
         return;
     };
-    let payload = c.payload(parts);
-    let Some(&left_sep) = payload.get(1) else {
+    let Some(left_sep) = c.field(parts, PayloadField::LeftSeparator) else {
         return;
     };
-    let Some(&right_sep) = payload.get(2) else {
+    let Some(right_sep) = c.field(parts, PayloadField::RightSeparator) else {
         return;
     };
     // The official `rightSeparator` is the token read after the condition
@@ -641,7 +639,7 @@ fn for_header_condition(c: &Check<'_>, stmt: u32) -> bool {
     else {
         return false;
     };
-    let Some(&right_sep) = c.payload(parts).get(2) else {
+    let Some(right_sep) = c.field(parts, PayloadField::RightSeparator) else {
         return false;
     };
     let Some(token) = c.unit.tokens.get(right_sep as usize) else {
@@ -835,10 +833,8 @@ fn member_function_typed(c: &Check<'_>, class_row: u32, name: &str) -> bool {
                             written = Some(kid);
                         }
                         NodeKind::Identifier
-                            if c.payload(kid).first()
-                                == Some(
-                                    &(dartq_parser::IdentifierContext::FieldDeclaration as u32),
-                                )
+                            if c.field(kid, PayloadField::Context)
+                                == Some(dartq_parser::IdentifierContext::FieldDeclaration as u32)
                                 && c.lexeme(c.head_token(kid)) == name =>
                         {
                             return written
@@ -859,7 +855,7 @@ fn member_function_typed(c: &Check<'_>, class_row: u32, name: &str) -> bool {
 /// operator token (`slice::binary_operands`'s adopted shape, read from
 /// the dispatch face).
 fn binary_right_run(c: &Check<'_>, run: &[u32], root: u32) -> Vec<u32> {
-    let Some(&op_token) = c.payload(root).first() else {
+    let Some(op_token) = c.field(root, PayloadField::Operator) else {
         return Vec::new();
     };
     let Some(token) = c.unit.tokens.get(op_token as usize) else {
@@ -884,10 +880,10 @@ fn binary_right_run(c: &Check<'_>, run: &[u32], root: u32) -> Vec<u32> {
 /// multi-row send group), so the windows split on the payload's `?`/`:`
 /// tokens; the condition sits left of the `?` and enters neither window.
 fn arm_runs(c: &Check<'_>, run: &[u32], root: u32) -> Vec<Vec<u32>> {
-    let Some(&question) = c.payload(root).first() else {
+    let Some(question) = c.field(root, PayloadField::Question) else {
         return Vec::new();
     };
-    let Some(&colon) = c.payload(root).get(1) else {
+    let Some(colon) = c.field(root, PayloadField::Colon) else {
         return Vec::new();
     };
     let (Some(question_end), Some(colon_span)) = (

@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, container_members, operator_name};
+use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, operator_name};
 use crate::rules::{SupertypeClause, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_implementing_value_types.dart:36-60`
@@ -66,7 +66,7 @@ fn overrides_equals(c: &Check<'_>, row: u32) -> bool {
             container_members(c, ancestor).1.into_iter().any(|member| {
                 c.kind(member) == NodeKind::Method
                     && operator_name(c, member)
-                        .and_then(|name| c.payload_word(name, 0))
+                        .and_then(|name| c.field_token(name, PayloadField::Name))
                         .is_some_and(|t| c.lexeme(t) == "==")
             })
         })

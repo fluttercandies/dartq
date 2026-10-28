@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, container_members, fields_declare, is_identifier_token, name_row_token, override_annotation, parameter_rows, sole_statement_tokens};
+use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, fields_declare, is_identifier_token, name_row_token, override_annotation, parameter_rows, sole_statement_tokens};
 use crate::rules::{MemberQuery, NONE_TOKEN, get_set_token, member_matches, member_name, same_file_ancestors, type_before, utf16_token_span};
 
 const STATIC_BIT: u16 = 1 << 3;
@@ -82,12 +82,12 @@ fn check(c: &mut Check<'_>) {
     c.report(utf16_token_span(c, name_row_token(c, name_row)), &[]);
 }
 
-/// The name token of a formal parameter row (`FormalParameter` payload
-/// word 1; a function-typed formal anchors at its name).
+/// The name token of a formal parameter row (the `FormalParameter`
+/// row's `Name` word; a function-typed formal anchors at its name).
 fn parameter_name_token(c: &Check<'_>, parameter: u32) -> Option<u32> {
     match c.kind(parameter) {
-        NodeKind::FormalParameter => match c.payload(parameter).get(1) {
-            Some(&name) if name != NONE_TOKEN => Some(name),
+        NodeKind::FormalParameter => match c.field(parameter, PayloadField::Name) {
+            Some(name) if name != NONE_TOKEN => Some(name),
             _ => None,
         },
         NodeKind::FunctionTypedFormalParameter => Some(c.head_token(parameter)),
@@ -172,8 +172,8 @@ fn class_member_named(c: &Check<'_>, name: &str) -> bool {
     own || same_file_ancestors(c, container, true).iter().any(|&a| {
         container_members(c, a).1.iter().any(|&m| match c.kind(m) {
             NodeKind::Fields
-                if c.payload(m).first()
-                    == Some(&(dartq_parser::MemberKind::NonStaticField as u32)) =>
+                if c.field(m, PayloadField::MemberKind)
+                    == Some(dartq_parser::MemberKind::NonStaticField as u32) =>
             {
                 fields_declare(c, m, name)
             }

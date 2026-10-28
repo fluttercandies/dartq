@@ -343,8 +343,16 @@ STAGE_ROOT="$OUT/staging"
 STAGE_CORPUS="$STAGE_ROOT/$SCAN_DESC"
 mkdir -p "$STAGE_CORPUS"
 MATERIALIZE_MODE="corpus:$(clone_dir "$SCAN" "$STAGE_CORPUS")"
-if [ "$TREE_KIND" = "Language" ]; then
-  STAGE_UTILS="$(dirname "$STAGE_CORPUS")/Utils"
+# Stage Utils for any tree whose files reach it with ../ escapes — measured
+# per run, not assumed by tree kind: the current corpus has LanguageFeatures,
+# LibTest and TypeSystem files importing ../../../Utils/ helpers too (the
+# pkg/-mapping face covers their package: imports, not these relative ones).
+# Utils lives at the co19/ level — the same depth as the source checkout
+# (co19/Utils), so `--only` slices keep their ../../../Utils escapes
+# resolving (dirname of a sliced corpus would strand them one level deep).
+STAGE_UTILS="$STAGE_ROOT/co19/Utils"
+if [ "$TREE_KIND" = "Language" ] || [ -n "$(grep -rlE "(import|export|part) +['\"](\.\./)+Utils/" \
+      --include='*.dart' "$SCAN" 2>/dev/null | head -1)" ]; then
   mkdir -p "$STAGE_UTILS"
   MATERIALIZE_MODE="$MATERIALIZE_MODE utils:$(clone_dir "$CO19_ROOT/Utils" "$STAGE_UTILS")"
 fi

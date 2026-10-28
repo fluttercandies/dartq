@@ -4180,7 +4180,12 @@ impl<'a> Engine<'a> {
             // type_analyzer.dart's `InferenceContext` grounds the formal
             // before any assignability ask). Only the exact unsolved
             // residue qualifies: a non-primitive, non-collection head that
-            // resolves to no container.
+            // resolves to no container AND is no in-scope type parameter —
+            // an in-scope parameter is a real type variable, not residue:
+            // the enclosing class's own `E` instantiates independently of
+            // this send's solve, and the oracle keeps the mismatch
+            // (`StateController<dynamic>` into `StateController<ValueT>`,
+            // #2687 — `dynamic` is not a subtype of the variable).
             if f == Ty::Dynamic
                 && matches!(
                     t,
@@ -4191,6 +4196,7 @@ impl<'a> Engine<'a> {
                     }
                 )
                 && let Ty::Named { name, .. } = t
+                && !self.type_params.contains(&name)
                 && self.unbound_formal_head(name)
             {
                 continue;

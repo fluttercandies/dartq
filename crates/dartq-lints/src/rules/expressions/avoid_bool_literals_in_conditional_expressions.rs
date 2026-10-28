@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use dartq_semantic::model::Ty;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_bool_literals_in_conditional_expressions.dart`
@@ -46,11 +46,10 @@ fn check(c: &mut Check<'_>) {
         return;
     };
     let node = c.node();
-    let payload = c.payload(node);
-    let Some(&question) = payload.first() else {
+    let Some(question) = c.field(node, PayloadField::Question) else {
         return;
     };
-    let Some(&colon) = payload.get(1) else {
+    let Some(colon) = c.field(node, PayloadField::Colon) else {
         return;
     };
     // The then/else arms over the direct children, split at the `?`/`:`

@@ -21,7 +21,8 @@ use std::fs;
 use std::sync::Mutex;
 
 use common::{
-    BROKEN_MAIN, CLEAN_MAIN, Harness, Workspace, notification, request, spawn, store_root,
+    BROKEN_MAIN, CLEAN_MAIN, Harness, Workspace, notification, request, request_settled, spawn,
+    store_root,
 };
 use serde_json::{Value, json};
 
@@ -72,8 +73,10 @@ const TEST_SOURCE: &str =
 const AGENT_B_SOURCE: &str = "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  Foo? g = Foo();\n  g.meth();\n  foo();\n}\n";
 
 /// One scripted step: the wire message, the transcript growth to settle on
-/// (0 = settle through a probe answer, for frame-less steps), and the
-/// response-contract check over the transcript so far.
+/// (a request additionally requires its own answer, so an async push
+/// satisfying the growth alone never releases the step; 0 = settle through
+/// a probe answer, for frame-less steps), and the response-contract check
+/// over the transcript so far.
 struct Step<'check> {
     message: Value,
     settle: usize,
@@ -547,4 +550,80 @@ fn agent_script_over_the_daemon_rpc_surface() {
     );
 
     fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// The settle condition a request step polls, pinned on the frozen failure
+/// shape: the commit's merge push landed inside the next request's window,
+/// satisfied the frame growth alone, and the step released while the answer
+/// was still unwritten (`request 7 answers`, 0.06 s). The growth — even
+/// alongside another request's answer — must not settle; only the target
+/// id's answer does, and the growth stays a floor when a step expects
+/// frames beyond the answer.
+#[test]
+fn a_request_step_settles_on_its_answer_not_the_frame_growth() {
+    let answer = |id: Value| json!({"jsonrpc": "2.0", "id": id, "result": {"v": 1}});
+    let push = json!({
+        "jsonrpc": "2.0",
+        "method": "dartq/diagnostics",
+        "params": {"uri": "file:///workspace/lib/b.dart", "diagnostics": []},
+    });
+    // The settled baseline: the startup probe plus answers 2..6.
+    let before = [
+        answer(json!(1001)),
+        answer(json!(2)),
+        answer(json!(3)),
+        answer(json!(4)),
+        answer(json!(5)),
+        answer(json!(6)),
+    ];
+    let settled = |extra: &[Value]| {
+        let mut transcript = before.to_vec();
+        transcript.extend_from_slice(extra);
+        transcript
+    };
+    // The push grows the count to the expected seven — request 7's answer
+    // is still unwritten, so the step must hold.
+    assert!(!request_settled(
+        &settled(&[push.clone()]),
+        before.len(),
+        1,
+        &json!(7)
+    ));
+    // The answer's arrival settles, with or without the push.
+    assert!(request_settled(
+        &settled(&[answer(json!(7))]),
+        before.len(),
+        1,
+        &json!(7)
+    ));
+    assert!(request_settled(
+        &settled(&[push.clone(), answer(json!(7))]),
+        before.len(),
+        1,
+        &json!(7)
+    ));
+    // The growth is a floor: a step expecting the answer plus a push does
+    // not settle on the answer alone.
+    assert!(!request_settled(
+        &settled(&[answer(json!(7))]),
+        before.len(),
+        2,
+        &json!(7)
+    ));
+    assert!(request_settled(
+        &settled(&[answer(json!(7)), push]),
+        before.len(),
+        2,
+        &json!(7)
+    ));
+    // The id matches by value: a string id settles on its own answer,
+    // never on the numeric lookalike.
+    let string_answer = json!({"jsonrpc": "2.0", "id": "agent-7", "result": {"v": 1}});
+    assert!(request_settled(
+        &[string_answer.clone()],
+        0,
+        1,
+        &json!("agent-7")
+    ));
+    assert!(!request_settled(&[string_answer], 0, 1, &json!(7)));
 }

@@ -17,7 +17,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::comments::Comment;
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::RuleSpec;
@@ -1220,7 +1220,7 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
 }
 
 pub(crate) mod public_member_api_docs {
-    use super::{Check, NodeKind, RuleSpec, is_doc_form};
+    use super::{PayloadField, Check, NodeKind, RuleSpec, is_doc_form};
     use crate::rules::{MemberQuery, NONE_TOKEN, body_members, get_set_token, initialized_identifier_name, member_annotations, member_matches, member_name, same_file_ancestors, utf16_token_span};
 
     /// Official: `pkg/linter/lib/src/rules/public_member_api_docs.dart` — a
@@ -1344,9 +1344,9 @@ pub(crate) mod public_member_api_docs {
             return;
         }
         // The element row is childless: the bridge `handle_enum_element`
-        // anchors the row at the name token and stores it as payload word 0
-        // (the constant's name, `EnumConstantDeclaration.name`).
-        let Some(name) = c.payload(node).first().copied() else {
+        // anchors the row at the name token and stores it as the row's
+        // `Name` word (the constant's name, `EnumConstantDeclaration.name`).
+        let Some(name) = c.field(node, PayloadField::Name) else {
             return;
         };
         if name == NONE_TOKEN || c.lexeme(name).starts_with('_') {
@@ -1526,7 +1526,8 @@ pub(crate) mod public_member_api_docs {
             // (:222) invalid extension-type fields — the instance shape;
             // the static face reports (the extension-type tests' static
             // field case).
-            if c.payload(node).first() == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            if c.field(node, PayloadField::MemberKind)
+                == Some(dartq_parser::MemberKind::NonStaticField as u32)
                 && c.path
                     .iter()
                     .any(|&n| c.kind(n) == NodeKind::ExtensionTypeDeclaration)
@@ -1542,7 +1543,8 @@ pub(crate) mod public_member_api_docs {
         // variable of the row.
         let documented = doc_attached(c, doc_token(c, node));
         let instance = !is_top_level
-            && c.payload(node).first() == Some(&(dartq_parser::MemberKind::NonStaticField as u32));
+            && c.field(node, PayloadField::MemberKind)
+                == Some(dartq_parser::MemberKind::NonStaticField as u32);
         for var in variables(c, node) {
             let Some(name) = initialized_identifier_name(c, var) else {
                 continue;
@@ -1747,7 +1749,7 @@ pub(crate) mod public_member_api_docs {
             matches!(c.kind(kid), NodeKind::OperatorName)
                 || (c.kind(kid) == NodeKind::Identifier
                     && matches!(
-                        c.payload(kid).first().copied(),
+                        c.field(kid, PayloadField::Context),
                         Some(ctx)
                             if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
                                 || ctx == dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32
@@ -1760,10 +1762,7 @@ pub(crate) mod public_member_api_docs {
             .find(|&kid| is_declared_name(kid))
             .or_else(|| member_name(c, member))?;
         Some(if c.kind(name) == NodeKind::OperatorName {
-            c.payload(name)
-                .first()
-                .copied()
-                .unwrap_or_else(|| c.head_token(name))
+            c.field(name, PayloadField::Name).unwrap_or_else(|| c.head_token(name))
         } else {
             c.head_token(name)
         })
@@ -1987,19 +1986,19 @@ pub(crate) fn doc_group_of<'a>(c: &Check<'a>, row: u32) -> &'a [Comment] {
 /// The written name token of a class-like declaration row — the
 /// `getNodeToAnnotate`/`name.isPrivate` face. The two extension shapes
 /// never mint a name row: the parser reads the name straight off the
-/// cursor and the bridge stores it as a payload word
-/// (`begin_extension_declaration` word 1, `begin_extension_type_declaration`
-/// word 2), `NONE_TOKEN` when absent — an unnamed extension answers `None`
+/// cursor and the bridge stores it as the row's `Name` word
+/// (`begin_extension_declaration` / `begin_extension_type_declaration`),
+/// `NONE_TOKEN` when absent — an unnamed extension answers `None`
 /// (private by `extensions.dart:104`). The rest resolve through
 /// [`container_name`]'s `Identifier` row, whose span head is the token.
 pub(crate) fn container_name_token(c: &Check<'_>, row: u32) -> Option<u32> {
     match c.kind(row) {
         NodeKind::ExtensionDeclaration => {
-            let token = c.payload(row).get(1).copied()?;
+            let token = c.field(row, PayloadField::Name)?;
             (token != NONE_TOKEN).then_some(token)
         }
         NodeKind::ExtensionTypeDeclaration => {
-            let token = c.payload(row).get(2).copied()?;
+            let token = c.field(row, PayloadField::Name)?;
             (token != NONE_TOKEN).then_some(token)
         }
         _ => container_name(c, row).map(|name| c.head_token(name)),
@@ -2013,7 +2012,7 @@ fn container_name(c: &Check<'_>, row: u32) -> Option<u32> {
     let is_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx
                         == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
@@ -2036,7 +2035,7 @@ fn container_name(c: &Check<'_>, row: u32) -> Option<u32> {
 }
 
 pub(crate) mod comment_references {
-    use super::{Check, Comment, NodeKind, RuleSpec, comment_lexeme, container_name_token, doc_group_of, is_doc_form};
+    use super::{PayloadField, Check, Comment, NodeKind, RuleSpec, comment_lexeme, container_name_token, doc_group_of, is_doc_form};
     use crate::comments::CommentKind;
     use dartq_parser::IdentifierContext;
     use dartq_source::StringId;
@@ -2290,7 +2289,7 @@ pub(crate) mod comment_references {
             if c.kind(id) != NodeKind::Identifier {
                 continue;
             }
-            let context = c.payload(id).first().copied();
+            let context = c.field(id, PayloadField::Context);
             if context == Some(IdentifierContext::FormalParameterDeclaration as u32)
                 || context == Some(IdentifierContext::FieldInitializer as u32)
             {

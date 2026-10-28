@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, body_members, get_set_token};
+use super::{PayloadField, Check, NodeKind, RuleSpec, body_members, get_set_token};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_classes_with_only_static_members.dart:30-71`
 /// — a class whose members are all static (and whose fields are not all
@@ -117,7 +117,7 @@ fn class_name_row(c: &Check<'_>, class_row: u32) -> Option<u32> {
     let is_class_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx
                         == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
@@ -149,8 +149,8 @@ fn has_instance_members(c: &Check<'_>, class_row: u32) -> bool {
         .iter()
         .any(|&member| match c.kind(member) {
             NodeKind::Fields => {
-                c.payload(member).first()
-                    == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                c.field(member, PayloadField::MemberKind)
+                    == Some(dartq_parser::MemberKind::NonStaticField as u32)
             }
             NodeKind::Method => {
                 dartq_ast::mod_flags(c.unit.ast, member) & STATIC_OR_SEALED_BIT == 0
@@ -182,7 +182,7 @@ fn is_non_default_constructor(c: &Check<'_>, ctor: u32) -> bool {
         ) && c.collect_direct(kid).into_iter().any(|param| {
             c.kind(param) == NodeKind::FormalParameter
                 && matches!(
-                    c.payload(param).get(4).copied(),
+                    c.field(param, PayloadField::FormalParameterKind),
                     Some(k)
                         if k == dartq_parser::FormalParameterKind::RequiredPositional as u32
                             || k == dartq_parser::FormalParameterKind::RequiredNamed as u32

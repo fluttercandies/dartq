@@ -22,7 +22,7 @@
 //! debug-method references) read their syntactic shapes; each rule's
 //! module doc registers its direction.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 use dartq_parser::IdentifierContext;
 
 use crate::engine::Check;
@@ -432,7 +432,7 @@ fn carries_annotation(c: &Check<'_>, row: u32, name: &str) -> bool {
 fn class_name_row(c: &Check<'_>, class: u32) -> Option<u32> {
     let is_class_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
-            && c.payload(kid).first().copied()
+            && c.field(kid, PayloadField::Context)
                 == Some(IdentifierContext::ClassOrMixinOrExtensionDeclaration as u32)
     };
     if let Some(name) = c
@@ -462,7 +462,7 @@ fn member_name_row(c: &Check<'_>, member: u32) -> Option<u32> {
     let named = |ctx: IdentifierContext| {
         c.collect_direct(member).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first().copied() == Some(ctx as u32)
+                && c.field(kid, PayloadField::Context) == Some(ctx as u32)
         })
     };
     named(IdentifierContext::MethodDeclarationContinuation)
@@ -503,9 +503,9 @@ fn formal_rows(c: &Check<'_>, params: u32) -> Vec<u32> {
     rows
 }
 
-/// A simple formal parameter's name (payload word 1).
+/// A simple formal parameter's name (the row's `Name` word).
 fn param_name<'a>(c: &'a Check<'_>, param: u32) -> Option<&'a str> {
-    let name = c.payload(param).get(1).copied()?;
+    let name = c.field(param, PayloadField::Name)?;
     (name != crate::rules::NONE_TOKEN).then(|| c.lexeme(name))
 }
 
@@ -1199,7 +1199,7 @@ pub(crate) mod sized_box_for_whitespace {
 }
 
 pub(crate) mod sized_box_shrink_expand {
-    use super::{Check, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework, value_root};
+    use super::{PayloadField, Check, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework, value_root};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/sized_box_shrink_expand.dart` — a default
@@ -1306,9 +1306,7 @@ pub(crate) mod sized_box_shrink_expand {
                 lexeme.parse::<f64>().ok()
             }
             NodeKind::DotAccess => c
-                .payload(root)
-                .first()
-                .copied()
+                .field(root, PayloadField::Operator)
                 .and_then(|dot| infinity_at(c, dot)),
             _ => None,
         }
@@ -1338,7 +1336,7 @@ pub(crate) mod sized_box_shrink_expand {
     ) -> Option<f64> {
         let run = pieces.get(range.clone())?;
         let dot = match c.kind(*run.last()?) {
-            NodeKind::DotAccess => c.payload(*run.last()?).first().copied()?,
+            NodeKind::DotAccess => c.field(*run.last()?, PayloadField::Operator)?,
             _ => return None,
         };
         let invoked = run
@@ -2400,7 +2398,7 @@ pub(crate) mod diagnostic_describe_all_properties {
     use dartq_ast::mod_flags;
     use dartq_parser::MemberKind;
 
-    use super::{Check, NodeKind, RuleSpec, any_clause, chain_spells_root, member_name_row, member_named};
+    use super::{PayloadField, Check, NodeKind, RuleSpec, any_clause, chain_spells_root, member_name_row, member_named};
     use crate::rules::{body_members, get_set_token, initialized_identifier_name, utf16_token_span};
 
     /// The `static` `ModSet` bit (bridge `mod_bits`, member family).
@@ -2458,7 +2456,9 @@ pub(crate) mod diagnostic_describe_all_properties {
                     properties.push(token);
                 }
                 NodeKind::Fields => {
-                    if c.payload(*member).first() != Some(&(MemberKind::NonStaticField as u32)) {
+                    if c.field(*member, PayloadField::MemberKind)
+                        != Some(MemberKind::NonStaticField as u32)
+                    {
                         continue;
                     }
                     for decl in c.collect_direct(*member) {

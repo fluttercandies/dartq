@@ -1,9 +1,10 @@
 # dartq official analyzer diagnostic codes — generated data table.
 # DO NOT EDIT: regenerate with
-#   cargo run -p upstream-gen --bin analyzer-codes-gen -- --sdk-src <dart-sdk-tree>
+#   DARTQ_SDK_SRC=<dart-sdk-tree> cargo run -p upstream-gen --bin analyzer-codes-gen
 # Content pin: crates/dartq-diagnostics/tests/analyzer_codes_tsv.rs (blake3).
+# SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable) — conformance/pin.toml (verified by --check).
 # Source: pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart of the pinned
-#   SDK checkout (dart 3.15.0 (main channel)), generated upstream from
+#   SDK checkout (dart 3.13.7, stable), generated upstream from
 #   pkg/analyzer/messages.yaml (class groups) plus
 #   pkg/_fe_analyzer_shared/messages.yaml (shared parser codes; their
 #   class column spells `_fe_analyzer_shared`).
@@ -14,14 +15,14 @@
 # MACHINE = uppercase(name). SEV derives from TYPE by the upstream
 #   DiagnosticType constants: SYNTACTIC_ERROR/COMPILE_TIME_ERROR -> ERROR,
 #   STATIC_WARNING -> WARNING, HINT/TODO -> INFO.
-# 1160 registry consts fold to 982 name rows (sharedName families
+# 1150 registry consts fold to 979 name rows (sharedName families
 #   keep the first registry entry; hasPublishedDocs folds any-variant —
 #   upstream has no name with mixed flags, verified on every run).
 # Rows are sorted by name. The syntax tier (data/syntax-codes.tsv) is
-#   oracle-locked to dart 3.13.1 and OVERRIDES these rows for its 259
-#   names in build.rs: 3.15 recast field_initializer_outside_constructor
-#   to COMPILE_TIME_ERROR and moved two templates — the pinned table
-#   wins for the acceptance set.
+#   oracle-locked (its own header names the lock) and OVERRIDES these rows
+#   for its names in build.rs — the syntax snapshot wins for its
+#   acceptance set; a handful of this table's rows legitimately differ
+#   there (patch-level upstream rewordings), so the override stays.
 FfiCode	abi_specific_integer_invalid	ABI_SPECIFIC_INTEGER_INVALID	COMPILE_TIME_ERROR	ERROR	true	Classes extending 'AbiSpecificInteger' must have exactly one const constructor, no other members, and no type parameters.	Try removing all type parameters, removing all members, and adding one const constructor.
 FfiCode	abi_specific_integer_mapping_extra	ABI_SPECIFIC_INTEGER_MAPPING_EXTRA	COMPILE_TIME_ERROR	ERROR	true	Classes extending 'AbiSpecificInteger' must have exactly one 'AbiSpecificIntegerMapping' annotation specifying the mapping from ABI to a 'NativeType' integer with a fixed size.	Try removing the extra annotation.
 FfiCode	abi_specific_integer_mapping_missing	ABI_SPECIFIC_INTEGER_MAPPING_MISSING	COMPILE_TIME_ERROR	ERROR	true	Classes extending 'AbiSpecificInteger' must have exactly one 'AbiSpecificIntegerMapping' annotation specifying the mapping from ABI to a 'NativeType' integer with a fixed size.	Try adding an annotation.
@@ -38,10 +39,9 @@ ParserErrorCode	abstract_static_method	ABSTRACT_STATIC_METHOD	SYNTACTIC_ERROR	ER
 CompileTimeErrorCode	abstract_super_member_reference	ABSTRACT_SUPER_MEMBER_REFERENCE	COMPILE_TIME_ERROR	ERROR	true	The {0} '{1}' is always abstract in the supertype.
 FfiCode	address_position	ADDRESS_POSITION	COMPILE_TIME_ERROR	ERROR	true	The '.address' expression can only be used as argument to a leaf native external call.
 FfiCode	address_receiver	ADDRESS_RECEIVER	COMPILE_TIME_ERROR	ERROR	true	The receiver of '.address' must be a concrete 'TypedData', a concrete 'TypedData' '[]', an 'Array', an 'Array' '[]', a Struct field, or a Union field.	Change the receiver of '.address' to one of the allowed kinds.
-WarningCode	ambiguous_comment_reference	AMBIGUOUS_COMMENT_REFERENCE	STATIC_WARNING	WARNING	false	The name '{0}' is ambiguous because it is defined in the libraries {1}.	Try using a prefix for one of the import directives, or hiding the name from all but one of the imports.
 CompileTimeErrorCode	ambiguous_export	AMBIGUOUS_EXPORT	COMPILE_TIME_ERROR	ERROR	true	The name '{0}' is defined in the libraries '{1}' and '{2}'.	Try removing the export of one of the libraries, or explicitly hiding the name in one of the export directives.
 CompileTimeErrorCode	ambiguous_extension_member_access	AMBIGUOUS_EXTENSION_MEMBER_ACCESS	COMPILE_TIME_ERROR	ERROR	true	A member named '{0}' is defined in {1}, and none are more specific.	Try using an extension override to specify the extension you want to be chosen.
-CompileTimeErrorCode	ambiguous_import	AMBIGUOUS_IMPORT	COMPILE_TIME_ERROR	ERROR	true	The {0} '{1}' is defined in the libraries {2}.	Try using 'as prefix' for one of the import directives, or hiding the name from all but one of the imports.
+CompileTimeErrorCode	ambiguous_import	AMBIGUOUS_IMPORT	COMPILE_TIME_ERROR	ERROR	true	The name '{0}' is defined in the libraries {1}.	Try using 'as prefix' for one of the import directives, or hiding the name from all but one of the imports.
 CompileTimeErrorCode	ambiguous_set_or_map_literal_both	AMBIGUOUS_SET_OR_MAP_LITERAL_BOTH	COMPILE_TIME_ERROR	ERROR	true	The literal can't be either a map or a set because it contains at least one literal map entry or a spread operator spreading a 'Map', and at least one element which is neither of these.	Try removing or changing some of the elements so that all of the elements are consistent.
 CompileTimeErrorCode	ambiguous_set_or_map_literal_either	AMBIGUOUS_SET_OR_MAP_LITERAL_EITHER	COMPILE_TIME_ERROR	ERROR	true	This literal must be either a map or a set, but the elements don't have enough information for type inference to work.	Try adding type arguments to the literal (one for sets, two for maps).
 AnalysisOptionsWarningCode	analysis_option_deprecated	ANALYSIS_OPTION_DEPRECATED	STATIC_WARNING	WARNING	true	The option '{0}' is no longer supported.	Try removing the option.
@@ -76,7 +76,7 @@ _fe_analyzer_shared	assignment_to_primary_constructor_parameter	ASSIGNMENT_TO_PR
 CompileTimeErrorCode	assignment_to_type	ASSIGNMENT_TO_TYPE	COMPILE_TIME_ERROR	ERROR	true	Types can't be assigned a value.
 CompileTimeErrorCode	async_for_in_wrong_context	ASYNC_FOR_IN_WRONG_CONTEXT	COMPILE_TIME_ERROR	ERROR	true	The async for-in loop can only be used in an async function.	Try marking the function body with either 'async' or 'async*', or removing the 'await' before the for-in loop.
 ParserErrorCode	async_keyword_used_as_identifier	ASYNC_KEYWORD_USED_AS_IDENTIFIER	SYNTACTIC_ERROR	ERROR	false	The keywords 'await' and 'yield' can't be used as identifiers in an asynchronous or generator function.
-_fe_analyzer_shared	augmentation_extends_clause_already_present	AUGMENTATION_EXTENDS_CLAUSE_ALREADY_PRESENT	COMPILE_TIME_ERROR	ERROR	false	The augmentation has an 'extends' clause, but an augmentation target already includes an 'extends' clause and it isn't allowed to be repeated or changed.	Try removing the 'extends' clause, either here or in the augmentation target.
+CompileTimeErrorCode	augmentation_extends_clause_already_present	AUGMENTATION_EXTENDS_CLAUSE_ALREADY_PRESENT	COMPILE_TIME_ERROR	ERROR	false	The augmentation has an 'extends' clause, but an augmentation target already includes an 'extends' clause and it isn't allowed to be repeated or changed.	Try removing the 'extends' clause, either here or in the augmentation target.
 CompileTimeErrorCode	augmentation_formal_parameter_modifier_extra	AUGMENTATION_FORMAL_PARAMETER_MODIFIER_EXTRA	COMPILE_TIME_ERROR	ERROR	false	The augmentation has the '{0}' modifier on this formal parameter, but the declaration doesn't.	Try removing the '{0}' modifier, or adding it to the declaration.
 CompileTimeErrorCode	augmentation_formal_parameter_modifier_missing	AUGMENTATION_FORMAL_PARAMETER_MODIFIER_MISSING	COMPILE_TIME_ERROR	ERROR	false	The augmentation is missing the '{0}' modifier on this formal parameter that the declaration has.	Try adding the '{0}' modifier, or removing it from the declaration.
 CompileTimeErrorCode	augmentation_formal_parameter_type_mismatch	AUGMENTATION_FORMAL_PARAMETER_TYPE_MISMATCH	COMPILE_TIME_ERROR	ERROR	false	The augmentation's formal parameter type '{1}' must be the same as the declaration's formal parameter type '{0}'.	Try changing the augmentation's formal parameter type to match the declaration, or omit the type.
@@ -93,7 +93,6 @@ CompileTimeErrorCode	augmentation_return_type_mismatch	AUGMENTATION_RETURN_TYPE_
 CompileTimeErrorCode	augmentation_type_parameter_bound	AUGMENTATION_TYPE_PARAMETER_BOUND	COMPILE_TIME_ERROR	ERROR	false	The augmentation type parameter must have the same bound as the corresponding type parameter of the declaration.	Try changing the augmentation to match the declaration type parameters.
 CompileTimeErrorCode	augmentation_type_parameter_count	AUGMENTATION_TYPE_PARAMETER_COUNT	COMPILE_TIME_ERROR	ERROR	false	The augmentation must have the same number of type parameters as the declaration.	Try changing the augmentation to match the declaration type parameters.
 CompileTimeErrorCode	augmentation_type_parameter_name	AUGMENTATION_TYPE_PARAMETER_NAME	COMPILE_TIME_ERROR	ERROR	false	The augmentation type parameter must have the same name as the corresponding type parameter of the declaration.	Try changing the augmentation to match the declaration type parameters.
-CompileTimeErrorCode	augmentation_variable_different_getter_setter_types	AUGMENTATION_VARIABLE_DIFFERENT_GETTER_SETTER_TYPES	COMPILE_TIME_ERROR	ERROR	false	The getter and setter augmented by this variable have different types: '{0}' and '{1}'.	Try changing the getter and setter to have the same type.
 CompileTimeErrorCode	augmentation_without_declaration	AUGMENTATION_WITHOUT_DECLARATION	COMPILE_TIME_ERROR	ERROR	false	The declaration being augmented doesn't exist.	Try changing the augmentation to match an existing declaration.
 CompileTimeErrorCode	augmented_expression_is_not_setter	AUGMENTED_EXPRESSION_IS_NOT_SETTER	COMPILE_TIME_ERROR	ERROR	false	The augmented declaration is not a setter, it can't be used to write a value.	Try assigning a value to a setter.
 CompileTimeErrorCode	augmented_expression_is_setter	AUGMENTED_EXPRESSION_IS_SETTER	COMPILE_TIME_ERROR	ERROR	false	The augmented declaration is a setter, it can't be used to read a value.	Try assigning a value to the augmented setter.
@@ -223,10 +222,10 @@ AnalysisOptionsWarningCode	deprecated_lint	DEPRECATED_LINT	STATIC_WARNING	WARNIN
 AnalysisOptionsWarningCode	deprecated_lint_with_replacement	DEPRECATED_LINT_WITH_REPLACEMENT	STATIC_WARNING	WARNING	false	The lint rule '{0}' is deprecated and replaced by '{1}'.	Try replacing '{0}' with '{1}'.
 HintCode	deprecated_member_use	DEPRECATED_MEMBER_USE	HINT	INFO	true	'{0}' is deprecated and shouldn't be used.	Try replacing the use of the deprecated member with the replacement.
 WarningCode	deprecated_mixin	DEPRECATED_MIXIN	STATIC_WARNING	WARNING	true	Mixing in '{0}' is deprecated.	Try removing '{0}' from the 'with' clause.
+WarningCode	deprecated_new_in_comment_reference	DEPRECATED_NEW_IN_COMMENT_REFERENCE	STATIC_WARNING	WARNING	true	Using the 'new' keyword in a comment reference is deprecated.	Try referring to a constructor by its name.
 WarningCode	deprecated_optional	DEPRECATED_OPTIONAL	STATIC_WARNING	WARNING	true	Omitting an argument for the '{0}' parameter is deprecated.	Try passing an argument for '{0}'.
 WarningCode	deprecated_subclass	DEPRECATED_SUBCLASS	STATIC_WARNING	WARNING	true	Subclassing '{0}' is deprecated.	Try removing the 'extends' clause, or removing '{0}' from the 'implements' clause.
 WarningCode	deprecated_subtype_of_function	DEPRECATED_SUBTYPE_OF_FUNCTION	STATIC_WARNING	WARNING	true	Extending 'Function' is deprecated.	Try removing 'Function' from the 'extends' clause.
-CompileTimeErrorCode	different_inherited_getter_and_setter_types	DIFFERENT_INHERITED_GETTER_AND_SETTER_TYPES	COMPILE_TIME_ERROR	ERROR	false	Can't infer a type for '{0}' because the combined member signature of the getter has return type '{1}', which is not the same as the parameter type '{2}' of the combined member signature of the setter.	Try adding an explicit type.
 _fe_analyzer_shared	directive_after_declaration	DIRECTIVE_AFTER_DECLARATION	SYNTACTIC_ERROR	ERROR	false	Directives must appear before any declarations.	Try moving the directive before any declarations.
 CompileTimeErrorCode	disallowed_type_instantiation_expression	DISALLOWED_TYPE_INSTANTIATION_EXPRESSION	COMPILE_TIME_ERROR	ERROR	true	Only a generic type, generic function, generic instance method, or generic constructor can have type arguments.	Try removing the type arguments, or instantiating the type(s) of a generic type, generic function, generic instance method, or generic constructor.
 WarningCode	doc_directive_argument_wrong_format	DOC_DIRECTIVE_ARGUMENT_WRONG_FORMAT	STATIC_WARNING	WARNING	false	The '{0}' argument must be formatted as {1}.	Try formatting '{0}' as {1}.
@@ -238,8 +237,9 @@ WarningCode	doc_directive_missing_closing_tag	DOC_DIRECTIVE_MISSING_CLOSING_TAG	
 WarningCode	doc_directive_missing_opening_tag	DOC_DIRECTIVE_MISSING_OPENING_TAG	STATIC_WARNING	WARNING	false	Doc directive is missing an opening tag.	Try opening the directive with the appropriate opening tag, '{0}'.
 WarningCode	doc_directive_unknown	DOC_DIRECTIVE_UNKNOWN	STATIC_WARNING	WARNING	false	Doc directive '{0}' is unknown.	Try using one of the supported doc directives.
 WarningCode	doc_import_cannot_be_deferred	DOC_IMPORT_CANNOT_BE_DEFERRED	STATIC_WARNING	WARNING	true	Doc imports can't be deferred.	Try removing the 'deferred' keyword.
+WarningCode	doc_import_cannot_have_combinators	DOC_IMPORT_CANNOT_HAVE_COMBINATORS	STATIC_WARNING	WARNING	true	Doc imports can't have show or hide combinators.	Try removing the combinator.
 WarningCode	doc_import_cannot_have_configurations	DOC_IMPORT_CANNOT_HAVE_CONFIGURATIONS	STATIC_WARNING	WARNING	true	Doc imports can't have configurations.	Try removing the configurations.
-WarningCode	doc_import_in_part_file	DOC_IMPORT_IN_PART_FILE	STATIC_WARNING	WARNING	false	Doc imports in part files require the 'enhanced-parts' language feature.	Try moving the doc import to the library file.
+WarningCode	doc_import_cannot_have_prefix	DOC_IMPORT_CANNOT_HAVE_PREFIX	STATIC_WARNING	WARNING	true	Doc imports can't have prefixes.	Try removing the prefix.
 CompileTimeErrorCode	dot_shorthand_missing_context	DOT_SHORTHAND_MISSING_CONTEXT	COMPILE_TIME_ERROR	ERROR	true	A dot shorthand can't be used where there is no context type.
 CompileTimeErrorCode	dot_shorthand_undefined_member	DOT_SHORTHAND_UNDEFINED_MEMBER	COMPILE_TIME_ERROR	ERROR	true	The static getter '{0}' isn't defined for the context type '{1}'.	Try correcting the name to the name of an existing static getter, or defining a getter or field named '{0}'.
 CompileTimeErrorCode	duplicate_constructor	DUPLICATE_CONSTRUCTOR	COMPILE_TIME_ERROR	ERROR	true	The unnamed constructor is already defined.	Try giving one of the constructors a name.
@@ -283,7 +283,6 @@ CompileTimeErrorCode	equal_keys_in_const_map	EQUAL_KEYS_IN_CONST_MAP	COMPILE_TIM
 WarningCode	equal_keys_in_map	EQUAL_KEYS_IN_MAP	STATIC_WARNING	WARNING	true	Two keys in a map literal shouldn't be equal.	Change or remove the duplicate key.
 CompileTimeErrorCode	equal_keys_in_map_pattern	EQUAL_KEYS_IN_MAP_PATTERN	COMPILE_TIME_ERROR	ERROR	true	Two keys in a map pattern can't be equal.	Change or remove the duplicate key.
 _fe_analyzer_shared	equality_cannot_be_equality_operand	EQUALITY_CANNOT_BE_EQUALITY_OPERAND	SYNTACTIC_ERROR	ERROR	false	A comparison expression can't be an operand of another comparison expression.	Try putting parentheses around one of the comparisons.
-AnalysisOptionsWarningCode	exclude_invalid_glob	EXCLUDE_INVALID_GLOB	STATIC_WARNING	WARNING	false	The exclude glob pattern '{0}' shouldn't start with a forward slash.	Remove the leading forward slash.
 _fe_analyzer_shared	expected_body	EXPECTED_BODY	SYNTACTIC_ERROR	ERROR	false	A catch clause must have a body, even if it is empty.	Try adding an empty body.
 ParserErrorCode	expected_case_or_default	EXPECTED_CASE_OR_DEFAULT	SYNTACTIC_ERROR	ERROR	false	Expected 'case' or 'default'.	Try placing this code inside a case clause.
 ParserErrorCode	expected_class_member	EXPECTED_CLASS_MEMBER	SYNTACTIC_ERROR	ERROR	false	Expected a class member.	Try placing this code inside a class member.
@@ -313,7 +312,6 @@ CompileTimeErrorCode	expression_in_map	EXPRESSION_IN_MAP	COMPILE_TIME_ERROR	ERRO
 CompileTimeErrorCode	extends_non_class	EXTENDS_NON_CLASS	COMPILE_TIME_ERROR	ERROR	true	Classes can only extend other classes.	Try specifying a different superclass, or removing the extends clause.
 CompileTimeErrorCode	extension_as_expression	EXTENSION_AS_EXPRESSION	COMPILE_TIME_ERROR	ERROR	true	Extension '{0}' can't be used as an expression.	Try replacing it with a valid expression.
 _fe_analyzer_shared	extension_augmentation_has_on_clause	EXTENSION_AUGMENTATION_HAS_ON_CLAUSE	SYNTACTIC_ERROR	ERROR	false	Extension augmentations can't have 'on' clauses.	Try removing the 'on' clause.
-_fe_analyzer_shared	extension_augmentation_without_name	EXTENSION_AUGMENTATION_WITHOUT_NAME	SYNTACTIC_ERROR	ERROR	false	An extension augmentation must have a name.	Try adding the name of the extension to augment.
 CompileTimeErrorCode	extension_conflicting_static_and_instance	EXTENSION_CONFLICTING_STATIC_AND_INSTANCE	COMPILE_TIME_ERROR	ERROR	true	An extension can't define static member '{0}' and an instance member with the same name.	Try renaming the member to a name that doesn't conflict.
 _fe_analyzer_shared	extension_declares_abstract_member	EXTENSION_DECLARES_ABSTRACT_MEMBER	SYNTACTIC_ERROR	ERROR	true	Extensions can't declare abstract members.	Try providing an implementation for the member.
 _fe_analyzer_shared	extension_declares_constructor	EXTENSION_DECLARES_CONSTRUCTOR	SYNTACTIC_ERROR	ERROR	true	Extensions can't declare constructors.	Try removing the constructor declaration.
@@ -338,7 +336,7 @@ CompileTimeErrorCode	extension_type_inherited_member_conflict	EXTENSION_TYPE_INH
 CompileTimeErrorCode	extension_type_representation_depends_on_itself	EXTENSION_TYPE_REPRESENTATION_DEPENDS_ON_ITSELF	COMPILE_TIME_ERROR	ERROR	true	The extension type representation can't depend on itself.	Try specifying a different type.
 CompileTimeErrorCode	extension_type_representation_type_bottom	EXTENSION_TYPE_REPRESENTATION_TYPE_BOTTOM	COMPILE_TIME_ERROR	ERROR	true	The representation type can't be a bottom type.	Try specifying a different type.
 _fe_analyzer_shared	extension_type_with	EXTENSION_TYPE_WITH	SYNTACTIC_ERROR	ERROR	false	An extension type declaration can't have a 'with' clause.	Try removing the 'with' clause or replacing the 'with' with 'implements'.
-_fe_analyzer_shared	extension_type_with_abstract_member	EXTENSION_TYPE_WITH_ABSTRACT_MEMBER	COMPILE_TIME_ERROR	ERROR	true	'{0}' must have a method body because '{1}' is an extension type.	Try adding a body to '{0}'.
+CompileTimeErrorCode	extension_type_with_abstract_member	EXTENSION_TYPE_WITH_ABSTRACT_MEMBER	COMPILE_TIME_ERROR	ERROR	true	'{0}' must have a method body because '{1}' is an extension type.	Try adding a body to '{0}'.
 _fe_analyzer_shared	external_class	EXTERNAL_CLASS	SYNTACTIC_ERROR	ERROR	false	Classes can't be declared to be 'external'.	Try removing the keyword 'external'.
 _fe_analyzer_shared	external_constructor_with_field_initializers	EXTERNAL_CONSTRUCTOR_WITH_FIELD_INITIALIZERS	SYNTACTIC_ERROR	ERROR	false	An external constructor can't initialize fields.	Try removing the field initializers, or removing the keyword 'external'.
 _fe_analyzer_shared	external_constructor_with_initializer	EXTERNAL_CONSTRUCTOR_WITH_INITIALIZER	SYNTACTIC_ERROR	ERROR	false	An external constructor can't have any initializers.
@@ -438,7 +436,6 @@ AnalysisOptionsWarningCode	include_file_not_found	INCLUDE_FILE_NOT_FOUND	STATIC_
 AnalysisOptionsErrorCode	included_file_parse_error	INCLUDED_FILE_PARSE_ERROR	COMPILE_TIME_ERROR	ERROR	true	{3} in {0}({1}..{2})
 AnalysisOptionsWarningCode	included_file_warning	INCLUDED_FILE_WARNING	STATIC_WARNING	WARNING	true	Warning in the included options file {0}({1}..{2}): {3}
 AnalysisOptionsWarningCode	incompatible_lint	INCOMPATIBLE_LINT	STATIC_WARNING	WARNING	true	The rule '{0}' is incompatible with '{1}'.	Try removing all but one of the incompatible rules.
-AnalysisOptionsWarningCode	incompatible_plugin_source	INCOMPATIBLE_PLUGIN_SOURCE	STATIC_WARNING	WARNING	false	The plugin '{0}' is specified with a different source in '{1}'.	Ensure that all specifications of the same plugin use an identical source.
 CompileTimeErrorCode	inconsistent_inheritance	INCONSISTENT_INHERITANCE	COMPILE_TIME_ERROR	ERROR	true	Superinterfaces don't have a valid override for '{0}': {1}.	Try adding an explicit override that is consistent with all of the inherited members.
 CompileTimeErrorCode	inconsistent_inheritance_getter_and_method	INCONSISTENT_INHERITANCE_GETTER_AND_METHOD	COMPILE_TIME_ERROR	ERROR	false	'{0}' is inherited as a getter (from '{1}') and also a method (from '{2}').	Try adjusting the supertypes of this class to remove the inconsistency.
 CompileTimeErrorCode	inconsistent_language_version_override	INCONSISTENT_LANGUAGE_VERSION_OVERRIDE	COMPILE_TIME_ERROR	ERROR	true	Parts must have exactly the same language version override as the library.
@@ -450,8 +447,8 @@ CompileTimeErrorCode	induced_setter_without_body	INDUCED_SETTER_WITHOUT_BODY	COM
 WarningCode	inference_failure_on_collection_literal	INFERENCE_FAILURE_ON_COLLECTION_LITERAL	STATIC_WARNING	WARNING	true	The type argument(s) of '{0}' can't be inferred.	Use explicit type argument(s) for '{0}'.
 WarningCode	inference_failure_on_function_invocation	INFERENCE_FAILURE_ON_FUNCTION_INVOCATION	STATIC_WARNING	WARNING	true	The type argument(s) of the function '{0}' can't be inferred.	Use explicit type argument(s) for '{0}'.
 WarningCode	inference_failure_on_function_return_type	INFERENCE_FAILURE_ON_FUNCTION_RETURN_TYPE	STATIC_WARNING	WARNING	true	The return type of '{0}' can't be inferred.	Declare the return type of '{0}'.
-WarningCode	inference_failure_on_generic_invocation	INFERENCE_FAILURE_ON_GENERIC_INVOCATION	STATIC_WARNING	WARNING	false	The type argument(s) of the generic function type '{0}' can't be inferred.	Use explicit type argument(s) for '{0}'.
-WarningCode	inference_failure_on_instance_creation	INFERENCE_FAILURE_ON_INSTANCE_CREATION	STATIC_WARNING	WARNING	false	The type argument(s) of the constructor '{0}' can't be inferred.	Use explicit type argument(s) for '{0}'.
+WarningCode	inference_failure_on_generic_invocation	INFERENCE_FAILURE_ON_GENERIC_INVOCATION	STATIC_WARNING	WARNING	true	The type argument(s) of the generic function type '{0}' can't be inferred.	Use explicit type argument(s) for '{0}'.
+WarningCode	inference_failure_on_instance_creation	INFERENCE_FAILURE_ON_INSTANCE_CREATION	STATIC_WARNING	WARNING	true	The type argument(s) of the constructor '{0}' can't be inferred.	Use explicit type argument(s) for '{0}'.
 WarningCode	inference_failure_on_uninitialized_variable	INFERENCE_FAILURE_ON_UNINITIALIZED_VARIABLE	STATIC_WARNING	WARNING	true	The type of '{0}' can't be inferred without either a type or initializer.	Try specifying the type of the variable.
 WarningCode	inference_failure_on_untyped_parameter	INFERENCE_FAILURE_ON_UNTYPED_PARAMETER	STATIC_WARNING	WARNING	true	The type of '{0}' can't be inferred; a type must be explicitly provided.	Try specifying the type of the parameter.
 _fe_analyzer_shared	initialized_variable_in_for_each	INITIALIZED_VARIABLE_IN_FOR_EACH	SYNTACTIC_ERROR	ERROR	false	The loop variable in a for-each loop can't be initialized.	Try removing the initializer, or using a different kind of loop.
@@ -478,7 +475,7 @@ CompileTimeErrorCode	invalid_assignment	INVALID_ASSIGNMENT	COMPILE_TIME_ERROR	ER
 _fe_analyzer_shared	invalid_await_in_for	INVALID_AWAIT_IN_FOR	SYNTACTIC_ERROR	ERROR	false	The keyword 'await' isn't allowed for a normal 'for' statement.	Try removing the keyword, or use a for-each statement.
 WarningCode	invalid_await_not_required_annotation	INVALID_AWAIT_NOT_REQUIRED_ANNOTATION	STATIC_WARNING	WARNING	true	The annotation 'awaitNotRequired' can only be applied to a Future-returning function, or a Future-typed field.
 ParserErrorCode	invalid_code_point	INVALID_CODE_POINT	SYNTACTIC_ERROR	ERROR	false	The escape sequence '{0}' isn't a valid code point.
-ParserErrorCode	invalid_comment_reference	INVALID_COMMENT_REFERENCE	SYNTACTIC_ERROR	ERROR	false	Comment references should contain a possibly prefixed identifier, but shouldn't contain anything else.
+ParserErrorCode	invalid_comment_reference	INVALID_COMMENT_REFERENCE	SYNTACTIC_ERROR	ERROR	false	Comment references should contain a possibly prefixed identifier and can start with 'new', but shouldn't contain anything else.
 CompileTimeErrorCode	invalid_constant	INVALID_CONSTANT	COMPILE_TIME_ERROR	ERROR	false	Invalid constant value.
 _fe_analyzer_shared	invalid_constant_const_prefix	INVALID_CONSTANT_CONST_PREFIX	SYNTACTIC_ERROR	ERROR	false	The expression can't be prefixed by 'const' to form a constant pattern.	Try wrapping the expression in 'const ( ... )' instead.
 _fe_analyzer_shared	invalid_constant_pattern_binary	INVALID_CONSTANT_PATTERN_BINARY	SYNTACTIC_ERROR	ERROR	false	The binary operator {0} is not supported as a constant pattern.	Try wrapping the expression in 'const ( ... )'.
@@ -561,7 +558,6 @@ WarningCode	invalid_widget_preview_private_argument	INVALID_WIDGET_PREVIEW_PRIVA
 CompileTimeErrorCode	invocation_of_extension_without_call	INVOCATION_OF_EXTENSION_WITHOUT_CALL	COMPILE_TIME_ERROR	ERROR	true	The extension '{0}' doesn't define a 'call' method so the override can't be used in an invocation.
 CompileTimeErrorCode	invocation_of_non_function	INVOCATION_OF_NON_FUNCTION	COMPILE_TIME_ERROR	ERROR	true	'{0}' isn't a function.	Try correcting the name to match an existing function, or define a method or function named '{0}'.
 CompileTimeErrorCode	invocation_of_non_function_expression	INVOCATION_OF_NON_FUNCTION_EXPRESSION	COMPILE_TIME_ERROR	ERROR	true	The expression doesn't evaluate to a function, so it can't be invoked.
-JsInteropCode	js_interop_extension_constructor_js_annotation_has_no_effect	JS_INTEROP_EXTENSION_CONSTRUCTOR_JS_ANNOTATION_HAS_NO_EFFECT	COMPILE_TIME_ERROR	ERROR	false	The '@JS' annotation on an extension type constructor has no effect and is disallowed.	Try removing the '@JS' annotation from the constructor, and putting it on the extension type to rename non-object literal constructors.
 CompileTimeErrorCode	label_in_outer_scope	LABEL_IN_OUTER_SCOPE	COMPILE_TIME_ERROR	ERROR	true	Can't reference label '{0}' declared in an outer method.
 CompileTimeErrorCode	label_undefined	LABEL_UNDEFINED	COMPILE_TIME_ERROR	ERROR	true	Can't reference an undefined label '{0}'.	Try defining the label, or correcting the name to match an existing label.
 CompileTimeErrorCode	late_final_field_with_const_constructor	LATE_FINAL_FIELD_WITH_CONST_CONSTRUCTOR	COMPILE_TIME_ERROR	ERROR	true	Can't have a late final field in a class with a generative const constructor.	Try removing the 'late' modifier, or don't declare 'const' constructors.
@@ -634,7 +630,6 @@ _fe_analyzer_shared	mixin_application_class_augmentation	MIXIN_APPLICATION_CLASS
 CompileTimeErrorCode	mixin_application_concrete_super_invoked_member_type	MIXIN_APPLICATION_CONCRETE_SUPER_INVOKED_MEMBER_TYPE	COMPILE_TIME_ERROR	ERROR	true	The super-invoked member '{0}' has the type '{1}', and the concrete member in the class has the type '{2}'.
 CompileTimeErrorCode	mixin_application_no_concrete_super_invoked_member	MIXIN_APPLICATION_NO_CONCRETE_SUPER_INVOKED_MEMBER	COMPILE_TIME_ERROR	ERROR	true	The class doesn't have a concrete implementation of the super-invoked member '{0}'.
 CompileTimeErrorCode	mixin_application_not_implemented_interface	MIXIN_APPLICATION_NOT_IMPLEMENTED_INTERFACE	COMPILE_TIME_ERROR	ERROR	true	'{0}' can't be mixed onto '{1}' because '{1}' doesn't implement '{2}'.	Try extending the class '{0}'.
-_fe_analyzer_shared	mixin_augmentation_has_on_clause	MIXIN_AUGMENTATION_HAS_ON_CLAUSE	SYNTACTIC_ERROR	ERROR	false	Mixin augmentations can't have 'on' clauses.	Try removing the 'on' clause.
 CompileTimeErrorCode	mixin_class_declaration_extends_not_object	MIXIN_CLASS_DECLARATION_EXTENDS_NOT_OBJECT	COMPILE_TIME_ERROR	ERROR	true	The class '{0}' can't be declared a mixin because it extends a class other than 'Object'.	Try removing the 'mixin' modifier or changing the superclass to 'Object'.
 CompileTimeErrorCode	mixin_class_declaration_with_clause	MIXIN_CLASS_DECLARATION_WITH_CLAUSE	COMPILE_TIME_ERROR	ERROR	true	The class '{0}' can't be declared a mixin because it has a 'with' clause.	Try removing the 'with' clause or removing the 'mixin' modifier from the class.
 CompileTimeErrorCode	mixin_class_declares_non_trivial_generative_constructor	MIXIN_CLASS_DECLARES_NON_TRIVIAL_GENERATIVE_CONSTRUCTOR	COMPILE_TIME_ERROR	ERROR	true	The mixin class '{0}' can't declare a non-trivial generative constructor.
@@ -651,7 +646,7 @@ _fe_analyzer_shared	mixin_with_clause	MIXIN_WITH_CLAUSE	SYNTACTIC_ERROR	ERROR	fa
 CompileTimeErrorCode	mixin_with_non_class_superclass	MIXIN_WITH_NON_CLASS_SUPERCLASS	COMPILE_TIME_ERROR	ERROR	false	Mixin can only be applied to class.
 _fe_analyzer_shared	modifier_out_of_order	MODIFIER_OUT_OF_ORDER	SYNTACTIC_ERROR	ERROR	false	The modifier '{0}' should be before the modifier '{1}'.	Try re-ordering the modifiers.
 _fe_analyzer_shared	multiple_clauses	MULTIPLE_CLAUSES	SYNTACTIC_ERROR	ERROR	false	Each '{0}' definition can have at most one '{1}' clause.	Try combining all of the '{1}' clauses into a single clause.
-_fe_analyzer_shared	multiple_combinators	MULTIPLE_COMBINATORS	SYNTACTIC_ERROR	ERROR	true	At most one 'show' or 'hide' combinator can be used on an import or export directive.	Try combining all of the combinators into a single combinator.
+WarningCode	multiple_combinators	MULTIPLE_COMBINATORS	STATIC_WARNING	WARNING	true	Using multiple 'hide' or 'show' combinators is never necessary and often produces surprising results.	Try using a single combinator.
 _fe_analyzer_shared	multiple_extends_clauses	MULTIPLE_EXTENDS_CLAUSES	SYNTACTIC_ERROR	ERROR	false	Each class definition can have at most one extends clause.	Try choosing one superclass and define your class to implement (or mix in) the others.
 ParserErrorCode	multiple_implements_clauses	MULTIPLE_IMPLEMENTS_CLAUSES	SYNTACTIC_ERROR	ERROR	false	Each class or mixin definition can have at most one implements clause.	Try combining all of the implements clauses into a single clause.
 _fe_analyzer_shared	multiple_library_directives	MULTIPLE_LIBRARY_DIRECTIVES	SYNTACTIC_ERROR	ERROR	false	Only one library directive may be declared in a file.	Try removing all but one of the library directives.
@@ -699,9 +694,10 @@ CompileTimeErrorCode	non_bool_expression	NON_BOOL_EXPRESSION	COMPILE_TIME_ERROR	
 CompileTimeErrorCode	non_bool_negation_expression	NON_BOOL_NEGATION_EXPRESSION	COMPILE_TIME_ERROR	ERROR	true	A negation operand must have a static type of 'bool'.	Try changing the operand to the '!' operator.
 CompileTimeErrorCode	non_bool_operand	NON_BOOL_OPERAND	COMPILE_TIME_ERROR	ERROR	true	The operands of the operator '{0}' must be assignable to 'bool'.
 WarningCode	non_const_argument_for_const_parameter	NON_CONST_ARGUMENT_FOR_CONST_PARAMETER	STATIC_WARNING	WARNING	true	Argument '{0}' must be a constant.	Try replacing the argument with a constant.
-WarningCode	non_const_call_to_literal_constructor	NON_CONST_CALL_TO_LITERAL_CONSTRUCTOR	STATIC_WARNING	WARNING	true	This instance creation must be 'const', because '{0}' is marked as '@literal'.	Try adding a 'const' keyword.
+WarningCode	non_const_call_to_literal_constructor	NON_CONST_CALL_TO_LITERAL_CONSTRUCTOR	STATIC_WARNING	WARNING	true	This instance creation must be 'const', because the {0} constructor is marked as '@literal'.	Try adding a 'const' keyword.
 CompileTimeErrorCode	non_const_generative_enum_constructor	NON_CONST_GENERATIVE_ENUM_CONSTRUCTOR	COMPILE_TIME_ERROR	ERROR	true	Generative enum constructors must be 'const'.	Try adding the keyword 'const'.
 CompileTimeErrorCode	non_const_map_as_expression_statement	NON_CONST_MAP_AS_EXPRESSION_STATEMENT	COMPILE_TIME_ERROR	ERROR	false	A non-constant map or set literal without type arguments can't be used as an expression statement.
+CompileTimeErrorCode	non_constant_annotation_constructor	NON_CONSTANT_ANNOTATION_CONSTRUCTOR	COMPILE_TIME_ERROR	ERROR	true	Annotation creation can only call a const constructor.
 CompileTimeErrorCode	non_constant_case_expression	NON_CONSTANT_CASE_EXPRESSION	COMPILE_TIME_ERROR	ERROR	true	Case expressions must be constant.
 CompileTimeErrorCode	non_constant_case_expression_from_deferred_library	NON_CONSTANT_CASE_EXPRESSION_FROM_DEFERRED_LIBRARY	COMPILE_TIME_ERROR	ERROR	true	Constant values from a deferred library can't be used as a case expression.	Try re-writing the switch as a series of if statements, or changing the import to not be deferred.
 CompileTimeErrorCode	non_constant_default_value	NON_CONSTANT_DEFAULT_VALUE	COMPILE_TIME_ERROR	ERROR	true	The default value of an optional parameter must be constant.
@@ -781,6 +777,7 @@ CompileTimeErrorCode	pattern_variable_assignment_inside_guard	PATTERN_VARIABLE_A
 _fe_analyzer_shared	pattern_variable_declaration_outside_function_or_method	PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD	SYNTACTIC_ERROR	ERROR	false	A pattern variable declaration may not appear outside a function or method.	Try declaring ordinary variables and assigning from within a function or method.
 ManifestWarningCode	permission_implies_unsupported_hardware	PERMISSION_IMPLIES_UNSUPPORTED_HARDWARE	STATIC_WARNING	WARNING	false	Permission makes app incompatible for Chrome OS, consider adding optional {0} feature tag,	 Try adding `<uses-feature android:name="{0}"  android:required="false">`.
 PubspecWarningCode	platform_value_disallowed	PLATFORM_VALUE_DISALLOWED	STATIC_WARNING	WARNING	true	Keys in the `platforms` field can't have values.	Try removing the value, while keeping the key.
+AnalysisOptionsWarningCode	plugins_in_inner_options	PLUGINS_IN_INNER_OPTIONS	STATIC_WARNING	WARNING	true	Plugins can only be specified in the root of a pub workspace or the root of a package that isn't in a workspace.	Try specifying plugins in an analysis options file at '{0}'.
 ParserErrorCode	positional_after_named_argument	POSITIONAL_AFTER_NAMED_ARGUMENT	SYNTACTIC_ERROR	ERROR	false	Positional arguments must occur before named arguments.	Try moving all of the positional arguments before the named arguments.
 CompileTimeErrorCode	positional_field_in_object_pattern	POSITIONAL_FIELD_IN_OBJECT_PATTERN	COMPILE_TIME_ERROR	ERROR	true	Object patterns can only use named fields.	Try specifying the field name.
 ParserErrorCode	positional_parameter_outside_group	POSITIONAL_PARAMETER_OUTSIDE_GROUP	SYNTACTIC_ERROR	ERROR	false	Positional parameters must be enclosed in square brackets ('[' and ']').	Try surrounding the positional parameters in square brackets.
@@ -902,6 +899,7 @@ _fe_analyzer_shared	typedef_augmentation	TYPEDEF_AUGMENTATION	SYNTACTIC_ERROR	ER
 _fe_analyzer_shared	typedef_in_class	TYPEDEF_IN_CLASS	SYNTACTIC_ERROR	ERROR	false	Typedefs can't be declared inside classes.	Try moving the typedef to the top-level.
 ScannerErrorCode	unawaited_return_in_try_block	UNAWAITED_RETURN_IN_TRY_BLOCK	STATIC_WARNING	WARNING	true	Returning a 'Future' without 'await' inside a try block.	Try adding an 'await'.
 CompileTimeErrorCode	unchecked_use_of_nullable_value	UNCHECKED_USE_OF_NULLABLE_VALUE	COMPILE_TIME_ERROR	ERROR	true	The function can't be unconditionally invoked because it can be 'null'.	Try adding a null check ('!').
+CompileTimeErrorCode	undefined_annotation	UNDEFINED_ANNOTATION	COMPILE_TIME_ERROR	ERROR	true	Undefined name '{0}' used as an annotation.	Try defining the name or importing it from another library.
 CompileTimeErrorCode	undefined_class	UNDEFINED_CLASS	COMPILE_TIME_ERROR	ERROR	true	Undefined class '{0}'.	Try changing the name to the name of an existing class, or creating a class with the name '{0}'.
 CompileTimeErrorCode	undefined_constructor_in_initializer	UNDEFINED_CONSTRUCTOR_IN_INITIALIZER	COMPILE_TIME_ERROR	ERROR	true	The class '{0}' doesn't have a constructor named '{1}'.	Try defining a constructor named '{1}' in '{0}', or invoking a different constructor.
 CompileTimeErrorCode	undefined_enum_constant	UNDEFINED_ENUM_CONSTANT	COMPILE_TIME_ERROR	ERROR	true	There's no constant named '{0}' in '{1}'.	Try correcting the name to the name of an existing constant, or defining a constant named '{0}'.

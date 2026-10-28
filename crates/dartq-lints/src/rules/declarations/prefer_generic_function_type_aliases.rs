@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_generic_function_type_aliases.dart:44-64`
 /// — every old-form `typedef` (no `=`; the analyzer's `FunctionTypeAlias`,
@@ -20,8 +20,8 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    // Old form ⟺ no `=` token (the `Typedef` payload word 1).
-    if c.payload(node).get(1).copied() != Some(NONE_TOKEN) {
+    // Old form ⟺ no `=` token (the `Typedef` row's `Equals` word).
+    if c.field(node, PayloadField::Equals) != Some(NONE_TOKEN) {
         return;
     }
     // `node.semicolon.isSynthetic` bails (:48-49).

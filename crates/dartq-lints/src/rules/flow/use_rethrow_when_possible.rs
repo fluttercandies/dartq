@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::{byte_span_of_token, initialized_identifier_name, tail_token, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/use_rethrow_when_possible.dart:36-46`
@@ -67,9 +67,9 @@ fn check(c: &mut Check<'_>) {
     let Some(exception) = exception else {
         return;
     };
-    // The parameter name is payload word 1 (the
+    // The parameter name is the row's `Name` word (the
     // `FormalParameterEnd` layout).
-    let Some(&name) = c.payload(exception).get(1) else {
+    let Some(name) = c.field(exception, PayloadField::Name) else {
         return;
     };
     // The thrown expression is exactly the parameter name (upstream
@@ -236,7 +236,7 @@ fn parameter_names<'a>(c: &'a Check<'a>, function: u32) -> Vec<&'a str> {
         .into_iter()
         .filter(|&param| c.kind(param) == NodeKind::FormalParameter)
         .filter_map(|param| {
-            let name = c.payload(param).get(1).copied()?;
+            let name = c.field(param, PayloadField::Name)?;
             (name != super::NONE_TOKEN).then(|| c.lexeme(name))
         })
         .collect()

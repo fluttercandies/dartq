@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice};
 
 const DART_IS_JS_PROBLEM: &str = "Runtime check between '{0}' and '{1}' checks whether a Dart value is a JS interop type, which might not be platform-consistent.";
 const DART_IS_JS_CORRECTION: &str =
@@ -275,10 +275,10 @@ fn same_file_js_class(c: &Check<'_>, name: &str) -> bool {
         }
         let named = c.collect_direct(top).into_iter().any(|kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first()
+                && c.field(kid, PayloadField::Context)
                     == Some(
-                        &(dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
-                            as u32),
+                        dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
+                            as u32,
                     )
                 && c.lexeme(c.head_token(kid)) == name
         });

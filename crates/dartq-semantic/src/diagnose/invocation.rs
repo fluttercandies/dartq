@@ -1165,11 +1165,14 @@ impl<'a> Engine<'a> {
         }
         // The staged-join record (B5): the merged row's facts outlive pass
         // 2's stack take — one read event folds once, so the repeat insert
-        // is a no-op.
+        // is a no-op. The token-end index rides along (last insert wins,
+        // matching the reverse scan it replaced — see `chain_node_read`).
         if let Err(index) = self
             .member_reads
             .binary_search_by(|read| read.offset.cmp(&member.range.offset))
         {
+            let end = member.range.offset + self.member_name_units(member.name);
+            self.member_read_ends.insert(end, index as u32);
             self.member_reads.insert(
                 index,
                 MemberRead {
@@ -4961,6 +4964,86 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The assignment write target's static type when the rows below the
+    /// callee spell exactly `target = <this send>` (or `??=`): receiver
+    /// chain links join by `.` gaps and the target row sits behind a gap
+    /// whose only non-whitespace bytes are the assignment operator —
+    /// `==`/`=>` are an equality and an arrow, `,`/`:` an argument list,
+    /// `?` a conditional, none of them a write (`assignment_expression_
+    /// resolver.dart` offers the write context before the RHS resolves).
+    /// Bounded to the nearest eight rows; every step is a constant-size
+    /// byte probe.
+    fn assignment_write_ctx(&mut self, callee: usize) -> Option<Ty> {
+        let mut above = self.rows.get(callee)?.range.offset;
+        for row in self.rows.get(..callee)?.iter().rev().take(8) {
+            let mut at = row.range.end();
+            while at < above && self.byte_at(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                at += 1;
+            }
+            let (assigned, len) = match self.byte_at(at) {
+                Some(b'=') if self.byte_at(at + 1) != Some(b'=') => (true, 1),
+                Some(b'?')
+                    if self.byte_at(at + 1) == Some(b'?') && self.byte_at(at + 2) == Some(b'=') =>
+                {
+                    (true, 3)
+                }
+                Some(b'.') => (false, 1),
+                _ => return None,
+            };
+            at += len;
+            while at < above {
+                match self.byte_at(at) {
+                    Some(b) if b.is_ascii_whitespace() => at += 1,
+                    _ => return None,
+                }
+            }
+            if assigned {
+                // The LHS folds one pass behind the send (getter-backed
+                // member reads resolve in pass 2), so an `Unknown` row
+                // re-derives through the accessor face — the getter's
+                // declared return instantiated on the receiver (#2481's
+                // read face, `initializer_read_ty`).
+                let ty = if row.ty != Ty::Unknown {
+                    row.ty
+                } else {
+                    let row = row.clone();
+                    self.initializer_read_ty(&row)
+                };
+                return (ty != Ty::Unknown).then_some(ty);
+            }
+            above = row.range.offset;
+        }
+        None
+    }
+
+    /// Whether the container's declaration wrote an extends head no scope
+    /// can resolve (`class StateController<StateT> extends
+    /// StateNotifier<StateT>` behind a missing package import): the head is
+    /// written but names no container, so the clause's super formals are
+    /// untypeable in the oracle's model too (its `InvalidType` superclass).
+    /// The head must resolve in the DECLARING library's scope, not this
+    /// one — privacy included (`dart:collection`'s private `_SplayTree` is
+    /// a fully typed superclass even though invisible from here, so the
+    /// owner-scoped ask keeps SDK classes constrainable).
+    fn declared_extends_unresolved(&self, container: StringId) -> bool {
+        let Some((face, owner)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        else {
+            return false;
+        };
+        let Some(head) = face.superclass else {
+            return false;
+        };
+        let scope = self.owner_library_of(owner, container).unwrap_or(self.lib);
+        resolve_container(self.graph, self.namespaces, self.index, scope, owner, head).is_none()
+    }
+
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
     /// the assignability walk (`extra_positional_arguments[_could_be_named]`
@@ -5532,16 +5615,21 @@ impl<'a> Engine<'a> {
                             name,
                             kind: ContainerKind::Class,
                         } => {
-                            let formals = self
-                                .index
-                                .get(self.file)
-                                .and_then(|f| f.container(name))
-                                .and_then(|c| c.ctor_formals.get(&row.name))
-                                .map(|f| (**f).clone());
-                            formals.map(|mut formals| {
-                                self.patch_field_formals(name, &mut formals);
-                                formals
-                            })
+                            // The factory lane joins the plain table's
+                            // lookup (a redirecting factory's own written
+                            // formals), but never for a closure-carrying
+                            // send: the formals would type the closures'
+                            // own parameters through the written schema, a
+                            // substitution chain this model under-seeds
+                            // (the `StreamTransformer.fromHandlers`
+                            // nullability cascade) — the closure chain
+                            // keeps the prior under-report.
+                            if level.closures.is_empty() {
+                                self.ctor_schema_formals(name, row.name)
+                                    .or_else(|| self.factory_ctor_formals(name, row.name))
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     },
@@ -5549,7 +5637,12 @@ impl<'a> Engine<'a> {
             }
             // The unnamed creation's head (`B(x)`, #1351): the folded
             // container row carries the class — its unnamed face's formals
-            // (the collector keys the container's own name).
+            // (the collector keys the container's own name). A foreign
+            // class reaches the graph-resolved table only on the
+            // provably-unconstrainable face (#2687: its extends head
+            // resolves nowhere, so the formals carry no decidable type
+            // either and the send needs the instantiation gate below);
+            // every other foreign creation keeps the under-report.
             RowShape::Bare(BareInfo::Container {
                 name,
                 kind: ContainerKind::Class,
@@ -5559,7 +5652,12 @@ impl<'a> Engine<'a> {
                     .get(self.file)
                     .and_then(|f| f.container(*name))
                     .and_then(|c| c.ctor_formals.get(name))
-                    .map(|f| (**f).clone());
+                    .map(|f| (**f).clone())
+                    .or_else(|| {
+                        self.declared_extends_unresolved(*name)
+                            .then(|| self.ctor_schema_formals(*name, *name))
+                            .flatten()
+                    });
                 formals.map(|mut formals| {
                     self.patch_field_formals(*name, &mut formals);
                     formals
@@ -6055,6 +6153,43 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            // The assignment write context (#2687): the LHS of the `=` the
+            // send is the RHS of (`_controllerNotifier.result =
+            // $Result.data(controller)` — the field's static type is the
+            // send's contextType, assignment_expression_resolver.dart's
+            // write context). The rows below the callee carry the folded
+            // LHS; the byte gap between it and the send's receiver chain
+            // discriminates the assignment (`=`/`??=`) from every other
+            // join (`.` chain, `,`/`:` argument, `?` conditional). The
+            // send's own parameter list (foreign-aware, unlike the
+            // bounds capture) pairs the context's written arguments. A
+            // send carrying closure arguments stays out: its formals
+            // then type the closures' own parameters, a substitution
+            // chain whose nullability face this model under-seeds (the
+            // `StreamTransformer.fromHandlers` cascade) — under-report
+            // over a wrong binding.
+            let write_ctx = self.assignment_write_ctx(callee).filter(|_| level.closures.is_empty());
+            if let Some(container) = creation_container
+                && let Some(Ty::Named {
+                    name: head,
+                    args,
+                    ..
+                }) = write_ctx
+                && head == container
+                && args != ArgListId::EMPTY
+            {
+                let pool = self.boundary.args.borrow();
+                let ctx_args = pool.get(args);
+                if ctx_args.len() == params.len() {
+                    for ((param, _), ty) in params.iter().zip(ctx_args) {
+                        if let Some(index) = param_index(*param)
+                            && solutions[index].is_none()
+                        {
+                            solutions[index] = Some(*ty);
+                        }
+                    }
+                }
+            }
             // Upward face: the argument constraints solve each parameter
             // (`generic_inferrer.dart`'s `TypeConstraintFromArgument`
             // origins). Every formal the write pairs unifies structurally
@@ -6378,30 +6513,49 @@ impl<'a> Engine<'a> {
         // `pending_send_ty` and lands on the merged row at the fold
         // (`UnboundedArg<int> v = UnboundedArg<num>(0);` — the assignment
         // check reads the instantiation, not the unknown). A partially
-        // solved instantiation keeps the prior unknown face: an ungrounded
-        // slot's oracle answer is the bound (probed 3.47.1:
-        // `Box<S>(S s)`'s `Box(dynamic x)` answers `Box<dynamic>`), but
-        // the contexts that decide it (the declaration annotation, the
-        // parameter type) are exactly the faces this model under-seeds —
-        // a `dynamic` guess over an under-seeded solve reported rows the
-        // oracle never wrote (flat_buffers.dart's context-solved
-        // `Offset(_tail)`), so only the fully solved instantiation lands.
+        // solved instantiation keeps the prior unknown face — EXCEPT the
+        // provably unconstrainable face: the declaring class wrote an
+        // extends head that resolves nowhere, so every super formal of
+        // its constructors carries an unresolvable parameter type (the
+        // oracle's `InvalidType`) and a still-open slot can never gain an
+        // upward candidate from any formal that mentions it; the oracle's
+        // unsolved fill (the bound, else dynamic) is then the exact
+        // answer (`StateController(super._state)` over an unresolved
+        // `StateNotifier` instantiates `StateController<dynamic>`). An
+        // under-seeded solve never mimics this face: a resolvable extends
+        // clause types its super formals, and a formal that names the
+        // parameter keeps the slot out (its argument may still constrain
+        // it in the oracle — flat_buffers.dart's context-solved
+        // `Offset(_tail)` stays on the fully-solved path alone).
         if let Some(container) = creation_container
             && unnamed_creation
             && let Some(params) = &exec_params
-            && solutions.iter().all(|slot| slot.is_some())
         {
-            let args: Box<[Ty]> = params
-                .iter()
-                .zip(solutions.iter())
-                .map(|((_param, _bound), slot)| (*slot).unwrap_or(Ty::Dynamic))
-                .collect();
-            let ty = self
-                .boundary
-                .args
-                .borrow_mut()
-                .named(container, false, &args);
-            self.pending_send_ty = Some((callee, ty));
+            let mentions_param = |ty: Ty| {
+                params
+                    .iter()
+                    .any(|(param, _)| self.formal_mentions_param(ty, *param))
+            };
+            let unconstrainable = self
+                .declared_extends_unresolved(container)
+                && formals
+                    .positional
+                    .iter()
+                    .chain(formals.named.iter())
+                    .all(|formal| !mentions_param(formal.ty));
+            if solutions.iter().all(|slot| slot.is_some()) || unconstrainable {
+                let args: Box<[Ty]> = params
+                    .iter()
+                    .zip(solutions.iter())
+                    .map(|((_param, bound), slot)| slot.or(*bound).unwrap_or(Ty::Dynamic))
+                    .collect();
+                let ty = self
+                    .boundary
+                    .args
+                    .borrow_mut()
+                    .named(container, false, &args);
+                self.pending_send_ty = Some((callee, ty));
+            }
         }
     }
 

@@ -4171,7 +4171,7 @@ pub(crate) mod matching_super_parameters {
             assert_eq!(lints.len(), 1, "{lints:?}");
             assert_eq!(
                 lints[0].message,
-                "The super parameter named 'abc' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
+                "The super parameter named 'abc'' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
             );
         }
 
@@ -4199,7 +4199,7 @@ pub(crate) mod matching_super_parameters {
             assert_eq!(lints.len(), 1, "{lints:?}");
             assert_eq!(
                 lints[0].message,
-                "The super parameter named 'abc' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
+                "The super parameter named 'abc'' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
             );
 
             let source = "class A {\n  A(int xyz);\n}\n\nclass B extends A {\n  B(super.abc);\n}\n";

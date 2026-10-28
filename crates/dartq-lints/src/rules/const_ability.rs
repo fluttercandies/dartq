@@ -49,7 +49,7 @@
 //! parent link. The module's pins parse through the production bridge
 //! ([`crate::testsupport::Fixture::parse`]) for exactly that reason.
 
-use dartq_ast::{NodeKind, mod_flags};
+use dartq_ast::{NodeKind, PayloadField, mod_flags};
 use dartq_semantic::Analysis;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -553,7 +553,7 @@ fn string_closes(lexeme: &str) -> bool {
 /// (the one typed non-const the shape proves), and the operands are
 /// judged through the extent.
 fn binary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
-    let op = unit.ast.payload(row).first().copied();
+    let op = unit.ast.field(row, PayloadField::Operator);
     let legal = op.is_some_and(|token| const_operator(lexeme(unit, token)));
     if !legal {
         return false;
@@ -1101,9 +1101,9 @@ fn primary_ctor_const_face(
         .into_iter()
         .find(|&kid| unit.ast.kind(kid) == NodeKind::PrimaryConstructor)
         .is_some_and(|primary| {
-            // Payload word 1 is the `const` keyword (TOKEN_NONE when absent);
-            // word 2 is `has_constructor_name`.
-            let const_kw = unit.ast.payload(primary).get(1).copied();
+            // The `ConstKeyword` word carries the `const` keyword
+            // (TOKEN_NONE when absent); `HasConstructorName` follows it.
+            let const_kw = unit.ast.field(primary, PayloadField::ConstKeyword);
             if const_kw.is_none_or(|kw| kw == dartq_ast::TOKEN_NONE) {
                 return false;
             }
@@ -1111,7 +1111,7 @@ fn primary_ctor_const_face(
                 .into_iter()
                 .find(|&kid| {
                     unit.ast.kind(kid) == NodeKind::Identifier
-                        && unit.ast.payload(kid).first().copied()
+                        && unit.ast.field(kid, PayloadField::Context)
                             == Some(
                                 dartq_parser::IdentifierContext::PrimaryConstructorDeclaration
                                     as u32,
@@ -1222,7 +1222,7 @@ fn ctor_member_selector<'s>(unit: &Unit<'s>, member: u32) -> Option<&'s str> {
     // A named constructor's selector rides the continuation-context
     // identifier; the unnamed face's own name is the answer.
     for id in ids {
-        if unit.ast.payload(id).first().copied()
+        if unit.ast.field(id, PayloadField::Context)
             == Some(dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32)
         {
             return Some(lexeme(unit, head_token(unit, id)));
@@ -1245,10 +1245,10 @@ fn class_members(unit: &Unit<'_>, class_row: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The selector name a `DotAccess` marker spells (the dot is payload
-/// word 0; the name follows it).
+/// The selector name a `DotAccess` marker spells (the dot rides the
+/// row's `Operator` word; the name follows it).
 fn selector_name<'s>(unit: &Unit<'s>, marker: u32) -> Option<&'s str> {
-    let dot = unit.ast.payload(marker).first().copied()?;
+    let dot = unit.ast.field(marker, PayloadField::Operator)?;
     Some(lexeme(unit, dot + 1))
 }
 
@@ -1283,16 +1283,17 @@ fn static_const_names<'s>(unit: &Unit<'s>, fields: u32) -> Vec<&'s str> {
 /// nest it inside the row.
 fn declaration_name<'s>(unit: &Unit<'s>, row: u32) -> Option<&'s str> {
     // The extension type's name never tiles as an `Identifier` child —
-    // `begin_extension_type_declaration` patches it into payload word 2.
+    // `begin_extension_type_declaration` patches it into the row's `Name`
+    // word.
     if unit.ast.kind(row) == NodeKind::ExtensionTypeDeclaration {
-        if let Some(&name) = unit.ast.payload(row).get(2) {
+        if let Some(name) = unit.ast.field(row, PayloadField::Name) {
             return Some(lexeme(unit, name));
         }
     }
     let is_name = |kid: u32| {
         unit.ast.kind(kid) == NodeKind::Identifier
             && matches!(
-                unit.ast.payload(kid).first().copied(),
+                unit.ast.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx
                         == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration

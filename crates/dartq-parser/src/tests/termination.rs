@@ -235,3 +235,42 @@ fn adversarial_inputs_terminate_with_bounded_diagnostics() {
         );
     }
 }
+
+/// A malformed super-initializer must not stall the initializer loop: the
+/// `expectedAfterButGot('(')` recovery queues its synthetic parens AHEAD of
+/// the `super` head, so the expression re-read returns without consuming it
+/// and the missing-comma continuation re-parsed the same head forever —
+/// each turn re-reporting and re-queueing tokens (unbounded diagnostics,
+/// GBs of RSS on the SDK's own illegal_initializer_test). The no-progress
+/// guard breaks the stall and hands the tokens to the member loop
+/// (tests/language/variable/illegal_initializer_test.dart,
+/// co19 Generative_Constructors/initializers_t07,
+/// invalid_super_in_initializer test_constructor_name_is_keyword).
+#[test]
+fn initializer_loop_terminates_on_stalled_super_recovery() {
+    let cases = [
+        "class A { A(); A.foo(); } class B extends A { B.c1() : super.foo; }",
+        "class C { C() : super.() {} }",
+        "class C { C() : super.const() {} }",
+        "class A {} class B extends A { B() : this.foo; B.z() : this; }",
+    ];
+    for case in cases {
+        let source: &'static str = Box::leak(case.to_owned().into_boxed_str());
+        let (table, text) = scan_ok(source);
+        let mut listener = Collector::default();
+        {
+            let mut parser = Parser::new(text, table, latest_features(), &mut listener);
+            parser.parse_unit();
+            assert!(!parser.is_bailed(), "case {case:?}: no cap trip expected");
+        }
+        assert!(
+            !listener.errors.is_empty(),
+            "case {case:?}: the malformed initializer still reports"
+        );
+        assert!(
+            listener.errors.len() < 20,
+            "case {case:?}: a stalled recovery must not flood ({})",
+            listener.errors.len()
+        );
+    }
+}

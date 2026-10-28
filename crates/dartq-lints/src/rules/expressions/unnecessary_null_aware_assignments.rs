@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
 use crate::rules::{first_child, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_null_aware_assignments.dart:42-49`
@@ -22,7 +22,10 @@ fn check(c: &mut Check<'_>) {
     let node = c.node();
     // `node.operator.type == QUESTION_QUESTION_EQ &&
     // node.rightHandSide.isNullLiteral` (:45-46).
-    if c.payload_word(node, 0).map(|op| c.lexeme(op)) != Some("??=") {
+    if c.field_token(node, PayloadField::Operator)
+        .map(|op| c.lexeme(op))
+        != Some("??=")
+    {
         return;
     }
     let Some(rhs) = last_child(c, node) else {
@@ -44,7 +47,7 @@ fn check(c: &mut Check<'_>) {
     // production row opens at the operator's tile anchor and swallows
     // the trailing `;`, so the extent runs from the left operand's
     // first token to the `null` literal's own end.
-    let Some(op_token) = c.payload_word(node, 0) else {
+    let Some(op_token) = c.field_token(node, PayloadField::Operator) else {
         return;
     };
     let Some((left, _)) = slice::binary_operands(c) else {

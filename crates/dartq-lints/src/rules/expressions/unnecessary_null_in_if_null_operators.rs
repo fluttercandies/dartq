@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_null_in_if_null_operators.dart:34-49`
 /// — `a ?? null` (or `null ?? a`) reports at the `null` literal, right
@@ -13,7 +13,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(&op) = c.payload(node).first() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if c.lexeme(op) != "??" {

@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice, token_seq_equal};
+use super::{PayloadField, Check, NodeKind, RuleSpec, slice, token_seq_equal};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_if_null_operators.dart:22-63`
 /// — `x == null ? a : x` (or the `!=`/then mirror) reports at the
@@ -55,9 +55,8 @@ pub(super) fn null_check_parts<'a>(
     c: &'a Check<'a>,
     node: u32,
 ) -> Option<(&'a str, u32, Vec<u32>, Vec<u32>, (Vec<u32>, Vec<u32>))> {
-    let payload = c.payload(node);
-    let &question = payload.first()?;
-    let &colon = payload.get(1)?;
+    let question = c.field(node, PayloadField::Question)?;
+    let colon = c.field(node, PayloadField::Colon)?;
     // The arms over the direct children, split at the `?`/`:` payload
     // separators by head token; rows left of `?` exist only in
     // hand-built trees (the condition among the node's children). The
@@ -95,7 +94,7 @@ pub(super) fn null_check_parts<'a>(
     if c.kind(binary) != NodeKind::BinaryExpression {
         return None;
     }
-    let op_token = c.payload_word(binary, 0)?;
+    let op_token = c.field_token(binary, PayloadField::Operator)?;
     let op = c.lexeme(op_token);
     if op != "==" && op != "!=" {
         return None;
@@ -196,12 +195,12 @@ fn row_tokens_equal(c: &Check<'_>, x: u32, y: u32) -> bool {
     }
     // `DotAccess`/`CascadeAccess` cover `[selector, follower]` — the
     // follower rides the covered span but is not the access's own
-    // token; `payload[0]`/`payload[0]+1` name the operator and the
-    // selector. `Qualified` covers `[receiver, .]` exactly, so it
+    // token; the `Operator` word (and its `+1`) names the operator and
+    // the selector. `Qualified` covers `[receiver, .]` exactly, so it
     // falls through to the whole-range compare.
     if matches!(c.kind(x), NodeKind::DotAccess | NodeKind::CascadeAccess) {
         let own = |row: u32| -> Option<(u32, u32)> {
-            let dot = c.payload(row).first().copied()?;
+            let dot = c.field(row, PayloadField::Operator)?;
             Some((dot, dot + 1))
         };
         let Some((dx, nx)) = own(x) else { return false };
@@ -219,10 +218,10 @@ fn row_tokens_equal(c: &Check<'_>, x: u32, y: u32) -> bool {
 /// would also cross the arm's own closer (`f(g() == null ? a : g())`
 /// ends `))`, the inner `)` belonging to the arm). The bound is
 /// therefore structural: the else run's last real row's own end token —
-/// an access marker ends at its selector (`payload[0] + 1`), every
-/// other real row at its range end.
+/// an access marker ends at its selector (the `Operator` word + 1),
+/// every other real row at its range end.
 pub(super) fn conditional_end(c: &Check<'_>, node: u32) -> u32 {
-    let Some(&colon) = c.payload(node).get(1) else {
+    let Some(colon) = c.field(node, PayloadField::Colon) else {
         return c.utf16_span(node).end;
     };
     let last = c
@@ -240,9 +239,8 @@ pub(super) fn conditional_end(c: &Check<'_>, node: u32) -> u32 {
         return c.utf16_span(node).end;
     };
     let token = if matches!(c.kind(last), NodeKind::DotAccess | NodeKind::CascadeAccess) {
-        c.payload(last)
-            .first()
-            .map(|&dot| dot + 1)
+        c.field(last, PayloadField::Operator)
+            .map(|dot| dot + 1)
             .unwrap_or_else(|| c.unit.ast.token_range(last).end - 1)
     } else {
         c.unit.ast.token_range(last).end - 1

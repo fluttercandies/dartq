@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, slice};
+use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
 use crate::rules::expressions::{query_site, static_type_faces as faces};
 use dartq_semantic::model::Ty;
 
@@ -113,10 +113,10 @@ fn context_is_function_type(c: &Check<'_>, closure: u32) -> bool {
             // (:494-496, `ancestor.staticType`). The production
             // `Assignment` row spans the right side only (the bridge
             // opens it at the operand boundary) with the operator
-            // token in payload word 0 — the target is the identifier
-            // token immediately before it.
+            // token in the row's `Operator` word — the target is the
+            // identifier token immediately before it.
             NodeKind::Assignment => {
-                let Some(&eq) = c.payload(ancestor).first() else {
+                let Some(eq) = c.field(ancestor, PayloadField::Operator) else {
                     return false;
                 };
                 // The bare-identifier target face: the token before the
@@ -279,7 +279,7 @@ fn member_callee_sig<'s>(
     send: usize,
 ) -> Option<dartq_semantic::model::FnSig<'s>> {
     let marker = slice::access_marker(c, siblings, send, NodeKind::DotAccess)?;
-    let dot = c.payload(marker).first().copied()?;
+    let dot = c.field(marker, PayloadField::Operator)?;
     let selector = dot + 1;
     let receiver_run: Vec<u32> = siblings
         .iter()

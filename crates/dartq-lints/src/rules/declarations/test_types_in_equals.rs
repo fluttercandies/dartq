@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, formal_parameter_rows, operator_name};
+use super::{PayloadField, Check, NodeKind, RuleSpec, formal_parameter_rows, operator_name};
 use crate::rules::class_declaration_name;
 
 /// Official: `pkg/linter/lib/src/rules/test_types_in_equals.dart:35-48`
@@ -53,7 +53,7 @@ fn check(c: &mut Check<'_>) {
     let [param] = params.as_slice() else {
         return;
     };
-    let Some(&param_name) = c.payload(*param).get(1) else {
+    let Some(param_name) = c.field(*param, PayloadField::Name) else {
         return;
     };
     if param_name == crate::rules::NONE_TOKEN
@@ -76,7 +76,7 @@ fn is_equals_override(c: &Check<'_>, method: u32) -> bool {
     // The `OperatorName` completes as the Method's left sibling inside
     // the body wrapper (`operator_name` reads child-then-adjacent).
     let is_eq = operator_name(c, method)
-        .and_then(|row| c.payload_word(row, 0))
+        .and_then(|row| c.field_token(row, PayloadField::Name))
         .is_some_and(|t| c.lexeme(t) == "==");
     if !is_eq {
         return false;

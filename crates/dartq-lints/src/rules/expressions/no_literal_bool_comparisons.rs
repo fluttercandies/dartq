@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, RuleSpec, query_site, same_file};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file};
 use crate::rules::{byte_span_of_token, slice};
 
 /// Official: `pkg/linter/lib/src/rules/no_literal_bool_comparisons.dart:44-62`
@@ -28,7 +28,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(op) = c.payload(node).first().copied() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if !matches!(c.lexeme(op), "==" | "!=" | "|" | "||" | "&" | "&&" | "^") {
@@ -193,10 +193,8 @@ fn member_is_bool(c: &Check<'_>, class_name: &str, name: &str) -> bool {
                             written = Some(kid);
                         }
                         NodeKind::Identifier
-                            if c.payload(kid).first()
-                                == Some(
-                                    &(dartq_parser::IdentifierContext::FieldDeclaration as u32),
-                                )
+                            if c.field(kid, PayloadField::Context)
+                                == Some(dartq_parser::IdentifierContext::FieldDeclaration as u32)
                                 && c.lexeme(c.head_token(kid)) == name =>
                         {
                             return written.is_some_and(|row| non_null_bool_type(c, row));
@@ -208,10 +206,8 @@ fn member_is_bool(c: &Check<'_>, class_name: &str, name: &str) -> bool {
             NodeKind::Method if crate::rules::get_set_token(c, member) == Some("get") => {
                 let Some(name_row) = c.collect_direct(member).into_iter().find(|&kid| {
                     c.kind(kid) == NodeKind::Identifier
-                        && c.payload(kid).first()
-                            == Some(
-                                &(dartq_parser::IdentifierContext::MethodDeclaration as u32),
-                            )
+                        && c.field(kid, PayloadField::Context)
+                            == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32)
                 }) else {
                     continue;
                 };

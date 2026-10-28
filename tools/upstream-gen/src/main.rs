@@ -4,13 +4,15 @@
 //!
 //! The SDK tree is a local read-only checkout that tracked code must
 //! never reference silently: the source root comes from `--sdk-src` or
-//! the `DART_SDK_SRC` environment variable, and the run fails with a
-//! usage message when neither is set.
+//! the `DARTQ_SDK_SRC` environment variable, and the run fails with a
+//! usage message when neither is set. The checkout must be exactly the
+//! SDK `conformance/pin.toml` pins (version and stable channel); the
+//! pinned revision is stamped into the generated header.
 //!
 //! Usage (from the workspace root):
 //!
 //! ```text
-//! cargo run -p upstream-gen --bin analyzer-codes-gen -- --sdk-src <dart-sdk-tree> [--check] [--verbose]
+//! DARTQ_SDK_SRC=<dart-sdk-tree> cargo run -p upstream-gen --bin analyzer-codes-gen -- [--check] [--verbose]
 //! ```
 //!
 //! Modes:
@@ -18,10 +20,13 @@
 //!   (or `--out <path>`);
 //! - `--check`: re-derives the table and diffs it against the tracked
 //!   file, exiting 1 with a regeneration hint on drift — the CI face.
+//!   The tracked header's `SDK pin:` revision must match `pin.toml`,
+//!   and the checkout's `tools/VERSION` must match the pinned version.
 //!
 //! Determinism: the emitted document is a pure function of the SDK tree
 //! (no timestamps, sorted rows), so `--check` is byte-exact.
 
+mod pin;
 mod registry;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,10 +35,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use pin::Pin;
 use registry::{Entry, Row, class_map, fold, parse_registry, render_tsv};
 
 const USAGE: &str = "usage: analyzer-codes-gen [--sdk-src <dart-sdk-tree>] [--out <path>] [--check] [--verbose]\n\
-                     the SDK tree also resolves from the DART_SDK_SRC environment variable";
+                     the SDK tree also resolves from the DARTQ_SDK_SRC environment variable; \
+                     it must match conformance/pin.toml";
 
 /// `(message, exit code)`: 2 marks usage errors, 1 run failures.
 type Failure = (String, u8);
@@ -78,10 +85,12 @@ fn run() -> Result<(), Failure> {
             }
         }
     }
-    let Some(sdk_src) = sdk_src.or_else(|| std::env::var("DART_SDK_SRC").ok().map(PathBuf::from))
+    let Some(sdk_src) = sdk_src.or_else(|| std::env::var("DARTQ_SDK_SRC").ok().map(PathBuf::from))
     else {
         return Err((format!("no SDK source given; {USAGE}"), 2));
     };
+    let pin = Pin::load().map_err(|e| (format!("conformance pin: {e}"), 1))?;
+    let checkout_stamp = pin.verify_checkout(&sdk_src).map_err(|e| (e, 1))?;
     let out = out.unwrap_or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../crates/dartq-diagnostics/data/analyzer-codes.tsv")
@@ -93,7 +102,6 @@ fn run() -> Result<(), Failure> {
     let read = |path: &Path| {
         fs::read_to_string(path).map_err(|e| (format!("reading {}: {e}", path.display()), 1))
     };
-    let version = sdk_version(&sdk_src)?;
 
     let entries = parse_registry(&read(&registry_path)?)
         .map_err(|e| (format!("{}:{e}", registry_path.display()), 1))?;
@@ -103,10 +111,11 @@ fn run() -> Result<(), Failure> {
     if verbose {
         print_tally(&entries, &rows, &classes);
     }
-    let document = render_tsv(&rows, entries.len(), &version);
+    let document = render_tsv(&rows, entries.len(), &pin.stamp(&checkout_stamp), &checkout_stamp);
 
     if check {
         let tracked = read(&out).map_err(|(message, _)| (format!("--check {message}"), 1))?;
+        check_revision(&pin, &tracked, &out)?;
         if tracked == document {
             println!(
                 "analyzer-codes-gen: ok — {} rows match {}",
@@ -145,39 +154,30 @@ fn run() -> Result<(), Failure> {
     Ok(())
 }
 
-/// The SDK identity stamp for the TSV header, from the checkout's
-/// `tools/VERSION` (the file the SDK's own version tooling generates
-/// from) — e.g. `dart 3.15.0 (main channel)`.
-fn sdk_version(sdk_src: &Path) -> Result<String, Failure> {
-    let version_path = sdk_src.join("tools/VERSION");
-    let text = fs::read_to_string(&version_path).map_err(|e| {
-        (
+/// The `--check` revision gate: the tracked document must carry an
+/// `SDK pin:` header naming exactly the pinned revision — a mismatch (or
+/// a missing stamp, i.e. a hand-edited or pre-pin file) fails with both
+/// revisions named, before the byte comparison.
+fn check_revision(pin: &Pin, tracked: &str, out: &Path) -> Result<(), Failure> {
+    match pin::header_revision(tracked) {
+        Some(found) if found == pin.sdk_revision => Ok(()),
+        Some(found) => Err((
             format!(
-                "reading {}: {e} (is this a Dart SDK tree?)",
-                version_path.display()
+                "{}: generated from SDK revision {found} but conformance/pin.toml pins {}; \
+                 regenerate against the pinned tree",
+                out.display(),
+                pin.sdk_revision
             ),
             1,
-        )
-    })?;
-    let mut fields = BTreeMap::new();
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(' ') {
-            fields.insert(key.to_owned(), value.trim().to_owned());
-        }
-    }
-    let get = |key: &str| fields.get(key).cloned().unwrap_or_default();
-    let channel = get("CHANNEL");
-    let version = format!("{}.{}.{}", get("MAJOR"), get("MINOR"), get("PATCH"));
-    if version == ".." || channel.is_empty() {
-        return Err((
+        )),
+        None => Err((
             format!(
-                "{}: malformed VERSION file (channel {channel:?}, version {version:?})",
-                version_path.display()
+                "{}: no `SDK pin:` header line; regenerate with tools/upstream-gen",
+                out.display()
             ),
             1,
-        ));
+        )),
     }
-    Ok(format!("dart {version} ({channel} channel)"))
 }
 
 /// The `--verbose` face: per-class row tallies cross-checked against the

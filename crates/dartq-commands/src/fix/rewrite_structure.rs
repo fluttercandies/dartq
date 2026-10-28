@@ -154,10 +154,15 @@ pub(crate) fn matching_open(tokens: &TokenTable, close: usize, kind: TokenKind) 
 /// `);`). The lint's own gates stand in for the producer's checks — the
 /// declaration-form header, the single-argument body invocation, the
 /// argument's identity as the loop variable.
+///
+/// The rule reports the `ForIn` node, whose span may sit one token short
+/// of the statement's own end, so the replacement is bounded structurally
+/// from the `for` keyword: a block body ends at its matching `}` — the
+/// official's `node.end` — and a bare body at its `;`.
 pub(crate) fn for_each_tear_off(input: &FixInput<'_>) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
-    let (first, last) = hit_tokens(tokens, &input.range)?;
+    let (first, _last) = hit_tokens(tokens, &input.range)?;
     if kind_of(tokens, first)? != TokenKind::Keyword(Keyword::For) {
         return None;
     }
@@ -252,11 +257,22 @@ pub(crate) fn for_each_tear_off(input: &FixInput<'_>) -> Option<(u32, u32, Strin
         };
     }
     // The iterable's text and the invocation's callee text (the invocation
-    // minus its argument list — the tear-off).
+    // minus its argument list — the tear-off), the statement's end
+    // structural from the body's shape.
     let iterable = token_text(tokens, text, in_kw + 1..rparen)?;
     let callee = token_text(tokens, text, invoke_start..invoke_paren)?;
-    let (start16, length16) = span_over(text, tokens, first, last)?;
-    Some((start16, length16, format!("{iterable}.forEach({callee});")))
+    let end_tok = if braced {
+        tokens.matching_end(rparen + 1)?
+    } else {
+        stmt_end
+    };
+    let (start16, _) = span_over(text, tokens, first, first)?;
+    let end16 = utf16_end(tokens, text, end_tok)?;
+    Some((
+        start16,
+        end16.checked_sub(start16)?,
+        format!("{iterable}.forEach({callee});"),
+    ))
 }
 
 /// `prefer_expression_function_bodies`: the reported `{ return e; }` block

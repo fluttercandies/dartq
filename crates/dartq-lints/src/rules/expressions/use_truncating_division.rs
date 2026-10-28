@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/use_truncating_division.dart` — a `/`
@@ -31,7 +31,7 @@ fn check(c: &mut Check<'_>) {
         return;
     };
     // The division operator (:37).
-    let Some(&op) = c.payload(c.node()).first() else {
+    let Some(op) = c.field(c.node(), PayloadField::Operator) else {
         return;
     };
     if c.lexeme(op) != "/" {

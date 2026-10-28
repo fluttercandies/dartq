@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, slice};
 use crate::rules::NONE_TOKEN;
 use dartq_semantic::{Binding, BindingKind};
 
@@ -137,7 +137,7 @@ fn check(c: &mut Check<'_>) {
         // member face resolves the same-library member on the
         // receiver's container.
         Some((&marker, _)) if c.kind(marker) == NodeKind::DotAccess => {
-            let Some(selector) = c.payload(marker).first().map(|&dot| dot + 1) else {
+            let Some(selector) = c.field(marker, PayloadField::Operator).map(|dot| dot + 1) else {
                 return;
             };
             let name = analysis.strings().intern(c.lexeme(selector));
@@ -193,7 +193,7 @@ fn conditional_face(c: &Check<'_>, node: u32) -> Option<(core::ops::Range<u32>, 
     if c.kind(rhs) != NodeKind::LiteralNull {
         return None;
     }
-    let op_token = c.payload(binary).first().copied()?;
+    let op_token = c.field(binary, PayloadField::Operator)?;
     // The `leftOperand.toSource()` window opens at the condition's
     // first token — the operand run's earliest head, never the
     // binary's covered start (a member operand's covered span opens at
@@ -209,7 +209,7 @@ fn conditional_face(c: &Check<'_>, node: u32) -> Option<(core::ops::Range<u32>, 
 /// the statement leaf.
 fn if_face(c: &Check<'_>, node: u32) -> Option<(core::ops::Range<u32>, Vec<u32>)> {
     // `elseKeyword == null` (:49).
-    if c.payload(node).first().copied() != Some(NONE_TOKEN) {
+    if c.field(node, PayloadField::ElseKeyword) != Some(NONE_TOKEN) {
         return None;
     }
     let kids = c.collect_direct(node);
@@ -267,7 +267,7 @@ fn condition_window(c: &Check<'_>, condition: u32) -> Option<core::ops::Range<u3
     if c.kind(condition) != NodeKind::BinaryExpression {
         return None;
     }
-    let op = c.payload_word(condition, 0)?;
+    let op = c.field_token(condition, PayloadField::Operator)?;
     if c.lexeme(op) != "!=" {
         return None;
     }

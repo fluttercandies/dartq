@@ -6,26 +6,31 @@
 //!
 //! Both source trees are local read-only checkouts that tracked code must
 //! never reference silently: the SDK root resolves from `--sdk-src` or
-//! `DART_SDK_SRC`, the `package:lints` snapshot from `--lints-src` or
+//! `DARTQ_SDK_SRC`, the `package:lints` snapshot from `--lints-src` or
 //! `DART_LINTS_SRC`, and the run fails with a usage message when either
-//! is missing.
+//! is missing. The SDK tree must be exactly the one `conformance/pin.toml`
+//! pins (version and stable channel); the pinned revision is stamped into
+//! both generated headers and verified by `--check`.
 //!
 //! Usage (from the workspace root):
 //!
 //! ```text
-//! cargo run -p upstream-gen --bin linter-meta-gen -- --sdk-src <dart-sdk-tree> --lints-src <lints-tree> [--check] [--verbose]
+//! DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> \
+//!   cargo run -p upstream-gen --bin linter-meta-gen -- [--check] [--verbose]
 //! ```
 //!
 //! Modes:
 //! - default: writes both outputs;
 //! - `--check`: re-derives both documents and byte-compares them against
 //!   the tracked files, exiting 1 with a regeneration hint on drift —
-//!   the CI face.
+//!   the CI face. The tracked headers' `SDK pin:` revision must match
+//!   `pin.toml`, and the checkout's `tools/VERSION` must match the pin.
 //!
 //! Determinism: both emitted documents are pure functions of the source
 //! trees (no timestamps, sorted rows), so `--check` is byte-exact.
 
 mod linter_meta;
+mod pin;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,10 +40,11 @@ use linter_meta::{
     RuleRow, fold, lints_set_names, parse_messages, render_lint_docs_rows, render_rule_meta,
     scan_rule_files, validate_names, version_consts,
 };
+use pin::Pin;
 
 const USAGE: &str = "usage: linter-meta-gen [--sdk-src <dart-sdk-tree>] [--lints-src <lints-tree>]\
                      \n                     [--out <path>] [--docs-out <path>] [--check] [--verbose]\
-                     \n                     the SDK tree resolves from DART_SDK_SRC, the lints tree from DART_LINTS_SRC";
+                     \n                     the SDK tree resolves from DARTQ_SDK_SRC (it must match conformance/pin.toml), the lints tree from DART_LINTS_SRC";
 
 /// `(message, exit code)`: 2 marks usage errors, 1 run failures.
 type Failure = (String, u8);
@@ -83,7 +89,7 @@ fn run() -> Result<(), Failure> {
             }
         }
     }
-    let Some(sdk_src) = sdk_src.or_else(|| std::env::var("DART_SDK_SRC").ok().map(PathBuf::from))
+    let Some(sdk_src) = sdk_src.or_else(|| std::env::var("DARTQ_SDK_SRC").ok().map(PathBuf::from))
     else {
         return Err((format!("no SDK source given; {USAGE}"), 2));
     };
@@ -92,6 +98,8 @@ fn run() -> Result<(), Failure> {
     else {
         return Err((format!("no lints source given; {USAGE}"), 2));
     };
+    let pin = Pin::load().map_err(|e| (format!("conformance pin: {e}"), 1))?;
+    let checkout_stamp = pin.verify_checkout(&sdk_src).map_err(|e| (e, 1))?;
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = out.unwrap_or_else(|| {
         manifest.join("../../crates/dartq-lints/src/generated/rule_meta.rs")
@@ -104,7 +112,6 @@ fn run() -> Result<(), Failure> {
     let read = |path: &Path| -> Result<String, Failure> {
         fs::read_to_string(path).map_err(|e| (format!("reading {}: {e}", path.display()), 1))
     };
-    let version = sdk_version(&sdk_src)?;
     let messages = read(&sdk_src.join("pkg/linter/messages.yaml"))?;
     let entries = parse_messages(&messages).map_err(|e| (e, 1))?;
     let lint_names = read(&sdk_src.join("pkg/linter/lib/src/lint_names.g.dart"))?;
@@ -134,18 +141,20 @@ fn run() -> Result<(), Failure> {
     if verbose {
         print_tally(&rows, &entries);
     }
-    let document = render_rule_meta(&rows, entries.len(), &version);
-    let docs = render_lint_docs_rows(&rows);
+    let pin_line = pin.stamp(&checkout_stamp);
+    let document = render_rule_meta(&rows, entries.len(), &pin_line, &checkout_stamp);
+    let docs = render_lint_docs_rows(&rows, &pin_line, &checkout_stamp);
 
     for (path, document) in [(&out, document.as_str()), (&docs_out, docs.as_str())] {
         if check {
             let tracked = read(path).map_err(|(message, _)| (format!("--check {message}"), 1))?;
+            check_revision(&pin, &tracked, path)?;
             if tracked != document {
                 return Err((
                     format!(
                         "{}: drift from the pinned upstream sources; regenerate with: \
-                         cargo run -p upstream-gen --bin linter-meta-gen -- --sdk-src \
-                         <dart-sdk-tree> --lints-src <lints-tree>",
+                         DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> \
+                         cargo run -p upstream-gen --bin linter-meta-gen",
                         path.display()
                     ),
                     1,
@@ -179,38 +188,30 @@ fn run() -> Result<(), Failure> {
     Ok(())
 }
 
-/// The SDK identity stamp for the table header, from the checkout's
-/// `tools/VERSION` — the same stamp `analyzer-codes-gen` writes.
-fn sdk_version(sdk_src: &Path) -> Result<String, Failure> {
-    let version_path = sdk_src.join("tools/VERSION");
-    let text = fs::read_to_string(&version_path).map_err(|e| {
-        (
+/// The `--check` revision gate: the tracked document must carry an
+/// `SDK pin:` header naming exactly the pinned revision — a mismatch (or
+/// a missing stamp, i.e. a hand-edited or pre-pin file) fails with both
+/// revisions named, before the byte comparison.
+fn check_revision(pin: &Pin, tracked: &str, out: &Path) -> Result<(), Failure> {
+    match pin::header_revision(tracked) {
+        Some(found) if found == pin.sdk_revision => Ok(()),
+        Some(found) => Err((
             format!(
-                "reading {}: {e} (is this a Dart SDK tree?)",
-                version_path.display()
+                "{}: generated from SDK revision {found} but conformance/pin.toml pins {}; \
+                 regenerate against the pinned tree",
+                out.display(),
+                pin.sdk_revision
             ),
             1,
-        )
-    })?;
-    let mut fields = std::collections::BTreeMap::new();
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(' ') {
-            fields.insert(key.to_owned(), value.trim().to_owned());
-        }
-    }
-    let get = |key: &str| fields.get(key).cloned().unwrap_or_default();
-    let channel = get("CHANNEL");
-    let version = format!("{}.{}.{}", get("MAJOR"), get("MINOR"), get("PATCH"));
-    if version == ".." || channel.is_empty() {
-        return Err((
+        )),
+        None => Err((
             format!(
-                "{}: malformed VERSION file (channel {channel:?}, version {version:?})",
-                version_path.display()
+                "{}: no `SDK pin:` header line; regenerate with tools/upstream-gen",
+                out.display()
             ),
             1,
-        ));
+        )),
     }
-    Ok(format!("dart {version} ({channel} channel)"))
 }
 
 /// The `--verbose` face: the fold tally by group and state.

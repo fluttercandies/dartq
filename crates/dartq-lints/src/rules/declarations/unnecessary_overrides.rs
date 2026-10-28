@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
+use super::{PayloadField, Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
 use crate::rules::{MemberQuery, has_doc_comment, member_annotations, member_is_concrete, member_matches, same_file_ancestors, token_seq_equal, type_before};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_overrides.dart`
@@ -56,8 +56,8 @@ fn check(c: &mut Check<'_>) {
     let Some(name_row) = operator.or_else(|| {
         c.collect_direct(node).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first()
-                    == Some(&(dartq_parser::IdentifierContext::MethodDeclaration as u32))
+                && c.field(kid, PayloadField::Context)
+                    == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32)
         })
     }) else {
         return;
@@ -104,9 +104,10 @@ fn check(c: &mut Check<'_>) {
                         && match operator {
                             Some(_) => {
                                 let inherited_op = operator_name(c, member)
-                                    .and_then(|row| c.payload_word(row, 0))
+                                    .and_then(|row| c.field_token(row, PayloadField::Name))
                                     .map(|t| c.lexeme(t));
-                                let own_op = c.payload_word(name_row, 0).map(|t| c.lexeme(t));
+                                let own_op =
+                                    c.field_token(name_row, PayloadField::Name).map(|t| c.lexeme(t));
                                 inherited_op.is_some() && inherited_op == own_op
                             }
                             None => !member_matches(c, member, query, &name).is_empty(),
@@ -139,9 +140,9 @@ fn check(c: &mut Check<'_>) {
     // The body walk (:95, :52-113; operators :245-292).
     // The body walk (:95, :52-113; operators :245-292). The
     // `OperatorName` row anchors at the `operator` keyword; the operator
-    // itself is payload word 0.
+    // itself rides the row's `Name` word.
     let forwards = match operator {
-        Some(op_row) => match c.payload_word(op_row, 0) {
+        Some(op_row) => match c.field_token(op_row, PayloadField::Name) {
             Some(token) => super_operator_forwards(c, node, c.lexeme(token)),
             None => false,
         },
@@ -154,7 +155,7 @@ fn check(c: &mut Check<'_>) {
         let range = match operator {
             Some(op_row) => {
                 let Some(start) = c
-                    .payload_word(op_row, 0)
+                    .field_token(op_row, PayloadField::Name)
                     .and_then(|token| c.utf16_of_token(token))
                 else {
                     return;
@@ -304,9 +305,10 @@ fn flat_params<'a>(c: &'a Check<'_>, params: u32) -> Vec<ParamFace<'a>> {
 }
 
 fn param_face<'a>(c: &'a Check<'_>, param: u32, group: u8) -> Option<ParamFace<'a>> {
-    let payload = c.payload(param);
-    let receiver = payload.first().copied().unwrap_or(crate::rules::NONE_TOKEN);
-    let name_token = payload.get(1).copied()?;
+    let receiver = c
+        .field(param, PayloadField::Receiver)
+        .unwrap_or(crate::rules::NONE_TOKEN);
+    let name_token = c.field(param, PayloadField::Name)?;
     if name_token == crate::rules::NONE_TOKEN {
         return None;
     }
@@ -463,7 +465,7 @@ fn super_operator_forwards(c: &Check<'_>, node: u32, op: &str) -> bool {
             if c.kind(row) != NodeKind::BinaryExpression {
                 continue;
             }
-            let Some(&op_token) = c.payload(row).first() else {
+            let Some(op_token) = c.field(row, PayloadField::Operator) else {
                 continue;
             };
             if c.lexeme(op_token) != op {
@@ -683,7 +685,7 @@ fn super_setter_forwards(c: &Check<'_>, rows: &[u32], name: &str, param: &str) -
     else {
         return false;
     };
-    let Some(&op) = c.payload(assignment).first() else {
+    let Some(op) = c.field(assignment, PayloadField::Operator) else {
         return false;
     };
     if c.lexeme(op) != "=" {

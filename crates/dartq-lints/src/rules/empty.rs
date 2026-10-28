@@ -1,7 +1,7 @@
 //! The emptiness family: `empty_statements`, `empty_constructor_bodies`,
 //! `empty_catches`, `avoid_empty_else`.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::RuleSpec;
@@ -20,7 +20,7 @@ fn last_token_of(c: &Check<'_>, node: u32) -> u32 {
 }
 
 pub(crate) mod empty_statements {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_statements.dart:33-53` —
     /// report every `EmptyStatement` except one that "defines semantics":
@@ -54,7 +54,7 @@ pub(crate) mod empty_statements {
         if c.kind(parent) != NodeKind::SwitchCase {
             return false;
         }
-        let expressions = c.payload(parent).get(2).copied().unwrap_or(0) as usize;
+        let expressions = c.field(parent, PayloadField::ExpressionCount).unwrap_or(0) as usize;
         let kids = c.direct_children(parent);
         if expressions >= kids.len() {
             return false;
@@ -122,7 +122,7 @@ pub(crate) mod empty_constructor_bodies {
 }
 
 pub(crate) mod empty_catches {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_catches.dart:31-45` — an
     /// empty catch block with no comments before `}` reports at the block,
@@ -153,7 +153,7 @@ pub(crate) mod empty_catches {
             }
         });
         if let Some(exception) = exception
-            && let Some(&name) = c.payload(exception).get(1)
+            && let Some(name) = c.field(exception, PayloadField::Name)
             && super::is_just_underscores(c.lexeme(name))
         {
             return;
@@ -179,7 +179,7 @@ pub(crate) mod empty_catches {
 }
 
 pub(crate) mod avoid_empty_else {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_empty_else.dart:32-41` — an
     /// `else` branch that is a non-synthetic empty statement reports at the
@@ -194,7 +194,7 @@ pub(crate) mod avoid_empty_else {
         let node = c.node();
         // Else present iff the `else` payload token is set;
         // the else statement is the last child.
-        if c.payload(node).first().copied() == Some(crate::rules::NONE_TOKEN) {
+        if c.field(node, PayloadField::ElseKeyword) == Some(crate::rules::NONE_TOKEN) {
             return;
         }
         let Some(else_stmt) = super::last_child(c, node) else {
@@ -512,7 +512,7 @@ mod tests {
 }
 
 pub(crate) mod prefer_asserts_with_message {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_asserts_with_message.dart`
@@ -533,12 +533,11 @@ pub(crate) mod prefer_asserts_with_message {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let payload = c.payload(node);
         // Registered faces only: initializer (0) and statement (1).
-        if payload.first().copied().unwrap_or(NONE_TOKEN) > 1 {
+        if c.field(node, PayloadField::AssertKind).unwrap_or(NONE_TOKEN) > 1 {
             return;
         }
-        if payload.get(2).copied() == Some(NONE_TOKEN) {
+        if c.field(node, PayloadField::Comma) == Some(NONE_TOKEN) {
             let range = c.utf16_span(node);
             c.report(range, &[]);
         }
@@ -568,7 +567,7 @@ pub(crate) mod prefer_asserts_with_message {
 }
 
 pub(crate) mod throw_in_finally {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/throw_in_finally.dart`
@@ -600,7 +599,7 @@ pub(crate) mod throw_in_finally {
             return;
         };
         let try_statement = path[ts_pos];
-        if c.payload(try_statement).first().copied() == Some(NONE_TOKEN) {
+        if c.field(try_statement, PayloadField::FinallyKeyword) == Some(NONE_TOKEN) {
             return;
         }
         // The node's chain must pass through the finally block (the last
@@ -639,7 +638,7 @@ pub(crate) mod throw_in_finally {
             let f = Fixture::parse("void f() { try {} finally { throw 1; } }");
             let lints = f.run(&one_rule("throw_in_finally"));
             assert_eq!(lints.len(), 1);
-            assert_eq!(lints[0].message, "Use of 'throw' in a 'finally' block.");
+            assert_eq!(lints[0].message, "Use of 'throw' in 'finally' block.");
             assert_eq!(lints[0].range.start, 28);
         }
 
@@ -660,7 +659,7 @@ pub(crate) mod throw_in_finally {
 }
 
 pub(crate) mod unnecessary_breaks {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_breaks.dart`
     /// — a labeled-`break`-free `break` that is the last of more than one
@@ -699,7 +698,7 @@ pub(crate) mod unnecessary_breaks {
         if c.kind(parent) != NodeKind::SwitchCase {
             return;
         }
-        let expressions = c.payload(parent).get(2).copied().unwrap_or(0) as usize;
+        let expressions = c.field(parent, PayloadField::ExpressionCount).unwrap_or(0) as usize;
         let is_last = {
             let kids = c.direct_children(parent);
             if expressions >= kids.len() {
@@ -748,7 +747,7 @@ pub(crate) mod unnecessary_breaks {
 }
 
 pub(crate) mod unnecessary_final {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::{NONE_TOKEN, utf16_token_span};
 
     /// The two official message variants under one name
@@ -874,7 +873,7 @@ pub(crate) mod unnecessary_final {
         let Some(keyword) = modifier_run_final(c, node) else {
             return;
         };
-        let name = c.payload(node).get(1).copied().unwrap_or(NONE_TOKEN);
+        let name = c.field(node, PayloadField::Name).unwrap_or(NONE_TOKEN);
         if name == NONE_TOKEN {
             return;
         }
@@ -916,11 +915,11 @@ pub(crate) mod unnecessary_final {
     ///   iterable, so adjacency is not the read — the declaration is the
     ///   parts row's only `VariablesDeclaration` sibling); the keyword and
     ///   the written-type gap are read off it like the local-declaration
-    ///   face. The parts' own payload word 2 is absent here — it is the
-    ///   pattern form's word only.
-    /// - `ForEachPartsWithPattern` (`for (final (a, b) in xs)`): payload word
-    ///   2 carries `pattern_keyword`; the official passes the without-type
-    ///   variant unconditionally.
+    ///   face. The parts' own `PatternKeyword` word is absent here — it is
+    ///   the pattern form's word only.
+    /// - `ForEachPartsWithPattern` (`for (final (a, b) in xs)`): the
+    ///   `PatternKeyword` word carries the pattern-position keyword; the
+    ///   official passes the without-type variant unconditionally.
     fn for_in_parts(c: &mut Check<'_>, node: u32) {
         let Some(parent) = c.ancestor(1) else {
             return;
@@ -950,7 +949,7 @@ pub(crate) mod unnecessary_final {
             report_at(c, keyword, name > keyword + 1);
             return;
         }
-        let keyword = c.payload(node).get(2).copied().unwrap_or(NONE_TOKEN);
+        let keyword = c.field(node, PayloadField::PatternKeyword).unwrap_or(NONE_TOKEN);
         if keyword == NONE_TOKEN || c.lexeme(keyword) != "final" {
             return;
         }
@@ -1080,7 +1079,7 @@ pub(crate) mod unnecessary_final {
 }
 
 pub(crate) mod one_member_abstracts {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// `NodeHeader.flags` modifier-mask bit for the class-family `abstract`
@@ -1115,10 +1114,16 @@ pub(crate) mod one_member_abstracts {
         if dartq_ast::mod_flags(c.unit.ast, node) & ABSTRACT_BIT == 0 {
             return;
         }
-        // Payload words 1..3 are the `extends`/`with`/`implements` clause
-        // keywords: any present clause keeps the class.
-        let payload = c.payload(node);
-        if payload.len() < 4 || payload[1..4].iter().any(|&word| word != NONE_TOKEN) {
+        // The `extends`/`with`/`implements` clause keywords: any present
+        // clause keeps the class.
+        if [
+            PayloadField::ExtendsKeyword,
+            PayloadField::WithKeyword,
+            PayloadField::ImplementsKeyword,
+        ]
+        .into_iter()
+        .any(|field| c.field(node, field) != Some(NONE_TOKEN))
+        {
             return;
         }
         let members = crate::rules::names::class_like_members(c, node);
@@ -1143,7 +1148,7 @@ pub(crate) mod one_member_abstracts {
         let [method] = tally[..] else {
             return;
         };
-        if c.payload(method).get(1).copied() != Some(NONE_TOKEN) {
+        if c.field(method, PayloadField::GetOrSet) != Some(NONE_TOKEN) {
             return;
         }
         // `method.isAbstract`: the body is the empty `;` form.

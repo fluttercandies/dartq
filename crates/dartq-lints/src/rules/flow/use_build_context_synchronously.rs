@@ -1,6 +1,6 @@
 use std::path::Component;
 
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: upstream Dart SDK source,
 /// `pkg/linter/lib/src/rules/use_build_context_synchronously.dart` —
@@ -124,7 +124,7 @@ fn declares_build_context_type(c: &Check<'_>) -> bool {
             c.kind(kid) == NodeKind::Identifier
                 && c.lexeme(c.head_token(kid)) == "BuildContext"
                 && matches!(
-                    c.payload(kid).first().copied(),
+                    c.field(kid, PayloadField::Context),
                     Some(ctx)
                         if ctx
                             == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration

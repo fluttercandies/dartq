@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/use_function_type_syntax_for_parameters.dart:34-49`
 /// — a formal parameter written with the old function syntax
@@ -25,7 +25,7 @@ fn check(c: &mut Check<'_>) {
         .into_iter()
         .find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
-                && c.payload(kid).first().copied()
+                && c.field(kid, PayloadField::Context)
                     != Some(dartq_parser::IdentifierContext::TypeReference as u32)
         })
         .map_or_else(|| c.head_token(node), |kid| c.head_token(kid));

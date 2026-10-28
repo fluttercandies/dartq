@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec, first_child, last_child};
+use super::{Check, NodeKind, PayloadField, RuleSpec, first_child, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/always_put_control_body_on_new_line.dart:30-78`
 /// — a control structure's body statement on the same line as the
@@ -36,9 +36,7 @@ fn check(c: &mut Check<'_>) {
             }
             // The else branch (:50-53), skipped for `else if` chains.
             let Some(else_kw) = c
-                .payload(node)
-                .first()
-                .copied()
+                .field(node, PayloadField::ElseKeyword)
                 .filter(|&kw| kw != super::NONE_TOKEN)
             else {
                 return;

@@ -16775,3 +16775,82 @@ fn non_constant_map_pattern_key_reports_at_the_key() {
     assert_eq!(rows[0].severity, Severity::Error);
 }
 
+
+/// The receiver-expression walk must terminate on recovery-staged
+/// degenerate records: `x.(null)` folds a member read whose `recv_span`
+/// names its own member token, and the chain hop cycled on the same span
+/// forever (stack overflow — SDK issue 29943; the same fold underlies the
+/// anonymous-method cascades and `p.(unresolved)`). The strictly-earlier
+/// hop guard answers through the classified receiver instead, and the
+/// oracle's face survives (missing_identifier + undefined_identifier).
+#[test]
+fn recv_walk_degenerate_record_terminates() {
+    let r = report("bad() { x.(null); } main() {}");
+    let mut codes = code_names(&r);
+    codes.sort_unstable();
+    assert_eq!(
+        codes,
+        ["missing_identifier", "undefined_identifier"],
+        "{:?}",
+        code_names(&r)
+    );
+}
+
+/// A bare-read credit must never outlive its frame: the for-body recovery
+/// re-walks tokens after the frame closed, and the write-intent conversion
+/// consumed the stale `local_hits` entry past the truncated `locals`
+/// (`self.locals[hit]` — index out of bounds, front_end parser_recovery_04).
+/// The frame close now drops the truncated range's entries; the reads keep
+/// their credits where the locals still live.
+#[test]
+fn local_hit_credit_dies_with_frame() {
+    let r = report(
+        "class int {} void foo() { for (int i = 0; i < 10; i++) final <int> f = [42]; } \
+             void bar() { for (int i = 0; i < 10; i++) var y = a<int, void>?.c = 42; }",
+    );
+    assert!(
+        code_names(&r).iter().any(|c| *c == "unused_local_variable"),
+        "{:?}",
+        code_names(&r)
+    );
+}
+
+/// Const evaluation must share substructure: each level references the
+/// previous const twice, and a deep-cloning value domain doubled per level
+/// (9+ GB before the kill on the SDK's own 44-level test,
+/// canonicalize/hashing_memoize_array_test). The shared (`Rc`) payloads
+/// clone in O(1); the values stay oracle-clean.
+#[test]
+fn const_shared_substructure_stays_bounded() {
+    let mut src = String::from("const l0 = [null, null];\n");
+    for level in 1..40 {
+        src.push_str(&format!(
+            "const l{level} = [l{}, l{}];\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    let r = report(&src);
+    assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+}
+
+/// A 10k-section cascade must resolve in linear time: the chain-walk scan
+/// and the cascade streak walk-back were each O(N) per row — O(N²) over
+/// the file, killed at 240 s with flat memory (SDK regress41983's 20k
+/// sections). The token-end index, the pass-2 receiver memo and the
+/// precomputed streak index make the pass input-bounded.
+#[test]
+fn long_cascade_resolves_linearly() {
+    let mut src =
+        String::from("class int {} class List<T> { void add(T x) {} } void main() { var xs = <int>[]");
+    for i in 0..10_000 {
+        src.push_str(&format!("..add({i})"));
+    }
+    src.push_str("; xs; }");
+    let r = report(&src);
+    assert!(
+        code_names(&r).len() < 20,
+        "{:?}",
+        code_names(&r)
+    );
+}

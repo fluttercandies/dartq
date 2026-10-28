@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_adjacent_string_concatenation.dart:37-46`
 /// — `+` whose two operands are both string literals reports at the
@@ -12,7 +12,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    let Some(&op) = c.payload(node).first() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return;
     };
     if c.lexeme(op) != "+" {

@@ -1,4 +1,4 @@
-use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
 use crate::rules::{is_statement_row, slice};
 
 /// Official: `pkg/linter/lib/src/rules/use_test_throws_matchers.dart`
@@ -39,9 +39,9 @@ fn check(c: &mut Check<'_>) {
     {
         return;
     }
-    // `node.finallyBlock == null` (:56): payload word 0 is the
-    // `finally` token (the `TryStatementEnd` payload).
-    if c.payload(node).first() != Some(&NONE_TOKEN) {
+    // `node.finallyBlock == null` (:56): the `FinallyKeyword` word is
+    // the `finally` token (the `TryStatementEnd` payload).
+    if c.field(node, PayloadField::FinallyKeyword) != Some(NONE_TOKEN) {
         return;
     }
     // The body block is the try's first child; `node.body.statements.

@@ -1,4 +1,4 @@
-use super::{Check, NodeKind, RuleSpec};
+use super::{PayloadField, Check, NodeKind, RuleSpec};
 use crate::rules::last_child;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_function_declarations_over_variables.dart:40-58`
@@ -172,7 +172,7 @@ fn writes_name(c: &Check<'_>, node: u32, name: &str) -> bool {
     if c.kind(node) != NodeKind::Assignment {
         return false;
     }
-    let Some(&op) = c.payload(node).first() else {
+    let Some(op) = c.field(node, PayloadField::Operator) else {
         return false;
     };
     let Some((left, _)) = crate::rules::slice::binary_operands_at(c, node) else {
@@ -213,12 +213,12 @@ fn unary_writes_name(c: &Check<'_>, kids: &[u32], index: usize, name: &str) -> b
 }
 
 /// The pattern-assignment face: the childless `PatternAssignment`
-/// marker anchors over the `=` (payload word 0), and the target
+/// marker anchors over the `=` (the row's `Equals` word), and the target
 /// pattern's pieces are the owner siblings before it, up to the `=`
 /// byte — a write when an `AssignedVariablePattern` names the bare
 /// name (`(f, _) = ...`).
 fn pattern_writes_name(c: &Check<'_>, node: u32, name: &str) -> bool {
-    let Some(equals) = c.payload(node).first().copied() else {
+    let Some(equals) = c.field(node, PayloadField::Equals) else {
         return false;
     };
     let Some(eq_start) = c
