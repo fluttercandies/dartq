@@ -543,11 +543,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parseRecordType`. The cursor sits before the `(`.
     /// `recordType ::= '(' recordTypeFields ','? recordTypeNamedFields? ')'`.
     ///
-    /// Depth-guarded: record fields recurse into `compute_type` and back into
-    /// nested record types, so `((((...` is unbounded recursion without the
-    /// guard (official `recoverFromStackOverflow`).
+    /// Guarded by [`crate::parser::TYPE_DEPTH_CRASH_GUARD`], not
+    /// [`crate::parser::MAX_DEPTH`]: record fields recurse into `compute_type`
+    /// and back into nested record types, so `((((...` is unbounded recursion
+    /// without a guard — but the official parser carries NO counter on this
+    /// path (the oracle emits one per-level row for every nesting level of the
+    /// 600-deep manual case and never reports `stackOverflow`), so no
+    /// observable cap may sit inside that domain. The crash guard only keeps
+    /// the Rust recursion bounded far above any oracle-reachable depth.
     pub(crate) fn parse_record_type(&mut self, is_question_part_of_type: bool) -> TokenSpan {
-        if !self.enter_depth() {
+        if !self.enter_type_depth() {
             return self.peek_span();
         }
         let start = self.peek_span(); // `(`
@@ -627,7 +632,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
         self.listener
             .end_record_type(start, question, parameter_count, has_named_fields);
-        self.leave_depth();
+        self.leave_type_depth();
         question.unwrap_or(end)
     }
 

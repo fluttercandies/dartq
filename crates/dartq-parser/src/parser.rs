@@ -14,10 +14,31 @@ use crate::listener::ParserListener;
 use crate::recovery::is_identifier;
 use crate::token_id::{TokenId, TokenSpan};
 
-/// Maximum structural nesting before the parser forces unwinding (official
-/// `recoverFromStackOverflow` cap, `parser_impl.dart:6709/:6939`): the guards
-/// trip once the depth EXCEEDS it (`depth++ > 500` — the 502nd nested entry).
+/// Maximum structural nesting on the statement/expression recursion paths
+/// (official `statementDepth`/`expressionDepth` caps, `parser_impl.dart`
+/// :6686-6695/:6915-6948): the guard trips once the depth EXCEEDS it
+/// (`depth++ > 500` — the 502nd nested entry).
+///
+/// The official parser guards ONLY these two recursion paths; the type-descent
+/// path (`computeType` → record types / type arguments) recurses unguarded, so
+/// it is guarded by [`TYPE_DEPTH_CRASH_GUARD`] instead — far above any
+/// oracle-reachable depth.
 pub(crate) const MAX_DEPTH: u32 = 500;
+
+/// Rust-stack crash guard on the type-descent path (record types, type
+/// arguments/variables). The official parser has NO depth limit there
+/// (`computeType` → `parseRecordType` → `parseRecordTypeField` → `computeType`
+/// recurses with no counter), so the oracle-defined domain is cap-free: a
+/// 600-deep record type must yield 600 per-level
+/// `record_type_one_positional_no_trailing_comma` rows and no
+/// `stack_overflow`. This guard exists only to keep Rust recursion bounded
+/// (no process abort); its trip point lies outside the oracle-defined domain
+/// (the oracle itself dies on the VM call stack long before it), so the
+/// structured bailout it takes — one `stack_overflow` report with the cap in
+/// its text, then a terminal unwind — is a documented known-diff attributed to
+/// input depth beyond the oracle's own survival, never reachable at
+/// oracle-parity depths.
+pub(crate) const TYPE_DEPTH_CRASH_GUARD: u32 = 10_000;
 
 /// Per-file diagnostics cap (rust-analyzer parser-bailout practice). A
 /// recovery loop that cannot make progress must not stream unbounded
@@ -57,8 +78,14 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// Official `isLastPatternAllowedInsideUnaryPattern`
     /// (`parser_impl.dart:342`).
     pub(crate) is_last_pattern_allowed_inside_unary_pattern: bool,
-    /// Structural nesting depth guard.
+    /// Structural nesting depth guard (statement/expression recursion).
     depth: u32,
+    /// Type-descent nesting depth (record types, type arguments/variables).
+    /// Counted separately from [`Self::depth`] because the official parser
+    /// counts statement/expression recursion only — folding type descent into
+    /// [`MAX_DEPTH`] would leak type nesting into the 500 cap the oracle never
+    /// applies there. Guarded by [`TYPE_DEPTH_CRASH_GUARD`].
+    type_depth: u32,
     /// Statement nesting depth (official `statementDepth`, the separate
     /// `parseStatement` counter with the same 500 cap).
     pub(crate) statement_depth: u32,
@@ -202,6 +229,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             features,
             is_last_pattern_allowed_inside_unary_pattern: true,
             depth: 0,
+            type_depth: 0,
             statement_depth: 0,
             diagnostics_emitted: 0,
             bailed: false,
@@ -299,32 +327,59 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
 
     // --- depth + bailout guards ---------------------------------------------
 
-    /// Enters a nested structure; `false` means a cap was hit (nesting cap,
-    /// or the bailout already latched) and the caller must return immediately
-    /// without consuming — the enclosing loops' no-progress guards unwind.
-    /// Hitting the nesting cap latches the bailout (official
+    /// Enters a nested statement/expression structure; `false` means a cap was
+    /// hit (nesting cap, or the bailout already latched) and the caller must
+    /// return immediately without consuming — the enclosing loops' no-progress
+    /// guards unwind. Hitting the nesting cap latches the bailout (official
     /// `recoverFromStackOverflow`: report `stackOverflow` once and stop).
     pub(crate) fn enter_depth(&mut self) -> bool {
-        if self.bailed {
-            return false;
-        }
-        if self.depth > MAX_DEPTH {
-            // One report per deep form: once the fuse latched (the official
-            // local guard, `parser_impl.dart:6947`), further cap entries
-            // unwind silently; the latch clears only at a form boundary that
-            // made real progress (`Parser::clear_depth_fuse`).
-            if !self.depth_fuse_latched {
-                self.depth_fuse_latched = true;
-                self.bail(crate::message::msg::stack_overflow(MAX_DEPTH));
-            }
+        if self.depth_cap_hit(self.depth, MAX_DEPTH) {
             return false;
         }
         self.depth += 1;
         true
     }
 
+    /// Enters a type-descent structure (record type, type arguments/variables).
+    /// The official parser does NOT guard this path (`computeType` recursion
+    /// carries no counter), so the guard here is the far-above-parity
+    /// [`TYPE_DEPTH_CRASH_GUARD`] — a Rust-stack crash guard, not an observable
+    /// cap: within the oracle-defined domain it can never trip.
+    pub(crate) fn enter_type_depth(&mut self) -> bool {
+        if self.depth_cap_hit(self.type_depth, TYPE_DEPTH_CRASH_GUARD) {
+            return false;
+        }
+        self.type_depth += 1;
+        true
+    }
+
     pub(crate) fn leave_depth(&mut self) {
         self.depth -= 1;
+    }
+
+    pub(crate) fn leave_type_depth(&mut self) {
+        self.type_depth -= 1;
+    }
+
+    /// Shared cap check for both depth counters: `true` means the caller must
+    /// return immediately (bailout already latched, or `depth` just tripped
+    /// `cap`, latching the one-report fuse and the terminal bailout).
+    fn depth_cap_hit(&mut self, depth: u32, cap: u32) -> bool {
+        if self.bailed {
+            return true;
+        }
+        if depth > cap {
+            // One report per deep form: once the fuse latched (the official
+            // local guard, `parser_impl.dart:6947`), further cap entries
+            // unwind silently; the latch clears only at a form boundary that
+            // made real progress (`Parser::clear_depth_fuse`).
+            if !self.depth_fuse_latched {
+                self.depth_fuse_latched = true;
+                self.bail(crate::message::msg::stack_overflow(cap));
+            }
+            return true;
+        }
+        false
     }
 
     /// Clears the expression-fuse latch at a form boundary that made real
@@ -500,6 +555,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             is_last_pattern_allowed_inside_unary_pattern: self
                 .is_last_pattern_allowed_inside_unary_pattern,
             depth: self.depth,
+            type_depth: self.type_depth,
             statement_depth: self.statement_depth,
             diagnostics_emitted: self.diagnostics_emitted,
             bailed: self.bailed,

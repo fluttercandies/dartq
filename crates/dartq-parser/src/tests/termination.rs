@@ -4,8 +4,13 @@
 //! Four axes are pinned here:
 //! 1. the per-file diagnostics cap latches a terminal bailout and stops the
 //!    parse before a pathological input can stream unbounded reports;
-//! 2. the structural-nesting guard latches the same bailout on a recursion
-//!    bomb (official `recoverFromStackOverflow`);
+//! 2. the statement/expression nesting guards latch the same bailout on a
+//!    recursion bomb (official `recoverFromStackOverflow`), while the
+//!    type-descent path (record types, type arguments/variables) carries NO
+//!    observable cap — the official parser counters only
+//!    statement/expression recursion, so oracle-parity depths there must
+//!    parse to completion; it is bounded only by the far-above-parity
+//!    `TYPE_DEPTH_CRASH_GUARD` (structured bail, never a panic);
 //! 3. the `<id>` fast-shape consume paths emit the official event order
 //!    without the off-by-one that used to trip `debug_assert!(peek_is_closer)`
 //!    on `@List<int>` (corpus `annotation_with_type_arguments_uninstantiated`);
@@ -61,11 +66,17 @@ fn diagnostics_cap_latches_and_stops_parsing() {
     );
 }
 
-/// A recursion bomb: 600 nested record-type parens blow past the official
-/// nesting cap of 500 and latch the bailout (`stackOverflow`) instead of
-/// overflowing the stack.
+/// The 600-deep record-type case (manual/diagnostic/stack_overflow/1): the
+/// official parser has NO depth counter on the type-descent path
+/// (`computeType` → `parseRecordType` → `parseRecordTypeField` → `computeType`
+/// recurses unguarded), so the oracle iterates and emits one
+/// `recordTypeOnePositionalFieldNoTrailingComma` row per nesting level at that
+/// level's closing paren (columns 616→1215) and never reports
+/// `stackOverflow`. dartq must reproduce that row set 1:1: no observable cap
+/// on this path — the `TYPE_DEPTH_CRASH_GUARD` sits far above any
+/// oracle-reachable depth and is a stack-safety crash guard, not a limit.
 #[test]
-fn nesting_cap_latches_on_deep_record_types() {
+fn deep_record_type_matches_oracle_per_level_rows() {
     let source: &'static str = Box::leak(
         format!("typedef T = {}int{};", "(".repeat(600), ")".repeat(600)).into_boxed_str(),
     );
@@ -74,16 +85,56 @@ fn nesting_cap_latches_on_deep_record_types() {
     {
         let mut parser = Parser::new(text, table, latest_features(), &mut listener);
         parser.parse_unit();
-        assert!(parser.is_bailed(), "nesting cap must latch the bailout");
+        assert!(
+            !parser.is_bailed(),
+            "the type-descent path has no observable cap: the 600-deep \
+             record type must parse to completion"
+        );
     }
-    let codes = listener.error_codes();
-    assert!(
-        codes.contains(&"stack_overflow".to_owned()),
-        "the terminal diagnostic is the official stackOverflow code: {codes:?}"
+    let code = "record_type_one_positional_no_trailing_comma";
+    assert_eq!(
+        listener.errors.len(),
+        600,
+        "the row set is exactly the oracle's — no stack_overflow, no other noise: {:?}",
+        listener.error_codes().iter().skip(599).take(3).collect::<Vec<_>>()
     );
     assert!(
-        codes.len() <= 4,
-        "the bailout bounds total diagnostics on the bomb: {codes:?}"
+        listener
+            .errors
+            .iter()
+            .all(|(c, _, _)| c == code),
+        "every row is the per-level record-type diagnostic"
+    );
+    // Reports unwind innermost-first: the innermost `)` sits at UTF-16 offset
+    // 615 (`typedef T = ` is 12 chars plus 600 open parens), the outermost at
+    // 1214 — the oracle's 1:616 → 1:1215 columns, one-based.
+    assert_eq!(listener.errors[0].1, 615, "innermost level's closer first");
+    assert_eq!(listener.errors[599].1, 1214, "outermost level's closer last");
+}
+
+/// Deep-but-valid nested type arguments (`A<A<...>>`, 600 levels) are VALID
+/// Dart the oracle parses silently; the type-argument descent sites share the
+/// record type's crash-guard posture — no observable cap, zero diagnostics,
+/// no false-positive `stack_overflow` on valid code.
+#[test]
+fn deep_valid_type_arguments_produce_zero_diagnostics() {
+    let source: &'static str = Box::leak(
+        format!("{}int{} x;", "A<".repeat(600), ">".repeat(600)).into_boxed_str(),
+    );
+    let (table, text) = scan_ok(source);
+    let mut listener = Collector::default();
+    {
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
+        parser.parse_unit();
+        assert!(
+            !parser.is_bailed(),
+            "valid deep type arguments must not trip any cap"
+        );
+    }
+    assert!(
+        listener.errors.is_empty(),
+        "the oracle is silent on this shape: {:?}",
+        listener.errors.iter().take(5).collect::<Vec<_>>()
     );
 }
 

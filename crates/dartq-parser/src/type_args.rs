@@ -122,7 +122,7 @@ impl TypeParamOrArg {
                     parser.cursor.advance();
                 }
                 debug_assert_eq!(parser.peek_kind(), TokenKind::Lt, "beginGroup.isA(LT)");
-                if !parser.enter_depth() {
+                if !parser.enter_type_depth() {
                     return parser.peek_span();
                 }
                 let begin = parser.peek_span(); // `<`
@@ -138,7 +138,7 @@ impl TypeParamOrArg {
                 let closer_id = parser.cursor.consume_closer();
                 let closer = parser.span_of(closer_id);
                 parser.listener.end_type_arguments(1, begin, closer);
-                parser.leave_depth();
+                parser.leave_type_depth();
                 closer
             }
             TypeParamOrArg::Complex(g) => (*g).parse_arguments(parser),
@@ -167,7 +167,7 @@ impl TypeParamOrArg {
                     parser.cursor.advance();
                 }
                 debug_assert_eq!(parser.peek_kind(), TokenKind::Lt, "beginGroup.isA(LT)");
-                if !parser.enter_depth() {
+                if !parser.enter_type_depth() {
                     return parser.peek_span();
                 }
                 let begin = parser.peek_span(); // `<`
@@ -184,7 +184,7 @@ impl TypeParamOrArg {
                 let end = parser.span_of(closer_id);
                 parser.listener.end_type_variable(end, 0, None, None);
                 parser.listener.end_type_variables(begin, end);
-                parser.leave_depth();
+                parser.leave_type_depth();
                 end
             }
             TypeParamOrArg::Complex(g) => (*g).parse_variables(parser, allows_variance),
@@ -979,7 +979,7 @@ impl ComplexTypeParamOrArg {
         }
         debug_assert_eq!(parser.cursor.peek_id(), self.start); // cursor on `<`
         let begin = parser.peek_span(); // `<`
-        if !parser.enter_depth() {
+        if !parser.enter_type_depth() {
             return begin;
         }
         parser.listener.begin_type_arguments(begin);
@@ -990,7 +990,7 @@ impl ComplexTypeParamOrArg {
             if parser.is_bailed() {
                 end = parser.peek_span();
                 parser.listener.end_type_arguments(count, begin, end);
-                parser.leave_depth();
+                parser.leave_type_depth();
                 return end;
             }
             let mut type_info = parser.compute_type(true, false);
@@ -1028,7 +1028,7 @@ impl ComplexTypeParamOrArg {
                         parser.span_of(id)
                     };
                     parser.listener.end_type_arguments(count, begin, end);
-                    parser.leave_depth();
+                    parser.leave_type_depth();
                     return end;
                 }
                 // Official `looksLikeTypeParamOrArg` + `parseMissingComma`
@@ -1053,7 +1053,7 @@ impl ComplexTypeParamOrArg {
                     if parser.cursor.at_eof() {
                         end = parser.peek_span();
                         parser.listener.end_type_arguments(count, begin, end);
-                        parser.leave_depth();
+                        parser.leave_type_depth();
                         return end;
                     }
                     continue;
@@ -1071,7 +1071,7 @@ impl ComplexTypeParamOrArg {
                     begin,
                 );
                 parser.listener.end_type_arguments(count, begin, end);
-                parser.leave_depth();
+                parser.leave_type_depth();
                 return end;
             }
             parser.cursor.advance();
@@ -1087,7 +1087,7 @@ impl ComplexTypeParamOrArg {
     ) -> TokenSpan {
         let begin = parser.peek_span(); // `<`
         debug_assert_eq!(parser.cursor.peek_id(), self.start); // entry invariant: cursor on `<`
-        if !parser.enter_depth() {
+        if !parser.enter_type_depth() {
             return begin;
         }
         parser.listener.begin_type_variables(begin);
@@ -1252,7 +1252,7 @@ impl ComplexTypeParamOrArg {
             parser.type_arg_group_end_or_synthetic(begin)
         };
         parser.listener.end_type_variables(begin, end);
-        parser.leave_depth();
+        parser.leave_type_depth();
         end
     }
 }
