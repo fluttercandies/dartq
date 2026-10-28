@@ -248,6 +248,12 @@ pub fn run_overlaid<'a>(
         if !conflict_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(conflict_rows));
         }
+        // The inner-options plugins rows ride the same face (the
+        // parse-model's engagement, analysis time).
+        let inner_rows = inner_plugins_rows(engine);
+        if !inner_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(inner_rows));
+        }
         // The ignore-comment removed-state rows (#1005) ride the same face.
         let removed_rows = removed_lint_use_rows(engine, roots);
         if !removed_rows.is_empty() {
@@ -404,6 +410,10 @@ pub fn run_targets<'a>(
             plugin_conflict_rows(&loaded, &|path| engine.file_table().try_file_id(path));
         if !conflict_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(conflict_rows));
+        }
+        let inner_rows = inner_plugins_rows(engine);
+        if !inner_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(inner_rows));
         }
         let removed_rows = removed_lint_use_rows(engine, roots);
         if !removed_rows.is_empty() {
@@ -1088,6 +1098,47 @@ fn plugin_conflict_rows(
         }
     }
     rows
+}
+
+/// The `plugins_in_inner_options` rows (`_ParsedPluginsData.parse`,
+/// upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/analysis_options/analysis_options_parse_model.dart`
+/// :1538-1545): every *initial* options file whose directory is not the
+/// context root and whose top-level `plugins:` is a map reports at the
+/// section's whole value node, the correction naming the context root — the
+/// oracle's context root, the workspace bound (context_builder.dart passes
+/// `contextRoot.root` into every `optionsFileMap` entry's parse, so a
+/// nested file's directory — its own map key — is never the root).
+/// [`AnalysisOptions::has_plugins_map`] encodes both legs, the initial one
+/// and the map one (the flag is recorded for the initial file's own parse
+/// only); a non-map section reports `invalid_section_format` instead and
+/// never reaches this row. Distinct loaded files yield once (two keys
+/// sharing one options file are one parse, officially too).
+fn inner_plugins_rows(engine: &Engine) -> Vec<Diagnostic> {
+    let context_root = engine.packages().workspace_root();
+    let mut inner: Vec<&analysis_options::AnalysisOptions> = engine
+        .options_entries()
+        .filter(|(_, options)| {
+            options.has_plugins_map && options.file_path.parent() != Some(context_root)
+        })
+        .map(|(_, options)| options)
+        .collect();
+    inner.sort_unstable_by(|a, b| a.file_path.cmp(&b.file_path));
+    inner.dedup_by(|a, b| a.file_path == b.file_path);
+    let table = engine.file_table();
+    inner
+        .into_iter()
+        .filter_map(|options| {
+            let file = table.try_file_id(&options.file_path)?;
+            Some(
+                analysis_options::OptionsIssue::plugins_in_inner_options(
+                    &context_root.display().to_string(),
+                    options.plugins_section_anchor(),
+                )
+                .to_diagnostic(file),
+            )
+        })
+        .collect()
 }
 
 /// The `note:` advisory for one options file whose YAML failed to parse —
@@ -3397,6 +3448,130 @@ mod tests {
             .expect("the row above");
         assert_eq!(row.code.machine, "UNDEFINED_LINT");
         assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The Unicode text face through the real pipeline: a bidi code point
+    /// in a comment reports on the Dart file it lives in (`lib/test.dart`,
+    /// the row's own FileId), a clean sibling file stays silent, and the
+    /// row renders the oracle's message, severity, and span — the landed
+    /// `options_verifier_pins` row now firing through the engine's
+    /// per-file walk.
+    #[test]
+    fn run_overlaid_reports_text_direction_rows_on_their_own_files() {
+        let bidi = '\u{202E}';
+        let flipped = format!("// The text direction is silently flipped here {bidi}\nvoid f() {{\n}}\n");
+        let root = workspace(
+            "analyze_text_direction_rows",
+            &[
+                ("lib/test.dart", flipped.as_str()),
+                ("lib/clean.dart", "void g() {}\n"),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let rows: Vec<&Diagnostic> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "text_direction_code_point_in_comment")
+            .collect();
+        let test_file = engine
+            .file_table()
+            .try_file_id(&root.join("lib/test.dart"))
+            .expect("the analyzed file is interned");
+        assert_eq!(rows.len(), 1, "only the flipped file's row: {rows:?}");
+        let row = rows[0];
+        assert_eq!(row.file, test_file, "the row rides the Dart file's own id");
+        assert_eq!(row.severity, Severity::Warning);
+        assert_eq!(
+            row.message.as_str(),
+            "The Unicode code point 'U+202E' changes the appearance of text from how \
+             it's interpreted by the compiler."
+        );
+        assert_eq!(
+            row.range.offset,
+            u32::try_from(flipped.find(bidi).expect("anchor")).expect("u32")
+        );
+        assert_eq!(row.range.length, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The inner-plugins face through the real pipeline: an inner options
+    /// file (a nested directory's own initial file) declaring a top-level
+    /// `plugins:` map reports on that file at the section's whole value
+    /// node, the correction naming the context root; the root's own map
+    /// stays silent at its context root; and a non-map section never
+    /// reaches the row.
+    #[test]
+    fn run_overlaid_reports_plugins_in_inner_options_on_inner_files_only() {
+        let root = workspace("analyze_inner_plugins", &[("lib/test.dart", "void f() {}\n")]);
+        let root = root.canonicalize().expect("canonical root");
+        let inner_options = "plugins:\n  custom_lint:\n    path: .\n";
+        std::fs::write(root.join("lib/analysis_options.yaml"), inner_options)
+            .expect("inner options");
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "plugins:\n  root_plugin:\n    path: .\n",
+        )
+        .expect("root options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let rows: Vec<&Diagnostic> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "plugins_in_inner_options")
+            .collect();
+        let inner_file = engine
+            .file_table()
+            .try_file_id(&root.join("lib/analysis_options.yaml"))
+            .expect("the inner options file is interned");
+        assert_eq!(rows.len(), 1, "the root's map stays silent: {rows:?}");
+        let row = rows[0];
+        assert_eq!(row.file, inner_file);
+        assert_eq!(
+            row.message.as_str(),
+            "Plugins can only be specified in the root of a pub workspace or the root of a \
+             package that isn't in a workspace."
+        );
+        let correction = row.correction.clone().expect("the pinned correction");
+        assert_eq!(
+            correction.as_ref(),
+            format!(
+                "Try specifying plugins in an analysis options file at '{}'.",
+                root.display()
+            )
+        );
+        assert_eq!(
+            row.range.offset,
+            u32::try_from(inner_options.find("custom_lint").expect("anchor")).expect("u32")
+        );
+        assert_eq!(row.range.length, 24);
+        std::fs::remove_dir_all(&root).ok();
+
+        // The non-map arm: a scalar `plugins:` section has no map leg, so
+        // the inner-options row never fires (the section's own row face is
+        // the parse model's, not this one's).
+        let root = workspace(
+            "analyze_inner_plugins_non_map",
+            &[("lib/test.dart", "void f() {}\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        std::fs::write(root.join("lib/analysis_options.yaml"), "plugins: custom_lint\n")
+            .expect("inner options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+        assert!(
+            run.diagnostics
+                .iter()
+                .all(|d| d.code.name != "plugins_in_inner_options"),
+            "a non-map section never reaches the inner-options row"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

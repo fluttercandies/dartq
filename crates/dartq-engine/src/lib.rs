@@ -533,6 +533,7 @@ impl Engine {
         self.state.arm_warm();
         let mut rows = self.option_issue_rows();
         rows.extend(self.validator_issue_rows());
+        rows.extend(self.text_direction_rows());
         if !rows.is_empty() {
             // The engine rows leave the pipeline canonically sorted; the
             // merged set stays canonical for the rows' (rare, cold) addition.
@@ -578,6 +579,7 @@ impl Engine {
         self.state.arm_warm();
         let mut rows = self.option_issue_rows();
         rows.extend(self.validator_issue_rows());
+        rows.extend(self.text_direction_rows());
         if rows.is_empty() && !self.severity_overrides_present() {
             return Ok(shared);
         }
@@ -903,6 +905,36 @@ impl Engine {
             for issue in analysis_options::manifest_issues(text, true) {
                 rows.push(issue.to_diagnostic(file));
             }
+        }
+        rows
+    }
+
+    /// The Unicode text verifier's rows: every resident Dart file runs
+    /// [`analysis_options::text_direction_issues`] — the oracle's
+    /// engagement phase, analysis time (the verifier rides every parsed
+    /// compilation unit, upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/unicode_text_verifier.dart`:17-40), each
+    /// row attributed to the Dart file's own FileId. The sweep walks the
+    /// whole residency every call — the rows are a pure function of current
+    /// bytes, so the incremental result equals the full recompute (a
+    /// dirty-only walk would drop the untouched files' rows from the
+    /// standing output between passes). Callers append the returned rows
+    /// and re-sort canonically. Empty in the common case (the scan's
+    /// pre-pass rejects any file without a flagged code point).
+    fn text_direction_rows(&self) -> Vec<Diagnostic> {
+        let mut rows = Vec::new();
+        for (file, facts) in self.state.residency.iter() {
+            let Some(bytes) = self.state.store.get(facts.content) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            rows.extend(
+                analysis_options::text_direction_issues(text)
+                    .into_iter()
+                    .map(|issue| issue.to_diagnostic(*file)),
+            );
         }
         rows
     }
@@ -1497,6 +1529,22 @@ impl Engine {
     #[must_use]
     pub fn options_for_root(&self, root: &Path) -> Option<&analysis_options::AnalysisOptions> {
         self.state.options.get(root).map(Arc::as_ref)
+    }
+
+    /// The loaded options entries keyed at their governing directory — the
+    /// context roots' own entries plus every nested options directory
+    /// inside them ([`analysis_options::AnalysisOptions::for_roots`], the
+    /// same map [`Engine::option_issue_rows`] joins through). The CLI's
+    /// inner-options face walks it; the map is a hash, so callers order
+    /// for themselves.
+    #[must_use]
+    pub fn options_entries(
+        &self,
+    ) -> impl Iterator<Item = (&Path, &analysis_options::AnalysisOptions)> {
+        self.state
+            .options
+            .iter()
+            .map(|(dir, options)| (dir.as_path(), Arc::as_ref(options)))
     }
 
     /// The line index of a resident file. Options-file rows resolve through
