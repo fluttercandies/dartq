@@ -1,0 +1,25 @@
+# Real-world projects analyzed straight from the local pub cache (never
+# vendored). Each entry pins one package at an exact version verified
+# present under ~/.pub-cache/hosted/pub.dev/ (the same versions the
+# formerly vendored real-package copies were recorded at). Nothing
+# consumes this list yet — the conformance runner will resolve and
+# analyze these packages on demand.
+
+[packages]
+analyzer = "14.5.0"
+archive = "4.3.0"
+args = "2.7.0"
+bloc = "9.2.1"
+collection = "1.19.1"
+dio = "5.11.1"
+drift = "2.34.0"
+html = "0.15.7"
+http = "1.6.0"
+intl = "0.20.3"
+meta = "1.19.0"
+path = "1.9.1"
+petitparser = "7.1.0"
+riverpod = "3.4.3"
+url_launcher_android = "6.3.33"
+webview_flutter_android = "4.13.0"
+xml = "7.1.0"

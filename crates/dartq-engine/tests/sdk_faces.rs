@@ -1,20 +1,18 @@
-//! The SDK facade pins (ticket #2005): the lints-corpus acceptance files run
+//! The SDK facade pins (ticket #2005): the lint-fixture acceptance files run
 //! through the real pipeline over the generated flat existence face and the
-//! generated SDK export faces. Each test is the in-repo twin of the corpus
-//! differential rows — the fixture content is the tracked corpus file
-//! itself, so the pin and the differential can never drift apart.
+//! generated SDK export faces. Each test is the in-repo twin of the
+//! differential rows — the fixture content is tracked verbatim under
+//! tests/fixtures/lints/, so the pin and the differential can never drift
+//! apart.
 
 mod common;
 
 use common::Fixture;
 use dartq_engine::CancellationToken;
 
-const JS_INTEROP_FAMILY: &str =
-    include_str!("../../../tests/corpus/lints/lib/js_interop_family.dart");
-const DIRECTIVES_ORDERING: &str =
-    include_str!("../../../tests/corpus/lints/lib/directives_ordering.dart");
-const COMBINATORS_ORDERING: &str =
-    include_str!("../../../tests/corpus/lints/lib/combinators_ordering.dart");
+const JS_INTEROP_FAMILY: &str = include_str!("fixtures/lints/js_interop_family.dart");
+const DIRECTIVES_ORDERING: &str = include_str!("fixtures/lints/directives_ordering.dart");
+const COMBINATORS_ORDERING: &str = include_str!("fixtures/lints/combinators_ordering.dart");
 
 /// One diagnostic as `code: message` — enough to pin the face rows the
 /// corpus differential keys on.

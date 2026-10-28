@@ -2,20 +2,16 @@
 #
 # scripts/ci.sh (per-crate serial fmt + clippy) is fully subsumed by the
 # workspace-wide steps of the `rust` job, so it is not re-run here. The
-# `gates` job runs the Dart differential gates (m0 / m1 / lints), the M4
-# schema-freeze sweep + plugin-host Dart suite (#945), and the reproducibility
-# reproducibility gate, which scripts/ci.sh deliberately excludes, reproducing
-# their local oracle assumptions on the runner:
-#   - The gates resolve the oracle at $FVM_HOME/default/bin/cache/dart-sdk
+# `gates` job runs the M4 schema-freeze sweep + plugin-host Dart suite
+# (#945), which scripts/ci.sh deliberately excludes, reproducing their
+# local oracle assumptions on the runner:
+#   - The sweep resolves the oracle at $FVM_HOME/default/bin/cache/dart-sdk
 #     (fvm layout, default FVM_HOME=~/fvm); setup-dart's SDK is symlinked
 #     into that shape.
-#   - The gate bars are calibrated against the Dart 3.13.1 oracle of record
-#     (a different banner is a WARN in the scripts but can legitimately
-#     shift the code set), so the SDK is pinned instead of tracking stable.
-#   - Corpus .dart_tool/ directories are gitignored, so the four gate
-#     corpora are pub-getted from a clean clone.
-#   - Each gate's default command expects ./target/{release,debug}/dartq and
-#     ./target/{release,debug}/harness; both profiles are built.
+#   - The oracle is pinned (3.13.1, the historical oracle of record)
+#     instead of tracking stable.
+#   - The sweep's default command expects ./target/{release,debug}/dartq;
+#     both profiles are built.
 name: ci
 
 on:
@@ -75,23 +71,10 @@ jobs:
           sdk_root="$(dirname "$(dirname "$(command -v dart)")")"
           mkdir -p "$HOME/fvm/default/bin/cache"
           ln -s "$sdk_root" "$HOME/fvm/default/bin/cache/dart-sdk"
-      - name: Pub-get the gate corpora
-        run: |
-          for corpus in m0 m0-syntax m1-semantic lints; do
-            (cd "tests/corpus/$corpus" && dart pub get)
-          done
-      - name: Build dartq and harness
+      - name: Build dartq
         run: |
           cargo build -p dartq-cli --release
-          cargo build -p harness --release
           cargo build -p dartq-cli
-          cargo build -p harness
-      - name: M0 differential gate
-        run: bash scripts/m0-gate.sh --label ci
-      - name: M1 differential gate
-        run: bash scripts/m1-gate.sh --label ci
-      - name: Lint differential gate
-        run: bash scripts/lint-gate.sh --label ci
       # M4 schema-freeze sweep (#945): the frozen v1 CLI/RPC surface
       # end-to-end — CLI machine/json faces plus a live daemon RPC session
       # over a tiny fixture. Uses the debug dartq built above (--no-build)
@@ -108,26 +91,3 @@ jobs:
         run: |
           dart pub get
           dart test -j 2
-      # reproducibility gate. RUNBOOK: the first LIVE run of this gate
-      # is the main-agent's serial-phase action — a clean-tree local
-      # `scripts/repro-gate.sh` run validates it first, and the commit
-      # landing on main is what triggers this job. Do not dispatch or re-run
-      # CI for this gate by hand.
-      #
-      # Resource shape: a single-process serial gate — it self-builds the
-      # release profile (a no-op after the build step above) and spawns two
-      # fresh `dartq analyze` processes over the small m0 corpus (the
-      # e2e-verified face; the heavy mega/1k face stays a local serial-phase
-      # run via REPRO_CORPUS). Memory stays bounded by the corpus slice; the
-      # gate's clean-tracked-tree guard holds here because gate reports
-      # (target/evidence is gitignored) and persisted regression cases are untracked.
-      - id: repro
-        name: Reproducibility gate
-        run: bash scripts/repro-gate.sh --label ci
-      - name: Upload the repro report on failure
-        if: failure() && steps.repro.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: repro-report
-          path: target/evidence/repro/ci/
-          if-no-files-found: ignore

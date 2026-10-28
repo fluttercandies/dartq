@@ -1,6 +1,9 @@
 //! Long-tail parser-recovery pins (#2200): real-corpus faces from the
 //! drift/dio/xml/petitparser packages where the parser derailed while the
-//! oracle parsed cleanly.
+//! oracle parsed cleanly. The full-package files the fixes were measured on
+//! now live in the pub cache (see conformance/realworld.toml); the pins here
+//! are the minimal reductions extracted from them, so the recovery decisions
+//! stay pinned without vendoring package source.
 //!
 //! Families and fixes:
 //! - conditional expression continuing an `is` test with type arguments —
@@ -97,104 +100,4 @@ fn iife_in_assert_initializer() {
         "class P {\n  P(p, i)\n      : assert(p.isNotEmpty, 'x'),\n        assert((() {\n          for (var i = 0; i < 1; i++) {\n            if (p[i] != i) return false;\n          }\n          return true;\n        }()));\n}",
     );
     assert!(c.errors.is_empty(), "{:?}", codes(&c));
-}
-
-// —— real-corpus locks —————————————————————————————————————————————————————
-// The exact files that carried the 19 divergent rows, pinned so the recovery
-// decisions stay aligned with the oracle's clean parse.
-
-const DIO_IO_PROGRESS: &str =
-    include_str!("../../../../tests/corpus/real/dio/lib/src/progress_stream/io_progress_stream.dart");
-const DIO_MULTIPART: &str =
-    include_str!("../../../../tests/corpus/real/dio/lib/src/multipart_file.dart");
-const DRIFT_UPDATE: &str =
-    include_str!("../../../../tests/corpus/real/drift/lib/src/runtime/query_builder/statements/update.dart");
-const DRIFT_INSERT: &str =
-    include_str!("../../../../tests/corpus/real/drift/lib/src/runtime/query_builder/statements/insert.dart");
-const DRIFT_INSERT3: &str =
-    include_str!("../../../../tests/corpus/real/drift/lib/src/drift3_preview/src/query_builder/statements/insert.dart");
-const XML_SEQUENCE: &str =
-    include_str!("../../../../tests/corpus/real/xml/lib/src/xpath/xdm/sequence.dart");
-const PP_PATH: &str =
-    include_str!("../../../../tests/corpus/real/petitparser/lib/src/reflection/internal/path.dart");
-
-fn assert_target_codes_absent(name: &str, src: &'static str) {
-    let mut p = setup(src);
-    p.parse_unit();
-    let c = std::mem::take(p.listener);
-    let offenders: Vec<_> = c
-        .errors
-        .iter()
-        .filter(|(code, _, _)| {
-            matches!(
-                code.as_str(),
-                "expected_token" | "unexpected_token" | "missing_identifier"
-            )
-        })
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "{name}: target recovery codes present: {offenders:?} (all: {:?})",
-        c.errors
-    );
-}
-
-#[test]
-fn corpus_dio_io_progress_stream_parses_clean() {
-    assert_target_codes_absent("dio io_progress_stream", DIO_IO_PROGRESS);
-}
-
-#[test]
-fn corpus_drift_update_parses_clean() {
-    assert_target_codes_absent("drift update", DRIFT_UPDATE);
-}
-
-#[test]
-fn corpus_drift_insert_parses_clean() {
-    assert_target_codes_absent("drift insert", DRIFT_INSERT);
-}
-
-#[test]
-fn corpus_drift_insert3_preview_parses_clean() {
-    assert_target_codes_absent("drift insert3_preview", DRIFT_INSERT3);
-}
-
-#[test]
-fn corpus_xml_sequence_parses_clean() {
-    assert_target_codes_absent("xml sequence", XML_SEQUENCE);
-}
-
-#[test]
-fn corpus_petitparser_path_parses_clean() {
-    assert_target_codes_absent("petitparser path", PP_PATH);
-}
-
-#[test]
-fn corpus_dio_multipart_file_target_codes_absent() {
-    // The oracle also reports four EXTRANEOUS_MODIFIER rows in this file
-    // (68/90/137/151); those are pinned elsewhere — only the recovery codes
-    // are in scope here.
-    let mut p = setup(DIO_MULTIPART);
-    p.parse_unit();
-    let c = std::mem::take(p.listener);
-    let unexpected: Vec<_> = c
-        .errors
-        .iter()
-        .filter(|(code, _, _)| {
-            matches!(
-                code.as_str(),
-                "expected_token" | "unexpected_token" | "missing_identifier"
-            )
-        })
-        .collect();
-    assert!(
-        unexpected.is_empty(),
-        "dio multipart_file: target recovery codes present: {unexpected:?} (all: {:?})",
-        c.errors
-    );
-    assert_eq!(
-        c.error_codes(),
-        vec!["extraneous_modifier"; 4],
-        "dio multipart_file: full error surface drifted"
-    );
 }

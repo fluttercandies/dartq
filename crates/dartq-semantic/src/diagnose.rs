@@ -421,7 +421,7 @@ mod unused_finalization;
 /// face), which the single-file rig cannot express.
 ///
 /// Behavioral oracle: dart 3.13.1 `dart analyze --format=machine` probes
-/// (see the fixture under tests/corpus/m2-warning for the live row).
+/// (the retired m2-warning fixture carried the live row).
 /// Official source: best_practices_verifier.dart:1276-1290
 /// (`_checkForLiteralConstructorUse`).
 #[cfg(test)]

@@ -201,8 +201,8 @@ fn for_body_reports() {
 // `ParenthesizedCondition`), which is exactly what fixed child indexes
 // used to report. These pins run through the production bridge.
 
-/// Block-armed if with an `else` (`tests/corpus/lints/lib/
-/// always_put_control_body_on_new_line.dart:26` shape) — the oracle
+/// Block-armed if with an `else` (the retired lint corpus's
+/// always_put_control_body_on_new_line.dart:26 shape) — the oracle
 /// emits nothing, and so does the structural arm read.
 #[test]
 fn else_block_arms_stay_silent_on_real_parse() {
@@ -224,8 +224,8 @@ void f(bool c) {
     );
 }
 
-/// `else if` chain with block arms (`tests/corpus/lints/lib/
-/// avoid_double_and_int_checks.dart:10` shape) — the else arm is an
+/// `else if` chain with block arms (the retired lint corpus's
+/// avoid_double_and_int_checks.dart:10 shape) — the else arm is an
 /// IfStatement and is skipped, the then block passes, and the nested
 /// if's own visit stays silent.
 #[test]
@@ -246,7 +246,7 @@ void f(num p) {
     );
 }
 
-/// The `else ;` face (`tests/corpus/lints/lib/flow_family.dart:15`
+/// The `else ;` face (the retired lint corpus's flow_family.dart:15
 /// shape) keeps reporting — at the else statement itself, matching the
 /// oracle anchor (`reportAtNode(elseStatement)`).
 #[test]
@@ -1385,9 +1385,9 @@ fn rethrow_of_shadowing_local_passes() {
 // `FormalParameters` container; both reads answer on those shapes
 // through the production bridge.
 
-/// `catch (e) { throw e; }` (`tests/corpus/lints/lib/
-/// avoid_catches_without_on_clauses.dart:47` and
-/// `flow_family.dart:34` shapes) reports at the `throw e` expression.
+/// `catch (e) { throw e; }` (the retired lint corpus's
+/// avoid_catches_without_on_clauses.dart:47 and
+/// flow_family.dart:34 shapes) reports at the `throw e` expression.
 #[test]
 fn bare_catch_rethrow_reports_on_real_parse() {
     let source = "\

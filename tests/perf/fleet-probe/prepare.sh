@@ -12,11 +12,9 @@
 # .dart_tool/package_config.json use relative paths only — so each daemon
 # pointed at a copy analyzes its own copy's bytes.
 #
-# Fixture choice (the probe's measured anchor corpora):
-#   10k  -> tests/corpus/mega/10k   (~9,898 .dart files, ~40 MB)
-#   100k -> tests/corpus/mega/100k  (~99,598 .dart files, ~398 MB)
-#   1k   -> tests/corpus/mega/1k    (~1k files, ~4 MB; smoke scale)
-# Override the source with DARTQ_PROBE_SOURCE for other corpora.
+# Fixture source: DARTQ_PROBE_SOURCE must name a package directory (the
+# repo no longer vendors a corpus; point it at a pub-cache package checkout
+# or any generated tree — byte-identical copies of it feed the N instances).
 #
 # Usage: prepare.sh [--dry-run] [--clean] <scale> <N>
 #   scale in {1k,10k,100k}; N >= 1 copies.
@@ -64,13 +62,19 @@ if [ "$N" -lt 1 ]; then
   exit 2
 fi
 
-SOURCE="${DARTQ_PROBE_SOURCE:-$REPO_ROOT/tests/corpus/mega/$SCALE}"
+SOURCE="${DARTQ_PROBE_SOURCE:-}"
 FLEET_ROOT="${DARTQ_FLEET_ROOT:-${TMPDIR:-/tmp}/dartq-fleet}"
 DEST_BASE="$FLEET_ROOT/$SCALE"
 
+if [ -z "$SOURCE" ]; then
+  echo "prepare.sh: DARTQ_PROBE_SOURCE is required — set it to a package fixture" \
+       "directory (pubspec.yaml + .dart_tool/package_config.json)" >&2
+  exit 2
+fi
+
 if [ ! -f "$SOURCE/pubspec.yaml" ] || [ ! -f "$SOURCE/.dart_tool/package_config.json" ]; then
   echo "prepare.sh: '$SOURCE' is not a package fixture (need pubspec.yaml and" \
-       ".dart_tool/package_config.json); set DARTQ_PROBE_SOURCE to override" >&2
+       ".dart_tool/package_config.json)" >&2
   exit 2
 fi
 

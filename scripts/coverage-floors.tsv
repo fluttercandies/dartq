@@ -13,7 +13,7 @@
 #   state-machine / grammar / table code with direct unit pins;
 #   dartq-diagnostics measured at 99.15% today (the measured-baseline tier).
 # Tier B — semantic / engine, resolution-heavy (floor 65):
-#   exercised largely via harness and engine integration tests; the
+#   exercised largely via engine integration tests; the
 #   unit-visible share is lower.
 # Tier C — I/O and CLI boundary (floor 50):
 #   real-SDK loading and the process boundary are environment-dependent;
@@ -25,9 +25,7 @@
 #     dartq-daemon. They ride `default` until the first full advisory run
 #     lands their numbers, then gain tier rows — numbers exist before
 #     any floor bites.
-#   - Test/tool members, measurement infrastructure not product code:
-#     tests/harness (measured as the "harness" row) and tools/corpus-gen;
-#     dartq-plugin-host is a Dart package (no Cargo.toml, never measured).
+#   - dartq-plugin-host is a Dart package (no Cargo.toml, never measured).
 #
 # Ratchet: raise a floor only together with the measured baseline that
 # proves it; land advisory first, flip the gate with --enforce once the

@@ -41,14 +41,14 @@ bytes, produces the same content keys, and lands in the same shared roots.
 
 ## Fixture choice
 
-`tests/corpus/mega/10k` (9,898 `.dart` files, ~40 MB) and
-`tests/corpus/mega/100k` (99,598 `.dart` files, ~398 MB) — the same faces
-the ADR section 1 anchor table reports (85,952 KiB and 616,112 KiB tree
-peak). Both are complete package fixtures: `pubspec.yaml`,
-`pubspec.lock`, `packages/`, and a relative-path
-`.dart_tool/package_config.json`, so each copy analyzes its own bytes.
-`1k` exists as a smoke scale. A different corpus can be injected with
-`DARTQ_PROBE_SOURCE`.
+Historically the mega generated corpora carried the anchor faces (10k and
+100k files, 85,952 KiB and 616,112 KiB tree peak in the ADR section 1
+anchor table); the repo no longer vendors a corpus. The fleet source is
+whatever `DARTQ_PROBE_SOURCE` names: a complete package fixture
+(`pubspec.yaml`, `pubspec.lock`, `packages/`, and a relative-path
+`.dart_tool/package_config.json`), so each copy analyzes its own bytes —
+a pub-cache package checkout (see conformance/realworld.toml) or a
+generated tree of the target scale.
 
 ### Disk headroom and descope arithmetic
 

@@ -1149,6 +1149,7 @@ mod tests {
                     is_interface: false,
                     is_mixin_class: false,
                     superclass: None,
+                    factory_formals: Vec::new(),
                     members: vec![(
                         1,
                         PersistedMemberEntry {

@@ -1,5 +1,5 @@
-//! The sii-probes corpus wave (ledger GAP-SII, ticket #1689): one test per
-//! frozen regression case in `tests/corpus/regressions/cases/`, pinning the
+//! The sii-probes wave (ledger GAP-SII, ticket #1689): one test per frozen
+//! scanner regression case of the retired regression-case corpus, pinning the
 //! scanner-face rows of the official recovery shapes against upstream Dart
 //! SDK source, `pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart`
 //! (string/interpolation paths) and `pkg/analyzer/lib/src/dart/scanner/

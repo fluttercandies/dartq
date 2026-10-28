@@ -867,7 +867,7 @@ mod tests {
     use dartq_diagnostics::{DiagnosticType, EXPECTED_TOKEN};
 
     /// Byte-shape parity with the harness machine parser
-    /// (`tests/harness/src/machine.rs` `parse_machine`): 8 `|`-separated
+    /// (the retired harness's machine reader `parse_machine`): 8 `|`-separated
     /// fields, uppercase severity/type/code, 1-based line/col, UTF-16 length.
     #[test]
     fn machine_line_parity_with_harness() {

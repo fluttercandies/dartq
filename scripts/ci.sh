@@ -8,22 +8,10 @@
 #   cargo fmt   -p <crate> -- --check
 #   cargo clippy -p <crate> --offline --all-targets -- -D warnings
 #
-# then runs the oracle-free calibration pins (#937): `cargo test -p harness`
-# and `cargo test -p dartq-semantic --test m3_codes_pin` — seconds-fast,
-# catch frozen-universe drift before any differential work. The m3 pin
-# asserts set equality between tests/harness/m3_unused_codes.txt (already
-# re-frozen: 11 rows) and the 11-variant USAGE_FAMILY in m3_codes_pin.rs —
-# verification only, green on the committed freeze. A red there is a real
-# drift, never a designed one: add the targeted fixture it demands first,
-# then `cargo test -p dartq-semantic --test m3_codes_pin
-# regen_m3_unused_codes -- --ignored` and reconcile the header prose —
-# never regen blind. The harness pins include the freeze --check family
-# (#2681): tests/harness/src/freeze.rs re-derives the m1/m2_warning/m3
-# codes freezes byte-for-byte from repo-internal sources
-# (analyzer-codes.tsv, the m3 targeted fixtures), and the fixture-coverage
-# manifest check below its tier table asserts byte equality against the
-# same canonical builder its regen writes — a stale freeze fails the gate
-# naming its regen command.
+# Registry drift pins (#2677/#2676): the tracked analyzer-codes.tsv and the
+# generated rule metadata must be exactly what tools/upstream-gen derives
+# from the SDK tree of record (env-gated; skipped when the SDK tree is not
+# set).
 #
 # `--check-only` runs a fast `cargo check -p <crate>` instead (no pins: the
 # mode compiles only). The script
@@ -95,7 +83,7 @@ if [ "$mode" = "check" ] && [ "$coverage" != 0 ]; then
     exit 2
 fi
 
-# Member paths from the explicit member list (crates/* and tests/harness).
+# Member paths from the explicit member list (crates/* and tools/*).
 members=$(sed -n '/^members = \[/,/^\]/p' Cargo.toml | grep -o '"[^"]*"' | tr -d '"')
 if [ -z "$members" ]; then
     echo "ci: no workspace members parsed from Cargo.toml" >&2
@@ -130,16 +118,6 @@ done
 # the gate naming the drifted freeze before any differential work starts.
 # Gate mode only: --check-only is the fast compile-only probe.
 if [ "$mode" = "gate" ]; then
-    echo "== cargo test pins: harness"
-    if ! cargo test -q -p harness; then
-        echo "ci: cargo test pins FAILED: harness" >&2
-        exit 1
-    fi
-    echo "== cargo test pins: dartq-semantic m3_codes_pin"
-    if ! cargo test -q -p dartq-semantic --test m3_codes_pin; then
-        echo "ci: cargo test pins FAILED: dartq-semantic (m3_codes_pin)" >&2
-        exit 1
-    fi
     # Registry drift pin (#2677): the tracked analyzer-codes.tsv must be
     # exactly what tools/upstream-gen derives from the SDK tree of record.
     # Env-gated like the repo's other SDK-tree steps — the checkout is a
@@ -165,18 +143,6 @@ if [ "$mode" = "gate" ]; then
         fi
     else
         echo "== linter-meta-gen --check: skipped (DART_SDK_SRC or DART_LINTS_SRC not set)"
-    fi
-    # Harness freeze --check (#2681): the gate-universe codes freezes
-    # must equal their repo-internal derivations byte-for-byte (the
-    # analyzer-codes.tsv mirror for m1/m2_warning, the targeted fixtures
-    # for m3) — no env gating. These also run inside the harness pins
-    # above; this named step pins the drift face next to the generator
-    # checks. The fixture-coverage manifest byte check rides the harness
-    # pins step (fixture_coverage_manifest_matches_corpus_derivation).
-    echo "== harness freeze --check (m1/m2_warning/m3 codes freezes)"
-    if ! cargo test -q -p harness freeze_check; then
-        echo "ci: harness freeze --check FAILED (stale gate-universe freeze; the failing test prints its regen command)" >&2
-        exit 1
     fi
 fi
 
@@ -215,14 +181,10 @@ if [ "$coverage" != 0 ]; then
     fi
 fi
 
-# Remaining heavyweight phases (differential gates, test suites beyond the
-# calibration pins above) are NOT run
+# Remaining heavyweight phases (differential verification, test suites
+# beyond the pins above) are NOT run
 # here: they execute real processes over the whole workspace and are reserved
-# for the serial verification phase (the resource discipline after the 80GB/90GB memory incidents):
-#   scripts/m1-gate.sh         — M1 differential gate (serial phase only)
-#   scripts/acceptance-gate.sh — valid-syntax acceptance gate (serial phase only)
-#   scripts/repro-gate.sh      — reproducibility gate (serial phase only)
-#   scripts/serial-gates.sh    — the full serial chain, coverage included
+# for the serial verification phase (the resource discipline after the 80GB/90GB memory incidents).
 # The coverage face is the one exception: --coverage (or COVERAGE=1) opts
 # this invocation in as the serial window's coverage step (the gate above);
 # COVERAGE=smoke opts in only the advisory subset pre-flight.

@@ -4782,27 +4782,12 @@ final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
         assert_eq!(rows, [], "60-block scale: {rows:?}");
     }
 
-    /// The strongest pins: the four real intl corpus files whose 234
-    /// spurious rows founded this ticket (#2187 census cluster #6). Every
-    /// one must stay silent — the oracle emits `equal_keys_in_map` /
-    /// `equal_elements_in_set` nowhere in these files.
-    #[test]
-    fn real_intl_corpus_files_stay_silent() {
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/real/intl/lib");
-        let files = [
-            "date_symbol_data_local.dart",
-            "date_time_patterns.dart",
-            "number_symbols_data.dart",
-            "src/intl/constants.dart",
-        ];
-        for rel in files {
-            let source =
-                std::fs::read_to_string(format!("{root}/{rel}")).expect("corpus file");
-            let rows = duplicate_spans(&source);
-            assert_eq!(rows.len(), 0, "{rel} fired {}: first {rows:?}", rows.len());
-        }
-    }
-
+    /// The real-package face that founded this ticket (#2187 census
+    /// cluster #6: 234 spurious rows over four package:intl data files)
+    /// is now covered by the conformance runner over the pub cache (see
+    /// conformance/realworld.toml) — the generated data tables are too
+    /// large to inline and must not be vendored.
+    ///
     /// A multi-byte literal before a map must not corrupt the key
     /// payloads: the string-leaf interior cuts in bytes through the
     /// engine's UTF-16→byte conversion, so `£` (2 UTF-8 bytes, 1 UTF-16

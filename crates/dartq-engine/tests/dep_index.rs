@@ -6,7 +6,8 @@
 //! `invalid_override`, and the dep files themselves stay row-silent (the
 //! differential counts workspace files only).
 //!
-//! The fixture is the tracked `tests/corpus/dep-interface` tree: the `ws`
+//! The fixture is the `dep-interface` tree materialized into a fresh temp
+//! root from `tests/fixtures/dep-interface/` (tracked verbatim): the `ws`
 //! package's hand-written `package_config.json` points the `dep` entry at
 //! the sibling directory (a relative `rootUri` is legal per the pub
 //! package_config format), and the hosted `pubspec.lock` entry classifies
@@ -23,28 +24,81 @@ use dartq_package::PackageTable;
 use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
 use dartq_sdk::SdkSnapshot;
 
-const BAD_OVERRIDE: &str = include_str!(
-    "../../../tests/corpus/dep-interface/ws/lib/bad_override.dart"
-);
-const GOOD_OVERRIDE: &str = include_str!(
-    "../../../tests/corpus/dep-interface/ws/lib/good_override.dart"
-);
-const LOCAL_BASE: &str =
-    include_str!("../../../tests/corpus/dep-interface/ws/lib/local_base.dart");
-const TWIN_BAD: &str = include_str!("../../../tests/corpus/dep-interface/ws/lib/twin_bad.dart");
-const TWIN_GOOD: &str =
-    include_str!("../../../tests/corpus/dep-interface/ws/lib/twin_good.dart");
+/// The fixture's file layout, materialized verbatim into a temp root per
+/// run. The pub-generated config lives as `ws/dart_tool/package_config.json`
+/// in the fixture (a dot-directory cannot be tracked) and lands at
+/// `ws/.dart_tool/package_config.json` in the materialized tree.
+const FIXTURE_FILES: &[(&str, &str)] = &[
+    (
+        "ws/pubspec.yaml",
+        include_str!("fixtures/dep-interface/ws/pubspec.yaml"),
+    ),
+    (
+        "ws/pubspec.lock",
+        include_str!("fixtures/dep-interface/ws/pubspec.lock"),
+    ),
+    (
+        "ws/.dart_tool/package_config.json",
+        include_str!("fixtures/dep-interface/ws/dart_tool/package_config.json"),
+    ),
+    (
+        "ws/lib/bad_override.dart",
+        include_str!("fixtures/dep-interface/ws/lib/bad_override.dart"),
+    ),
+    (
+        "ws/lib/good_override.dart",
+        include_str!("fixtures/dep-interface/ws/lib/good_override.dart"),
+    ),
+    (
+        "ws/lib/local_base.dart",
+        include_str!("fixtures/dep-interface/ws/lib/local_base.dart"),
+    ),
+    (
+        "ws/lib/twin_bad.dart",
+        include_str!("fixtures/dep-interface/ws/lib/twin_bad.dart"),
+    ),
+    (
+        "ws/lib/twin_good.dart",
+        include_str!("fixtures/dep-interface/ws/lib/twin_good.dart"),
+    ),
+    (
+        "dep/lib/dep.dart",
+        include_str!("fixtures/dep-interface/dep/lib/dep.dart"),
+    ),
+    (
+        "dep/lib/src/base.dart",
+        include_str!("fixtures/dep-interface/dep/lib/src/base.dart"),
+    ),
+];
 
-/// Assembles the engine over the tracked corpus tree (read-only): the
+const BAD_OVERRIDE: &str = include_str!("fixtures/dep-interface/ws/lib/bad_override.dart");
+const GOOD_OVERRIDE: &str = include_str!("fixtures/dep-interface/ws/lib/good_override.dart");
+const LOCAL_BASE: &str = include_str!("fixtures/dep-interface/ws/lib/local_base.dart");
+const TWIN_BAD: &str = include_str!("fixtures/dep-interface/ws/lib/twin_bad.dart");
+const TWIN_GOOD: &str = include_str!("fixtures/dep-interface/ws/lib/twin_good.dart");
+
+/// Materializes the fixture tree into a fresh process-unique temp root and
+/// returns the `ws` package path.
+fn materialize_fixture(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "dartq-engine-dep-index-fixture-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    for (relative, content) in FIXTURE_FILES {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("fixture dir");
+        std::fs::write(&path, content).expect("fixture file");
+    }
+    root.join("ws")
+}
+
+/// Assembles the engine over the materialized fixture tree (read-only): the
 /// config, lock, and pubspec parse from disk; the synthetic VM-segment SDK
 /// is the usual throwaway. The caller feeds the `ws/lib` files as content —
 /// the `dep` tree stays disk-only, which is the lazy load under test.
 fn corpus_engine(tag: &str) -> (Engine, PathBuf) {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ws = manifest
-        .join("../../tests/corpus/dep-interface/ws")
-        .canonicalize()
-        .expect("tracked corpus tree resolves");
+    let ws = materialize_fixture(tag);
     let config_dir = ws.join(".dart_tool");
     let config = Arc::new(
         PackageConfig::parse(
@@ -177,7 +231,7 @@ fn dep_member_face_matches_the_same_package_baseline() {
     );
     // The dep files themselves yield zero rows: the index serves faces,
     // never diagnostics.
-    let dep_root = ws.parent().expect("corpus root").join("dep");
+    let dep_root = ws.parent().expect("fixture root").join("dep");
     let dep_rows: Vec<&Diagnostic> = diagnostics
         .iter()
         .filter(|diagnostic| {

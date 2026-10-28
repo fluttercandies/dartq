@@ -16,13 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`crates/dartq-engine`'s `SDK_LIBRARY_FACES`) — replacing the hand-grown
   samples; SDK-rooted `uri_does_not_exist` and `undefined_annotation` false
   positives are gone (#2005).
-- `corpus-gen --flutter-app`: a widget-skeleton emitter over a checked-in
-  stub Flutter package (the same bytes feed the oracle and dartq), plus the
-  `scripts/app-gate.sh` gate leg — the serial verification chain grows
-  35 → 36 steps (#2063).
-- Vendored real-package corpora: riverpod 3.4.3 (57 files) and drift 2.34.0
-  (211 files) under `tests/corpus/real/`, each with a `PROVENANCE.md`
-  pinning the exact upstream version (#2064).
 - `dartq rename` — rename one symbol across the analyzed workspace (the dry
   run prints the machine-readable edit set; `--write` applies it in place,
   refusing files outside the workspace).

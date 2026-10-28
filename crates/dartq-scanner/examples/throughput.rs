@@ -8,11 +8,13 @@
 //!
 //! ```text
 //! cargo run -p dartq-scanner --example throughput --release
-//! cargo run -p dartq-scanner --example throughput --release -- tests/corpus
+//! DARTQ_BENCH_CORPUS=<corpus-dir> \
+//!   cargo run -p dartq-scanner --example throughput --release
 //! ```
 //!
-//! With no argument the benchmark scans `tests/corpus` (every `*.dart` file,
-//! collected recursively in sorted order, `.dart_tool` skipped). Files are
+//! The corpus must be supplied (a directory scanned recursively for `*.dart`
+//! files in sorted order, `.dart_tool` skipped — via DARTQ_BENCH_CORPUS or a
+//! single positional argument); there is no vendored default. Files are
 //! read once; the K rounds do no I/O. Throughput is reported in MB/s using
 //! the 10^6-byte convention.
 
@@ -41,8 +43,19 @@ struct CorpusFile {
 
 fn main() {
     let mut args = std::env::args().skip(1);
+    // No default corpus: the repo no longer vendors a Dart corpus. Point
+    // DARTQ_BENCH_CORPUS at a directory (or pass one positionally).
     let root = match (args.next(), args.next()) {
-        (None, _) => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus"),
+        (None, _) => match std::env::var("DARTQ_BENCH_CORPUS") {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => {
+                eprintln!(
+                    "no corpus: set DARTQ_BENCH_CORPUS=<dir> (a directory of .dart files) \
+                     or pass one as the single positional argument"
+                );
+                exit(2);
+            }
+        },
         (Some(arg), None) => PathBuf::from(arg),
         (Some(_), Some(_)) => {
             eprintln!("error: expected at most one positional argument (dir or file)");

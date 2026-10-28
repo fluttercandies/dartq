@@ -30,10 +30,7 @@ members = [
     "crates/dartq-schema",
     "crates/dartq-session",
     "crates/dartq-test",
-    "tests/harness",
-    "tools/bench-corpus-gen",
     "tools/conformance",
-    "tools/corpus-gen",
     "tools/sdk-faces-gen",
     "tools/upstream-gen",
 ]

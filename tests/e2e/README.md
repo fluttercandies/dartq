@@ -16,9 +16,8 @@ and the test-result cache never touch the invoking user's caches.
 
 ## What it covers (and why it exists this way)
 
-`analyze` already has the systematic flag-parity matrix
-(`scripts/cli-parity-matrix.sh`) and `test` the byte-parity gates; this
-suite covers everything else at the process level — the newer verbs and
+`analyze` already has systematic flag-parity coverage and `test` the
+byte-parity gates; this suite covers everything else at the process level — the newer verbs and
 the cross-verb situations their unit tests can't see (real detached
 processes, real unix sockets, real `git worktree add`, real `dart pub
 get`, kill -9 takeovers, concurrent CLI users).

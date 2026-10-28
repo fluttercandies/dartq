@@ -3,7 +3,7 @@
 //! flow through `parse_unit` without panicking.
 //!
 //! Three root-cause families, pinned verbatim (the files are official SDK
-//! test corpus members, BSD-licensed, copied unmodified from tests/corpus/):
+//! test corpus members, BSD-licensed, kept under src/tests/fixtures/):
 //!
 //! * `gate_m0_f_bounded.dart` / `gate_m0_function_bounded_sealed_classes.dart`
 //!   — exhaustiveness data with bounded type parameters: the completion pass

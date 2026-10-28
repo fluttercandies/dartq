@@ -9,8 +9,8 @@
 //! the real class and stays silent (or reports only genuinely-missing
 //! members).
 //!
-//! The fixture mirrors the tracked `tests/corpus/dep-interface` assembly in
-//! a throwaway tree: the `dep` package is hosted-classified through the
+//! The fixture is a throwaway tree shaped like the dep-interface assembly
+//! (see dep_index.rs): the `dep` package is hosted-classified through the
 //! `pubspec.lock` entry (cache content, never workspace source) with its
 //! root on disk beside the workspace, and the workspace barrel re-exports
 //! the dep file's containers. The dep files are never fed as content — they

@@ -42,12 +42,9 @@ cd "$(dirname "$0")/.."
 
 PATTERN='[.]third|(^|[^[:alnum:]_./])[d]ocs/|AGENTS[.]md|[P]RD|GOALS[.]md|REF[.]md|[.]goal/|/Users/[a-z]'
 
-# tests/plugin-validation/vendor and tests/corpus/real/*/lib are vendored
-# upstream content (Cargo.lock class), not our reference. The corpus form
-# needs the trailing /**: a single-* pathspec only matches paths ending at
-# .../lib, never the subtree beneath it (wildcarded pathspecs get no
-# implicit directory-prefix matching — 1260 vendored corpus files leaked
-# through the bare form). tests/plugin-validation/corpora is the same
+# tests/plugin-validation/vendor is vendored
+# upstream content (Cargo.lock class), not our reference.
+# tests/plugin-validation/corpora is the same
 # upstream-fixed class: its Dart sources are verbatim third-party test
 # cases, so a `this.third` constructor parameter there legitimately trips
 # the `[.]third` vendored-checkout pattern — identifier rewrites would
@@ -59,7 +56,7 @@ PATTERN='[.]third|(^|[^[:alnum:]_./])[d]ocs/|AGENTS[.]md|[P]RD|GOALS[.]md|REF[.]
 # file it ships (skills/adapters/agents-md/AGENTS.md) is tracked, so the
 # reference dangles nowhere. Same class as the vendored-content excludes
 # above: the heuristic would false-positive on the convention's own name.
-excludes=(':(exclude).gitignore' ':(exclude)scripts/untracked-ref-gate.sh' ':(exclude)Cargo.lock' ':(exclude)tests/plugin-validation/vendor' ':(exclude)tests/plugin-validation/corpora' ':(exclude)tests/corpus/real/*/lib/**' ':(exclude)skills')
+excludes=(':(exclude).gitignore' ':(exclude)scripts/untracked-ref-gate.sh' ':(exclude)Cargo.lock' ':(exclude)tests/plugin-validation/vendor' ':(exclude)tests/plugin-validation/corpora' ':(exclude)skills')
 
 # Sanctioned standard-tool position (charter exemption face): the fvm SDK
 # default (`~/fvm/...`, or its absolute-user spelling) inside recorded

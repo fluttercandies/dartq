@@ -1,11 +1,10 @@
 //! GAP-PPIN parser recovery pins (#1690): the five owned rows of the
-//! known-diffs ledger's parser-recovery family
-//! (`tests/corpus/regressions/known-diffs.json`, cases 3f04615b / 4241f7cb /
-//! 6716c102 / 76dd104c / a7c0c7f0). Every expected row set below is the
-//! frozen machine-captured oracle side of the case file
-//! (`tests/corpus/regressions/cases/<hash8>.json`), converted to
-//! `(utf16 start, utf16 end)` spans over the frozen inputs; semantic-tier
-//! and lint-tier codes (unused_*, undefined_*, uri_*, duplicate_definition,
+//! known-diffs ledger's parser-recovery family (the retired regression-case
+//! corpus, cases 3f04615b / 4241f7cb / 6716c102 / 76dd104c / a7c0c7f0).
+//! Every expected row set below is the frozen machine-captured oracle side
+//! of the case file, converted to `(utf16 start, utf16 end)` spans over the
+//! frozen inputs (verbatim under `tests/fixtures/`); semantic-tier and
+//! lint-tier codes (unused_*, undefined_*, uri_*, duplicate_definition,
 //! extra_positional_arguments, return_of_invalid_type) are outside the
 //! parser's surface and pinned by their own tickets.
 
@@ -16,13 +15,13 @@ use dartq_scanner::{ScanConfig, TokenTable};
 use super::collector::{Collector, latest_features};
 use crate::parser::Parser;
 
-const CORPUS_ROOT: &str = "tests/corpus/m0-syntax";
+/// The frozen case inputs, verbatim, relative to this crate's manifest.
+const FIXTURE_ROOT: &str = "src/tests/fixtures/gate_ppin";
 
-/// Reads a frozen corpus input and leaks it for the `'static` cursors.
+/// Reads a frozen case input and leaks it for the `'static` cursors.
 fn corpus_source(rel: &str) -> &'static str {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../")
-        .join(CORPUS_ROOT)
+        .join(FIXTURE_ROOT)
         .join(rel);
     let raw =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -93,7 +92,7 @@ fn assert_rows(source: &'static str, expected: &[(&str, u32, u32)], label: &str)
 /// bytes): one row at (74, 75).
 #[test]
 fn ppin_a7c0c7f0_unmatched_open_brace_at_eof_row_shape() {
-    let source = corpus_source("lib/src/patterns/issue50591_example2.dart");
+    let source = corpus_source("issue50591_example2.dart");
     assert_eq!(source.len(), 74, "frozen input is 74 bytes");
     assert_rows(
         source,
@@ -118,7 +117,7 @@ fn ppin_a7c0c7f0_unmatched_open_brace_at_eof_row_shape() {
 /// shapes, minus the `typedef void = ...` missing-name face on line 132).
 #[test]
 fn ppin_4241f7cb_typedef_keyword_name_faces() {
-    let source = corpus_source("lib/src/error_recovery/keyword_named_typedefs.dart");
+    let source = corpus_source("keyword_named_typedefs.dart");
     let (rows, _) = rows_and_texts(source);
 
     let built_in = rows
@@ -206,7 +205,7 @@ fn ppin_4241f7cb_typedef_keyword_name_faces() {
 /// enclosing `void` function. Oracle case 3f04615b parser rows:
 #[test]
 fn ppin_3f04615b_accessor_recovery_local_function_shape() {
-    let source = corpus_source("lib/targeted/blindspot_accessors.dart");
+    let source = corpus_source("blindspot_accessors.dart");
     assert_rows(
         source,
         &[
@@ -248,7 +247,7 @@ fn ppin_3f04615b_accessor_recovery_local_function_shape() {
 /// `duplicate_definition` is semantic-tier and excluded).
 #[test]
 fn ppin_6716c102_library_directive_unterminated_recovery() {
-    let source = corpus_source("lib/targeted/blindspot_library_directives.dart");
+    let source = corpus_source("blindspot_library_directives.dart");
     let scanner_rows: Vec<_> = scan_with_diagnostics(source).1;
     assert_eq!(
         scanner_rows,
@@ -302,7 +301,7 @@ fn ppin_6716c102_library_directive_unterminated_recovery() {
 #[test]
 fn ppin_76dd104c_interpolation_recovery_rows_and_texts() {
     let source =
-        corpus_source("lib/src/error_recovery/with_outline/typing_string_interpolation_2.dart");
+        corpus_source("../curly/typing_string_interpolation_2.dart");
     let scanner_rows: Vec<_> = scan_with_diagnostics(source).1;
     assert_eq!(
         scanner_rows,

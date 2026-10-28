@@ -3048,7 +3048,7 @@ mod tests {
         assert_eq!(lints[0].range, 9..24);
     }
 
-    /// The corpus face (`tests/corpus/lints/lib/docs.dart`, oracle anchor
+    /// The lint-fixture face (the retired corpus's docs.dart, oracle anchor
     /// (10, 1) length 59) through the production parse: nine plain `//`
     /// header lines above the dangling `///` stay outside the 59-byte
     /// doc-line span.

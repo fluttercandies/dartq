@@ -404,8 +404,8 @@ fn cyclic_hierarchy_reports_each_node_once() {
 /// The meta stand-in the rig analyzes like any dependency: the
 /// `UseResult` class the annotation resolves through (`check_annotation`'s
 /// namespace face, the import-use credit, the exported probe). The
-/// corpus's vendored stand-in (`tests/corpus/real/meta/lib/meta.dart`)
-/// carries the full class; the rig needs the declaration face only —
+/// package_meta stand-in it mirrors (formerly vendored, now a pub-cache
+/// package) carries the full class; the rig needs the declaration face only —
 /// the meta-face lanes key the uri, and the `unless` value rides the
 /// source walk, never the element shapes.
 const META_STANDIN: &str = "class UseResult {\n\

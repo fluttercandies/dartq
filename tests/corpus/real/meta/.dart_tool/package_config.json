@@ -1,6 +1,0 @@
-{
-  "configVersion": 2,
-  "packages": [
-    {"name": "meta", "rootUri": "..", "packageUri": "lib/", "languageVersion": "3.13"}
-  ]
-}

@@ -116,7 +116,7 @@ fn written_out_operator_chain_terminates() {
 /// `beginTypeArguments(<)`, identifier, type, `endTypeArguments(>)`.
 #[test]
 fn simple_type_arguments_consume_in_official_order() {
-    // The exact corpus content (tests/corpus/m0-syntax/lib/targeted/
+    // The exact corpus content (the retired m0-syntax targeted fixture
     // annotation_with_type_arguments_uninstantiated.dart).
     let parser = setup("@List<int> int x = 0;\n");
     let mut parser = parser;

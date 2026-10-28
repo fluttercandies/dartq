@@ -29,9 +29,9 @@
 //! unresolvable-head recovery (`Object?`) — the conservative iron rule.
 //!
 //! Oracle provenance: every pinned shape is silent under `dart analyze`
-//! (Dart 3.13.1, fvm 3.47.1) on the `/tmp/probe2440` fixtures; the corpus
-//! reduction is `tests/corpus/real/analyzer/lib/src/util/collection.dart`'s
-//! `forCorrespondingPairs` with the `informative_data.dart` call shape.
+//! (Dart 3.13.1, fvm 3.47.1) on the `/tmp/probe2440` fixtures; the shape
+//! reduces the `forCorrespondingPairs` face of package_analyzer's
+//! `collection.dart` with the `informative_data.dart` call shape.
 
 use super::*;
 use crate::collector::collect;

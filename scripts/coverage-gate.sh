@@ -35,8 +35,8 @@
 # The whole invocation builds into CARGO_TARGET_DIR=target/coverage-build,
 # never the shared target/: a coverage run compiles instrumented binaries,
 # and letting them land in the shared target/debug/ would overwrite the
-# exact dartq/harness binaries scripts/m2-gate.sh consumes as its gate
-# inputs (instrumented binaries also drop .profraw files into their cwd on
+# exact dartq binary the suite chain drives as its input
+# (instrumented binaries also drop .profraw files into their cwd on
 # every run). The isolated tree sits inside the already-gitignored target/,
 # so no ignore-file change; the cost is a second cold build tree per run,
 # consistent with the sccache-bypassed cold-build posture above.
@@ -528,8 +528,6 @@ fold_rows() { # <lcov> -> "crate hit total" rows, LC_ALL=C sorted
     crate = "other"
     if (match(path, "crates/[^/]+/")) {
       crate = substr(path, RSTART + 7, RLENGTH - 8)
-    } else if (index(path, "tests/harness/") != 0) {
-      crate = "harness"
     }
     cur = crate
   }

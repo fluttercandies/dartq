@@ -1,5 +1,5 @@
 //! The M1 semantic diagnostic code table: the frozen M1 gate families the
-//! semantic layer owns (`tests/harness/m1_codes.txt`), with tier and verbatim
+//! semantic layer owns, with tier and verbatim
 //! oracle message per code.
 //!
 //! One variant per implemented frozen row. Every row was transcribed from
@@ -98,7 +98,7 @@ pub enum SemanticCode {
     /// diagnostic in 3.14 (`removedIn: "3.14"` — absent from the pinned
     /// 3.15-main registry, only `messages.yaml` retains the text). The row
     /// stays for the 3.13.1 measurement oracle, which still emits it and
-    /// freezes it in `tests/harness/m1_codes.txt` — under-report, never
+    /// froze it in the retired m1 codes freeze — under-report, never
     /// false-positive.
     UndefinedAnnotation,
     /// `Undefined class '{0}'.`

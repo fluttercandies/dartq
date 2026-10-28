@@ -636,8 +636,10 @@ fn expected_semicolon_anchors_on_the_unterminated_string() {
 
 #[test]
 fn pin_8e7bfa84_semicolon_anchors_and_eof_docking() {
-    // Full corpus source (tests/corpus/regressions/cases/8e7bfa84.json,
-    // m0-syntax string2.dart). Four terminated strings keep anchoring the
+    // Full corpus source (the retired regression-case corpus's 8e7bfa84
+    // capture, m0-syntax string2.dart; kept verbatim under
+    // fixtures/regression_8e7bfa84_unterminated_interpolations.dart). Four
+    // terminated strings keep anchoring the
     // ensureSemicolon row on their last consumed segment (the tail `"""` for
     // the `$bar` interpolation, the whole literal otherwise) while the
     // unterminated tail anchors on its synthetic string; the unclosed `{`

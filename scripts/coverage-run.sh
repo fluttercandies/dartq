@@ -42,7 +42,7 @@
 # floor = int(measured percent) − 5, clamped to ≥ 0 — five points of
 # regression headroom under each crate's measured baseline. `default` is
 # policy, not measurement: never rewritten. Rows for crates that produced no
-# coverage (LF:0 stubs) are preserved verbatim. The harness/other fold rows
+# coverage (LF:0 stubs) are preserved verbatim. The other fold rows
 # are measurement infrastructure and never become floors; measured rows with
 # no existing floor row are appended at the end of the data section (just
 # before `default`).
@@ -195,12 +195,12 @@ if [ "$MODE" = "measure" ]; then
 
   # Fold the gate's byte-stable summary table into the measured TSV.
   # Table rows are: name lines-hit lines-total pct% floor — keep the
-  # product-crate rows only (drop the header, TOTAL, and the harness/other
+  # product-crate rows only (drop the header, TOTAL, and the other
   # measurement-infrastructure rows).
   [ -f "$REPORT_DIR/summary.txt" ] || { echo "coverage-run: gate summary not found: $REPORT_DIR/summary.txt" >&2; exit 2; }
   LC_ALL=C awk '
     NF == 5 && $4 ~ /%$/ && $5 ~ /^[0-9]+(\.[0-9]+)?$/ &&
-    $1 != "crate" && $1 != "TOTAL" && $1 != "harness" && $1 != "other" {
+    $1 != "crate" && $1 != "TOTAL" && $1 != "other" {
       pct = $4; sub(/%$/, "", pct)
       printf "%s\t%s\t%s\t%s\n", $1, $2, $3, pct
     }
@@ -231,7 +231,7 @@ if [ "$MODE" = "floors-from-measured" ]; then
         printf "coverage-run: malformed measured row %d: %s\n", FNR, $0 > "/dev/stderr"
         err = 1; exit 2
       }
-      if (f[1] == "harness" || f[1] == "other" || f[1] == "TOTAL" || f[1] == "crate") {
+      if (f[1] == "other" || f[1] == "TOTAL" || f[1] == "crate") {
         printf "coverage-run: %s is measurement infrastructure, not a floorable crate row\n", f[1] > "/dev/stderr"
         err = 1; exit 2
       }

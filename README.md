@@ -42,8 +42,8 @@ target/release/dartq analyze . --format=machine --sdk <dart-sdk-root>
 ```
 
 For differential confidence, the same faces are compared against
-`dart analyze` (Dart 3.13.1) by the harness — see
-[Differential Testing](#differential-testing).
+`dart analyze` on real-world projects taken straight from the local pub
+cache — see [Differential Testing](#differential-testing).
 
 ## Design Pillars
 
@@ -72,7 +72,7 @@ cargo test --workspace
 
 The toolchain is pinned by `rust-toolchain.toml` (Rust 1.96.0, edition
 2024, resolver "3"). `Cargo.lock` is committed: the workspace ships
-binaries (`dartq-cli`, `harness`). Concurrent cargo invocations share
+binary (`dartq-cli`). Concurrent cargo invocations share
 `target/` under a workspace-pinned job cap (`.cargo/config.toml`,
 `jobs = 2`).
 
@@ -357,8 +357,7 @@ small edits.
 ## Architecture
 
 One-way layering, one crate per concern. 23 `dartq-*` workspace crates,
-plus the differential-testing harness and the corpus and SDK-face
-generators (`tools/corpus-gen`, `tools/sdk-faces-gen`). Status = what ships
+plus the SDK-face generator (`tools/sdk-faces-gen`). Status = what ships
 through the CLI/daemon faces today:
 
 | Layer | Crate | Role | Status |
@@ -386,69 +385,23 @@ through the CLI/daemon faces today:
 | Interface | [`dartq-commands`](crates/dartq-commands) | Per-command cores shared by the CLI and daemon faces: plain parameters in, typed results out — no parsing, printing, or exit codes | landed |
 | Interface | [`dartq-cli`](crates/dartq-cli) | Command-line entry point | landed |
 | Interface | [`dartq-daemon`](crates/dartq-daemon) | JSON-RPC daemon over stdin/stdout: turn batching, overlay edits, plugin host, `dartq/*` methods, `dartq/diagnostics` pushes | landed |
-| Testing | [`harness`](tests/harness) | Differential-testing driver: oracle vs dartq over shared corpora, `(code, file)` Jaccard comparison | landed |
 
 `crates/dartq-plugin-host/` is the host-side Dart package of the plugin
 protocol and is not part of the Cargo workspace.
 
 ## Differential Testing
 
-`tests/harness` runs the official analyzer (`dart analyze --format=machine`)
-and dartq over the same corpora and compares results as `(code, file)`
-entry sets (Jaccard). Corpora live in `tests/corpus/`: `m0` (assembled
-analyzer-suite cases), `m0-syntax` (syntax-broken files), `real/` (17
-vendored ecosystem packages — riverpod, drift, and friends — each with a
-`PROVENANCE.md` recording its exact upstream version), and the syntax
-gate's code list `syntax-codes.txt` (255 codes, the scanner/parser subset
-of `crates/dartq-diagnostics/data/syntax-codes.tsv`).
-
-Every differential gate holds the full-parity bar — `(code, file)` Jaccard
-1.0 at the gate's tier, with residuals passing only via individually
-adjudicated pinned exemptions — against the single oracle of record:
-`dart analyze` from a pinned Dart 3.13.1 install, on `PATH` or the fvm
-default install (what the gate scripts resolve). The gate chain, one
-script per gate under `scripts/`, in gate order:
-
-| Gate | Face | Tier / universe |
-| --- | --- | --- |
-| `m0-gate.sh` run A | check | ERROR, the 255-code syntax universe |
-| `m0-gate.sh` run B | analyze | ERROR, the 290-code union (255 syntax + 36 M1 − 1 overlap) |
-| `m1-gate.sh` | analyze | ERROR, the frozen semantic code set (`tests/harness/m1_codes.txt`) |
-| `lint-gate.sh` | analyze | INFO × LINT, the frozen lint-code universe with adjudicated exclusions (`tests/harness/lint_codes.txt`, `lint_divergences.tsv`) |
-| `incremental-gate.sh` | — | every step of each curated edit sequence: incremental re-analysis through a live daemon session matches full recompute byte-for-byte (`tests/corpus/incremental/`) |
-| `m2-gate.sh` | analyze | WARNING, the frozen M2 code set (`tests/harness/m2_warning_codes.txt`) |
-| `m3-gate.sh` | analyze | WARNING, the frozen unused-family set (`tests/harness/m3_unused_codes.txt`) |
-| `sem2-gate.sh` | analyze | ERROR, the frozen semantic wave-2 set (`tests/harness/sem2_codes.txt`) |
-| `acceptance-gate.sh` | check | zero diagnostics of any tier over the valid-syntax feature-family corpus (`tests/corpus/acceptance/`) |
-| `repro-gate.sh` | — | fresh-process runs are byte-identical; the sealed `{tuple, output_digest}` pair lands under `target/evidence/repro/` |
-
-Honest state of the recorded evidence: the last recorded gate runs predate
-the corpus reorganization and fell below the full-parity bars, so no
-current-tree gate numbers exist yet — the 1.0.0 release gate chain
-re-establishes the evidence, and the final per-gate numbers land in this
-section from that run. The harness itself is runnable directly:
-
-```bash
-cargo test -p harness          # harness unit tests
-cargo run -p harness -- corpus # assemble corpora and run pub get
-
-# Comparator self-check: both sides dart analyze, Jaccard must be 1.000.
-cargo run -p harness -- run --e2e-oracle \
-  --corpus-dir tests/corpus/m0 --corpus-dir tests/corpus/m0-syntax \
-  --severity-filter ERROR --codes-file tests/corpus/syntax-codes.txt
-
-# Real differential run: swap --e2e-oracle for the dartq driver.
-cargo run -p harness -- run \
-  --corpus-dir tests/corpus/m0 --corpus-dir tests/corpus/m0-syntax \
-  --severity-filter ERROR --codes-file tests/corpus/syntax-codes.txt \
-  --dartq-cmd "cargo run -q -p dartq-cli -- check --format=machine"
-```
-
-Exit codes: `0` = gate met, `1` = below threshold, `2` = harness error.
-Preflight requires every corpus package to carry a
-`.dart_tool/package_config.json` with `languageVersion >= 3.13`.
-`--oracle-dart`, `--type-filter`, and `--threshold` are also available; see
-`cargo run -p harness -- --help`.
+The correctness basis is differential: dartq's results are compared against
+the official analyzer (`dart analyze`) as `(severity, code, file)` entry
+sets. Cases are extracted from the pinned Dart SDK, and real-world
+projects are analyzed straight from the local pub cache (never vendored):
+`conformance/realworld.toml` lists the packages and exact versions the
+conformance runner drives (`analyzer`, `archive`, `args`, `bloc`,
+`collection`, `dio`, `drift`, `html`, `http`, `intl`, `meta`, `path`,
+`petitparser`, `riverpod`, `url_launcher_android`, `webview_flutter_android`,
+`xml`). Every gate holds the full-parity bar — Jaccard 1.0 per face and
+severity, with residuals passing only via individually adjudicated pinned
+exemptions — against the oracle of record.
 
 ## Oracle Baseline
 
@@ -485,8 +438,6 @@ Honest state of the 1.0.0 tree:
   `dartq/sync` edit reports, `dartq/diagnostics` pushes, `dartq/cancel` —
   see [Daemon](#daemon)); it is not a language server and speaks no LSP —
   no `textDocument/*` or lifecycle frames exist.
-- The 1.0.0 differential gates cover the `check` and `analyze` faces (see
-  [Differential Testing](#differential-testing)).
 - The semantic diagnostic tier is scoped to the families the diagnoser
   implements (undefined identifiers and members, wrong-number-of-arguments
   and -type-arguments, the part/part-of family, duplicate definitions,
@@ -514,11 +465,9 @@ builds.
 ```bash
 scripts/ci.sh              # serial per-crate gate: cargo fmt --check,
                            # clippy --all-targets -- -D warnings, the
-                           # oracle-free calibration pins, then the doc
+                           # registry-drift pins, then the doc
                            # gate (rustdoc -D warnings)
 scripts/ci.sh --check-only # fast mode: cargo check per crate only
-scripts/serial-gates.sh    # the serial verification window: the
-                           # authoritative gate chain, coverage included
 ```
 
 The CI loop walks the workspace members (fixture/test-only members
@@ -526,11 +475,11 @@ skipped), one crate at a time, and stops at the first failure naming the
 crate. Concurrency stays under the workspace job cap —
 `.cargo/config.toml` pins `jobs = 2`; the script passes no `-j`.
 
-The 1.0.0 release harness (`scripts/release.sh`) runs the full gate chain
-in order — calibration pins → `m0-gate` → `m1-gate` → `lint-gate` →
-`m2-gate` → `m3-gate` → the M4 suites plus the schema-freeze sweep →
-`ci.sh` → `repro-gate` — one subprocess at a time, each with its own
-evidence directory under `target/evidence/`. Coverage floors and runners live
+The 1.0.0 release harness (`scripts/release.sh`) runs the suite chain in
+order — the M4 suites plus the schema-freeze sweep → `ci.sh` — one
+subprocess at a time, each with its own evidence directory under
+`target/evidence/`, and executes the resident engine bench under the RSS
+watchdog with `--run-bench`. Coverage floors and runners live
 alongside (`scripts/coverage-floors.tsv`, `coverage-run.sh`,
 `coverage-gate.sh`).
 

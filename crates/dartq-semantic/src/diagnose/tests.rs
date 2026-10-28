@@ -7687,8 +7687,8 @@ fn const_eval_faults_match_the_official_codes() {
     );
 }
 
-/// The dynamic operand face (tests/corpus/m1-semantic
-/// lib/targeted/const_eval_type_num_string.dart:9): a `dynamic` right
+/// The dynamic operand face (the retired m1-semantic targeted fixture
+/// const_eval_type_num_string.dart:9): a `dynamic` right
 /// operand is assignable to the operator's formal — the argument face
 /// stays silent and only the const-eval fault reports, const context
 /// or not. The literal operand keeps the co-fire the oracle probes
@@ -14239,8 +14239,8 @@ fn local_named_function_and_expression_stay_live() {
 // —— #748: non_nullable_equals_parameter / unnecessary_no_such_method ——
 //
 // Behavioral oracle: dart 3.13.1 `dart analyze --format=machine` probes
-// (see the fixture headers under tests/corpus/m2-warning for the live
-// rows). Official sources:
+// (the retired m2-warning fixture headers carried the live rows).
+// Official sources:
 // best_practices_verifier.dart:1345-1374 (`_checkForNullableEqualsPara-
 // meterType`) and :1433-1478 (`_checkForUnnecessaryNoSuchMethod`).
 

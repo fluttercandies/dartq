@@ -177,7 +177,8 @@ fn two_unclosed_braces_do_not_rescan() {
     }
 }
 
-// --- the handed-off corpus files themselves (tracked in tests/corpus) ---
+// --- the oracle-pinned fixture files themselves (verbatim under
+// src/tests/fixtures/curly/, recovered from the retired corpus) ---
 //
 // Scanner-level oracle pins (`dart analyze --format=machine`, Dart 3.15
 // main): the re-scan reduces every file in the #440 handoff to exactly the
@@ -185,13 +186,23 @@ fn two_unclosed_braces_do_not_rescan() {
 // / the extra unterminated_string_literal are parser-side over-reports that
 // disappear once the token stream carries the recovered shape.
 
-fn corpus_file(rel: &str) -> Option<String> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/corpus/m0-syntax/lib/src/error_recovery/")
-        .join(rel);
-    let src = std::fs::read_to_string(&path).ok()?;
+fn corpus_file(rel: &str) -> &'static str {
+    let src = match rel {
+        "with_outline/typing_01.dart" => include_str!("fixtures/curly/typing_01.dart"),
+        "with_outline/typing_03.dart" => include_str!("fixtures/curly/typing_03.dart"),
+        "with_outline/typing_04.dart" => include_str!("fixtures/curly/typing_04.dart"),
+        "with_outline/typing_05.dart" => include_str!("fixtures/curly/typing_05.dart"),
+        "with_outline/typing_string_interpolation_1.dart" => {
+            include_str!("fixtures/curly/typing_string_interpolation_1.dart")
+        }
+        "with_outline/typing_string_interpolation_2.dart" => {
+            include_str!("fixtures/curly/typing_string_interpolation_2.dart")
+        }
+        "bracket_mismatch_01.dart" => include_str!("fixtures/curly/bracket_mismatch_01.dart"),
+        other => panic!("unknown fixture: {other}"),
+    };
     assert!(!src.is_empty(), "{rel} unexpectedly empty");
-    Some(src)
+    src
 }
 
 #[test]
@@ -207,10 +218,7 @@ fn corpus_typing_files_recover_to_single_expected_token() {
         ("with_outline/typing_05.dart", "\n        }\n"),
     ];
     for (rel, closer_pattern) in cases {
-        let Some(src) = corpus_file(rel) else {
-            eprintln!("skip: {rel} not present");
-            continue;
-        };
+        let src = corpus_file(rel);
         let r = scan_src(&src);
         let closer = src
             .find(closer_pattern)
@@ -232,11 +240,8 @@ fn corpus_typing_files_recover_to_single_expected_token() {
 
 #[test]
 fn corpus_string_interpolation_1_recovers() {
-    let Some(src) = corpus_file("with_outline/typing_string_interpolation_1.dart") else {
-        eprintln!("skip: corpus file not present");
-        return;
-    };
-    let r = scan_src(src.as_str());
+    let src = corpus_file("with_outline/typing_string_interpolation_1.dart");
+    let r = scan_src(src);
     // oracle: expected_token '}' @ the `$` — and NO unterminated_string_literal.
     // Scanner-side: no diagnostics, one unmatched pair at the `$`.
     assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
@@ -264,11 +269,8 @@ fn corpus_string_interpolation_1_recovers() {
 
 #[test]
 fn corpus_string_interpolation_2_recovers() {
-    let Some(src) = corpus_file("with_outline/typing_string_interpolation_2.dart") else {
-        eprintln!("skip: corpus file not present");
-        return;
-    };
-    let r = scan_src(src.as_str());
+    let src = corpus_file("with_outline/typing_string_interpolation_2.dart");
+    let r = scan_src(src);
     // The scanner keeps only the two unterminated rows; both expected_token
     // rows ride the pair list (parser-side post-parse report).
     assert_codes(
@@ -323,10 +325,7 @@ fn corpus_string_interpolation_2_recovers() {
 /// stream closes every remaining brace.
 #[test]
 fn corpus_bracket_mismatch_01_deep_match_drops() {
-    let Some(src) = corpus_file("bracket_mismatch_01.dart") else {
-        eprintln!("skip: corpus file not present");
-        return;
-    };
+    let src = corpus_file("bracket_mismatch_01.dart");
     let r = scan_src(&src);
     assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     // Every begin pairs with a real closer; nothing synthetic anywhere.
