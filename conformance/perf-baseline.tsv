@@ -1,0 +1,26 @@
+# conformance/perf-baseline.tsv — the tracked quiet-machine performance
+# reference for `scripts/perf-bench.sh diff --against baseline` (opt-in in
+# scripts/ci.sh via DARTQ_PERF_DIFF=1).
+#
+# Schema — one row per face, tab-separated, exactly the rows
+# `scripts/perf-bench.sh record` appends to target/perf-history/records.tsv:
+#
+#   date <TAB> commit <TAB> face <TAB> wall_s <TAB> rss_mib
+#
+# Faces: analyzer-cold (one cold analyze of the analyzer package) and
+# concurrency-5x (five parallel cold analyzes; wall = the batch makespan,
+# RSS = the coincident five-process sum).
+#
+# Update procedure: on a quiet machine (wall numbers are only meaningful
+# there — see the posture note in scripts/perf-gate.sh), run
+# `scripts/perf-bench.sh record`, sanity-check the two fresh rows in
+# target/perf-history/records.tsv, then copy them here in place of the
+# previous reference rows and commit.
+#
+# The rows below are seeded from the 2026-10-28 frozen baseline in
+# conformance/perf-thresholds.toml (Apple M1 Max, 32 GiB, macOS arm64,
+# binary db4216c5d633) so the diff works before the first quiet-machine
+# recording lands; replace them with freshly recorded rows per the
+# procedure above.
+2026-10-28	db4216c5d633	analyzer-cold	4.41	189.2
+2026-10-28	db4216c5d633	concurrency-5x	6.84	951.0

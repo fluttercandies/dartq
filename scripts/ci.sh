@@ -36,6 +36,17 @@
 # only, distinct target/coverage outputs, never a floors baseline). Any
 # other value is a usage error, never a silent skip. Unset: no coverage
 # face.
+# Stored-baseline perf diff (opt-in): DARTQ_PERF_DIFF=1|true runs
+# scripts/perf-bench.sh diff --against baseline after the release build —
+# the two always-available faces (analyzer-cold, concurrency-5x) are
+# re-measured and compared against the tracked quiet-machine reference in
+# conformance/perf-baseline.tsv, failing when a face regresses beyond the
+# slack factors in conformance/perf-thresholds.toml [meta]. Exit 77
+# (input absent, nothing measured) is reported and tolerated, mirroring
+# the perf-threshold gate's skip posture (conformance-gate.sh under
+# DARTQ_PERF=1). Wall numbers need a quiet machine — on a shared host,
+# re-run on an idle machine before acting on a wall regression. Any other
+# value is a usage error, never a silent skip. Unset: no perf-diff face.
 # Doc gate (#1169): after the faces above, `cargo doc -p <crate> --no-deps`
 # runs one crate at a time (same member skip rule) with
 # RUSTDOCFLAGS="-D warnings": every rustdoc warning — broken intra-doc
@@ -161,6 +172,29 @@ if [ "$mode" = "gate" ]; then
         echo "ci: e2e routed-parity leg FAILED" >&2
         exit 1
     fi
+fi
+
+# Stored-baseline perf diff (opt-in, DARTQ_PERF_DIFF): runs after the e2e
+# leg, which has just built the release binary the measurement uses. See
+# the header for the posture.
+if [ "$mode" = "gate" ] && [ -n "${DARTQ_PERF_DIFF:-}" ]; then
+    case "$DARTQ_PERF_DIFF" in
+    1 | true)
+        echo "== perf diff: scripts/perf-bench.sh diff --against baseline"
+        bash scripts/perf-bench.sh diff --against baseline
+        rc=$?
+        if [ "$rc" -eq 77 ]; then
+            echo "ci: perf diff skipped (perf-bench exited 77: input absent, nothing measured)"
+        elif [ "$rc" -ne 0 ]; then
+            echo "ci: perf diff FAILED (exit $rc)" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ci: unsupported DARTQ_PERF_DIFF value '$DARTQ_PERF_DIFF' (use 1|true)" >&2
+        exit 2
+        ;;
+    esac
 fi
 
 # Coverage gate (--coverage / COVERAGE): the llvm-cov line-coverage floor
