@@ -1,14 +1,18 @@
 //! Termination-invariant tests (#18): the parser must terminate on any input
 //! bytes with memory bounded by the input plus the per-file caps.
 //!
-//! Three axes are pinned here:
+//! Four axes are pinned here:
 //! 1. the per-file diagnostics cap latches a terminal bailout and stops the
 //!    parse before a pathological input can stream unbounded reports;
 //! 2. the structural-nesting guard latches the same bailout on a recursion
 //!    bomb (official `recoverFromStackOverflow`);
 //! 3. the `<id>` fast-shape consume paths emit the official event order
 //!    without the off-by-one that used to trip `debug_assert!(peek_is_closer)`
-//!    on `@List<int>` (corpus `annotation_with_type_arguments_uninstantiated`).
+//!    on `@List<int>` (corpus `annotation_with_type_arguments_uninstantiated`);
+//! 4. the constructor-initializer loop's turn cap latches the same bailout
+//!    when its no-progress guard's blind spot is occupied (a parked real
+//!    stream whose inserted queue never drains — zero diagnostic burn, so no
+//!    other cap would ever fire).
 //!
 //! These tests run in the dedicated serial verification phase.
 
@@ -273,4 +277,52 @@ fn initializer_loop_terminates_on_stalled_super_recovery() {
             listener.errors.len()
         );
     }
+}
+
+/// The turn cap over the initializer loop's no-progress guard (#2731
+/// residual, hang-audit #2729): the guard only breaks when the real stream
+/// is parked AND the inserted-token queue has drained; a state whose every
+/// turn re-queues as much as it consumes keeps the queue permanently
+/// non-empty, and the repeated same-anchor reports dedupe to zero diagnostic
+/// burn — no cap would ever latch and the loop would spin forever. No real
+/// input shape reaches that state (the corpora hang-audit found none), so
+/// the belt is driven directly at the module level: a crafted inserted-token
+/// queue feeds 2500 well-formed synthetic entries (`foo = bar,`) through the
+/// loop while the real stream stays pinned — every turn consumes exactly the
+/// four queued tokens, the queue never drains before the cap, and the turn
+/// cap (members.rs `INITIALIZER_TURN_CAP`, 4× the nesting cap) must latch
+/// the terminal bailout instead of running to the end of the queue. The
+/// queue leads with a synthetic `:` because the entry gate peeks the
+/// queue-first stream.
+#[test]
+fn initializer_turn_cap_latches_on_parked_queue() {
+    let (table, text) = scan_ok(": x");
+    let mut listener = Collector::default();
+    {
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
+        parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Colon, 0);
+        for _ in 0..2500 {
+            let at = 3; // past the real `: x`, at the EOF pin
+            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Identifier, at);
+            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Eq, at);
+            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Identifier, at);
+            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Comma, at);
+        }
+        parser.parse_initializers_opt();
+        assert!(
+            parser.is_bailed(),
+            "the turn cap must latch the bailout past 2000 turns"
+        );
+    }
+    assert_eq!(
+        listener.errors.len(),
+        1,
+        "the crafted entries are well formed: only the terminal reports: {:?}",
+        listener.errors
+    );
+    assert_eq!(
+        listener.error_codes(),
+        vec!["dartq/internal_error".to_owned()],
+        "the one diagnostic is the bounded terminal bailout"
+    );
 }

@@ -21,11 +21,25 @@ use crate::listener::{
     ParserListener,
 };
 use crate::message::msg;
-use crate::parser::{AsyncModifier, Parser};
+use crate::parser::{AsyncModifier, MAX_DEPTH, Parser};
 use crate::recovery::is_identifier;
 use crate::token_id::{TokenId, TokenSpan};
 use crate::type_args::TypeParamOrArg;
 use crate::types::TypeInfo;
+
+/// Hard turn cap for the constructor-initializer recovery loop
+/// ([`Parser::parse_initializers_opt`]), a belt over its arm-specific
+/// no-progress guard (4× the structural nesting cap — far past anything the
+/// parser can even express). The guard only breaks when the real stream is
+/// parked AND the inserted-token queue has drained; a recovery state whose
+/// every turn re-queues as much as it consumes keeps the queue permanently
+/// non-empty, the guard never fires, and the same-anchor reports dedupe to
+/// zero diagnostic burn — so even the per-file diagnostics cap never latches
+/// and the loop would spin forever. Every legitimate turn consumes at least
+/// one real token (the queue is always drained in well-formed parses), so
+/// reaching the cap needs thousands of initializer entries in one list:
+/// unreachable by valid input.
+const INITIALIZER_TURN_CAP: usize = 4 * MAX_DEPTH as usize;
 
 /// A member modifier set as walked by the member impls (official local
 /// variables in `parseTopLevelMemberImpl` / `parse...MemberImpl`).
@@ -2052,10 +2066,32 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let mut count = 0usize;
         let mut last_end = begin;
         let mut last_real = self.cursor.real_pos();
+        let mut turns = 0usize;
         loop {
             if self.is_bailed() {
                 // Terminal bailout: unwind without consumption (see
                 // `parse_list_literal` in literals.rs).
+                break;
+            }
+            turns += 1;
+            if turns > INITIALIZER_TURN_CAP {
+                // Belt over the no-progress guard below: that guard breaks
+                // only when the real stream is parked with the queue
+                // drained; a parked stream whose queue is re-filled as fast
+                // as each turn drains it never satisfies it, and the
+                // repeated same-anchor reports dedupe away (zero diagnostic
+                // burn), so no other cap would ever stop the loop. The cap
+                // is unreachable by valid input — see
+                // [`INITIALIZER_TURN_CAP`] — and latches the same one-shot
+                // terminal bailout as the other caps.
+                self.bail(crate::message::Message::new(
+                    dartq_diagnostics::DARTQ_INTERNAL_ERROR,
+                    format!(
+                        "Constructor initializer recovery exceeded \
+                         {INITIALIZER_TURN_CAP} turns; the rest of the file \
+                         was not analyzed."
+                    ),
+                ));
                 break;
             }
             last_end = self.parse_initializer(last_end);
