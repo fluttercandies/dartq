@@ -2,7 +2,8 @@
 //! `MockLibraryUnit('lib/path.dart', r'''...''')` declarations under the
 //! analyzer testing package's `src/mock_packages/` tree, composed into
 //! packages exactly like the official `mock_packages.dart` `addX()` methods,
-//! plus the `angular_meta` mock inlined in the resolution test setup.
+//! plus the `angular_meta` mock inlined in the resolution test setup and the
+//! `test_api` fixture the linter's `use_test_throws_matchers` suite writes.
 //!
 //! The SDK-internal test packages that the language/co19 suites import
 //! (`expect`, `async_helper`, `dart_internal`) and the `collection` fixture
@@ -48,6 +49,7 @@ pub fn extract(
     if let Some(meta) = angular_meta(context_collection) {
         packages.insert("angular_meta".to_string(), vec![meta]);
     }
+    packages.insert("test_api".to_string(), test_api());
     for (package, files) in sdk_packages(sdk_src) {
         packages.insert(package, files);
     }
@@ -237,6 +239,41 @@ class MapEquality<K, V> extends Equality<Map<K, V>> {
 }
 "#;
 
+/// The `package:test_api` fixture the linter's `use_test_throws_matchers`
+/// suite writes into its environment (upstream
+/// `pkg/linter/test/rules/use_test_throws_matchers_test.dart` `setUp`,
+/// registering the package through `PackageConfigFileBuilder` and writing
+/// these two files). The signatures mirror the real package:test_api
+/// frontend API (`expect(actual, matcher)`, `fail` returning `Never`); the
+/// `lib/src/frontend/expect.dart` layout is load-bearing — the rule resolves
+/// `fail` and asserts its declaring library URI is exactly
+/// `package:test_api/src/frontend/expect.dart`.
+const TEST_API_EXPECT: &str = r#"
+// Mock of the package:test_api frontend surface the use_test_throws_matchers
+// suite registers (upstream use_test_throws_matchers_test.dart setUp); the
+// signatures are the real public ones.
+void expect(dynamic actual, dynamic matcher) {}
+
+Never fail(String message) {}
+"#;
+
+const TEST_API_EXPORT: &str = r#"
+export 'src/frontend/expect.dart';
+"#;
+
+fn test_api() -> Vec<MockFile> {
+    vec![
+        MockFile {
+            path: "lib/src/frontend/expect.dart".to_string(),
+            content: TEST_API_EXPECT.to_string(),
+        },
+        MockFile {
+            path: "lib/test_api.dart".to_string(),
+            content: TEST_API_EXPORT.to_string(),
+        },
+    ]
+}
+
 /// The package composition: which source files under `mock_packages/` make up
 /// which package (the official `addFfi`/`addFlutter`/... members).
 fn composition(root: &std::path::Path) -> Vec<(String, Vec<String>)> {
@@ -383,6 +420,22 @@ fn angular_meta(context_collection: &str) -> Option<MockFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_fixture_mirrors_the_upstream_setUp_files() {
+        let files = test_api();
+        assert_eq!(files.len(), 2);
+        let expect = files
+            .iter()
+            .find(|f| f.path == "lib/src/frontend/expect.dart")
+            .expect("expect.dart");
+        // The signatures the analyzed snippets call, verbatim from the
+        // upstream setUp literal.
+        assert!(expect.content.contains("void expect(dynamic actual, dynamic matcher) {}"));
+        assert!(expect.content.contains("Never fail(String message) {}"));
+        let export = files.iter().find(|f| f.path == "lib/test_api.dart").expect("test_api.dart");
+        assert_eq!(export.content, "\nexport 'src/frontend/expect.dart';\n");
+    }
 
     #[test]
     fn parses_unit_declarations() {

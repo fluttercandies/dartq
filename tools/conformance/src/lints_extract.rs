@@ -96,6 +96,13 @@ const SETUP_CALLS: [&str; 5] = [
     "newPackage",
 ];
 
+/// Fixture packages a test registers through `PackageConfigFileBuilder` that
+/// the mocks tree backs (`use_test_throws_matchers_test.dart` registers
+/// `test_api`; the mock carries the two files the official setUp writes).
+/// Other registered names (`analyzer`, `nonAnalyzer`, ...) have no mock and
+/// stay unmodeled.
+const CONFIG_REGISTERED_MOCKS: [&str; 1] = ["test_api"];
+
 /// A skipped call site and why.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Skip {
@@ -382,7 +389,7 @@ fn literal_arg(arg: &str) -> Option<String> {
 fn interpret_calls(body: &str, env: &mut Env, note: &mut dyn FnMut(String)) {
     let mut pos = 0usize;
     while let Some((name, open, _)) =
-        find_call(body, pos, &|n| SETUP_CALLS.contains(&n))
+        find_call(body, pos, &|n| SETUP_CALLS.contains(&n) || n == "add")
     {
         let Some(close) = match_paren(body, open) else {
             break;
@@ -393,6 +400,7 @@ fn interpret_calls(body: &str, env: &mut Env, note: &mut dyn FnMut(String)) {
                 interpret_new_file(&body[..open], env, &args, note)
             }
             "newPackage" => interpret_new_package(body, open, close, env, note),
+            "add" => interpret_config_add(&body[..open], env, &args),
             "writeTestPackageConfig" => {
                 // The builders used here carry no mock packages beyond the
                 // getters; a non-empty cascade cannot be modeled.
@@ -434,6 +442,29 @@ fn same_as_default(arg: &crate::dart::Arg) -> bool {
             Some("experiments") => a.expr.trim() == "experiments",
             _ => false,
         })
+}
+
+/// `<builder>.add(name: <pkg>, rootFolder: ...)` on a
+/// `PackageConfigFileBuilder`: registers `<pkg>` when the mocks tree backs it
+/// (the mock carries the files the official setUp writes alongside). The
+/// companion `newFile` calls for those files stay unmodeled — their
+/// `$fixtureRootPath` local has no modeled value, so they record their
+/// advisory skips and produce no sections.
+fn interpret_config_add(prefix: &str, env: &mut Env, args: &[crate::dart::Arg]) {
+    if !prefix.contains("PackageConfigFileBuilder") {
+        return;
+    }
+    let Some(name) = args
+        .iter()
+        .find(|a| a.label.as_deref() == Some("name"))
+        .and_then(|a| literal_arg(&a.expr))
+    else {
+        return;
+    };
+    if !CONFIG_REGISTERED_MOCKS.contains(&name.as_str()) || env.aux_packages.contains(&name) {
+        return;
+    }
+    env.aux_packages.push(name);
 }
 
 fn interpret_new_file(
@@ -1128,6 +1159,70 @@ fn ensure_newline(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The upstream `use_test_throws_matchers_test.dart` shape: a
+    /// `PackageConfigFileBuilder` registration plus companion files whose
+    /// path local the extractor does not model.
+    const TEST_API_FILE: &str = r#"
+@reflectiveTest
+class UseTestThrowsMatchersTest extends LintRuleTest {
+  @override
+  String get lintRule => LintNames.use_test_throws_matchers;
+
+  @override
+  void setUp() {
+    super.setUp();
+    var testApiPath = '$workspaceRootPath/test_api';
+    var packageConfigBuilder = PackageConfigFileBuilder();
+    packageConfigBuilder.add(
+      name: 'test_api',
+      rootFolder: getFolder(testApiPath),
+    );
+    writeTestPackageConfig2(config: packageConfigBuilder);
+    newFile('$testApiPath/lib/src/frontend/expect.dart', r'''
+void expect(dynamic actual, dynamic matcher) {}
+
+Never fail(String message) {}
+''');
+    newFile('$testApiPath/lib/test_api.dart', r'''
+export 'src/frontend/expect.dart';
+''');
+  }
+
+  test_failInTry() async {
+    await assertDiagnosticsFromMarkup(r'''
+import 'package:test_api/test_api.dart';
+
+void f() {
+  try {
+    f();
+    [!fail('fail');!]
+  } catch (e) {}
+}
+''');
+  }
+}
+"#;
+
+    #[test]
+    fn config_registered_test_api_backs_the_case() {
+        let out = extract_file("use_test_throws_matchers_test.dart", TEST_API_FILE);
+        assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
+        let case = &out.cases[0];
+        assert_eq!(case.id, "lints/use_test_throws_matchers/UseTestThrowsMatchersTest/test_failInTry#0");
+        assert_eq!(case.aux_packages, vec!["test_api"]);
+        // The fixture files come from the mocks tree; the unmodeled companion
+        // paths record advisory skips and produce no sections.
+        assert_eq!(case.files.len(), 1);
+        assert_eq!(case.files[0].0, "lib/test.dart");
+        assert!(
+            out.skips
+                .iter()
+                .all(|s| s.reason == "companion_path"),
+            "{:?}",
+            out.skips
+        );
+    }
 
     #[test]
     fn markup_stripping_matches_official_scanner() {
