@@ -7120,8 +7120,17 @@ impl<'a> Engine<'a> {
                     // keeps silent; a `Function` head is callable outright.
                     && self.source.as_bytes().get(self.byte_of(range.offset)) != Some(&b']')
                     && !matches!(row.ty, Ty::Named { name, .. } if self.strings.resolve(name) == "Function")
+                    // A callee typed by an in-scope type parameter resolves
+                    // callability through its written bound (the resolver's
+                    // `resolveToBound` step — upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/dart/resolver/
+                    // function_expression_invocation_resolver.dart:66: a
+                    // function-form bound (`T extends MyFunction`) answers
+                    // `receiverType is FunctionTypeImpl` and never reaches
+                    // the report arms).
+                    && !matches!(row.ty, Ty::Named { name, .. } if self.is_scope_param(name)
+                        && self.param_bound_callable(name))
                 {
-                    
                     self.emit(
                         SemanticCode::InvocationOfNonFunctionExpression,
                         range,
@@ -7159,12 +7168,35 @@ impl<'a> Engine<'a> {
                     self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
                     return;
                 }
-                let Ty::Named { name, .. } = ty else {
+                let Ty::Named { name, nullable: ty_nullable, .. } = ty else {
+                    // A record-typed callee reports both ways the record
+                    // face answers upstream: a `call`-named field resolves
+                    // through the `recordField != null` arm and a record
+                    // without one falls to `needsGetterError` — both report
+                    // at the callee (upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/dart/resolver/
+                    // function_expression_invocation_resolver.dart:103-121).
+                    if matches!(ty, Ty::Record { .. }) {
+                        let range = row.range;
+                        self.emit(
+                            SemanticCode::InvocationOfNonFunctionExpression,
+                            range,
+                            "",
+                            "",
+                        );
+                    }
                     return;
                 };
                 // A `Function`-typed value is the function-type supertype —
-                // callable.
-                if self.strings.resolve(*name) == "Function" {
+                // callable. The borrowed reads copy out here: the extension
+                // cache's warm-up below is the arm's one `&mut` call, and
+                // every later read consumes the copies, so the scrutinee
+                // borrow ends at this point.
+                let name = *name;
+                let ty_nullable = *ty_nullable;
+                let row_name = row.name;
+                let row_range = row.range;
+                if self.strings.resolve(name) == "Function" {
                     return;
                 }
                 // A parameterized function-type alias is callable the same
@@ -7173,17 +7205,35 @@ impl<'a> Engine<'a> {
                 // captured alias RHS stands in for the unmodeled
                 // substitution). An alias chain (`typedef B = A<int>` where
                 // `A` is the fn alias) chases to its terminal function shape.
-                if self.alias_fn_sig(*name).is_some() {
+                if self.alias_fn_sig(name).is_some() {
                     return;
                 }
                 // An interface-typed callee resolves its `call` member like
                 // the oracle's type-property resolve (`sum(1, 2)` over
                 // `Adder` with `int call(int, int)`); a present `call`
-                // method is callable, anything else reports.
+                // method is callable, anything else reports. An
+                // in-scope-extension `call` method answers the same way —
+                // the type-property resolve consults the accessible
+                // extensions (`extension E on C { int call(int x) }` over
+                // `C()`; a nullable receiver needs a nullable `on` type —
+                // `extension on int?` over `int? a`), upstream Dart SDK
+                // source, pkg/analyzer/lib/src/dart/resolver/
+                // function_expression_invocation_resolver.dart:92-100.
                 if matches!(
-                    self.resolved_member(*name, self.intern("call")),
+                    self.resolved_member(name, self.intern("call")),
                     Some(entry) if entry.kind == MemberKind::Method
-                ) {
+                ) || self.extension_call_member(name, ty_nullable)
+                {
+                    return;
+                }
+                // A type-parameter-typed callee resolves through its written
+                // bound — the resolver's `resolveToBound` step (upstream Dart
+                // SDK source, pkg/analyzer/lib/src/dart/resolver/
+                // function_expression_invocation_resolver.dart:66): a
+                // function-form bound (`typedef MyFunction = double
+                // Function(int _); T extends MyFunction`) is callable, a
+                // `call`-bearing bound likewise.
+                if self.is_scope_param(name) && self.param_bound_callable(name) {
                     return;
                 }
                 // A cross-file function-type alias is callable like the
@@ -7195,10 +7245,10 @@ impl<'a> Engine<'a> {
                 // under-report posture (`Predicate<T> predicate` over
                 // petitparser's shared `typedef Predicate<T> =
                 // Callback<T, bool>`).
-                if self.bounds.alias_fn_shape(*name).is_none()
-                    && self.bounds.alias_named_shape(*name).is_none()
+                if self.bounds.alias_fn_shape(name).is_none()
+                    && self.bounds.alias_named_shape(name).is_none()
                     && matches!(
-                        self.top_level_decl(*name).as_deref(),
+                        self.top_level_decl(name).as_deref(),
                         Some(decl) if decl.kind == MicroKind::TypeAlias
                     )
                 {
@@ -7211,8 +7261,8 @@ impl<'a> Engine<'a> {
                 // here, so the face keeps silent. The dart:core primitives
                 // have no declaring stub, yet their non-callable verdicts
                 // are known.
-                if self.top_level_decl(*name).is_none()
-                    && !self.members.primitive_ids.contains(name)
+                if self.top_level_decl(name).is_none()
+                    && !self.members.primitive_ids.contains(&name)
                 {
                     return;
                 }
@@ -7225,15 +7275,14 @@ impl<'a> Engine<'a> {
                     .frames
                     .iter()
                     .rev()
-                    .any(|f| f.locals.contains(&row.name))
+                    .any(|f| f.locals.contains(&row_name))
                 {
-                    self.deferred_invocation_faces.push((row.range, row.name));
+                    self.deferred_invocation_faces.push((row_range, row_name));
                     return;
                 }
-                let range = row.range;
                 self.emit(
                     SemanticCode::InvocationOfNonFunctionExpression,
-                    range,
+                    row_range,
                     "",
                     "",
                 );
@@ -7247,6 +7296,24 @@ impl<'a> Engine<'a> {
                 // `super.x()` resolves through its superclass chain —
                 // only a `call` member on the resolved target (inherited
                 // members included) makes the receiver itself invocable.
+                // An enclosing EXTENSION's own `call` method is such a
+                // member: `this` types as the `on` type and the `.call`
+                // property resolve finds the extension itself applicable
+                // (`extension E on C { int call(int x) => 0;
+                // int m() => this(2); }`, upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/resolver/
+                // function_expression_invocation_resolver.dart:92-100).
+                if !is_super
+                    && let Some((container, kind)) = self.container_context()
+                    && kind == ContainerKind::Extension
+                    && matches!(
+                        self.index.get(self.file).and_then(|f| f.container(container))
+                            .and_then(|c| c.members.get(&self.intern("call"))),
+                        Some(entry) if entry.kind == MemberKind::Method
+                    )
+                {
+                    return;
+                }
                 let start = if is_super {
                     self.container_context()
                         .and_then(|(container, _)| {
@@ -7310,6 +7377,57 @@ impl<'a> Engine<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Whether the in-scope type parameter `name`'s written bound is a
+    /// callable face: a function-form bound (`T extends void Function()`,
+    /// the bound stand-in for the resolver's `receiverType is
+    /// FunctionTypeImpl` arm — upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/
+    /// function_expression_invocation_resolver.dart:66-79), an aliased
+    /// function shape (`typedef MyFunction = double Function(int _); T
+    /// extends MyFunction`), or a bound head carrying a `call` method.
+    pub(crate) fn param_bound_callable(&self, name: StringId) -> bool {
+        let Some(bound) = self.param_bound(name) else {
+            return false;
+        };
+        match bound {
+            Ty::Function { .. } => true,
+            Ty::Named { name: head, .. } => {
+                self.strings.resolve(head) == "Function"
+                    || self.alias_fn_sig(head).is_some()
+                    || matches!(
+                        self.resolved_member(head, self.intern("call")),
+                        Some(entry) if entry.kind == MemberKind::Method
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether an accessible extension applies to the head `name` at the
+    /// receiver's nullability and declares a `call` METHOD — the
+    /// extension-provided `.call` face of the oracle's type-property
+    /// resolve (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/
+    /// function_expression_invocation_resolver.dart:92-100, the
+    /// `typePropertyResolver.resolve` call whose lookup consults the
+    /// library's accessible extensions). A nullable receiver matches only
+    /// a nullable `on` type (`String?` is not a subtype of `String` — the
+    /// `applicableTo` predicate), matching the face's own applicability
+    /// gate.
+    pub(crate) fn extension_call_member(&mut self, name: StringId, nullable: bool) -> bool {
+        let call = self.intern("call");
+        let pairs: Vec<(&ExtensionFace, FileId)> =
+            self.accessible_extension_faces().to_vec();
+        pairs.iter().any(|(face, _)| {
+            face.on_type == Some(name)
+                && (!nullable || face.on_type_nullable)
+                && matches!(
+                    face.members.get(&call),
+                    Some(entry) if entry.kind == MemberKind::Method
+                )
+        })
     }
 
     pub(crate) fn consume_send(&mut self, end: Token) -> Option<SendExit> {

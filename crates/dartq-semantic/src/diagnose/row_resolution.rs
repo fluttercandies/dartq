@@ -316,7 +316,7 @@ impl<'a> Engine<'a> {
             let callable = match flow_ty {
                 Some(ty) => match ty {
                     Ty::Function { .. } => true,
-                    Ty::Named { name: head, .. } => {
+                    Ty::Named { name: head, nullable, .. } => {
                         self.strings.resolve(head) == "Function"
                             || self.fn_var_sigs.contains_key(&name)
                             || self.alias_fn_sig(head).is_some()
@@ -324,6 +324,18 @@ impl<'a> Engine<'a> {
                                 self.resolved_member(head, self.intern("call")),
                                 Some(entry) if entry.kind == MemberKind::Method
                             )
+                            // The bound/extension faces the parse-time arm
+                            // holds (`resolveToBound` and the extension-
+                            // `call` resolve — upstream Dart SDK source,
+                            // pkg/analyzer/lib/src/dart/resolver/
+                            // function_expression_invocation_resolver.dart
+                            // :66, :92-100): a flow read typed by an
+                            // in-scope parameter answers through its bound;
+                            // any head answers through an applicable
+                            // extension's `call` method.
+                            || (self.is_scope_param(head)
+                                && self.param_bound_callable(head))
+                            || self.extension_call_member(head, nullable)
                     }
                     _ => false,
                 },

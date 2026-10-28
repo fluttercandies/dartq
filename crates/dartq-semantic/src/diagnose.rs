@@ -5032,6 +5032,19 @@ mod ticket_2769_tests;
 #[cfg(test)]
 mod ticket_2777_tests;
 
+/// The #2781 pins: the `invocation_of_non_function_expression` face's
+/// callable exemptions mirror the resolver's decision order (upstream
+/// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+/// function_expression_invocation_resolver.dart:55-145) — a bound
+/// function-form callee (`resolveToBound`), an extension-provided
+/// `call` member (the type-property resolve's extension leg), and a
+/// flow-promoted captured parameter (`is Function(Object)` inside a
+/// closure, the official write-capture-only gate) keep silent, while a
+/// record-typed callee reports (the `recordField`/`needsGetterError`
+/// arms).
+#[cfg(test)]
+mod ticket_2781_tests;
+
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.
 #[cfg(test)]
