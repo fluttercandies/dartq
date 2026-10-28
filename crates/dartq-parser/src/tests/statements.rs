@@ -827,22 +827,38 @@ fn local_function_modifier_reports_extraneous() {
 // —— termination bombs ——————————————————————————————————————————————————————
 
 #[test]
-fn deep_nested_blocks_latch_stack_overflow() {
+fn deep_nested_blocks_continue_past_the_fuse() {
+    // 600-deep `{}` blocks: the statement-depth fuse (official
+    // `recoverFromStackOverflow`, parser_impl.dart:11353-11365) is a LOCAL
+    // guard, not a terminal latch — one `stack_overflow` report on the
+    // 502nd `{`, the synthetic-`;` skip to the first `}`, then the parse
+    // resumes: the 501 open blocks plus the function body consume their
+    // closers, and the 99 leftover `}`s (98 from the run — the body closes
+    // on run-closer #502 — plus the trailing ` }`) reach the unit member
+    // loop (one `expected_executable` per stray closer) — the same cascade
+    // face the oracle streams on corpus deep_nesting_statement_test_01.
     let source: &'static str = Box::leak(
         format!("void f() {{ {}{} }}", "{".repeat(600), "}".repeat(600)).into_boxed_str(),
     );
     let mut p = setup(source);
     p.parse_unit();
-    assert!(p.is_bailed(), "the nesting cap must latch the bailout");
+    assert!(
+        !p.is_bailed(),
+        "the fuse must not latch a terminal bailout: {:?}",
+        p.listener.error_codes()
+    );
     let codes = p.listener.error_codes();
-    assert!(
-        codes.contains(&"stack_overflow".to_owned()),
-        "the terminal diagnostic is stackOverflow: {codes:?}"
+    assert_eq!(
+        codes.iter().filter(|c| *c == "stack_overflow").count(),
+        1,
+        "one stack_overflow report per breach site: {codes:?}"
     );
-    assert!(
-        codes.len() <= 4,
-        "the bailout bounds total diagnostics: {codes:?}"
+    assert_eq!(
+        codes.iter().filter(|c| *c == "expected_executable").count(),
+        99,
+        "the 99 leftover closers fall to the member-loop cascade face: {codes:?}"
     );
+    assert_eq!(codes.len(), 100, "no other noise: {codes:?}");
 }
 
 #[test]

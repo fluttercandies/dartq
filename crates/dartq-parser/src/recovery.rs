@@ -1178,17 +1178,24 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         self.cursor.advance();
     }
 
-    /// Official `recoverFromStackOverflow` (`parser_impl.dart:11386`), the
-    /// statement-depth fuse: report `stackOverflow`, insert a synthetic `;`
-    /// with its `handleEmptyStatement` event, skip to the enclosing `}` (or
-    /// EOF), and latch the terminal bailout so every grammar loop unwinds
-    /// without consuming further tokens.
+    /// Official `recoverFromStackOverflow` (`parser_impl.dart:11353-11365`),
+    /// the statement-depth fuse (`parseStatement`, :6686-6695): report
+    /// `stackOverflow` once on the statement's first token, insert a
+    /// synthetic `;` with its `handleEmptyStatement` event, and skip to the
+    /// enclosing `}` (or EOF) — then CONTINUE parsing. The official guard is
+    /// a local recursion counter (`statementDepth`, decremented on unwind),
+    /// not a terminal latch: the enclosing frames unwind through their
+    /// closers by kind, and the abandoned remainder falls to the ordinary
+    /// recovery faces — the unit member loop reports `expected_executable`
+    /// per stray `}`, which is exactly the oracle's post-fuse cascade on the
+    /// corpus case `deep_nesting_statement_test_01` (9,753 rows: the fuse
+    /// report, 9,750 per-stray-`}` rows, the tail declaration faces). One
+    /// report per breach site: the counter trips only on the 502nd nested
+    /// statement entry, and the unwind brings it back below the cap.
     pub(crate) fn recover_from_stack_overflow(&mut self) {
-        if self.is_bailed() {
-            return;
-        }
-        self.bail(msg::stack_overflow(crate::parser::MAX_DEPTH));
-        let semi = self.synthetic(TokenKind::Semicolon, self.peek_span().range.offset);
+        let at = self.peek_span();
+        self.report(msg::stack_overflow(crate::parser::MAX_DEPTH), at);
+        let semi = self.synthetic(TokenKind::Semicolon, at.range.offset);
         self.listener.handle_empty_statement(semi);
         while !self.cursor.at_eof() && self.peek_kind() != TokenKind::CloseCurly {
             self.cursor.advance();

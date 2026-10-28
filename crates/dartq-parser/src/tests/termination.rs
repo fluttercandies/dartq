@@ -4,8 +4,11 @@
 //! Four axes are pinned here:
 //! 1. the per-file diagnostics cap latches a terminal bailout and stops the
 //!    parse before a pathological input can stream unbounded reports;
-//! 2. the statement/expression nesting guards latch the same bailout on a
-//!    recursion bomb (official `recoverFromStackOverflow`), while the
+//! 2. the statement/expression nesting guards are LOCAL recover-and-continue
+//!    fuses (official `recoverFromStackOverflow`: one `stackOverflow` report
+//!    per breach site, synthetic-`;`/identifier splice, skip to the enclosing
+//!    closer, then keep parsing — the post-fuse cascade rides the ordinary
+//!    recovery faces), while the
 //!    type-descent path (record types, type arguments/variables) carries NO
 //!    observable cap — the official parser counters only
 //!    statement/expression recursion, so oracle-parity depths there must
@@ -136,6 +139,132 @@ fn deep_valid_type_arguments_produce_zero_diagnostics() {
         "the oracle is silent on this shape: {:?}",
         listener.errors.iter().take(5).collect::<Vec<_>>()
     );
+}
+
+/// The corpus cascade (oracle case
+/// `language/syntax/deep_nesting_statement_test_01`): 10,000 nested
+/// `if (x == 0) {` lines inside `main()`, one `}` run closing everything.
+/// The statement-depth fuse trips on the 502nd nested statement entry —
+/// line 263's block `{` (oracle row `stack_overflow` 263:15) — and, being a
+/// LOCAL guard, the parse continues: the open frames unwind through their
+/// closers and the leftover `}` run reaches the unit member loop, one
+/// `expected_executable` per stray closer, then the trailing top-level
+/// declaration `print("survived!");` rides its own faces. The oracle row
+/// set is 9,753 ERROR rows: 1 `stack_overflow` + 9,750
+/// `expected_executable` + `missing_identifier` (10015:9, the string
+/// literal) + `missing_function_body` (10015:21). The per-file diagnostics
+/// cap (10,000) must NOT clip the cascade.
+#[test]
+fn deep_statement_corpus_cascade_matches_oracle_rows() {
+    // The corpus shape, regenerated (ASCII throughout, so UTF-16 offsets
+    // equal byte offsets; only the line/column geometry matters for the
+    // anchors, and every diagnostic-bearing line is byte-identical to the
+    // oracle input's geometry).
+    let mut source = String::new();
+    for _ in 0..8 {
+        source.push_str("// Deeply nested statements must not crash the parser.\n");
+    }
+    source.push('\n'); // line 9
+    source.push_str("var x = 0;\n"); // line 10
+    source.push('\n'); // line 11
+    source.push_str("main() {\n"); // line 12
+    source.push_str("  if (x == 0) {\n"); // line 13
+    for _ in 14..=10012 {
+        source.push_str("  if (x == 0) { //# 01: continued\n");
+    }
+    // Line 10013 is indented like the rest of the body: the 9,999 closers
+    // sit at columns 3..10001 (the first stray cascade anchor is 10013:254
+    // — 251 closers consumed by the unwind: 250 block frames + main's body).
+    source.push_str("  ");
+    source.push_str(&"}".repeat(9_999)); // line 10013
+    source.push_str(" //# 01: continued\n");
+    source.push_str("  }\n"); // line 10014
+    source.push_str("  print(\"survived!\");\n"); // line 10015
+    source.push_str("}\n"); // line 10016
+    let source: &'static str = Box::leak(source.into_boxed_str());
+
+    // 1-based (line, col) -> 0-based UTF-16 offset.
+    fn at(source: &str, line: u32, col: u32) -> u32 {
+        let mut offset = 0u32;
+        for (i, l) in source.lines().enumerate() {
+            if i as u32 + 1 == line {
+                return offset + col - 1;
+            }
+            offset += l.len() as u32 + 1;
+        }
+        panic!("line {line} beyond the input");
+    }
+
+    let (table, text) = scan_ok(source);
+    let mut listener = Collector::default();
+    {
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
+        parser.parse_unit();
+        assert!(
+            !parser.is_bailed(),
+            "9,753 rows sit below the 10,000 diagnostics cap: the cascade \
+             must not be clipped"
+        );
+    }
+    assert_eq!(listener.errors.len(), 9_753, "the oracle's row count");
+    let codes = listener.error_codes();
+    assert_eq!(
+        codes.iter().filter(|c| *c == "stack_overflow").count(),
+        1,
+        "one fuse report per breach site"
+    );
+    assert_eq!(
+        codes.iter().filter(|c| *c == "expected_executable").count(),
+        9_750,
+        "one row per stray closer"
+    );
+    assert_eq!(
+        codes.iter().filter(|c| *c == "missing_identifier").count(),
+        1
+    );
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|c| *c == "missing_function_body")
+            .count(),
+        1
+    );
+    let so: Vec<u32> = listener
+        .errors
+        .iter()
+        .filter(|(c, _, _)| c == "stack_overflow")
+        .map(|(_, s, _)| *s)
+        .collect();
+    assert_eq!(
+        so,
+        vec![at(source, 263, 15)],
+        "the fuse report anchors on line 263's block `{{`"
+    );
+    let exec: Vec<u32> = listener
+        .errors
+        .iter()
+        .filter(|(c, _, _)| c == "expected_executable")
+        .map(|(_, s, _)| *s)
+        .collect();
+    assert_eq!(
+        exec[0],
+        at(source, 10013, 254),
+        "the first stray closer is the oracle's first cascade anchor"
+    );
+    assert_eq!(
+        *exec.last().unwrap(),
+        at(source, 10016, 1),
+        "the last stray closer is the oracle's last cascade anchor"
+    );
+    for (code, start, end) in &listener.errors {
+        if code == "missing_identifier" {
+            assert_eq!(*start, at(source, 10015, 9));
+            assert_eq!(*end, at(source, 10015, 9) + 11, "the string literal span");
+        }
+        if code == "missing_function_body" {
+            assert_eq!(*start, at(source, 10015, 21));
+        }
+    }
 }
 
 /// A written-out-operator chain: every `xor` link fires the entry-floor

@@ -330,8 +330,11 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
     /// Enters a nested statement/expression structure; `false` means a cap was
     /// hit (nesting cap, or the bailout already latched) and the caller must
     /// return immediately without consuming — the enclosing loops' no-progress
-    /// guards unwind. Hitting the nesting cap latches the bailout (official
-    /// `recoverFromStackOverflow`: report `stackOverflow` once and stop).
+    /// guards unwind. Hitting the nesting cap latches the bailout — the
+    /// structured stop for the sub-expression entries that carry no
+    /// `parse_precedence` frame per level (patterns, formal parameters); the
+    /// officially guarded faces (`parseStatement`/`parseExpression`) take
+    /// their own recover-and-continue fuses before this path is reached.
     pub(crate) fn enter_depth(&mut self) -> bool {
         if self.depth_cap_hit(self.depth, MAX_DEPTH) {
             return false;

@@ -622,9 +622,12 @@ fn augment_extension_type_representation_pair() {
     );
 }
 
-/// The statement-depth fuse (`recoverFromStackOverflow`, :11386) fires the
-/// official triple: one `stack_overflow` report, a synthetic `;` with its
-/// `handleEmptyStatement` event, and the skip to `}`/EOF.
+/// The statement-depth fuse (`recoverFromStackOverflow`,
+/// parser_impl.dart:11353-11365) fires the official triple: one
+/// `stack_overflow` report, a synthetic `;` with its `handleEmptyStatement`
+/// event, and the skip to `}`/EOF — then the parse CONTINUES (the guard is
+/// a local recursion counter, not a terminal latch): the if-chain frames
+/// unwind without needing closers and the function body closes cleanly.
 #[test]
 fn stack_overflow_fuse_triple() {
     let nested: &'static str =
@@ -634,8 +637,8 @@ fn stack_overflow_fuse_triple() {
     let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     assert!(
-        p.is_bailed(),
-        "the depth fuse must latch the terminal bailout"
+        !p.is_bailed(),
+        "the fuse must not latch a terminal bailout"
     );
     assert_eq!(
         p.listener.error_codes(),

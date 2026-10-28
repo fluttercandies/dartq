@@ -847,11 +847,13 @@ fn written_out_operator_recovery_reports_once() {
 // —— termination ——————————————————————————————————————————————————————————
 
 #[test]
-fn deep_nesting_latches_the_bailout() {
+fn deep_nesting_expression_fuse_continues() {
     // 600 nested list literals inside a variable initializer: the official
     // expressionDepth guard (parser_impl.dart:6939-6963) is LOCAL — one
     // stackOverflow report, skip to the group end, synthetic-identifier
-    // splice, and the parse completes without a terminal bailout.
+    // splice, and the parse completes without a terminal bailout. The full
+    // post-fuse tail is pinned exactly by
+    // stack_overflow_fuse_tail_normal_unwind (gate_m0_wave8).
     let source: &'static str = Box::leak(
         format!(
             "void f() {{ var x = {}1{}; }}",
@@ -862,10 +864,14 @@ fn deep_nesting_latches_the_bailout() {
     );
     let mut p = setup(source);
     p.parse_unit();
+    assert!(
+        !p.is_bailed(),
+        "the expression fuse is local: no terminal bailout"
+    );
     let codes = p.listener.codes();
     assert!(
         codes.contains(&"stack_overflow".to_owned()),
-        "the terminal diagnostic is the official stackOverflow code: {:?}",
+        "the fuse diagnostic is the official stackOverflow code: {:?}",
         codes.last()
     );
 }
