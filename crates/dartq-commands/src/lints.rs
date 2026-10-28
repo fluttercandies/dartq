@@ -72,16 +72,15 @@ use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, SourceRange};
 use dartq_engine::analysis_options::{
     AnalysisOptions, canonical_diagnostic_name, is_known_diagnostic_code,
 };
-use dartq_engine::{Engine, LibraryId, Reachability};
+use dartq_engine::{Engine, LibraryId, Reachability, YamlIgnores};
 use dartq_flow::FlowFact;
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_lints::{
-    AsyncContextUse, Comments, EnableSet, Features, IgnoreInfo, Lint, PathVerdict, RULES,
-    ReachabilityFace, RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_path_entry,
-    check_section, check_url, is_breaking_version, mounts_semantics, parse_unit,
-    parse_unit_with_tokens, resolve_dependency_path, rule_by_name, run,
-    run_breaking_version_annotations, scan_path_entries, scan_screenshot_entries, type_use_counts,
-    unignorable_ignores, unnecessary_ignore_analyzer_rows, unnecessary_ignore_late_rows,
+    AsyncContextUse, Comments, EnableSet, Features, IgnoreInfo, Lint, RULES,
+    ReachabilityFace, RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_section,
+    check_url, is_breaking_version, mounts_semantics, parse_unit, parse_unit_with_tokens,
+    rule_by_name, run, run_breaking_version_annotations, type_use_counts, unignorable_ignores,
+    unnecessary_ignore_analyzer_rows, unnecessary_ignore_late_rows,
 };
 use dartq_package::PackageIdentity;
 use dartq_parser::ParserFeatures;
@@ -119,7 +118,10 @@ pub fn enable_set(rules: Option<&[String]>) -> EnableSet {
 /// resolve the names. The pubspec dependency-validator family (upstream
 /// Dart SDK source,
 /// `pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart`,
-/// `diagnostic.g.dart` :13986-14030) and the type-check warning (the
+/// `diagnostic.g.dart` :13986-14030) emits from the engine's validator
+/// face (`Engine::analyze`'s `validator_issue_rows`); this table keeps
+/// the three names' `CodeInfo` identity for the registry-parallel
+/// `CODES` mapping. The type-check warning (the
 /// always-on `BestPracticesVerifier` pass, upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/error/best_practices_verifier.dart:987-1041`,
 /// `diagnostic.g.dart` :17642-17666 — the linter-side rule file left the
@@ -1544,18 +1546,16 @@ fn unignorable_rows(
 /// boundary, upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/workspace/pub.dart` `findPackageFor` :341-351,
 /// and the oracle's driver lints every pubspec under the analysis roots)
-/// — under the same enable-set resolution the Dart files get, plus the
+/// — under the same enable-set resolution the Dart files get. The
 /// dependency-validator family (`path_not_posix`, `path_does_not_exist`,
-/// `path_pubspec_does_not_exist`) always-on: the oracle's validator runs
-/// unconditionally (`dependency_validator.dart` `validatePathEntries`
-/// :42-93 — no enable-set gate; the publishability flag it takes only
-/// drives the separate `invalid_dependency` code), so the family scan
-/// runs regardless of `set`. A listed family name in `linter.rules`
-/// cannot double-report — the specs register `kinds: &[]`, so the AST run
-/// stays silent and this pass is the family's only emission path. A
-/// capture miss (no engine pass yet, or no pubspec file) leaves the file
-/// unreported. Rows carry the official value-node span (UTF-16 over the
-/// pubspec text) and the `IgnoreInfo.forYaml` suppression face.
+/// `path_pubspec_does_not_exist`) and the screenshots `path` checks emit
+/// from the engine's validator face (`Engine::analyze`'s
+/// `validator_issue_rows`), not here: this pass owns only the three
+/// enable-set-gated lints. A listed family name in `linter.rules` cannot
+/// double-report — the specs register `kinds: &[]`, so the AST run stays
+/// silent and the validator face is the family's only emission path. Rows
+/// carry the official value-node span (UTF-16 over the pubspec text) and
+/// the `IgnoreInfo.forYaml` suppression face.
 #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     let dirs: Vec<PathBuf> = engine
@@ -1563,14 +1563,6 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
         .iter()
         .filter_map(|path| path.parent().map(Path::to_path_buf))
         .collect();
-    // The family's rules, resolved per verdict — the registry pins all
-    // three names (the registry pin test), so a miss is a build-invariant
-    // break and reports loudly instead of dropping oracle rows.
-    let path_rule = |verdict: PathVerdict| match verdict {
-        PathVerdict::NotPosix => rule_by_name("path_not_posix"),
-        PathVerdict::DoesNotExist => rule_by_name("path_does_not_exist"),
-        PathVerdict::PubspecDoesNotExist => rule_by_name("path_pubspec_does_not_exist"),
-    };
 
     let mut out = Vec::new();
     for dir in dirs {
@@ -1593,14 +1585,7 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
         let urls_on = urls_rule.is_some_and(|id| set.is_enabled(id));
         let names_on = names_rule.is_some_and(|id| set.is_enabled(id));
         let sort_on = sort_rule.is_some_and(|id| set.is_enabled(id));
-        let path_entries = scan_path_entries(text);
-        let screenshot_entries = scan_screenshot_entries(text);
-        if !urls_on
-            && !names_on
-            && !sort_on
-            && path_entries.is_empty()
-            && screenshot_entries.is_empty()
-        {
+        if !urls_on && !names_on && !sort_on {
             continue;
         }
         let facts = scan_pubspec(text);
@@ -1664,62 +1649,6 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
                     correction: spec.render_correction(&[]),
                 });
             }
-        }
-        // The `validatePathEntries` walk (upstream Dart SDK source,
-        // pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart
-        // :51-77): each scanned `path:` value in document order, judged
-        // against the resolved folder's existence facts — `is_dir` reads
-        // `getFolder(..).exists` (a regular file reads as a missing
-        // folder) and a `pubspec.yaml` file inside reads
-        // `getChild(..).exists`. The row anchors at the raw value span
-        // (quotes included, the `YamlNode.span` face) with the cooked
-        // scalar as the message argument, and shares the pass's
-        // `IgnoreInfo.forYaml` suppression face.
-        for entry in path_entries {
-            let resolved = resolve_dependency_path(&dir, &entry.path);
-            let folder_exists = resolved.is_dir();
-            let pubspec_exists = folder_exists && resolved.join("pubspec.yaml").is_file();
-            let Some(verdict) = check_path_entry(&entry.path, folder_exists, pubspec_exists) else {
-                continue;
-            };
-            let rule = path_rule(verdict).expect("registry-pinned dependency-validator code");
-            let spec = &RULES[rule.0 as usize];
-            let (line, _) = lines.byte_to_line_col(saturate_slot_u32(entry.range.start));
-            if ignores.ignored(line, spec.name) {
-                continue;
-            }
-            rows.push(Lint {
-                rule,
-                range: utf16_range(&lines, text, &entry.range),
-                message: spec.render_problem(&[entry.path.as_str()]),
-                correction: spec.render_correction(&[]),
-            });
-        }
-        // The `screenshotsValidator` walk (upstream Dart SDK source,
-        // pkg/analyzer/lib/src/pubspec/validators/screenshot_validator.dart
-        // :12-38): each `screenshots:` list item's `path` field, judged
-        // against the resolved *file*'s existence (`provider.getFile` —
-        // a directory at the resolved path still misses). Shares the
-        // pass's `IgnoreInfo.forYaml` suppression face and the
-        // `path_does_not_exist` spec.
-        for entry in screenshot_entries {
-            let resolved = resolve_dependency_path(&dir, &entry.path);
-            if resolved.is_file() {
-                continue;
-            }
-            let rule =
-                rule_by_name("path_does_not_exist").expect("registry-pinned path_does_not_exist");
-            let spec = &RULES[rule.0 as usize];
-            let (line, _) = lines.byte_to_line_col(saturate_slot_u32(entry.range.start));
-            if ignores.ignored(line, spec.name) {
-                continue;
-            }
-            rows.push(Lint {
-                rule,
-                range: utf16_range(&lines, text, &entry.range),
-                message: spec.render_problem(&[entry.path.as_str()]),
-                correction: spec.render_correction(&[]),
-            });
         }
         out.extend(rows.into_iter().map(|lint| row(lint, file)));
     }
@@ -1832,89 +1761,6 @@ fn utf16_range(
     lines.byte_to_utf16(text, range.start as u32)..lines.byte_to_utf16(text, range.end as u32)
 }
 
-/// The YAML-face suppression table (`IgnoreInfo.forYaml`,
-/// pkg/analyzer/lib/src/ignore_comments/ignore_info.dart:97-104, 145-163):
-/// `# ignore:` entries — alone on their line suppress the NEXT line,
-/// trailing suppress their own — and `# ignore_for_file:` entries
-/// file-wide. The names are the comma-separated, whitespace-trimmed list;
-/// matching is case-insensitive (the Dart-token comment path is a
-/// different face and is not reused).
-struct YamlIgnores {
-    on_line: FxHashMap<u32, Vec<String>>,
-    for_file: Vec<String>,
-}
-
-impl YamlIgnores {
-    fn parse(text: &str) -> Self {
-        let mut info = Self {
-            on_line: FxHashMap::default(),
-            for_file: Vec::new(),
-        };
-        for (index, line) in text.lines().enumerate() {
-            let line_no = saturate_slot_u32(index) + 1;
-            if let Some((before, names)) = yaml_ignore_entry(line, "ignore:") {
-                // Alone on the line -> the next line (ignore_info.dart:157).
-                let target = if before.trim().is_empty() {
-                    line_no + 1
-                } else {
-                    line_no
-                };
-                info.on_line.entry(target).or_default().extend(names);
-            }
-            if let Some((_, names)) = yaml_ignore_entry(line, "ignore_for_file:") {
-                info.for_file.extend(names);
-            }
-        }
-        info
-    }
-
-    /// Whether a lint named `name` reported on 1-based `line` is
-    /// suppressed (`_ignoredAt`, ignore_info.dart:186-212).
-    fn ignored(&self, line: u32, name: &str) -> bool {
-        self.for_file
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(name))
-            || self
-                .on_line
-                .get(&line)
-                .is_some_and(|entries| entries.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
-    }
-}
-
-/// The `#`-commented marker entry of one YAML line: the text before the
-/// `#` run, and the name list after the marker. The official regexes'
-/// greedy `.*` reads the LAST `#` run the rest still matches from; the
-/// scan keeps the last candidate the same way.
-fn yaml_ignore_entry<'a>(line: &'a str, marker: &str) -> Option<(&'a str, Vec<String>)> {
-    let bytes = line.as_bytes();
-    let mut found = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b != b'#' {
-            continue;
-        }
-        let mut j = i;
-        while j < bytes.len() && bytes[j] == b'#' {
-            j += 1;
-        }
-        let mut k = j;
-        while k < bytes.len() && bytes[k] == b' ' {
-            k += 1;
-        }
-        if line[k..].starts_with(marker) {
-            found = Some((&line[..i], &line[k + marker.len()..]));
-        }
-    }
-    found.map(|(before, rest)| {
-        (
-            before,
-            rest.split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        )
-    })
-}
 
 /// The options entry governing a file in `dir`: the nearest
 /// `analysis_options.yaml` at or above `dir`
@@ -2710,7 +2556,8 @@ void stray() {}
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The dependency-validator family mounts always-on: no options file
+    /// The dependency-validator family mounts always-on (from the
+    /// engine's validator face, not this pass): no options file
     /// (the options-less posture enables zero lints) and the path rows
     /// still report — the oracle's `validatePathEntries` runs
     /// unconditionally — with the family's `STATIC_WARNING` severity, the

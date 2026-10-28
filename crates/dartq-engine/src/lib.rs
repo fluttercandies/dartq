@@ -77,6 +77,7 @@ use dartq_snapshot::{
 use dartq_source::{
     FileId, FileTable, LineIndex, MemorySourceStore, MmapSourceStore, OpenError,
     PooledMappedSourceStore, PooledSourceStore, SourceStore, SourceText, StringTable,
+    saturate_slot_u32,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -530,7 +531,8 @@ impl Engine {
         // materialize at the first `warm_step`. A cancelled run skipped
         // the `?` above, so a partial settle arms nothing.
         self.state.arm_warm();
-        let rows = self.option_issue_rows();
+        let mut rows = self.option_issue_rows();
+        rows.extend(self.validator_issue_rows());
         if !rows.is_empty() {
             // The engine rows leave the pipeline canonically sorted; the
             // merged set stays canonical for the rows' (rare, cold) addition.
@@ -574,7 +576,8 @@ impl Engine {
         self.capture_nested_pubspecs();
         // The settle's arming point (#2739), as in [`Self::analyze`].
         self.state.arm_warm();
-        let rows = self.option_issue_rows();
+        let mut rows = self.option_issue_rows();
+        rows.extend(self.validator_issue_rows());
         if rows.is_empty() && !self.severity_overrides_present() {
             return Ok(shared);
         }
@@ -843,6 +846,65 @@ impl Engine {
                     .map(move |issue| issue.to_diagnostic(file))
             })
             .collect()
+    }
+
+    /// The pubspec/AndroidManifest validator face's rows: every captured
+    /// pubspec runs the seven upstream validators
+    /// ([`analysis_options::pubspec_issues`]) and every captured
+    /// `android/AndroidManifest.xml` runs the manifest validator
+    /// ([`analysis_options::manifest_issues`]) — the oracle's engagement
+    /// phase, analysis time: the CLI driver validates each walked pubspec
+    /// and manifest alongside the Dart files of the same batch (upstream
+    /// Dart SDK source, `pkg/analyzer_cli/lib/src/driver.dart` :301-344,
+    /// :346-381). Manifest rows gate on the governing options'
+    /// `chrome-os-manifest-checks` (driver.dart :358 — the file's own
+    /// options, resolved by the same deepest-ancestor rule the severity
+    /// face uses), default off (`analysis_options.dart` :54). Each
+    /// pubspec's rows pass the `IgnoreInfo.forYaml` suppression face the
+    /// same engagement applies (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart` :80-83; the
+    /// manifest branch carries none). Callers append the returned rows and
+    /// re-sort canonically; the severity face re-levels them with the rest
+    /// of the output (driver.dart :322, :374). Empty in the common case.
+    fn validator_issue_rows(&mut self) -> Vec<Diagnostic> {
+        let mut rows = Vec::new();
+        for path in self.captured_pubspecs() {
+            let Some(dir) = path.parent() else { continue };
+            let file = self.state.files.intern(&path);
+            let Some((text, index)) = self.state.reported.get(&file) else {
+                continue;
+            };
+            let issues = analysis_options::pubspec_issues(text, dir);
+            if issues.is_empty() {
+                continue;
+            }
+            let ignores = YamlIgnores::parse(text);
+            for issue in issues {
+                let (line, _) = index.line_col_utf16(text, issue.offset);
+                if ignores.ignored(line, issue.code.name) {
+                    continue;
+                }
+                rows.push(issue.to_diagnostic(file));
+            }
+        }
+        for path in self.captured_manifests() {
+            let check_manifest = path
+                .ancestors()
+                .find_map(|dir| self.state.options.get(dir))
+                .and_then(|options| options.chrome_os_manifest_checks)
+                .unwrap_or(false);
+            if !check_manifest {
+                continue;
+            }
+            let file = self.state.files.intern(&path);
+            let Some((text, _)) = self.state.reported.get(&file) else {
+                continue;
+            };
+            for issue in analysis_options::manifest_issues(text, true) {
+                rows.push(issue.to_diagnostic(file));
+            }
+        }
+        rows
     }
 
     /// Whether any governing options entry declares an `analyzer.errors`
@@ -2098,6 +2160,93 @@ pub fn pooled_mmap_store(pool: &MappedContentPool) -> Box<dyn SourceStore + Send
     Box::new(PooledMappedSourceStore::new(pool))
 }
 
+/// The YAML-face ignore-comment suppression table (`IgnoreInfo.forYaml`,
+/// upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/ignore_comments/ignore_info.dart` :145-166):
+/// `# ignore: name, name` entries suppress by 1-based line — an entry
+/// alone on its line suppresses the NEXT line (:157, `beforeComment`
+/// empty) — plus file-wide `# ignore_for_file:` entries. The pubspec
+/// validator face and the pubspec lint face share it.
+pub struct YamlIgnores {
+    on_line: FxHashMap<u32, Vec<String>>,
+    for_file: Vec<String>,
+}
+
+impl YamlIgnores {
+    /// Parses the ignore entries of one YAML file's text.
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        let mut info = Self {
+            on_line: FxHashMap::default(),
+            for_file: Vec::new(),
+        };
+        for (index, line) in text.lines().enumerate() {
+            let line_no = saturate_slot_u32(index) + 1;
+            if let Some((before, names)) = yaml_ignore_entry(line, "ignore:") {
+                // Alone on the line -> the next line (ignore_info.dart:157).
+                let target = if before.trim().is_empty() {
+                    line_no + 1
+                } else {
+                    line_no
+                };
+                info.on_line.entry(target).or_default().extend(names);
+            }
+            if let Some((_, names)) = yaml_ignore_entry(line, "ignore_for_file:") {
+                info.for_file.extend(names);
+            }
+        }
+        info
+    }
+
+    /// Whether a diagnostic named `name` reported on 1-based `line` is
+    /// suppressed (`_ignoredAt`, ignore_info.dart:186-212).
+    #[must_use]
+    pub fn ignored(&self, line: u32, name: &str) -> bool {
+        self.for_file
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(name))
+            || self
+                .on_line
+                .get(&line)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
+    }
+}
+
+/// The `#`-commented marker entry of one YAML line: the text before the
+/// `#` run, and the name list after the marker. The official regexes'
+/// greedy `.*` reads the LAST `#` run the rest still matches from; the
+/// scan keeps the last candidate the same way.
+fn yaml_ignore_entry<'a>(line: &'a str, marker: &str) -> Option<(&'a str, Vec<String>)> {
+    let bytes = line.as_bytes();
+    let mut found = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'#' {
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j] == b'#' {
+            j += 1;
+        }
+        let mut k = j;
+        while k < bytes.len() && bytes[k] == b' ' {
+            k += 1;
+        }
+        if line[k..].starts_with(marker) {
+            found = Some((&line[..i], &line[k + marker.len()..]));
+        }
+    }
+    found.map(|(before, rest)| {
+        (
+            before,
+            rest.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2638,6 +2787,64 @@ mod tests {
         assert!(engine.state.residency_epoch > engine.nested_scan_epoch);
         engine.capture_nested_pubspecs();
         assert_eq!(engine.nested_scan_passes, 2);
+    }
+
+    /// The validator face's mount (#2773): a bad pubspec (the
+    /// `missing_name` shape) analyzed through the real pipeline emits the
+    /// validator's row exactly once, attributed to the pubspec file
+    /// itself — the commands-side pubspec pass carries no family rows
+    /// anymore, so this face is the row's only source.
+    #[test]
+    fn pubspec_validator_row_flows_through_analyze_once() {
+        let (root, mut engine) = facade_engine();
+        std::fs::write(root.join("pubspec.yaml"), "environment:\n  sdk: ^3.5.0\n")
+            .expect("pubspec");
+        engine.set_content(&root.join("lib/a.dart"), b"void a() {}\n");
+        let cancel = CancellationToken::new();
+        let events = &mut |_: EngineEvent| {};
+        let rows = engine.analyze(&[], events, &cancel).expect("analyze");
+        assert_eq!(rows.len(), 1, "exactly one validator row: {rows:?}");
+        assert_eq!(rows[0].code.name, "missing_name");
+        assert_eq!(
+            engine.state.files.path(rows[0].file),
+            Some(root.join("pubspec.yaml").as_path()),
+        );
+    }
+
+    /// The manifest face's gate (#2773): the captured
+    /// `android/AndroidManifest.xml` validates only when the governing
+    /// options enable `chrome-os-manifest-checks` — off by default (the
+    /// oracle's field default, `analysis_options.dart` :54), on for a
+    /// root entry carrying it, the `no_touchscreen_feature` row emitting
+    /// exactly once when enabled.
+    #[test]
+    fn manifest_validator_rows_honor_the_gate() {
+        let (root, mut engine) = facade_engine();
+        std::fs::create_dir_all(root.join("android")).expect("android dir");
+        std::fs::write(
+            root.join("android/AndroidManifest.xml"),
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n</manifest>\n",
+        )
+        .expect("manifest");
+        engine.set_content(&root.join("lib/a.dart"), b"void a() {}\n");
+        let cancel = CancellationToken::new();
+        let events = &mut |_: EngineEvent| {};
+        let off = engine.analyze(&[], events, &cancel).expect("gate off");
+        assert!(
+            off.iter().all(|row| row.code.name != "no_touchscreen_feature"),
+            "default is off: {off:?}"
+        );
+        let mut options = analysis_options::AnalysisOptions::default();
+        options.chrome_os_manifest_checks = Some(true);
+        engine.state.options.insert(root.clone(), Arc::new(options));
+        let on = engine.analyze(&[], events, &cancel).expect("gate on");
+        assert_eq!(
+            on.iter()
+                .filter(|row| row.code.name == "no_touchscreen_feature")
+                .count(),
+            1,
+            "exactly one manifest row: {on:?}"
+        );
     }
 
     /// The shared-output face (#1387), end to end through the facade: the
