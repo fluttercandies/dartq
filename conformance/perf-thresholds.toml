@@ -1,0 +1,94 @@
+# dartq performance regression thresholds — the 2026-10-28 P1 baseline
+# frozen as machine-readable gates, consumed by scripts/perf-gate.sh (run it
+# directly, or opt in via DARTQ_PERF=1 in scripts/conformance-gate.sh).
+#
+# Posture: a gate here is a REGRESSION tripwire, not a leaderboard. The
+# thresholds absorb ordinary measurement noise and no more:
+#
+#     wall: baseline x 1.25        peak RSS: baseline x 1.15
+#
+# Slack rationale: 25% of wall covers cross-machine variance (the baseline
+# came from one Apple M1 Max box), CPU thermal throttling, and cold-cache
+# noise on a shared host. Peak memory is far steadier run to run, so 15%
+# is enough while still catching the failure classes that matter — an
+# algorithmic regression, a new copy on a hot path, an unbounded cache. A
+# noisy reference run on a loaded machine may still trip the wall face;
+# that is the tripwire doing its job. Re-run on a quiet machine before
+# touching a threshold, and never loosen one to make a noisy run pass.
+#
+# Inputs are resolved through the per-gate DARTQ_PERF_INPUT_<GATE-ID>
+# env vars (the requires field below; the id uppercased with dashes as
+# underscores) pointing at an input root. A gate whose input is absent is
+# reported SKIP with the variable to set — a perf gate never silently
+# passes. analyzer-cold and concurrency-5x can additionally resolve their
+# input without any configuration: the pub-cache analyzer package at the
+# version pinned in conformance/realworld.toml.
+#
+# Platform of record: Apple M1 Max (10 cores), 32 GiB, macOS arm64,
+# measured with /usr/bin/time -l (peak RSS in bytes) plus a 0.5 s ps
+# sampler for the concurrency face.
+
+[meta]
+date = "2026-10-28"
+baseline_report = "perf/baseline-2026-10-28.md in the internal audit tree (not tracked in this repository)"
+binary_commit = "db4216c5d6338d01f7addc26df9cd6bdd8022a30"
+oracle_version = "Dart 3.13.7 stable"
+machine = "Apple M1 Max (10 cores), 32 GiB RAM, macOS arm64"
+protocol = "medians of 3 runs; dartq --cold against a cache-warm oracle (see the baseline report's warmth caveat)"
+# Diff-mode slack factors, consumed by scripts/perf-bench.sh: a stored-
+# baseline diff fails when the new wall exceeds the reference x wall_slack
+# or the new peak RSS exceeds the reference x rss_slack — the same noise
+# envelope the absolute max fields in the [[gate]] entries were derived
+# from. Kept here so both consumers read one source of truth.
+wall_slack = 1.25
+rss_slack = 1.15
+
+[[gate]]
+id = "analyzer-cold"
+description = "one cold analyze of the analyzer package (447 files, 317,851 LOC)"
+input = "analyzer package source at the version pinned in conformance/realworld.toml; the script falls back to the pub-cache copy when the env var is unset"
+requires = "DARTQ_PERF_INPUT_ANALYZER_COLD"
+baseline_wall_s = 4.41
+baseline_rss_mib = 189.2
+wall_p50_max_s = 5.51
+rss_max_mib = 217.6
+
+[[gate]]
+id = "concurrency-5x"
+description = "5 parallel cold analyzes of the analyzer package (the product's stated 5-instance ceiling); wall is the batch makespan, RSS is the coincident 5-process sum sampled every 0.5 s"
+input = "same input as analyzer-cold"
+requires = "DARTQ_PERF_INPUT_CONCURRENCY_5X"
+baseline_wall_s = 6.84
+baseline_rss_mib = 951.0
+wall_p50_max_s = 8.55
+rss_max_mib = 1093.7
+
+[[gate]]
+id = "mega100k-cold"
+description = "one cold analyze of the generated mega/100k corpus (99,598 files, 5,397,638 LOC)"
+input = "the mega/100k corpus root; no longer present in this checkout, so the gate skips until a corpus copy is provided"
+requires = "DARTQ_PERF_INPUT_MEGA100K_COLD"
+baseline_wall_s = 23.18
+baseline_rss_mib = 1281.0
+wall_p50_max_s = 28.98
+rss_max_mib = 1473.2
+
+[[gate]]
+id = "small16-cold-sum"
+description = "16 small pub packages analyzed one after another, wall times summed (every run sits on dartq's ~0.64 s CLI startup floor); wall-sum only — a sequential RSS sum is not a footprint, so RSS is not gated here"
+input = "one directory holding the 16 packages as subdirectories (the set pinned in conformance/realworld.toml)"
+requires = "DARTQ_PERF_INPUT_SMALL16_COLD_SUM"
+baseline_wall_s = 10.34
+wall_p50_max_s = 12.93
+
+[[gate]]
+id = "incremental-edit"
+description = "resident daemon, single-line edits to the 1.6 MB ast.dart in the analyzer corpus; P50/P95 over 20 rounds, RSS is the daemon's sampled peak"
+input = "analyzer corpus copy driven through the daemon RPC edit driver (the A6 protocol of the baseline report); perf-gate.sh reports this gate SKIP — it needs the driver session, not a plain analyze"
+requires = "DARTQ_PERF_INPUT_INCREMENTAL_EDIT"
+baseline_wall_p50_s = 4.27
+baseline_wall_p95_s = 5.52
+baseline_rss_mib = 600.0
+wall_p50_max_s = 5.34
+wall_p95_max_s = 6.90
+rss_max_mib = 690.0
