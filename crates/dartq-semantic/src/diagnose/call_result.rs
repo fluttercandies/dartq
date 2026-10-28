@@ -102,7 +102,7 @@ impl Engine<'_> {
                 ..
             },
         } = *recv
-            && let Some((found, _)) = resolve_container(
+            && let Some((found, owner)) = resolve_container(
                 self.graph,
                 self.namespaces,
                 self.index,
@@ -112,7 +112,16 @@ impl Engine<'_> {
             )
         {
             for (index, param) in found.type_param_names.iter().enumerate() {
-                let bound = found.type_param_bounds.get(index).copied().unwrap_or(Ty::Dynamic);
+                // The declaration's bounds interned in the OWNER unit's
+                // pool — project into the diagnosing universe before any
+                // walk or comparison (a foreign slot read through
+                // `boundary.pool()` is an out-of-bounds index, the same
+                // projection every `resolve_container` consumer makes).
+                let bound = found
+                    .type_param_bounds
+                    .get(index)
+                    .map(|&bound| self.boundary.ty(owner, bound))
+                    .unwrap_or(Ty::Dynamic);
                 let mut self_referential = false;
                 self.boundary.pool().visit_named(bound, &mut |named| {
                     if let Ty::Named { name, .. } = named

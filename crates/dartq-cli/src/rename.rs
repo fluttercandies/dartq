@@ -90,9 +90,9 @@ fn parse_target(spec: &str) -> Result<(PathBuf, Anchor), String> {
 /// Crash tier like the other faces: a panic aborts with exit 4 and stdout
 /// kept empty, because [`run`] writes only after the run succeeded.
 pub(crate) fn run_entry(args: &RenameArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = crate::crash_tier(|| {
         run(args, &mut io::BufWriter::new(io::stdout().lock()))
-    }));
+    });
     if let Ok(code) = outcome {
         code
     } else {

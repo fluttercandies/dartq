@@ -781,7 +781,7 @@ struct BatchArgs {
 
 #[derive(Args)]
 struct SymbolArgs {
-    /// The symbol name to look up.
+    /// The symbol name to look up; under `--fuzzy`, the fuzzy query.
     name: String,
     /// Package directory holding pubspec.yaml and
     /// `.dart_tool/package_config.json`; defaults to the current directory.
@@ -800,6 +800,14 @@ struct SymbolArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     sdk: Option<PathBuf>,
+    /// Fuzzy discovery instead of the exact lookup: the declarations whose
+    /// names fuzzy-match the argument, best-first in the `decls` rows —
+    /// exact prefix, then word-boundary camelCase, then contiguous
+    /// substring, then sparse subsequence, case-insensitively; ties by
+    /// name length, then lexicographic; capped at the top 32. Answers on
+    /// the symbol face only (no reference rows are joined).
+    #[arg(long)]
+    fuzzy: bool,
 }
 
 /// Severity arithmetic: the highest fatal tier present.
@@ -887,9 +895,7 @@ fn check_run(args: &CheckArgs, out: &mut impl Write) -> u8 {
     // stdout kept empty — a partial diagnostic set must never masquerade as a
     // valid {0,1,2,3} result.
     let analyze_at = Instant::now();
-    let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dartq_commands::check::analyze_targets(&args.paths, &files)
-    }));
+    let analyzed = crash_tier(|| dartq_commands::check::analyze_targets(&args.paths, &files));
     let analyze_ms = elapsed_ms(analyze_at.elapsed());
     let run = match analyzed {
         Ok(Ok(run)) => run,
@@ -1033,9 +1039,7 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
     if args.fast {
         return check(&check_from_analyze(args));
     }
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        analyze_run(args, &mut BufWriter::new(io::stdout().lock()))
-    }));
+    let outcome = crash_tier(|| analyze_run(args, &mut BufWriter::new(io::stdout().lock())));
     if let Ok(code) = outcome {
         code
     } else {
@@ -1329,7 +1333,7 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
 fn under_crash_tier<T>(
     pass: impl FnOnce() -> Result<T, dartq_commands::analyze::AnalyzeError>,
 ) -> Result<T, u8> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
+    match crash_tier(pass) {
         Ok(Ok(run)) => Ok(run),
         Ok(Err(error)) => {
             eprintln!("dartq: internal error: {error}");
@@ -1340,6 +1344,79 @@ fn under_crash_tier<T>(
             Err(exit::INTERNAL_ERROR)
         }
     }
+}
+
+/// Serializes crash-tier hook arm/disarm: hook install/remove is
+/// process-global, so two passes arming at once could drop a restore. The
+/// guard is held only across the arm and disarm, never across `pass` — a
+/// nested crash tier inside `pass` (the analyze face wraps
+/// `analyze_targets`'s own tier) must not deadlock on it; the thread-local
+/// `ARMED` flag collapses the inner tier into a plain `catch_unwind`
+/// (the outer arming's hook already covers every panic in the subtree).
+static CRASH_TIER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// This thread already armed the crash-tier hook around an enclosing
+    /// pass: a nested tier skips re-arming — the outer hook fires on any
+    /// panic in the subtree, and hook disarm belongs to the outermost tier.
+    static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One crash-tier pass with deterministic panic death: a panic anywhere in
+/// `pass` — on the calling thread or on a rayon worker the pass spawned —
+/// exits the process at the internal tier, never relies on unwind
+/// propagation. `catch_unwind` alone cannot save the face: the panic rides
+/// back through rayon's job join, which stays open until every sibling job
+/// of the same fan-out completes — a sibling's own unbounded work would
+/// hold the join open forever and leave the process spinning at 100% CPU
+/// (the post-panic hang class). The armed hook prints the panic through
+/// the previous (default) hook, then `process::exit`s — sibling jobs die
+/// with the process, the crash tier's stdout-stays-empty contract holds
+/// (the writers buffer until success). The hook is chained over whatever
+/// was installed before and restored when `pass` returns; a panic that
+/// fires under it never unwinds, so `catch_unwind` below stays the
+/// belt-and-suspenders tier for a hook bypass (`panic=abort` builds,
+/// non-hook panic paths), not the mechanism.
+pub(crate) fn crash_tier<T>(pass: impl FnOnce() -> T) -> std::thread::Result<T> {
+    if ARMED.get() {
+        // Nested tier inside an armed ancestor: the ancestor's hook covers
+        // this subtree — run the plain unwind tier rather than re-arm (and
+        // rather than serialize on the lock `pass` itself may still hold).
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass));
+    }
+    // Arm under the lock, run unlocked, disarm under the lock — the guard
+    // scope is the swap only, so a nested tier inside `pass` never waits on
+    // it (the `ARMED` flag above is the re-entrancy answer).
+    let previous: std::sync::Arc<
+        dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static,
+    > = {
+        let _guard = CRASH_TIER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `take_hook` moves the installed hook out — shared ownership so the
+        // armed hook can chain to it AND the disarm can reinstall the same
+        // hook.
+        let previous: std::sync::Arc<
+            dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static,
+        > = std::panic::take_hook().into();
+        let chained = std::sync::Arc::clone(&previous);
+        std::panic::set_hook(Box::new(move |info| {
+            chained(info);
+            std::process::exit(i32::from(exit::INTERNAL_ERROR));
+        }));
+        previous
+    };
+    ARMED.set(true);
+    let armed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass));
+    ARMED.set(false);
+    {
+        let _guard = CRASH_TIER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+    }
+    armed
 }
 
 /// The analyze face's CLI overrides (#938): `--packages` and the
@@ -1853,10 +1930,23 @@ fn query_references(args: &SymbolArgs) -> u8 {
     }
 }
 
+/// `--fuzzy` rides the symbol face only: the discovery answer joins no
+/// reference rows, so the reference-family faces refuse the flag up front
+/// (the usage tier) instead of silently answering their exact semantics.
+fn refuse_fuzzy(args: &SymbolArgs) -> Option<u8> {
+    args.fuzzy.then(|| {
+        eprintln!("error: --fuzzy answers `dartq query symbol` only");
+        exit::USAGE
+    })
+}
+
 /// the references face's runner: the routed consult with the references
 /// kind, then the symbol runner verbatim (the seam where the faces'
 /// rows diverge).
 fn query_references_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = refuse_fuzzy(args) {
+        return code;
+    }
     if let Some(code) = resident::route_query(args, QueryKind::References, out) {
         return code;
     }
@@ -1881,6 +1971,9 @@ fn query_callers(args: &SymbolArgs) -> u8 {
 /// (`dartq_commands::query::callers`); exit 0 on success, zero results
 /// included.
 fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = refuse_fuzzy(args) {
+        return code;
+    }
     if let Some(code) = resident::route_query(args, QueryKind::Callers, out)
     {
         return code;
@@ -1931,6 +2024,9 @@ fn query_implementations(args: &SymbolArgs) -> u8 {
 /// (`dartq_commands::query::implementations`); exit 0 on success, zero
 /// results included. The routed consult leads (#2629).
 fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = refuse_fuzzy(args) {
+        return code;
+    }
     if let Some(code) =
         resident::route_query(args, QueryKind::Implementations, out)
     {
@@ -1983,6 +2079,9 @@ fn query_dependencies(args: &SymbolArgs) -> u8 {
 /// exit 0 on success, zero results included. The routed consult leads
 /// (#2629).
 fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = refuse_fuzzy(args) {
+        return code;
+    }
     if let Some(code) =
         resident::route_query(args, QueryKind::Dependencies, out)
     {
@@ -2117,7 +2216,9 @@ fn write_query_out(
 /// then the analyze workspace assembly, one analyze pass (the
 /// read-after-write — the query reflects and never re-drives it), and the
 /// engine's symbol answer on `out`. Exit 0 on success, zero results
-/// included.
+/// included. `--fuzzy` routes the same run to the discovery face: the
+/// ranked candidates replace the exact lookup's rows, the envelope is
+/// unchanged.
 fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = resident::route_query(args, QueryKind::Symbol, out) {
         return code;
@@ -2129,7 +2230,12 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    let run = match dartq_commands::query::symbol(&mut engine, &args.name) {
+    let run = if args.fuzzy {
+        dartq_commands::query::symbol_fuzzy(&mut engine, &args.name)
+    } else {
+        dartq_commands::query::symbol(&mut engine, &args.name)
+    };
+    let run = match run {
         Ok(run) => run,
         Err(error) => {
             eprintln!("dartq: internal error: {error}");
@@ -4057,20 +4163,15 @@ mod tests {
     }
 
     /// The analyze face's crash tier: a panic anywhere in the engine pass
-    /// maps to exit 4 — the exit half of the harness's Panic signature
-    /// (exit 4 + empty stdout; stdout stays empty structurally because the
-    /// writers run only after the pass succeeds, the `check` face's
-    /// `catch_unwind` shape) — a run `Err` stays the internal tier, and a
-    /// clean pass passes through with no exit override.
+    /// exits at the internal-error tier — the armed hook's deterministic
+    /// death, pinned end-to-end by
+    /// [`crash_tier_exits_at_internal_error_on_worker_panic`] (in-process
+    /// here it would kill the harness). The tier's remaining arms: a run
+    /// `Err` stays the internal tier, and a clean pass passes through with
+    /// no exit override.
     #[test]
-    fn analyze_crash_tier_maps_panic_to_internal_exit() {
+    fn analyze_crash_tier_maps_error_to_internal_exit() {
         use dartq_commands::analyze::AnalyzeError;
-
-        let panicked = under_crash_tier(|| -> Result<(), AnalyzeError> { panic!("injected") });
-        assert!(
-            matches!(panicked, Err(exit::INTERNAL_ERROR)),
-            "panic → exit 4, not the runtime's 101"
-        );
 
         let failed = under_crash_tier(|| Err::<(), _>(AnalyzeError::Cancelled));
         assert!(matches!(failed, Err(exit::INTERNAL_ERROR)), "run Err → 4");
@@ -4387,6 +4488,7 @@ mod tests {
             format,
             verbosity: Verbosity::Compact,
             sdk: Some(root.join("sdk")),
+            fuzzy: false,
         }
     }
 
@@ -5299,5 +5401,66 @@ mod tests {
             );
         }
         fs::remove_dir_all(&plain).ok();
+    }
+
+    /// The crash tier's deterministic panic death: a panic inside the
+    /// armed pass exits the process at the internal-error tier even when it
+    /// fires on a thread whose unwind could not reach `catch_unwind` before
+    /// a sibling job's own (possibly unbounded) work finished — the hang
+    /// class the hook exists to kill. The armed hook also restores the
+    /// previous hook after a clean pass, and a nested tier inside an armed
+    /// pass neither deadlocks nor re-arms.
+    ///
+    /// The panic itself runs in a self-spawned child: the armed hook's
+    /// `process::exit` would kill the test harness if it fired in-process.
+    /// `DARTQ_CRASH_TIER_SELFTEST` selects the child path, which panics on
+    /// a spawned thread — the path `catch_unwind` alone could never save.
+    #[test]
+    fn crash_tier_exits_at_internal_error_on_worker_panic() {
+        if std::env::var_os("DARTQ_CRASH_TIER_SELFTEST").is_some() {
+            crash_tier(|| {
+                std::thread::spawn(|| panic!("crash-tier selftest"));
+                // A sibling job that never completes: without the armed
+                // hook the join would hold this pass open forever — the
+                // post-panic spin the tier exists to kill.
+                loop {
+                    std::thread::park();
+                }
+            })
+            .ok();
+            return;
+        }
+        let current = std::env::current_exe().expect("test binary");
+        let output = std::process::Command::new(current)
+            .args([
+                "--exact",
+                "tests::crash_tier_exits_at_internal_error_on_worker_panic",
+                "--nocapture",
+            ])
+            .env("DARTQ_CRASH_TIER_SELFTEST", "1")
+            .output()
+            .expect("selftest child runs");
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(exit::INTERNAL_ERROR)),
+            "the armed hook exits the process at the internal tier; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("crash-tier selftest"),
+            "the default hook's panic message still prints"
+        );
+    }
+
+    /// A nested `crash_tier` inside an armed ancestor neither deadlocks
+    /// nor re-arms: the outer arming covers the subtree, the inner tier
+    /// degrades to a plain `catch_unwind` (the `ARMED` flag's whole job).
+    /// A panic-free nested run returns `Ok`, and the previous hook is
+    /// restored when the outer tier disarms.
+    #[test]
+    fn nested_crash_tier_runs_under_the_ancestor_arming() {
+        let got = crash_tier(|| crash_tier(|| 7));
+        assert!(matches!(got, Ok(Ok(7))));
     }
 }

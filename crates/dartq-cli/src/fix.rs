@@ -242,9 +242,9 @@ fn write_status(
 /// Crash tier like the other faces: a panic aborts with exit 4 and stdout
 /// kept empty, because [`run`] writes only after the run succeeded.
 pub(crate) fn run_entry(args: &FixArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = crate::crash_tier(|| {
         run(args, &mut io::BufWriter::new(io::stdout().lock()))
-    }));
+    });
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -254,9 +254,9 @@ pub(crate) fn run_entry(args: &FixArgs) -> u8 {
 
 /// Crash tier for the assists face (same contract as [`run_entry`]).
 pub(crate) fn run_assists_entry(args: &AssistsArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = crate::crash_tier(|| {
         run_assists(args, &mut io::BufWriter::new(io::stdout().lock()))
-    }));
+    });
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;

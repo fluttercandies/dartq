@@ -991,7 +991,7 @@ fn runner_version(root: &Path) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_entry(args: &TestArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&args.args)));
+    let outcome = crate::crash_tier(|| run(&args.args));
     outcome.unwrap_or_else(|_| {
         eprintln!("dartq: internal error: the test face panicked");
         exit::INTERNAL_ERROR

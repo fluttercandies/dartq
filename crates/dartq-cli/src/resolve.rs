@@ -54,9 +54,9 @@ pub(crate) struct PositionArgs {
 /// stdout kept empty, because the runners write only after the query fully
 /// succeeded.
 pub(crate) fn resolve_at_entry(args: &PositionArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = crate::crash_tier(|| {
         resolve_at_run(args, &mut BufWriter::new(io::stdout().lock()))
-    }));
+    });
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -66,9 +66,9 @@ pub(crate) fn resolve_at_entry(args: &PositionArgs) -> u8 {
 
 /// Crash tier like [`resolve_at_entry`].
 pub(crate) fn completion_entry(args: &PositionArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = crate::crash_tier(|| {
         completion_run(args, &mut BufWriter::new(io::stdout().lock()))
-    }));
+    });
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;

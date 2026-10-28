@@ -62,7 +62,7 @@ pub(crate) fn run_entry(args: &IndexArgs) -> u8 {
 }
 
 fn run(args: &IndexArgs, out: &mut impl Write) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_checked(args, out)));
+    let outcome = crate::crash_tier(|| run_checked(args, out));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;

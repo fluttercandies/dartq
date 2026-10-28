@@ -69,9 +69,9 @@ pub(crate) struct CompatArgs {
 /// stdout kept empty, because [`run`] writes only after the query fully
 /// succeeded.
 pub(crate) fn run_entry(args: &CompatArgs) -> u8 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = crate::crash_tier(|| {
         run(args, &mut BufWriter::new(io::stdout().lock()))
-    }));
+    });
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
