@@ -85,7 +85,8 @@
 //!   the locators.
 //! * `compact` (default) — every section as an array, empty sections
 //!   included (a missing section is indistinguishable from an empty one
-//!   otherwise).
+//!   otherwise) — except `others`, omitted when empty: no remaining
+//!   candidate is the common case, and the minimal tier still counts it.
 //! * `full` — equal to `compact` today: every field the substrate can
 //!   reach is already a locator or a verdict, so there is nothing extra
 //!   to inline. The tier exists in the contract for the faces that gain
@@ -144,9 +145,10 @@ pub struct SymbolDeclHit<'a> {
 /// The explain report, JSON contract `v: 1` (the short-vocabulary envelope).
 ///
 /// Section arrays are `Some` at [`Verbosity::Compact`] and
-/// [`Verbosity::Full`] (empty sections included — the seam is visible),
-/// `None` at [`Verbosity::Minimal`], where [`ExplainReport::counts`]
-/// replaces them. `declaration` is `None` when the symbol is unknown.
+/// [`Verbosity::Full`] (empty sections included — the seam is visible;
+/// `others` is the exception, `None` when empty), `None` at
+/// [`Verbosity::Minimal`], where [`ExplainReport::counts`] replaces them.
+/// `declaration` is `None` when the symbol is unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainReport {
     /// The output contract version ([`EXPLAIN_SCHEMA_VERSION`]). Wire: `v`.
@@ -186,7 +188,9 @@ pub struct ExplainReport {
     #[serde(rename = "tests", skip_serializing_if = "Option::is_none")]
     pub affected_tests: Option<Vec<AffectedTest>>,
     /// The remaining same-named declarations the primary was picked over,
-    /// in rank order — the disambiguation face (#2621). Wire: `others`.
+    /// in rank order — the disambiguation face (#2621). Wire: `others`;
+    /// absent when empty at `compact`/`full` (no candidate is the common
+    /// case; `counts.others` carries the zero at `minimal`).
     #[serde(rename = "others", skip_serializing_if = "Option::is_none")]
     pub others: Option<Vec<OtherDeclRow>>,
     /// Per-section row counts (`minimal` only, replacing the arrays).
@@ -636,13 +640,18 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     });
     let dependencies = sections.then(|| dependency_rows(primary, importers, &label_of));
     let affected_tests = sections.then(|| affected_test_rows(primary, tests, &label_of));
-    let others = sections.then(|| {
-        ranked
-            .iter()
-            .skip(1)
-            .map(|&(_, hit)| other_row(hit, &decls_of, &file_label_of, &line_of, strings))
-            .collect()
-    });
+    // `others` drops when empty (the field docs' exception): the empty
+    // disambiguation set is the common case, and a present key would read
+    // as a section the way the always-visible arrays do.
+    let others = sections
+        .then(|| {
+            ranked
+                .iter()
+                .skip(1)
+                .map(|&(_, hit)| other_row(hit, &decls_of, &file_label_of, &line_of, strings))
+                .collect::<Vec<_>>()
+        })
+        .filter(|rows| !rows.is_empty());
 
     ExplainReport {
         schema_version: EXPLAIN_SCHEMA_VERSION,
@@ -1088,9 +1097,9 @@ mod tests {
                     {"path": "package:t/c.dart"},
                 ],
                 "tests": [{"path": "package:t/a_test.dart"}],
-                "others": [],
             }),
-            "every section present, sorted by its documented key"
+            "every section present, sorted by its documented key; `others` \
+             absent when empty"
         );
     }
 
@@ -1235,7 +1244,8 @@ mod tests {
     }
 
     /// An unknown symbol answers the seam report: no declaration, every
-    /// section empty (never absent at compact), zero counts.
+    /// section empty (never absent at compact — `others` the exception:
+    /// empty is absent), zero counts.
     #[test]
     fn unknown_symbol_answers_the_empty_seam_report() {
         let fx = fixture();
@@ -1261,7 +1271,7 @@ mod tests {
         assert_eq!(report.interfaces, Some(Vec::new()));
         assert_eq!(report.constructors, Some(Vec::new()));
         assert_eq!(report.methods, Some(Vec::new()));
-        assert_eq!(report.others, Some(Vec::new()), "the seam stays visible");
+        assert!(report.others.is_none(), "empty `others` is absent");
         assert!(report.counts.is_none(), "counts are a minimal-tier field");
     }
 

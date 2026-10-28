@@ -520,9 +520,15 @@ fn explain_diagnostic_answer(
             }]
         })
         .unwrap_or_default();
-    let documentation = code_info
-        .has_published_docs
-        .then(|| format!("https://dart.dev/diagnostics/{}", code_info.name));
+    // The documentation URL rides the same published-table decision the
+    // json face serves (`dartq_diagnostics::documentation_url`) — never
+    // the per-row `has_published_docs` flag, which a pre-capture store
+    // would leave stale, and which never answered the lint arm (an
+    // unpublished first-party lint still publishes its `lints` page).
+    let documentation = dartq_diagnostics::documentation_url(
+        code_info.name,
+        matches!(code_info.dtype, dartq_diagnostics::DiagnosticType::Lint),
+    );
     let report = diquery::explain_diagnostic(
         diquery::DiagnosticEcho {
             code: code_info.name.to_owned(),
@@ -907,7 +913,10 @@ mod tests {
             "the libraries that import dog.dart, label order"
         );
         assert_eq!(json["tests"], json!([{"path": dog_test}]));
-        assert_eq!(json["others"], json!([]), "one declaration, no candidates");
+        assert!(
+            json.get("others").is_none(),
+            "one declaration, no candidates — `others` absent when empty"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1008,7 +1017,10 @@ mod tests {
         assert_eq!(json["refs"], json!([]));
         assert_eq!(json["deps"], json!([]));
         assert_eq!(json["tests"], json!([]));
-        assert_eq!(json["others"], json!([]));
+        assert!(
+            json.get("others").is_none(),
+            "no candidates — `others` absent when empty"
+        );
         assert!(
             json.get("counts").is_none(),
             "counts are a minimal-tier field"
@@ -1112,13 +1124,19 @@ mod tests {
             offset(REPO_LIB, "createTask(String title) {}"),
             "the client's member, not the first same-named row"
         );
-        assert_eq!(json["others"], json!([]), "the filter leaves one hit");
+        assert!(
+            json.get("others").is_none(),
+            "the filter leaves one hit — `others` absent when empty"
+        );
 
         for miss in ["TodoRepository.absent", "NoSuchClass.createTask"] {
             let json = explain(&root, Some(&root.join("sdk")), miss, Verbosity::Compact)
                 .expect("the seam report, never an error");
             assert!(json.get("declaration").is_none(), "{miss}: no hit");
-            assert_eq!(json["others"], json!([]), "{miss}: no candidates");
+            assert!(
+                json.get("others").is_none(),
+                "{miss}: no candidates — absent when empty"
+            );
         }
 
         std::fs::remove_dir_all(&root).ok();
@@ -1193,9 +1211,13 @@ mod tests {
         // The container sections are empty by nature for a member; the
         // library faces still answer (main.dart imports the declaring
         // library).
-        for section in ["bases", "ifaces", "ctors", "methods", "others"] {
+        for section in ["bases", "ifaces", "ctors", "methods"] {
             assert_eq!(json[section], json!([]), "{section} is empty by nature");
         }
+        assert!(
+            json.get("others").is_none(),
+            "no candidates — `others` absent when empty"
+        );
         assert_eq!(json["deps"], json!([{"path": "lib/main.dart"}]));
         assert_eq!(json["tests"], json!([]));
 
@@ -1215,7 +1237,10 @@ mod tests {
                 .expect("the seam report, never an error");
             assert!(json.get("declaration").is_none(), "{miss}: no hit");
             assert_eq!(json["refs"], json!([]), "{miss}: no references");
-            assert_eq!(json["others"], json!([]), "{miss}: no candidates");
+            assert!(
+                json.get("others").is_none(),
+                "{miss}: no candidates — absent when empty"
+            );
         }
 
         std::fs::remove_dir_all(&root).ok();
@@ -1318,6 +1343,42 @@ mod tests {
         assert!(json.get("why").is_none());
         assert!(json.get("related").is_none());
         assert_eq!(json["diagnostic"]["code"], "unused_import");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The documentation URL pin (#2656): a lint code's explain answers
+    /// the same URL the json face prints — the published tables'
+    /// decision through `dartq_diagnostics::documentation_url`, never
+    /// the per-row flag (which never answered the lint arm: an
+    /// unpublished first-party lint still publishes its `lints` page).
+    #[test]
+    fn diagnostic_explain_answers_the_lint_documentation_url() {
+        let root = workspace(
+            "explain_diag_lint",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    avoid_print: true\n",
+                ),
+                ("lib/fires.dart", "void f() {\n  print('x');\n}\n"),
+            ],
+        );
+        let json = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "avoid_print",
+            None,
+            Verbosity::Compact,
+        )
+        .expect("explain_diagnostic run");
+        assert_eq!(json["diagnostic"]["code"], "avoid_print");
+        assert_eq!(json["why"]["code_family"], "LINT");
+        assert_eq!(
+            json["doc"],
+            "https://dart.dev/diagnostics/avoid_print",
+            "the same URL the json face's row carries"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

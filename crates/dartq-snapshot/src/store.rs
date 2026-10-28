@@ -406,12 +406,15 @@ impl SnapshotStore {
         let dir = header.dir_id();
         // This save is the generation's new truth: records from sibling
         // stamps can no longer vouch for on-disk frames (the frames they
-        // named were overwritten or swept). Today's saves always use the
-        // default tables, so this is a no-op in practice — the #1386
-        // audit's note — but the bookkeeping keys on the stamp so a future
-        // non-default save group cannot serve stale skips.
+        // named were overwritten or swept). The current stamp's records
+        // survive — this save continues that landed set (manifest keys
+        // absent from `changed` are on disk under it by contract), and the
+        // sweep below unrecords exactly what it deletes, so the flush face
+        // stays O(changed) across ticks instead of resetting per save.
         let mut written = self.lock_written();
-        written.retain(|(generation_dir, _), _| generation_dir != &dir);
+        written.retain(|&(generation_dir, stamp), _| {
+            generation_dir != dir || stamp == tables_stamp
+        });
         let records = written.entry((dir, tables_stamp)).or_default();
         let mut written_bytes = encoded_tables.len() as u64;
         for entry in changed {

@@ -25,8 +25,14 @@ dartq session stop --all  # end every live session
 ```
 
 Output is one row per line (lon by default, `--format json` for JSON
-rows). `start` on an unwritable or foreign tree **degrades to
-standalone, printed, never an error**: the command proceeds in-process.
+rows). `status` may print a `progress` row first — the current
+worktree's cold-analysis trace (`{type:progress root files_scanned
+current_package}`), present whenever the worktree's session generation
+has scanned files — then one `session` row per live session
+(`{type:session root pid sdk binary age_s stale_binary}`), same-root
+rows adjacent, most recent heartbeat first. `start` on an unwritable or
+foreign tree **degrades to standalone, printed, never an error**: the
+command proceeds in-process.
 
 ## Watching a Cold Analysis
 

@@ -88,9 +88,14 @@ pub struct RuleFact {
     /// The `package:lints` membership (`core`/`recommended`/`diagnostic`/
     /// `removed`/`standalone`).
     pub group: String,
-    /// The SDK version that removed the rule, when it did.
+    /// The SDK version that removed the rule, when it did (absent on the
+    /// wire otherwise — the schema's string-or-absent column, never a
+    /// null).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_since: Option<String>,
-    /// The SDK version that deprecated the rule, when it did.
+    /// The SDK version that deprecated the rule, when it did (absent on
+    /// the wire, like `removed_since`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecated_since: Option<String>,
 }
 

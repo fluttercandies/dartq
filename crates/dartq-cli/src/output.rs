@@ -32,13 +32,15 @@ use std::io::{self, Write};
 use clap::ValueEnum;
 use serde_json::Value;
 
-use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
-
 /// The analyze/check faces' lon document — the shared builder both the CLI
 /// and the daemon's `dartq/analyze` render through (`dartq-commands`' own,
 /// #2657: no second encoder).
 pub(crate) use dartq_commands::analyze::diags_document;
-use dartq_commands::analyze::severity_word;
+// The relocated per-format renderers (#2627): the one writer per format —
+// `dartq-commands::render` — that the cold path here and the daemon's
+// routed face both call; re-exported so the CLI's call sites keep their
+// spelling.
+pub(crate) use dartq_commands::render::{lon_line, write_human, write_lon};
 
 /// The unified `--format` axis. `lon` is the constant default; an invalid
 /// spelling is clap's usage error (exit 64), the same tier every other
@@ -51,19 +53,6 @@ pub(crate) enum OutputFormat {
     Json,
     /// Human rendering on the read faces; write faces fall back to lon.
     Text,
-}
-
-/// One LON line of `value`.
-pub(crate) fn lon_line(value: &Value) -> String {
-    // The values are serde_json graphs: no non-finite floats exist in the
-    // model, and every producer's depth sits far under the codec's limits
-    // — an error here is a program bug, not a runtime case.
-    lon::to_string(value).expect("the value graph encodes as LON")
-}
-
-/// The `lon` face: one canonical line.
-pub(crate) fn write_lon(out: &mut impl Write, value: &Value) -> io::Result<()> {
-    writeln!(out, "{}", lon_line(value))
 }
 
 /// The `json` face: the frozen single-line shape, untouched.
@@ -82,27 +71,13 @@ pub(crate) fn write_text_value(out: &mut impl Write, value: &Value) -> io::Resul
     )
 }
 
-/// The analyze `text` face's row spelling: `sev code line:col msg` under
-/// the file heading, `sev` lowercase like every non-oracle face (the
-/// grouped human renderer in `main` owns headings and the count tail;
-/// this is the row).
-pub(crate) fn text_diag_row(diag: &Diagnostic, layout: &dyn FileLayoutProvider) -> String {
-    let (line, col) = layout.line_col(diag.file, diag.range.offset);
-    format!(
-        "{} {} {}:{} {}",
-        severity_word(diag.severity),
-        diag.code.name,
-        line,
-        col,
-        diag.message
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use dartq_diagnostics::{AnalysisOutput, FileId, Severity, SourceRange, UNDEFINED_IDENTIFIER};
+    use dartq_diagnostics::{
+        AnalysisOutput, Diagnostic, FileId, Severity, SourceRange, UNDEFINED_IDENTIFIER,
+    };
 
     use super::*;
 

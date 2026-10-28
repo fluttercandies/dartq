@@ -68,7 +68,7 @@ const label = 'alpha';
     "any(i['name']=='alpha' for i in j['items'])" "alpha is a candidate"
   json_check "$(out_file pos-cand)" \
     "all(i['name'].startswith('a') for i in j['items'])" \
-    "only prefix-matching names are candidates (label does not match `a`)"
+    "only prefix-matching names are candidates (label does not match 'a')"
   # A cursor inside the string literal completes with an empty prefix
   # (the char before the cursor is the quote, not an identifier char) —
   # never an error.

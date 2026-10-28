@@ -334,6 +334,7 @@ dependencies = [
  "dartq-semantic",
  "dartq-source",
  "filetime",
+ "lon",
  "rayon",
  "rustc-hash",
  "serde",

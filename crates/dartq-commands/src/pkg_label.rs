@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(locate(root, &root.join("lib/a.dart")), "lib/a.dart");
         // Outside the root: SDK, pub cache, sibling checkouts.
         assert_eq!(
-            locate(root, Path::new("/Users/x/.pub-cache/hosted/x/lib/a.dart")),
-            "/Users/x/.pub-cache/hosted/x/lib/a.dart"
+            locate(root, Path::new("/pub-cache/hosted/x/lib/a.dart")),
+            "/pub-cache/hosted/x/lib/a.dart"
         );
         assert_eq!(locate(root, Path::new("/proj/other/lib/a.dart")), "/proj/other/lib/a.dart");
         // The root itself strips to an empty tail: absolute.

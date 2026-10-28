@@ -32,6 +32,13 @@ A suite is never cached when its closure:
 - reads the environment through a shape the extractor cannot name —
   iterating `Platform.environment`, computed keys, aliased maps.
 
+These refusals read the suite's own closure — its files and the
+package's `lib/`. The toolchain tier (the Flutter SDK's packages: the
+framework, `flutter_test`, the engine bindings) is exempt: its files'
+bytes are keyed (an SDK edit re-keys) but their internal clock and
+environment plumbing never refuses — a first-party binding aliasing the
+whole environment map is the tool's own plumbing, not a suite read.
+
 Not drift (replayable): `Random`, `Stopwatch` durations, `pid` — a replayed
 outcome is one sample of the same distribution a fresh run draws.
 

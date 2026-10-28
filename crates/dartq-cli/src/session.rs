@@ -498,6 +498,15 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         .expect("the heartbeat thread spawns");
 
     let mut last_client = Instant::now();
+    // Consecutive accept failures (#2675): a transient accept error (a
+    // descriptor or connection-table blip under host load) must never end
+    // the daemon by itself — the shutdown ladder it used to take strands
+    // every held debug session behind a socket nothing answers, which a
+    // client observes as a hung transport followed by a fresh daemon that
+    // knows none of its sessions. The loop retries one tick at a time;
+    // only a listener that cannot recover for a whole window (40 ticks ≈
+    // 10 s) ends the serve through the ladder.
+    let mut accept_failures: u32 = 0;
     // #2619: the exit signals land in a flag this loop's tick polls —
     // SIGTERM (the election reap's grace window, `session stop`) and
     // SIGINT both take the graceful ladder below instead of killing a
@@ -516,6 +525,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     }
     loop {
         if signalled.load(std::sync::atomic::Ordering::Relaxed) {
+            stop_accepting(listener, &layout);
             return serve_shutdown(
                 &mut session,
                 &events,
@@ -529,6 +539,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                accept_failures = 0;
                 last_client = Instant::now();
                 let _ = stream.set_nonblocking(false);
                 let _ = events.append("session", "client_attached", serde_json::json!({}));
@@ -543,20 +554,30 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => {
-                eprintln!("dartq: session serve: accept failed: {error}");
-                return serve_shutdown(
-                    &mut session,
-                    &events,
-                    &layout,
-                    &root,
-                    &beating,
-                    beater,
-                    "accept_failed",
-                    exit::SOFTWARE,
-                );
+                accept_failures += 1;
+                if accept_failures == 1 || accept_failures % 20 == 0 {
+                    eprintln!(
+                        "dartq: session serve: accept failed ({accept_failures} consecutive): {error}"
+                    );
+                }
+                if accept_failures >= 40 {
+                    eprintln!("dartq: session serve: the listener cannot recover; shutting down");
+                    stop_accepting(listener, &layout);
+                    return serve_shutdown(
+                        &mut session,
+                        &events,
+                        &layout,
+                        &root,
+                        &beating,
+                        beater,
+                        "accept_failed",
+                        exit::SOFTWARE,
+                    );
+                }
             }
         }
         if idle_elapsed(last_client, Instant::now(), session.debug_sessions_len()) > idle_timeout {
+            stop_accepting(listener, &layout);
             return serve_shutdown(
                 &mut session,
                 &events,
@@ -570,6 +591,17 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         }
         std::thread::sleep(TICK);
     }
+}
+
+/// Ends the accept face at ladder entry (#2675): the socket path unlinks
+/// and the listener drops BEFORE the — possibly seconds-long — detach
+/// ladder runs, so a client connecting during the ladder is refused at
+/// once and re-elects cleanly instead of hanging against a doomed
+/// daemon's backlog, and a takeover during the ladder can never bind a
+/// socket the dying daemon's cleanup would later strip.
+fn stop_accepting(listener: UnixListener, layout: &Layout) {
+    let _ = std::fs::remove_file(&layout.socket);
+    drop(listener);
 }
 
 /// The idle clock (#2619): client silence, frozen at zero while any
@@ -673,6 +705,17 @@ pub(crate) fn serve_loop_for_tests(dir: &Path, sdk: &Path) -> u8 {
     serve_loop(
         &ServeArgs { dir: dir.to_path_buf(), sdk: sdk.to_path_buf() },
         Duration::from_secs(1),
+    )
+}
+
+/// [`serve_loop_for_tests`] with a caller-chosen idle window — the
+/// resident-routing tests run a cold in-process pass beside the serve
+/// loop and must not race the 1 s self-reap.
+#[cfg(all(test, unix))]
+pub(crate) fn serve_loop_for_tests_with(dir: &Path, sdk: &Path, idle: Duration) -> u8 {
+    serve_loop(
+        &ServeArgs { dir: dir.to_path_buf(), sdk: sdk.to_path_buf() },
+        idle,
     )
 }
 

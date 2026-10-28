@@ -32,7 +32,6 @@
 //! one protocol, two faces.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -284,6 +283,15 @@ diagnostics (dartq_analyze) — this answers the counterfactual. Answers exactly
                  server's working directory (the workspace root as the fallback).",
             ),
             opt(
+                "symbols",
+                ParamKind::Strings,
+                "The CLI's repeatable --symbol narrowing, one spelling per item: a bare \
+                 `name` (every same-named declaration), `Container.name` (that \
+                 container's face), or `path/to/file.dart:line` (the declaration at \
+                 that line). Absent is the file-level posture; a spelling that \
+                 resolves to nothing is the face's usage error.",
+            ),
+            opt(
                 "verbosity",
                 VERBOSITY,
                 "Parses for grammar parity; the report is tier-invariant.",
@@ -345,7 +353,7 @@ tools.",
                 "target",
                 ParamKind::Str,
                 "The rename anchor: 'PATH:LINE:COL' (1-based; the column counts UTF-16 \
-                 code units) or 'PATH:OFFSET' (0-based byte offset).",
+                 code units) or 'PATH:OFFSET' (0-based UTF-16 code-unit offset).",
             ),
             req(
                 "new_name",
@@ -1096,25 +1104,11 @@ fn fix_text(answer: Value) -> String {
         .join("\n")
 }
 
-/// How long one proxied daemon request may run before the caller hears
-/// about it (#2587): every daemon face is bounded well inside this (the
-/// slowest legitimate one is a debug hot restart at ~2 min plus
-/// breakpoint re-arms), and a wedged engine surfaces as a bounded error
-/// instead of a hung client.
-const DAEMON_CALL_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// One proxied daemon round trip's failure: the daemon answered a
-/// JSON-RPC error (a domain failure carrying its machine-code prefix,
-/// e.g. the debug family's `DARTQ/DEBUG/*`), or the transport failed
-/// before an answer (connect refused, no resident session, a wedged
-/// engine, a malformed frame). The MCP face flattens both into its
-/// `isError` text; the CLI's debug face maps them to different exit
-/// tiers.
-#[derive(Debug)]
-pub(crate) enum ProxyError {
-    Daemon(i64, String),
-    Transport(String),
-}
+/// The daemon-proxy failure face and the transport bound live in
+/// `resident` — the binary's one session transport (the routed one-shot
+/// faces of #2627 proxy through the same machinery).
+pub(crate) use crate::resident::CALL_TIMEOUT as DAEMON_CALL_TIMEOUT;
+pub(crate) use crate::resident::ProxyError;
 
 /// One daemon request over the session socket, bounded by
 /// [`DAEMON_CALL_TIMEOUT`].
@@ -1134,118 +1128,7 @@ pub(crate) fn daemon_call_bounded(
              start it with `dartq session start` in a writable checkout"
         )));
     }
-    let mut stream = UnixStream::connect(&mcp.layout.socket)
-        .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    // The bound covers the whole round trip: a wedged engine (or a
-    // wedged serve between clients) answers the timeout error, never a
-    // hang.
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    let body = serde_json::to_string(&json!({
-        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-    }))
-    .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len())
-        .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    stream
-        .flush()
-        .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    // The daemon streams publishes and progress notifications ahead of
-    // the answer on the same connection (#2596: a resident that picked up
-    // an out-of-band edit emits its diagnostics pushes first) — the proxy
-    // reads past every notification frame until the response (the frame
-    // carrying our id).
-    let wedged = || {
-        ProxyError::Transport(format!(
-            "the engine did not answer {method} within {timeout:?} — \
-             the session may be wedged; check `dartq session status`"
-        ))
-    };
-    let mut answer = match read_frame(&mut stream) {
-        Ok(answer) => answer,
-        Err(ReadError::Wedged) => return Err(wedged()),
-        Err(ReadError::Io(error)) => return Err(ProxyError::Transport(error.to_string())),
-        Err(ReadError::Malformed(message)) => return Err(ProxyError::Transport(message)),
-    };
-    while answer.get("id").is_none() {
-        answer = match read_frame(&mut stream) {
-            Ok(frame) => frame,
-            Err(ReadError::Wedged) => return Err(wedged()),
-            Err(ReadError::Io(error)) => return Err(ProxyError::Transport(error.to_string())),
-            Err(ReadError::Malformed(message)) => return Err(ProxyError::Transport(message)),
-        };
-    }
-    if let Some(error) = answer.get("error") {
-        return Err(ProxyError::Daemon(
-            // The daemon's error answers always carry both fields
-            // (`Response::error`); -32603 is the JSON-RPC fallback tier.
-            error["code"].as_i64().unwrap_or(-32603),
-            error["message"].as_str().unwrap_or_default().to_owned(),
-        ));
-    }
-    Ok(answer.get("result").cloned().unwrap_or_else(|| json!({})))
-}
-
-/// One framed-read failure: the socket timed out (the wedge signal,
-/// #2587), the transport broke, or the frame was not a valid
-/// Content-Length-framed JSON message.
-enum ReadError {
-    Wedged,
-    Io(std::io::Error),
-    Malformed(String),
-}
-
-impl std::fmt::Debug for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Wedged => f.write_str("Wedged"),
-            Self::Io(error) => write!(f, "Io({error})"),
-            Self::Malformed(message) => write!(f, "Malformed({message})"),
-        }
-    }
-}
-
-/// Reads one Content-Length framed JSON message.
-fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
-    let mut read = |buf: &mut [u8]| {
-        stream.read_exact(buf).map_err(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) {
-                ReadError::Wedged
-            } else {
-                ReadError::Io(error)
-            }
-        })
-    };
-    let mut header = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        read(&mut byte)?;
-        header.push(byte[0]);
-        if header.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    let header = String::from_utf8_lossy(&header);
-    let length: usize = header
-        .lines()
-        .find_map(|line| {
-            line.split_once(':').and_then(|(name, value)| {
-                (name.trim().eq_ignore_ascii_case("content-length"))
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-        })
-        .ok_or_else(|| ReadError::Malformed("missing Content-Length".to_owned()))?;
-    let mut body = vec![0u8; length];
-    read(&mut body)?;
-    serde_json::from_slice(&body).map_err(|error| ReadError::Malformed(error.to_string()))
+    crate::resident::session_call(&mcp.layout.socket, method, params, timeout)
 }
 
 /// The rename face over a cold in-process engine (the rare tool). The
@@ -1288,7 +1171,7 @@ fn rename_call(params: &Value, mcp: &Mcp) -> Result<String, String> {
 
 /// The rename anchor spec: the CLI face's grammar — a trailing
 /// `:LINE:COL` pair (1-based; UTF-16 code units), a single trailing
-/// `:OFFSET` (0-based bytes), anything else malformed. Split from the
+/// `:OFFSET` (0-based UTF-16 code units), anything else malformed. Split from the
 /// right so a Windows-style drive path keeps its colon.
 fn parse_target(spec: &str) -> Result<(PathBuf, dartq_commands::rename::Anchor), String> {
     let malformed = || format!("expected PATH:LINE:COL or PATH:OFFSET, got `{spec}`");
@@ -1310,7 +1193,7 @@ fn parse_target(spec: &str) -> Result<(PathBuf, dartq_commands::rename::Anchor),
         }
         return Ok((
             PathBuf::from(path),
-            dartq_commands::rename::Anchor::ByteOffset(offset),
+            dartq_commands::rename::Anchor::Utf16Offset(offset),
         ));
     }
     Err(malformed())
@@ -1389,6 +1272,9 @@ fn read_resource(params: &Value, mcp: &Mcp) -> Result<Value, Value> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::os::unix::net::UnixStream;
+
+    use crate::resident::{ReadError, read_frame};
 
     /// The serve fixture's twin (the session tests'): a package with a
     /// stub SDK.
@@ -1647,6 +1533,31 @@ mod tests {
                 .contains_key("frame_index"),
             "the evaluate schema spells frame_index"
         );
+        // The impact face carries the CLI's repeatable --symbol narrowing
+        // (#2663): a string array, optional — absent is the file-level
+        // posture — spelled `symbols` like the daemon face's own list
+        // parameters (sdk_roots, paths, args).
+        let impact = tool_shape(
+            TOOLS
+                .iter()
+                .find(|tool| tool.name == "dartq_impact")
+                .expect("impact"),
+        );
+        assert_eq!(
+            impact["inputSchema"]["properties"]["symbols"]["type"], "array",
+            "the narrowing rides as the CLI's repeatable-flag list"
+        );
+        assert_eq!(
+            impact["inputSchema"]["properties"]["symbols"]["items"]["type"], "string"
+        );
+        assert!(
+            !impact["inputSchema"]["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .any(|value| value.as_str() == Some("symbols")),
+            "symbols is optional — absent is the file-level posture"
+        );
     }
 
     /// `tools/call` validates against the table: an unknown parameter,
@@ -1736,6 +1647,94 @@ mod tests {
         assert!(
             legal["result"]["isError"].as_bool() == Some(true),
             "no session: {legal}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The impact face's `symbols` narrowing reaches the daemon request
+    /// verbatim — every spelling, order kept, the CLI's repeatable
+    /// `--symbol` list (#2663) — and the daemon's usage answer for an
+    /// unknown spelling (its InvalidParams tier carrying the face's own
+    /// `no such symbol` wording) rides the MCP face as the tool-result
+    /// `isError` text, not the MCP layer's INVALID_PARAMS rejection that
+    /// answered before the parameter joined the table.
+    #[test]
+    fn impact_symbols_ride_the_daemon_request_and_usage_errors_flatten() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-symbols-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(&layout.dir).expect("session dir");
+        let listener = std::os::unix::net::UnixListener::bind(&layout.socket).expect("bind");
+        // The daemon's own answer for an unknown spelling: the impact
+        // face maps the usage error to its InvalidParams tier, message
+        // and all — the stub speaks that frame back.
+        let usage = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32602, "message": "no such symbol in lib/a.dart: NoSuch"},
+        });
+        let (seen, request) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let frame = match read_frame(&mut stream) {
+                Ok(frame) => frame,
+                Err(_) => return,
+            };
+            let body = usage.to_string();
+            let _ = write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len());
+            let _ = stream.flush();
+            let _ = seen.send(frame);
+        });
+        let mcp = Mcp {
+            layout,
+            root: root.clone(),
+            session: Ok(()),
+        };
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "dartq_impact", "arguments": {
+                           "path": "lib/a.dart",
+                           "symbols": ["TodoAppService.editDraft", "TodoList", "lib/a.dart:12"],
+                       }}})
+                .to_string()
+                .into_bytes(),
+            ),
+            &mut output,
+            &mcp,
+        )
+        .expect("serve");
+        let frame = request
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the daemon saw the call");
+        assert_eq!(frame["method"], "dartq/impact");
+        assert_eq!(frame["params"]["path"], "lib/a.dart");
+        assert_eq!(
+            frame["params"]["symbols"],
+            json!(["TodoAppService.editDraft", "TodoList", "lib/a.dart:12"]),
+            "every spelling rides the request verbatim, order kept"
+        );
+        let answer: Value = String::from_utf8(output)
+            .expect("utf-8")
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .next()
+            .expect("one answer line");
+        assert!(
+            answer["result"].is_object(),
+            "the daemon's usage answer is a tool result, not the MCP layer's \
+             rejection: {answer}"
+        );
+        assert_eq!(answer["result"]["isError"], true);
+        let text = answer["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        assert!(
+            text.contains("no such symbol"),
+            "the daemon's usage message rides the isError text: {text}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1983,7 +1982,7 @@ mod tests {
         );
         assert_eq!(
             ok("lib/a.dart:58"),
-            (PathBuf::from("lib/a.dart"), Anchor::ByteOffset(58))
+            (PathBuf::from("lib/a.dart"), Anchor::Utf16Offset(58))
         );
         assert_eq!(
             ok("/w/a.dart:1:2"),
@@ -1999,11 +1998,11 @@ mod tests {
                 Anchor::LineCol { line: 1, column: 2 }
             )
         );
-        // The offset form: a single trailing number is a 0-based byte
-        // offset (the CLI face's own grammar).
+        // The offset form: a single trailing number is a 0-based UTF-16
+        // code-unit offset (the CLI face's own grammar).
         assert_eq!(
             ok("a.dart:58"),
-            (PathBuf::from("a.dart"), Anchor::ByteOffset(58))
+            (PathBuf::from("a.dart"), Anchor::Utf16Offset(58))
         );
         for bad in ["a.dart", "a.dart:x", ":58", ""] {
             assert!(parse_target(bad).is_err(), "`{bad}` must be refused");
@@ -2012,7 +2011,7 @@ mod tests {
         // accepted, exactly like the CLI face's grammar.
         assert_eq!(
             ok("we:ird/a.dart:2"),
-            (PathBuf::from("we:ird/a.dart"), Anchor::ByteOffset(2))
+            (PathBuf::from("we:ird/a.dart"), Anchor::Utf16Offset(2))
         );
     }
 

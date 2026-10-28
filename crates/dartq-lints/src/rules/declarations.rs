@@ -18,7 +18,7 @@
 //! `deprecated_member_use_from_same_package`,
 //! `remove_deprecations_in_breaking_versions`.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 use rustc_hash::FxHashMap;
 
 use crate::engine::Check;
@@ -59,7 +59,7 @@ pub(crate) fn member_declaration_name(c: &Check<'_>, member: u32) -> Option<u32>
         .find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
                 && matches!(
-                    c.payload(kid).first().copied(),
+                    c.field(kid, PayloadField::Context),
                     Some(ctx)
                         if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
                             || ctx
@@ -184,9 +184,9 @@ fn function_name_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
 fn pattern_binds(c: &Check<'_>, pattern: u32, name: &str) -> bool {
     c.children(pattern).any(|descendant| {
         c.kind(descendant) == NodeKind::DeclaredVariablePattern
-            && c.payload(descendant)
-                .first()
-                .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+            && c
+                .field(descendant, PayloadField::Variable)
+                .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
     })
 }
 
@@ -208,16 +208,15 @@ fn for_in_binds(c: &Check<'_>, scope: u32, name: &str) -> bool {
         .iter()
         .copied()
         .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
-        .and_then(|parts| c.payload(parts).get(3).copied())
+        .and_then(|parts| c.field(parts, PayloadField::InKeyword))
         .filter(|&token| token != NONE_TOKEN)
     else {
         return false;
     };
     kids.into_iter().any(|kid| match c.kind(kid) {
         NodeKind::DeclaredVariablePattern => c
-            .payload(kid)
-            .first()
-            .is_some_and(|&v| v < in_token && c.lexeme(v) == name),
+            .field(kid, PayloadField::Variable)
+            .is_some_and(|v| v < in_token && c.lexeme(v) == name),
         NodeKind::Identifier => {
             c.unit.ast.token_range(kid).end <= in_token && c.lexeme(c.head_token(kid)) == name
         }
@@ -272,12 +271,11 @@ fn path_shadowed(c: &Check<'_>, top_index: usize, name: &str) -> bool {
             NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
                 c.collect_direct(scope).into_iter().any(|kid| {
                     // Case patterns complete as flat direct children,
-                    // so the variable is the child's
-                    // own payload token.
+                    // so the variable is the child's own `Variable` word.
                     c.kind(kid) == NodeKind::DeclaredVariablePattern
-                        && c.payload(kid)
-                            .first()
-                            .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+                        && c
+                            .field(kid, PayloadField::Variable)
+                            .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
                 })
             }
             NodeKind::IfStatement => {
@@ -296,9 +294,8 @@ fn path_shadowed(c: &Check<'_>, top_index: usize, name: &str) -> bool {
                     return false;
                 };
                 let has_guard = c
-                    .payload(branch_kids[cond_pos])
-                    .get(1)
-                    .is_some_and(|&when| when != NONE_TOKEN);
+                    .field(branch_kids[cond_pos], PayloadField::WhenKeyword)
+                    .is_some_and(|when| when != NONE_TOKEN);
                 branch_kids.get(cond_pos + 1) == Some(&child)
                     || (has_guard && branch_kids.get(cond_pos) == Some(&child))
             }
@@ -365,9 +362,9 @@ fn scope_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
         NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
             c.collect_direct(node).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::DeclaredVariablePattern
-                    && c.payload(kid)
-                        .first()
-                        .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+                    && c
+                        .field(kid, PayloadField::Variable)
+                        .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
             })
         }
         NodeKind::IfStatement => if_case_binds(c, node, name),
@@ -388,19 +385,18 @@ fn if_case_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
         return false;
     };
     let has_case = c
-        .payload(kids[cond_pos])
-        .first()
-        .is_some_and(|&case| case != NONE_TOKEN);
+        .field(kids[cond_pos], PayloadField::CaseKeyword)
+        .is_some_and(|case| case != NONE_TOKEN);
     has_case
         && kids[..=cond_pos].iter().any(|&kid| {
             // A `DeclaredVariablePattern` completes as a flat direct child
             // of the if statement (sibling of the condition row), so the
-            // binder check reads the row's own payload word, not only its
-            // descendants.
+            // binder check reads the row's own `Variable` word, not only
+            // its descendants.
             (c.kind(kid) == NodeKind::DeclaredVariablePattern
-                && c.payload(kid)
-                    .first()
-                    .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name))
+                && c
+                    .field(kid, PayloadField::Variable)
+                    .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name))
                 || pattern_binds(c, kid, name)
         })
 }
@@ -461,13 +457,13 @@ fn scope_binds_at(c: &Check<'_>, node: u32, name: &str, at: usize) -> bool {
 fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
     match c.kind(parameter) {
         NodeKind::FormalParameter => {
-            let name = c.payload(parameter).get(1).copied()?;
+            let name = c.field(parameter, PayloadField::Name)?;
             (name != NONE_TOKEN).then(|| c.lexeme(name))
         }
         NodeKind::FunctionTypedFormalParameter => {
             let name_row = c.collect_direct(parameter).into_iter().find(|&kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.payload(kid).first().copied()
+                    && c.field(kid, PayloadField::Context)
                         != Some(dartq_parser::IdentifierContext::TypeReference as u32)
             });
             Some(
@@ -663,7 +659,7 @@ fn super_formal_provably_unmatched(c: &Check<'_>, param: u32, written: u32) -> b
         return false; // formals uncaptured — undecidable
     };
     let strings = analysis.strings();
-    let kind = c.payload(param).get(4).copied();
+    let kind = c.field(param, PayloadField::FormalParameterKind);
     let named = matches!(
         kind,
         Some(k)
@@ -671,7 +667,7 @@ fn super_formal_provably_unmatched(c: &Check<'_>, param: u32, written: u32) -> b
                 || k == dartq_parser::FormalParameterKind::RequiredNamed as u32
     );
     let target = if named {
-        let Some(&name_token) = c.payload(param).get(1) else {
+        let Some(name_token) = c.field(param, PayloadField::Name) else {
             return false; // a nameless named-formal face — undecidable
         };
         if name_token == crate::rules::NONE_TOKEN {
@@ -787,7 +783,7 @@ fn type_name_echo(c: &Check<'_>, ctor: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
     c.collect_direct(ctor)
         .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx))
+        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
 }
 
 /// The written constructor name part: the method-continuation context
@@ -796,7 +792,7 @@ fn constructor_name_part(c: &Check<'_>, ctor: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
     c.collect_direct(ctor)
         .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx))
+        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
 }
 
 /// A modifier keyword immediately before a constructor row's span head:
@@ -822,7 +818,7 @@ fn container_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
     let is_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
                         as u32
@@ -855,11 +851,11 @@ fn container_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
 fn container_name_token(c: &Check<'_>, row: u32) -> Option<u32> {
     match c.kind(row) {
         NodeKind::ExtensionDeclaration => {
-            let token = c.payload(row).get(1).copied()?;
+            let token = c.field(row, PayloadField::Name)?;
             (token != NONE_TOKEN).then_some(token)
         }
         NodeKind::ExtensionTypeDeclaration => {
-            let token = c.payload(row).get(2).copied()?;
+            let token = c.field(row, PayloadField::Name)?;
             (token != NONE_TOKEN).then_some(token)
         }
         _ => container_name_node(c, row).map(|node| c.head_token(node)),
@@ -911,12 +907,12 @@ fn formal_parameter_rows(c: &Check<'_>, owner: u32) -> Vec<u32> {
 fn async_words(c: &Check<'_>, body: u32) -> (u32, u32) {
     match c.kind(body) {
         NodeKind::BlockBody => (
-            c.payload(body).first().copied().unwrap_or(NONE_TOKEN),
-            c.payload(body).get(1).copied().unwrap_or(NONE_TOKEN),
+            c.field(body, PayloadField::AsyncKeyword).unwrap_or(NONE_TOKEN),
+            c.field(body, PayloadField::Star).unwrap_or(NONE_TOKEN),
         ),
         NodeKind::ExpressionBody => (
-            c.payload(body).get(2).copied().unwrap_or(NONE_TOKEN),
-            c.payload(body).get(3).copied().unwrap_or(NONE_TOKEN),
+            c.field(body, PayloadField::AsyncKeyword).unwrap_or(NONE_TOKEN),
+            c.field(body, PayloadField::Star).unwrap_or(NONE_TOKEN),
         ),
         _ => (NONE_TOKEN, NONE_TOKEN),
     }
@@ -959,9 +955,7 @@ fn same_class_field_type(c: &Check<'_>, class_row: u32, name: &str) -> Option<u3
 /// `operator` keyword), an `Identifier` through its span head.
 fn name_row_token(c: &Check<'_>, name: u32) -> u32 {
     if c.kind(name) == NodeKind::OperatorName {
-        c.payload(name)
-            .first()
-            .copied()
+        c.field(name, PayloadField::Name)
             .unwrap_or_else(|| c.head_token(name))
     } else {
         c.head_token(name)
@@ -1120,11 +1114,9 @@ fn sole_statement_tokens(c: &Check<'_>, method: u32) -> Option<core::ops::Range<
     let body = crate::rules::last_child(c, method)?;
     match c.kind(body) {
         NodeKind::ExpressionBody => {
-            let arrow = c.payload(body).first().copied()?;
+            let arrow = c.field(body, PayloadField::Arrow)?;
             let semi = c
-                .payload(body)
-                .get(1)
-                .copied()
+                .field(body, PayloadField::Semicolon)
                 .unwrap_or(crate::rules::NONE_TOKEN);
             (semi != crate::rules::NONE_TOKEN).then_some(arrow + 1..semi)
         }
@@ -1256,7 +1248,8 @@ fn instance_field_written_type(c: &Check<'_>, name: &str) -> Option<u32> {
     })?;
     for member in c.children(container).start..=container {
         if c.kind(member) != NodeKind::Fields
-            || c.payload(member).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            || c.field(member, PayloadField::MemberKind)
+                != Some(dartq_parser::MemberKind::NonStaticField as u32)
         {
             continue;
         }
@@ -1607,9 +1600,9 @@ fn element_types<'a>(
                     expression_spelling(c, core::slice::from_ref(&value))?,
                 )
             } else {
-                // The colon (payload word 0) splits the side piece runs —
-                // `entry_sides`' own boundary.
-                let colon = c.payload(marker).first().copied()?;
+                // The colon (the marker's `Colon` word) splits the side
+                // piece runs — `entry_sides`' own boundary.
+                let colon = c.field(marker, PayloadField::Colon)?;
                 let split =
                     sides.partition_point(|&row| c.unit.ast.token_range(row).end <= colon + 1);
                 (
@@ -1743,7 +1736,7 @@ fn entry_sides(c: &Check<'_>, segment: &[u32]) -> Option<(u32, u32)> {
     if let [key, value] = direct.as_slice() {
         return Some((*key, *value));
     }
-    let colon = c.payload(marker).first().copied()?;
+    let colon = c.field(marker, PayloadField::Colon)?;
     let split = sides.partition_point(|&row| c.unit.ast.token_range(row).end <= colon + 1);
     Some((*sides[..split].last()?, *sides[split..].last()?))
 }

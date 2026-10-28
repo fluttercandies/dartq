@@ -137,6 +137,7 @@ use dartq_commands::layout::EngineLayout;
 use dartq_commands::query::{BatchQuery, QueryKind};
 use dartq_commands::resolve as resolve_core;
 use dartq_commands::resolve::ResolveError;
+use dartq_commands::workspace::WorkspaceAdvisory;
 use dartq_commands::{Verbosity, check, compat as compat_core, fix, impact as impact_core, query};
 use dartq_diagnostics::{AnalysisOutput, Diagnostic, FileLayoutProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -200,15 +201,22 @@ pub(crate) enum Request {
     /// located paths, oracle display order). `None` is the CLI's
     /// positional default, resolved at answer time (the server's working
     /// directory when it lies inside the workspace, the workspace root
-    /// itself otherwise).
+    /// itself otherwise). `targets` (plural) is the routed one-shot CLI
+    /// face's aim list (#2627) — same classification, several aims, the
+    /// union covered — and `format` switches the answer to the routed
+    /// shape: the rendered stdout bytes of the same writers the cold CLI
+    /// face prints through, beside the severity counts and the workspace
+    /// advisory.
     Analyze {
-        target: Option<dartq_commands::analyze::Target>,
+        targets: Vec<dartq_commands::analyze::Target>,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
     },
     Check {
         paths: Vec<PathBuf>,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -362,11 +370,16 @@ struct VerbosityParams {
 }
 
 /// The `dartq/analyze` payload: the optional aim (a directory or file —
-/// the CLI positional's mirror) beside the tier.
+/// the CLI positional's mirror) beside the tier, the plural aims of the
+/// routed one-shot face (#2627), and the rendered-output switch.
 #[derive(Deserialize)]
 struct AnalyzeParams {
     #[serde(default)]
     target: Option<PathBuf>,
+    #[serde(default)]
+    targets: Vec<PathBuf>,
+    #[serde(default)]
+    format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
 }
@@ -375,7 +388,21 @@ struct AnalyzeParams {
 struct CheckParams {
     paths: Vec<PathBuf>,
     #[serde(default)]
+    format: Option<RenderFormat>,
+    #[serde(default)]
     verbosity: Verbosity,
+}
+
+/// The routed face's output switch (#2627): the format the one-shot CLI
+/// would print — the answer carries the rendered bytes of the same writer
+/// the cold face uses (one renderer per format; see
+/// `dartq_commands::render`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RenderFormat {
+    Lon,
+    Json,
+    Text,
 }
 
 #[derive(Deserialize)]
@@ -491,12 +518,36 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<AnalyzeParams>(params.clone()).map_err(invalid)?;
-            let target = match decoded.target.as_deref() {
-                None => None,
-                Some(target) => Some(classify_target(&resolve(root, target.to_path_buf()))?),
-            };
+            // One aim list: the singular `target` (the MCP face) and the
+            // plural `targets` (the routed one-shot face) are two
+            // spellings of the same slot, never both.
+            if decoded.target.is_some() && !decoded.targets.is_empty() {
+                return Err("dartq/analyze takes `target` or `targets`, not both".into());
+            }
+            let aims: Vec<PathBuf> = decoded
+                .target
+                .map_or_else(|| decoded.targets.clone(), |target| vec![target])
+                .into_iter()
+                .map(|aim| resolve(root, aim))
+                .collect();
+            let targets = aims
+                .iter()
+                .map(|aim| classify_target(aim))
+                .collect::<Result<Vec<_>, _>>()?;
+            // The rendered face is the cold CLI face's bytes: the compact
+            // rows over the base view — a tier or an agent view has no
+            // rendered spelling yet.
+            if decoded.format.is_some() {
+                if decoded.verbosity != Verbosity::Compact {
+                    return Err("the rendered dartq/analyze face serves the compact rows".into());
+                }
+                if agent.is_some() {
+                    return Err("the rendered dartq/analyze face answers the base view".into());
+                }
+            }
             Ok(Request::Analyze {
-                target,
+                targets,
+                format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -617,8 +668,20 @@ fn parse_check_or_fix(method: &str, params: &Value, root: &Path) -> Result<Reque
     if method == "dartq/check" {
         let (agent, since) = session_fields(params)?;
         let context = context_field(params)?;
+        // The rendered face is the cold CLI face's bytes (the compact
+        // rows, the disk view) — the same rules the analyze face's
+        // rendered arm states.
+        if decoded.format.is_some() {
+            if decoded.verbosity != Verbosity::Compact {
+                return Err("the rendered dartq/check face serves the compact rows".into());
+            }
+            if agent.is_some() {
+                return Err("the rendered dartq/check face answers the disk view".into());
+            }
+        }
         Ok(Request::Check {
             paths,
+            format: decoded.format,
             verbosity: decoded.verbosity,
             agent,
             context,
@@ -1148,6 +1211,18 @@ pub(crate) struct Drain<'a> {
     pub changes: &'a Changes<'a>,
     /// The session's current delta cursor, echoed by delta answers.
     pub cursor: u64,
+    /// The session's workspace advisory (#741), when it holds one — the
+    /// routed one-shot face's answer carries it so the caller prints it
+    /// on the stream its cold face uses (stderr for the data faces, the
+    /// leading stdout line for text).
+    pub advisory: Option<&'a WorkspaceAdvisory>,
+    /// The universe stamp (#2675): the package config the session's
+    /// analysis universe was assembled from, with the (mtime, size) it
+    /// was read at. The routed one-shot face's answer carries it so the
+    /// caller can verify the universe against the disk bytes NOW — a
+    /// mismatch means the answer must not be printed (the caller falls
+    /// back to its own cold path).
+    pub package_stamp: Option<&'a PackageStamp>,
     /// The requesting agent's overlay paths (`dartq/check`'s engine view
     /// answers over the discovered set plus these; empty for base groups).
     pub overlay_paths: &'a [PathBuf],
@@ -1157,23 +1232,67 @@ pub(crate) struct Drain<'a> {
     pub symbols: &'a SymbolTable,
 }
 
+/// The package config one analysis universe was assembled from, with the
+/// on-disk stamp it was read at (#2675's belt-and-braces contract): the
+/// routed answer carries it, and a caller that sees different disk bytes
+/// now refuses the answer. `mtime_ns` is nanoseconds since the UNIX
+/// epoch (0 for a filesystem reporting no mtime).
+pub(crate) struct PackageStamp {
+    pub(crate) path: PathBuf,
+    pub(crate) mtime_ns: u64,
+    pub(crate) size: u64,
+}
+
+impl PackageStamp {
+    /// Stamps the package config at `path` as it sits on disk right now;
+    /// `None` when there is none (the assembly's BasicWorkspace floor).
+    pub(crate) fn read(path: PathBuf) -> Option<Self> {
+        let meta = std::fs::metadata(&path).ok()?;
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        Some(Self {
+            path,
+            mtime_ns,
+            size: meta.len(),
+        })
+    }
+
+    /// The wire form the routed answer carries: `null` for a universe
+    /// with no package config.
+    pub(crate) fn wire(&self) -> Value {
+        json!({
+            "path": self.path.display().to_string(),
+            "mtime_ns": self.mtime_ns,
+            "size": self.size,
+        })
+    }
+}
+
 /// Answers one staged request at the drain. Shared borrows throughout: the
 /// read task fans coalesced requests out to the answer workers over these.
 pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, SessionError> {
     match request {
         Request::Index { verbosity, .. } => Ok(index_answer(drain, *verbosity)),
         Request::Analyze {
-            target, verbosity, ..
-        } => Ok(analyze_answer(drain, *verbosity, target.as_ref())),
+            targets,
+            format,
+            verbosity,
+            ..
+        } => Ok(analyze_answer(drain, *verbosity, targets, *format)),
         Request::Check {
             paths,
+            format,
             verbosity,
             agent,
             since,
             ..
         } => match agent {
             Some(_) => check_engine_view(drain, paths, *verbosity, *since),
-            None => check_disk_view(drain, paths, *verbosity, *since),
+            None => check_disk_view(drain, paths, *format, *verbosity, *since),
         },
         Request::Query {
             name,
@@ -1318,21 +1437,29 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 /// order (the oracle display order), the seven-key compact row. Minimal
 /// keeps the red line (the document's rows minus `sev`/`msg`); full
 /// equals compact plus the short-id economics over row `file` values.
+///
+/// With `format` (#2627) the answer is instead the routed one-shot face:
+/// the rendered stdout bytes of the same writer the cold CLI face prints
+/// through (`rendered_answer`), beside the severity counts and the
+/// workspace advisory.
 pub(crate) fn analyze_answer(
     drain: &Drain<'_>,
     verbosity: Verbosity,
-    target: Option<&dartq_commands::analyze::Target>,
+    targets: &[dartq_commands::analyze::Target],
+    format: Option<RenderFormat>,
 ) -> Value {
-    let target = target
-        .cloned()
-        .unwrap_or_else(|| default_target(drain.root));
+    let default = default_target(drain.root);
+    let targets = if targets.is_empty() {
+        std::slice::from_ref(&default)
+    } else {
+        targets
+    };
     let layout = EngineLayout::over(drain.engine, drain.diagnostics.iter().map(|d| d.file));
-    let targets = [target];
     let covered: Vec<Diagnostic> =
         dartq_commands::analyze::oracle_order(drain.diagnostics, &layout)
             .into_iter()
             .filter(|diagnostic| {
-                dartq_commands::analyze::covered(layout.file_path(diagnostic.file), &targets)
+                dartq_commands::analyze::covered(layout.file_path(diagnostic.file), targets)
             })
             .cloned()
             .collect();
@@ -1340,10 +1467,14 @@ pub(crate) fn analyze_answer(
         inner: &layout,
         root: drain.engine.packages().workspace_root(),
     };
-    let mut answer = dartq_commands::analyze::diags_document(&AnalysisOutput {
+    let output = AnalysisOutput {
         diagnostics: &covered,
         files: &document,
-    });
+    };
+    if let Some(format) = format {
+        return rendered_answer(format, &output, drain.advisory, drain.package_stamp);
+    }
+    let mut answer = dartq_commands::analyze::diags_document(&output);
     if verbosity == Verbosity::Minimal
         && let Some(rows) = answer["diags"].as_array_mut()
     {
@@ -1355,6 +1486,60 @@ pub(crate) fn analyze_answer(
         }
     }
     session_answer(answer, verbosity, None, drain, &[("diags", "file")])
+}
+
+/// The routed one-shot answer (#2627): the rendered stdout bytes of the
+/// format's one writer — `lon` the canonical line over the shared
+/// document builder, `json` the oracle envelope, `text` the grouped
+/// human face — beside `counts` (the severity arithmetic the caller's
+/// exit tier needs), `advisory` (the workspace advisory row, when the
+/// session holds one; the caller prints it on the stream its cold face
+/// uses), and `packages` (#2675: the universe's package-config stamp —
+/// the caller verifies it against the disk before printing). The bytes
+/// are the cold face's bytes: the same writer functions, the same
+/// inputs, rendered here only because the oracle envelope's key order
+/// and the tier-specific shapes do not survive a `Value` round trip.
+fn rendered_answer(
+    format: RenderFormat,
+    output: &AnalysisOutput<'_>,
+    advisory: Option<&WorkspaceAdvisory>,
+    package_stamp: Option<&PackageStamp>,
+) -> Value {
+    let mut stdout = Vec::new();
+    let rendered = match format {
+        RenderFormat::Lon => dartq_commands::render::write_lon(
+            &mut stdout,
+            &dartq_commands::analyze::diags_document(output),
+        ),
+        RenderFormat::Json => dartq_diagnostics::write_json(&mut stdout, output),
+        RenderFormat::Text => dartq_commands::render::write_human(
+            &mut stdout,
+            output.diagnostics,
+            output.files,
+        ),
+    };
+    rendered.expect("an in-memory writer never fails");
+    let (errors, warnings, infos) =
+        output
+            .diagnostics
+            .iter()
+            .fold((0usize, 0usize, 0usize), |(e, w, i), diag| {
+                match diag.severity {
+                    dartq_diagnostics::Severity::Error => (e + 1, w, i),
+                    dartq_diagnostics::Severity::Warning => (e, w + 1, i),
+                    dartq_diagnostics::Severity::Info => (e, w, i + 1),
+                }
+            });
+    json!({
+        "v": SCHEMA_VERSION,
+        "stdout": String::from_utf8(stdout).expect("the writers emit UTF-8"),
+        "counts": {"error": errors, "warning": warnings, "info": infos},
+        "advisory": advisory.map(|advisory| json!({
+            "code": advisory.code().name,
+            "message": advisory.message(),
+        })),
+        "packages": package_stamp.map(PackageStamp::wire),
+    })
 }
 
 /// The analyze document's layout face: the engine's paths and positions
@@ -1423,9 +1608,14 @@ fn check_row(
 
 /// The base view's check answer: the M0 disk pipeline (scan+parse over the
 /// discovered file set), rows filtered by the delta cursor when one came.
+/// With `format` (#2627) the answer is the routed one-shot face — the
+/// rendered stdout bytes of the same writer the cold CLI check face
+/// prints through (the run's own `AnalysisOutput` is the provider the
+/// cold face uses, so the bytes are identical by construction).
 fn check_disk_view(
     drain: &Drain<'_>,
     paths: &[PathBuf],
+    format: Option<RenderFormat>,
     verbosity: Verbosity,
     since: Option<u64>,
 ) -> Result<Value, SessionError> {
@@ -1441,6 +1631,12 @@ fn check_disk_view(
     // the root-derived spellings answer under the caller's target).
     let run = check::analyze_targets(paths, &files).map_err(SessionError::Io)?;
     let output = run.output();
+    if let Some(format) = format {
+        // No advisory and no universe stamp: the M0 pipeline is scan+parse
+        // over the disk — its bytes read no package universe, so there is
+        // nothing for the caller to verify against the disk.
+        return Ok(rendered_answer(format, &output, None, None));
+    }
     let diags: Vec<Value> = output
         .diagnostics
         .iter()

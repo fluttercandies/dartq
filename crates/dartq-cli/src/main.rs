@@ -64,7 +64,6 @@
 //! regardless — the main loop observes the channel disconnect and ends the
 //! session through the transport's own exit path.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -84,9 +83,7 @@ use dartq_commands::workspace::{
     AnalyzeOverrides, WorkspaceAdvisory, engine_config_with_advisory,
     engine_config_with_overrides_phased, open_engine,
 };
-use dartq_diagnostics::{
-    AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json,
-};
+use dartq_diagnostics::{AnalysisOutput, Diagnostic, Severity, write_json};
 use dartq_engine::EngineConfig;
 use dartq_sdk::SdkSnapshot;
 
@@ -100,12 +97,15 @@ mod index;
 mod output;
 mod packages;
 mod rename;
+mod resident;
 mod resolve;
 mod session;
 mod test;
 
 pub(crate) use output::OutputFormat;
-use output::{diags_document, text_diag_row, write_json_value, write_lon, write_text_value};
+use output::{
+    diags_document, write_human, write_json_value, write_lon, write_text_value,
+};
 
 /// Process exit codes, pinned to the dartdev oracle (analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210) plus the sysexits-style tiers the
@@ -357,6 +357,18 @@ struct CheckArgs {
     /// Off by default (`--fatal-infos` sets it) — mirrors the oracle.
     #[arg(long)]
     fatal_infos: bool,
+    /// Run in-process, without the worktree's resident session. The
+    /// default consults the session layer: a live session is attached,
+    /// and when none is live one is spawned and waited for — the answer
+    /// is the daemon's over the same targets, rendered through the same
+    /// writers. `--cold` skips all of that (the pre-#2627 behavior).
+    /// Invocations carrying a per-run engine posture (`--overlay`,
+    /// `--packages`, `--enable-experiment`, `--no-plugins`,
+    /// `--memory-limit`, `--trace-events`, `--cache-size-limit`) and
+    /// multi-workspace target sets always run in-process — the resident
+    /// engine serves the plain face.
+    #[arg(long)]
+    cold: bool,
     /// The dartdev global flags, accepted and ignored — see
     /// [`DartdevGlobals`].
     #[command(flatten)]
@@ -499,13 +511,20 @@ struct AnalyzeArgs {
         value_parser = dartq_engine::store::parse_size_limit
     )]
     cache_size_limit: Option<u64>,
+    /// Run in-process, without the worktree's resident session. The
+    /// default consults a live session when one is attached (never
+    /// spawning one — a syntax sweep must not pay an engine bring-up);
+    /// `--cold` skips the consult (`--fast` under the analyze spelling
+    /// takes the same route).
+    #[arg(long)]
+    cold: bool,
     /// The dartdev global flags, accepted and ignored — see
     /// [`DartdevGlobals`].
     #[command(flatten)]
     dartdev_globals: DartdevGlobals,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AnalyzeFormat {
     /// Canonical LON over the short vocabulary: one `{v diags:[…]}`
     /// document, one flat `{code sev file line col len msg doc?}` row
@@ -692,6 +711,7 @@ fn check_from_analyze(args: &AnalyzeArgs) -> CheckArgs {
         fatal_warnings: args.fatal_warnings,
         no_fatal_warnings: args.no_fatal_warnings,
         fatal_infos: args.fatal_infos,
+        cold: args.cold,
         dartdev_globals: args.dartdev_globals,
         paths: args.targets.clone(),
     }
@@ -784,18 +804,40 @@ struct SymbolArgs {
 
 /// Severity arithmetic: the highest fatal tier present.
 /// Errors are always fatal (3); warnings fatal unless `--no-fatal-warnings`
-/// (2); infos fatal only under `--fatal-infos` (1).
+/// (2); infos fatal only under `--fatal-infos` (1). [`severity_tier`] is
+/// the one ladder — the cold faces over their diagnostic rows, the
+/// resident-routed faces over the answer's severity counts.
 fn severity_exit(diags: &[Diagnostic], fatal_warnings: bool, fatal_infos: bool) -> u8 {
-    diags
-        .iter()
-        .map(|d| match d.severity {
-            Severity::Error => exit::ERRORS,
-            Severity::Warning if fatal_warnings => exit::FATAL_WARNINGS,
-            Severity::Info if fatal_infos => exit::FATAL_INFOS,
-            _ => exit::CLEAN,
-        })
-        .max()
-        .unwrap_or(exit::CLEAN)
+    let mut has_error = false;
+    let mut has_warning = false;
+    let mut has_info = false;
+    for d in diags {
+        match d.severity {
+            Severity::Error => has_error = true,
+            Severity::Warning => has_warning = true,
+            Severity::Info => has_info = true,
+        }
+    }
+    severity_tier(has_error, has_warning, has_info, fatal_warnings, fatal_infos)
+}
+
+/// The severity ladder over presence flags (see [`severity_exit`]).
+fn severity_tier(
+    has_error: bool,
+    has_warning: bool,
+    has_info: bool,
+    fatal_warnings: bool,
+    fatal_infos: bool,
+) -> u8 {
+    if has_error {
+        exit::ERRORS
+    } else if has_warning && fatal_warnings {
+        exit::FATAL_WARNINGS
+    } else if has_info && fatal_infos {
+        exit::FATAL_INFOS
+    } else {
+        exit::CLEAN
+    }
 }
 
 fn check(args: &CheckArgs) -> u8 {
@@ -810,6 +852,16 @@ fn check(args: &CheckArgs) -> u8 {
 /// writer-taking shape (`query_symbol_run`, `explain_run`), so the output
 /// documents are pinnable without capturing the process stdout.
 fn check_run(args: &CheckArgs, out: &mut impl Write) -> u8 {
+    // The resident consult (#2627): a live session answers the same M0
+    // pipeline in the daemon, rendered through the same writers. Attach
+    // only — never a spawn (see `resident::route_check`). No session
+    // here is the check face's normal shape, not a fallback: it proceeds
+    // in-process with no advisory.
+    if !args.cold
+        && let Some(code) = resident::route_check(args, out)
+    {
+        return code;
+    }
     let started = Instant::now();
     let discovery_at = Instant::now();
     // The check face's own setup window: run start → discovery walk start.
@@ -999,6 +1051,12 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
 /// through the oracle-format writers. The workspace assembly and the
 /// engine pass — plain or `--overlay` — live in `dartq-commands`; this
 /// shell adds the crash tier, the writers, and the exit tier.
+///
+/// The resident consult (#2627) leads: the plain face asks the
+/// worktree's session for the same targets first (spawning it when none
+/// is live) and prints the daemon-rendered answer through the same
+/// writers — byte-identical to the cold path below, which serves every
+/// invocation the resident engine cannot honor and every fallback.
 fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     // Resolve every target before any analysis (the oracle's order: the
     // whole rest list is classified upfront, analyze.dart:182-193). A
@@ -1010,6 +1068,11 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    if !args.cold
+        && let Some(code) = resident::route_analyze(args, &targets, out, &session::spawn_server)
+    {
+        return code;
+    }
     analyze_targets(args, &targets, out)
 }
 
@@ -1436,12 +1499,25 @@ fn write_json_memory(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::R
     write_json(&mut line, output)?;
     // The envelope ends `]}\n` by the shared writer's contract.
     debug_assert!(line.ends_with(b"}\n"));
+    let mut line = String::from_utf8(line).expect("the writer emits UTF-8");
+    splice_memory_key(&mut line);
+    out.write_all(line.as_bytes())
+}
+
+/// The `--memory` member splice over a rendered JSON-envelope line
+/// (analyze face): `,"memory":<peak RSS KiB>` before the closing brace —
+/// the resident-routed face applies the same splice over the
+/// daemon-rendered bytes (the RSS is the calling process's own, the
+/// quantity the flag names).
+fn splice_memory_key(line: &mut String) {
+    if !line.ends_with("}\n") {
+        return;
+    }
     line.truncate(line.len() - 2);
     if let Some(kb) = max_rss_bytes().map(|bytes| bytes / 1024) {
-        write!(line, ",\"memory\":{kb}")?;
+        line.push_str(&format!(",\"memory\":{kb}"));
     }
-    line.extend_from_slice(b"}\n");
-    out.write_all(&line)
+    line.push_str("}\n");
 }
 
 /// The human-format advisory line, ahead of the diagnostics groups: the
@@ -1739,49 +1815,6 @@ fn target_panel(target: ContextTarget) -> &'static str {
         ContextTarget::Io => dartq_engine::DEFAULT_TARGET,
         ContextTarget::Web => "js",
         ContextTarget::Wasm => "wasm",
-    }
-}
-
-/// Human format: one `root: <absolute>` line when rows exist and the run
-/// has one analysis root (the lon face's own gate — the base the located
-/// headings spell against), diagnostics grouped by file (canonical path
-/// order; headings spelled through the locator — root-relative inside,
-/// absolute outside), the row grammar `sev code line:col msg` under each
-/// group, the count tail (the oracle's spelling). Not a differential
-/// face — layout may change freely.
-fn write_human(
-    out: &mut impl Write,
-    diags: &[Diagnostic],
-    layout: &dyn FileLayoutProvider,
-) -> io::Result<()> {
-    let root = layout.analysis_root();
-    let mut groups: BTreeMap<&Path, Vec<&Diagnostic>> = BTreeMap::new();
-    for diag in diags {
-        groups
-            .entry(layout.file_path(diag.file))
-            .or_default()
-            .push(diag);
-    }
-    if let Some(root) = root.filter(|_| !groups.is_empty()) {
-        writeln!(out, "root: {}", root.display())?;
-    }
-    for (path, group) in &groups {
-        let heading = match root {
-            Some(root) => dartq_commands::locate(root, path),
-            None => path.display().to_string(),
-        };
-        writeln!(out, "{heading}")?;
-        for diag in group {
-            writeln!(out, "  {}", text_diag_row(diag, layout))?;
-        }
-    }
-    match diags.len() {
-        // The oracle's clean-set tail carries the exclamation mark
-        // (`dart analyze`, 3.13.1: `No issues found!`); the counted tails
-        // keep the period (`N issues found.`).
-        0 => writeln!(out, "No issues found!"),
-        1 => writeln!(out, "1 issue found."),
-        n => writeln!(out, "{n} issues found."),
     }
 }
 
@@ -2296,7 +2329,7 @@ mod tests {
             .map(|cli| cli.command)
     }
 
-    fn check_args(args: &[&str]) -> CheckArgs {
+    pub(crate) fn check_args(args: &[&str]) -> CheckArgs {
         match parse_args_of(args) {
             Ok(Some(Command::Check(check))) => check,
             _ => panic!("expected check command"),
@@ -2777,6 +2810,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            cold: true,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
@@ -2809,6 +2843,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            cold: true,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
@@ -2852,6 +2887,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            cold: true,
             dartdev_globals: DartdevGlobals::default(),
         };
         let mut out: Vec<u8> = Vec::new();
@@ -2901,6 +2937,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            cold: true,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
@@ -3004,6 +3041,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            cold: true,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.join("notes.txt")],
         };
@@ -3199,7 +3237,7 @@ mod tests {
     /// assembly the dartq-engine integration fixture (tests/common/mod.rs)
     /// pins, so the CLI's workspace faces are exercised exactly as the
     /// engine's own tests do.
-    fn analyze_fixture(tag: &str, libraries: &[(&str, &str)]) -> PathBuf {
+    pub(crate) fn analyze_fixture(tag: &str, libraries: &[(&str, &str)]) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("dq_cli_analyze_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -3253,7 +3291,7 @@ mod tests {
         root
     }
 
-    fn analyze_args(
+    pub(crate) fn analyze_args(
         root: &Path,
         format: AnalyzeFormat,
         metrics_json: Option<PathBuf>,
@@ -3272,6 +3310,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            cold: true,
             memory_limit: None,
             trace_events: None,
             cache_size_limit: None,

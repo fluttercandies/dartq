@@ -30,6 +30,10 @@
 //!   `token_range`, `children`, `parent`, `payload`.
 //! - The derived-field accessors for eliminated payload words (`question`,
 //!   `mod_flags`, `last_token`, …) — #174.
+//! - The named payload-field face ([`PayloadField`], [`field_index`],
+//!   [`SyntaxTable::field`], [`AstBuilder::patch_field`]): every kind's
+//!   word layout as one checked-in table, so payload words are addressed
+//!   by name, never by index.
 //! - [`AstKey`] — content-addressed cache identity; identical keys share one
 //!   unit across workspaces/contexts.
 //! - Traversal is `match node.kind` + an explicit stack — deliberately no
@@ -45,6 +49,7 @@
 
 mod builder;
 mod derived;
+mod fields;
 mod key;
 mod kind;
 mod span;
@@ -56,6 +61,7 @@ pub use builder::{AstBuilder, Marker};
 pub use derived::{
     first_modifier, for_token, head_is, indexed_open, last_token, mod_flags, question,
 };
+pub use fields::{PAYLOAD_FIELDS, PayloadField, field_index};
 pub use key::{AstKey, FeatureSetId, ParserVersion};
 pub use kind::{LeafShape, NodeKind, leaf_shape};
 pub use span::{byte_span, utf16_span};

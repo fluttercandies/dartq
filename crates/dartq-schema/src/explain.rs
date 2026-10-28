@@ -6,7 +6,9 @@
 //! face's constructor rows (no source span exists for them — the name
 //! and the rendered parameter face are the facts), and `others` carries
 //! the remaining same-named declarations the primary was picked over
-//! (locator rows: file, kind, container, 1-based line).
+//! (locator rows: file, kind, container, 1-based line; absent when empty
+//! — the producer drops an empty disambiguation set, and the validator
+//! stays absent-tolerant like every optional column).
 //!
 //! # Verbosity tiers (crate docs, "Verbosity tiers")
 //!

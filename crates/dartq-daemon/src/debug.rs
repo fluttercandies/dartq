@@ -379,8 +379,8 @@ fn load_manifests(dir: &Path) -> Vec<(u32, SessionManifest)> {
 
 /// One candidate line of the ambiguity listing: `#id kind script` for a
 /// launch, `#id attach <ws_uri>` for an attach.
-fn session_line(managed: &ManagedSession, id: u32) -> String {
-    match &managed.origin {
+fn origin_line(origin: &Origin, id: u32) -> String {
+    match origin {
         Origin::Launch { script, kind } => {
             format!("#{id} {} {}", launch_kind_word(*kind), script.display())
         }
@@ -400,19 +400,24 @@ fn select_session(manager: &mut DebugManager, requested: Option<u32>) -> Result<
         None => {
             let mut ids: Vec<u32> = manager.sessions.keys().copied().collect();
             ids.sort_unstable();
-            match ids[..] {
-                [] => Err(DebugError::NoSessions),
-                [only] => Ok(only),
-                _ => {
-                    let candidates = ids
-                        .iter()
-                        .map(|&id| session_line(&manager.sessions[&id], id))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    Err(DebugError::AmbiguousSession(candidates))
-                }
-            }
+            sole_or_ambiguous(&ids, |id| origin_line(&manager.sessions[&id].origin, id))
         }
+    }
+}
+
+/// The selector's decision over the live id set: the sole live session
+/// picks itself; zero and several are the machine-coded misses, the
+/// several case listing every candidate in id order. Split from the
+/// registry read so the several-case listing pins hermetically — a live
+/// [`DebugSession`] needs a real VM, which only the process-level e2e
+/// leg holds.
+fn sole_or_ambiguous(ids: &[u32], line: impl Fn(u32) -> String) -> Result<u32, DebugError> {
+    match ids {
+        [] => Err(DebugError::NoSessions),
+        [only] => Ok(*only),
+        several => Err(DebugError::AmbiguousSession(
+            several.iter().map(|&id| line(id)).collect::<Vec<_>>().join("; "),
+        )),
     }
 }
 
@@ -1734,9 +1739,7 @@ mod tests {
     /// The sole-session selector: an absent `session_id` never reaches a
     /// VM against an empty registry — every session-bearing face answers
     /// the machine-coded `NO_SESSIONS` miss naming the way out, and an
-    /// explicit id keeps its own `NO_SUCH_SESSION` miss. The several-
-    /// sessions listing needs live sessions and is pinned at the process
-    /// level (the e2e debug leg's ambiguity check).
+    /// explicit id keeps its own `NO_SUCH_SESSION` miss.
     #[test]
     fn absent_session_id_answers_the_machine_coded_misses() {
         let mut manager = DebugManager::sharing(Arc::new(AtomicUsize::new(0)));
@@ -1780,6 +1783,41 @@ mod tests {
             message.starts_with("DARTQ/DEBUG/NO_SUCH_SESSION: "),
             "{message}"
         );
+    }
+
+    /// The several-sessions selector (#2675 pin): with two live sessions
+    /// an absent `session_id` answers `AMBIGUOUS_SESSION` listing both
+    /// candidates in id order — the attach as `#id attach <ws_uri>`, the
+    /// launch as `#id kind script` — so the caller can pick; one live
+    /// session still picks itself.
+    #[test]
+    fn several_live_sessions_list_both_candidates_in_id_order() {
+        let attach = Origin::Attach("ws://127.0.0.1:61282/IEhvwjJyhjM=/ws".to_owned());
+        let launch = Origin::Launch {
+            script: Path::new("/tree/loop/bin/loop.dart").to_path_buf(),
+            kind: LaunchKind::Dart,
+        };
+        let line = |id: u32| match id {
+            2 => origin_line(&attach, id),
+            3 => origin_line(&launch, id),
+            other => panic!("unexpected candidate id {other}"),
+        };
+        let error = sole_or_ambiguous(&[2, 3], line).expect_err("several live sessions refuse to guess");
+        let DebugError::AmbiguousSession(candidates) = error else {
+            panic!("the several case is the ambiguity listing, not {error:?}");
+        };
+        assert_eq!(
+            candidates,
+            "#2 attach ws://127.0.0.1:61282/IEhvwjJyhjM=/ws; \
+             #3 dart /tree/loop/bin/loop.dart"
+        );
+        // The other two arms stay theirs: zero live is the way-out miss,
+        // one live picks itself.
+        assert!(matches!(
+            sole_or_ambiguous(&[], line),
+            Err(DebugError::NoSessions)
+        ));
+        assert_eq!(sole_or_ambiguous(&[3], line).expect("sole"), 3);
     }
 
     /// The dispatch wiring is hermetically exercisable without a live

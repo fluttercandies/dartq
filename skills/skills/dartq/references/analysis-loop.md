@@ -107,7 +107,9 @@ daemon `dartq/fix` and MCP `dartq_fix` take the same `role` (exact
 spellings, default `primary`).
 
 Rename anchors are `PATH:LINE:COL` (1-based; column counts UTF-16 code
-units — the same units an editor reports) or `PATH:OFFSET` (0-based bytes).
+units — the same units an editor reports) or `PATH:OFFSET` (0-based
+UTF-16 code units — the same unit every `off` in the edit rows; on
+pure-ASCII files it equals the byte count).
 
 ## 5. Verify
 

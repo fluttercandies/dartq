@@ -9,7 +9,8 @@
 //!
 //! - the anchor is `PATH:LINE:COL` (1-based line, 1-based UTF-16 code-unit
 //!   column — the diagnostics position convention every other face
-//!   prints) or `PATH:OFFSET` (0-based byte offset);
+//!   prints) or `PATH:OFFSET` (0-based UTF-16 code-unit offset — the
+//!   same unit every `off` dartq prints or accepts uses);
 //! - the default is a dry run: the machine document prints, nothing
 //!   writes; `--write` applies the edit set in place — collect-then-write
 //!   (every file's patched buffer computed before any file changes), only
@@ -37,7 +38,8 @@ use crate::exit;
 #[derive(Args)]
 pub(crate) struct RenameArgs {
     /// The rename anchor: `PATH:LINE:COL` (1-based; the column counts
-    /// UTF-16 code units) or `PATH:OFFSET` (0-based byte offset).
+    /// UTF-16 code units) or `PATH:OFFSET` (0-based UTF-16 code-unit
+    /// offset — the unit every `off` in the answer rows uses).
     pub(crate) target: String,
     /// The new identifier: a legal Dart identifier, not a reserved word.
     #[arg(long = "new-name", value_name = "IDENT")]
@@ -80,7 +82,7 @@ fn parse_target(spec: &str) -> Result<(PathBuf, Anchor), String> {
         if path.is_empty() {
             return Err(malformed());
         }
-        return Ok((PathBuf::from(path), Anchor::ByteOffset(offset)));
+        return Ok((PathBuf::from(path), Anchor::Utf16Offset(offset)));
     }
     Err(malformed())
 }
@@ -286,11 +288,11 @@ mod tests {
 
         let (path, anchor) = parse_target("lib/a.dart:58").expect("offset");
         assert_eq!(path, PathBuf::from("lib/a.dart"));
-        assert_eq!(anchor, Anchor::ByteOffset(58));
+        assert_eq!(anchor, Anchor::Utf16Offset(58));
 
         let (path, anchor) = parse_target("we:ird/a.dart:58").expect("colon path, offset form");
         assert_eq!(path, PathBuf::from("we:ird/a.dart"));
-        assert_eq!(anchor, Anchor::ByteOffset(58));
+        assert_eq!(anchor, Anchor::Utf16Offset(58));
 
         for malformed in ["lib/a.dart", "lib/a.dart:x", "lib/a.dart:1:x", ":58", ""] {
             assert!(

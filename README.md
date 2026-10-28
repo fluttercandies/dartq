@@ -16,6 +16,18 @@ bounded memory footprint outrank every other consideration.
 
 ## Quickstart
 
+Prebuilt binaries ship on the releases page as
+`dartq-<version>-<os>-<arch>.tar.gz` (`os` is `macos` or `linux`, `arch`
+is `arm64` or `x86_64`), each with a `.sha256` sidecar. On macOS, the
+Homebrew tap installs the same binaries:
+
+```bash
+brew tap fluttercandies/dartq
+brew install dartq
+```
+
+Building from source:
+
 ```bash
 cargo build --release -p dartq-cli   # the binary lands at target/release/dartq
 

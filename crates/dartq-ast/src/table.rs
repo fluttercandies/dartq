@@ -10,6 +10,7 @@
 
 use core::mem::size_of;
 
+use crate::PayloadField;
 use crate::kind::{NodeKind, flags, payload_len};
 
 /// Pool index sentinel: the node has no payload words.
@@ -153,6 +154,27 @@ impl SyntaxTable {
     pub fn parent(&self, id: u32) -> Option<u32> {
         let parent = self.parents[id as usize];
         (parent != PARENT_NONE).then_some(parent)
+    }
+
+    /// The node's payload word named by `field` — the named read face over
+    /// [`Self::payload`]: the index resolves through
+    /// [`crate::fields::PAYLOAD_FIELDS`] against the node's kind, so a
+    /// reader never addresses a word by number. `None` only when the kind's
+    /// row has no such field (a kind/field mismatch is a bug the
+    /// `debug_assert` names; tests run debug, so a wrong pairing fails
+    /// loudly there — the release face stays total and cheap).
+    ///
+    /// Token-valued words may carry [`crate::TOKEN_NONE`] (absent); filter
+    /// at the call site the way [`Self::payload`] readers always have.
+    #[must_use]
+    pub fn field(&self, id: u32, field: PayloadField) -> Option<u32> {
+        let kind = self.kind(id);
+        let index = crate::fields::field_index(kind, field);
+        debug_assert!(
+            index.is_some(),
+            "{field:?} is not a payload field of {kind:?} (row {id})"
+        );
+        Some(self.payload(id)[usize::from(index?)])
     }
 
     /// The node's shared-pool payload words (empty for span-only and

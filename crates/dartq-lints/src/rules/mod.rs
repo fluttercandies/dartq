@@ -26,7 +26,7 @@ pub(crate) mod slice;
 pub(crate) mod strings;
 pub(crate) mod types;
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 use dartq_scanner::KeywordStyle;
 use rustc_hash::FxHashMap;
 
@@ -162,7 +162,7 @@ pub(crate) fn class_declaration_name<'a>(c: &'a Check<'_>, class_row: u32) -> Op
     let is_class_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
-                c.payload(kid).first().copied(),
+                c.field(kid, PayloadField::Context),
                 Some(ctx)
                     if ctx
                         == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
@@ -211,7 +211,7 @@ pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
         .copied()
         .find(|&child| match c.kind(child) {
             NodeKind::Identifier => matches!(
-                c.payload(child).first().copied(),
+                c.field(child, PayloadField::Context),
                 Some(ctx)
                     if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
                         || ctx == dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
@@ -258,15 +258,19 @@ pub(crate) fn initialized_identifier_name(c: &Check<'_>, var: u32) -> Option<u32
 }
 
 /// The `var`/`final`/`const` keyword of a [`NodeKind::VariablesDeclaration`]
-/// row. Real parses store only `late` in payload word 0; the span head is
-/// face-dependent — a field declaration anchors the row at the keyword
-/// itself (members.rs `decl_head`: `late`, else var/final/const, else the
-/// type start), a local declaration at the name — so the head answers
-/// directly when it lexes as the keyword, and the name-anchored face
-/// recovers it with a bounded backward token walk stopped by statement
-/// boundaries; hand-built tables may carry the keyword itself in word 0.
+/// row. Real parses store only `late` in the row's `LateKeyword` word; the
+/// span head is face-dependent — a field declaration anchors the row at the
+/// keyword itself (members.rs `decl_head`: `late`, else var/final/const,
+/// else the type start), a local declaration at the name — so the head
+/// answers directly when it lexes as the keyword, and the name-anchored
+/// face recovers it with a bounded backward token walk stopped by statement
+/// boundaries; hand-built tables may carry the keyword itself in that word.
 pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u32> {
-    let stored = c.payload(row).first().copied().unwrap_or(NONE_TOKEN);
+    let stored = if c.kind(row) == NodeKind::VariablesDeclaration {
+        c.field(row, PayloadField::LateKeyword).unwrap_or(NONE_TOKEN)
+    } else {
+        NONE_TOKEN
+    };
     if stored != NONE_TOKEN && matches!(c.lexeme(stored), "var" | "final" | "const") {
         return Some(stored);
     }
@@ -414,7 +418,7 @@ pub(crate) fn is_just_underscores(name: &str) -> bool {
 /// carries a `NamedRecordField` whose name equals the bound variable's name
 /// (constant_identifier_names.dart:49-52, no_leading_underscores...dart:70-73).
 pub(crate) fn is_field_name_shortcut(c: &Check<'_>, pattern: u32) -> bool {
-    let Some(&name) = c.payload(pattern).first() else {
+    let Some(name) = c.field(pattern, PayloadField::Variable) else {
         return false;
     };
     let Some(parent) = c.ancestor(1) else {
@@ -552,7 +556,7 @@ pub(crate) fn const_keyword(c: &Check<'_>, node: u32) -> Option<u32> {
             head_is_const(c, node).then(|| c.head_token(node))
         }
         NodeKind::ListLiteral | NodeKind::SetOrMapLiteral | NodeKind::RecordLiteral => {
-            let keyword = c.payload(node).first().copied()?;
+            let keyword = c.field(node, PayloadField::ConstKeyword)?;
             (keyword != NONE_TOKEN).then_some(keyword)
         }
         _ => None,
@@ -654,17 +658,15 @@ pub(crate) fn has_doc_comment(c: &Check<'_>, node: u32) -> bool {
         })
 }
 
-/// The `get`/`set` keyword token of a member declaration, by lexeme.
-/// `Method` payload word 1 and `TopLevelMethod` payload word 0 are the
-/// `get_set` option.
+/// The `get`/`set` keyword token of a member declaration, by lexeme —
+/// the member's `GetOrSet` payload word (absent sentinel for plain
+/// methods).
 pub(crate) fn get_set_token<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
-    let word = match c.kind(node) {
-        NodeKind::Method => 1,
-        NodeKind::TopLevelMethod => 0,
-        _ => return None,
-    };
-    match c.payload(node).get(word) {
-        Some(&token) if token != crate::rules::NONE_TOKEN => Some(c.lexeme(token)),
+    if !matches!(c.kind(node), NodeKind::Method | NodeKind::TopLevelMethod) {
+        return None;
+    }
+    match c.field(node, PayloadField::GetOrSet) {
+        Some(token) if token != crate::rules::NONE_TOKEN => Some(c.lexeme(token)),
         _ => None,
     }
 }
@@ -741,7 +743,7 @@ fn class_row_index(c: &Check<'_>) -> FxHashMap<String, u32> {
         for kid in kids {
             let named = c.kind(kid) == NodeKind::Identifier
                 && matches!(
-                    c.payload(kid).first().copied(),
+                    c.field(kid, PayloadField::Context),
                     Some(ctx)
                         if ctx == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
                             as u32
@@ -959,9 +961,9 @@ pub(crate) fn member_matches(
             for kid in c.collect_direct(member) {
                 match c.kind(kid) {
                     NodeKind::Identifier
-                        if c.payload(kid).first()
+                        if c.field(kid, PayloadField::Context)
                             == Some(
-                                &(dartq_parser::IdentifierContext::MethodDeclaration as u32),
+                                dartq_parser::IdentifierContext::MethodDeclaration as u32,
                             ) =>
                     {
                         if c.lexeme(c.head_token(kid)) == name {
@@ -969,7 +971,9 @@ pub(crate) fn member_matches(
                         }
                     }
                     NodeKind::OperatorName if query == MemberQuery::Method => {
-                        let op = c.payload(kid).first().copied().unwrap_or(u32::MAX);
+                        let op = c
+                            .field(kid, PayloadField::Name)
+                            .unwrap_or(u32::MAX);
                         if c.lexeme(op) == name {
                             hits.push(kid);
                         }
@@ -980,8 +984,8 @@ pub(crate) fn member_matches(
         }
         NodeKind::Fields => {
             if query == MemberQuery::Method
-                || c.payload(member).first()
-                    != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                || c.field(member, PayloadField::MemberKind)
+                    != Some(dartq_parser::MemberKind::NonStaticField as u32)
             {
                 return hits;
             }
@@ -1102,7 +1106,8 @@ fn build_field_type_rows(c: &Check<'_>, class_row: u32) -> Vec<(u32, Option<u32>
         // The same face `member_matches`' Variable arm reads: a non-static
         // `Fields` row declaring through `InitializedIdentifier` rows.
         if c.kind(member) != NodeKind::Fields
-            || c.payload(member).first() != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            || c.field(member, PayloadField::MemberKind)
+                != Some(dartq_parser::MemberKind::NonStaticField as u32)
         {
             continue;
         }

@@ -934,6 +934,21 @@ pub struct Session {
     /// (#2596): a moved stamp on an engine-work drain re-evaluates the
     /// workspace advisory (a mid-session `pub get` heals its verdict).
     config_stamps: [Option<(SystemTime, u64)>; 3],
+    /// The universe stamp (#2675): the package config the analysis
+    /// universe was assembled from and the on-disk bytes it was read at.
+    /// Re-noted by the config-input watch's universe rebuild (including
+    /// the content-neutral arm — a `pub get` rewriting identical bytes
+    /// moves the stamp without moving the universe), and carried by the
+    /// routed answer so a caller can verify it against the disk.
+    package_stamp: Option<commands::PackageStamp>,
+    /// The shell's runtime knobs the universe rebuild re-arms on a
+    /// re-opened default context (#2675): the per-context memory budget
+    /// and the L3 content-store cap. The trace sink cannot travel — one
+    /// sink is one writer and the engine consumed it — so a rebuild
+    /// logs (`context_traced`) and continues untraced.
+    context_memory_limit_mib: u64,
+    context_content_store_limit: Option<u64>,
+    context_traced: bool,
     /// Whether the refresh walk's live-path skip has been reported (#2596)
     /// — the once-per-session stderr line for paths the ceiling refused.
     refresh_skip_reported: bool,
@@ -1246,6 +1261,16 @@ impl Session {
             }
             pool
         });
+        // The rebuild recipe (#2675): the shell's runtime knobs, captured
+        // before the trace sink moves into the default context — the
+        // config-input watch's universe rebuild re-arms them on a
+        // re-opened context (the trace sink itself cannot travel: one
+        // sink is one writer, and the engine consumed it).
+        let (context_memory_limit_mib, context_content_store_limit, context_traced) = (
+            session_runtime.memory_limit_mib,
+            session_runtime.content_store_limit,
+            session_runtime.trace.is_some(),
+        );
         // The contexts' workspace root (`config_dir` = root/.dart_tool) and
         // the default context's resolved SDK root; both captured before the
         // config moves into the context.
@@ -1337,6 +1362,11 @@ impl Session {
         // advisory's own evaluation moment — so only a later disk move of
         // pubspec / package config / analysis options re-evaluates it.
         let config_stamps = config_input_stamps(&workspace_root);
+        // The universe's own stamp (#2675): the package config the
+        // assembled resolution was read from, as it sits right now.
+        let package_stamp = commands::PackageStamp::read(
+            config_dir.join("package_config.json"),
+        );
         // #2619: the debug registry's live counter, shared with the
         // manager wherever it lives (here or on the debug worker).
         let debug_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1361,6 +1391,10 @@ impl Session {
             publishes_due: false,
             discovered: false,
             config_stamps,
+            package_stamp,
+            context_memory_limit_mib,
+            context_content_store_limit,
+            context_traced,
             refresh_skip_reported: false,
             symbols: commands::SymbolTable::default(),
             lint_memo: dartq_commands::lints::LintMemo::default(),
@@ -1489,11 +1523,11 @@ impl Session {
         // The stamps were noted at assembly (the advisory's evaluation
         // moment), so a first-turn comparison never misreads the
         // assembly's own stamps as a move: only a real config-input
-        // change — on the discovery turn or any later one — re-evaluates
-        // the verdict.
+        // change — on the discovery turn or any later one — re-derives
+        // what the assembly derived from those inputs.
         if self.config_stamps_moved() {
             self.note_config_stamps();
-            self.refresh_workspace_advisory();
+            self.refresh_config_inputs();
         }
     }
 
@@ -1510,15 +1544,147 @@ impl Session {
         self.config_stamps != config_input_stamps(&self.workspace_root)
     }
 
+    /// The config-input watch's one re-derivation (#2675): a moved
+    /// pubspec / package config / analysis options re-runs the shell
+    /// edge's own resolution once — `engine_config_with_advisory` over
+    /// the workspace root, the same evaluation the assembly performed —
+    /// and feeds BOTH faces it answers: the advisory verdict
+    /// ([`Self::adopt_workspace_advisory`], the #741/#2596 heal) and the
+    /// analysis universe itself ([`Self::rebuild_universe`], #2675 — the
+    /// routed answer must reflect the config bytes on disk at call time,
+    /// so a mid-session `pub get` invalidates the assembled package
+    /// graph instead of answering from it forever). A failed
+    /// re-derivation is an observation, never a refusal: the assembled
+    /// universe and the stored verdict stand, and the routed answer's
+    /// carried stamp lets the caller catch the gap.
+    fn refresh_config_inputs(&mut self) {
+        match engine_config_with_advisory(&self.workspace_root, Some(&self.sdk_root)) {
+            Ok((config, _, advisory)) => {
+                self.adopt_workspace_advisory(advisory);
+                self.rebuild_universe(config);
+            }
+            Err(error) => {
+                eprintln!("dartq-daemon: workspace advisory re-evaluation skipped: {error}");
+            }
+        }
+    }
+
+    /// The universe rebuild (#2675): re-derives the default context over
+    /// `config` — the fresh on-disk resolution — through the runtime's
+    /// own config-fork face. `open_context` dedups by configuration key,
+    /// so the move is honest in both directions: a content-neutral
+    /// rewrite (pub get emitting identical bytes) dedups to the SAME
+    /// context and only re-notes the stamp, and a real move opens a
+    /// fresh engine over the new package graph while the old one closes.
+    ///
+    /// The swap runs at the drain seam, after [`Runtime::drain`] popped
+    /// this turn's tasks: the popped reads re-point at the fresh id
+    /// (their analysis then runs on the new universe, ahead of this
+    /// turn's answers), the still-staged write applies on top of the
+    /// fresh engine's discovered disk state, and the publish baseline
+    /// clears so the next base read republishes the whole view (FileIds
+    /// are per-engine; a stale baseline could alias another file).
+    /// Warm-start, memory budget, and content-store arming mirror the
+    /// assembly's `open` posture; the trace sink cannot travel (one
+    /// sink, one writer, consumed by the old engine) and the rebuild
+    /// logs and continues untraced. The plugin set relaunches over the
+    /// fresh pub faces — the same discovery the assembly ran. Declared
+    /// extra contexts keep their assembled universes (their fork
+    /// dimensions are the shell's `dartq.yaml` contract; the production
+    /// serve shell declares none, and the routed face answers the
+    /// default context). Residual, by design: `since`-filtered delta
+    /// faces see universe-driven row moves only through the publish
+    /// channel — the per-path changed table has no entry for files no
+    /// write touched.
+    ///
+    /// A failure at any step keeps the assembled universe (logged) —
+    /// never a failed turn.
+    fn rebuild_universe(&mut self, mut config: EngineConfig) {
+        let stamp = commands::PackageStamp::read(
+            config.config_dir.join("package_config.json"),
+        );
+        let pub_config = Arc::clone(&config.pub_config);
+        let config_dir = config.config_dir.clone();
+        if let Some(pool) = &self.mapped_pool {
+            config.store = dartq_engine::pooled_mmap_store(pool);
+        }
+        let old = self.default_context;
+        let opened = self
+            .runtime
+            .open_context(dartq_engine::ContextConfig { engine: config, flags: 0 });
+        let fresh = match opened {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                eprintln!("dartq-daemon: universe rebuild skipped: {error}");
+                return;
+            }
+        };
+        if fresh != old {
+            // Invariant: `open_context` returned this id for a live context.
+            let engine = self
+                .runtime
+                .context_state_mut(fresh)
+                .expect("the context opened above");
+            engine.set_memory_limit(Some(self.context_memory_limit_mib));
+            if let Some(limit) = self.context_content_store_limit
+                && let Some(root) = dartq_engine::store::default_root()
+            {
+                let store_config = dartq_engine::store::StoreConfig { root, size_limit: limit };
+                if let Err(error) = engine.open_content_store(&store_config) {
+                    eprintln!("dartq-daemon: content store disabled: {error}");
+                }
+            }
+            if let Some(store) = &self.snapshot.store {
+                let header = engine.snapshot_header();
+                if let Some(snapshot) = store.load::<PersistedFacts>(&header) {
+                    engine.ingest_facts_snapshot(snapshot);
+                }
+            }
+            if self.context_traced {
+                eprintln!(
+                    "dartq-daemon: the trace sink does not carry across a universe rebuild"
+                );
+            }
+            // The fresh context discovers its workspace here — ahead of
+            // this turn's write apply and read analysis, the same order
+            // the lazy boot's discovery pass produces.
+            if let Err(error) = self.engine_mut(fresh).discover_workspace() {
+                eprintln!("dartq-daemon: workspace discovery failed: {error}");
+            }
+            self.default_context = fresh;
+            self.context_ids.retain(|id| *id != old);
+            self.context_ids.insert(0, fresh);
+            for read in &mut self.reads {
+                if read.context == old {
+                    read.context = fresh;
+                }
+            }
+            if self.runtime.close_context(old).is_err() {
+                // Invariant: the id came from assembly and was never
+                // closed; a miss is a program bug, not input state.
+                eprintln!("dartq-daemon: universe rebuild could not close the old context");
+            }
+            self.published.clear();
+            self.publishes_due = true;
+            self.pub_config = pub_config;
+            self.config_dir = config_dir;
+            let fresh_plugins =
+                PluginSet::launch(&self.workspace_root, &self.pub_config, &self.config_dir);
+            std::mem::replace(&mut self.plugins, fresh_plugins).shutdown();
+        }
+        // Either arm re-notes the stamp: the universe equals whatever
+        // these on-disk bytes produce — fresh on a rebuild, unchanged on
+        // a content-neutral rewrite.
+        self.package_stamp = stamp;
+    }
+
     /// The config-input watch sweep's advisory heal: re-runs the assembly's
     /// advisory face over the workspace root with the default context's
     /// resolved SDK — the same evaluation the shell edge ran once at
     /// assembly — and replaces the stored verdict wholesale: cleared when
     /// the fresh resolution carries none, updated when it does. Only the
     /// watched config inputs route here, so the source-edit stability the
-    /// pull face documents stands. The heal moves the reported verdict only;
-    /// the contexts' assembled resolution stays until a real session
-    /// restart.
+    /// pull face documents stands.
     ///
     /// The publish face keeps the once-per-session economics: before the
     /// session-start push has fired, the stored replacement is enough (the
@@ -1538,6 +1704,14 @@ impl Session {
                 return;
             }
         };
+        self.adopt_workspace_advisory(fresh);
+    }
+
+    /// Installs a freshly evaluated advisory verdict — [`Self::
+    /// refresh_workspace_advisory`]'s body over an already-computed
+    /// verdict, so the watch's one re-derivation feeds the rebuild and
+    /// the heal without a second SDK load.
+    fn adopt_workspace_advisory(&mut self, fresh: Option<WorkspaceAdvisory>) {
         if fresh == self.workspace_advisory {
             return;
         }
@@ -3079,6 +3253,8 @@ impl Session {
             diagnostics: &diagnostics,
             changes: &changes,
             cursor: self.cursor,
+            advisory: self.workspace_advisory.as_ref(),
+            package_stamp: self.package_stamp.as_ref(),
             overlay_paths: &overlay_paths,
             symbols: &self.symbols,
         };
@@ -4233,7 +4409,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4260,6 +4437,99 @@ mod tests {
             turn.publishes.iter().all(|push| push.uri != fresh_uri),
             "a fresh assembly never publishes the advisory"
         );
+    }
+
+    /// The universe rebuild (#2675): a mid-session package-config rewrite
+    /// re-derives the analysis universe before the next answer — the same
+    /// session that answered the dangling `package:dep/extra.dart` import
+    /// as an error answers clean once the config names the dependency,
+    /// and the routed answer's `packages` stamp names the config bytes
+    /// the fresh universe was assembled from (the caller's
+    /// belt-and-braces input).
+    #[test]
+    fn a_moved_package_config_rebuilds_the_universe_before_the_next_answer() {
+        let (workspace, mut session) = fixture_with(
+            "universe-rebuild",
+            "import 'package:dep/extra.dart';\n\nint main() => extra();\n",
+        );
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let pull = |session: &mut Session, id: i64| {
+            session.queue_command(
+                RequestId::Num(id),
+                Request::Analyze {
+                    targets: Vec::new(),
+                    format: Some(crate::commands::RenderFormat::Lon),
+                    verbosity: Verbosity::Compact,
+                    agent: None,
+                    context: None,
+                },
+            );
+            let turn = session.service();
+            turn.answers[0]
+                .1
+                .as_ref()
+                .expect("the routed pull answers")
+                .clone()
+        };
+
+        // Before: the resolution does not know `dep` — the import dangles.
+        let before = pull(&mut session, 1);
+        assert!(
+            before["stdout"]
+                .as_str()
+                .expect("the routed face renders stdout")
+                .contains("uri_does_not_exist"),
+            "the dangling import is an error before the dependency exists: {before}"
+        );
+
+        // The dependency joins the resolution (a pub get's shape: the
+        // config names it, the package lands beside the workspace).
+        let dep = workspace
+            .root
+            .parent()
+            .expect("the temp parent")
+            .join("dartq-daemon-test-dep-universe-rebuild");
+        std::fs::create_dir_all(dep.join("lib")).expect("the dep lib dir");
+        std::fs::write(
+            dep.join("pubspec.yaml"),
+            "name: dep\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("the dep pubspec");
+        std::fs::write(dep.join("lib/extra.dart"), "int extra() => 1;\n").expect("the dep lib");
+        let config_path = workspace.path(".dart_tool/package_config.json");
+        std::fs::write(
+            &config_path,
+            concat!(
+                r#"{"configVersion": 2, "packages": ["#,
+                r#"{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, "#,
+                r#"{"name": "dep", "rootUri": "../../dartq-daemon-test-dep-universe-rebuild", "packageUri": "lib/", "languageVersion": "3.5"}"#,
+                r#"], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+            ),
+        )
+        .expect("the fresh config");
+
+        // After: the same session's next answer reflects the new universe —
+        // clean, with the stamp naming the config bytes on disk now.
+        let after = pull(&mut session, 2);
+        let stdout = after["stdout"].as_str().expect("the routed face renders stdout");
+        assert!(
+            !stdout.contains("uri_does_not_exist") && !stdout.contains("undefined_function"),
+            "the once-dangling import now resolves (no stale universe): {after}"
+        );
+        assert!(stdout.contains("diags:[]"), "the tree answers clean: {after}");
+        let packages = after.get("packages").expect("the stamp rides the answer");
+        assert_eq!(
+            packages["path"].as_str().expect("the config path"),
+            config_path.display().to_string()
+        );
+        let meta = std::fs::metadata(&config_path).expect("the config stats");
+        assert_eq!(
+            packages["size"].as_u64(),
+            Some(meta.len()),
+            "the stamp names the config's current bytes: {packages}"
+        );
+        let _ = std::fs::remove_dir_all(&dep);
     }
 
     /// The span-capacity rejection advisories (#1549): an oversized staged
@@ -4376,7 +4646,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4413,7 +4684,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4449,7 +4721,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4507,7 +4780,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4552,7 +4826,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4641,7 +4916,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4710,7 +4986,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4723,7 +5000,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4771,7 +5049,8 @@ mod tests {
             session.queue_command(
                 RequestId::Num(id),
                 Request::Analyze {
-                    target: None,
+                    targets: Vec::new(),
+                    format: None,
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
@@ -4781,7 +5060,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(8),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Full,
                 agent: None,
                 context: None,
@@ -4849,7 +5129,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4883,7 +5164,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4939,7 +5221,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4969,7 +5252,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5020,7 +5304,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5063,7 +5348,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5205,7 +5491,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5259,7 +5546,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5387,7 +5675,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5605,7 +5894,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5669,7 +5959,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5678,7 +5969,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5727,7 +6019,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5749,7 +6042,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5817,7 +6111,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5876,7 +6171,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5901,7 +6197,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6021,7 +6318,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6109,7 +6407,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6154,7 +6453,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6201,7 +6501,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6234,7 +6535,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6291,6 +6593,7 @@ mod tests {
             RequestId::Num(2),
             Request::Check {
                 paths: vec![workspace.path("lib")],
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6329,6 +6632,7 @@ mod tests {
             RequestId::Num(2),
             Request::Check {
                 paths: vec![workspace.path("lib/nope.dart")],
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6350,6 +6654,7 @@ mod tests {
             RequestId::Num(3),
             Request::Check {
                 paths: vec![workspace.path("lib")],
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6399,6 +6704,7 @@ mod tests {
             RequestId::Num(id),
             Request::Check {
                 paths: paths.to_vec(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: agent.map(str::to_owned),
                 context: None,
@@ -6460,7 +6766,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(5),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6611,7 +6918,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -6624,7 +6932,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -6643,7 +6952,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6688,6 +6998,7 @@ mod tests {
             RequestId::Num(2),
             Request::Check {
                 paths: vec![workspace.path("lib")],
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -6707,7 +7018,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6909,7 +7221,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6933,7 +7246,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6980,7 +7294,8 @@ mod tests {
             session.queue_command(
                 RequestId::Num(id),
                 Request::Analyze {
-                    target: None,
+                    targets: Vec::new(),
+                    format: None,
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
@@ -7027,7 +7342,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(20),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7143,7 +7459,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7292,7 +7609,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7376,7 +7694,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7410,7 +7729,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7449,7 +7769,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7701,7 +8022,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7741,7 +8063,8 @@ mod tests {
             session.queue_command(
                 RequestId::Num(i64::try_from(index).expect("index fits i64") + 2),
                 Request::Analyze {
-                    target: None,
+                    targets: Vec::new(),
+                    format: None,
                     verbosity: Verbosity::Compact,
                     agent: Some(agent),
                     context: None,
@@ -7766,7 +8089,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(10_000),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: Some(format!("agent-{}", count - 1)),
                 context: None,
@@ -7812,7 +8136,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8394,7 +8719,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8403,7 +8729,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8458,7 +8785,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8519,7 +8847,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("a".into()),
@@ -8585,7 +8914,8 @@ mod tests {
         warm.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8594,7 +8924,8 @@ mod tests {
         warm.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8734,7 +9065,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8921,7 +9253,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8953,7 +9286,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9002,7 +9336,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9038,7 +9373,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9083,7 +9419,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9106,7 +9443,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9128,7 +9466,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9163,7 +9502,8 @@ mod tests {
             session.queue_command(
                 RequestId::Num(i64::from(strike) + 2),
                 Request::Analyze {
-                    target: None,
+                    targets: Vec::new(),
+                    format: None,
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
@@ -9187,7 +9527,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(5),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9199,7 +9540,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(6),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9264,7 +9606,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -9442,7 +9785,8 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
-                target: None,
+                targets: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,

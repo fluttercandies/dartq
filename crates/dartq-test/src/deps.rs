@@ -112,7 +112,10 @@ pub struct FileFacts {
     /// Reads the process environment through a shape the extractor cannot
     /// name — iterating `Platform.environment`, indexing it with a computed
     /// key, aliasing the map into a variable. A suite whose closure reaches
-    /// one is never cached: any variable could reach a verdict.
+    /// one is never cached: any variable could reach a verdict. (The
+    /// toolchain tier is exempt — a first-party flutter binding aliasing
+    /// the whole map as its default is the tool's plumbing, not a suite
+    /// author's read; its named reads still join the key.)
     ///
     /// Dot-shorthand `.environment['X']` accesses (Dart 3.10's inferred
     /// static invocation, no `Platform` receiver spelled) are not tracked;

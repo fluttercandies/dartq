@@ -4,7 +4,7 @@
 //! `non_constant_identifier_names`, `file_names`, and
 //! `matching_super_parameters`.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
@@ -94,7 +94,7 @@ pub(crate) mod camel_case_types {
 }
 
 pub(crate) mod camel_case_extensions {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_extensions.dart:31-42`
     /// — a named extension's name must be `UpperCamelCase`. The name is
@@ -113,7 +113,7 @@ pub(crate) mod camel_case_extensions {
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         // Anonymous extensions (`extension on X`) have no name: skip.
-        let Some(&name) = c.payload(node).get(1) else {
+        let Some(name) = c.field(node, PayloadField::Name) else {
             return;
         };
         if name == crate::rules::NONE_TOKEN {
@@ -131,7 +131,7 @@ pub(crate) mod camel_case_extensions {
 }
 
 pub(crate) mod constant_identifier_names {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/constant_identifier_names.dart:36-73`
     /// — `const` variables (fields, top-level, locals), enum constants, and
@@ -201,11 +201,11 @@ pub(crate) mod constant_identifier_names {
                 }
             }
             NodeKind::DeclaredVariablePattern => {
-                // Name token is payload word 0 (`variable: T`).
+                // Name token is the pattern's `Variable` word (`variable: T`).
                 if super::is_field_name_shortcut(c, node) {
                     return;
                 }
-                if let Some(&name) = c.payload(node).first()
+                if let Some(name) = c.field(node, PayloadField::Variable)
                     && name != crate::rules::NONE_TOKEN
                 {
                     super::check_lower_camel(c, name, c.lexeme(name));
@@ -217,7 +217,7 @@ pub(crate) mod constant_identifier_names {
 }
 
 pub(crate) mod no_leading_underscores_for_local_identifiers {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/no_leading_underscores_for_local_identifiers.dart:36-133`
     /// — local identifiers (local variables, catch parameters, non-named
@@ -274,8 +274,8 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
                 let mut hits: Vec<u32> = Vec::new();
                 for child in c.direct_children(node).iter().copied() {
                     if c.kind(child) == NodeKind::FormalParameter {
-                        // name: T is payload word 1 (the `FormalParameter` layout).
-                        if let Some(&name) = c.payload(child).get(1)
+                        // name: T is the formal's `Name` word.
+                        if let Some(name) = c.field(child, PayloadField::Name)
                             && name != crate::rules::NONE_TOKEN
                         {
                             hits.push(name);
@@ -310,7 +310,7 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
                 if super::is_field_name_shortcut(c, node) {
                     return;
                 }
-                if let Some(&name) = c.payload(node).first()
+                if let Some(name) = c.field(node, PayloadField::Variable)
                     && name != crate::rules::NONE_TOKEN
                 {
                     report_underscored(c, name);
@@ -322,8 +322,8 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
 
     /// Checks the non-field formals of one parameters section (required or
     /// positional-optional — named sections never reach here). Field
-    /// (`this.x`) and super formals are exempt (:99-104): receiver payload
-    /// word 0 is the `this`/`super` token when present. Hits are gathered
+    /// (`this.x`) and super formals are exempt (:99-104): the `Receiver`
+    /// word is the `this`/`super` token when present. Hits are gathered
     /// under the scratch borrow, then reported.
     fn report_positional_formals(c: &mut Check<'_>, node: u32) {
         let mut hits: Vec<u32> = Vec::new();
@@ -331,12 +331,12 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
             if c.kind(child) != NodeKind::FormalParameter {
                 continue;
             }
-            if let Some(&receiver) = c.payload(child).first()
+            if let Some(receiver) = c.field(child, PayloadField::Receiver)
                 && receiver != crate::rules::NONE_TOKEN
             {
                 continue;
             }
-            if let Some(&name) = c.payload(child).get(1)
+            if let Some(name) = c.field(child, PayloadField::Name)
                 && name != crate::rules::NONE_TOKEN
             {
                 hits.push(name);
@@ -361,7 +361,7 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
 }
 
 pub(crate) mod non_constant_identifier_names {
-    use super::{Check, Group, NodeKind, RuleSpec, is_just_underscores};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec, is_just_underscores};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `pkg/linter/lib/src/rules/non_constant_identifier_names.dart:36-169`
@@ -441,7 +441,7 @@ pub(crate) mod non_constant_identifier_names {
                 let mut hits: Vec<u32> = Vec::new();
                 for child in c.direct_children(node).iter().copied() {
                     if c.kind(child) == NodeKind::FormalParameter
-                        && let Some(&name) = c.payload(child).get(1)
+                        && let Some(name) = c.field(child, PayloadField::Name)
                         && name != NONE_TOKEN
                     {
                         hits.push(name);
@@ -470,7 +470,7 @@ pub(crate) mod non_constant_identifier_names {
                 if super::is_field_name_shortcut(c, node) {
                     return;
                 }
-                if let Some(&name) = c.payload(node).first()
+                if let Some(name) = c.field(node, PayloadField::Variable)
                     && name != NONE_TOKEN
                 {
                     check_plain(c, name, false);
@@ -487,9 +487,8 @@ pub(crate) mod non_constant_identifier_names {
                     // Field formals (`this.x`) are skipped (:103-105); super
                     // formals keep the check (official skips only
                     // `FieldFormalParameter`).
-                    if c.payload(child)
-                        .first()
-                        .copied()
+                    if c
+                        .field(child, PayloadField::Receiver)
                         .is_some_and(|recv| recv != NONE_TOKEN && c.lexeme(recv) == "this")
                     {
                         continue;
@@ -504,7 +503,7 @@ pub(crate) mod non_constant_identifier_names {
                     // empty synthetic identifiers; both are skipped here, so
                     // only a written name (a real, non-synthetic identifier)
                     // is style-checked.
-                    if let Some(&name) = c.payload(child).get(1)
+                    if let Some(name) = c.field(child, PayloadField::Name)
                         && name != NONE_TOKEN
                         && c.unit
                             .tokens
@@ -525,7 +524,7 @@ pub(crate) mod non_constant_identifier_names {
                 // ahead of it).
                 let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
                 let name = c.direct_children(node).iter().copied().find(|&ch| {
-                    c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                    c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
                 });
                 if let Some(name) = name {
                     check_plain(c, c.head_token(name), false);
@@ -548,7 +547,7 @@ pub(crate) mod non_constant_identifier_names {
                 // method-context identifier names are checked.
                 let ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
                 let name = c.direct_children(node).iter().copied().find(|&ch| {
-                    c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                    c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
                 });
                 if let Some(name) = name {
                     check_plain(c, c.head_token(name), false);
@@ -560,7 +559,7 @@ pub(crate) mod non_constant_identifier_names {
                 // constructors — just-underscores exempt).
                 let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
                 let name = c.direct_children(node).iter().copied().find(|&ch| {
-                    c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                    c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
                 });
                 if let Some(name) = name {
                     let underscores_ok = c
@@ -581,7 +580,7 @@ pub(crate) mod non_constant_identifier_names {
                     // event fires after the value parses, bridge
                     // `handle_named_record_field`); the colon payload and
                     // the name sit immediately before it.
-                    let Some(&colon) = c.payload(field).first() else {
+                    let Some(colon) = c.field(field, PayloadField::Colon) else {
                         continue;
                     };
                     let Some(name) = colon.checked_sub(1) else {
@@ -633,7 +632,7 @@ pub(crate) mod non_constant_identifier_names {
         let ctx = dartq_parser::IdentifierContext::RecordFieldDeclaration as u32;
         if let Some(name) =
             c.direct_children(entry).iter().copied().find(|&ch| {
-                c.kind(ch) == NodeKind::Identifier && c.payload(ch).first() == Some(&ctx)
+                c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
             })
         {
             hits.push(c.head_token(name));
@@ -658,7 +657,7 @@ pub(crate) mod non_constant_identifier_names {
 }
 
 pub(crate) mod file_names {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/file_names.dart:24-42` — the file
     /// base name must be `lowercase_with_underscores`
@@ -744,7 +743,7 @@ pub(crate) mod file_names {
     /// 'a/b/foo.dart';` — the first `String` token after the `of`
     /// keyword's base name).
     fn part_of_uri_library_name<'a>(c: &'a Check<'_>, part_of: u32) -> Option<&'a str> {
-        let Some(&of_token) = c.payload(part_of).first() else {
+        let Some(of_token) = c.field(part_of, PayloadField::OfKeyword) else {
             return None;
         };
         let mut token = of_token;
@@ -811,7 +810,7 @@ pub(crate) mod file_names {
 }
 
 pub(crate) mod no_wildcard_variable_uses {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
     use dartq_parser::IdentifierContext;
 
     /// Official: `pkg/linter/lib/src/rules/no_wildcard_variable_uses.dart:36-77`
@@ -849,7 +848,7 @@ pub(crate) mod no_wildcard_variable_uses {
         let node = c.node();
         // Uses only: the expression contexts (the official `test_localVar`
         // reports the `print(_)` use, never the declaration).
-        let Some(&ctx) = c.payload(node).first() else {
+        let Some(ctx) = c.field(node, PayloadField::Context) else {
             return;
         };
         if ctx != IdentifierContext::Expression as u32
@@ -876,7 +875,7 @@ pub(crate) mod no_wildcard_variable_uses {
 }
 
 pub(crate) mod avoid_types_as_parameter_names {
-    use super::{Check, Group, NodeKind, RuleSpec, utf16_start_of};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec, utf16_start_of};
 
     /// The dart:core type names every scope resolves to a class (the bare
     /// lexical face of the official's element test — `ClassElement`
@@ -942,8 +941,7 @@ pub(crate) mod avoid_types_as_parameter_names {
 
     fn check_parameter(c: &mut Check<'_>) {
         let node = c.node();
-        let name_token = c.payload(node).get(1).copied();
-        let Some(name_token) = name_token else {
+        let Some(name_token) = c.field(node, PayloadField::Name) else {
             return;
         };
         let name = c.lexeme(name_token);
@@ -994,9 +992,7 @@ pub(crate) mod avoid_types_as_parameter_names {
                 )
             });
             let field_formal = c
-                .payload(node)
-                .first()
-                .copied()
+                .field(node, PayloadField::Receiver)
                 .filter(|&token| token != crate::rules::NONE_TOKEN)
                 .is_some_and(|token| c.lexeme(token) == "this");
             if typed || field_formal {
@@ -1148,7 +1144,7 @@ pub(crate) mod avoid_types_as_parameter_names {
 }
 
 pub(crate) mod use_super_parameters {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
     use crate::rules::expressions::query_site;
     use crate::rules::types::leak_formal_rows;
     use crate::rules::{NONE_TOKEN, body_members};
@@ -1329,19 +1325,20 @@ pub(crate) mod use_super_parameters {
             .iter()
             .enumerate()
             .filter_map(|(index, &param)| {
-                let words = c.payload(param);
-                let receiver = words
-                    .first()
-                    .copied()
+                let receiver = c
+                    .field(param, PayloadField::Receiver)
                     .filter(|&token| token != NONE_TOKEN)
                     .map(|token| c.lexeme(token));
-                let &name_token = words.get(1)?;
+                let name_token = c.field(param, PayloadField::Name)?;
                 (name_token != NONE_TOKEN).then(|| Param {
                     row: param,
                     name_token,
                     name: c.lexeme(name_token),
                     index,
-                    named: matches!(words.get(4).copied(), Some(1 | 2)),
+                    named: matches!(
+                        c.field(param, PayloadField::FormalParameterKind),
+                        Some(1 | 2)
+                    ),
                     receiver,
                 })
             })
@@ -3533,11 +3530,19 @@ pub(crate) fn class_like_members(c: &Check<'_>, owner: u32) -> Vec<u32> {
     else {
         return Vec::new();
     };
-    // The constants' rows all close before the `;` — cut there. Without
-    // members there is no `;` (the payload carries the sentinel) and the
-    // cut is inert.
-    let cut = match c.payload(owner).get(2) {
-        Some(&token) if token != crate::rules::NONE_TOKEN => utf16_token_span(c, token).end,
+    // The enum constants' rows all close before the `;` — cut there. Without
+    // members there is no `;` (the row carries the sentinel) and the cut is
+    // inert; class-like owners carry no elements-end word at all (the cut
+    // is enum-only).
+    let cut = match c.kind(owner) {
+        NodeKind::EnumDeclaration => {
+            match c.field(owner, PayloadField::ElementsEnd) {
+                Some(token) if token != crate::rules::NONE_TOKEN => {
+                    utf16_token_span(c, token).end
+                }
+                _ => 0,
+            }
+        }
         _ => 0,
     };
     c.collect_direct(body)
@@ -3560,7 +3565,7 @@ fn constructor_name(c: &Check<'_>, ctor: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
     c.collect_direct(ctor)
         .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx))
+        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
 }
 
 /// No written name (the unnamed form, canonically `new`) or spelled
@@ -3785,7 +3790,7 @@ pub(crate) mod sort_constructors_first {
 }
 
 pub(crate) mod matching_super_parameters {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
     use crate::rules::expressions::query_site;
     use crate::rules::types::leak_formal_rows;
     use crate::rules::{NONE_TOKEN, body_members};
@@ -3843,11 +3848,11 @@ pub(crate) mod matching_super_parameters {
         let ours: Vec<u32> = leak_formal_rows(c, parameters)
             .into_iter()
             .filter(|&param| {
-                let words = c.payload(param);
-                words
-                    .first()
-                    .is_some_and(|&kw| kw != NONE_TOKEN && c.lexeme(kw) == "super")
-                    && words.get(4).is_some_and(|&kind| matches!(kind, 0 | 3))
+                c.field(param, PayloadField::Receiver)
+                    .is_some_and(|kw| kw != NONE_TOKEN && c.lexeme(kw) == "super")
+                    && c
+                        .field(param, PayloadField::FormalParameterKind)
+                        .is_some_and(|kind| matches!(kind, 0 | 3))
             })
             .collect();
         if ours.is_empty() {
@@ -3927,7 +3932,7 @@ pub(crate) mod matching_super_parameters {
             return;
         }
         for (index, &param) in ours.iter().enumerate() {
-            let Some(&name_token) = c.payload(param).get(1) else {
+            let Some(name_token) = c.field(param, PayloadField::Name) else {
                 continue;
             };
             if name_token == NONE_TOKEN {
@@ -3961,15 +3966,16 @@ pub(crate) mod matching_super_parameters {
                 if c.kind(kid) != NodeKind::PrimaryConstructor {
                     return false;
                 }
-                // `payload[2]` = has_constructor_name; the selector itself is the
-                // `Identifier` child with the PrimaryConstructorDeclaration
-                // context.
-                let named = c.payload(kid).get(2).copied() == Some(1);
+                // `HasConstructorName` decides named vs unnamed; the
+                // selector itself is the `Identifier` child with the
+                // PrimaryConstructorDeclaration context.
+                let named =
+                    c.field(kid, PayloadField::HasConstructorName) == Some(1);
                 match selector {
                     None => !named,
                     Some(want) => named && c.children(kid).any(|name_row| {
                         c.kind(name_row) == NodeKind::Identifier
-                            && c.payload(name_row).first().copied()
+                            && c.field(name_row, PayloadField::Context)
                                 == Some(
                                     dartq_parser::IdentifierContext::PrimaryConstructorDeclaration
                                         as u32,
@@ -3985,9 +3991,14 @@ pub(crate) mod matching_super_parameters {
         Some(
             leak_formal_rows(c, params)
                 .into_iter()
-                .filter(|&param| matches!(c.payload(param).get(4).copied(), Some(0 | 3)))
+                .filter(|&param| {
+                    matches!(
+                        c.field(param, PayloadField::FormalParameterKind),
+                        Some(0 | 3)
+                    )
+                })
                 .filter_map(|param| {
-                    let token = c.payload(param).get(1).copied()?;
+                    let token = c.field(param, PayloadField::Name)?;
                     (token != NONE_TOKEN).then(|| c.lexeme(token).to_string())
                 })
                 .collect(),

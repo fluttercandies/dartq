@@ -168,6 +168,17 @@ impl Fixture {
     }
 }
 
+/// The workspace is throwaway: removed best-effort on drop (the creation
+/// pre-clean stays, so a same-named leftover from a crashed run never
+/// bleeds in), and `let _` tolerates tests that already removed the
+/// directory themselves. Runs therefore leave no `dartq-engine-test-*`
+/// directories behind.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 /// Collects events so tests can assert work order and counts.
 #[derive(Debug, Default)]
 pub struct EventLog {

@@ -1,0 +1,123 @@
+# Release distribution: on a v* tag, build the dartq CLI for the three
+# shipped targets, package tarball + sha256 sidecar per target, render the
+# Homebrew formula with the real digests, and attach everything to the
+# GitHub Release. Creating the tag (and the release gate chain before it)
+# belongs to the human-driven release harness; this workflow only reacts.
+#
+# Re-runs: workflow_dispatch takes the existing tag as an input and checks
+# out exactly that ref, so a failed attach step can be repeated without
+# re-tagging.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # The pushed ref on tag triggers, the explicit input on dispatch re-runs.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    # Runner labels per the actions/runner-images available-images table:
+    #   macos-latest  = macOS arm64 (currently macOS-26 arm64)
+    #   macos-15-intel = macOS x86_64 (the plain macos-15 label is arm64)
+    #   ubuntu-latest = Linux x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos, arch: arm64, runner: macos-latest }
+          - { os: macos, arch: x86_64, runner: macos-15-intel }
+          - { os: linux, arch: x86_64, runner: ubuntu-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Resolve the release version
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::tag '$RELEASE_TAG' must start with v + a digit"; exit 1 ;;
+          esac
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain trace
+        run: |
+          rustc --version
+          cargo --version
+      - name: Version guard (tag vs crate version)
+        run: |
+          crate_ver="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "dartq-cli") | .version')"
+          if [ -z "$crate_ver" ]; then
+            echo "::error::dartq-cli not found in cargo metadata (layout drift?)"
+            exit 1
+          fi
+          if [ "$crate_ver" != "$RELEASE_VERSION" ]; then
+            echo "::error::tag v$RELEASE_VERSION does not match the dartq-cli version $crate_ver in Cargo.toml (mis-tag)"
+            exit 1
+          fi
+      # .cargo/config.toml caps local builds at jobs = 2 for host memory
+      # discipline; CI has the memory to use every core. Per the cargo
+      # config reference, "Environment variables will take precedence over
+      # TOML configuration files": CARGO_BUILD_JOBS set to the string
+      # `default` "sets the value back to defaults" (all logical CPUs), and
+      # an empty RUSTC_WRAPPER "overwrites the config and resets cargo to
+      # not use a wrapper" (the workspace pins none; this guards a local
+      # ambient sccache from leaking in via inheritance).
+      - name: Build the release binary
+        env:
+          RUSTC_WRAPPER: ''
+          CARGO_BUILD_JOBS: default
+        run: cargo build --release -p dartq-cli --locked
+      - name: Package tarball + sha256 sidecar
+        run: >
+          scripts/release/package.sh target/release/dartq
+          "$RELEASE_VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The formula template + render script come from the tagged tree.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Resolve the release version
+        run: echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Render the Homebrew formula
+        run: scripts/release/render-formula.sh "$RELEASE_VERSION" dist dist/dartq.rb
+      - name: Attach assets to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/dartq-*.tar.gz
+            dist/dartq-*.tar.gz.sha256
+            dist/dartq.rb

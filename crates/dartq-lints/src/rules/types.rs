@@ -8,7 +8,7 @@
 //! `tighten_type_of_initializing_formals`, and the variance checker
 //! `unsafe_variance`.
 
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
@@ -301,7 +301,7 @@ fn written_display(c: &Check<'_>, row: u32) -> String {
 pub(crate) mod avoid_shadowing_type_parameters {
     use dartq_parser::MemberKind;
 
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_shadowing_type_parameters.dart:38-152`
     /// — a type parameter whose name equals a type parameter of an enclosing
@@ -336,7 +336,8 @@ pub(crate) mod avoid_shadowing_type_parameters {
         let node = c.node();
         // Static methods have nothing above them to shadow (:76-85).
         if c.kind(node) == NodeKind::Method
-            && c.payload(node).first() == Some(&(MemberKind::StaticMethod as u32))
+            && c.field(node, PayloadField::DeclarationKind)
+                == Some(MemberKind::StaticMethod as u32)
         {
             return;
         }
@@ -433,7 +434,7 @@ pub(crate) mod avoid_shadowing_type_parameters {
 pub(crate) mod library_private_types_in_public_api {
     use crate::rules::type_before;
 
-    use super::{
+    use super::{PayloadField, 
         Check, Group, NodeKind, RuleSpec, first_type_child, member_name_typed, record_type_fields,
         type_argument_rows, type_arguments_row,
     };
@@ -551,17 +552,15 @@ pub(crate) mod library_private_types_in_public_api {
             .find(|&kid| c.kind(kid) == NodeKind::Identifier)
             .map(|name| c.head_token(name))
             .or_else(|| {
-                // `begin_extension_declaration` patches the name into word 1
-                // (word 2 is the `on` keyword); `begin_extension_type_declaration`
-                // patches it into word 2.
-                let slot = match c.kind(decl) {
-                    NodeKind::ExtensionDeclaration => 1,
-                    NodeKind::ExtensionTypeDeclaration => 2,
-                    _ => return None,
-                };
-                c.payload(decl)
-                    .get(slot)
-                    .copied()
+                // The declaration's `Name` word (`begin_extension_declaration`
+                // / `begin_extension_type_declaration` patch the name token).
+                if !matches!(
+                    c.kind(decl),
+                    NodeKind::ExtensionDeclaration | NodeKind::ExtensionTypeDeclaration
+                ) {
+                    return None;
+                }
+                c.field(decl, PayloadField::Name)
                     .filter(|&tok| tok != crate::rules::NONE_TOKEN)
             });
         match name_token {
@@ -768,20 +767,18 @@ pub(crate) mod library_private_types_in_public_api {
     /// (:124-126/:239-241).
     fn check_implicit_formal(c: &mut Check<'_>, decl: u32, param: u32) {
         let receiver = c
-            .payload(param)
-            .first()
-            .copied()
+            .field(param, PayloadField::Receiver)
             .unwrap_or(crate::rules::NONE_TOKEN);
         if receiver == crate::rules::NONE_TOKEN {
             return;
         }
-        let Some(&name_token) = c.payload(param).get(1) else {
+        let Some(name_token) = c.field(param, PayloadField::Name) else {
             return;
         };
         let name = c.lexeme(name_token);
         let named = matches!(
-            c.payload(param).get(4),
-            Some(&kind)
+            c.field(param, PayloadField::FormalParameterKind),
+            Some(kind)
                 if kind == dartq_parser::FormalParameterKind::RequiredNamed as u32
                     || kind == dartq_parser::FormalParameterKind::OptionalNamed as u32
         );
@@ -815,8 +812,8 @@ pub(crate) mod library_private_types_in_public_api {
         };
         for member in c.direct_children(body).iter().copied() {
             if c.kind(member) != NodeKind::Fields
-                || c.payload(member).first()
-                    != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                || c.field(member, PayloadField::MemberKind)
+                    != Some(dartq_parser::MemberKind::NonStaticField as u32)
             {
                 continue;
             }
@@ -849,12 +846,12 @@ pub(crate) mod library_private_types_in_public_api {
     }
 
     /// The written type of the field `name` in the same-file superclass —
-    /// the direct `extends` name read off the declaration's payload
-    /// (`class B extends A`: the keyword rides payload word 1, the
+    /// the direct `extends` name read off the declaration's `ExtendsKeyword`
+    /// word (`class B extends A`: the keyword rides the word, the
     /// superclass head the next token), then the superclass row found
     /// among the unit's class-like wrappers.
     fn super_field_type(c: &Check<'_>, decl: u32, name: &str) -> Option<u32> {
-        let extends_kw = c.payload(decl).get(1).copied()?;
+        let extends_kw = c.field(decl, PayloadField::ExtendsKeyword)?;
         if extends_kw == crate::rules::NONE_TOKEN || c.lexeme(extends_kw) != "extends" {
             return None;
         }
@@ -2449,7 +2446,7 @@ mod tests {
 }
 
 pub(crate) mod prefer_constructors_over_static_methods {
-    use dartq_ast::NodeKind;
+    use dartq_ast::{NodeKind, PayloadField};
 
     use crate::engine::Check;
     use crate::registry::{Group, RuleSpec};
@@ -2503,7 +2500,7 @@ pub(crate) mod prefer_constructors_over_static_methods {
         // owners qualify. Extension members are `Extension` declarations —
         // the `DeclarationKind` payload word filters them here.
         if !matches!(
-            c.payload(node).first().copied(),
+            c.field(node, PayloadField::DeclarationKind),
             Some(kind)
                 if kind == dartq_parser::DeclarationKind::Class as u32
                     || kind == dartq_parser::DeclarationKind::ExtensionType as u32
@@ -2568,7 +2565,7 @@ pub(crate) mod prefer_constructors_over_static_methods {
             if c.kind(owner) != NodeKind::ExtensionTypeDeclaration {
                 return None;
             }
-            let name = c.payload(owner).get(2).copied()?;
+            let name = c.field(owner, PayloadField::Name)?;
             (name != crate::rules::NONE_TOKEN).then(|| c.lexeme(name))
         });
         let Some(class_name) = class_name else {
@@ -2691,7 +2688,7 @@ pub(crate) mod prefer_constructors_over_static_methods {
 }
 
 pub(crate) mod strict_top_level_inference {
-    use dartq_ast::NodeKind;
+    use dartq_ast::{NodeKind, PayloadField};
 
     use crate::engine::Check;
     use crate::registry::{Group, RuleSpec};
@@ -2897,8 +2894,8 @@ pub(crate) mod strict_top_level_inference {
         // The override lookup answers only for instance fields (a static
         // or top-level variable never overrides).
         let overridable = is_field
-            && c.payload(parent).first()
-                == Some(&(dartq_parser::MemberKind::NonStaticField as u32));
+            && c.field(parent, PayloadField::MemberKind)
+                == Some(dartq_parser::MemberKind::NonStaticField as u32);
         let container = container_of(c);
         let variables: Vec<u32> = c
             .direct_children(node)
@@ -2980,9 +2977,10 @@ pub(crate) mod strict_top_level_inference {
         {
             return false;
         }
-        let payload = c.payload(param);
-        let receiver = payload.first().copied().unwrap_or(crate::rules::NONE_TOKEN);
-        let Some(&name) = payload.get(1) else {
+        let receiver = c
+            .field(param, PayloadField::Receiver)
+            .unwrap_or(crate::rules::NONE_TOKEN);
+        let Some(name) = c.field(param, PayloadField::Name) else {
             return true;
         };
         if name == crate::rules::NONE_TOKEN {
@@ -3072,10 +3070,12 @@ pub(crate) mod strict_top_level_inference {
         out
     }
 
-    /// The `isNamed` face of a formal row (payload word 4);
-    /// a function-typed row answers positional (exotic shape).
+    /// The `isNamed` face of a formal row (the `FormalParameterKind`
+    /// word); a function-typed row answers positional (exotic shape).
     fn named_formal(c: &Check<'_>, row: u32) -> bool {
-        let kind = c.payload(row).get(4).copied().unwrap_or(u32::MAX);
+        let kind = c
+            .field(row, PayloadField::FormalParameterKind)
+            .unwrap_or(u32::MAX);
         kind == dartq_parser::FormalParameterKind::OptionalNamed as u32
             || kind == dartq_parser::FormalParameterKind::RequiredNamed as u32
     }
@@ -3129,7 +3129,7 @@ pub(crate) mod strict_top_level_inference {
             return Some((c.head_token(name), untyped));
         }
         let operator = operator_name_row(c, node)?;
-        let name = c.payload(operator).first().copied()?;
+        let name = c.field(operator, PayloadField::Name)?;
         Some((name, untyped))
     }
 
@@ -3648,7 +3648,7 @@ pub(crate) mod strict_top_level_inference {
 }
 
 pub(crate) mod type_annotate_public_apis {
-    use dartq_ast::NodeKind;
+    use dartq_ast::{NodeKind, PayloadField};
     use dartq_semantic::model::Ty;
 
     use crate::engine::Check;
@@ -3869,13 +3869,12 @@ pub(crate) mod type_annotate_public_apis {
         }
         let is_setter = get_set_token(c, node) == Some("set");
         let index_setter = c.kind(name) == NodeKind::OperatorName
-            && c.payload(name)
-                .first()
-                .copied()
+            && c
+                .field(name, PayloadField::Name)
                 .is_some_and(|op| c.lexeme(op) == "[]=");
         if return_type_missing(c, node, name) && !is_setter && !index_setter {
             let token = match c.kind(name) {
-                NodeKind::OperatorName => c.payload(name).first().copied(),
+                NodeKind::OperatorName => c.field(name, PayloadField::Name),
                 _ => Some(c.head_token(name)),
             };
             if let Some(token) = token {
@@ -3923,11 +3922,11 @@ pub(crate) mod type_annotate_public_apis {
     }
 
     /// `visitFunctionTypeAlias` (:87-95): the legacy form only — the
-    /// generalized typedef carries the `=` payload word and is no
+    /// generalized typedef carries the `Equals` payload word and is no
     /// `FunctionTypeAlias`.
     fn check_typedef(c: &mut Check<'_>) {
         let node = c.node();
-        if c.payload(node).get(1).copied() != Some(crate::rules::NONE_TOKEN) {
+        if c.field(node, PayloadField::Equals) != Some(crate::rules::NONE_TOKEN) {
             return;
         }
         let Some(name) = member_name_typed(c, node) else {
@@ -3962,7 +3961,7 @@ pub(crate) mod type_annotate_public_apis {
         // private, the unnamed form is public-facing.
         let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
         let named = c.direct_children(node).iter().copied().find(|&kid| {
-            c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         });
         if named.is_some_and(|name| c.lexeme(c.head_token(name)).starts_with('_')) {
             return;
@@ -4000,7 +3999,7 @@ pub(crate) mod type_annotate_public_apis {
         // context identifier); the unnamed form is public-facing.
         let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
         let named = c.direct_children(node).iter().copied().find(|&kid| {
-            c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         });
         if named.is_some_and(|name| c.lexeme(c.head_token(name)).starts_with('_')) {
             return;
@@ -4052,9 +4051,7 @@ pub(crate) mod type_annotate_public_apis {
 
     fn check_parameter(c: &mut Check<'_>, param: u32) {
         let receiver = c
-            .payload(param)
-            .first()
-            .copied()
+            .field(param, PayloadField::Receiver)
             .unwrap_or(crate::rules::NONE_TOKEN);
         if receiver != crate::rules::NONE_TOKEN {
             return; // `this.x` / `super.x`: not the `RegularFormalParameter` face
@@ -4078,7 +4075,7 @@ pub(crate) mod type_annotate_public_apis {
         }) {
             return;
         }
-        let Some(name) = c.payload(param).get(1).copied() else {
+        let Some(name) = c.field(param, PayloadField::Name) else {
             return;
         };
         if name == crate::rules::NONE_TOKEN || is_just_underscores(c.lexeme(name)) {
@@ -4439,7 +4436,7 @@ pub(crate) mod no_raw_types {
 }
 
 pub(crate) mod always_specify_types {
-    use super::{
+    use super::{PayloadField, 
         Check, Group, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, raw_generic_face,
         type_arguments_row,
     };
@@ -4623,12 +4620,12 @@ pub(crate) mod always_specify_types {
         let row = c.node();
         // Receiver formals are the Field/Super formal visitors upstream and
         // never enter (:135 registration).
-        let payload = c.payload(row);
-        if payload.first().copied().unwrap_or(crate::rules::NONE_TOKEN) != crate::rules::NONE_TOKEN
+        if c.field(row, PayloadField::Receiver).unwrap_or(crate::rules::NONE_TOKEN)
+            != crate::rules::NONE_TOKEN
         {
             return;
         }
-        let Some(&name) = payload.get(1) else {
+        let Some(name) = c.field(row, PayloadField::Name) else {
             return;
         };
         if name == crate::rules::NONE_TOKEN || is_just_underscores(c.lexeme(name)) {
@@ -4682,7 +4679,7 @@ pub(crate) mod always_specify_types {
 }
 
 pub(crate) mod avoid_futureor_void {
-    use super::{
+    use super::{PayloadField, 
         Check, Group, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows,
         type_arguments_row, type_sibling_before,
     };
@@ -4914,7 +4911,9 @@ pub(crate) mod avoid_futureor_void {
             if c.kind(section) != NodeKind::FormalParameter {
                 continue;
             }
-            let receiver = c.payload(section).first().copied().unwrap_or(NONE_TOKEN);
+            let receiver = c
+                .field(section, PayloadField::Receiver)
+                .unwrap_or(NONE_TOKEN);
             if receiver == NONE_TOKEN {
                 checked(c, Variance::Out, first_type_child(c, section));
             }
@@ -5273,7 +5272,7 @@ fn leak_detector_check(c: &mut Check<'_>, predicates: &LeakPredicates) {
                 if !formal_declaring(c, param) {
                     continue;
                 }
-                let Some(&name) = c.payload(param).get(1) else {
+                let Some(name) = c.field(param, PayloadField::Name) else {
                     continue;
                 };
                 if name == NONE_TOKEN {
@@ -5412,12 +5411,10 @@ fn extension_type_implements(c: &Check<'_>, spelling: &str, predicates: &LeakPre
             if c.kind(kid) != NodeKind::ExtensionTypeDeclaration {
                 continue;
             }
-            // The extension-type name is the header's payload word — the
+            // The extension-type name is the header's `Name` word — the
             // `begin_extension_type_declaration` name anchor.
             let names = c
-                .payload(kid)
-                .get(2)
-                .copied()
+                .field(kid, PayloadField::Name)
                 .filter(|&token| token != crate::rules::NONE_TOKEN)
                 .map(|token| c.lexeme(token));
             if names != Some(spelling) {
@@ -5474,9 +5471,9 @@ fn leak_valid_use(
             // `visitConstructorFieldInitializer` (:222-228): the field is
             // initialized in some constructor's initializer list.
             NodeKind::FieldInitializer if candidate.field => {
-                if c.payload(row)
-                    .first()
-                    .is_some_and(|&name| name != NONE_TOKEN && c.lexeme(name) == candidate.name)
+                if c
+                    .field(row, PayloadField::Name)
+                    .is_some_and(|name| name != NONE_TOKEN && c.lexeme(name) == candidate.name)
                 {
                     return true;
                 }
@@ -5484,13 +5481,12 @@ fn leak_valid_use(
             // `visitFieldFormalParameter` (:231-241): `this.name` declares
             // or assigns the field (fields only, :232).
             NodeKind::FormalParameter if candidate.field => {
-                let words = c.payload(row);
-                if words
-                    .first()
-                    .is_some_and(|&kw| kw != NONE_TOKEN && c.lexeme(kw) == "this")
-                    && words
-                        .get(1)
-                        .is_some_and(|&name| name != NONE_TOKEN && c.lexeme(name) == candidate.name)
+                if c
+                    .field(row, PayloadField::Receiver)
+                    .is_some_and(|kw| kw != NONE_TOKEN && c.lexeme(kw) == "this")
+                    && c
+                        .field(row, PayloadField::Name)
+                        .is_some_and(|name| name != NONE_TOKEN && c.lexeme(name) == candidate.name)
                 {
                     return true;
                 }
@@ -5667,7 +5663,7 @@ fn leak_tear_off_use(
     candidate: &LeakCandidate<'_>,
     predicates: &LeakPredicates,
 ) -> bool {
-    let Some(&dot) = c.payload(marker).first() else {
+    let Some(dot) = c.field(marker, PayloadField::Operator) else {
         return false;
     };
     if dot
@@ -5690,7 +5686,7 @@ fn leak_tear_off_use(
 /// word.
 fn leak_assignment_use(c: &Check<'_>, assignment: u32, candidate: &LeakCandidate<'_>) -> bool {
     let range = c.unit.ast.token_range(assignment);
-    let Some(&op) = c.payload(assignment).first() else {
+    let Some(op) = c.field(assignment, PayloadField::Operator) else {
         return false;
     };
     if op == NONE_TOKEN || op >= range.end {
@@ -5757,10 +5753,10 @@ fn leak_return_use(c: &Check<'_>, statement: u32, candidate: &LeakCandidate<'_>)
     name == candidate.name
 }
 
-/// The selector a whole-access marker names (the dot is payload word 0;
-/// the name follows it).
+/// The selector a whole-access marker names (the `Operator` word is the
+/// dot; the name follows it).
 fn marker_dot_name(c: &Check<'_>, marker: u32) -> Option<u32> {
-    c.payload(marker).first().map(|&dot| dot + 1)
+    c.field(marker, PayloadField::Operator).map(|dot| dot + 1)
 }
 
 /// The head token of a local declaration's written type (the face
@@ -5902,7 +5898,7 @@ pub(crate) mod close_sinks {
 }
 
 pub(crate) mod tighten_type_of_initializing_formals {
-    use super::{Check, Group, NodeKind, RuleSpec, leak_formal_rows};
+    use super::{PayloadField, Check, Group, NodeKind, RuleSpec, leak_formal_rows};
     use crate::rules::{
         NONE_TOKEN, TypeFace, body_members, initialized_identifier_name, same_file_ancestors,
         slice, type_face, variables_declaration_keyword,
@@ -5998,9 +5994,9 @@ pub(crate) mod tighten_type_of_initializing_formals {
         else {
             return;
         };
-        if c.payload(condition)
-            .first()
-            .is_none_or(|&op| c.lexeme(op) != "!=")
+        if c
+            .field(condition, PayloadField::Operator)
+            .is_none_or(|op| c.lexeme(op) != "!=")
         {
             return;
         }
@@ -6046,14 +6042,14 @@ pub(crate) mod tighten_type_of_initializing_formals {
         // initializer-list scope); a bare field reference or a plain
         // formal is neither face and stays silent (:60-67).
         let Some(param) = parameters.iter().copied().find(|&param| {
-            c.payload(param)
-                .get(1)
-                .is_some_and(|&name_token| name_token != NONE_TOKEN && c.lexeme(name_token) == name)
+            c.field(param, PayloadField::Name)
+                .is_some_and(|name_token| name_token != NONE_TOKEN && c.lexeme(name_token) == name)
         }) else {
             return;
         };
-        let words = c.payload(param);
-        let receiver = words.first().copied().unwrap_or(NONE_TOKEN);
+        let receiver = c
+            .field(param, PayloadField::Receiver)
+            .unwrap_or(NONE_TOKEN);
         if receiver == NONE_TOKEN {
             return;
         }
@@ -7165,7 +7161,7 @@ fn alias_parameter_variance<'a>(
     alias_row: u32,
     name: &'a str,
 ) -> AliasVariance {
-    if c.payload(alias_row).get(1) != Some(&crate::rules::NONE_TOKEN) {
+    if c.field(alias_row, PayloadField::Equals) != Some(crate::rules::NONE_TOKEN) {
         return match first_type_child(c, alias_row) {
             Some(body) => compute_variance(c, names, variances, alias_row, name, body),
             None => AliasVariance::Unrelated,
@@ -7704,7 +7700,7 @@ fn check_named_type(c: &mut Check<'_>, direction: Direction, row: u32) {
     ) {
         return;
     }
-    if c.payload(parameter).get(1) != Some(&crate::rules::NONE_TOKEN) {
+    if c.field(parameter, PayloadField::Variance) != Some(crate::rules::NONE_TOKEN) {
         return; // variance-marked: not legacy covariant
     }
     c.report(c.utf16_span(row), &[]);
@@ -7761,9 +7757,9 @@ fn argument_mapping(c: &Check<'_>, row: u32, count: usize) -> Option<Vec<Mapping
     Some(
         parameters
             .iter()
-            .map(|&parameter| match c.payload(parameter).get(1) {
-                Some(&token) if c.lexeme(token) == "in" => Mapping::Inverse,
-                Some(&token) if c.lexeme(token) == "inout" => Mapping::InOut,
+            .map(|&parameter| match c.field(parameter, PayloadField::Variance) {
+                Some(token) if c.lexeme(token) == "in" => Mapping::Inverse,
+                Some(token) if c.lexeme(token) == "inout" => Mapping::InOut,
                 _ => Mapping::Same,
             })
             .collect(),

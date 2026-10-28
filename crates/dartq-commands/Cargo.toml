@@ -29,6 +29,9 @@ dartq-schema = { workspace = true }
 dartq-sdk = { workspace = true }
 dartq-semantic = { workspace = true }
 dartq-source = { workspace = true }
+# The analyze/check renderers' LON encoder (`render`): the one writer the
+# cold CLI and the daemon's routed face share (#2627).
+lon = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }

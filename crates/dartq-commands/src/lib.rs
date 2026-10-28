@@ -60,6 +60,7 @@ pub mod packages;
 mod pkg_label;
 pub mod plugins;
 pub mod query;
+pub mod render;
 pub mod rename;
 pub mod resolve;
 mod rule_states;

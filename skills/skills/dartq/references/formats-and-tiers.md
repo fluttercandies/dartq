@@ -56,6 +56,18 @@ The json face keeps the long frozen spellings (`schema_version`,
 `declarations`, `references`, …) — jq consumers and the schema contracts
 are untouched.
 
+Every `off`/`len` dartq prints or accepts counts **UTF-16 code units** —
+query/explain/impact rows, rename edit rows and `PATH:OFFSET` anchors,
+fix patches, `resolve`/`complete` columns alike (the LSP and analyzer
+json convention; equal to bytes on pure-ASCII files). The one position
+face outside the rule: `dartq events`' byte-budget pagination
+(`max_bytes`), which measures its own pages, not source text.
+
+The analyzer/lint documentation tables behind the `doc` field and the
+json `documentation` URL (`https://dart.dev/diagnostics/<name>` /
+`https://dart.dev/lints/<name>`) are pinned to the Dart SDK version
+dartq targets and move with it.
+
 [Language Object Notation v1]: https://github.com/fluttercandies/lon/blob/main/spec/lon-v1.md
 
 ## analyze: the Three Faces
@@ -70,7 +82,9 @@ are untouched.
   `dart analyze --format=json` (`version` key, absolute paths; every
   first-party lint row carries `documentation`:
   `https://dart.dev/diagnostics/<name>` when published, else
-  `https://dart.dev/lints/<name>`; advisories ride stderr).
+  `https://dart.dev/lints/<name>`; advisories ride stderr). The same
+  published tables serve `explain --diagnostic`'s `doc` — the two faces
+  cannot disagree.
 - `text`: a leading `root: <abs>` line when rows exist, then diagnostics
   grouped by file under located headings, `sev code line:col msg` rows,
   the count tail (`No issues found!` / `N issues found.`).

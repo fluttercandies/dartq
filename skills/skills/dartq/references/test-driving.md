@@ -61,6 +61,17 @@ packages once and runs later shards with `--no-pub`, so parallel shards
 never contend on `pubspec.lock`. `--platform tester` runs here; any other
 platform, web, devices, and integration tests delegate to the stock tool.
 
+Replay works the same as on the Dart path: a green suite re-runs its key
+— the import closure plus `flutter_test_config`, bundled assets and
+fonts, golden files, the resolution, the Flutter SDK and engine stamps,
+the arguments and environment — and the second run reprints the recorded
+events. The Flutter SDK's own packages (the framework, `flutter_test`)
+ride as the toolchain tier: still content-keyed (editing the SDK
+re-keys) but never refused for their internal clock or environment
+reads. A suite refuses replay only through its own closure — its files
+and the package's `lib/` (see
+[cache-and-markers.md](cache-and-markers.md)).
+
 ## Plain `dartq test` inside a Flutter package
 
 Without `--flutter`, `dartq test` applies `dart test` semantics even in a

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dartq_ast::{AstBuilder, NodeKind, TOKEN_NONE};
+use dartq_ast::{AstBuilder, NodeKind, PayloadField, TOKEN_NONE};
 use dartq_language::LanguageVersion;
 use dartq_scanner::{ScanConfig, TokenTable, scan};
 use dartq_source::{FileTable, LineIndex};
@@ -270,10 +270,11 @@ pub const NONE: u32 = TOKEN_NONE;
 pub const EXPR_CTX: u32 = dartq_parser::IdentifierContext::Expression as u32;
 
 /// Builds an `Identifier` node spanning `[first, end)` (Fielded: the context
-/// word must be patched, builder contract).
+/// word must be patched, builder contract — named through the payload-field
+/// table, so a wrong field fails the builder's debug assert at build time).
 pub fn identifier(b: &mut AstBuilder, first: u32, end: u32) {
     b.begin(NodeKind::Identifier, first);
-    b.patch(0, EXPR_CTX);
+    b.patch_field(PayloadField::Context, EXPR_CTX);
     b.end(NodeKind::Identifier, end);
 }
 

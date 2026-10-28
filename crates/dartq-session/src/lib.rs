@@ -162,13 +162,25 @@ fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// The current executable's content hash — one read of the binary.
+/// The current executable's content hash — one read of the binary,
+/// memoized on success: the bytes cannot change under a running
+/// process, and the election computes the triple per consult (a plain
+/// analyze consults once, its retry ladder twice, the daemon at
+/// bring-up and every face after) — one read+hash per process, never
+/// one per call. A failed read is not memoized — the next consult
+/// retries it, the pre-memo behavior.
 fn binary_hash() -> io::Result<String> {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(hash) = HASH.get() {
+        return Ok(hash.clone());
+    }
     let bytes = std::fs::read(std::env::current_exe()?)?;
     let digest: [u8; 8] = blake3::hash(&bytes).as_bytes()[..8]
         .try_into()
         .expect("8 bytes");
-    Ok(hex::encode(digest))
+    let hash = hex::encode(digest);
+    let _ = HASH.set(hash.clone());
+    Ok(hash)
 }
 
 // ---------------------------------------------------------------------------

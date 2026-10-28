@@ -23,6 +23,7 @@
 
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 
+use crate::PayloadField;
 use crate::kind::{LeafShape, NodeKind, accepts_begin, flags, leaf_shape, payload_len};
 use crate::table::{DATA_NONE, NodeHeader, SyntaxTable};
 
@@ -514,6 +515,30 @@ impl AstBuilder {
             });
         }
         self.pool[slot] = value;
+    }
+
+    /// Back-fills the innermost open node's payload word named by `field`
+    /// — the named face of [`Self::patch`]: the word index resolves against
+    /// the open node's kind through [`crate::fields::PAYLOAD_FIELDS`], so a
+    /// field that does not belong to that kind is a named debug failure
+    /// instead of a silent wrong-word write (release degrades through the
+    /// error log exactly like an out-of-slot index: the write is skipped).
+    pub fn patch_field(&mut self, field: PayloadField, value: u32) {
+        let open_kind = self.open.last().map(|node| node.kind);
+        let Some(kind) = open_kind else {
+            debug_assert!(false, "patch without an open node");
+            return;
+        };
+        match crate::fields::field_index(kind, field) {
+            Some(index) => self.patch(index as usize, value),
+            None => {
+                debug_assert!(
+                    false,
+                    "{field:?} is not a payload field of the open {kind:?}"
+                );
+                self.mark_error();
+            }
+        }
     }
 
     /// Marks an error inside the innermost open node; the bit propagates to

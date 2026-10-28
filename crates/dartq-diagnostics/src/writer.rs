@@ -240,13 +240,11 @@ fn json_context_message<'a>(
 ///   carry is a plugin code — the analyzer-side `LintCode.url` is
 ///   null, so no URL.
 ///
-/// The URL is built in the caller's reused buffer and returned borrowed.
+/// The URL is built in the caller's reused buffer and returned borrowed;
+/// the decision itself is [`crate::doc_prefix`], the one table
+/// [`crate::documentation_url`] serves every other face through.
 fn documentation_url(code: CodeInfo, buf: &mut String) -> Option<&str> {
-    let prefix = match code.dtype {
-        DiagnosticType::Lint => crate::lint_docs::lint_doc_prefix(code.name)?,
-        _ if crate::analyzer_docs::published(code.name) => "https://dart.dev/diagnostics/",
-        _ => return None,
-    };
+    let prefix = crate::doc_prefix(code.name, matches!(code.dtype, DiagnosticType::Lint))?;
     buf.clear();
     buf.push_str(prefix);
     buf.push_str(code.name);

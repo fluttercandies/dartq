@@ -8,7 +8,10 @@
 //!   environment's toolchain half (`DART_*`/`FLUTTER_*`); the variables a
 //!   suite's closure reads by literal key join per-suite below, and an
 //!   unnamable environment read (`Platform.environment` iterated, aliased,
-//!   computed-keyed) refuses caching for that suite;
+//!   computed-keyed) refuses caching for that suite — a suite-side file's
+//!   read; the toolchain tier's unnamable reads (the tester binding's
+//!   whole-map default) are the tool's plumbing and exempt, its named
+//!   reads keying like any other file's;
 //! - the **package resolution**: `pubspec.yaml`, `pubspec.lock`,
 //!   `.dart_tool/package_config.json`, and `dart_test.yaml`;
 //! - the suite's **import closure**: every Dart file transitively reached
@@ -360,8 +363,14 @@ impl Cache {
         // lock). The Flutter SDK's packages are a git checkout a developer
         // may edit, so they stay inputs, but like hosted code they are the
         // toolchain's: their drift and path literals are not the suite's.
+        // The config's `flutterRoot` property names the SDK, but pub only
+        // writes it when it resolves inside the tool (`FLUTTER_ROOT` set —
+        // a `dart pub get` resolution or another generator's config
+        // carries none), so on a flutter run the binary's own SDK names
+        // the same checkout the toolchain stamps pin and classifies it
+        // too.
         let immutable: Vec<PathBuf> = config.pub_cache_root().into_iter().collect();
-        let toolchain: Vec<PathBuf> = config
+        let mut toolchain: Vec<PathBuf> = config
             .additional_properties
             .get("flutterRoot")
             .and_then(serde_json::Value::as_str)
@@ -369,6 +378,14 @@ impl Cache {
             .map(|root| PathBuf::from(root).join("packages"))
             .into_iter()
             .collect();
+        if runner.flutter {
+            let bin = runner.bin.canonicalize().unwrap_or_else(|_| runner.bin.to_path_buf());
+            if let Some(packages) = bin.parent().and_then(Path::parent).map(|sdk| sdk.join("packages"))
+                && !toolchain.contains(&packages)
+            {
+                toolchain.push(packages);
+            }
+        }
 
         let base = self.base_key(runner)?;
         // `flutter test` wraps each suite in its `flutter_test_config.dart`:
@@ -445,10 +462,20 @@ impl Cache {
                 let mut env_names: Vec<&str> = Vec::new();
                 let mut env_opaque = false;
                 for &id in &ids {
-                    if let Some(file_facts) = dense.env_facts(id) {
-                        env_opaque |= file_facts.env_opaque;
-                        env_names.extend(file_facts.env_reads.iter().map(String::as_str));
-                    }
+                    let Some((file_facts, toolchain)) = dense.env_facts(id) else {
+                        continue;
+                    };
+                    // The toolchain tier is exempt from the refusal, not
+                    // from the key: its named reads key like any other
+                    // file's, but an unnamable read — the tester binding
+                    // aliasing the whole `Platform.environment` map as
+                    // its default — is the tool's plumbing (the tool
+                    // builds the tester's environment; no dartq-side
+                    // value names it), not a suite author's read. Without
+                    // the exemption every flutter suite on earth refuses,
+                    // `flutter_test`'s `_binding_io.dart` in the closure.
+                    env_opaque |= file_facts.env_opaque && !toolchain;
+                    env_names.extend(file_facts.env_reads.iter().map(String::as_str));
                 }
                 if env_opaque {
                     return None;
@@ -928,12 +955,15 @@ impl Dense {
         }
     }
 
-    /// The Dart facts of the interned path `id`, when it is a graph node
-    /// whose facts were read (`None` for package inputs, absent candidates,
-    /// and untrusted headers).
-    fn env_facts(&self, id: u32) -> Option<&FileFacts> {
+    /// The Dart facts of the interned path `id` and whether the file
+    /// belongs to the toolchain, when it is a graph node whose facts were
+    /// read (`None` for package inputs, absent candidates, and untrusted
+    /// headers).
+    fn env_facts(&self, id: u32) -> Option<(&FileFacts, bool)> {
         let node = self.node_of.get(id as usize).copied().filter(|&n| n != u32::MAX)?;
-        self.facts[node as usize].as_deref()
+        self.facts[node as usize]
+            .as_deref()
+            .map(|facts| (facts, self.in_toolchain[node as usize]))
     }
 
     /// The inputs of one suite, or `None` when its import closure holds an
@@ -1724,5 +1754,89 @@ mod tests {
             std::env::remove_var("VSCODE_DARTQ_PROBE");
             std::env::remove_var("TERM_PROGRAM_DARTQ");
         }
+    }
+
+    /// The flutter replay rule (#2656): the Flutter SDK's own packages
+    /// are the toolchain tier — keyed by content (an SDK edit re-keys)
+    /// but never refused for their internal clock or environment
+    /// plumbing, and the tier is named by the run's own `flutter` binary
+    /// when the config carries no `flutterRoot` property (the
+    /// `dart pub get` shape). The first-party binding shapes that used
+    /// to refuse every flutter suite — `flutter_test`'s `_binding_io
+    /// .dart` aliasing the whole environment map beside a wall-clock
+    /// read — key here; a suite-side file with the same shapes still
+    /// refuses.
+    #[test]
+    fn flutter_suites_key_through_the_toolchain_tier() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sdk = tmp.path().join("sdk");
+        let root = tmp.path().join("fx");
+        let write = |path: &std::path::Path, body: &str| {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, body).expect("write");
+        };
+        write(&sdk.join("bin/flutter"), "#!/stub\n");
+        write(
+            &sdk.join("packages/ft/lib/ft.dart"),
+            concat!(
+                "import 'dart:io';\n",
+                "Object? environment;\n",
+                "void bind() {\n",
+                "  environment ??= Platform.environment;\n",
+                "  print(DateTime.now());\n",
+                "  print(Platform.environment['UNIT_TEST_ASSETS']);\n",
+                "}\n",
+            ),
+        );
+        write(&root.join("pubspec.yaml"), "name: fx\n");
+        write(
+            &root.join(".dart_tool/package_config.json"),
+            &format!(
+                concat!(
+                    r#"{{"configVersion": 2, "packages": [{{"name": "fx", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, "#,
+                    r#"{{"name": "ft", "rootUri": "file://{}", "packageUri": "lib/", "languageVersion": "3.5"}}], "generator": "dart"}}"#
+                ),
+                sdk.display()
+            ),
+        );
+        write(
+            &root.join("test/a_test.dart"),
+            "import 'package:ft/ft.dart';\nvoid main() {}\n",
+        );
+        write(
+            &root.join("test/local_test.dart"),
+            "void main() { final e = Platform.environment; }\n",
+        );
+        let root = root.canonicalize().expect("canon");
+        let bin = sdk.join("bin/flutter");
+        let suites = ["test/a_test.dart", "test/local_test.dart"]
+            .map(|rel| root.join(rel))
+            .to_vec();
+        let runner = Runner { bin: &bin, args: &[], flutter: true };
+        let store = tmp.path().join("store");
+        let mut cache = Cache::with_store(&root, store.clone());
+        let keys = cache.keys(&suites, runner).expect("keys");
+        assert!(
+            keys[0].is_some(),
+            "the toolchain tier's plumbing does not refuse the suite"
+        );
+        assert!(
+            keys[1].is_none(),
+            "a suite-side unnamable environment read still refuses"
+        );
+        // The replay round trip: stage, verify against an unchanged
+        // disk, commit, and a fresh cache answers the stored events —
+        // the second run replays instead of running stock.
+        let key = keys[0].clone().expect("key");
+        cache.stage(&key, &[]).expect("stage");
+        let after = cache.rekey(&suites, runner).expect("rekey");
+        assert_eq!(after[0].as_deref(), Some(key.as_str()), "stable across a run");
+        let verified: FxHashSet<String> = [key.clone()].into_iter().collect();
+        cache.commit(&verified).expect("commit");
+        cache.save().expect("save");
+        assert!(
+            Cache::with_store(&root, store).lookup(&key).is_some(),
+            "the next run replays"
+        );
     }
 }

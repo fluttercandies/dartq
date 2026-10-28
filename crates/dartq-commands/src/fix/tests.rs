@@ -1211,8 +1211,12 @@
             Verbosity::Compact,
         );
 
+        // Document keys appear in declaration order: `serde_json`'s
+        // `preserve_order` is feature-unified into this crate through the
+        // shipping binary's dependency graph, so the writer's insertion
+        // order is the long-standing wire contract.
         let keys: Vec<_> = doc.as_object().expect("document object").keys().collect();
-        assert_eq!(keys, ["edits", "file", "v"]);
+        assert_eq!(keys, ["file", "v", "edits"]);
         assert_eq!(doc["v"], 1);
         assert_eq!(doc["file"], "/abs/t.dart");
         let text = doc.to_string();
@@ -1232,7 +1236,7 @@
         );
         for (edit, expected_source) in edits.iter().zip(["builtin-lint", "live"]) {
             let keys: Vec<_> = edit.as_object().expect("edit object").keys().collect();
-            assert_eq!(keys, ["anchor", "len", "off", "role", "src", "text"]);
+            assert_eq!(keys, ["off", "len", "text", "src", "role", "anchor"]);
             assert_eq!(edit["src"], expected_source);
             assert_eq!(edit["role"], "primary", "plugin rows are primary by nature");
         }
@@ -1242,7 +1246,7 @@
 
         let anchor = &edits[0]["anchor"];
         let keys: Vec<_> = anchor.as_object().expect("anchor object").keys().collect();
-        assert_eq!(keys, ["after", "before", "col", "line"]);
+        assert_eq!(keys, ["line", "col", "before", "after"]);
         assert_eq!(anchor["line"], 1);
         assert_eq!(anchor["col"], 20);
         assert_eq!(anchor["before"], "var a = ");
@@ -1261,7 +1265,7 @@
             .expect("edit object")
             .keys()
             .collect();
-        assert_eq!(keys, ["len", "off", "role", "src", "text"]);
+        assert_eq!(keys, ["off", "len", "text", "src", "role"]);
         dartq_schema::validate_at_tier(
             &minimal.to_string(),
             dartq_schema::Domain::FixPatch,
@@ -1277,7 +1281,7 @@
             .collect();
         assert_eq!(
             builtin,
-            ["anchor", "len", "msg", "off", "role", "rule", "src", "text"]
+            ["off", "len", "text", "src", "role", "anchor", "rule", "msg"]
         );
         assert_eq!(full["edits"][0]["rule"], "unnecessary_new");
         let plugin_row: Vec<_> = full["edits"][1]
@@ -1287,7 +1291,7 @@
             .collect();
         assert_eq!(
             plugin_row,
-            ["anchor", "len", "msg", "off", "priority", "role", "src", "text"]
+            ["off", "len", "text", "src", "role", "anchor", "msg", "priority"]
         );
         assert_eq!(full["edits"][1]["msg"], "insert const");
         assert_eq!(full["edits"][1]["priority"], 1);
@@ -1321,7 +1325,7 @@
         );
         let anchor = &doc["edits"][0]["anchor"];
         let keys: Vec<_> = anchor.as_object().expect("anchor object").keys().collect();
-        assert_eq!(keys, ["after", "col", "line"]);
+        assert_eq!(keys, ["line", "col", "after"]);
         assert_eq!(anchor["after"], " a;");
         dartq_schema::validate(&doc.to_string(), dartq_schema::Domain::FixPatch)
             .expect("the omitted-context document is schema-valid");
@@ -1347,12 +1351,14 @@
             Verbosity::Compact,
             &[EditOutcome::Applied, EditOutcome::Stale],
         );
+        // Declaration order is the wire contract (`preserve_order` is
+        // feature-unified through the shipping binary).
         let keys: Vec<_> = applied
             .as_object()
             .expect("document object")
             .keys()
             .collect();
-        assert_eq!(keys, ["edits", "file", "summary", "v"]);
+        assert_eq!(keys, ["file", "v", "edits", "summary"]);
         assert_eq!(applied["summary"]["applied"], 1);
         assert_eq!(applied["summary"]["stale"], 1);
         for (row, outcome) in applied["edits"]
@@ -1364,7 +1370,7 @@
             let keys: Vec<_> = row.as_object().expect("edit object").keys().collect();
             assert_eq!(
                 keys,
-                ["anchor", "len", "off", "outcome", "role", "src", "text"]
+                ["off", "len", "text", "src", "role", "anchor", "outcome"]
             );
             assert_eq!(row["outcome"], outcome.1);
             assert_eq!(row["src"], outcome.0);
@@ -1385,7 +1391,7 @@
             .expect("document object")
             .keys()
             .collect();
-        assert_eq!(keys, ["edits", "file", "v"]);
+        assert_eq!(keys, ["file", "v", "edits"]);
         let text = proposal.to_string();
         assert!(
             !text.contains("outcome") && !text.contains("summary"),
@@ -1797,17 +1803,19 @@
         assert_eq!(row["edits"][0]["text"], "const ");
         assert_eq!(row["edits"][0]["anchor"]["line"], 1);
         assert_eq!(compact["errors"][0]["plugin"], "dead");
+        // Declaration order is the wire contract (`preserve_order` is
+        // feature-unified through the shipping binary).
         let keys: Vec<_> = compact
             .as_object()
             .expect("document object")
             .keys()
             .collect();
-        assert_eq!(keys, ["assists", "errors", "file", "v"]);
+        assert_eq!(keys, ["file", "v", "assists", "errors"]);
 
         let minimal = assists_json(&answer, Verbosity::Minimal);
         let row = &minimal["assists"][0];
         let keys: Vec<_> = row.as_object().expect("assists row").keys().collect();
-        assert_eq!(keys, ["edits", "msg", "src"], "priority drops");
+        assert_eq!(keys, ["msg", "src", "edits"], "priority drops");
         let keys: Vec<_> = row["edits"][0]
             .as_object()
             .expect("edit row")
@@ -1815,7 +1823,7 @@
             .collect();
         assert_eq!(
             keys,
-            ["len", "off", "src", "text"],
+            ["off", "len", "text", "src"],
             "anchor drops"
         );
 

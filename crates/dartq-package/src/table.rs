@@ -766,14 +766,17 @@ sdks:
     }
 
     #[test]
-    fn invalid_names_are_rejected_and_duplicates_fold() {
+    fn invalid_names_and_duplicate_names_are_rejected() {
         // An invalid name is the shared dartq-pub face's hard error: a name
         // outside even the reader's loose charset — pub's constructor
-        // sanity check (`package_config.dart:44-51`). A duplicate name
-        // folds to its first entry instead (package_config-3.0.0
-        // `package_config.dart:624-633`): the oracle never surfaces a
-        // repeated name as a diagnostic, and pub's writer cannot produce
-        // one.
+        // sanity check (`package_config.dart:44-51`). A duplicate name is
+        // the same hard error at parse, not a first-wins fold: upstream
+        // package_config, package_config_impl.dart (`_validatePackages`)
+        // reports `Duplicate package name '<name>'` through `onError`, and
+        // the public parse entry points default that handler to `throwError`
+        // (the post-report `continue` runs only under a custom handler —
+        // the analyzer passes none; probed #2434: two same-name entries
+        // floor the whole config, neither resolves).
         let invalid = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [{"name": "foo bar", "rootUri": "../"}]}"#,
         )
@@ -786,23 +789,13 @@ sdks:
             "unexpected error: {error}"
         );
 
-        let duplicated = PackageConfig::parse(
-            r#"{"configVersion": 2, "packages": [
-                {"name": "app", "rootUri": "../"},
-                {"name": "app", "rootUri": "../"}]}"#,
-        )
-        .expect("parses with the fold");
-        assert_eq!(
-            duplicated.packages.len(),
-            1,
-            "the later duplicate is skipped"
-        );
-        let table =
-            PackageTable::build(&duplicated, &graph_for(&duplicated), Path::new("/proj/.dart_tool"))
-                .expect("the folded config builds");
-        assert_eq!(
-            table.get("app").expect("app entry").root,
-            PathBuf::from("/proj")
+        let duplicated = r#"{"configVersion": 2, "packages": [
+            {"name": "app", "rootUri": "../"},
+            {"name": "app", "rootUri": "../other"}]}"#;
+        let error = PackageConfig::parse(duplicated).expect_err("duplicate name");
+        assert!(
+            error.to_string().contains("duplicate package name `app`"),
+            "unexpected error: {error}"
         );
     }
 

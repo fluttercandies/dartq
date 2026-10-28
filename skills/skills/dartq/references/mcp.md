@@ -61,10 +61,11 @@ not exist.
 
 Every `tools/call` answer rides `content[0].text` as **canonical LON** —
 the same encoding the CLI's `--format lon` default prints, and the same
-*value*: each tool's text is exactly the equivalent CLI command's stdout
-(#2657). One LON line per document; the multi-document faces (`dartq_fix`'s
-per-file patch documents, `dartq_events`' per-row stream) answer the same
-lines the CLI prints, joined by `\n`. `dartq_analyze` answers the CLI's
+*value*: each tool's text equals the equivalent CLI command's stdout
+without its trailing newline for single-document faces; multi-document
+faces answer the same lines the CLI prints, joined by `\n` (#2657 —
+measured: the CLI's one-byte `\n` terminator is the only delta).
+`dartq_analyze` answers the CLI's
 `dartq analyze` document itself (the `root` key, root-relative files, the
 CLI's row order); `dartq_impact` answers the CLI's report, environment
 verdicts included; `dartq_rename` answers the CLI's rename document. The

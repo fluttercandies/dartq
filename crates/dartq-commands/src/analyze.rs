@@ -1652,7 +1652,7 @@ mod tests {
     fn diags_document_locates_files_and_carries_the_root() {
         let mut table = dartq_source::FileTable::new();
         let inside = table.intern(Path::new("/w/pkg/lib/a.dart"));
-        let outside = table.intern(Path::new("/Users/x/.pub-cache/x/lib/b.dart"));
+        let outside = table.intern(Path::new("/pub-cache/x/lib/b.dart"));
         let row = |file: FileId| {
             Diagnostic::new(
                 Severity::Error,
@@ -1680,7 +1680,7 @@ mod tests {
         let diags = document["diags"].as_array().expect("rows");
         assert_eq!(diags[0]["file"], "lib/a.dart", "inside the root: relative");
         assert_eq!(
-            diags[1]["file"], "/Users/x/.pub-cache/x/lib/b.dart",
+            diags[1]["file"], "/pub-cache/x/lib/b.dart",
             "outside the root: absolute"
         );
         assert!(

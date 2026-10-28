@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use dartq_ast::{NodeKind, SyntaxTable, byte_span, utf16_span};
+use dartq_ast::{NodeKind, PayloadField, SyntaxTable, byte_span, utf16_span};
 use dartq_scanner::TokenTable;
 use dartq_semantic::Analysis;
 use dartq_source::LineIndex;
@@ -1031,12 +1031,12 @@ fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>)
     let node = *path.last().expect("collect on a node");
     // The name span and scope set per declaration face: an `Identifier`
     // names through its own node span and reads the context discriminant
-    // off payload word 0; a `DeclaredVariablePattern` names through payload
-    // word 0 (the variable token — the `: T` shorthand carries none) and
-    // scopes like a local.
+    // off its `Context` payload word; a `DeclaredVariablePattern` names
+    // through its `Variable` payload word (the variable token — the `: T`
+    // shorthand carries none) and scopes like a local.
     let (name_bytes, scopes) = match unit.ast.kind(node) {
         NodeKind::Identifier => {
-            let Some(&ctx) = unit.ast.payload(node).first() else {
+            let Some(ctx) = unit.ast.field(node, PayloadField::Context) else {
                 return;
             };
             let scopes: &[NodeKind] = match ctx {
@@ -1054,7 +1054,7 @@ fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>)
             (byte_span(unit.tokens, unit.ast, node), scopes)
         }
         NodeKind::DeclaredVariablePattern => {
-            let Some(&name_token) = unit.ast.payload(node).first() else {
+            let Some(name_token) = unit.ast.field(node, PayloadField::Variable) else {
                 return;
             };
             if name_token == dartq_ast::TOKEN_NONE {
@@ -1370,6 +1370,31 @@ impl<'a> Check<'a> {
     #[must_use]
     pub fn payload(&self, id: u32) -> &[u32] {
         self.unit.ast.payload(id)
+    }
+
+    /// The node's payload word named by `field` — the named read face over
+    /// [`Check::payload`] (see [`SyntaxTable::field`]); the raw word, with
+    /// [`NONE_TOKEN`] filtering left to the caller. `None` only on a
+    /// kind/field mismatch, which the debug assert names.
+    #[must_use]
+    pub fn field(&self, id: u32, field: PayloadField) -> Option<u32> {
+        self.unit.ast.field(id, field)
+    }
+
+    /// [`Check::field`] for token-valued words: `None` when the word is
+    /// absent or carries the [`dartq_ast::TOKEN_NONE`] sentinel — the named
+    /// face of [`Check::payload_word`].
+    #[must_use]
+    pub fn field_token(&self, id: u32, field: PayloadField) -> Option<u32> {
+        let stored = self
+            .field(id, field)
+            .filter(|&stored| stored != dartq_ast::TOKEN_NONE);
+        debug_assert!(
+            stored.is_some(),
+            "payload field {field:?} of {:?} row {id} is absent or NONE_TOKEN",
+            self.unit.ast.kind(id),
+        );
+        stored
     }
 
     /// The token id at the head of `id`'s span.

@@ -1,0 +1,45 @@
+# dartq Homebrew formula template.
+# Rendered by scripts/release/render-formula.sh with the real version and
+# the per-target digests of the GitHub Release assets; the rendered file is
+# the complete formula. Do not edit the rendered output by hand.
+class Dartq < Formula
+  desc "Fast static analysis engine for Dart and Flutter"
+  homepage "https://github.com/fluttercandies/dartq"
+  license "Apache-2.0 OR MIT"
+  version "@VERSION@"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/fluttercandies/dartq/releases/download/v@VERSION@/dartq-@VERSION@-macos-arm64.tar.gz"
+      sha256 "@SHA_MACOS_ARM64@"
+    end
+    on_intel do
+      url "https://github.com/fluttercandies/dartq/releases/download/v@VERSION@/dartq-@VERSION@-macos-x86_64.tar.gz"
+      sha256 "@SHA_MACOS_X86_64@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/fluttercandies/dartq/releases/download/v@VERSION@/dartq-@VERSION@-linux-x86_64.tar.gz"
+      sha256 "@SHA_LINUX_X86_64@"
+    end
+  end
+
+  def install
+    bin.install "dartq"
+  end
+
+  def caveats
+    <<~EOS
+      dartq analyzes Dart and Flutter code and needs a Dart SDK already on
+      this machine (installed via Flutter, fvm, or dart.dev). It does not
+      install or manage one: point it at your SDK with --sdk <dart-sdk-root>
+      or the DART_SDK environment variable.
+    EOS
+  end
+
+  test do
+    system "#{bin}/dartq", "--version"
+  end
+end

@@ -16,10 +16,12 @@
 //!
 //! # Contract
 //!
-//! * The anchor is a `(path, position)` pair; the position converts
-//!   against the analyzed snapshot's own text (the bytes and line index
-//!   the rows were built from), so a position and the rows can never
-//!   disagree.
+//! * The anchor is a `(path, position)` pair; every position spells
+//!   UTF-16 code units — the unit all `off`/`len` values dartq prints
+//!   and accepts use (the LSP and analyzer json convention) — and
+//!   converts against the analyzed snapshot's own text (the bytes and
+//!   line index the rows were built from), so a position and the rows
+//!   can never disagree.
 //! * A position the rows do not cover answers the empty edit set (the
 //!   query family's zero-results posture), not an error.
 //! * The new name validates before any analysis work: a legal Dart
@@ -86,15 +88,18 @@ pub enum RenameError {
     Analyze(#[from] AnalyzeError),
 }
 
-/// The anchor position inside the target file. Both forms convert against
-/// the analyzed text; the line/column column convention is the engine's
-/// diagnostics convention (1-based line, 1-based UTF-16 code-unit column).
+/// The anchor position inside the target file. Both forms spell UTF-16
+/// code units and convert against the analyzed text; the line/column
+/// convention is the engine's diagnostics convention (1-based line,
+/// 1-based UTF-16 code-unit column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
     /// 1-based line and column.
     LineCol { line: u32, column: u32 },
-    /// 0-based byte offset (on a UTF-8 character boundary).
-    ByteOffset(u64),
+    /// 0-based UTF-16 code-unit offset (the same unit every `off` in the
+    /// rows and the edit set uses; never between the surrogates of one
+    /// character).
+    Utf16Offset(u64),
 }
 
 impl Anchor {
@@ -102,7 +107,7 @@ impl Anchor {
     fn spelled(self) -> String {
         match self {
             Self::LineCol { line, column } => format!("{line}:{column}"),
-            Self::ByteOffset(offset) => format!("offset {offset}"),
+            Self::Utf16Offset(offset) => format!("offset {offset}"),
         }
     }
 }
@@ -201,20 +206,25 @@ pub fn plan<'a>(
         .expect("analyzed content is UTF-8");
     let index = engine.line_index(file).expect("analyzed FileId line index");
     let offset = match anchor {
-        Anchor::ByteOffset(byte) => {
-            let Ok(byte) = u32::try_from(byte) else {
+        Anchor::Utf16Offset(units) => {
+            let Ok(units) = u32::try_from(units) else {
                 return Err(range("past the end of the file"));
             };
-            if byte > text.len() as u32 {
+            // The text's UTF-16 length through the same index the splice
+            // converts through (the end byte is always a boundary).
+            let total = index.byte_to_utf16(text, text.len() as u32);
+            if units > total {
                 return Err(range(&format!(
-                    "past the end of the file ({} bytes)",
-                    text.len()
+                    "past the end of the file ({total} code units)"
                 )));
             }
-            if !text.is_char_boundary(byte as usize) {
-                return Err(range("inside a multi-byte character"));
+            // A mid-surrogate offset snaps to its character's first byte
+            // (`utf16_to_byte`'s contract); the round trip names it.
+            let byte = index.utf16_to_byte(text, units);
+            if index.byte_to_utf16(text, byte) != units {
+                return Err(range("inside a surrogate pair"));
             }
-            index.byte_to_utf16(text, byte)
+            units
         }
         Anchor::LineCol { line, column } => {
             let lines = index.line_count();
@@ -607,7 +617,7 @@ mod tests {
         let run = rename(
             &mut engine,
             &m_path,
-            Anchor::ByteOffset(call as u64),
+            Anchor::Utf16Offset(call as u64),
             "startTask",
         )
         .expect("rename");
@@ -774,7 +784,7 @@ mod tests {
             let run = rename(
                 &mut engine,
                 &m_path,
-                Anchor::ByteOffset(anchor as u64),
+                Anchor::Utf16Offset(anchor as u64),
                 "n",
             )
             .expect("rename");
@@ -856,7 +866,7 @@ mod tests {
             let run = rename(
                 &mut engine,
                 &m_path,
-                Anchor::ByteOffset(anchor as u64),
+                Anchor::Utf16Offset(anchor as u64),
                 "n",
             )
             .expect("rename");
@@ -898,7 +908,7 @@ mod tests {
         let run = rename(
             &mut engine,
             &a,
-            Anchor::ByteOffset(A.find("fa").expect("decl") as u64),
+            Anchor::Utf16Offset(A.find("fa").expect("decl") as u64),
             "gb",
         )
         .expect("rename");
@@ -936,6 +946,53 @@ mod tests {
         assert_eq!(json["target"]["line"], 1);
         assert_eq!(json["edits"].as_array().expect("edits array").len(), 2);
         assert_eq!(json["edits"][1]["file"], b.to_string_lossy().into_owned());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The offset unit pin (#2656): the `PATH:OFFSET` anchor counts
+    /// UTF-16 code units — the same unit every `off` the faces print. A
+    /// declaration behind non-ASCII text separates the spellings ('é'
+    /// 1 unit / 2 bytes, 'ö' 1/2, '😀' 2/4): the UTF-16 count resolves
+    /// the declaration with a UTF-16 row offset, the byte count
+    /// overshoots the token, and an offset between the surrogates of one
+    /// character refuses.
+    #[test]
+    fn the_offset_anchor_counts_utf16_code_units() {
+        const WIDE: &str = "const s = 'héllo wörld 😀';\nvoid fa() {}\n";
+        let root = workspace("rename_utf16", &[("lib/a.dart", WIDE)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let a = canonical(&root, "lib/a.dart");
+
+        let byte = WIDE.find("fa").expect("declaration");
+        let units = WIDE[..byte].encode_utf16().count();
+        assert!(units < byte, "the fixture separates the spellings");
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(units as u64), "gb")
+            .expect("rename");
+        let target = run.target.expect("the UTF-16 spelling resolves");
+        assert_eq!(target.name, "fa");
+        assert_eq!(
+            target.range.offset as usize, units,
+            "the rows' `off` is UTF-16 code units"
+        );
+
+        // The byte count overshoots the token by the wide deficit — no
+        // identifier there, the empty edit set answers.
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(byte as u64), "gb")
+            .expect("rename");
+        assert!(run.target.is_none(), "the byte spelling misses the token");
+
+        // Between the two surrogates of '😀' is inside one character.
+        let emoji = WIDE.find('\u{1f600}').expect("astral");
+        let mid = WIDE[..emoji].encode_utf16().count() + 1;
+        let error = match rename(&mut engine, &a, Anchor::Utf16Offset(mid as u64), "gb") {
+            Err(error) => error,
+            Ok(_) => panic!("a mid-surrogate offset refuses"),
+        };
+        assert!(
+            error.to_string().contains("surrogate"),
+            "names the surrogate pair: {error}"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1111,7 +1168,7 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let a = canonical(&root, "lib/a.dart");
         for bad in ["class", "1abc", "a-b"] {
-            let Err(error) = rename(&mut engine, &a, Anchor::ByteOffset(5), bad) else {
+            let Err(error) = rename(&mut engine, &a, Anchor::Utf16Offset(5), bad) else {
                 panic!("the gate refuses `{bad}`");
             };
             let error = error.to_string();
@@ -1128,7 +1185,7 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let a = canonical(&root, "lib/a.dart");
 
-        let run = rename(&mut engine, &a, Anchor::ByteOffset(0), "gb").expect("rename");
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(0), "gb").expect("rename");
         assert!(run.target.is_none());
         assert!(run.edits.is_empty());
         let json = to_json(&run, "gb");
@@ -1146,7 +1203,7 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let a = canonical(&root, "lib/a.dart");
 
-        let run = rename(&mut engine, &a, Anchor::ByteOffset(5), "gb").expect("rename");
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(5), "gb").expect("rename");
         for edit in run.edits.clone() {
             let path = run.layout.file_path(edit.file).to_owned();
             let text = std::fs::read_to_string(&path).expect("disk text");
@@ -1176,7 +1233,7 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let a = canonical(&root, "lib/a.dart");
 
-        let run = rename(&mut engine, &a, Anchor::ByteOffset(5), "gb").expect("rename");
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(5), "gb").expect("rename");
         let file = run.edits[0].file;
 
         std::fs::write(&a, "void fa() {}\n// drift\n").expect("rewrite");

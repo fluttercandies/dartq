@@ -845,8 +845,11 @@ fn code_registry_looks_up_official_and_dartq_codes() {
         assert_eq!(code.machine, code.name.to_uppercase());
         count += 1;
     }
-    // 276 builtin codes: the R780 parity wave plus the #1797 dialect
-    // extension's two dartq-own rows (`dartq/package_config_invalid`,
-    // `dartq/source_rejected`); the live iteration above is the authority.
-    assert_eq!(count, 276);
+    // 277 builtin codes: the R780 parity wave, the #1797 dialect extension's
+    // two dartq-own rows (`dartq/package_config_invalid`,
+    // `dartq/source_rejected`), plus `refutable_pattern_in_irrefutable_context`
+    // (276 + 1; an official compile-time code in the upstream Dart SDK
+    // registry, added with the parser's refutable-pattern reporting); the
+    // live iteration above is the authority.
+    assert_eq!(count, 277);
 }
