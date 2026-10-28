@@ -372,24 +372,22 @@ impl Runtime {
     /// (interactive first, then normal, background; context ascending,
     /// arrival order within a tier), then every read (same order).
     ///
-    /// # Panics
-    ///
-    /// Panics on the structural invariant that every queued task references
-    /// an open context — maintained by [`Runtime::enqueue`] checking and
-    /// [`Runtime::close_context`] clearing; a miss is a program bug.
+    /// Every queued task references an open context — [`Runtime::enqueue`]
+    /// checks liveness and [`Runtime::close_context`] clears the queue — so
+    /// the drain-time epoch lookup answers a live epoch. Drift (a miss)
+    /// cannot panic: the closed slot answers the stale sentinel (see
+    /// [`drain_epoch`]), every task under it drops as stale at this drain,
+    /// and the report's `stale_dropped` count carries the miss.
     #[must_use]
     pub fn drain(&mut self) -> DrainReport {
         // Field capture, not `self.slot`: a method-call closure would borrow
         // all of `self` and fight the scheduler's mutable borrow.
         let contexts = &self.contexts;
-        let epochs = |id: ContextId| {
-            contexts
-                .get(id.index() as usize)
-                .and_then(Option::as_ref)
-                .expect("queued tasks reference live contexts: enqueue checks and close clears")
-                .epoch
-        };
-        self.scheduler.drain(&epochs)
+        self.scheduler.drain(&|id| {
+            let epoch = drain_epoch(contexts, id);
+            debug_assert_ne!(epoch, u64::MAX, "queued task references a closed context");
+            epoch
+        })
     }
 
     /// Reclaims the shared overlay store's dead content: every id no
@@ -429,6 +427,19 @@ impl Runtime {
             .get_mut(id.index() as usize)
             .and_then(Option::as_mut)
     }
+}
+
+/// The drain-time epoch of `id`'s context, total over every arena slot: a
+/// closed slot answers `u64::MAX` — an epoch no live context reaches — so
+/// every task still queued under it misses the epoch match and drops stale
+/// at the drain. Enqueue checks liveness and close clears the queue, so a
+/// miss face is drift; the drain flow debug-asserts it, and the sentinel
+/// keeps release total.
+fn drain_epoch(contexts: &[Option<Context>], id: ContextId) -> u64 {
+    contexts
+        .get(id.index() as usize)
+        .and_then(Option::as_ref)
+        .map_or(u64::MAX, |context| context.epoch)
 }
 
 /// Length-prefixed field fold: prefixing every field with its length keeps
@@ -877,6 +888,71 @@ mod tests {
             engine.content(file),
             Some(canonical.as_bytes()),
             "the second BOM survives as content"
+        );
+    }
+
+    /// The drain-time epoch lookup is total: a closed slot answers the
+    /// sentinel no live epoch reaches, so any task a close missed drops
+    /// stale at the drain instead of panicking (the former `.expect`); a
+    /// live slot answers its own epoch.
+    #[test]
+    fn drain_epoch_answers_a_closed_slot_with_the_stale_sentinel() {
+        let closed: Vec<Option<Context>> = vec![None];
+        assert_eq!(
+            drain_epoch(&closed, ContextId::from_index(0)),
+            u64::MAX,
+            "the closed slot answers the stale sentinel"
+        );
+
+        let (root, config, packages) = fixture("drain-epoch");
+        let engine = Engine::new(engine_config(&root, &config, &packages, crate::memory_store()))
+            .expect("engine");
+        let live = vec![Some(Context {
+            engine,
+            key: ContextKey([0; 16]),
+            epoch: 7,
+            overlay: FxHashMap::default(),
+        })];
+        assert_eq!(drain_epoch(&live, ContextId::from_index(0)), 7);
+    }
+
+    /// Close-time purge proof: tasks queued at close can never drain —
+    /// `close_context` clears the queue before the id recycles (a clear,
+    /// not a stale drop), and the recycled id's fresh incarnation starts
+    /// with an empty queue.
+    #[test]
+    fn close_context_purges_queued_tasks_before_the_id_recycles() {
+        let (root, config, packages) = fixture("close-purge");
+        let mut runtime = Runtime::new();
+        let id = runtime
+            .open_context(ContextConfig {
+                engine: engine_config(&root, &config, &packages, crate::memory_store()),
+                flags: 0,
+            })
+            .expect("open");
+        runtime.enqueue(id, true, Tier::Normal, 1).expect("enqueue");
+        runtime
+            .enqueue(id, false, Tier::Interactive, 2)
+            .expect("enqueue");
+        runtime.close_context(id).expect("close");
+
+        let report = runtime.drain();
+        assert!(report.tasks.is_empty(), "the closed context's queue is gone");
+        assert_eq!(
+            report.stale_dropped, 0,
+            "the purge is a clear, not a stale drop"
+        );
+
+        let reused = runtime
+            .open_context(ContextConfig {
+                engine: engine_config(&root, &config, &packages, crate::memory_store()),
+                flags: 0,
+            })
+            .expect("reopen");
+        assert_eq!(reused, id, "the id recycles through the freelist");
+        assert!(
+            runtime.drain().tasks.is_empty(),
+            "the fresh incarnation drains empty"
         );
     }
 }

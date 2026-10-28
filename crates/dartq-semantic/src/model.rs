@@ -1203,12 +1203,19 @@ impl<V> NameMap<V> {
 impl<V> std::ops::Index<&StringId> for NameMap<V> {
     type Output = V;
 
+    /// The value under `name`, answered through [`NameMap::get`] — one
+    /// search implementation. The `Index` trait cannot answer `None`, so a
+    /// miss panics: the module's tripwire posture for program bugs (the
+    /// [`ArgPool::get`] precedent). Every current caller indexes with a
+    /// name sourced from the map's own rows; a lookup of an externally
+    /// supplied name must route through [`NameMap::get`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `name` is not present — a caller-side program bug, not
+    /// a recoverable condition.
     fn index(&self, name: &StringId) -> &V {
-        let at = self
-            .rows
-            .binary_search_by_key(name, |(key, _)| *key)
-            .expect("name present in NameMap");
-        &self.rows[at].1
+        self.get(name).expect("name present in NameMap")
     }
 }
 
@@ -2432,5 +2439,29 @@ mod tests {
             ty_f.render(&forward, &pool_f),
             "arrival order must not decide the rendering"
         );
+    }
+
+    /// The `Index` impl answers keys-sourced names through the same search
+    /// as `get` — every current caller indexes with a name taken from the
+    /// map's own rows.
+    #[test]
+    fn name_map_index_answers_keys_sourced_names() {
+        let strings = StringTable::new();
+        let (a, b) = (strings.intern("a"), strings.intern("b"));
+        let map: NameMap<u32> = [(a, 1), (b, 2)].into_iter().collect();
+        assert_eq!(map[&a], 1);
+        assert_eq!(map[&b], 2);
+    }
+
+    /// An externally supplied name is the documented tripwire face (the
+    /// `ArgPool::get` posture): event-driven lookups route through `get`,
+    /// and a direct index panics with the invariant text.
+    #[test]
+    #[should_panic(expected = "name present in NameMap")]
+    fn name_map_index_panics_on_an_externally_supplied_name() {
+        let strings = StringTable::new();
+        let (a, absent) = (strings.intern("a"), strings.intern("absent"));
+        let map: NameMap<u32> = [(a, 1)].into_iter().collect();
+        let _ = map[&absent];
     }
 }

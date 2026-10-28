@@ -420,9 +420,11 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
     for (index, file) in order.iter().enumerate() {
         unit_of.insert(*file, saturate_slot_u32(index));
         bases.push(node_total);
-        node_total = node_total
-            .checked_add(products[file].rows)
-            .expect("the declaration universe fits u32");
+        // Same saturation policy as `saturate_slot_u32` two lines up: the
+        // declaration universe is u32-bounded by design, and a hypothetical
+        // overflow saturates rather than panics (the CSR stays consistent —
+        // saturation is the module's invariant, never an expect).
+        node_total = node_total.saturating_add(products[file].rows);
     }
     let mut bits: Vec<Box<[u64]>> = Vec::with_capacity(order.len());
     let mut stack: Vec<u32> = Vec::new();

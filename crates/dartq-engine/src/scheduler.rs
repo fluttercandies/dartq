@@ -102,9 +102,11 @@ impl Scheduler {
     /// and returns the live set in writer-priority order, tier-ordered within
     /// each class.
     ///
-    /// `epoch_of` maps a context to its current epoch. Invariant: every
-    /// queued task references a live context (enqueue checks liveness and
-    /// `drop_context` clears the queue), so the caller's lookup cannot miss.
+    /// `epoch_of` maps a context to its current epoch, and must be total.
+    /// Every queued task references a live context (enqueue checks liveness
+    /// and `drop_context` clears the queue); if drift ever leaves one under
+    /// a closed slot, the caller's sentinel answer mismatches the task's
+    /// epoch and the task drops stale here — a miss degrades, never panics.
     pub(crate) fn drain(&mut self, epoch_of: &dyn Fn(ContextId) -> u64) -> DrainReport {
         // Collection order across queues is context-ascending, and `append`
         // keeps arrival order within a queue — the drain's deterministic

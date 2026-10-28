@@ -6905,8 +6905,14 @@ impl<'a> Engine<'a> {
             .last()
             .is_some_and(|(owner, _, _)| *owner == callee)
         {
-            let (_, args, span) = self.literal_ctor_stash.pop().expect("paired stash");
-            self.check_literal_ctor_invocation(callee, &args, span);
+            // The armed `last` check owns this frame, so the pop reads the
+            // same slot with no intervening mutation — an empty pop is
+            // only-on-drift. The face skips into the pairing ledger (the
+            // lints bridge's `expect_paired` posture) instead of panicking.
+            match self.literal_ctor_stash.pop() {
+                Some((_, args, span)) => self.check_literal_ctor_invocation(callee, &args, span),
+                None => self.pairing.miss("paired literal ctor stash"),
+            }
         }
         if let Some(row) = self.rows.get(callee) {
             let callee_offset = row.range.offset;

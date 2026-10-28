@@ -774,11 +774,14 @@ impl<'a> Boundary<'a> {
     }
 
     /// `owner`'s own unit pool — the universe its entries' slots index.
-    pub(crate) fn foreign_pool(&self, owner: FileId) -> &'a crate::model::ArgPool {
-        self.index
-            .get(owner)
-            .expect("projecting a slot whose owner unit is resident")
-            .type_args()
+    /// `None` is the stale-owner face: a foreign `Ty` cached in a member
+    /// row can outlive its owner unit's residency (the unit left the index
+    /// while this diagnosis still holds slots derived from it). The caller
+    /// skips the projection onto the unknown face — the same stale-edge
+    /// drop the reachability fold applies to cached edges — never reading
+    /// a foreign slot through the diagnosing pool.
+    pub(crate) fn foreign_pool(&self, owner: FileId) -> Option<&'a crate::model::ArgPool> {
+        Some(self.index.get(owner)?.type_args())
     }
 
     /// Projects a `Ty` owned by `owner`'s pool into the diagnosing
@@ -799,8 +802,13 @@ impl<'a> Boundary<'a> {
                 if shape == crate::model::RecordShapeId::EMPTY {
                     return ty;
                 }
+                let Some(foreign) = self.foreign_pool(owner) else {
+                    // Stale owner: no pool holds the shape — degrade to the
+                    // unknown face rather than read a foreign slot through
+                    // the diagnosing pool.
+                    return Ty::Dynamic;
+                };
                 let (positional, named) = {
-                    let foreign = self.foreign_pool(owner);
                     let shape = foreign.record_shape(shape);
                     (shape.positional.to_vec(), shape.named.to_vec())
                 };
@@ -816,8 +824,13 @@ impl<'a> Boundary<'a> {
                 if shape == crate::model::FnShapeId::EMPTY {
                     return ty;
                 }
+                let Some(foreign) = self.foreign_pool(owner) else {
+                    // Stale owner: no pool holds the shape — degrade to the
+                    // unknown face rather than read a foreign slot through
+                    // the diagnosing pool.
+                    return Ty::Dynamic;
+                };
                 let (type_params, return_ty, positional, named) = {
-                    let foreign = self.foreign_pool(owner);
                     let shape = foreign.function_shape(shape);
                     (
                         shape.type_params,
@@ -880,8 +893,13 @@ impl<'a> Boundary<'a> {
                 args: local,
             };
         }
-        // The slot came from `owner`'s own entries, so its pool is resident.
-        let list: Vec<Ty> = self.foreign_pool(owner).get(args).to_vec();
+        // The slot came from `owner`'s own entries; a stale owner (the unit
+        // left residency under this diagnosis) has no pool to fold the list
+        // from — degrade to the unknown face, never a foreign slot read.
+        let Some(foreign) = self.foreign_pool(owner) else {
+            return Ty::Dynamic;
+        };
+        let list: Vec<Ty> = foreign.get(args).to_vec();
         let projected: Vec<Ty> = list.iter().map(|&arg| self.ty(owner, arg)).collect();
         let Ty::Named { args: local, .. } =
             self.args.borrow_mut().named(name, nullable, &projected)
@@ -1603,6 +1621,33 @@ pub(crate) struct CatchClauseFact {
     pub(crate) end: SourceRange,
 }
 
+/// The parser↔listener pairing ledger (the lints bridge's `expect_paired`
+/// posture): the first miss's invariant text is retained, later misses only
+/// bump the saturating count. A miss degrades its event — never the rows —
+/// and the whole ledger is two words: no allocation on the healthy path.
+#[derive(Default)]
+pub(crate) struct PairingLedger {
+    /// First miss this unit saw, as the violated invariant's text.
+    pub(crate) first: Option<&'static str>,
+    /// Total misses, saturating — repeated mismatches never grow anything
+    /// past this word.
+    pub(crate) count: u32,
+}
+
+impl PairingLedger {
+    /// Records one pairing miss. Release builds stay silent — the miss only
+    /// degrades its event; debug builds note the first miss once on stderr
+    /// (the crate has no log facade and none is added for this).
+    pub(crate) fn miss(&mut self, what: &'static str) {
+        if self.first.is_none() {
+            self.first = Some(what);
+            #[cfg(debug_assertions)]
+            eprintln!("dartq semantic: pairing miss: {what}");
+        }
+        self.count = self.count.saturating_add(1);
+    }
+}
+
 /// The engine: one parse, then the resolution pass.
 #[expect(clippy::struct_excessive_bools)] // flag set mirrors the oracle's verifier latches
 pub(crate) struct Engine<'a> {
@@ -1989,6 +2034,10 @@ pub(crate) struct Engine<'a> {
     /// index, the captured argument trees, and the whole-invocation span.
     /// Adjudicated (and popped) at the send's `consume_send`.
     pub(crate) literal_ctor_stash: Vec<(usize, Vec<crate::const_eval::Node>, SourceRange)>,
+    /// The pairing ledger behind the audited stash pops (see
+    /// [`PairingLedger`]) — degraded events record here, the pass never
+    /// panics on a pairing miss.
+    pub(crate) pairing: PairingLedger,
     /// Formal-parameter default values are const contexts (a candidate
     /// creation inside one is implicitly `const` — the oracle is silent).
     pub(crate) default_value_depth: u32,
@@ -4981,5 +5030,96 @@ mod extension_type_ctors {
             "{:?}",
             code_names(&report)
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_projection {
+    //! The boundary projector's stale-owner degrade: a foreign `Ty` cached
+    //! in a member row can outlive its owner unit's residency, so every
+    //! pool read behind [`Boundary::foreign_pool`] answers `None` and the
+    //! projection lands on the unknown face — a foreign slot id must never
+    //! reach the diagnosing pool's reads (the former residency `.expect`).
+
+    use super::{Boundary, PairingLedger};
+    use crate::library::ElementIndex;
+    use crate::model::{ArgListId, FnShapeId, RecordShapeId, Ty};
+    use dartq_resolution::{LibraryGraphBuilder, Namespaces};
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// A stale owner's named, record, and function faces all project to the
+    /// unknown face — the skip the reachability stale-edge drop applies,
+    /// never a foreign slot read through the diagnosing pool.
+    #[test]
+    fn stale_foreign_owner_projects_to_the_unknown_face() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let own = files.intern(Path::new("main.dart"));
+        // The stale unit: interned, never inserted into the index — the
+        // left-residency face.
+        let foreign = files.intern(Path::new("gone.dart"));
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let index = ElementIndex::default();
+        let boundary = Boundary::new(&index, own, lib, None, &graph, &namespaces, &strings);
+
+        // Foreign-shaped slots, minted fresh so the ids are non-reserved:
+        // the projection must degrade on the owner lookup, before any pool
+        // read — a wrong-slot read would panic here, not degrade.
+        let args = boundary.intern_list(&[Ty::named(strings.intern("int"))]);
+        let record = boundary
+            .args
+            .borrow_mut()
+            .intern_record(&[Ty::named(strings.intern("int"))], &[]);
+        let function = boundary.args.borrow_mut().intern_function(
+            0,
+            Ty::named(strings.intern("int")),
+            &[],
+            &[],
+        );
+        assert_ne!(args, ArgListId::EMPTY);
+        assert_ne!(record, RecordShapeId::EMPTY);
+        assert_ne!(function, FnShapeId::EMPTY);
+
+        assert!(
+            boundary.foreign_pool(foreign).is_none(),
+            "the stale owner answers no pool"
+        );
+        let named = boundary.ty(
+            foreign,
+            Ty::Named {
+                name: strings.intern("List"),
+                nullable: false,
+                args,
+            },
+        );
+        assert_eq!(named, Ty::Dynamic, "a stale named face reads unknown");
+        assert_eq!(
+            boundary.ty(foreign, Ty::Record { shape: record, nullable: false }),
+            Ty::Dynamic,
+            "a stale record face reads unknown"
+        );
+        assert_eq!(
+            boundary.ty(foreign, Ty::Function { shape: function, nullable: false }),
+            Ty::Dynamic,
+            "a stale function face reads unknown"
+        );
+    }
+
+    /// The pairing ledger (the lints bridge's `expect_paired` posture):
+    /// the first miss's invariant text is retained, later misses only bump
+    /// the count, and the whole ledger stays two words.
+    #[test]
+    fn pairing_ledger_retains_the_first_miss_and_counts_the_rest() {
+        let mut ledger = PairingLedger::default();
+        assert_eq!(ledger.count, 0, "a healthy stream records nothing");
+        ledger.miss("first miss");
+        ledger.miss("second miss");
+        ledger.miss("third miss");
+        assert_eq!(ledger.first, Some("first miss"));
+        assert_eq!(ledger.count, 3);
     }
 }

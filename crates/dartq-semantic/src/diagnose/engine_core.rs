@@ -123,6 +123,7 @@ impl<'a> Engine<'a> {
             enum_unnamed_ctor_uses: Vec::new(),
             literal_ctor_arms: Vec::new(),
             literal_ctor_stash: Vec::new(),
+            pairing: PairingLedger::default(),
             default_value_depth: 0,
             formal_written: None,
             formal_written_saved: None,
@@ -4393,11 +4394,25 @@ impl<'a> Engine<'a> {
                     // inference without an import — drift's `Predicate<T>`):
                     // class-vs-alias is undecidable at the name level while
                     // the oracle resolves it, so the condition faces keep
-                    // silent. The dart:core primitives have no declaring
+                    // silent. In-scope-ness is the NAMESPACE question
+                    // (`lookup_scoped`), never `top_level_decl` — a name
+                    // declared through the graph without an `ElementIndex`
+                    // stub (the unindexed `dart:core` face posture,
+                    // `List`/`Map`/`Set`) is in scope, not a foreign
+                    // projection. The dart:core primitives have no declaring
                     // stub, yet their non-`bool` verdicts are known.
-                    if self.top_level_decl(name).is_none()
-                        && !self.members.primitive_ids.contains(&name)
-                    {
+                    let in_scope = !matches!(
+                        lookup_scoped(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            name,
+                        ),
+                        ScopedHit::NotFound
+                    );
+                    if !in_scope && !self.members.primitive_ids.contains(&name) {
                         return false;
                     }
                     name != self.members.primitive_ids[3]
