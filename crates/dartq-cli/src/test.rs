@@ -1117,6 +1117,20 @@ struct Stats {
     stock: usize,
 }
 
+/// The `--stats` refusal histogram: each [`dartq_test::Refusal`] label
+/// with its suite count, most frequent first (label order breaking ties),
+/// so the same run always prints the same string. Empty when no suite was
+/// refused — the caller prints no parenthesis then.
+fn refusal_summary(refusals: &[Option<dartq_test::Refusal>]) -> String {
+    let mut counts: FxHashMap<&'static str, usize> = FxHashMap::default();
+    for refusal in refusals.iter().flatten() {
+        *counts.entry(refusal.label()).or_default() += 1;
+    }
+    let mut reasons: Vec<(&'static str, usize)> = counts.into_iter().collect();
+    reasons.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    reasons.iter().map(|(label, count)| format!("{count} {label}")).collect::<Vec<_>>().join(", ")
+}
+
 /// Run the plan: replay what the cache proves, run the rest grouped, rerun
 /// whatever a grouped run did not prove green under the stock runner, and
 /// emit every suite's events in selection order as soon as every suite
@@ -1139,6 +1153,8 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         }
         None => vec![None; abs.len()],
     };
+    let refusals: Vec<Option<dartq_test::Refusal>> =
+        cache.as_ref().map(|cache| cache.refusals().to_vec()).unwrap_or_default();
 
     // The output side.
     let color = plan.inv.color.unwrap_or_else(report::color_default);
@@ -1356,12 +1372,15 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let stock_spoke = stock_stderr;
     outputs.each(|sink| sink.done(success))?;
     if plan.inv.stats {
+        let refusals = refusal_summary(&refusals);
+        let refusals = if refusals.is_empty() { String::new() } else { format!(" ({refusals})") };
         eprintln!(
-            "dartq test: {} suites — {} replayed, {} grouped, {} stock ({:.1}s)",
+            "dartq test: {} suites — {} replayed, {} grouped, {} stock{} ({:.1}s)",
             plan.suites.len(),
             stats.replayed,
             stats.grouped,
             stats.stock,
+            refusals,
             started.elapsed().as_secs_f64()
         );
     }
@@ -1758,6 +1777,32 @@ mod tests {
         assert_eq!(spell("test//sub").as_deref(), Some("test//sub"));
         assert_eq!(spell("a_test.dart?name=x"), None);
         assert_eq!(spell("a%20b_test.dart"), None);
+    }
+
+    /// The `--stats` refusal histogram: `count label` entries, most
+    /// frequent first (ties alphabetical), empty when nothing refused —
+    /// the line wraps it in parentheses only when non-empty.
+    #[test]
+    fn refusal_summary_is_stable() {
+        use dartq_test::Refusal;
+        assert_eq!(refusal_summary(&[]), "");
+        assert_eq!(refusal_summary(&[None, None]), "");
+        let refusals = [
+            Some(Refusal::Nondeterministic),
+            Some(Refusal::AbsoluteDirectory),
+            Some(Refusal::Nondeterministic),
+            None,
+            Some(Refusal::AbsoluteDirectory),
+            Some(Refusal::Nondeterministic),
+            Some(Refusal::EnvOpaque),
+        ];
+        assert_eq!(
+            refusal_summary(&refusals),
+            "3 nondeterministic, 2 absolute-directory, 1 environment"
+        );
+        // Equal counts sort by label; keyed and refused suites mix freely.
+        let tied = [Some(Refusal::Untrusted), Some(Refusal::NoCache)];
+        assert_eq!(refusal_summary(&tied), "1 no-cache, 1 untrusted");
     }
 
     /// `flutter test`'s own grammar: the tool's shaping options pass,

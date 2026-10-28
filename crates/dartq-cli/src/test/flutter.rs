@@ -276,6 +276,8 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         }
         None => vec![None; abs.len()],
     };
+    let refusals: Vec<Option<dartq_test::Refusal>> =
+        cache.as_ref().map(|cache| cache.refusals().to_vec()).unwrap_or_default();
 
     // Every suite path is absolute, so the tool always prints it.
     let opts = report::Options {
@@ -434,12 +436,15 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     outputs.each(|sink| sink.done(success))?;
     eprint!("{tool_stderr}");
     if plan.inv.stats {
+        let refusals = super::refusal_summary(&refusals);
+        let refusals = if refusals.is_empty() { String::new() } else { format!(" ({refusals})") };
         eprintln!(
-            "dartq test: {} suites — {} replayed, {} grouped, {} stock ({:.1}s)",
+            "dartq test: {} suites — {} replayed, {} grouped, {} stock{} ({:.1}s)",
             plan.suites.len(),
             stats.replayed,
             stats.grouped,
             stats.ran,
+            refusals,
             started.elapsed().as_secs_f64()
         );
     }

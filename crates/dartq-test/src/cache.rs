@@ -8,10 +8,15 @@
 //!   environment's toolchain half (`DART_*`/`FLUTTER_*`); the variables a
 //!   suite's closure reads by literal key join per-suite below, and an
 //!   unnamable environment read (`Platform.environment` iterated, aliased,
-//!   computed-keyed) refuses caching for that suite — a suite-side file's
-//!   read; the toolchain tier's unnamable reads (the tester binding's
-//!   whole-map default) are the tool's plumbing and exempt, its named
-//!   reads keying like any other file's;
+//!   computed-keyed) refuses caching only when the reading file belongs to
+//!   the suite's own package (the package under test and its path
+//!   dependencies — the workspace-authored code the run can hold
+//!   responsible for the read). A dependency package's unnamable read
+//!   folds a digest of the whole current environment into that suite's
+//!   key instead, so an environment change re-keys and an identical one
+//!   replays; the toolchain tier's unnamable reads (the tester binding's
+//!   whole-map default) stay exempt plumbing, its named reads keying
+//!   like any other file's;
 //! - the **package resolution**: `pubspec.yaml`, `pubspec.lock`,
 //!   `.dart_tool/package_config.json`, and `dart_test.yaml`;
 //! - the suite's **import closure**: every Dart file transitively reached
@@ -90,7 +95,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Cache layout version: bump on any key or entry format change.
-const FORMAT: &str = "dartq-test-cache-v10";
+const FORMAT: &str = "dartq-test-cache-v11";
 
 /// Stored outcomes kept in the shared store; the least recently used are
 /// pruned past it. Every revision of every suite of every checkout is one
@@ -303,6 +308,10 @@ pub struct Cache {
     /// verdict was not proven for its key.
     staging: PathBuf,
     staged: FxHashSet<String>,
+    /// Per-suite [`Refusal`] of the last [`Self::keys`]/[`Self::rekey`]
+    /// call, aligned to that call's suite order (`None` where the suite
+    /// keyed). Empty before the first call.
+    refusals: Vec<Option<Refusal>>,
 }
 
 impl Cache {
@@ -328,6 +337,7 @@ impl Cache {
             store: store.clone(),
             staging: store.join(format!(".staging-{}", std::process::id())),
             staged: FxHashSet::default(),
+            refusals: Vec::new(),
         }
     }
 
@@ -339,21 +349,26 @@ impl Cache {
     ///
     /// I/O failures reading the package tree.
     pub fn keys(&mut self, suites: &[PathBuf], runner: Runner<'_>) -> io::Result<Vec<Option<String>>> {
-        let none = || vec![None; suites.len()];
+        // A resolution-level failure refuses every suite at once, with the
+        // same reason recorded for each.
+        let none = |cache: &mut Self| {
+            cache.refusals = vec![Some(Refusal::Resolution); suites.len()];
+            vec![None; suites.len()]
+        };
         let config_path = package_config_path(&self.root);
         let text = match std::fs::read_to_string(&config_path) {
             Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(none()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(none(self)),
             Err(error) => return Err(error),
         };
         let Ok(config) = dartq_pub::PackageConfig::parse(&text) else {
-            return Ok(none());
+            return Ok(none(self));
         };
         let Some(dart_tool) = config_path.parent() else {
-            return Ok(none());
+            return Ok(none(self));
         };
         let Ok(packages) = config.resolve(dart_tool) else {
-            return Ok(none());
+            return Ok(none(self));
         };
         let lib_dirs: FxHashMap<&str, &Path> = packages
             .iter()
@@ -388,6 +403,36 @@ impl Cache {
         }
 
         let base = self.base_key(runner)?;
+
+        // Ownership tier of every closure file for the environment rules:
+        // the suite's *own* package is the package under test (`self.root`,
+        // which covers its `test/` trees too) plus its path dependencies —
+        // workspace-authored code whose reads are the suite's own to key.
+        // Everything else a suite can reach is a *dependency* (hosted,
+        // git and sdk sources, or anything the resolution names outside
+        // the workspace); the Flutter SDK's packages keep their separate
+        // toolchain tier. The lock — already a package input — names the
+        // source of every resolved package; a missing or unreadable lock
+        // leaves only the package under test itself "own", a conservative
+        // floor that errs toward digest-keying rather than refusing.
+        let own_names: FxHashSet<String> = dart_tool
+            .parent()
+            .and_then(|root| std::fs::read_to_string(root.join("pubspec.lock")).ok())
+            .and_then(|text| dartq_pub::LockFile::parse(&text).ok())
+            .map(|lock| {
+                lock.packages
+                    .into_iter()
+                    .filter(|(_, package)| package.source == dartq_pub::SourceKind::Path)
+                    .map(|(name, _)| name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let own: Vec<PathBuf> = packages
+            .iter()
+            .filter(|package| own_names.contains(package.name.as_str()))
+            .map(|package| package.root.clone())
+            .collect();
+
         // `flutter test` wraps each suite in its `flutter_test_config.dart`:
         // the configs' closures join the graph.
         let wrappers: Vec<(Vec<PathBuf>, Vec<PathBuf>)> = if runner.flutter {
@@ -402,13 +447,14 @@ impl Cache {
         let package = package_files(&self.root)?;
         let index = PathIndex::new(&self.root, &package);
 
-        // Inputs per suite as interned ids; `None` = untrusted.
+        // Inputs per suite as interned ids; `Err` = refused, with the
+        // reason the closure walk met first.
         let mut paths = Interner::default();
         let package_ids: Vec<u32> = package.iter().map(|path| paths.intern(path)).collect();
         let mut memo = FxHashMap::default();
-        let dense = Dense::new(&self.root, &graph, &toolchain, &mut paths);
+        let dense = Dense::new(&self.root, &graph, &toolchain, &own, &mut paths);
         let asset_ids: Vec<u32> = assets.iter().map(|path| paths.intern(path)).collect();
-        let mut inputs: Vec<Option<SuiteInputs>> = suites
+        let mut inputs: Vec<Result<SuiteInputs, Refusal>> = suites
             .iter()
             .enumerate()
             .map(|(index_in_run, suite)| {
@@ -422,7 +468,7 @@ impl Cache {
                     inputs.ids.extend(absent.iter().map(|path| paths.intern(path)));
                     inputs.ids.extend_from_slice(&asset_ids);
                 }
-                Some(inputs)
+                Ok(inputs)
             })
             .collect();
         self.stamps.stamp(paths.paths.clone())?;
@@ -447,7 +493,8 @@ impl Cache {
             })
             .collect();
         let root = &self.root;
-        Ok(inputs
+        let env_digest = LazyDigest::new();
+        let keys: Vec<Result<String, Refusal>> = inputs
             .into_par_iter()
             .zip(suites.par_iter())
             .map(|(inputs, suite)| {
@@ -456,29 +503,34 @@ impl Cache {
                 ids.dedup();
                 // The environment's suite half: the names this suite's
                 // closure reads by literal key, each keyed with its
-                // current value. A closure whose environment access the
-                // extractor cannot name is never cached — any variable
-                // could reach a verdict.
+                // current value. An unnamable environment read's outcome
+                // depends on the reading file's tier: the suite's own
+                // package refuses (any variable could reach a verdict),
+                // a dependency package keys the whole current environment
+                // instead, and the toolchain tier stays exempt — the
+                // tester binding aliasing the whole `Platform.environment`
+                // map as its default is the tool's plumbing (the tool
+                // builds the tester's environment; no dartq-side value
+                // names it), not a suite author's read. Without the
+                // toolchain exemption every flutter suite on earth
+                // refuses, `flutter_test`'s `_binding_io.dart` in the
+                // closure.
                 let mut env_names: Vec<&str> = Vec::new();
-                let mut env_opaque = false;
+                let mut env_opaque_own = false;
+                let mut env_opaque_dep = false;
                 for &id in &ids {
-                    let Some((file_facts, toolchain)) = dense.env_facts(id) else {
+                    let Some((file_facts, tier)) = dense.env_facts(id) else {
                         continue;
                     };
-                    // The toolchain tier is exempt from the refusal, not
-                    // from the key: its named reads key like any other
-                    // file's, but an unnamable read — the tester binding
-                    // aliasing the whole `Platform.environment` map as
-                    // its default — is the tool's plumbing (the tool
-                    // builds the tester's environment; no dartq-side
-                    // value names it), not a suite author's read. Without
-                    // the exemption every flutter suite on earth refuses,
-                    // `flutter_test`'s `_binding_io.dart` in the closure.
-                    env_opaque |= file_facts.env_opaque && !toolchain;
+                    match tier {
+                        Tier::Toolchain => {}
+                        Tier::Own => env_opaque_own |= file_facts.env_opaque,
+                        Tier::Dependency => env_opaque_dep |= file_facts.env_opaque,
+                    }
                     env_names.extend(file_facts.env_reads.iter().map(String::as_str));
                 }
-                if env_opaque {
-                    return None;
+                if env_opaque_own {
+                    return Err(Refusal::EnvOpaque);
                 }
                 env_names.sort_unstable();
                 env_names.dedup();
@@ -506,9 +558,27 @@ impl Cache {
                         hasher.update(bytes);
                     }
                 }
-                Some(hasher.finalize().to_hex().to_string())
+                // A dependency package's whole-map read can observe any
+                // variable: fold the whole current environment's digest
+                // into the key. An environment change re-keys the suite
+                // and it runs again; an identical environment replays —
+                // the read can observe nothing the key does not cover.
+                if env_opaque_dep {
+                    hasher.update(&env_digest.get());
+                }
+                Ok(hasher.finalize().to_hex().to_string())
             })
-            .collect())
+            .collect();
+        self.refusals = keys.iter().map(|key| key.as_ref().err().copied()).collect();
+        Ok(keys.into_iter().map(Result::ok).collect())
+    }
+
+    /// Why each suite of the last [`Self::keys`]/[`Self::rekey`] call had
+    /// no key (`None` where it did), in that call's suite order. Empty
+    /// before the first call.
+    #[must_use]
+    pub fn refusals(&self) -> &[Option<Refusal>] {
+        &self.refusals
     }
 }
 
@@ -617,17 +687,11 @@ impl Cache {
         // (per-suite, in [`Self::keys`]) — an IDE terminal's ambient
         // variables (`TERM_PROGRAM`, `VSCODE_*`, …) no longer invalidate
         // replay.
-        let ignored = std::env::var(IGNORE_ENV_VAR).unwrap_or_default();
-        let ignored: Vec<&str> = ignored.split(',').map(str::trim).filter(|name| !name.is_empty()).collect();
+        let ignored = env_ignore_patterns();
         let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
             .filter(|(name, _)| {
                 let name = name.to_string_lossy();
-                (name.starts_with("DART_") || name.starts_with("FLUTTER_"))
-                    && !VOLATILE_ENV.contains(&name.as_ref())
-                    && !ignored.iter().any(|pattern| match pattern.strip_suffix('*') {
-                        Some(prefix) => name.starts_with(prefix),
-                        None => name == *pattern,
-                    })
+                (name.starts_with("DART_") || name.starts_with("FLUTTER_")) && !env_ignored(name.as_ref(), &ignored)
             })
             .collect();
         env.sort_unstable();
@@ -640,7 +704,86 @@ impl Cache {
         }
         Ok(hasher.finalize().to_hex().to_string())
     }
+}
 
+/// The `IGNORE_ENV_VAR` opt-out, parsed into name/prefix patterns.
+fn env_ignore_patterns() -> Vec<String> {
+    std::env::var(IGNORE_ENV_VAR)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A variable every key ignores: a shell/terminal volatile
+/// ([`VOLATILE_ENV`]) or one the operator opted out of through
+/// `IGNORE_ENV_VAR` (a trailing `*` matches a prefix).
+fn env_ignored(name: &str, ignored: &[String]) -> bool {
+    VOLATILE_ENV.contains(&name)
+        || ignored.iter().any(|pattern| match pattern.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == *pattern,
+        })
+}
+
+/// The environment digest shared across a `keys` call, computed on first
+/// use (most runs have no dependency-tier opaque reader and never pay the
+/// `vars_os` scan) and `Sync` for the parallel per-suite hashers.
+struct LazyDigest(std::sync::OnceLock<[u8; 32]>);
+
+impl LazyDigest {
+    fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    fn get(&self) -> [u8; 32] {
+        *self.0.get_or_init(environment_digest)
+    }
+}
+
+/// Which package tier a closure file's environment reads belong to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// The suite's own package and its path dependencies: unnamable reads
+    /// refuse caching.
+    Own,
+    /// Any other reachable package (hosted, git, sdk, or unattributed):
+    /// unnamable reads key the whole environment digest.
+    Dependency,
+    /// The Flutter SDK's packages: unnamable reads are tool plumbing,
+    /// exempt.
+    Toolchain,
+}
+
+/// A digest of the whole current process environment (name+value pairs,
+/// sorted), minus the variables every key already ignores. A suite whose
+/// closure holds an unnamable environment read inside a *dependency*
+/// package folds this into its key: any environment change re-keys the
+/// suite and it runs again, while an identical environment replays — the
+/// read can observe nothing the key does not cover. (The toolchain tier's
+/// plumbing stays exempt without this digest, and the suite's own package
+/// keeps refusing outright: a whole-map read authored in the workspace is
+/// the suite's own to fix.)
+fn environment_digest() -> [u8; 32] {
+    let ignored = env_ignore_patterns();
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(name, _)| !env_ignored(name.to_string_lossy().as_ref(), &ignored))
+        .collect();
+    env.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for (name, value) in env {
+        for part in [name, value] {
+            let bytes = part.as_encoded_bytes();
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+impl Cache {
     /// Close every suite's inputs over the paths its data files name: a
     /// fixture manifest (`files: [test/resources/a.dart]`) or an
     /// `analysis_options.yaml` `include:` that a test reads and follows.
@@ -650,7 +793,7 @@ impl Cache {
     /// the finite package (or absent candidates, which name nothing).
     fn follow_data_refs(
         &mut self,
-        inputs: &mut [Option<SuiteInputs>],
+        inputs: &mut [Result<SuiteInputs, Refusal>],
         index: &PathIndex,
         package: &[u32],
         paths: &mut Interner,
@@ -670,7 +813,7 @@ impl Cache {
         // (grown as new candidates are interned), so a closure walk never
         // hashes a path.
         let mut mark: Vec<u32> = Vec::new();
-        for (generation, suite) in inputs.iter_mut().flatten().enumerate() {
+        for (generation, suite) in inputs.iter_mut().filter_map(|inputs| inputs.as_mut().ok()).enumerate() {
             let generation = u32::try_from(generation + 1).expect("suite count fits u32");
             mark.resize(paths.paths.len(), 0);
             let mut frontier: Vec<u32> = Vec::with_capacity(suite.ids.len());
@@ -864,6 +1007,52 @@ impl PathIndex {
     }
 }
 
+/// Why a suite has no key — the one refusal the run reports per suite in
+/// `--stats`. Ordered by where the closure walk meets it, not by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// The package resolution itself is unusable: no
+    /// `.dart_tool/package_config.json`, an unparseable or unresolvable
+    /// one. Refuses every suite of the run at once.
+    Resolution,
+    /// The suite's own file never entered the import graph (a test file
+    /// the resolution cannot place is still reported, just never keyed).
+    SuiteUnknown,
+    /// A closure file's directive header could not be read with certainty
+    /// (an interpolated/escaped URI, an unterminated directive) or names a
+    /// URI outside what the cache can map.
+    Untrusted,
+    /// A closure file carries `// dartq: no-cache`.
+    NoCache,
+    /// A closure file reads drifting state (the wall clock, the network,
+    /// child processes, standard input, the host name, native code) with
+    /// no `// dartq: deterministic` attestation.
+    Nondeterministic,
+    /// A closure file spells an absolute path naming an existing
+    /// directory, whose listing no key covers.
+    AbsoluteDirectory,
+    /// A file of the suite's own package (or its path dependencies) reads
+    /// the environment through a shape no literal name covers — iterating
+    /// `Platform.environment`, a computed key, an alias of the map.
+    EnvOpaque,
+}
+
+impl Refusal {
+    /// The stable label `--stats` prints.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resolution => "resolution",
+            Self::SuiteUnknown => "unknown-suite",
+            Self::Untrusted => "untrusted",
+            Self::NoCache => "no-cache",
+            Self::Nondeterministic => "nondeterministic",
+            Self::AbsoluteDirectory => "absolute-directory",
+            Self::EnvOpaque => "environment",
+        }
+    }
+}
+
 /// Everything one suite's outcome can depend on.
 struct SuiteInputs {
     /// Interned input paths, in discovery order, possibly repeated.
@@ -886,14 +1075,20 @@ struct Dense {
     trusted: Vec<bool>,
     /// The node is library code of the package (`lib/`).
     in_lib: Vec<bool>,
-    /// The node belongs to the toolchain (the Flutter SDK's packages).
-    in_toolchain: Vec<bool>,
+    /// The node's package tier for the environment rules.
+    tier: Vec<Tier>,
     /// The package-level inputs every suite carries.
     base_inputs: Vec<u32>,
 }
 
 impl Dense {
-    fn new(root: &Path, graph: &FxHashMap<PathBuf, Node>, toolchain: &[PathBuf], paths: &mut Interner) -> Self {
+    fn new(
+        root: &Path,
+        graph: &FxHashMap<PathBuf, Node>,
+        toolchain: &[PathBuf],
+        own: &[PathBuf],
+        paths: &mut Interner,
+    ) -> Self {
         let lib = root.join("lib");
         let mut ordered: Vec<(&PathBuf, &Node)> = graph.iter().collect();
         ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -909,10 +1104,18 @@ impl Dense {
         let mut facts = Vec::with_capacity(ordered.len());
         let mut trusted = Vec::with_capacity(ordered.len());
         let mut in_lib = Vec::with_capacity(ordered.len());
-        let mut in_toolchain = Vec::with_capacity(ordered.len());
+        let mut tier = Vec::with_capacity(ordered.len());
         for (path, node) in &ordered {
             in_lib.push(path.starts_with(&lib));
-            in_toolchain.push(toolchain.iter().any(|dir| path.starts_with(dir)));
+            // The toolchain wins over the workspace: a path dependency
+            // pointed inside the Flutter SDK is still the tool's own code.
+            tier.push(if toolchain.iter().any(|dir| path.starts_with(dir)) {
+                Tier::Toolchain
+            } else if path.starts_with(root) || own.iter().any(|dir| path.starts_with(dir)) {
+                Tier::Own
+            } else {
+                Tier::Dependency
+            });
             match node {
                 Node::File { deps: edges, facts: file_facts } => {
                     // Every edge target was queued into the graph.
@@ -950,24 +1153,23 @@ impl Dense {
             facts,
             trusted,
             in_lib,
-            in_toolchain,
+            tier,
             base_inputs,
         }
     }
 
-    /// The Dart facts of the interned path `id` and whether the file
-    /// belongs to the toolchain, when it is a graph node whose facts were
-    /// read (`None` for package inputs, absent candidates, and untrusted
-    /// headers).
-    fn env_facts(&self, id: u32) -> Option<(&FileFacts, bool)> {
+    /// The Dart facts of the interned path `id` and the package tier its
+    /// environment reads belong to, when it is a graph node whose facts
+    /// were read (`None` for package inputs, absent candidates, and
+    /// untrusted headers).
+    fn env_facts(&self, id: u32) -> Option<(&FileFacts, Tier)> {
         let node = self.node_of.get(id as usize).copied().filter(|&n| n != u32::MAX)?;
-        self.facts[node as usize]
-            .as_deref()
-            .map(|facts| (facts, self.in_toolchain[node as usize]))
+        self.facts[node as usize].as_deref().map(|facts| (facts, self.tier[node as usize]))
     }
 
-    /// The inputs of one suite, or `None` when its import closure holds an
-    /// untrusted file.
+    /// The inputs of one suite, or the [`Refusal`] its import closure met
+    /// first (a stack walk's order is deterministic, so two runs of the
+    /// same closure name the same reason).
     fn suite_inputs(
         &self,
         root: &Path,
@@ -976,10 +1178,11 @@ impl Dense {
         index: &PathIndex,
         paths: &mut Interner,
         memo: &mut FxHashMap<String, Vec<u32>>,
-    ) -> Option<SuiteInputs> {
-        let start = *self.node_of.get(*paths.ids.get(suite)? as usize)?;
+    ) -> Result<SuiteInputs, Refusal> {
+        let start = *self.node_of.get(*paths.ids.get(suite).ok_or(Refusal::SuiteUnknown)? as usize)
+            .ok_or(Refusal::SuiteUnknown)?;
         if start == u32::MAX {
-            return None;
+            return Err(Refusal::SuiteUnknown);
         }
         let mut inputs = self.base_inputs.clone();
         let mut seen = vec![false; self.path_of.len()];
@@ -992,23 +1195,26 @@ impl Dense {
                 continue;
             }
             if !self.trusted[node] {
-                return None;
+                return Err(Refusal::Untrusted);
             }
             inputs.push(self.path_of[node]);
             stack.extend(self.deps[node].iter().copied().filter(|&dep| !seen[dep as usize]));
             let Some(facts) = &self.facts[node] else {
                 continue;
             };
-            if self.in_toolchain[node] {
+            if self.tier[node] == Tier::Toolchain {
                 continue;
             }
-            if facts.no_cache || (facts.nondeterministic && !facts.attested) {
-                return None;
+            if facts.no_cache {
+                return Err(Refusal::NoCache);
+            }
+            if facts.nondeterministic && !facts.attested {
+                return Err(Refusal::Nondeterministic);
             }
             for absolute in &facts.absolute_paths {
                 let path = Path::new(absolute);
                 if path.is_dir() {
-                    return None;
+                    return Err(Refusal::AbsoluteDirectory);
                 }
                 inputs.push(paths.intern(path));
             }
@@ -1038,7 +1244,7 @@ impl Dense {
         if whole_package {
             inputs.extend_from_slice(package);
         }
-        Some(SuiteInputs { ids: inputs, pinned })
+        Ok(SuiteInputs { ids: inputs, pinned })
     }
 }
 
@@ -1724,6 +1930,74 @@ mod tests {
         unsafe { std::env::remove_var("dartq_probe_read"); }
         assert_ne!(cache.rekey(&suites, runner(&bin)).expect("keys")[1], second[1]);
         unsafe { std::env::remove_var("dartq_probe_ambient"); }
+    }
+
+    /// A dependency package's unnamable environment read no longer refuses:
+    /// the suite keys with the whole environment's digest folded in, so an
+    /// environment change re-keys it while an identical one replays. The
+    /// suite's own package keeps refusing outright, and a closure mixing
+    /// both tiers keys. The fixture spells no `pubspec.lock`, so every
+    /// package outside the suite's own is a dependency — the conservative
+    /// floor a missing lock gives.
+    #[test]
+    fn dependency_opaque_env_reads_key_the_environment() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dep = tmp.path().join("dep");
+        std::fs::create_dir_all(dep.join("lib")).expect("dir");
+        let dep = dep.canonicalize().expect("canon");
+        std::fs::create_dir_all(tmp.path().join("fx")).expect("dir");
+        let root = tmp.path().join("fx").canonicalize().expect("canon");
+        let write = |path: &std::path::Path, body: &str| {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, body).expect("write");
+        };
+        write(&root.join("pubspec.yaml"), "name: fx\n");
+        write(
+            &root.join(".dart_tool/package_config.json"),
+            &format!(
+                concat!(
+                    r#"{{"configVersion": 2, "packages": [{{"name": "fx", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, "#,
+                    r#"{{"name": "dep", "rootUri": "file://{}", "packageUri": "lib/", "languageVersion": "3.5"}}]}}"#
+                ),
+                dep.display(),
+            ),
+        );
+        // The dependency reads the whole environment map; the suite's own
+        // helper reads one variable by name.
+        write(
+            &dep.join("lib/dep.dart"),
+            "import 'dart:io';\nMap<String, String> env() => Platform.environment;\n",
+        );
+        write(&root.join("lib/helper.dart"), "import 'dart:io';\nString? probe() => Platform.environment['dartq_probe_dep'];\n");
+        write(&root.join("test/dep_test.dart"), "import 'package:dep/dep.dart';\nvoid main() {}\n");
+        write(
+            &root.join("test/mixed_test.dart"),
+            "import 'package:dep/dep.dart';\nimport 'package:fx/helper.dart';\nvoid main() {}\n",
+        );
+        write(
+            &root.join("test/own_test.dart"),
+            "import 'dart:io';\nvoid main() { final e = Platform.environment; }\n",
+        );
+        let suites = ["test/dep_test.dart", "test/mixed_test.dart", "test/own_test.dart"]
+            .map(|rel| root.join(rel))
+            .to_vec();
+        let bin = root.join("pubspec.yaml");
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        unsafe { std::env::set_var("dartq_probe_dep", "one"); }
+        let first = cache.keys(&suites, runner(&bin)).expect("keys");
+        assert!(first[0].is_some(), "a dependency's whole-map read keys");
+        assert!(first[1].is_some(), "a mixed own/dependency closure keys");
+        assert!(first[2].is_none(), "the suite's own whole-map read still refuses");
+
+        // A changed variable re-keys — the dependency's read can observe
+        // it, so the suite runs again. (No "identical environment replays"
+        // assertion: sibling tests mutate the process environment in
+        // parallel, and the digest covers it all.)
+        unsafe { std::env::set_var("dartq_probe_dep", "two"); }
+        let second = cache.rekey(&suites, runner(&bin)).expect("keys");
+        assert_ne!(second[0], first[0], "the digest tracks the environment");
+        assert_ne!(second[1], first[1], "the mixed suite re-keys too");
+        unsafe { std::env::remove_var("dartq_probe_dep"); }
     }
 
     /// The base key's environment half is the toolchain's alone: IDE and
