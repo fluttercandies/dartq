@@ -158,6 +158,16 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// the generation header and forces re-capture (and
 /// `dartq_semantic::SIGNATURE_VERSION` to 13 — the faces hash into the
 /// element face).
+/// v20: containers carry their factory-constructor formals
+/// (`PersistedContainer::factory_formals`, `serde(default)`, the #2687
+/// factory lane). The column first entered the tree WITHOUT its bump —
+/// this retroactive entry forks the pre-column generations (the v15
+/// precedent). A v19 payload decodes factory-formal-less and carries a
+/// pre-factory baked `api_signature`, while the capture hashes factory
+/// formals into the element face, so serving it would serve divergent
+/// capture output; the bump invalidates such snapshots and forces
+/// re-capture. The fold moves on the shape lane — the formals ride the
+/// container row this version governs, so `SIGNATURE_VERSION` stays 13.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -176,7 +186,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 19;
+const FACTS_SHAPE_VERSION: u32 = 20;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with
@@ -692,29 +702,29 @@ impl FeatureGrants {
         // `dart:` URI resolution answers from, so a path produced by a
         // resolution attributes to its library whatever segment (or
         // platform variant) its source lives in. The library's directory:
-        // `<base>/<dirname(uri)>` — the join always has a parent (`uri`
-        // is non-empty and relative).
+        // `<base>/<dirname(uri)>`. A degenerate uri (an absolute root —
+        // `Path::join` replaces the base) has no parent directory: the
+        // library is unattributable and skips — a malformed embedder table
+        // must not fail startup.
         match sdk.embedder() {
             Some((base, table)) => {
                 for (name, library) in &table.libraries {
-                    let dir = base
-                        .join(&library.uri)
-                        .parent()
-                        .expect("library path under the yaml dir always has a directory")
-                        .to_path_buf();
-                    sdk_library_dirs.insert(Box::from(dir), Box::from(name.as_str()));
+                    let path = base.join(&library.uri);
+                    let Some(dir) = path.parent() else {
+                        continue;
+                    };
+                    sdk_library_dirs.insert(Box::from(dir.to_path_buf()), Box::from(name.as_str()));
                 }
                 lib_root = Box::from(base);
             }
             None => {
                 let dart_lib_root: Box<Path> = sdk.dart_sdk_root().join("lib").into_boxed_path();
                 for (name, uri) in dartq_sdk::FLAT_LIBRARIES.iter().copied() {
-                    let dir = dart_lib_root
-                        .join(uri)
-                        .parent()
-                        .expect("library path under lib/ always has a directory")
-                        .to_path_buf();
-                    sdk_library_dirs.insert(Box::from(dir), Box::from(name));
+                    let path = dart_lib_root.join(uri);
+                    let Some(dir) = path.parent() else {
+                        continue;
+                    };
+                    sdk_library_dirs.insert(Box::from(dir.to_path_buf()), Box::from(name));
                 }
                 lib_root = dart_lib_root;
             }
@@ -2892,6 +2902,31 @@ mod tests {
             owner(tree.root.join("sky_engine").join("lib").join("ui").join("ui.dart")),
             None,
             "an embedder directory outside the dart-sdk tree is no SDK library"
+        );
+    }
+
+    /// A degenerate embedder uri (`/` — the shape whose joined path has no
+    /// parent directory, the former startup panic face) is rejected one
+    /// gate earlier, at the snapshot load (the #1293 loader rule), so it
+    /// never reaches the directory-table build; the build-side skip guard
+    /// keeps the loop total regardless. The well-formed table over this
+    /// same fixture builds and attributes (see the embedder test above).
+    #[test]
+    fn degenerate_embedder_uri_is_rejected_at_load() {
+        let tree = GrantTree::new("degenerate");
+        std::fs::write(
+            tree.root.join("sky_engine").join("lib").join("_embedder.yaml"),
+            "embedded_libs:\n  \"dart:bad\": \"/\"\n",
+        )
+        .expect("yaml");
+        let err = SdkSnapshot::load(
+            &tree.root.join("dart-sdk"),
+            Some(tree.root.join("sky_engine").join("lib").as_path()),
+        )
+        .expect_err("the degenerate uri is a load-time hard error");
+        assert!(
+            format!("{err:?}").contains("not a non-empty path relative"),
+            "the degenerate-uri rule fires: {err:?}"
         );
     }
 }

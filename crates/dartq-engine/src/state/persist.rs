@@ -1055,7 +1055,7 @@ mod tests {
         r#""type_param_bounds":[],"sealed":false,"#,
         r#""with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"#,
         r#""enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"#,
-        r#""has_const_constructor":false,"ctor_formals":[],"annotations":[]}]],"container_order":[0],"#,
+        r#""has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"#,
         r#""extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"#,
         r#""nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"#,
         r#""type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"#,
