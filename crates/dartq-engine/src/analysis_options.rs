@@ -267,6 +267,20 @@ const PARSE_ERROR: CodeInfo = CodeInfo::new(
     true,
 );
 
+/// `Multiple plugins can't be enabled.` — one row per
+/// `analyzer.plugins` entry that names a plugin different from the
+/// section's first (upstream `_ParsedLegacyPluginsData.reportLocalMultiplePlugins`,
+/// analysis_options_parse_model.dart:1057-1063; registry
+/// `diagnostic.g.dart`:11886-11898, `STATIC_WARNING`, no published docs;
+/// the correction names the first plugin, `Remove all plugins following
+/// the first, '{0}'.`).
+const MULTIPLE_PLUGINS: CodeInfo = CodeInfo::new(
+    "multiple_plugins",
+    "MULTIPLE_PLUGINS",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
 /// `The plugin '{0}' is specified with a different source in '{1}'.`
 /// (registry :7870-7881, `STATIC_WARNING`; the correction is `Ensure that
 /// all specifications of the same plugin use an identical source.`). The
@@ -491,11 +505,7 @@ impl OptionsIssue {
     /// name, `other_file` the *other* options file's path (`{1}`), `span`
     /// the reporting file's plugin-key anchor ([`AnalysisOptions::plugin_name_anchor`]).
     #[must_use]
-    pub fn incompatible_plugin_source(
-        name: &str,
-        other_file: &Path,
-        span: (u32, u32),
-    ) -> Self {
+    pub fn incompatible_plugin_source(name: &str, other_file: &Path, span: (u32, u32)) -> Self {
         OptionsIssue {
             code: INCOMPATIBLE_PLUGIN_SOURCE,
             message: format!(
@@ -848,6 +858,14 @@ pub struct AnalysisOptions {
     /// package branch of the per-file feature sets (state.rs #936, the
     /// probe-pinned replace posture).
     pub experiments: Option<Vec<String>>,
+    /// `analyzer.optional-checks.chrome-os-manifest-checks`, merged
+    /// set-if-present across the include chain (the official
+    /// `AnalysisOptionsImpl.chromeOsManifestChecks` — a nearer file's map
+    /// value replaces the farther's; the scalar form `optional-checks:
+    /// chrome-os-manifest-checks` enables the check whole, parse_model
+    /// :1399-1499). `None` (never declared) is the official `false`
+    /// default — the manifest pass stays silent.
+    pub chrome_os_manifest_checks: Option<bool>,
     /// Per-code severity overrides, keyed by lowercased code name; `None`
     /// filters the code, `Some` re-levels it (the official
     /// `ErrorProcessor` list's per-code map form).
@@ -1330,6 +1348,10 @@ struct MergeState {
     strict_inference: Option<bool>,
     strict_raw_types: Option<bool>,
     experiments: Option<Vec<String>>,
+    /// The `chromeOsManifestChecks` accumulator — same set-if-present
+    /// merge as the strictness scalars (a nearer file's declared value
+    /// replaces the farther's).
+    chrome_os_manifest_checks: Option<bool>,
     excludes: Vec<ExcludeGlob>,
     /// Deduplication key of the official `Set<AnalysisOptionsExcludePattern>`:
     /// (declaring file, pattern).
@@ -1708,16 +1730,17 @@ impl MergeState {
         if let Some(experiments) = experiment_flags(map) {
             self.experiments = Some(experiments);
         }
+        if let Some(checks) = chrome_os_manifest_checks(map) {
+            self.chrome_os_manifest_checks = Some(checks);
+        }
         // `_applyPlugins` (analysis_options_parser.dart:300-328) — merged
         // per file like the other sections (nearer wins per name, an
         // invalid or null-valued section clears the chain's merge). The
         // section's row faces stay in `local_issues`/`plugin_issues`.
         self.apply_plugins(map, declaring_dir);
         if is_initial {
-            self.has_plugins_map = matches!(
-                map.get(Value::from("plugins")),
-                Some(Value::Mapping(_))
-            );
+            self.has_plugins_map =
+                matches!(map.get(Value::from("plugins")), Some(Value::Mapping(_)));
         }
         if is_initial {
             self.issues.extend(local_issues(map, text));
@@ -1762,6 +1785,7 @@ impl MergeState {
             strict_inference: self.strict_inference,
             strict_raw_types: self.strict_raw_types,
             experiments: self.experiments,
+            chrome_os_manifest_checks: self.chrome_os_manifest_checks,
             severity_overrides: self.errors,
             unignorable: self.unignorable,
             excludes: self.excludes,
@@ -2112,6 +2136,29 @@ fn language_scalars(map: &serde_yaml::Mapping) -> (Option<bool>, Option<bool>, O
         parse("strict-inference"),
         parse("strict-raw-types"),
     )
+}
+
+/// The `analyzer.optional-checks.chrome-os-manifest-checks` value
+/// (`_ParsedOptionalChecksData.parse`, parse_model:1399-1499): the map
+/// form's `toBool` conversion on the key's value (a non-boolean value
+/// contributes nothing — the shape row reports separately in
+/// [`local_issues`]); the scalar form names the check directly and
+/// enables it (`optional-checks: chrome-os-manifest-checks` —
+/// `enabledChecks` adds the legal names the scalar text matches).
+fn chrome_os_manifest_checks(map: &serde_yaml::Mapping) -> Option<bool> {
+    let section = map
+        .get(Value::from("analyzer"))
+        .and_then(|analyzer| analyzer.as_mapping())
+        .and_then(|analyzer| analyzer.get(Value::from("optional-checks")))?;
+    match section {
+        Value::Mapping(section) => section
+            .get(Value::from("chrome-os-manifest-checks"))
+            .and_then(to_bool),
+        Value::Null | Value::Sequence(_) | Value::Tagged(_) => None,
+        scalar => yaml_scalar_text(scalar)
+            .filter(|name| name == "chrome-os-manifest-checks")
+            .map(|_| true),
+    }
 }
 
 // --- Local shape rows (the initial file's own sections, #457) ---
@@ -2565,6 +2612,45 @@ fn local_issues(map: &serde_yaml::Mapping, text: &str) -> Vec<OptionsIssue> {
                 offset,
                 length,
             });
+        }
+        // `analyzer.plugins` conflicts — `_ParsedLegacyPluginsData`
+        // (parse_model:1007-1086): the section's entry stream is the
+        // scalar itself (one entry), the list's nodes, or the map's
+        // keys; each string-valued entry is one plugin name. The first
+        // name wins; every later *different* name reports
+        // `multiple_plugins` at its own node with the first name as the
+        // correction argument. A repeated same-name entry is not a
+        // conflict (the /2 case: `- aaa`, `- aaa` stays silent).
+        if let Some(plugins) = analyzer.get(Value::from("plugins")) {
+            let entries: Vec<&Value> = match plugins {
+                Value::Sequence(nodes) => nodes.iter().collect(),
+                Value::Mapping(entries) => entries.keys().collect(),
+                Value::Null | Value::Tagged(_) => Vec::new(),
+                scalar => vec![scalar],
+            };
+            let mut first_name: Option<&str> = None;
+            let cursor = std::cell::Cell::new(text.find("plugins").unwrap_or(0));
+            for entry in entries {
+                let Some(name) = entry.as_str() else {
+                    continue;
+                };
+                match first_name {
+                    None => first_name = Some(name),
+                    Some(first) if name != first => {
+                        let (offset, length) = anchor_occurrence(text, "analyzer", &cursor, name);
+                        issues.push(OptionsIssue {
+                            code: MULTIPLE_PLUGINS,
+                            message: "Multiple plugins can't be enabled.".to_owned(),
+                            correction: Some(format!(
+                                "Remove all plugins following the first, '{first}'."
+                            )),
+                            offset,
+                            length,
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
         }
         // `optional-checks` (:1399-1499) — the same parseBool shape as
         // strong-mode under the two check keys; the unknown-key row is the
@@ -3124,8 +3210,7 @@ fn plugin_value_anchor(text: &str, key: &str) -> (u32, u32) {
         if let Some((start, end)) = value_span(text.as_bytes(), key, key_at) {
             return (
                 byte_offset_to_utf16(text, start),
-                byte_offset_to_utf16(text, end)
-                    .saturating_sub(byte_offset_to_utf16(text, start)),
+                byte_offset_to_utf16(text, end).saturating_sub(byte_offset_to_utf16(text, start)),
             );
         }
         scan = key_at + key.len();
@@ -3152,7 +3237,10 @@ fn value_span(bytes: &[u8], key: &str, key_at: usize) -> Option<(usize, usize)> 
     while matches!(bytes.get(at), Some(b' ' | b'\t')) {
         at += 1;
     }
-    let key_line_start = bytes[..key_at].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let key_line_start = bytes[..key_at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
     let key_indent = indent_of(&bytes[key_line_start..key_at]);
     match bytes.get(at) {
         // Same-line content: the value token runs to the trimmed line end,
@@ -3186,10 +3274,7 @@ fn flow_span(bytes: &[u8], start: usize) -> (usize, usize) {
                 b'[' | b'{' => depth += 1,
                 b']' | b'}' => depth -= 1,
                 b'\n' if depth <= 0 => break,
-                b'#' if depth <= 0
-                    && at > start
-                    && matches!(bytes[at - 1], b' ' | b'\t') =>
-                {
+                b'#' if depth <= 0 && at > start && matches!(bytes[at - 1], b' ' | b'\t') => {
                     break;
                 }
                 _ => {}
@@ -3238,7 +3323,8 @@ fn block_span(bytes: &[u8], mut at: usize, key_indent: usize) -> Option<(usize, 
         }
         let dash_item = first == Some(b'-')
             && matches!(bytes.get(cursor + 1), Some(b' ' | b'\t' | b'\n') | None);
-        let inside = indent > key_indent || (dash_item && indent == key_indent)
+        let inside = indent > key_indent
+            || (dash_item && indent == key_indent)
             || (dash_item && indent == seq_indent);
         if !inside {
             break;
@@ -3279,12 +3365,7 @@ fn indent_of(line_head: &[u8]) -> usize {
 /// the value token, map entry → the entry value, list → the block's span).
 /// `key` is the entry's key token, resolved to its value's extent by
 /// [`plugin_value_anchor`].
-fn push_plugin_invalid_value(
-    issues: &mut Vec<OptionsIssue>,
-    text: &str,
-    section: &str,
-    key: &str,
-) {
+fn push_plugin_invalid_value(issues: &mut Vec<OptionsIssue>, text: &str, section: &str, key: &str) {
     let (offset, length) = plugin_value_anchor(text, key);
     issues.push(OptionsIssue {
         code: INVALID_SECTION_FORMAT,
@@ -3859,6 +3940,2309 @@ fn percent_decode(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&decoded).into_owned()
+}
+
+// --- Pubspec and Android manifest validation faces (#2757) ---
+//
+// The oracle's driver validates every `pubspec.yaml` and (under
+// `analyzer.optional-checks.chrome-os-manifest-checks`) every
+// `android/AndroidManifest.xml` it discovers in the workspace's packages —
+// upstream Dart SDK source, `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart`
+// (the seven per-file validators run in declaration order:
+// dependency, field, flutter, name, screenshots, platforms, workspace) and
+// `pkg/analyzer/lib/src/manifest/manifest_validator.dart`. Neither file is
+// YAML/XML-parsed by `serde_yaml` here: rows anchor at the official
+// `YamlNode`/`SourceFile` spans, so this section carries its own
+// span-tracking readers (the options face's anchoring convention cannot pin
+// the exact `4:7|12` row positions these faces report). Node spans are raw
+// source extents — quoted scalars include the quotes — while message
+// arguments use the cooked scalar text, both exactly as the upstream node
+// model reports them. Every judgment, iteration order, early return, and
+// message template mirrors the pinned 3.13.7 validators verbatim.
+
+const ASSET_DIRECTORY_DOES_NOT_EXIST: CodeInfo = CodeInfo::new(
+    "asset_directory_does_not_exist",
+    "ASSET_DIRECTORY_DOES_NOT_EXIST",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const ASSET_DOES_NOT_EXIST: CodeInfo = CodeInfo::new(
+    "asset_does_not_exist",
+    "ASSET_DOES_NOT_EXIST",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const ASSET_FIELD_NOT_LIST: CodeInfo = CodeInfo::new(
+    "asset_field_not_list",
+    "ASSET_FIELD_NOT_LIST",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const ASSET_MISSING_PATH: CodeInfo = CodeInfo::new(
+    "asset_missing_path",
+    "ASSET_MISSING_PATH",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const ASSET_NOT_STRING: CodeInfo = CodeInfo::new(
+    "asset_not_string",
+    "ASSET_NOT_STRING",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const ASSET_NOT_STRING_OR_MAP: CodeInfo = CodeInfo::new(
+    "asset_not_string_or_map",
+    "ASSET_NOT_STRING_OR_MAP",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const ASSET_PATH_NOT_STRING: CodeInfo = CodeInfo::new(
+    "asset_path_not_string",
+    "ASSET_PATH_NOT_STRING",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const CAMERA_PERMISSIONS_INCOMPATIBLE: CodeInfo = CodeInfo::new(
+    "camera_permissions_incompatible",
+    "CAMERA_PERMISSIONS_INCOMPATIBLE",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const DEPENDENCIES_FIELD_NOT_MAP: CodeInfo = CodeInfo::new(
+    "dependencies_field_not_map",
+    "DEPENDENCIES_FIELD_NOT_MAP",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const DEPRECATED_FIELD: CodeInfo = CodeInfo::new(
+    "deprecated_field",
+    "DEPRECATED_FIELD",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const FLUTTER_FIELD_NOT_MAP: CodeInfo = CodeInfo::new(
+    "flutter_field_not_map",
+    "FLUTTER_FIELD_NOT_MAP",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const INVALID_DEPENDENCY: CodeInfo = CodeInfo::new(
+    "invalid_dependency",
+    "INVALID_DEPENDENCY",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const INVALID_PLATFORMS_FIELD: CodeInfo = CodeInfo::new(
+    "invalid_platforms_field",
+    "INVALID_PLATFORMS_FIELD",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const MISSING_NAME: CodeInfo = CodeInfo::new(
+    "missing_name",
+    "MISSING_NAME",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const NAME_NOT_STRING: CodeInfo = CodeInfo::new(
+    "name_not_string",
+    "NAME_NOT_STRING",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const NO_TOUCHSCREEN_FEATURE: CodeInfo = CodeInfo::new(
+    "no_touchscreen_feature",
+    "NO_TOUCHSCREEN_FEATURE",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const NON_RESIZABLE_ACTIVITY: CodeInfo = CodeInfo::new(
+    "non_resizable_activity",
+    "NON_RESIZABLE_ACTIVITY",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const PATH_DOES_NOT_EXIST: CodeInfo = CodeInfo::new(
+    "path_does_not_exist",
+    "PATH_DOES_NOT_EXIST",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const PATH_NOT_POSIX: CodeInfo = CodeInfo::new(
+    "path_not_posix",
+    "PATH_NOT_POSIX",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const PATH_PUBSPEC_DOES_NOT_EXIST: CodeInfo = CodeInfo::new(
+    "path_pubspec_does_not_exist",
+    "PATH_PUBSPEC_DOES_NOT_EXIST",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const PERMISSION_IMPLIES_UNSUPPORTED_HARDWARE: CodeInfo = CodeInfo::new(
+    "permission_implies_unsupported_hardware",
+    "PERMISSION_IMPLIES_UNSUPPORTED_HARDWARE",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const PLATFORM_VALUE_DISALLOWED: CodeInfo = CodeInfo::new(
+    "platform_value_disallowed",
+    "PLATFORM_VALUE_DISALLOWED",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const SETTING_ORIENTATION_ON_ACTIVITY: CodeInfo = CodeInfo::new(
+    "setting_orientation_on_activity",
+    "SETTING_ORIENTATION_ON_ACTIVITY",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const UNKNOWN_PLATFORM: CodeInfo = CodeInfo::new(
+    "unknown_platform",
+    "UNKNOWN_PLATFORM",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const UNNECESSARY_DEV_DEPENDENCY: CodeInfo = CodeInfo::new(
+    "unnecessary_dev_dependency",
+    "UNNECESSARY_DEV_DEPENDENCY",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const UNSUPPORTED_CHROME_OS_FEATURE: CodeInfo = CodeInfo::new(
+    "unsupported_chrome_os_feature",
+    "UNSUPPORTED_CHROME_OS_FEATURE",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const UNSUPPORTED_CHROME_OS_HARDWARE: CodeInfo = CodeInfo::new(
+    "unsupported_chrome_os_hardware",
+    "UNSUPPORTED_CHROME_OS_HARDWARE",
+    DiagnosticType::StaticWarning,
+    false,
+);
+
+const WORKSPACE_FIELD_NOT_LIST: CodeInfo = CodeInfo::new(
+    "workspace_field_not_list",
+    "WORKSPACE_FIELD_NOT_LIST",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const WORKSPACE_VALUE_NOT_STRING: CodeInfo = CodeInfo::new(
+    "workspace_value_not_string",
+    "WORKSPACE_VALUE_NOT_STRING",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+const WORKSPACE_VALUE_NOT_SUBDIRECTORY: CodeInfo = CodeInfo::new(
+    "workspace_value_not_subdirectory",
+    "WORKSPACE_VALUE_NOT_SUBDIRECTORY",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// A span-tracking YAML node — the `yaml` package's node model reduced to
+/// the pubspec grammar: block and flow mappings/sequences plus typed
+/// scalars. `raw` is the byte extent the upstream `YamlNode.span` reports —
+/// the raw source text, quoted scalars' quotes included, trailing
+/// whitespace and ` #` comments trimmed; message arguments carry the cooked
+/// scalar text instead. Flow collections parse one level deep (their items
+/// as scalar nodes), the shape the pubspec validators read; YAML features
+/// the pubspec grammar never uses (anchors, block scalars, multi-line plain
+/// scalars) are outside this reader and its callers.
+enum PubspecNode {
+    Scalar {
+        raw: (usize, usize),
+        text: String,
+        kind: ScalarKind,
+    },
+    Seq {
+        raw: (usize, usize),
+        items: Vec<PubspecNode>,
+    },
+    Map {
+        raw: (usize, usize),
+        entries: Vec<(PubspecNode, PubspecNode)>,
+    },
+}
+
+/// The `yaml` package's implicit scalar resolution (`_tryParseScalar`,
+/// `yaml` loader.dart:214-257): the type distinction every `is String` /
+/// `== null` judgment in the validators reads — `42` is not a string,
+/// an unquoted `null` is null, a quoted `"null"` is a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    Null,
+    Bool,
+    Number,
+    Str,
+}
+
+impl PubspecNode {
+    /// The node's raw source extent (bytes).
+    fn raw(&self) -> (usize, usize) {
+        match self {
+            PubspecNode::Scalar { raw, .. } | PubspecNode::Seq { raw, .. }
+            | PubspecNode::Map { raw, .. } => *raw,
+        }
+    }
+
+    /// The cooked scalar text when the node is a *string* scalar
+    /// (`PubspecValidationContext.asString` — a non-string or non-scalar
+    /// node is no string).
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            PubspecNode::Scalar { text, kind: ScalarKind::Str, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Whether the node resolves to the YAML null (a missing value, `null`,
+    /// `Null`, `NULL`, `~`).
+    fn is_null(&self) -> bool {
+        matches!(
+            self,
+            PubspecNode::Scalar { kind: ScalarKind::Null, .. }
+        )
+    }
+
+    /// The block-or-flow mapping's entries, in document order.
+    fn as_map(&self) -> Option<&[(PubspecNode, PubspecNode)]> {
+        match self {
+            PubspecNode::Map { entries, .. } => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// The block-or-flow sequence's items, in document order.
+    fn as_seq(&self) -> Option<&[PubspecNode]> {
+        match self {
+            PubspecNode::Seq { items, .. } => Some(items),
+            _ => None,
+        }
+    }
+
+    /// The value node of the mapping entry keyed `key` (keys compare by
+    /// their cooked scalar text, the `contents.nodes[key]` face).
+    fn get(&self, key: &str) -> Option<&PubspecNode> {
+        self.get_entry(key).map(|(_, value)| value)
+    }
+
+    /// Both nodes of the mapping entry keyed `key`.
+    fn get_entry(&self, key: &str) -> Option<(&PubspecNode, &PubspecNode)> {
+        self.as_map()?
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(k, v)| (k, v))
+    }
+}
+
+/// A line-indexed reader over one pubspec text producing [`PubspecNode`]s.
+/// Line-oriented like the official scanner is token-oriented: blank and
+/// comment-only lines open no node and belong to no collection's extent;
+/// indentation decides containment exactly as [`block_span`] judges it
+/// (deeper lines ride under the open entry, `- ` items may sit at their
+/// key's own indentation).
+struct PubspecYaml<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+}
+
+impl<'a> PubspecYaml<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            bytes: text.as_bytes(),
+        }
+    }
+
+    /// The document root: the first content line's node; an empty (or
+    /// comment-only) document is a null scalar at the origin — the
+    /// `contents is! YamlMap` face the validators gate on.
+    fn parse_document(&self) -> PubspecNode {
+        match self.next_content_line(0) {
+            Some(i) => self.parse_node(i).0,
+            None => PubspecNode::Scalar {
+                raw: (0, 0),
+                text: String::new(),
+                kind: ScalarKind::Null,
+            },
+        }
+    }
+
+    /// The first content (non-blank, non-comment-only) line at or after
+    /// `from` — the range stops at the line count, so an all-blank tail
+    /// yields `None`.
+    fn next_content_line(&self, from: usize) -> Option<usize> {
+        (from..self.line_count()).find(|&i| self.line_content(i).is_some())
+    }
+
+    /// One line's `(indent, content start, content end)` — `None` for a
+    /// blank or comment-only line; the content end trims trailing
+    /// whitespace.
+    fn line_content(&self, i: usize) -> Option<(usize, usize, usize)> {
+        let bounds = self.line_bounds(i)?;
+        let head = &self.bytes[bounds.0..bounds.1];
+        let indent = indent_of(head);
+        if indent == head.len() || head[indent] == b'#' {
+            return None;
+        }
+        Some((indent, bounds.0 + indent, bounds.1))
+    }
+
+    /// The total number of lines (a trailing newline closes one line).
+    fn line_count(&self) -> usize {
+        1 + self.bytes.iter().filter(|&&b| b == b'\n').count()
+    }
+
+    /// The `(start, end)` byte bounds of line `i`'s text, newline excluded.
+    fn line_bounds(&self, i: usize) -> Option<(usize, usize)> {
+        if i >= self.line_count() {
+            return None;
+        }
+        let start = if i == 0 {
+            0
+        } else {
+            let mut newlines = 0;
+            let mut start = 0;
+            for (offset, b) in self.bytes.iter().enumerate() {
+                if *b == b'\n' {
+                    newlines += 1;
+                    if newlines == i {
+                        start = offset + 1;
+                        break;
+                    }
+                }
+            }
+            start
+        };
+        let end = self.bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(self.bytes.len(), |at| start + at);
+        Some((start, end))
+    }
+
+    /// The byte offset of line `i`'s start.
+    fn line_start(&self, i: usize) -> usize {
+        self.line_bounds(i).map_or(0, |(start, _)| start)
+    }
+
+    /// Parses the node opening at content line `i`: a sequence (dash item),
+    /// a mapping (`key:`), or an inline scalar/flow value.
+    fn parse_node(&self, i: usize) -> (PubspecNode, usize) {
+        let (indent, content, _) = self.line_content(i).expect("content line");
+        if self.bytes[content] == b'-'
+            && matches!(self.bytes.get(content + 1), Some(b' ' | b'\t') | None)
+        {
+            self.parse_seq(i, indent)
+        } else if self.key_colon(i, content).is_some() {
+            self.parse_map(i, content)
+        } else {
+            self.parse_inline(i, content)
+        }
+    }
+
+    /// Parses a block sequence whose items sit at column `indent`.
+    fn parse_seq(&self, i: usize, indent: usize) -> (PubspecNode, usize) {
+        let mut items = Vec::new();
+        let start = self.line_start(i) + indent;
+        let mut end = start;
+        let mut cur = i;
+        while cur < self.line_count() {
+            let Some((ind, content, content_end)) = self.line_content(cur) else {
+                cur += 1;
+                continue;
+            };
+            if ind != indent
+                || !(self.bytes[content] == b'-'
+                    && matches!(self.bytes.get(content + 1), Some(b' ' | b'\t') | None))
+            {
+                break;
+            }
+            let value_col = content
+                + 1
+                + self.bytes[content + 1..content_end]
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
+            let (node, next) = if value_col >= content_end {
+                self.parse_block_below(cur, indent)
+            } else if self.key_colon(cur, value_col).is_some() {
+                self.parse_map(cur, value_col)
+            } else {
+                self.parse_inline(cur, value_col)
+            };
+            end = node.raw().1;
+            items.push(node);
+            cur = next;
+        }
+        (
+            PubspecNode::Seq {
+                raw: (start, end),
+                items,
+            },
+            cur,
+        )
+    }
+
+    /// Parses a block mapping whose entries' keys sit at the byte offset
+    /// `key_col` on line `i` — the map's entries share one *column* (the
+    /// first key's line-relative column: a sequence item's map starts
+    /// mid-line, its continuations at that same column), and each entry's
+    /// child block opens past that column.
+    fn parse_map(&self, i: usize, key_col: usize) -> (PubspecNode, usize) {
+        let mut entries = Vec::new();
+        let column = key_col - self.line_start(i);
+        let start = key_col;
+        let mut end = start;
+        let mut cur = i;
+        while cur < self.line_count() {
+            let Some((ind, _, content_end)) = self.line_content(cur) else {
+                cur += 1;
+                continue;
+            };
+            if (if cur == i { column } else { ind }) != column {
+                break;
+            }
+            let at = self.line_start(cur) + column;
+            let Some(colon) = self.key_colon(cur, at) else {
+                break;
+            };
+            let key = self.quoted_or_plain_scalar(at, self.scalar_end(at, colon));
+            let after = colon
+                + 1
+                + self.bytes[colon + 1..content_end]
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
+            let (value, next) = if after < content_end {
+                self.parse_inline(cur, after)
+            } else {
+                self.parse_block_below(cur, column)
+            };
+            end = end.max(value.raw().1);
+            entries.push((key, value));
+            cur = next;
+        }
+        (
+            PubspecNode::Map {
+                raw: (start, end),
+                entries,
+            },
+            cur,
+        )
+    }
+
+    /// The value block below a `key:` (or bare `-`) whose line carries no
+    /// content: the first content line deeper than `key_indent` — or a
+    /// `- ` item at `key_indent` itself, YAML's same-indent sequence form —
+    /// opens it; anything shallower leaves a null scalar at the key line's
+    /// tail.
+    fn parse_block_below(&self, i: usize, key_indent: usize) -> (PubspecNode, usize) {
+        let tail = self.line_bounds(i).map_or(0, |(_, end)| end);
+        let null_node = || PubspecNode::Scalar {
+            raw: (tail, tail),
+            text: String::new(),
+            kind: ScalarKind::Null,
+        };
+        let Some(next) = self.next_content_line(i + 1) else {
+            return (null_node(), i + 1);
+        };
+        let Some((ind, content, _)) = self.line_content(next) else {
+            return (null_node(), next);
+        };
+        let dash = self.bytes[content] == b'-'
+            && matches!(self.bytes.get(content + 1), Some(b' ' | b'\t') | None);
+        if ind > key_indent || (ind == key_indent && dash) {
+            self.parse_node(next)
+        } else {
+            (null_node(), next)
+        }
+    }
+
+    /// Parses an inline value at byte `col` on line `i`: a flow collection
+    /// (possibly across lines) or a one-line scalar.
+    fn parse_inline(&self, i: usize, col: usize) -> (PubspecNode, usize) {
+        match self.bytes.get(col) {
+            Some(b'[') | Some(b'{') => self.parse_flow(col),
+            _ => {
+                let (_, _, content_end) = self.line_content(i).expect("content line");
+                (
+                    self.quoted_or_plain_scalar(col, self.scalar_end(col, content_end)),
+                    i + 1,
+                )
+            }
+        }
+    }
+
+    /// A scalar token's end at byte `start`: a quoted token ends after its
+    /// closing quote, a plain token at the trailing-whitespace / ` #`
+    /// comment trim of the line's content end.
+    fn scalar_end(&self, start: usize, content_end: usize) -> usize {
+        match self.bytes.get(start) {
+            Some(q @ (b'\'' | b'"')) => {
+                let mut at = start + 1;
+                while at < content_end {
+                    if self.bytes[at] == *q
+                        && !(*q == b'"' && self.bytes[at - 1] == b'\\')
+                    {
+                        return at + 1;
+                    }
+                    at += 1;
+                }
+                content_end
+            }
+            _ => {
+                let mut end = content_end;
+                let mut at = start;
+                while at < end {
+                    if self.bytes[at] == b'#'
+                        && at > start
+                        && matches!(self.bytes[at - 1], b' ' | b'\t')
+                    {
+                        end = at;
+                        break;
+                    }
+                    at += 1;
+                }
+                while end > start && matches!(self.bytes[end - 1], b' ' | b'\t' | b'\r') {
+                    end -= 1;
+                }
+                end
+            }
+        }
+    }
+
+    /// The scalar node over bytes `start..end`: quoted forms cook with
+    /// YAML's folding rules, plain forms resolve through
+    /// [`ScalarKind::resolve`].
+    fn quoted_or_plain_scalar(&self, start: usize, end: usize) -> PubspecNode {
+        let slice = &self.text[start..end];
+        match self.bytes.get(start) {
+            Some(b'\'') if end >= start + 2 => {
+                let inner = &slice[1..slice.len().saturating_sub(1)];
+                PubspecNode::Scalar {
+                    raw: (start, end),
+                    text: inner.replace("''", "'"),
+                    kind: ScalarKind::Str,
+                }
+            }
+            Some(b'"') if end >= start + 2 => {
+                let inner = &slice[1..slice.len().saturating_sub(1)];
+                PubspecNode::Scalar {
+                    raw: (start, end),
+                    text: unescape_double_quoted(inner),
+                    kind: ScalarKind::Str,
+                }
+            }
+            _ => PubspecNode::Scalar {
+                raw: (start, end),
+                text: slice.to_owned(),
+                kind: ScalarKind::resolve(slice),
+            },
+        }
+    }
+
+    /// Parses a flow collection opening at byte `start` (`[` or `{`),
+    /// splitting its interior at depth-one commas; items parse as scalars
+    /// or nested flows, map entries at their depth-one colon.
+    fn parse_flow(&self, start: usize) -> (PubspecNode, usize) {
+        let is_map = self.bytes[start] == b'{';
+        let mut depth = 0_i32;
+        let mut quote = None;
+        let mut at = start;
+        let mut end = self.bytes.len();
+        while at < self.bytes.len() {
+            let c = self.bytes[at];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                } else if c == b'\\' && q == b'"' {
+                    at += 1;
+                }
+            } else {
+                match c {
+                    b'\'' | b'"' => quote = Some(c),
+                    b'[' | b'{' => depth += 1,
+                    b']' | b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = at + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        // Interior chunks at depth one, commas splitting.
+        let interior_start = start + 1;
+        let interior_end = end.saturating_sub(1);
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        let mut chunk = interior_start;
+        let mut depth = 0_i32;
+        let mut quote = None;
+        let mut at = interior_start;
+        while at < interior_end {
+            let c = self.bytes[at];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                } else if c == b'\\' && q == b'"' {
+                    at += 1;
+                }
+            } else {
+                match c {
+                    b'\'' | b'"' => quote = Some(c),
+                    b'[' | b'{' => depth += 1,
+                    b']' | b'}' => depth -= 1,
+                    b',' if depth == 0 => {
+                        chunks.push((chunk, at));
+                        chunk = at + 1;
+                    }
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        chunks.push((chunk, interior_end));
+        let mut entries: Vec<(PubspecNode, PubspecNode)> = Vec::new();
+        let mut items: Vec<PubspecNode> = Vec::new();
+        for (from, to) in chunks {
+            let head = from
+                + self.bytes[from..to]
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
+            let tail = {
+                let mut t = to;
+                while t > head && matches!(self.bytes[t - 1], b' ' | b'\t') {
+                    t -= 1;
+                }
+                t
+            };
+            if head >= tail {
+                continue;
+            }
+            if is_map {
+                let mut at = head;
+                let mut quote = None;
+                let mut colon = None;
+                while at < tail {
+                    let c = self.bytes[at];
+                    if let Some(q) = quote {
+                        if c == q {
+                            quote = None;
+                        }
+                    } else {
+                        match c {
+                            b'\'' | b'"' => quote = Some(c),
+                            b':' => {
+                                colon = Some(at);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    at += 1;
+                }
+                let Some(colon) = colon else {
+                    continue;
+                };
+                let key = self.quoted_or_plain_scalar(head, self.scalar_end(head, colon));
+                let mut value_at = colon + 1;
+                while value_at < tail && matches!(self.bytes[value_at], b' ' | b'\t') {
+                    value_at += 1;
+                }
+                let value = match self.bytes.get(value_at) {
+                    Some(b'[') | Some(b'{') => self.parse_flow(value_at).0,
+                    _ => {
+                        self.quoted_or_plain_scalar(value_at, self.scalar_end(value_at, tail))
+                    }
+                };
+                entries.push((key, value));
+            } else {
+                items.push(match self.bytes.get(head) {
+                    Some(b'[') | Some(b'{') => self.parse_flow(head).0,
+                    _ => self.quoted_or_plain_scalar(head, self.scalar_end(head, tail)),
+                });
+            }
+        }
+        let raw = (start, end);
+        let node = if is_map {
+            PubspecNode::Map { raw, entries }
+        } else {
+            PubspecNode::Seq { raw, items }
+        };
+        // The line after the closing bracket's line resumes the walk.
+        let line = self.text[..end].bytes().filter(|&b| b == b'\n').count();
+        (node, line + 1)
+    }
+
+    /// The byte of the `:` that ends the mapping key starting at `col` on
+    /// line `i` — `None` when the token reads as something else (a scalar
+    /// head, a comment): the key runs to a `:` followed by whitespace, line
+    /// end, or the line's end (quoted keys first close their quotes).
+    fn key_colon(&self, i: usize, col: usize) -> Option<usize> {
+        let (_, _, content_end) = self.line_content(i)?;
+        let mut at = col;
+        let mut quote = None;
+        while at < content_end {
+            let c = self.bytes[at];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+            } else {
+                match c {
+                    b'\'' | b'"' => quote = Some(c),
+                    b':' => {
+                        let after = self.bytes.get(at + 1);
+                        if matches!(after, None | Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                            return Some(at);
+                        }
+                    }
+                    b'#' if at > col && matches!(self.bytes[at - 1], b' ' | b'\t') => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        None
+    }
+}
+
+/// YAML double-quoted scalar unescaping — the escape set the `yaml`
+/// scanner folds (`\"`, `\\`, the C0 named escapes, `\xXX`/`\uXXXX`/
+/// `\UXXXXXXXX`); unknown escapes keep the escaped character.
+fn unescape_double_quoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        match escaped {
+            '0' => out.push('\0'),
+            'a' => out.push('\u{7}'),
+            'b' => out.push('\u{8}'),
+            't' | '\t' => out.push('\t'),
+            'n' => out.push('\n'),
+            'v' => out.push('\u{b}'),
+            'f' => out.push('\u{c}'),
+            'r' => out.push('\r'),
+            'e' => out.push('\u{1b}'),
+            ' ' => out.push(' '),
+            '"' => out.push('"'),
+            '/' => out.push('/'),
+            '\\' => out.push('\\'),
+            'N' => out.push('\u{85}'),
+            '_' => out.push('\u{a0}'),
+            'L' => out.push('\u{2028}'),
+            'P' => out.push('\u{2029}'),
+            'x' | 'u' | 'U' => {
+                let width = match escaped {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                let mut value = 0_u32;
+                for _ in 0..width {
+                    match chars.next().and_then(|c| c.to_digit(16)) {
+                        Some(digit) => value = value * 16 + digit,
+                        None => break,
+                    }
+                }
+                out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+impl ScalarKind {
+    /// The implicit resolution of one plain scalar (`_tryParseScalar`,
+    /// `yaml` loader.dart:214-257, plus `_parseNumberValue` :268-334):
+    /// the null/bool spellings first, then the Dart int/double grammars
+    /// (`0x`/`0o` radix forms included, underscores never), everything
+    /// else a string.
+    fn resolve(text: &str) -> Self {
+        match text {
+            "" | "null" | "Null" | "NULL" | "~" => return ScalarKind::Null,
+            "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => {
+                return ScalarKind::Bool;
+            }
+            _ => {}
+        }
+        if is_yaml_number(text) {
+            ScalarKind::Number
+        } else {
+            ScalarKind::Str
+        }
+    }
+}
+
+/// Whether `text` resolves to a YAML number under the Dart loader's
+/// grammar: `.inf`/`.nan` spellings, `[+-]?0x[hex]+`, `[+-]?0o[0-7]+`,
+/// `[+-]?[0-9]+`, or a Dart `double.tryParse` decimal.
+fn is_yaml_number(text: &str) -> bool {
+    if matches!(
+        text,
+        ".inf" | ".Inf" | ".INF"
+            | "+.inf" | "+.Inf" | "+.INF"
+            | "-.inf" | "-.Inf" | "-.INF"
+            | ".nan" | ".NaN" | ".NAN"
+    ) {
+        return true;
+    }
+    let digits = |bytes: &[u8]| bytes.iter().all(u8::is_ascii_digit) && !bytes.is_empty();
+    let rest: &[u8] = match text.as_bytes().first() {
+        Some(b'+') | Some(b'-') => &text.as_bytes()[1..],
+        _ => text.as_bytes(),
+    };
+    if rest.len() >= 2 && rest[0] == b'0' && (rest[1] | 0x20) == b'x' {
+        return rest[2..].iter().all(u8::is_ascii_hexdigit) && rest.len() > 2;
+    }
+    if rest.len() >= 2 && rest[0] == b'0' && (rest[1] | 0x20) == b'o' {
+        return rest[2..].iter().all(|b| (b'0'..=b'7').contains(b)) && rest.len() > 2;
+    }
+    if digits(rest) {
+        return true;
+    }
+    dart_double(text)
+}
+
+/// The Dart `double.tryParse` decimal grammar: an optional sign, digits
+/// with an optional fraction and/or exponent, or a fraction-only form.
+fn dart_double(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
+        at = 1;
+    }
+    let int_start = at;
+    while at < bytes.len() && bytes[at].is_ascii_digit() {
+        at += 1;
+    }
+    let int_digits = at > int_start;
+    let mut fraction = false;
+    if at < bytes.len() && bytes[at] == b'.' {
+        at += 1;
+        let frac_start = at;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+        fraction = at > frac_start;
+    }
+    if !int_digits && !fraction {
+        return false;
+    }
+    if at < bytes.len() && (bytes[at] | 0x20) == b'e' {
+        at += 1;
+        if matches!(bytes.get(at), Some(b'+') | Some(b'-')) {
+            at += 1;
+        }
+        let exp_start = at;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+        if at == exp_start {
+            return false;
+        }
+    }
+    at == bytes.len()
+}
+
+/// The field names the validators read (`PubspecField`, pubspec_validator.dart
+/// :90-132).
+const FLUTTER_FIELD: &str = "flutter";
+const ASSETS_FIELD: &str = "assets";
+const ASSET_PATH_FIELD: &str = "path";
+const PATH_FIELD: &str = "path";
+const GIT_FIELD: &str = "git";
+const NAME_FIELD: &str = "name";
+const VERSION_FIELD: &str = "version";
+const PUBLISH_TO_FIELD: &str = "publish_to";
+const DEPENDENCIES_FIELD: &str = "dependencies";
+const DEV_DEPENDENCIES_FIELD: &str = "dev_dependencies";
+const SCREENSHOTS_FIELD: &str = "screenshots";
+const PLATFORMS_FIELD: &str = "platforms";
+const WORKSPACE_FIELD: &str = "workspace";
+
+/// The fields `fieldValidator` reports (`_deprecatedFields`,
+/// field_validator.dart:9).
+const DEPRECATED_FIELDS: [&str; 4] = ["author", "authors", "transformers", "web"];
+
+/// The platforms `platformsValidator` accepts (`_knownPlatforms`,
+/// platforms_validator.dart:12-19).
+const KNOWN_PLATFORMS: [&str; 6] = ["android", "ios", "linux", "macos", "web", "windows"];
+
+/// Validates one `pubspec.yaml`: the seven upstream validators in their
+/// declaration order, each judgment mirroring the pinned 3.13.7 validator
+/// verbatim (early returns included). `text` is the file's content, `dir`
+/// the directory containing it (the `packageRoot` every relative path
+/// resolves against).
+pub fn pubspec_issues(text: &str, dir: &Path) -> Vec<OptionsIssue> {
+    let yaml = PubspecYaml::new(text);
+    let root = yaml.parse_document();
+    let mut issues = Vec::new();
+    dependency_validator(&yaml, &root, dir, &mut issues);
+    field_validator(&yaml, &root, &mut issues);
+    flutter_validator(&yaml, &root, dir, &mut issues);
+    name_validator(&yaml, &root, &mut issues);
+    screenshots_validator(&yaml, &root, dir, &mut issues);
+    platforms_validator(&yaml, &root, &mut issues);
+    workspace_validator(&yaml, &root, dir, &mut issues);
+    issues
+}
+
+/// One row at a raw byte span, converted to the diagnostic's UTF-16 face.
+fn pubspec_row(
+    code: CodeInfo,
+    message: String,
+    correction: Option<String>,
+    text: &str,
+    raw: (usize, usize),
+) -> OptionsIssue {
+    let start = byte_offset_to_utf16(text, raw.0);
+    OptionsIssue {
+        code,
+        message,
+        correction,
+        offset: start,
+        length: byte_offset_to_utf16(text, raw.1).saturating_sub(start),
+    }
+}
+
+/// `dependencyValidator` (dependency_validator.dart:13-129): the `path:` /
+/// `git:` entries of both dependency sections judged against the resolved
+/// folder's existence facts, publishability gating `invalid_dependency`, and
+/// dev dependencies duplicated in `dependencies` reporting
+/// `unnecessary_dev_dependency`.
+fn dependency_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    dir: &Path,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(map) = root.as_map() else {
+        return;
+    };
+    let dependencies = declared_dependencies(yaml, map, DEPENDENCIES_FIELD, issues);
+    let dev_dependencies = declared_dependencies(yaml, map, DEV_DEPENDENCIES_FIELD, issues);
+    // Publishability (:102-111): a version — any non-null scalar — and a
+    // `publish_to` other than `none`.
+    let publishable = root
+        .get(VERSION_FIELD)
+        .is_some_and(|version| !version.is_null())
+        && root.get(PUBLISH_TO_FIELD).and_then(PubspecNode::as_str) != Some("none");
+    for (_, spec) in &dependencies {
+        validate_path_entries(yaml, dir, spec, publishable, issues);
+    }
+    for (key, spec) in &dev_dependencies {
+        let name = key.as_str();
+        if name.is_some()
+            && dependencies
+                .iter()
+                .any(|(dep_key, _)| dep_key.as_str() == name)
+        {
+            issues.push(pubspec_row(
+                UNNECESSARY_DEV_DEPENDENCY,
+                format!(
+                    "The dev dependency on {} is unnecessary because there is also a \
+                     normal dependency on that package.",
+                    name.unwrap_or_default()
+                ),
+                Some("Try removing the dev dependency.".to_owned()),
+                yaml.text,
+                key.raw(),
+            ));
+        }
+        validate_path_entries(yaml, dir, spec, false, issues);
+    }
+}
+
+/// `getDeclaredDependencies` (dependency_validator.dart:17-31): one
+/// section's named entries in document order — a missing or null field
+/// contributes none, a non-map field reports `dependencies_field_not_map`
+/// once and contributes none.
+fn declared_dependencies<'a>(
+    yaml: &PubspecYaml<'_>,
+    map: &'a [(PubspecNode, PubspecNode)],
+    field: &str,
+    issues: &mut Vec<OptionsIssue>,
+) -> Vec<(&'a PubspecNode, &'a PubspecNode)> {
+    let Some(node) = map
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(field))
+        .map(|(_, value)| value)
+    else {
+        return Vec::new();
+    };
+    if node.is_null() {
+        return Vec::new();
+    }
+    match node.as_map() {
+        Some(entries) => entries.iter().map(|(key, value)| (key, value)).collect(),
+        None => {
+            issues.push(pubspec_row(
+                DEPENDENCIES_FIELD_NOT_MAP,
+                format!("The value of the '{field}' field is expected to be a map."),
+                Some("Try converting the value to be a map.".to_owned()),
+                yaml.text,
+                node.raw(),
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// `validatePathEntries` (dependency_validator.dart:42-93): one dependency
+/// spec's `path:` value judged — not-POSIX first, then the folder's and its
+/// pubspec's existence — and, for publishable packages, the `path:`/`git:`
+/// forms reported at their keys.
+fn validate_path_entries(
+    yaml: &PubspecYaml<'_>,
+    dir: &Path,
+    spec: &PubspecNode,
+    check_for_path_and_git_deps: bool,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    if spec.as_map().is_none() {
+        return;
+    }
+    if let Some((key, value)) = spec.get_entry(PATH_FIELD) {
+        if let Some(path) = value.as_str() {
+            if path.contains('\\') {
+                issues.push(pubspec_row(
+                    PATH_NOT_POSIX,
+                    format!("The path '{path}' isn't a POSIX-style path."),
+                    Some("Try converting the value to a POSIX-style path.".to_owned()),
+                    yaml.text,
+                    value.raw(),
+                ));
+                return;
+            }
+            let resolved = resolve_dependency_path(dir, path);
+            let folder_exists = resolved.is_dir();
+            if !folder_exists {
+                issues.push(pubspec_row(
+                    PATH_DOES_NOT_EXIST,
+                    format!("The path '{path}' doesn't exist."),
+                    Some("Try creating the referenced path or using a path that exists.".to_owned()),
+                    yaml.text,
+                    value.raw(),
+                ));
+            } else if !resolved.join("pubspec.yaml").is_file() {
+                issues.push(pubspec_row(
+                    PATH_PUBSPEC_DOES_NOT_EXIST,
+                    format!("The directory '{path}' doesn't contain a pubspec."),
+                    Some(
+                        "Try creating a pubspec in the referenced directory or using a path \
+                         that has a pubspec."
+                            .to_owned(),
+                    ),
+                    yaml.text,
+                    value.raw(),
+                ));
+            }
+            if check_for_path_and_git_deps {
+                issues.push(invalid_dependency_row(yaml, key.raw(), PATH_FIELD));
+            }
+        }
+    }
+    if let Some((key, _)) = spec.get_entry(GIT_FIELD)
+        && check_for_path_and_git_deps
+    {
+        issues.push(invalid_dependency_row(yaml, key.raw(), GIT_FIELD));
+    }
+}
+
+/// The `invalid_dependency` row at one form's key span.
+fn invalid_dependency_row(yaml: &PubspecYaml<'_>, key_raw: (usize, usize), kind: &str) -> OptionsIssue {
+    pubspec_row(
+        INVALID_DEPENDENCY,
+        format!("Publishable packages can't have '{kind}' dependencies."),
+        Some(format!(
+            "Try adding a 'publish_to: none' entry to mark the package as not for \
+             publishing or remove the {kind} dependency."
+        )),
+        yaml.text,
+        key_raw,
+    )
+}
+
+/// `fieldValidator` (field_validator.dart:12-26): every top-level key whose
+/// name is one of the deprecated spellings, reported at the key.
+fn field_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(entries) = root.as_map() else {
+        return;
+    };
+    for (key, _) in entries {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        if DEPRECATED_FIELDS.contains(&name) {
+            issues.push(pubspec_row(
+                DEPRECATED_FIELD,
+                format!("The '{name}' field is no longer used and can be removed."),
+                Some("Try removing the field.".to_owned()),
+                yaml.text,
+                key.raw(),
+            ));
+        }
+    }
+}
+
+/// `flutterValidator` (flutter_validator.dart:12-67): the `flutter` section
+/// must be a map (an empty section is allowed), its `assets` a list, and
+/// every entry a string path or a map with a string `path:`.
+fn flutter_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    dir: &Path,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(map) = root.as_map() else {
+        return;
+    };
+    let Some(flutter) = map
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(FLUTTER_FIELD))
+        .map(|(_, value)| value)
+    else {
+        return;
+    };
+    let Some(flutter_entries) = flutter.as_map() else {
+        if !flutter.is_null() {
+            issues.push(pubspec_row(
+                FLUTTER_FIELD_NOT_MAP,
+                "The value of the 'flutter' field is expected to be a map.".to_owned(),
+                Some("Try converting the value to be a map.".to_owned()),
+                yaml.text,
+                flutter.raw(),
+            ));
+        }
+        return;
+    };
+    let Some(assets) = flutter_entries
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(ASSETS_FIELD))
+        .map(|(_, value)| value)
+    else {
+        return;
+    };
+    let Some(items) = assets.as_seq() else {
+        issues.push(pubspec_row(
+            ASSET_FIELD_NOT_LIST,
+            "The value of the 'assets' field is expected to be a list of relative file paths."
+                .to_owned(),
+            Some("Try converting the value to be a list of relative file paths.".to_owned()),
+            yaml.text,
+            assets.raw(),
+        ));
+        return;
+    };
+    for item in items {
+        match item {
+            PubspecNode::Scalar { .. } => match item.as_str() {
+                Some(entry) => validate_asset_path(yaml, dir, entry, item.raw(), issues),
+                None => {
+                    issues.push(pubspec_row(
+                        ASSET_NOT_STRING_OR_MAP,
+                        "An asset value is required to be a file path (string) or map.".to_owned(),
+                        Some("Try converting the value to be a string or map.".to_owned()),
+                        yaml.text,
+                        item.raw(),
+                    ));
+                    return;
+                }
+            },
+            PubspecNode::Map { .. } => match item.get(ASSET_PATH_FIELD) {
+                None => issues.push(pubspec_row(
+                    ASSET_MISSING_PATH,
+                    "Asset map entry must contain a 'path' field.".to_owned(),
+                    Some("Try adding a 'path' field.".to_owned()),
+                    yaml.text,
+                    item.raw(),
+                )),
+                Some(path)
+                    if !matches!(path, PubspecNode::Scalar { .. }) =>
+                {
+                    issues.push(pubspec_row(
+                        ASSET_PATH_NOT_STRING,
+                        "Asset paths are required to be file paths (strings).".to_owned(),
+                        Some("Try converting the value to be a string.".to_owned()),
+                        yaml.text,
+                        path.raw(),
+                    ))
+                }
+                Some(path) => match path.as_str() {
+                    Some(entry) => validate_asset_path(yaml, dir, entry, path.raw(), issues),
+                    None => {
+                        issues.push(pubspec_row(
+                            ASSET_NOT_STRING,
+                            "Assets are required to be file paths (strings).".to_owned(),
+                            Some("Try converting the value to be a string.".to_owned()),
+                            yaml.text,
+                            path.raw(),
+                        ));
+                        return;
+                    }
+                },
+            },
+            _ => issues.push(pubspec_row(
+                ASSET_NOT_STRING_OR_MAP,
+                "An asset value is required to be a file path (string) or map.".to_owned(),
+                Some("Try converting the value to be a string or map.".to_owned()),
+                yaml.text,
+                item.raw(),
+            )),
+        }
+    }
+}
+
+/// `_validateAssetPath` (flutter_validator.dart:101-124): `packages/`
+/// references go unvalidated, a trailing `/` demands a directory, and the
+/// row anchors at the entry's own node.
+fn validate_asset_path(
+    yaml: &PubspecYaml<'_>,
+    dir: &Path,
+    path: &str,
+    raw: (usize, usize),
+    issues: &mut Vec<OptionsIssue>,
+) {
+    if path.starts_with("packages/") {
+        return;
+    }
+    let resolved = dir.join(path);
+    if asset_exists_at_path(resolved.as_path()) {
+        return;
+    }
+    let (code, message) = if path.ends_with('/') {
+        (
+            ASSET_DIRECTORY_DOES_NOT_EXIST,
+            format!("The asset directory '{path}' doesn't exist."),
+        )
+    } else {
+        (
+            ASSET_DOES_NOT_EXIST,
+            format!("The asset file '{path}' doesn't exist."),
+        )
+    };
+    issues.push(pubspec_row(
+        code,
+        message,
+        Some(
+            if path.ends_with('/') {
+                "Try creating the directory or fixing the path to the directory."
+            } else {
+                "Try creating the file or fixing the path to the file."
+            }
+            .to_owned(),
+        ),
+        yaml.text,
+        raw,
+    ));
+}
+
+/// `_assetExistsAtPath` (flutter_validator.dart:71-97): the path itself as
+/// folder or file, else the same file name inside any sibling folder of its
+/// parent.
+fn asset_exists_at_path(path: &Path) -> bool {
+    if path.is_dir() || path.is_file() {
+        return true;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !parent.is_dir() {
+        return false;
+    }
+    let Ok(children) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    children
+        .flatten()
+        .any(|child| child.path().is_dir() && child.path().join(name).is_file())
+}
+
+/// `nameValidator` (name_validator.dart:12-26): the document must be a map
+/// carrying a string `name:`; a missing field reports at the origin, a
+/// non-string value at its own node.
+fn name_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(entries) = root.as_map() else {
+        issues.push(OptionsIssue {
+            code: MISSING_NAME,
+            message: "The 'name' field is required but missing.".to_owned(),
+            correction: Some("Try adding a field named 'name'.".to_owned()),
+            offset: 0,
+            length: 0,
+        });
+        return;
+    };
+    match entries
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(NAME_FIELD))
+        .map(|(_, value)| value)
+    {
+        None => issues.push(OptionsIssue {
+            code: MISSING_NAME,
+            message: "The 'name' field is required but missing.".to_owned(),
+            correction: Some("Try adding a field named 'name'.".to_owned()),
+            offset: 0,
+            length: 0,
+        }),
+        Some(value) if value.as_str().is_none() => issues.push(pubspec_row(
+            NAME_NOT_STRING,
+            "The value of the 'name' field is required to be a string.".to_owned(),
+            Some("Try converting the value to be a string.".to_owned()),
+            yaml.text,
+            value.raw(),
+        )),
+        Some(_) => {}
+    }
+}
+
+/// `screenshotsValidator` (screenshot_validator.dart:12-38): each
+/// `screenshots:` entry's `path:` must reference an existing *file*.
+fn screenshots_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    dir: &Path,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(items) = root.get(SCREENSHOTS_FIELD).and_then(PubspecNode::as_seq) else {
+        return;
+    };
+    for item in items {
+        let Some((_, path)) = item.get_entry(PATH_FIELD) else {
+            continue;
+        };
+        let Some(entry) = path.as_str() else {
+            continue;
+        };
+        if !dir.join(entry).is_file() {
+            issues.push(pubspec_row(
+                PATH_DOES_NOT_EXIST,
+                format!("The path '{entry}' doesn't exist."),
+                Some("Try creating the referenced path or using a path that exists.".to_owned()),
+                yaml.text,
+                path.raw(),
+            ));
+        }
+    }
+}
+
+/// `platformsValidator` (platforms_validator.dart:22-53): the `platforms`
+/// field must be a map whose keys name known platforms and whose values are
+/// empty; keys report at their key nodes, values at theirs.
+fn platforms_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(platforms) = root.get(PLATFORMS_FIELD) else {
+        return;
+    };
+    let Some(entries) = platforms.as_map() else {
+        issues.push(pubspec_row(
+            INVALID_PLATFORMS_FIELD,
+            "The 'platforms' field must be a map with platforms as keys.".to_owned(),
+            Some("Try changing the 'platforms' field to a map with platforms as keys.".to_owned()),
+            yaml.text,
+            platforms.raw(),
+        ));
+        return;
+    };
+    for (key, _) in entries {
+        let known = key.as_str().is_some_and(|name| KNOWN_PLATFORMS.contains(&name));
+        if !known {
+            let argument = match key {
+                PubspecNode::Scalar { text, .. } => text.clone(),
+                PubspecNode::Seq { .. } => "[]".to_owned(),
+                PubspecNode::Map { .. } => "{}".to_owned(),
+            };
+            issues.push(pubspec_row(
+                UNKNOWN_PLATFORM,
+                format!("The platform '{argument}' is not a recognized platform."),
+                Some("Try correcting the platform name or removing it.".to_owned()),
+                yaml.text,
+                key.raw(),
+            ));
+        }
+    }
+    for (_, value) in entries {
+        if !value.is_null() {
+            issues.push(pubspec_row(
+                PLATFORM_VALUE_DISALLOWED,
+                "Keys in the `platforms` field can't have values.".to_owned(),
+                Some("Try removing the value, while keeping the key.".to_owned()),
+                yaml.text,
+                value.raw(),
+            ));
+        }
+    }
+}
+
+/// `workspaceValidator` (workspace_validator.dart:24-55): the `workspace`
+/// field must be a list of subdirectory paths (glob syntax allowed, its
+/// non-glob prefix must exist).
+fn workspace_validator(
+    yaml: &PubspecYaml<'_>,
+    root: &PubspecNode,
+    dir: &Path,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let Some(workspace) = root.get(WORKSPACE_FIELD) else {
+        return;
+    };
+    let Some(items) = workspace.as_seq() else {
+        issues.push(pubspec_row(
+            WORKSPACE_FIELD_NOT_LIST,
+            "The value of the 'workspace' field is required to be a list of relative file paths."
+                .to_owned(),
+            Some("Try converting the value to be a list of relative file paths.".to_owned()),
+            yaml.text,
+            workspace.raw(),
+        ));
+        return;
+    };
+    for item in items {
+        match item.as_str() {
+            Some(entry) => {
+                validate_directory_path(yaml, dir, entry, item.raw(), issues);
+            }
+            None => {
+                issues.push(pubspec_row(
+                    WORKSPACE_VALUE_NOT_STRING,
+                    "Workspace entries are required to be directory paths (strings).".to_owned(),
+                    Some("Try converting the value to be a string.".to_owned()),
+                    yaml.text,
+                    item.raw(),
+                ));
+                if matches!(item, PubspecNode::Scalar { .. }) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `_validateDirectoryPath` (workspace_validator.dart:88-140): the value
+/// must stay inside the pubspec's directory; glob values judge their
+/// non-glob prefix, plain values the directory itself.
+fn validate_directory_path(
+    yaml: &PubspecYaml<'_>,
+    dir: &Path,
+    value: &str,
+    raw: (usize, usize),
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let joined = dir.join(value);
+    if !path_is_within(dir, &joined) {
+        issues.push(pubspec_row(
+            WORKSPACE_VALUE_NOT_SUBDIRECTORY,
+            format!(
+                "Workspace values must be a relative path of a subdirectory of '{}'.",
+                dir.display()
+            ),
+            Some(
+                "Try using a subdirectory of the directory containing the 'pubspec.yaml' file."
+                    .to_owned(),
+            ),
+            yaml.text,
+            raw,
+        ));
+        return;
+    }
+    if is_glob_pattern(value) {
+        if let Some(base) = glob_base_path(value) {
+            let base_dir = dir.join(&base);
+            if !base_dir.is_dir() {
+                issues.push(pubspec_row(
+                    PATH_DOES_NOT_EXIST,
+                    format!("The path '{base}' doesn't exist."),
+                    Some(
+                        "Try creating the referenced path or using a path that exists.".to_owned(),
+                    ),
+                    yaml.text,
+                    raw,
+                ));
+            }
+        }
+        return;
+    }
+    if !joined.is_dir() {
+        issues.push(pubspec_row(
+            PATH_DOES_NOT_EXIST,
+            format!("The path '{value}' doesn't exist."),
+            Some("Try creating the referenced path or using a path that exists.".to_owned()),
+            yaml.text,
+            raw,
+        ));
+    }
+}
+
+/// Whether `path` sits inside `base` — the `Folder.contains` face
+/// (`isWithin`): equality counts, escaping `..` segments do not.
+fn path_is_within(base: &Path, path: &Path) -> bool {
+    if path == base {
+        return true;
+    }
+    let normalized = normalize_path(path);
+    let normalized_base = normalize_path(base);
+    normalized.starts_with(&normalized_base)
+}
+
+/// Lexical path normalization — `context.normalize`: `.` segments drop,
+/// `..` segments pop, the root stays rooted.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `resolve_dependency_path`'s join — `context.joinAll(path.posix.split(..))`
+/// followed by `absolute` + `normalize` (dependency_validator.dart:59-63).
+fn resolve_dependency_path(dir: &Path, entry: &str) -> PathBuf {
+    let joined = if entry.starts_with('/') {
+        PathBuf::from(entry)
+    } else {
+        dir.join(entry)
+    };
+    normalize_path(&joined)
+}
+
+/// `_isGlobPattern` (workspace_validator.dart:66-68): `Glob.quote` changes
+/// the text — any of the quote set `* { [ ? \ } ] , - ( )` present.
+fn is_glob_pattern(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|b| b"*{[?\\}],-()".contains(&b))
+}
+
+/// `_globBasePath` (workspace_validator.dart:70-78): the non-glob prefix of
+/// the path's `/`-split parts, joined; `None` when the first part is
+/// already a pattern.
+fn glob_base_path(value: &str) -> Option<String> {
+    let mut non_glob = Vec::new();
+    for part in value.split('/') {
+        if is_glob_pattern(part) {
+            break;
+        }
+        non_glob.push(part);
+    }
+    if non_glob.is_empty() {
+        None
+    } else {
+        Some(non_glob.join("/"))
+    }
+}
+
+// --- Android manifest validation (manifest_validator.dart) ---
+
+/// The tags the manifest parser retains (`_manifestValidationElements`,
+/// manifest_validator.dart:40-46); everything else parses through with its
+/// subtree discarded.
+const MANIFEST_ELEMENTS: [&str; 5] = [
+    "activity",
+    "application",
+    "manifest",
+    "uses-feature",
+    "uses-permission",
+];
+
+/// The `uses-feature` names Chrome OS cannot support
+/// (`unsupportedHardwareFeatures`, manifest_values.dart:38-78).
+const UNSUPPORTED_HARDWARE_FEATURES: [&str; 37] = [
+    "android.hardware.camera",
+    "android.hardware.camera.autofocus",
+    "android.hardware.camera.capability.manual_post_processing",
+    "android.hardware.camera.capability.manual_sensor",
+    "android.hardware.camera.capability.raw",
+    "android.hardware.camera.flash",
+    "android.hardware.camera.level.full",
+    "android.hardware.consumerir",
+    "android.hardware.location.gps",
+    "android.hardware.nfc",
+    "android.hardware.nfc.hce",
+    "android.hardware.sensor.barometer",
+    "android.hardware.telephony",
+    "android.hardware.telephony.cdma",
+    "android.hardware.telephony.gsm",
+    "android.hardware.type.automotive",
+    "android.hardware.type.television",
+    "android.hardware.usb.accessory",
+    "android.hardware.usb.host",
+    // Partially-supported, only on some Chrome OS devices.
+    "android.hardware.sensor.accelerometer",
+    "android.hardware.sensor.compass",
+    "android.hardware.sensor.gyroscope",
+    "android.hardware.sensor.light",
+    "android.hardware.sensor.proximity",
+    "android.hardware.sensor.stepcounter",
+    "android.hardware.sensor.stepdetector",
+    // Software features that are not supported.
+    "android.software.app_widgets",
+    "android.software.device_admin",
+    "android.software.home_screen",
+    "android.software.input_methods",
+    "android.software.leanback",
+    "android.software.live_wallpaper",
+    "android.software.live_tv",
+    "android.software.managed_users",
+    "android.software.midi",
+    "android.software.sip",
+    "android.software.sip.voip",
+];
+
+/// One parsed manifest element: the lowercased tag name, its attributes
+/// (names lowercased, values verbatim, each with its source span), direct
+/// children, and the element's own span.
+struct ManifestElement {
+    name: String,
+    attributes: Vec<(String, String, (usize, usize))>,
+    children: Vec<ManifestElement>,
+    span: (usize, usize),
+}
+
+impl ManifestElement {
+    /// The value (and span) of one attribute — later duplicates win, the
+    /// parser's map-overwrite face.
+    fn attribute(&self, name: &str) -> Option<&(String, String, (usize, usize))> {
+        self.attributes.iter().rev().find(|(key, _, _)| key == name)
+    }
+
+    fn attribute_value(&self, name: &str) -> Option<&str> {
+        self.attribute(name).map(|(_, value, _)| value.as_str())
+    }
+}
+
+/// The Android manifest row set, gated on the
+/// `analyzer.optional-checks.chrome-os-manifest-checks` option (`check_manifest`
+/// — `ManifestValidator.validate`, manifest_validator.dart:412-424). `text`
+/// is the `AndroidManifest.xml` content; a malformed document parses to no
+/// rows (the parser never throws, its error result ends the walk silently).
+pub fn manifest_issues(text: &str, check_manifest: bool) -> Vec<OptionsIssue> {
+    if !check_manifest {
+        return Vec::new();
+    }
+    let mut parser = ManifestParser::new(text);
+    // The `manifest` root element, found past any leading comments and
+    // declarations; a stray end tag's element carries its name too, so only
+    // the retained-element results with the wrong name loop onward.
+    let manifest = loop {
+        match parser.parse_xml_tag() {
+            TagResult::Element(element) => {
+                if element.name == "manifest" {
+                    break element;
+                }
+            }
+            TagResult::Eof | TagResult::Error => return Vec::new(),
+            _ => {}
+        }
+    };
+    let features: Vec<&ManifestElement> = manifest
+        .children
+        .iter()
+        .filter(|child| child.name == "uses-feature")
+        .collect();
+    let permissions: Vec<&ManifestElement> = manifest
+        .children
+        .iter()
+        .filter(|child| child.name == "uses-permission")
+        .collect();
+    let mut issues = Vec::new();
+    validate_touchscreen_feature(text, &features, &manifest, &mut issues);
+    validate_features(text, &features, &mut issues);
+    validate_permissions(text, &permissions, &features, &mut issues);
+    if let Some(application) = manifest
+        .children
+        .iter()
+        .find(|child| child.name == "application")
+    {
+        for activity in application
+            .children
+            .iter()
+            .filter(|child| child.name == "activity")
+        {
+            validate_activity(text, activity, &mut issues);
+        }
+    }
+    issues
+}
+
+/// One manifest row at a byte span, converted to UTF-16.
+fn manifest_row(
+    code: CodeInfo,
+    message: String,
+    correction: Option<String>,
+    text: &str,
+    raw: (usize, usize),
+) -> OptionsIssue {
+    let start = byte_offset_to_utf16(text, raw.0);
+    OptionsIssue {
+        code,
+        message,
+        correction,
+        offset: start,
+        length: byte_offset_to_utf16(text, raw.1).saturating_sub(start),
+    }
+}
+
+/// `_validateTouchScreenFeature` (manifest_validator.dart:594-626): a
+/// `touchscreen` feature without `android:required` or with `true` reports
+/// per its shape, its absence reports on the manifest element itself.
+fn validate_touchscreen_feature(
+    text: &str,
+    features: &[&ManifestElement],
+    manifest: &ManifestElement,
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let feature = features.iter().copied().find(|element| {
+        element.attribute_value("android:name") == Some("android.hardware.touchscreen")
+    });
+    match feature {
+        Some(feature) => match feature.attribute_value("android:required") {
+            None => issues.push(unsupported_hardware_row(
+                text,
+                feature.attribute("android:name").map(|(_, _, span)| *span),
+                "android.hardware.touchscreen",
+            )),
+            Some("true") => issues.push(unsupported_feature_row(
+                text,
+                feature.attribute("android:name").map(|(_, _, span)| *span),
+                "android.hardware.touchscreen",
+            )),
+            Some(_) => {}
+        },
+        None => issues.push(manifest_row(
+            NO_TOUCHSCREEN_FEATURE,
+            "The default \"android.hardware.touchscreen\" needs to be optional for Chrome OS."
+                .to_owned(),
+            Some(
+                "Consider adding <uses-feature \
+                 android:name=\"android.hardware.touchscreen\" android:required=\"false\" /> \
+                 to the manifest."
+                    .to_owned(),
+            ),
+            text,
+            manifest.span,
+        )),
+    }
+}
+
+/// `_validateFeatures` (manifest_validator.dart:515-555): every retained
+/// `uses-feature` naming an unsupported hardware feature reports per its
+/// `android:required` shape.
+fn validate_features(
+    text: &str,
+    features: &[&ManifestElement],
+    issues: &mut Vec<OptionsIssue>,
+) {
+    for element in features {
+        let Some(name) = element.attribute_value("android:name") else {
+            continue;
+        };
+        let in_unsupported = UNSUPPORTED_HARDWARE_FEATURES.contains(&name);
+        if !in_unsupported {
+            continue;
+        }
+        match element.attribute_value("android:required") {
+            None => issues.push(unsupported_hardware_row(
+                text,
+                element.attribute("android:name").map(|(_, _, span)| *span),
+                name,
+            )),
+            Some("true") => issues.push(unsupported_feature_row(
+                text,
+                element.attribute("android:name").map(|(_, _, span)| *span),
+                name,
+            )),
+            Some(_) => {}
+        }
+    }
+}
+
+/// `_validatePermissions` (manifest_validator.dart:558-591): the CAMERA
+/// permission demands the camera feature pair, every other permission is
+/// checked against the hardware it implies.
+fn validate_permissions(
+    text: &str,
+    permissions: &[&ManifestElement],
+    features: &[&ManifestElement],
+    issues: &mut Vec<OptionsIssue>,
+) {
+    let has_camera = features
+        .iter()
+        .any(|f| f.attribute_value("android:name") == Some("android.hardware.camera"));
+    let has_autofocus = features
+        .iter()
+        .any(|f| f.attribute_value("android:name") == Some("android.hardware.camera.autofocus"));
+    for permission in permissions {
+        let name_span = permission.attribute("android:name").map(|(_, _, span)| *span);
+        if permission.attribute_value("android:name") == Some("android.permission.CAMERA") {
+            if !has_camera || !has_autofocus {
+                issues.push(manifest_row(
+                    CAMERA_PERMISSIONS_INCOMPATIBLE,
+                    "Camera permissions make app incompatible for Chrome OS, consider adding \
+                     optional features \"android.hardware.camera\" and \
+                     \"android.hardware.camera.autofocus\"."
+                        .to_owned(),
+                    Some(
+                        "Try adding `<uses-feature \
+                         android:name=\"android.hardware.camera\"  \
+                         android:required=\"false\">` `<uses-feature \
+                         android:name=\"android.hardware.camera.autofocus\"  \
+                         android:required=\"false\">`."
+                            .to_owned(),
+                    ),
+                    text,
+                    name_span.unwrap_or((0, 0)),
+                ));
+            }
+        } else if let Some(feature) = permission
+            .attribute_value("android:name")
+            .and_then(implied_unsupported_hardware)
+        {
+            issues.push(manifest_row(
+                PERMISSION_IMPLIES_UNSUPPORTED_HARDWARE,
+                format!(
+                    "Permission makes app incompatible for Chrome OS, consider adding \
+                     optional {feature} feature tag,"
+                ),
+                Some(format!(
+                    " Try adding `<uses-feature android:name=\"{feature}\"  \
+                     android:required=\"false\">`."
+                )),
+                text,
+                name_span.unwrap_or((0, 0)),
+            ));
+        }
+    }
+}
+
+/// `_validateActivity` (manifest_validator.dart:488-512): locked
+/// orientations and `resizeableActivity="false"` report at their
+/// attributes.
+fn validate_activity(text: &str, activity: &ManifestElement, issues: &mut Vec<OptionsIssue>) {
+    if let Some((_, value, span)) = activity.attribute("android:screenorientation")
+        && matches!(
+            value.as_str(),
+            "landscape"
+                | "portrait"
+                | "reverseLandscape"
+                | "reversePortrait"
+                | "sensorLandscape"
+                | "sensorPortrait"
+                | "userLandscape"
+                | "userPortrait"
+        )
+    {
+        issues.push(manifest_row(
+            SETTING_ORIENTATION_ON_ACTIVITY,
+            "The `<activity>` element should not be locked to any orientation so that \
+             users can take advantage of the multi-window environments and larger \
+             screens on Chrome OS"
+                .to_owned(),
+            Some(
+                "Consider declaring the corresponding activity element with \
+                 `screenOrientation=\"unspecified\"` or `\"fullSensor\"` attribute."
+                    .to_owned(),
+            ),
+            text,
+            *span,
+        ));
+    }
+    if let Some((_, value, span)) = activity.attribute("android:resizeableactivity")
+        && value == "false"
+    {
+        issues.push(manifest_row(
+            NON_RESIZABLE_ACTIVITY,
+            "The `<activity>` element should be allowed to be resized to allow users \
+             to take advantage of the multi-window environment on Chrome OS"
+                .to_owned(),
+            Some(
+                "Consider declaring the corresponding activity element with \
+                 `resizableActivity=\"true\"` attribute."
+                    .to_owned(),
+            ),
+            text,
+            *span,
+        ));
+    }
+}
+
+/// The `unsupported_chrome_os_hardware` row at one `android:name` span.
+fn unsupported_hardware_row(
+    text: &str,
+    span: Option<(usize, usize)>,
+    name: &str,
+) -> OptionsIssue {
+    manifest_row(
+        UNSUPPORTED_CHROME_OS_HARDWARE,
+        format!("The feature {name} isn't supported on Chrome OS, consider making it optional."),
+        Some("Try adding `android:required=\"false\"` for this feature.".to_owned()),
+        text,
+        span.unwrap_or((0, 0)),
+    )
+}
+
+/// The `unsupported_chrome_os_feature` row at one `android:name` span.
+fn unsupported_feature_row(
+    text: &str,
+    span: Option<(usize, usize)>,
+    name: &str,
+) -> OptionsIssue {
+    manifest_row(
+        UNSUPPORTED_CHROME_OS_FEATURE,
+        format!("The feature {name} isn't supported on Chrome OS, consider making it optional."),
+        Some("Try changing to `android:required=\"false\"` for this feature.".to_owned()),
+        text,
+        span.unwrap_or((0, 0)),
+    )
+}
+
+/// `getImpliedUnsupportedHardware` (manifest_values.dart:95-124): the
+/// hardware feature a permission's presence implies.
+fn implied_unsupported_hardware(permission: &str) -> Option<&'static str> {
+    match permission {
+        "android.permission.CAMERA" => Some("android.hardware.camera"),
+        "android.permission.CALL_PHONE"
+        | "android.permission.CALL_PRIVILEGED"
+        | "android.permission.MODIFY_PHONE_STATE"
+        | "android.permission.PROCESS_OUTGOING_CALLS"
+        | "android.permission.READ_SMS"
+        | "android.permission.RECEIVE_SMS"
+        | "android.permission.RECEIVE_MMS"
+        | "android.permission.RECEIVE_WAP_PUSH"
+        | "android.permission.SEND_SMS"
+        | "android.permission.WRITE_APN_SETTINGS"
+        | "android.permission.WRITE_SMS" => Some("android.hardware.telephony"),
+        _ => None,
+    }
+}
+
+/// One parse outcome of [`ManifestParser::parse_xml_tag`].
+enum TagResult {
+    /// A retained element (its subtree in tow).
+    Element(ManifestElement),
+    /// An end tag.
+    EndTag,
+    /// A parsed non-retained element (its subtree discarded) — comments and
+    /// declarations ride here too.
+    Other,
+    /// End of input.
+    Eof,
+    /// A parse error; the walk ends silently.
+    Error,
+}
+
+/// The rudimentary XML reader of `ManifestParser`
+/// (manifest_validator.dart:38-401), byte-faithful: element and attribute
+/// names lowercase, attribute spans run from the name's first byte to the
+/// closing quote's index (opening quote included), element spans run from
+/// the start tag's `<` through the end tag's (or `/>`'s) `>` inclusive.
+/// Malformed input yields [`TagResult::Error`] instead of throwing.
+struct ManifestParser<'a> {
+    content: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ManifestParser<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            content,
+            bytes: content.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn at(&self, offset: usize) -> Option<u8> {
+        self.bytes.get(self.pos + offset).copied()
+    }
+
+    fn is_ws(&self) -> bool {
+        self.bytes
+            .get(self.pos)
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    }
+
+    fn is_closing(&self) -> bool {
+        self.at(0) == Some(b'>')
+    }
+
+    /// The `/>` and `?>` two-character closings.
+    fn is_two_char_closing(&self) -> bool {
+        matches!(self.at(0), Some(b'?' | b'/')) && self.at(1) == Some(b'>')
+    }
+
+    /// Walks to the next tag and parses it.
+    fn parse_xml_tag(&mut self) -> TagResult {
+        while self.pos < self.bytes.len() && self.bytes[self.pos] != b'<' {
+            self.pos += 1;
+        }
+        if self.pos >= self.bytes.len() {
+            return TagResult::Eof;
+        }
+        // `<!--` opens a comment, any other `<!` a declaration; both parse
+        // through unretained.
+        if self.at(1) == Some(b'!') {
+            return if self.at(2) == Some(b'-') && self.at(3) == Some(b'-') {
+                self.parse_comment()
+            } else {
+                self.parse_declaration()
+            };
+        }
+        self.parse_normal_tag()
+    }
+
+    fn parse_comment(&mut self) -> TagResult {
+        self.pos += 4;
+        while !(self.at(0) == Some(b'-')
+            && self.at(1) == Some(b'-')
+            && self.at(2) == Some(b'>'))
+        {
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return TagResult::Error;
+            }
+        }
+        self.pos += 2;
+        TagResult::Other
+    }
+
+    fn parse_declaration(&mut self) -> TagResult {
+        self.pos += 2;
+        while !self.is_closing() {
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return TagResult::Error;
+            }
+        }
+        TagResult::Other
+    }
+
+    fn parse_normal_tag(&mut self) -> TagResult {
+        let start = self.pos;
+        self.pos += 1;
+        if self.pos >= self.bytes.len() || self.is_ws() {
+            // A tag cannot begin with whitespace.
+            return TagResult::Error;
+        }
+        let is_end_tag = self.at(0) == Some(b'/');
+        if is_end_tag {
+            self.pos += 1;
+        }
+        let name_start = self.pos;
+        let mut closed_empty = false;
+        while !self.is_closing() && !self.is_two_char_closing() && !self.is_ws() {
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return TagResult::Error;
+            }
+        }
+        let name = self.content[name_start..self.pos.min(self.content.len())].to_lowercase();
+        if self.is_two_char_closing() {
+            closed_empty = true;
+            self.pos += 1;
+        }
+        if is_end_tag {
+            // End tags carry no attributes; the `>` must follow.
+            return match self.parse_any_whitespace() {
+                false => TagResult::Error,
+                true if self.is_closing() => TagResult::EndTag,
+                true => TagResult::Error,
+            };
+        }
+        let is_relevant = MANIFEST_ELEMENTS.contains(&name.as_str());
+        let mut attributes = Vec::new();
+        let mut empty = closed_empty;
+        if !closed_empty && !self.is_closing() {
+            match self.parse_attributes(is_relevant) {
+                None => return TagResult::Error,
+                Some((parsed, was_empty)) => {
+                    attributes = parsed;
+                    empty = was_empty;
+                }
+            }
+        }
+        let mut children = Vec::new();
+        if !empty {
+            self.pos += 1;
+            loop {
+                match self.parse_xml_tag() {
+                    TagResult::EndTag => break,
+                    TagResult::Eof | TagResult::Error => return TagResult::Eof,
+                    TagResult::Other => {}
+                    TagResult::Element(child) => {
+                        children.push(child);
+                        self.pos += 1;
+                    }
+                }
+            }
+        }
+        if is_relevant {
+            TagResult::Element(ManifestElement {
+                name,
+                attributes,
+                children,
+                span: (start, self.pos + 1),
+            })
+        } else {
+            TagResult::Other
+        }
+    }
+
+    /// Skips whitespace, `false` at end of input (the
+    /// `_parseAnyWhitespace` error face).
+    fn parse_any_whitespace(&mut self) -> bool {
+        if self.pos >= self.bytes.len() {
+            return false;
+        }
+        while self.is_ws() {
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Parses attributes up to the tag's close; `None` on a malformed
+    /// attribute. Attribute names lowercase, values keep their case, the
+    /// span runs to the closing quote's index.
+    fn parse_attributes(&mut self, is_relevant: bool) -> Option<(Vec<(String, String, (usize, usize))>, bool)> {
+        let mut attributes = Vec::new();
+        loop {
+            if self.pos >= self.bytes.len() {
+                return None;
+            }
+            if self.is_closing() {
+                return Some((attributes, false));
+            } else if self.is_two_char_closing() {
+                self.pos += 1;
+                return Some((attributes, true));
+            } else if !self.is_ws() {
+                return None;
+            }
+            if !self.parse_any_whitespace() {
+                return None;
+            }
+            if self.is_closing() {
+                return Some((attributes, false));
+            } else if self.is_two_char_closing() {
+                self.pos += 1;
+                return Some((attributes, true));
+            }
+            // The attribute name runs to `=`; whitespace, `>`, or `/>`
+            // inside is the HTML-style valueless form XML rejects.
+            let name_start = self.pos;
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return None;
+            }
+            while self.at(0) != Some(b'=') {
+                if self.is_ws() || self.is_closing() || self.is_two_char_closing() {
+                    return None;
+                }
+                self.pos += 1;
+                if self.pos >= self.bytes.len() {
+                    return None;
+                }
+            }
+            let name = if is_relevant {
+                self.content[name_start..self.pos].to_lowercase()
+            } else {
+                String::new()
+            };
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return None;
+            }
+            let quote = match self.at(0) {
+                Some(q @ (b'\'' | b'"')) => q,
+                _ => return None,
+            };
+            self.pos += 1;
+            if self.pos >= self.bytes.len() {
+                return None;
+            }
+            let value_start = self.pos;
+            while self.at(0) != Some(quote) {
+                self.pos += 1;
+                if self.pos >= self.bytes.len() {
+                    return None;
+                }
+            }
+            if is_relevant {
+                let value = self.content[value_start..self.pos].to_owned();
+                let span = (name_start, self.pos);
+                attributes.push((name, value, span));
+            }
+            self.pos += 1;
+        }
+    }
 }
 
 // --- The pinned diagnostic-code name universe (`unrecognized_error_code`) ---
@@ -5240,66 +7624,228 @@ mod known_error_codes {
     /// name universe — :208-213 skips such citations at report time), while
     /// the same spelling is rejected in `analyzer.errors`.
     pub const UNIQUE_NAME_ALIASES: &[(&str, &str)] = &[
-        ("abstract_field_constructor_initializer", "abstract_field_initializer"),
-        ("ambiguous_extension_member_access_three_or_more", "ambiguous_extension_member_access"),
-        ("ambiguous_extension_member_access_two", "ambiguous_extension_member_access"),
-        ("analysis_option_deprecated_with_replacement", "analysis_option_deprecated"),
-        ("augmentation_induced_getter_already_complete", "declaration_already_complete"),
-        ("augmentation_induced_getter_return_type_mismatch", "augmentation_return_type_mismatch"),
-        ("augmentation_induced_setter_already_complete", "declaration_already_complete"),
-        ("augmentation_without_getter_declaration", "augmentation_without_declaration"),
-        ("augmentation_without_setter_declaration", "augmentation_without_declaration"),
-        ("base_class_implemented_outside_of_library", "invalid_use_of_type_outside_library"),
-        ("base_mixin_implemented_outside_of_library", "invalid_use_of_type_outside_library"),
-        ("built_in_identifier_as_extension_name", "built_in_identifier_in_declaration"),
-        ("built_in_identifier_as_extension_type_name", "built_in_identifier_in_declaration"),
-        ("built_in_identifier_as_prefix_name", "built_in_identifier_in_declaration"),
-        ("built_in_identifier_as_type_name", "built_in_identifier_in_declaration"),
-        ("built_in_identifier_as_type_parameter_name", "built_in_identifier_in_declaration"),
-        ("built_in_identifier_as_typedef_name", "built_in_identifier_in_declaration"),
-        ("class_instantiation_access_to_instance_member", "class_instantiation_access_to_member"),
-        ("class_instantiation_access_to_static_member", "class_instantiation_access_to_member"),
-        ("class_instantiation_access_to_unknown_member", "class_instantiation_access_to_member"),
-        ("conflicting_constructor_and_static_field", "conflicting_constructor_and_static_member"),
-        ("conflicting_constructor_and_static_getter", "conflicting_constructor_and_static_member"),
-        ("conflicting_constructor_and_static_method", "conflicting_constructor_and_static_member"),
-        ("conflicting_constructor_and_static_setter", "conflicting_constructor_and_static_member"),
-        ("conflicting_type_variable_and_class", "conflicting_type_variable_and_container"),
-        ("conflicting_type_variable_and_enum", "conflicting_type_variable_and_container"),
-        ("conflicting_type_variable_and_extension", "conflicting_type_variable_and_container"),
-        ("conflicting_type_variable_and_extension_type", "conflicting_type_variable_and_container"),
-        ("conflicting_type_variable_and_member_class", "conflicting_type_variable_and_member"),
-        ("conflicting_type_variable_and_member_enum", "conflicting_type_variable_and_member"),
-        ("conflicting_type_variable_and_member_extension", "conflicting_type_variable_and_member"),
-        ("conflicting_type_variable_and_member_extension_type", "conflicting_type_variable_and_member"),
-        ("conflicting_type_variable_and_member_mixin", "conflicting_type_variable_and_member"),
-        ("conflicting_type_variable_and_mixin", "conflicting_type_variable_and_container"),
-        ("const_constructor_constant_from_deferred_library", "collection_element_from_deferred_library"),
-        ("const_constructor_with_mixin_with_fields", "const_constructor_with_mixin_with_field"),
-        ("const_field_initializer_not_assignable", "field_initializer_not_assignable"),
-        ("const_primary_constructor_with_block_body", "const_primary_constructor_with_body"),
-        ("const_primary_constructor_with_expression_body", "const_primary_constructor_with_body"),
+        (
+            "abstract_field_constructor_initializer",
+            "abstract_field_initializer",
+        ),
+        (
+            "ambiguous_extension_member_access_three_or_more",
+            "ambiguous_extension_member_access",
+        ),
+        (
+            "ambiguous_extension_member_access_two",
+            "ambiguous_extension_member_access",
+        ),
+        (
+            "analysis_option_deprecated_with_replacement",
+            "analysis_option_deprecated",
+        ),
+        (
+            "augmentation_induced_getter_already_complete",
+            "declaration_already_complete",
+        ),
+        (
+            "augmentation_induced_getter_return_type_mismatch",
+            "augmentation_return_type_mismatch",
+        ),
+        (
+            "augmentation_induced_setter_already_complete",
+            "declaration_already_complete",
+        ),
+        (
+            "augmentation_without_getter_declaration",
+            "augmentation_without_declaration",
+        ),
+        (
+            "augmentation_without_setter_declaration",
+            "augmentation_without_declaration",
+        ),
+        (
+            "base_class_implemented_outside_of_library",
+            "invalid_use_of_type_outside_library",
+        ),
+        (
+            "base_mixin_implemented_outside_of_library",
+            "invalid_use_of_type_outside_library",
+        ),
+        (
+            "built_in_identifier_as_extension_name",
+            "built_in_identifier_in_declaration",
+        ),
+        (
+            "built_in_identifier_as_extension_type_name",
+            "built_in_identifier_in_declaration",
+        ),
+        (
+            "built_in_identifier_as_prefix_name",
+            "built_in_identifier_in_declaration",
+        ),
+        (
+            "built_in_identifier_as_type_name",
+            "built_in_identifier_in_declaration",
+        ),
+        (
+            "built_in_identifier_as_type_parameter_name",
+            "built_in_identifier_in_declaration",
+        ),
+        (
+            "built_in_identifier_as_typedef_name",
+            "built_in_identifier_in_declaration",
+        ),
+        (
+            "class_instantiation_access_to_instance_member",
+            "class_instantiation_access_to_member",
+        ),
+        (
+            "class_instantiation_access_to_static_member",
+            "class_instantiation_access_to_member",
+        ),
+        (
+            "class_instantiation_access_to_unknown_member",
+            "class_instantiation_access_to_member",
+        ),
+        (
+            "conflicting_constructor_and_static_field",
+            "conflicting_constructor_and_static_member",
+        ),
+        (
+            "conflicting_constructor_and_static_getter",
+            "conflicting_constructor_and_static_member",
+        ),
+        (
+            "conflicting_constructor_and_static_method",
+            "conflicting_constructor_and_static_member",
+        ),
+        (
+            "conflicting_constructor_and_static_setter",
+            "conflicting_constructor_and_static_member",
+        ),
+        (
+            "conflicting_type_variable_and_class",
+            "conflicting_type_variable_and_container",
+        ),
+        (
+            "conflicting_type_variable_and_enum",
+            "conflicting_type_variable_and_container",
+        ),
+        (
+            "conflicting_type_variable_and_extension",
+            "conflicting_type_variable_and_container",
+        ),
+        (
+            "conflicting_type_variable_and_extension_type",
+            "conflicting_type_variable_and_container",
+        ),
+        (
+            "conflicting_type_variable_and_member_class",
+            "conflicting_type_variable_and_member",
+        ),
+        (
+            "conflicting_type_variable_and_member_enum",
+            "conflicting_type_variable_and_member",
+        ),
+        (
+            "conflicting_type_variable_and_member_extension",
+            "conflicting_type_variable_and_member",
+        ),
+        (
+            "conflicting_type_variable_and_member_extension_type",
+            "conflicting_type_variable_and_member",
+        ),
+        (
+            "conflicting_type_variable_and_member_mixin",
+            "conflicting_type_variable_and_member",
+        ),
+        (
+            "conflicting_type_variable_and_mixin",
+            "conflicting_type_variable_and_container",
+        ),
+        (
+            "const_constructor_constant_from_deferred_library",
+            "collection_element_from_deferred_library",
+        ),
+        (
+            "const_constructor_with_mixin_with_fields",
+            "const_constructor_with_mixin_with_field",
+        ),
+        (
+            "const_field_initializer_not_assignable",
+            "field_initializer_not_assignable",
+        ),
+        (
+            "const_primary_constructor_with_block_body",
+            "const_primary_constructor_with_body",
+        ),
+        (
+            "const_primary_constructor_with_expression_body",
+            "const_primary_constructor_with_body",
+        ),
         ("const_with_non_type", "creation_with_non_type"),
-        ("const_with_type_parameters_constructor_tearoff", "const_with_type_parameters"),
-        ("const_with_type_parameters_function_tearoff", "const_with_type_parameters"),
-        ("constructor_already_complete", "declaration_already_complete"),
+        (
+            "const_with_type_parameters_constructor_tearoff",
+            "const_with_type_parameters",
+        ),
+        (
+            "const_with_type_parameters_function_tearoff",
+            "const_with_type_parameters",
+        ),
+        (
+            "constructor_already_complete",
+            "declaration_already_complete",
+        ),
         ("dead_code_late_wildcard_variable_initializer", "dead_code"),
-        ("deprecated_extends_function", "deprecated_subtype_of_function"),
-        ("deprecated_implements_function", "deprecated_subtype_of_function"),
-        ("deprecated_member_use_implicit_super_constructor_invocation", "deprecated_member_use"),
+        (
+            "deprecated_extends_function",
+            "deprecated_subtype_of_function",
+        ),
+        (
+            "deprecated_implements_function",
+            "deprecated_subtype_of_function",
+        ),
+        (
+            "deprecated_member_use_implicit_super_constructor_invocation",
+            "deprecated_member_use",
+        ),
         (
             "deprecated_member_use_implicit_super_constructor_invocation_with_message",
             "deprecated_member_use",
         ),
-        ("deprecated_member_use_implicit_type", "deprecated_member_use"),
-        ("deprecated_member_use_implicit_type_with_message", "deprecated_member_use"),
-        ("deprecated_member_use_with_message", "deprecated_member_use"),
-        ("deprecated_mixin_function", "deprecated_subtype_of_function"),
-        ("doc_directive_missing_one_argument", "doc_directive_missing_argument"),
-        ("doc_directive_missing_three_arguments", "doc_directive_missing_argument"),
-        ("doc_directive_missing_two_arguments", "doc_directive_missing_argument"),
-        ("dot_shorthand_undefined_getter", "dot_shorthand_undefined_member"),
-        ("dot_shorthand_undefined_invocation", "dot_shorthand_undefined_member"),
+        (
+            "deprecated_member_use_implicit_type",
+            "deprecated_member_use",
+        ),
+        (
+            "deprecated_member_use_implicit_type_with_message",
+            "deprecated_member_use",
+        ),
+        (
+            "deprecated_member_use_with_message",
+            "deprecated_member_use",
+        ),
+        (
+            "deprecated_mixin_function",
+            "deprecated_subtype_of_function",
+        ),
+        (
+            "doc_directive_missing_one_argument",
+            "doc_directive_missing_argument",
+        ),
+        (
+            "doc_directive_missing_three_arguments",
+            "doc_directive_missing_argument",
+        ),
+        (
+            "doc_directive_missing_two_arguments",
+            "doc_directive_missing_argument",
+        ),
+        (
+            "dot_shorthand_undefined_getter",
+            "dot_shorthand_undefined_member",
+        ),
+        (
+            "dot_shorthand_undefined_invocation",
+            "dot_shorthand_undefined_member",
+        ),
         ("duplicate_constructor_default", "duplicate_constructor"),
         ("duplicate_constructor_name", "duplicate_constructor"),
         ("expected_catch_clause_body", "expected_body"),
@@ -5317,81 +7863,213 @@ mod known_error_codes {
         ("expected_try_statement_body", "expected_body"),
         ("extends_deferred_class", "subtype_of_deferred_class"),
         ("extends_disallowed_class", "subtype_of_disallowed_type"),
-        ("extends_type_alias_expands_to_type_parameter", "supertype_expands_to_type_parameter"),
-        ("external_field_constructor_initializer", "external_with_initializer"),
+        (
+            "extends_type_alias_expands_to_type_parameter",
+            "supertype_expands_to_type_parameter",
+        ),
+        (
+            "external_field_constructor_initializer",
+            "external_with_initializer",
+        ),
         ("external_field_initializer", "external_with_initializer"),
         ("external_variable_initializer", "external_with_initializer"),
-        ("final_class_extended_outside_of_library", "invalid_use_of_type_outside_library"),
-        ("final_class_implemented_outside_of_library", "invalid_use_of_type_outside_library"),
+        (
+            "final_class_extended_outside_of_library",
+            "invalid_use_of_type_outside_library",
+        ),
+        (
+            "final_class_implemented_outside_of_library",
+            "invalid_use_of_type_outside_library",
+        ),
         (
             "final_class_used_as_mixin_constraint_outside_of_library",
             "invalid_use_of_type_outside_library",
         ),
-        ("final_not_initialized_constructor_1", "final_not_initialized_constructor"),
-        ("final_not_initialized_constructor_2", "final_not_initialized_constructor"),
-        ("final_not_initialized_constructor_3_plus", "final_not_initialized_constructor"),
+        (
+            "final_not_initialized_constructor_1",
+            "final_not_initialized_constructor",
+        ),
+        (
+            "final_not_initialized_constructor_2",
+            "final_not_initialized_constructor",
+        ),
+        (
+            "final_not_initialized_constructor_3_plus",
+            "final_not_initialized_constructor",
+        ),
         ("function_already_complete", "declaration_already_complete"),
-        ("illegal_concrete_enum_member_declaration", "illegal_concrete_enum_member"),
-        ("illegal_concrete_enum_member_inheritance", "illegal_concrete_enum_member"),
+        (
+            "illegal_concrete_enum_member_declaration",
+            "illegal_concrete_enum_member",
+        ),
+        (
+            "illegal_concrete_enum_member_inheritance",
+            "illegal_concrete_enum_member",
+        ),
         ("illegal_enum_values_declaration", "illegal_enum_values"),
         ("illegal_enum_values_inheritance", "illegal_enum_values"),
         ("implements_deferred_class", "subtype_of_deferred_class"),
         ("implements_disallowed_class", "subtype_of_disallowed_type"),
-        ("implements_type_alias_expands_to_type_parameter", "supertype_expands_to_type_parameter"),
+        (
+            "implements_type_alias_expands_to_type_parameter",
+            "supertype_expands_to_type_parameter",
+        ),
         ("incompatible_lint_files", "incompatible_lint"),
         ("incompatible_lint_included", "incompatible_lint"),
-        ("instance_access_to_static_member_of_unnamed_extension", "instance_access_to_static_member"),
-        ("interface_class_extended_outside_of_library", "invalid_use_of_type_outside_library"),
+        (
+            "instance_access_to_static_member_of_unnamed_extension",
+            "instance_access_to_static_member",
+        ),
+        (
+            "interface_class_extended_outside_of_library",
+            "invalid_use_of_type_outside_library",
+        ),
         ("invalid_field_name_from_object", "invalid_field_name"),
         ("invalid_field_name_positional", "invalid_field_name"),
         ("invalid_field_name_private", "invalid_field_name"),
-        ("invalid_implementation_override_setter", "invalid_implementation_override"),
-        ("invalid_language_version_override_at_sign", "invalid_language_version_override"),
-        ("invalid_language_version_override_equals", "invalid_language_version_override"),
-        ("invalid_language_version_override_greater", "invalid_language_version_override"),
-        ("invalid_language_version_override_location", "invalid_language_version_override"),
-        ("invalid_language_version_override_lower_case", "invalid_language_version_override"),
-        ("invalid_language_version_override_number", "invalid_language_version_override"),
-        ("invalid_language_version_override_prefix", "invalid_language_version_override"),
-        ("invalid_language_version_override_trailing_characters", "invalid_language_version_override"),
-        ("invalid_language_version_override_two_slashes", "invalid_language_version_override"),
+        (
+            "invalid_implementation_override_setter",
+            "invalid_implementation_override",
+        ),
+        (
+            "invalid_language_version_override_at_sign",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_equals",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_greater",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_location",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_lower_case",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_number",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_prefix",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_trailing_characters",
+            "invalid_language_version_override",
+        ),
+        (
+            "invalid_language_version_override_two_slashes",
+            "invalid_language_version_override",
+        ),
         ("invalid_null_aware_element", "invalid_null_aware_operator"),
-        ("invalid_null_aware_map_entry_key", "invalid_null_aware_operator"),
-        ("invalid_null_aware_map_entry_value", "invalid_null_aware_operator"),
-        ("invalid_null_aware_operator_after_short_circuit", "invalid_null_aware_operator"),
+        (
+            "invalid_null_aware_map_entry_key",
+            "invalid_null_aware_operator",
+        ),
+        (
+            "invalid_null_aware_map_entry_value",
+            "invalid_null_aware_operator",
+        ),
+        (
+            "invalid_null_aware_operator_after_short_circuit",
+            "invalid_null_aware_operator",
+        ),
         ("invalid_override_setter", "invalid_override"),
         (
             "invalid_reference_to_generative_enum_constructor_tearoff",
             "invalid_reference_to_generative_enum_constructor",
         ),
-        ("invalid_type_argument_in_const_list", "invalid_type_argument_in_const_literal"),
-        ("invalid_type_argument_in_const_map", "invalid_type_argument_in_const_literal"),
-        ("invalid_type_argument_in_const_set", "invalid_type_argument_in_const_literal"),
-        ("list_element_type_not_assignable_nullability", "list_element_type_not_assignable"),
-        ("map_key_type_not_assignable_nullability", "map_key_type_not_assignable"),
-        ("map_value_type_not_assignable_nullability", "map_value_type_not_assignable"),
-        ("missing_default_value_for_parameter_positional", "missing_default_value_for_parameter"),
-        ("missing_default_value_for_parameter_with_annotation", "missing_default_value_for_parameter"),
-        ("missing_override_of_must_be_overridden_one", "missing_override_of_must_be_overridden"),
-        ("missing_override_of_must_be_overridden_three_plus", "missing_override_of_must_be_overridden"),
-        ("missing_override_of_must_be_overridden_two", "missing_override_of_must_be_overridden"),
-        ("missing_required_param_with_details", "missing_required_param"),
+        (
+            "invalid_type_argument_in_const_list",
+            "invalid_type_argument_in_const_literal",
+        ),
+        (
+            "invalid_type_argument_in_const_map",
+            "invalid_type_argument_in_const_literal",
+        ),
+        (
+            "invalid_type_argument_in_const_set",
+            "invalid_type_argument_in_const_literal",
+        ),
+        (
+            "list_element_type_not_assignable_nullability",
+            "list_element_type_not_assignable",
+        ),
+        (
+            "map_key_type_not_assignable_nullability",
+            "map_key_type_not_assignable",
+        ),
+        (
+            "map_value_type_not_assignable_nullability",
+            "map_value_type_not_assignable",
+        ),
+        (
+            "missing_default_value_for_parameter_positional",
+            "missing_default_value_for_parameter",
+        ),
+        (
+            "missing_default_value_for_parameter_with_annotation",
+            "missing_default_value_for_parameter",
+        ),
+        (
+            "missing_override_of_must_be_overridden_one",
+            "missing_override_of_must_be_overridden",
+        ),
+        (
+            "missing_override_of_must_be_overridden_three_plus",
+            "missing_override_of_must_be_overridden",
+        ),
+        (
+            "missing_override_of_must_be_overridden_two",
+            "missing_override_of_must_be_overridden",
+        ),
+        (
+            "missing_required_param_with_details",
+            "missing_required_param",
+        ),
         (
             "mixin_application_no_concrete_super_invoked_setter",
             "mixin_application_no_concrete_super_invoked_member",
         ),
         ("mixin_deferred_class", "subtype_of_deferred_class"),
         ("mixin_of_disallowed_class", "subtype_of_disallowed_type"),
-        ("mixin_of_type_alias_expands_to_type_parameter", "supertype_expands_to_type_parameter"),
-        ("mixin_on_type_alias_expands_to_type_parameter", "supertype_expands_to_type_parameter"),
-        ("mixin_subtype_of_base_is_not_base", "subtype_of_base_or_final_is_not_base_final_or_sealed"),
-        ("mixin_subtype_of_final_is_not_base", "subtype_of_base_or_final_is_not_base_final_or_sealed"),
-        ("mixin_super_class_constraint_disallowed_class", "subtype_of_disallowed_type"),
+        (
+            "mixin_of_type_alias_expands_to_type_parameter",
+            "supertype_expands_to_type_parameter",
+        ),
+        (
+            "mixin_on_type_alias_expands_to_type_parameter",
+            "supertype_expands_to_type_parameter",
+        ),
+        (
+            "mixin_subtype_of_base_is_not_base",
+            "subtype_of_base_or_final_is_not_base_final_or_sealed",
+        ),
+        (
+            "mixin_subtype_of_final_is_not_base",
+            "subtype_of_base_or_final_is_not_base_final_or_sealed",
+        ),
+        (
+            "mixin_super_class_constraint_disallowed_class",
+            "subtype_of_disallowed_type",
+        ),
         ("mixins_super_class", "implements_super_class"),
         ("multiple_combinators_deprecated", "multiple_combinators"),
         ("new_with_non_type", "creation_with_non_type"),
-        ("no_default_super_constructor_explicit", "no_default_super_constructor"),
-        ("no_default_super_constructor_implicit", "no_default_super_constructor"),
+        (
+            "no_default_super_constructor_explicit",
+            "no_default_super_constructor",
+        ),
+        (
+            "no_default_super_constructor_implicit",
+            "no_default_super_constructor",
+        ),
         (
             "non_abstract_class_inherits_abstract_member_five_plus",
             "non_abstract_class_inherits_abstract_member",
@@ -5412,24 +8090,66 @@ mod known_error_codes {
             "non_abstract_class_inherits_abstract_member_two",
             "non_abstract_class_inherits_abstract_member",
         ),
-        ("non_const_call_to_literal_constructor_using_new", "non_const_call_to_literal_constructor"),
-        ("non_constant_list_element_from_deferred_library", "collection_element_from_deferred_library"),
-        ("non_constant_map_key_from_deferred_library", "collection_element_from_deferred_library"),
-        ("non_constant_map_value_from_deferred_library", "collection_element_from_deferred_library"),
-        ("non_exhaustive_switch_expression_private", "non_exhaustive_switch_expression"),
-        ("non_exhaustive_switch_statement_private", "non_exhaustive_switch_statement"),
-        ("not_enough_positional_arguments_name_plural", "not_enough_positional_arguments"),
-        ("not_enough_positional_arguments_name_singular", "not_enough_positional_arguments"),
-        ("not_enough_positional_arguments_plural", "not_enough_positional_arguments"),
-        ("not_enough_positional_arguments_singular", "not_enough_positional_arguments"),
+        (
+            "non_const_call_to_literal_constructor_using_new",
+            "non_const_call_to_literal_constructor",
+        ),
+        (
+            "non_constant_list_element_from_deferred_library",
+            "collection_element_from_deferred_library",
+        ),
+        (
+            "non_constant_map_key_from_deferred_library",
+            "collection_element_from_deferred_library",
+        ),
+        (
+            "non_constant_map_value_from_deferred_library",
+            "collection_element_from_deferred_library",
+        ),
+        (
+            "non_exhaustive_switch_expression_private",
+            "non_exhaustive_switch_expression",
+        ),
+        (
+            "non_exhaustive_switch_statement_private",
+            "non_exhaustive_switch_statement",
+        ),
+        (
+            "not_enough_positional_arguments_name_plural",
+            "not_enough_positional_arguments",
+        ),
+        (
+            "not_enough_positional_arguments_name_singular",
+            "not_enough_positional_arguments",
+        ),
+        (
+            "not_enough_positional_arguments_plural",
+            "not_enough_positional_arguments",
+        ),
+        (
+            "not_enough_positional_arguments_singular",
+            "not_enough_positional_arguments",
+        ),
         (
             "not_initialized_non_nullable_instance_field_constructor",
             "not_initialized_non_nullable_instance_field",
         ),
-        ("override_on_non_overriding_field", "override_on_non_overriding_member"),
-        ("override_on_non_overriding_getter", "override_on_non_overriding_member"),
-        ("override_on_non_overriding_method", "override_on_non_overriding_member"),
-        ("override_on_non_overriding_setter", "override_on_non_overriding_member"),
+        (
+            "override_on_non_overriding_field",
+            "override_on_non_overriding_member",
+        ),
+        (
+            "override_on_non_overriding_getter",
+            "override_on_non_overriding_member",
+        ),
+        (
+            "override_on_non_overriding_method",
+            "override_on_non_overriding_member",
+        ),
+        (
+            "override_on_non_overriding_setter",
+            "override_on_non_overriding_member",
+        ),
         (
             "pattern_variable_shared_case_scope_different_finality_or_type",
             "invalid_pattern_variable_in_shared_case_scope",
@@ -5446,21 +8166,66 @@ mod known_error_codes {
             "record_literal_one_positional_no_trailing_comma_by_type",
             "record_literal_one_positional_no_trailing_comma",
         ),
-        ("recursive_factory_redirect", "recursive_constructor_redirect"),
-        ("recursive_interface_inheritance_extends", "recursive_interface_inheritance"),
-        ("recursive_interface_inheritance_implements", "recursive_interface_inheritance"),
-        ("recursive_interface_inheritance_on", "recursive_interface_inheritance"),
-        ("recursive_interface_inheritance_with", "recursive_interface_inheritance"),
-        ("return_of_invalid_type_from_catch_error", "invalid_return_type_for_catch_error"),
-        ("return_of_invalid_type_from_constructor", "return_of_invalid_type"),
-        ("return_of_invalid_type_from_function", "return_of_invalid_type"),
-        ("return_of_invalid_type_from_method", "return_of_invalid_type"),
-        ("return_of_invalid_type_from_then", "invalid_return_type_for_then"),
-        ("return_type_invalid_for_catch_error", "invalid_return_type_for_catch_error"),
-        ("return_type_invalid_for_then", "invalid_return_type_for_then"),
-        ("sealed_class_subtype_outside_of_library", "invalid_use_of_type_outside_library"),
-        ("set_element_from_deferred_library", "collection_element_from_deferred_library"),
-        ("set_element_type_not_assignable_nullability", "set_element_type_not_assignable"),
+        (
+            "recursive_factory_redirect",
+            "recursive_constructor_redirect",
+        ),
+        (
+            "recursive_interface_inheritance_extends",
+            "recursive_interface_inheritance",
+        ),
+        (
+            "recursive_interface_inheritance_implements",
+            "recursive_interface_inheritance",
+        ),
+        (
+            "recursive_interface_inheritance_on",
+            "recursive_interface_inheritance",
+        ),
+        (
+            "recursive_interface_inheritance_with",
+            "recursive_interface_inheritance",
+        ),
+        (
+            "return_of_invalid_type_from_catch_error",
+            "invalid_return_type_for_catch_error",
+        ),
+        (
+            "return_of_invalid_type_from_constructor",
+            "return_of_invalid_type",
+        ),
+        (
+            "return_of_invalid_type_from_function",
+            "return_of_invalid_type",
+        ),
+        (
+            "return_of_invalid_type_from_method",
+            "return_of_invalid_type",
+        ),
+        (
+            "return_of_invalid_type_from_then",
+            "invalid_return_type_for_then",
+        ),
+        (
+            "return_type_invalid_for_catch_error",
+            "invalid_return_type_for_catch_error",
+        ),
+        (
+            "return_type_invalid_for_then",
+            "invalid_return_type_for_then",
+        ),
+        (
+            "sealed_class_subtype_outside_of_library",
+            "invalid_use_of_type_outside_library",
+        ),
+        (
+            "set_element_from_deferred_library",
+            "collection_element_from_deferred_library",
+        ),
+        (
+            "set_element_type_not_assignable_nullability",
+            "set_element_type_not_assignable",
+        ),
         (
             "subtype_of_base_is_not_base_final_or_sealed",
             "subtype_of_base_or_final_is_not_base_final_or_sealed",
@@ -5469,23 +8234,62 @@ mod known_error_codes {
             "subtype_of_final_is_not_base_final_or_sealed",
             "subtype_of_base_or_final_is_not_base_final_or_sealed",
         ),
-        ("subtype_of_struct_class_in_extends", "subtype_of_struct_class"),
-        ("subtype_of_struct_class_in_implements", "subtype_of_struct_class"),
+        (
+            "subtype_of_struct_class_in_extends",
+            "subtype_of_struct_class",
+        ),
+        (
+            "subtype_of_struct_class_in_implements",
+            "subtype_of_struct_class",
+        ),
         ("subtype_of_struct_class_in_with", "subtype_of_struct_class"),
         ("type_check_is_not_null", "type_check_with_null"),
         ("type_check_is_null", "type_check_with_null"),
-        ("unchecked_invocation_of_nullable_value", "unchecked_use_of_nullable_value"),
-        ("unchecked_method_invocation_of_nullable_value", "unchecked_use_of_nullable_value"),
-        ("unchecked_operator_invocation_of_nullable_value", "unchecked_use_of_nullable_value"),
-        ("unchecked_property_access_of_nullable_value", "unchecked_use_of_nullable_value"),
-        ("unchecked_use_of_nullable_value_as_condition", "unchecked_use_of_nullable_value"),
-        ("unchecked_use_of_nullable_value_as_iterator", "unchecked_use_of_nullable_value"),
-        ("unchecked_use_of_nullable_value_in_spread", "unchecked_use_of_nullable_value"),
-        ("unchecked_use_of_nullable_value_in_yield_each", "unchecked_use_of_nullable_value"),
+        (
+            "unchecked_invocation_of_nullable_value",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_method_invocation_of_nullable_value",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_operator_invocation_of_nullable_value",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_property_access_of_nullable_value",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_use_of_nullable_value_as_condition",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_use_of_nullable_value_as_iterator",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_use_of_nullable_value_in_spread",
+            "unchecked_use_of_nullable_value",
+        ),
+        (
+            "unchecked_use_of_nullable_value_in_yield_each",
+            "unchecked_use_of_nullable_value",
+        ),
         ("undefined_class_boolean", "undefined_class"),
-        ("undefined_constructor_in_initializer_default", "undefined_constructor_in_initializer"),
-        ("undefined_enum_constructor_named", "undefined_enum_constructor"),
-        ("undefined_enum_constructor_unnamed", "undefined_enum_constructor"),
+        (
+            "undefined_constructor_in_initializer_default",
+            "undefined_constructor_in_initializer",
+        ),
+        (
+            "undefined_enum_constructor_named",
+            "undefined_enum_constructor",
+        ),
+        (
+            "undefined_enum_constructor_unnamed",
+            "undefined_enum_constructor",
+        ),
         ("undefined_getter_on_function_type", "undefined_getter"),
         ("undefined_method_on_function_type", "undefined_method"),
         ("undefined_method_on_type_literal", "undefined_method"),
@@ -5494,12 +8298,30 @@ mod known_error_codes {
         ("undefined_super_method", "undefined_super_member"),
         ("undefined_super_operator", "undefined_super_member"),
         ("undefined_super_setter", "undefined_super_member"),
-        ("unnecessary_nan_comparison_false", "unnecessary_nan_comparison"),
-        ("unnecessary_nan_comparison_true", "unnecessary_nan_comparison"),
-        ("unnecessary_null_comparison_always_null_false", "unnecessary_null_comparison"),
-        ("unnecessary_null_comparison_always_null_true", "unnecessary_null_comparison"),
-        ("unnecessary_null_comparison_never_null_false", "unnecessary_null_comparison"),
-        ("unnecessary_null_comparison_never_null_true", "unnecessary_null_comparison"),
+        (
+            "unnecessary_nan_comparison_false",
+            "unnecessary_nan_comparison",
+        ),
+        (
+            "unnecessary_nan_comparison_true",
+            "unnecessary_nan_comparison",
+        ),
+        (
+            "unnecessary_null_comparison_always_null_false",
+            "unnecessary_null_comparison",
+        ),
+        (
+            "unnecessary_null_comparison_always_null_true",
+            "unnecessary_null_comparison",
+        ),
+        (
+            "unnecessary_null_comparison_never_null_false",
+            "unnecessary_null_comparison",
+        ),
+        (
+            "unnecessary_null_comparison_never_null_true",
+            "unnecessary_null_comparison",
+        ),
         ("unnecessary_type_check_false", "unnecessary_type_check"),
         ("unnecessary_type_check_true", "unnecessary_type_check"),
         ("unsupported_option_with_legal_value", "unsupported_option"),
@@ -5507,7 +8329,10 @@ mod known_error_codes {
         ("unsupported_option_without_values", "unsupported_option"),
         ("unused_result_with_message", "unused_result"),
         ("use_of_private_parameter_name", "undefined_named_parameter"),
-        ("wrong_number_of_parameters_for_operator_minus", "wrong_number_of_parameters_for_operator"),
+        (
+            "wrong_number_of_parameters_for_operator_minus",
+            "wrong_number_of_parameters_for_operator",
+        ),
         (
             "wrong_number_of_type_arguments_dot_shorthand_constructor",
             "wrong_number_of_type_arguments_constructor",
@@ -5608,5 +8433,599 @@ mod unique_name_alias_pins {
             "invalid_null_aware_operator_after_short_circuit"
         ));
         assert!(is_known_diagnostic_code("invalid_null_aware_operator"));
+    }
+}
+
+#[cfg(test)]
+mod pubspec_manifest_pins {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A throwaway workspace root — the facade fixture's temp-dir posture,
+    /// one unique directory per call, cleaned by the OS.
+    fn temp_root(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-pubspec-pin-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root dir");
+        root
+    }
+
+    /// Writes one fixture file (and its parent directories) under `root`.
+    fn write(root: &Path, relative: &str, content: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, content).expect("file");
+    }
+
+    /// The UTF-16 offset of one 1-based line/column position (the
+    /// expected.tsv face; every pin fixture is ASCII, so bytes and code
+    /// units agree).
+    fn at(text: &str, line: usize, col: usize) -> u32 {
+        let mut offset = 0_u32;
+        for (index, line_text) in text.split('\n').enumerate() {
+            if index + 1 == line {
+                return offset + col as u32 - 1;
+            }
+            offset += line_text.len() as u32 + 1;
+        }
+        unreachable!("line {line} past the fixture");
+    }
+
+    /// One row's full pin: code, message, span.
+    fn assert_row(issue: &OptionsIssue, code: &str, message: &str, offset: u32, length: u32) {
+        assert_eq!(issue.code.name, code, "code of {message}");
+        assert_eq!(issue.code.dtype, DiagnosticType::StaticWarning);
+        assert_eq!(issue.message, message);
+        assert_eq!(issue.offset, offset, "offset of {code}");
+        assert_eq!(issue.length, length, "length of {code}");
+    }
+
+    fn codes(issues: &[OptionsIssue]) -> Vec<&str> {
+        issues.iter().map(|issue| issue.code.name).collect()
+    }
+
+    #[test]
+    fn the_dependency_validator_pins_its_six_codes() {
+        // path_does_not_exist /1 — `missing_pkg` resolves nowhere.
+        let text = "name: test\ndependencies:\n  foo:\n    path: missing_pkg\n";
+        let issues = pubspec_issues(text, &temp_root("path-miss"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "path_does_not_exist",
+            "The path 'missing_pkg' doesn't exist.",
+            at(text, 4, 11),
+            11,
+        );
+        // path_does_not_exist /2 — the folder exists with a pubspec.
+        let root = temp_root("path-hit");
+        write(&root, "real_dep/pubspec.yaml", "name: real_dep\n");
+        let text = "name: test\ndependencies:\n  foo:\n    path: real_dep\n";
+        assert!(pubspec_issues(text, &root).is_empty());
+        // path_not_posix /1 — the backslash form reports at the raw span
+        // (quotes included) and skips the existence walk.
+        let text = "name: test\ndependencies:\n  foo:\n    path: 'sub\\dir'\n";
+        let issues = pubspec_issues(text, &temp_root("posix"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "path_not_posix",
+            "The path 'sub\\dir' isn't a POSIX-style path.",
+            at(text, 4, 11),
+            9,
+        );
+        // path_pubspec_does_not_exist /1 — the folder exists bare.
+        let root = temp_root("pubspec-miss");
+        std::fs::create_dir_all(root.join("bare_dir")).expect("bare dir");
+        let text = "name: test\ndependencies:\n  foo:\n    path: bare_dir\n";
+        let issues = pubspec_issues(text, &root);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "path_pubspec_does_not_exist",
+            "The directory 'bare_dir' doesn't contain a pubspec.",
+            at(text, 4, 11),
+            8,
+        );
+        // dependencies_field_not_map /1 — a scalar section; /2 an empty
+        // flow map stays silent.
+        let text = "name: test\ndependencies: not_a_map\n";
+        let issues = pubspec_issues(text, &temp_root("deps-shape"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "dependencies_field_not_map",
+            "The value of the 'dependencies' field is expected to be a map.",
+            at(text, 2, 15),
+            9,
+        );
+        assert!(pubspec_issues("name: test\ndependencies: {}\n", &temp_root("deps-flow")).is_empty());
+        // invalid_dependency /1 — publishable (a version, no
+        // `publish_to: none`) with a git dependency reports at the key;
+        // /2 — no version, not publishable, silent.
+        let text = "name: test\nversion: 1.0.0\ndependencies:\n  foo:\n    git:\n      url: https://github.com/example/foo\n";
+        let issues = pubspec_issues(text, &temp_root("invalid-dep"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "invalid_dependency",
+            "Publishable packages can't have 'git' dependencies.",
+            at(text, 5, 5),
+            3,
+        );
+        let text = "name: test\ndependencies:\n  foo:\n    git:\n      url: https://github.com/example/foo\n";
+        assert!(pubspec_issues(text, &temp_root("invalid-dep-neg")).is_empty());
+        // unnecessary_dev_dependency /1 — duplicated in both sections; /2
+        // dev-only stays silent.
+        let text = "name: test\ndependencies:\n  aaa: any\ndev_dependencies:\n  aaa: any\n";
+        let issues = pubspec_issues(text, &temp_root("dev-dep"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "unnecessary_dev_dependency",
+            "The dev dependency on aaa is unnecessary because there is also a normal \
+             dependency on that package.",
+            at(text, 5, 3),
+            3,
+        );
+        let text = "name: test\ndev_dependencies:\n  aaa: any\n";
+        assert!(pubspec_issues(text, &temp_root("dev-dep-neg")).is_empty());
+    }
+
+    #[test]
+    fn the_field_and_name_validators_pin_their_three_codes() {
+        // deprecated_field /1 — `author` reports at its key; /2 a
+        // non-deprecated field stays silent.
+        let text = "name: test\nauthor: someone\n";
+        let issues = pubspec_issues(text, &temp_root("deprecated"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "deprecated_field",
+            "The 'author' field is no longer used and can be removed.",
+            at(text, 2, 1),
+            6,
+        );
+        assert!(pubspec_issues("name: test\nmaintainer: someone\n", &temp_root("deprecated-neg")).is_empty());
+        // missing_name /1 — an empty document reports at the origin; /2 a
+        // named document stays silent.
+        let issues = pubspec_issues("", &temp_root("missing-name"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "missing_name",
+            "The 'name' field is required but missing.",
+            0,
+            0,
+        );
+        assert!(pubspec_issues("name: test\n", &temp_root("missing-name-neg")).is_empty());
+        // name_not_string /1 — an int scalar is not a string; a quoted
+        // spelling would be.
+        let text = "name: 42\n";
+        let issues = pubspec_issues(text, &temp_root("name-shape"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "name_not_string",
+            "The value of the 'name' field is required to be a string.",
+            at(text, 1, 7),
+            2,
+        );
+    }
+
+    #[test]
+    fn the_flutter_validator_pins_its_eight_codes() {
+        // flutter_field_not_map /1 — a non-empty scalar section; /2 the
+        // empty section stays silent.
+        let text = "name: test\nflutter: not_a_map\n";
+        let issues = pubspec_issues(text, &temp_root("flutter-shape"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "flutter_field_not_map",
+            "The value of the 'flutter' field is expected to be a map.",
+            at(text, 2, 10),
+            9,
+        );
+        assert!(pubspec_issues("name: test\nflutter:\n", &temp_root("flutter-neg")).is_empty());
+        // asset_field_not_list /1 — a scalar assets value; /2 an empty
+        // list stays silent.
+        let text = "name: test\nflutter:\n  assets: not_a_list\n";
+        let issues = pubspec_issues(text, &temp_root("assets-shape"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_field_not_list",
+            "The value of the 'assets' field is expected to be a list of relative file paths.",
+            at(text, 3, 11),
+            10,
+        );
+        assert!(
+            pubspec_issues("name: test\nflutter:\n  assets: []\n", &temp_root("assets-neg"))
+                .is_empty()
+        );
+        // asset_directory_does_not_exist /1 — the trailing-slash entry
+        // with no folder; /2 the folder present.
+        let text = "name: test\nflutter:\n  assets:\n    - missing_dir/\n";
+        let issues = pubspec_issues(text, &temp_root("asset-dir"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_directory_does_not_exist",
+            "The asset directory 'missing_dir/' doesn't exist.",
+            at(text, 4, 7),
+            12,
+        );
+        let root = temp_root("asset-dir-neg");
+        write(&root, "assets/keep.txt", "x");
+        assert!(pubspec_issues("name: test\nflutter:\n  assets:\n    - assets/\n", &root).is_empty());
+        // asset_does_not_exist /1 — the file entry missing; /2 present.
+        let text = "name: test\nflutter:\n  assets:\n    - missing.png\n";
+        let issues = pubspec_issues(text, &temp_root("asset-file"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_does_not_exist",
+            "The asset file 'missing.png' doesn't exist.",
+            at(text, 4, 7),
+            11,
+        );
+        let root = temp_root("asset-file-neg");
+        write(&root, "logo.png", "x");
+        assert!(pubspec_issues("name: test\nflutter:\n  assets:\n    - logo.png\n", &root).is_empty());
+        // asset_missing_path /1 — the map entry without `path:` reports at
+        // the map node's span; /2 the map with an existing path.
+        let text = "name: test\nflutter:\n  assets:\n    - source: images/x.png\n";
+        let issues = pubspec_issues(text, &temp_root("asset-map"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_missing_path",
+            "Asset map entry must contain a 'path' field.",
+            at(text, 4, 7),
+            20,
+        );
+        let root = temp_root("asset-map-neg");
+        write(&root, "images/x.png", "x");
+        assert!(
+            pubspec_issues("name: test\nflutter:\n  assets:\n    - path: images/x.png\n", &root)
+                .is_empty()
+        );
+        // asset_not_string /1 — an int `path:`; /2 the string form exists.
+        let text = "name: test\nflutter:\n  assets:\n    - path: 42\n";
+        let issues = pubspec_issues(text, &temp_root("asset-path-kind"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_not_string",
+            "Assets are required to be file paths (strings).",
+            at(text, 4, 13),
+            2,
+        );
+        // asset_path_not_string /1 — a list `path:` reports at the flow
+        // list's span; /2 the scalar string form exists.
+        let text = "name: test\nflutter:\n  assets:\n    - path: [a]\n";
+        let issues = pubspec_issues(text, &temp_root("asset-path-flow"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_path_not_string",
+            "Asset paths are required to be file paths (strings).",
+            at(text, 4, 13),
+            3,
+        );
+        // asset_not_string_or_map /1 — an int entry; /2 a string entry.
+        let text = "name: test\nflutter:\n  assets:\n    - 42\n";
+        let issues = pubspec_issues(text, &temp_root("asset-kind"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "asset_not_string_or_map",
+            "An asset value is required to be a file path (string) or map.",
+            at(text, 4, 7),
+            2,
+        );
+        let root = temp_root("asset-kind-neg");
+        write(&root, "logo.png", "x");
+        assert!(pubspec_issues("name: test\nflutter:\n  assets:\n    - logo.png\n", &root).is_empty());
+    }
+
+    #[test]
+    fn the_platforms_and_workspace_validators_pin_their_six_codes() {
+        // invalid_platforms_field /1 — a scalar section; /2 the map form.
+        let text = "name: test\nplatforms: not_a_map\n";
+        let issues = pubspec_issues(text, &temp_root("platforms-shape"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "invalid_platforms_field",
+            "The 'platforms' field must be a map with platforms as keys.",
+            at(text, 2, 12),
+            9,
+        );
+        assert!(pubspec_issues("name: test\nplatforms:\n  android:\n", &temp_root("platforms-neg")).is_empty());
+        // unknown_platform /1 — an unrecognized key; /2 a known one.
+        let text = "name: test\nplatforms:\n  brower:\n";
+        let issues = pubspec_issues(text, &temp_root("platform-unknown"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "unknown_platform",
+            "The platform 'brower' is not a recognized platform.",
+            at(text, 3, 3),
+            6,
+        );
+        assert!(pubspec_issues("name: test\nplatforms:\n  linux:\n", &temp_root("platform-unknown-neg")).is_empty());
+        // platform_value_disallowed /1 — a flow-map value; /2 the null
+        // value stays silent.
+        let text = "name: test\nplatforms:\n  android: {}\n";
+        let issues = pubspec_issues(text, &temp_root("platform-value"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "platform_value_disallowed",
+            "Keys in the `platforms` field can't have values.",
+            at(text, 3, 12),
+            2,
+        );
+        assert!(pubspec_issues("name: test\nplatforms:\n  android:\n", &temp_root("platform-value-neg")).is_empty());
+        // workspace_field_not_list /1 — a scalar section; /2 the list
+        // form over an existing subdirectory.
+        let text = "name: test\nworkspace: not_a_list\n";
+        let issues = pubspec_issues(text, &temp_root("workspace-shape"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "workspace_field_not_list",
+            "The value of the 'workspace' field is required to be a list of relative file paths.",
+            at(text, 2, 12),
+            10,
+        );
+        let root = temp_root("workspace-list");
+        std::fs::create_dir_all(root.join("pkg")).expect("pkg dir");
+        assert!(pubspec_issues("name: test\nworkspace:\n  - pkg\n", &root).is_empty());
+        // workspace_value_not_string /1 — an int entry; /2 the string
+        // form over an existing subdirectory.
+        let text = "name: test\nworkspace:\n  - 42\n";
+        let issues = pubspec_issues(text, &temp_root("workspace-kind"));
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "workspace_value_not_string",
+            "Workspace entries are required to be directory paths (strings).",
+            at(text, 3, 5),
+            2,
+        );
+        // workspace_value_not_subdirectory /1 — the escaping path reports
+        // at the raw span (quotes included) with the package root as the
+        // argument; /2 the in-root form stays silent.
+        let root = temp_root("workspace-escape");
+        std::fs::create_dir_all(root.join("pkg")).expect("pkg dir");
+        let text = "name: test\nworkspace:\n  - '../escape'\n";
+        let issues = pubspec_issues(text, &root);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "workspace_value_not_subdirectory",
+            &format!(
+                "Workspace values must be a relative path of a subdirectory of '{}'.",
+                root.display()
+            ),
+            at(text, 3, 5),
+            11,
+        );
+        assert!(pubspec_issues("name: test\nworkspace:\n  - pkg\n", &root).is_empty());
+    }
+
+    #[test]
+    fn the_screenshots_walk_reuses_the_path_row() {
+        let text = "name: test\nscreenshots:\n  - path: missing.png\n";
+        let issues = pubspec_issues(text, &temp_root("screenshots"));
+        assert_eq!(codes(&issues), ["path_does_not_exist"]);
+        assert_row(
+            &issues[0],
+            "path_does_not_exist",
+            "The path 'missing.png' doesn't exist.",
+            at(text, 3, 11),
+            11,
+        );
+        let root = temp_root("screenshots-neg");
+        write(&root, "shot.png", "x");
+        assert!(pubspec_issues("name: test\nscreenshots:\n  - path: shot.png\n", &root).is_empty());
+    }
+
+    #[test]
+    fn the_manifest_validator_pins_its_seven_codes() {
+        let touchscreen =
+            "    <uses-feature android:name=\"android.hardware.touchscreen\" android:required=\"false\" />\n";
+        // camera_permissions_incompatible /1 — CAMERA without the camera
+        // feature pair; /2 both features declared optional.
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-permission android:name=\"android.permission.CAMERA\" />\n</manifest>\n"
+        );
+        let issues = manifest_issues(&text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "camera_permissions_incompatible",
+            "Camera permissions make app incompatible for Chrome OS, consider adding optional \
+             features \"android.hardware.camera\" and \"android.hardware.camera.autofocus\".",
+            at(&text, 3, 22),
+            39,
+        );
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-feature android:name=\"android.hardware.camera\" android:required=\"false\" />\n    \
+             <uses-feature android:name=\"android.hardware.camera.autofocus\" \
+             android:required=\"false\" />\n    \
+             <uses-permission android:name=\"android.permission.CAMERA\" />\n</manifest>\n"
+        );
+        assert!(manifest_issues(&text, true).is_empty());
+        // no_touchscreen_feature /1 — the feature absent, the row on the
+        // manifest element's own span; /2 the feature optional.
+        let text = "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n</manifest>\n";
+        let issues = manifest_issues(text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "no_touchscreen_feature",
+            "The default \"android.hardware.touchscreen\" needs to be optional for Chrome OS.",
+            0,
+            81,
+        );
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}\
+             </manifest>\n"
+        );
+        assert!(manifest_issues(&text, true).is_empty());
+        // unsupported_chrome_os_hardware /1 — nfc without `required`; /2
+        // with `required="false"`.
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-feature android:name=\"android.hardware.nfc\" />\n</manifest>\n"
+        );
+        let issues = manifest_issues(&text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "unsupported_chrome_os_hardware",
+            "The feature android.hardware.nfc isn't supported on Chrome OS, consider making \
+             it optional.",
+            at(&text, 3, 19),
+            34,
+        );
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-feature android:name=\"android.hardware.nfc\" android:required=\"false\" />\n\
+             </manifest>\n"
+        );
+        assert!(manifest_issues(&text, true).is_empty());
+        // unsupported_chrome_os_feature /1 — telephony `required="true"`;
+        // /2 optional.
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-feature android:name=\"android.hardware.telephony\" \
+             android:required=\"true\" />\n</manifest>\n"
+        );
+        let issues = manifest_issues(&text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "unsupported_chrome_os_feature",
+            "The feature android.hardware.telephony isn't supported on Chrome OS, consider \
+             making it optional.",
+            at(&text, 3, 19),
+            40,
+        );
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-feature android:name=\"android.hardware.telephony\" \
+             android:required=\"false\" />\n</manifest>\n"
+        );
+        assert!(manifest_issues(&text, true).is_empty());
+        // The activity rows share one fixture shape.
+        let activity = |attribute: &str| {
+            format!(
+                "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n\
+                 {touchscreen}    <application>\n        <activity \
+                 android:name=\"com.example.MainActivity\" {attribute} />\n    </application>\n\
+                 </manifest>\n"
+            )
+        };
+        // setting_orientation_on_activity /1 — a locked orientation;
+        // /2 `unspecified`.
+        let text = activity("android:screenOrientation=\"portrait\"");
+        let issues = manifest_issues(&text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "setting_orientation_on_activity",
+            "The `<activity>` element should not be locked to any orientation so that users \
+             can take advantage of the multi-window environments and larger screens on \
+             Chrome OS",
+            at(&text, 4, 59),
+            35,
+        );
+        assert!(manifest_issues(&activity("android:screenOrientation=\"unspecified\""), true).is_empty());
+        // non_resizable_activity /1 — `resizeableActivity="false"`; /2
+        // `"true"`.
+        let text = activity("android:resizeableActivity=\"false\"");
+        let issues = manifest_issues(&text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "non_resizable_activity",
+            "The `<activity>` element should be allowed to be resized to allow users to take \
+             advantage of the multi-window environment on Chrome OS",
+            at(&text, 4, 59),
+            33,
+        );
+        assert!(manifest_issues(&activity("android:resizeableActivity=\"true\""), true).is_empty());
+        // permission_implies_unsupported_hardware /1 — CALL_PHONE implies
+        // telephony; /2 INTERNET implies nothing.
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-permission android:name=\"android.permission.CALL_PHONE\" />\n</manifest>\n"
+        );
+        let issues = manifest_issues(&text, true);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "permission_implies_unsupported_hardware",
+            "Permission makes app incompatible for Chrome OS, consider adding optional \
+             android.hardware.telephony feature tag,",
+            at(&text, 3, 22),
+            43,
+        );
+        let text = format!(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{touchscreen}    \
+             <uses-permission android:name=\"android.permission.INTERNET\" />\n</manifest>\n"
+        );
+        assert!(manifest_issues(&text, true).is_empty());
+        // The gate: the check off leaves the whole face silent.
+        assert!(manifest_issues(
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n</manifest>\n",
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_multiple_plugins_face_pins_its_conflict_row() {
+        // multiple_plugins /1 — the second different name reports at its
+        // own node (alongside the section's deprecation row); /2 a
+        // repeated same-name entry is no conflict.
+        let text = "analyzer:\n  plugins:\n    - aaa\n    - bbb\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let issues = local_issues(map.as_mapping().expect("mapping"), text);
+        let row = issues
+            .iter()
+            .find(|issue| issue.code.name == "multiple_plugins")
+            .expect("multiple_plugins row");
+        assert!(codes(&issues).contains(&"analysis_options_deprecated_plugins"));
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.code.name == "multiple_plugins")
+                .count(),
+            1
+        );
+        assert_row(
+            row,
+            "multiple_plugins",
+            "Multiple plugins can't be enabled.",
+            at(text, 4, 7),
+            3,
+        );
+        let text = "analyzer:\n  plugins:\n    - aaa\n    - aaa\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let issues = local_issues(map.as_mapping().expect("mapping"), text);
+        assert!(!codes(&issues).contains(&"multiple_plugins"));
     }
 }
