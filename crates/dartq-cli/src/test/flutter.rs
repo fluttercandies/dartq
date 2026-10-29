@@ -85,16 +85,63 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     if let Some(reason) = state_reason(&root, super::global_config_exists()) {
         return delegate_with(args, true, &reason);
     }
-    let Some(suites) = discover(&root, &inv.paths) else {
+    // `dart_test.yaml` is only the tool's own file when it holds keys only
+    // the runner reproduces (a reporter, presets, platform definitions,
+    // `pause_after_load`) — the dart path's `file_config` gate. `paths`,
+    // `filename`, `concurrency` and `selects` are this runner's own
+    // semantics: `paths` and `filename` select the suites to discover,
+    // `concurrency` caps workers, `selects` delegates the run when the
+    // runner must do the filtering itself.
+    let config = match super::file_config(&root) {
+        Ok(config) => config,
+        Err(()) => return delegate_with(args, true, "dart_test.yaml present"),
+    };
+    // `selects` names tag/platform filtering the runner applies itself —
+    // the run can proceed, but a JSON reporter that announces the suite
+    // count before the runner filters must delegate.
+    let json = inv.machine
+        || inv.reporter == Some(Kind::Json)
+        || matches!(inv.file_reporter, Some((Kind::Json, _)));
+    if config.selects && json {
+        return delegate_with(args, true, "dart_test.yaml selection config present");
+    }
+    let explicit = !inv.paths.is_empty();
+    let selections: Vec<String> = if explicit {
+        inv.paths.clone()
+    } else {
+        config
+            .paths
+            .clone()
+            .unwrap_or_else(|| vec!["test".to_owned()])
+    };
+    let Some(suites) = discover(&root, &selections) else {
         return delegate_with(args, true, "no test suites discovered");
     };
+    // `filename` narrows the file-name pattern of discovered suites —
+    // `dartq_pub::glob` is the same glob `package:test` evaluates the
+    // pattern with.
+    let mut suites = suites;
+    if let Some(pattern) = &config.filename {
+        match dartq_pub::glob::Glob::new(pattern) {
+            Ok(glob) => suites.retain(|suite| {
+                suite
+                    .abs
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| glob.matches_path(name))
+            }),
+            Err(_) => return delegate_with(args, true, "dart_test.yaml filename pattern invalid"),
+        }
+        if suites.is_empty() {
+            return delegate_with(args, true, "no test suites discovered");
+        }
+    }
     if suites
         .iter()
         .any(|suite| suite.abs.starts_with(root.join(INTEGRATION_TEST_DIR)))
     {
         return delegate_with(args, true, "integration_test suites present");
     }
-    let mut suites = suites;
     if let Some(base) = &inv.impacted {
         match dartq_commands::impact::impacted_tests(&root, None, base) {
             Ok(reached) => {
@@ -121,9 +168,6 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     };
     let files: Vec<PathBuf> = suites.iter().map(|suite| suite.abs.clone()).collect();
     let selections = dartq_test::select::select_all(&files, &filter);
-    let json = inv.machine
-        || inv.reporter == Some(Kind::Json)
-        || matches!(inv.file_reporter, Some((Kind::Json, _)));
     if json && selections.contains(&dartq_test::select::Selection::Unknown) {
         return delegate_requested(
             args,
@@ -143,7 +187,7 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
             return delegate_with(args, true, reason);
         }
     }
-    let workers = inv.concurrency.unwrap_or_else(|| {
+    let workers = inv.concurrency.or(config.concurrency).unwrap_or_else(|| {
         // This runner's default: three quarters of the cores, at least
         // one. The tool defaults to half the cores because each of its
         // concurrent suites costs a whole `flutter_tester` plus a fresh
@@ -185,9 +229,6 @@ fn state_reason(root: &Path, global_config: bool) -> Option<Cow<'static, str>> {
     let config = dartq_test::cache::package_config_path(root);
     if !config.is_file() {
         return Some(format!("no resolved {} — run flutter pub get", config.display()).into());
-    }
-    if root.join("dart_test.yaml").is_file() {
-        return Some("dart_test.yaml present".into());
     }
     global_config.then(|| "global dart_test config present".into())
 }
@@ -439,36 +480,143 @@ fn execute(plan: &Plan) -> io::Result<u8> {
 
     let mut staged: FxHashMap<usize, String> = FxHashMap::default();
     let mut tool_stderr = String::new();
+    let index_of: FxHashMap<&Path, usize> = plan
+        .suites
+        .iter()
+        .enumerate()
+        .map(|(index, suite)| (suite.abs.as_path(), index))
+        .collect();
+    // The tool's compile recipe (cached): names the stock tool's shared
+    // test-compile seed file, and its probe is what prepares the package's
+    // `build/unit_test_assets` before any `flutter test` or
+    // `flutter_tester` starts.
+    let recipe = if to_run.is_empty() {
+        None
+    } else {
+        dartq_test::flutter::Recipe::load(&plan.flutter, root, &build_args(&args))?
+    };
     // The grouped pass first: suites it proves green with nothing printed
     // are final; every other suite runs under the stock tool below.
     if to_run.len() > 1 {
-        let mut stock: Vec<usize> = Vec::new();
-        let grouped = grouped_pass(plan, &args, &to_run, &mut stock, &mut |index, block| {
-            stats.grouped += 1;
-            // Stage only green verdicts — a sharded suite's red verdict is
-            // delivered too (it must not rerun stock), and a cached red
-            // would replay a failure as fact.
-            if tally(&block.events).green {
-                if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
-                    cache.stage(key, &block.events)?;
-                    staged.insert(index, key.to_owned());
+        // `place` decides which suites a shared `flutter_tester` can host
+        // and which always run under the stock tool — the placement set is
+        // known before execution, so those shards launch now and run
+        // concurrently with the grouped pass.
+        let files: Vec<PathBuf> = to_run
+            .iter()
+            .map(|&index| plan.suites[index].abs.clone())
+            .collect();
+        let hostings = dartq_test::flutter::place(root, &files)?;
+        let mut stock_early = Vec::new();
+        let mut hosted_indices = Vec::new();
+        for (pos, hosting) in hostings.iter().enumerate() {
+            if hosting.placement == dartq_test::flutter::Placement::Stock {
+                stock_early.push(to_run[pos]);
+            } else {
+                hosted_indices.push(to_run[pos]);
+            }
+        }
+        // The recipe probe that ran above is also the tool's asset
+        // preparation (`build/unit_test_assets`): the stock shards it
+        // warms find the bundle already in place.
+        let (stock_tx, stock_rx) = std::sync::mpsc::channel::<(usize, SuiteBlock)>();
+        let mut stock_late = Vec::new();
+        let drain_stock = |stats: &mut Stats,
+                               slots: &mut Vec<Option<Vec<Json>>>,
+                               staged: &mut FxHashMap<usize, String>,
+                               cache: &mut Option<dartq_test::Cache>|
+         -> io::Result<()> {
+            while let Ok((index, block)) = stock_rx.try_recv() {
+                stats.ran += 1;
+                if complete(&block) && tally(&block.events).green {
+                    if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
+                        cache.stage(key, &block.events)?;
+                        staged.insert(index, key.to_owned());
+                    }
+                }
+                slots[index] = Some(block.events);
+            }
+            Ok(())
+        };
+        let grouped = std::thread::scope(|scope| {
+            // Stock shards run in a spawned thread; `drain_stock` collects
+            // their settled blocks whenever the grouped pass yields one.
+            let stock_handle = if stock_early.is_empty() {
+                None
+            } else {
+                let index_of = &index_of;
+                let args = &args;
+                let recipe = recipe.as_ref();
+                let tx = stock_tx.clone();
+                let indices = stock_early.clone();
+                Some(scope.spawn(move || {
+                    run_shards(plan, args, &indices, index_of, recipe, &mut |index, block| {
+                        tx.send((index, block))
+                            .map_err(|_| io::Error::other("stock consumer closed"))
+                    })
+                }))
+            };
+            drop(stock_tx);
+            let grouped = grouped_pass(
+                plan,
+                &args,
+                &hosted_indices,
+                &mut stock_late,
+                &mut |index, block| {
+                    drain_stock(&mut stats, &mut slots, &mut staged, &mut cache)?;
+                    stats.grouped += 1;
+                    // Stage only green verdicts — a sharded suite's red
+                    // verdict is delivered too (it must not rerun stock),
+                    // and a cached red would replay a failure as fact.
+                    if tally(&block.events).green {
+                        if let (Some(cache), Some(key)) =
+                            (cache.as_mut(), keys[index].as_deref())
+                        {
+                            cache.stage(key, &block.events)?;
+                            staged.insert(index, key.to_owned());
+                        }
+                    }
+                    slots[index] = Some(block.events);
+                    emit(&mut slots, &mut outputs, &mut totals)
+                },
+            );
+            // Wait for the stock shards and drain what they left.
+            let mut early_leftover = None;
+            if let Some(handle) = stock_handle {
+                match handle.join().unwrap_or_else(|_| {
+                    Err(io::Error::other("a stock shard panicked"))
+                }) {
+                    Ok(outcome) => early_leftover = Some(outcome),
+                    Err(error) => return Err(error),
                 }
             }
-            slots[index] = Some(block.events);
-            emit(&mut slots, &mut outputs, &mut totals)
+            drain_stock(&mut stats, &mut slots, &mut staged, &mut cache)?;
+            if let Some(outcome) = early_leftover {
+                for (index, events) in outcome.lost {
+                    stats.ran += 1;
+                    slots[index] = Some(events);
+                }
+                for event in &outcome.loose {
+                    if event.kind() == "error" {
+                        totals.failed += 1;
+                    }
+                    outputs.each(|sink| sink.loose(event))?;
+                }
+                tool_stderr.push_str(&outcome.stderr);
+            }
+            emit(&mut slots, &mut outputs, &mut totals)?;
+            grouped
         })?;
-        if grouped {
-            to_run = stock;
-        }
+        to_run = if grouped {
+            stock_late
+        } else {
+            // The grouped pass could not run at all — the hosted suites
+            // still need the stock tool; `stock_early` already ran.
+            hosted_indices
+        };
     }
     if !to_run.is_empty() {
-        let index_of: FxHashMap<&Path, usize> = plan
-            .suites
-            .iter()
-            .enumerate()
-            .map(|(index, suite)| (suite.abs.as_path(), index))
-            .collect();
-        let outcome = run_shards(plan, &args, &to_run, &index_of, &mut |index, block| {
+        let outcome = run_shards(plan, &args, &to_run, &index_of, recipe.as_ref(), &mut |index, block| {
             stats.ran += 1;
             if complete(&block) && tally(&block.events).green {
                 if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
@@ -660,14 +808,21 @@ struct Leftover {
 }
 
 /// Run `indices` across leased `flutter test` shards. Each suite's block
-/// reaches `on_block` as the suite settles.
+/// reaches `on_block` as the suite settles. `recipe`, when probed, names
+/// the tool's shared test-compile seed file: a compiled chunk kernel
+/// already on disk is copied there first, so every shard's resident
+/// compiler initializes from a kernel that already carries the framework.
 fn run_shards(
     plan: &Plan,
     args: &[String],
     indices: &[usize],
     index_of: &FxHashMap<&Path, usize>,
+    recipe: Option<&dartq_test::flutter::Recipe>,
     on_block: &mut dyn FnMut(usize, SuiteBlock) -> io::Result<()>,
 ) -> io::Result<Leftover> {
+    if let Some(recipe) = recipe {
+        dartq_test::flutter::seed_test_cache(recipe, &plan.root);
+    }
     let root = &plan.root;
     let profile = dartq_test::Profile::FLUTTER.calibrated("flutter");
     let target = plan.workers.min(indices.len()).max(1);
@@ -1400,10 +1555,14 @@ mod tests {
             None,
             "a resolved, config-less package runs here"
         );
+        // `dart_test.yaml` alone is not a precondition — `file_config`
+        // gates the runner-only keys; `concurrency` is this runner's own
+        // semantics and runs here.
         fs::write(root.join("dart_test.yaml"), "concurrency: 2\n").expect("write");
         assert_eq!(
             state_reason(root, false).as_deref(),
-            Some("dart_test.yaml present")
+            None,
+            "a resolved package with dart_test.yaml runs here"
         );
         fs::remove_file(root.join("dart_test.yaml")).expect("remove");
         assert_eq!(

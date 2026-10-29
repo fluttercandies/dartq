@@ -1330,9 +1330,16 @@ impl Dense {
             // resolve those caller paths against the checkout the same way
             // in every checkout. The suite side (tests and their helpers) is
             // where fixture paths are spelled and where a location can reach
-            // an assertion.
+            // an assertion. Its wall-clock reads are the same shape: a
+            // caller-supplied input the library consumes on the caller's
+            // behalf (`DatePicker(initialDate: …)`), so a `lib/` file's
+            // `DateTime.now()` does not refuse a suite whose own file has
+            // no drifting reads of its own.
             if self.in_lib[node] {
                 continue;
+            }
+            if facts.time_read && !facts.attested {
+                return Err(Refusal::Nondeterministic);
             }
             pinned |= facts.located && !facts.portable;
             for literal in &facts.path_literals {
@@ -1869,6 +1876,57 @@ mod tests {
             named[1],
             "deleting a named file invalidates"
         );
+    }
+
+    /// A `lib/` file's `DateTime.now()` is a caller-supplied input — the
+    /// library reads it on the caller's behalf, like a path literal. The
+    /// suite's own file still refuses on `time_read`; a lib file's
+    /// `time_read` alone does not refuse.
+    #[test]
+    fn lib_time_reads_do_not_refuse() {
+        let (tmp, root) = fixture();
+        let bin = root.join("pubspec.yaml");
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, body).expect("write");
+        };
+        // A lib file reading the wall clock: the caller decides whether it
+        // reaches a verdict, so the suite keys.
+        write("lib/clock.dart", "int now() => DateTime.now().hour;\n");
+        write(
+            "test/clock_via_lib_test.dart",
+            "import 'package:fx/clock.dart';\nvoid main() {}\n",
+        );
+        // A suite whose own file reads the wall clock still refuses.
+        write(
+            "test/clock_self_test.dart",
+            "void main() { DateTime.now(); }\n",
+        );
+        // A lib file reading the wall clock AND a no-cache marker refuses.
+        write("lib/bad.dart", "// dartq: no-cache\nint x() => 1;\n");
+        write(
+            "test/bad_test.dart",
+            "import 'package:fx/bad.dart';\nvoid main() {}\n",
+        );
+        let suites: Vec<PathBuf> = [
+            "test/clock_via_lib_test.dart",
+            "test/clock_self_test.dart",
+            "test/bad_test.dart",
+        ]
+        .map(|rel| root.join(rel))
+        .to_vec();
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let keys = cache.keys(&suites, runner(&bin)).expect("keys");
+        assert!(
+            keys[0].is_some(),
+            "a lib file's DateTime.now() is the caller's business"
+        );
+        assert_eq!(
+            keys[1], None,
+            "the suite's own file still refuses on time_read"
+        );
+        assert_eq!(keys[2], None, "a no-cache marker in lib still refuses");
     }
 
     /// The prune pass keeps the most recently used entries.

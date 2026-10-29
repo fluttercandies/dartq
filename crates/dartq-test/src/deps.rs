@@ -64,9 +64,7 @@ pub struct FileFacts {
     /// suite always runs under the stock loader.
     pub launch: bool,
     /// Reads state that drifts between runs with no file, argument or
-    /// environment change: the wall clock (`DateTime.now`,
-    /// `DateTime.timestamp` — dates move forward, so an expiry or calendar
-    /// assertion green today can be red tomorrow), the outside world (the
+    /// environment change: the outside world (the
     /// network: `Socket`, `ServerSocket`, `RawSocket`, `SecureSocket`,
     /// `RawDatagramSocket`, `WebSocket`, `HttpClient`, `HttpServer`,
     /// `InternetAddress`, `NetworkInterface`; child processes:
@@ -74,13 +72,24 @@ pub struct FileFacts {
     /// identity (`Platform.localHostname`), native code (`dart:ffi`), or
     /// imports a package whose purpose is one of those
     /// ([`DRIFT_PACKAGES`]). A suite whose closure reads one is never
-    /// cached.
+    /// cached. Wall-clock reads (`DateTime.now`/`timestamp`) live in
+    /// [`Self::time_read`]: lib files skip them (caller-supplied, like a
+    /// path literal) while suite-side files still refuse.
     ///
     /// Stationary randomness (`Random`, `Stopwatch` durations, `pid`) is not
     /// listed: a replayed outcome is then one sample of the same
     /// distribution a fresh run draws from, so replay cannot observe
     /// anything a rerun could not.
     pub nondeterministic: bool,
+    /// Reads the wall clock (`DateTime.now`, `DateTime.timestamp`) — a
+    /// caller-controlled input like a path literal: a widget library that
+    /// defaults `initialDate` to the current date is reading what its
+    /// caller could have supplied, and whether the read reaches a verdict
+    /// is the suite's business (its own file's reads still refuse, and an
+    /// attestation marker vouches where the lib cannot). Split from
+    /// [`Self::nondeterministic`] so `lib/` files do not refuse on time
+    /// alone.
+    pub time_read: bool,
     /// Carries the `// dartq: deterministic` attestation: the author vouches
     /// that this file's drifting reads ([`Self::nondeterministic`]) never
     /// reach a test verdict (a log timestamp, an analyzer modification
@@ -468,10 +477,10 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                 if (lexeme, member) == ("Platform", "environment") {
                     read_environment_access(source, tokens, index + 3, out);
                 }
+                out.time_read |= matches!((lexeme, member), ("DateTime", "now" | "timestamp"));
                 out.nondeterministic |= matches!(
                     (lexeme, member),
-                    ("DateTime", "now" | "timestamp")
-                        | ("Process", "run" | "runSync" | "start")
+                    ("Process", "run" | "runSync" | "start")
                         | ("Platform", "localHostname")
                         | (
                             "Socket"
@@ -837,8 +846,10 @@ void main() {
     #[test]
     fn drift_markers_and_launch() {
         let drift = |source: &str| of(source).nondeterministic;
-        assert!(drift("void main() { DateTime.now(); }"));
-        assert!(drift("void main() { DateTime.timestamp(); }"));
+        let time = |source: &str| of(source).time_read;
+        assert!(time("void main() { DateTime.now(); }"));
+        assert!(time("void main() { DateTime.timestamp(); }"));
+        assert!(!drift("void main() { DateTime.now(); }"));
         assert!(drift("void main() { Process.run('ls', []); }"));
         assert!(drift("void main() { Socket.connect('h', 1); }"));
         assert!(drift("void main() { HttpClient(); }"));

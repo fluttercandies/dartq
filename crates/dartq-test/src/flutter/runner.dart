@@ -296,7 +296,10 @@ class _Tester {
         return;
       }
     }
-    host.dirty.add(window.id);
+    // A non-marker line during the suite's window is the suite's own
+    // output (`print`, `stdout`, `stderr`, framework logging): it joins
+    // the block's events as a shell line and replays verbatim. Only a
+    // line outside every window (`_stray`) is unattributable.
   }
 
   /// Run `suite`: ask the tester to spawn its engine.

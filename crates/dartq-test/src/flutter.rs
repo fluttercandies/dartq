@@ -91,6 +91,15 @@ pub struct Recipe {
     /// `--output-dill`, `--initialize-from-dill`, `--packages` and
     /// `--incremental` arguments, which dartq supplies.
     pub compiler: Vec<String>,
+    /// The tool's shared test-compile seed: the `--initialize-from-dill`
+    /// target its trace carried (`build/test_cache/build/<build-key>.cache
+    /// .dill[.track.dill]`). Every `flutter test` process initializes its
+    /// resident compiler from this file; writing a richer kernel here
+    /// before the stock shards start seeds every shard's first compile.
+    /// Empty when the trace carried no seed (or the recipe predates this
+    /// field): no pre-seeding.
+    #[serde(default)]
+    pub test_cache: PathBuf,
     /// `flutter_tester` and its arguments, without the trailing kernel.
     pub tester: Vec<String>,
     /// The tester's whole environment as the probe suite observed it
@@ -206,18 +215,25 @@ impl Recipe {
         let environment = environment?;
         // The kernel is the last argument: the listener the tool compiled.
         command.pop()?;
-        // Per-run arguments dartq supplies itself.
+        // Per-run arguments dartq supplies itself — except
+        // `--initialize-from-dill`'s value, the tool's shared test-compile
+        // seed location, which dartq keeps to pre-seed the stock shards.
         let mut kept = Vec::with_capacity(compiler.len());
+        let mut test_cache = None;
         let mut parts = compiler.into_iter();
         while let Some(part) = parts.next() {
             match part.as_str() {
-                "--output-dill" | "--initialize-from-dill" | "--packages" => {
+                "--output-dill" | "--packages" => {
                     parts.next()?;
+                }
+                "--initialize-from-dill" => {
+                    test_cache = parts.next().map(PathBuf::from);
                 }
                 "--incremental" => {}
                 _ => kept.push(part),
             }
         }
+        let test_cache = test_cache.unwrap_or_default();
         let environment: Vec<(String, String)> = environment
             .into_iter()
             .filter(|(key, _)| key != "SERVER_PORT" && key != "FONTCONFIG_FILE")
@@ -234,6 +250,7 @@ impl Recipe {
         );
         Some(Self {
             compiler: kept,
+            test_cache,
             tester: command,
             environment,
             fonts,
@@ -421,18 +438,34 @@ enum Compiled {
 }
 
 impl Compiler {
-    fn start(recipe: &Recipe, packages: &Path, output: &Path, root: &Path) -> io::Result<Self> {
+    fn start(
+        recipe: &Recipe,
+        packages: &Path,
+        output: &Path,
+        root: &Path,
+        seed: Option<&Path>,
+    ) -> io::Result<Self> {
         let (program, args) = recipe
             .compiler
             .split_first()
             .ok_or_else(|| io::Error::other("empty compiler command"))?;
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .arg("--incremental")
             .arg("--packages")
             .arg(packages)
             .arg("--output-dill")
-            .arg(output)
+            .arg(output);
+        // The tool's own test compiler seeds each run's first compile from
+        // the previous run's kernel (`--initialize-from-dill`): the
+        // incremental compiler byte-compares every recorded URI against the
+        // filesystem and invalidates what changed, so a stale seed never
+        // shapes the output — it only skips recompiling what did not
+        // change (the whole framework, in practice).
+        if let Some(seed) = seed.filter(|seed| seed.is_file()) {
+            cmd.arg("--initialize-from-dill").arg(seed);
+        }
+        let mut child = cmd
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -681,6 +714,11 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     // entirely (the store's `.key` sidecar names the inputs the compiler
     // saw). Any doubt re-keys to a compile — serving a stale kernel is the
     // one unrecoverable sin of this pass.
+    //
+    // A kernel whose `.key` no longer matches is kept as `chunkN.seed.dill`:
+    // the incremental compiler initialized from it skips every unchanged
+    // library (the framework is the bulk of a cold compile) while still
+    // re-checking every source byte, so seeding is a pure speedup.
     let wanted_keys = chunk_keys(plan, &rows, &chunks);
     for (index, kernel) in kernels.iter().enumerate() {
         let adopted = kernel.is_file()
@@ -698,10 +736,13 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
                     .map_err(io::Error::other)?
                     .as_bytes(),
             )?;
+            let _ = std::fs::remove_file(kernel.with_extension("seed.dill"));
             continue;
         }
+        if kernel.is_file() {
+            let _ = std::fs::rename(kernel, kernel.with_extension("seed.dill"));
+        }
         for stale in [
-            kernel.clone(),
             kernel.with_extension("dill.failed"),
             kernel.with_extension("dill.json"),
             kernel.with_extension("dill.key"),
@@ -835,6 +876,7 @@ fn compile_chunks(
                     plan.packages,
                     &output,
                     plan.root,
+                    Some(&kernels[index].with_extension("seed.dill")),
                 )?);
             }
             let _ = std::fs::remove_file(&output);
@@ -853,6 +895,8 @@ fn compile_chunks(
                     // an interrupted run never leaves a key claiming a kernel
                     // that isn't there (adoption requires both).
                     std::fs::rename(&output, &kernels[index])?;
+                    // The new kernel replaces the seed it was compiled from.
+                    let _ = std::fs::remove_file(kernels[index].with_extension("seed.dill"));
                     // Key the kernel on what was actually compiled — a
                     // retried chunk's reduced set, so a later run wanting
                     // the full set re-keys and recompiles instead of
@@ -921,6 +965,65 @@ fn fail_chunk(
                 .map(|&local| plan.suites[suite_of(local)].path.clone()),
         );
     crate::stamp::write_atomic(&kernel.with_extension("dill.failed"), b"")
+}
+
+/// Seed the stock tool's shared test-compile cache (`recipe.test_cache`,
+/// the `--initialize-from-dill` target every `flutter test` process
+/// initializes its resident compiler from) with the largest chunk kernel
+/// this checkout already holds. A `flutter test` shard's *first* compile
+/// pays the framework-load unless its seed already carries it; our chunk
+/// kernels carry exactly that — framework plus the suites' shared closure.
+///
+/// The tool keeps the largest kernel under this path (its own rule:
+/// `firstCompile || !exists || cache.length < output.length`), so a bigger
+/// chunk kernel replaces a smaller seed and is never itself displaced. The
+/// incremental compiler byte-compares every URI recorded in the seed
+/// against the filesystem before trusting it — a stale or foreign kernel
+/// only loses speed, never correctness.
+///
+/// Best effort: any I/O failure just costs the speedup.
+pub fn seed_test_cache(recipe: &Recipe, root: &Path) {
+    let target = &recipe.test_cache;
+    if target.as_os_str().is_empty() {
+        return;
+    }
+    let dir = work_dir(root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let largest = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            (name.starts_with("chunk")
+                && name.ends_with(".dill")
+                && !name.ends_with(".seed.dill"))
+            .then(|| (entry.metadata().map_or(0, |meta| meta.len()), path))
+        })
+        .max_by_key(|(size, _)| *size);
+    let Some((size, kernel)) = largest else {
+        return;
+    };
+    if std::fs::metadata(target).is_ok_and(|meta| meta.len() >= size) {
+        return;
+    }
+    if let Some(parent) = target.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    // Copy through a sibling temp file so a shard never reads a
+    // partially-written seed.
+    let staged = target.with_extension(format!("seed-{}", std::process::id()));
+    if std::fs::copy(&kernel, &staged).is_ok() {
+        let _ = std::fs::rename(&staged, target).or_else(|_| {
+            let _ = std::fs::remove_file(&staged);
+            std::fs::copy(&kernel, target).map(|_| ())
+        });
+    } else {
+        let _ = std::fs::remove_file(&staged);
+    }
 }
 
 /// Where a suite runs.
@@ -1418,6 +1521,8 @@ mod tests {
                 "{dropped}"
             );
         }
+        // The seed path survives as the stock cohort's pre-seed target.
+        assert_eq!(recipe.test_cache, PathBuf::from("/p/build/x.dill"));
         for kept in [
             "--target=flutter",
             "-DFLUTTER_VERSION=3.47.1",
@@ -1699,6 +1804,7 @@ mod tests {
         std::fs::write(&packages, br#"{"configVersion":2,"packages":[]}"#).expect("write");
         let recipe = Recipe {
             compiler: vec!["fe".to_owned(), "--target=flutter".to_owned()],
+            test_cache: PathBuf::from("/t/cache.dill"),
             tester: vec!["tester".to_owned()],
             environment: Vec::new(),
             fonts: String::new(),
@@ -1812,6 +1918,7 @@ mod tests {
         std::fs::write(&suite_file, b"void main() {}").expect("write");
         let recipe = Recipe {
             compiler: vec!["fe".to_owned()],
+            test_cache: PathBuf::from("/t/cache.dill"),
             tester: vec![],
             environment: Vec::new(),
             fonts: String::new(),
@@ -1883,6 +1990,7 @@ mod tests {
         std::fs::write(&config_file, b"// config v1").expect("write");
         let recipe = Recipe {
             compiler: vec!["fe".to_owned()],
+            test_cache: PathBuf::from("/t/cache.dill"),
             tester: vec![],
             environment: vec![],
             fonts: String::new(),
@@ -1960,5 +2068,49 @@ mod tests {
         let upgraded =
             closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
         assert_ne!(changed, upgraded, "a toolchain stamp bump re-keys");
+    }
+
+    /// `seed_test_cache` copies the largest chunk kernel under the work dir
+    /// into the tool's shared seed path — but never displaces a seed that is
+    /// already at least as large (the tool's own largest-kernel rule).
+    #[test]
+    fn seed_test_cache_writes_the_largest_chunk_only_when_smaller() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canon");
+        let dir = work_dir(&root);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("chunk0.dill"), b"small").expect("kernel");
+        std::fs::write(dir.join("chunk1.dill"), b"the largest kernel").expect("kernel");
+        // Sidecars and seeds are not candidates.
+        std::fs::write(dir.join("chunk2.dill.key"), b"key").expect("key");
+        std::fs::write(dir.join("chunk3.seed.dill"), b"stale seed").expect("seed");
+        std::fs::write(dir.join("compile.dill"), b"compiler output").expect("out");
+        let recipe = Recipe {
+            compiler: vec!["fe".to_owned()],
+            test_cache: root.join("build/test_cache/build/x.cache.dill.track.dill"),
+            tester: vec![],
+            environment: vec![],
+            fonts: String::new(),
+        };
+        seed_test_cache(&recipe, &root);
+        assert_eq!(
+            std::fs::read(&recipe.test_cache).expect("seeded"),
+            b"the largest kernel",
+            "the largest chunk kernel seeds the tool's cache"
+        );
+        // A same-or-larger existing seed is kept.
+        std::fs::write(&recipe.test_cache, b"an even larger existing seed file").expect("write");
+        seed_test_cache(&recipe, &root);
+        assert_eq!(
+            std::fs::read(&recipe.test_cache).expect("kept"),
+            b"an even larger existing seed file"
+        );
+        // No seed path, no work — and no stray file beside the root.
+        let quiet = Recipe {
+            test_cache: PathBuf::new(),
+            ..recipe.clone()
+        };
+        seed_test_cache(&quiet, &root);
+        assert!(!root.join("seed-1").exists());
     }
 }

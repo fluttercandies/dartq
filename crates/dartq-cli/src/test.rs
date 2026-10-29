@@ -625,14 +625,14 @@ struct Suite {
 
 /// What `dart_test.yaml` contributes to selection and scheduling.
 #[derive(Debug, Default)]
-struct FileConfig {
-    paths: Option<Vec<String>>,
-    filename: Option<String>,
-    concurrency: Option<usize>,
+pub(super) struct FileConfig {
+    pub(super) paths: Option<Vec<String>>,
+    pub(super) filename: Option<String>,
+    pub(super) concurrency: Option<usize>,
     /// The file names suite selection of its own (tag selectors, platform
     /// selectors, per-tag configuration): only the runner knows which
     /// suites it loads.
-    selects: bool,
+    pub(super) selects: bool,
 }
 
 /// Keys of `dart_test.yaml` that take part in suite selection.
@@ -662,7 +662,7 @@ const RUNNER_ONLY_KEYS: &[&str] = &[
 
 /// Read `dart_test.yaml`; `Err` when it holds something only the runner
 /// reproduces (or that it would reject).
-fn file_config(root: &Path) -> Result<FileConfig, ()> {
+pub(super) fn file_config(root: &Path) -> Result<FileConfig, ()> {
     let Ok(text) = std::fs::read_to_string(root.join("dart_test.yaml")) else {
         return Ok(FileConfig::default());
     };
