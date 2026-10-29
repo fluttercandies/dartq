@@ -68,6 +68,7 @@ impl<'a> Engine<'a> {
             armed_ty: None,
             armed_ty_unresolved: false,
             armed_ty_span: None,
+            type_args_group_end: None,
             pending_decl_ty: None,
             pending_decl_ty_unresolved: false,
             ctor_init_writes: FxHashSet::default(),
@@ -542,6 +543,29 @@ impl<'a> Engine<'a> {
             self.file,
             range,
             None,
+        ));
+    }
+
+    /// The unchecked-nullable row's per-site rendering: a method invocation
+    /// (`a.foo()` on a nullable receiver) reports the invoked-method text
+    /// with the call correction, every other access shape the property
+    /// text with the access correction — upstream picks by the access
+    /// node's own shape (`type_property_resolver.dart:128-148`,
+    /// messages.yaml's two shared-name variants).
+    pub(crate) fn emit_unchecked_nullable(
+        &mut self,
+        range: SourceRange,
+        name: &str,
+        is_method: bool,
+    ) {
+        let code = SemanticCode::UncheckedUseOfNullableValue;
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            SemanticCode::unchecked_nullable_message(is_method, name),
+            self.file,
+            range,
+            Some(SemanticCode::unchecked_nullable_correction(is_method).to_string()),
         ));
     }
 
@@ -1683,7 +1707,24 @@ impl<'a> Engine<'a> {
             };
             return self.resolved_subtype(sub, future) || self.resolved_subtype(sub, value);
         }
-        self.slot_subtype(sub, sup) == Some(true)
+        // The terminal ask is the declared-edge lattice
+        // ([`Self::name_subtype`] — `NameWorld::is_subtype_of`), never
+        // [`Self::slot_subtype`]'s assignability fallback: the M1 matrix
+        // answers every nullable named target as a Right Top
+        // (`Ty::assignable_from`, the assignment question `S → T?`), and
+        // as a subtype answer it over-fires the constant-true verdict
+        // (`num? a; a is int?` — the oracle is silent,
+        // subtype.dart's interface rule needs the supertype graph).
+        // Function- and record-shape pairs keep the slot walk: its
+        // function rule is real subtyping (contravariant formals,
+        // covariant return) and its record rule the shape identity —
+        // the strict faces the name-level columns cannot spell.
+        match (sub, sup) {
+            (Ty::Record { .. } | Ty::Function { .. }, Ty::Record { .. } | Ty::Function { .. }) => {
+                self.slot_subtype(sub, sup) == Some(true)
+            }
+            _ => self.name_subtype(sub, sup),
+        }
     }
 
     /// The name-level `canBeSubtypeOf`
@@ -1734,6 +1775,45 @@ impl<'a> Engine<'a> {
         } else {
             Ty::Unknown
         }
+    }
+
+    /// The `this`/`super` keyword operand at an is-check the keyword
+    /// heads: the keyword pushes no row ([`Self::push_keyword_receiver`]
+    /// stages the flow side channel only), so the nearest row below
+    /// belongs to an older expression and must not stand in as the
+    /// operand — the keyword itself is the operand, typed by the
+    /// enclosing container ([`Self::this_static_ty`], an extension's
+    /// written `on` type included; `super`'s static type is the same
+    /// `thisType` face, upstream `ThisExpressionImpl.staticType`).
+    /// Answers the keyword's own span beside the type when the token
+    /// directly before `at` (the caller passes the `is` operator's
+    /// offset) is the keyword and a container face exists; `None`
+    /// otherwise, the ordinary operand-row read stands.
+    pub(crate) fn keyword_operand_ty(&self, at: u32) -> Option<(Ty, SourceRange)> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens.partition_point(|t| t.utf16_offset < at);
+        let keyword = index.checked_sub(1).and_then(|i| tokens.get(i))?;
+        if !matches!(
+            keyword.kind,
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::This)
+                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Super)
+        ) {
+            return None;
+        }
+        let (container, kind) = self.container_context()?;
+        let ty = self.this_static_ty(container, kind);
+        if ty == Ty::Unknown {
+            return None;
+        }
+        // `this`/`super` are pure ASCII: the UTF-16 length is the byte
+        // length.
+        Some((
+            ty,
+            SourceRange {
+                offset: keyword.utf16_offset,
+                length: keyword.byte_len,
+            },
+        ))
     }
 
     /// `unnecessary_cast` on the expression form (`_isUnnecessaryCast`,
@@ -1883,8 +1963,19 @@ impl<'a> Engine<'a> {
     /// `type_check_with_null` family, downgraded to the constant row when
     /// the operand is the `null` literal; a provable subtype is
     /// constant-true, `is!` reporting the complement's polarity.
-    pub(crate) fn check_type_check(&mut self, at: SourceRange, negated: bool) {
+    pub(crate) fn check_type_check(
+        &mut self,
+        at: SourceRange,
+        keyword_operand: Option<(Ty, SourceRange)>,
+        negated: bool,
+    ) {
         let Some(checked) = self.armed_ty else { return };
+        // The `this`/`super` keyword operand (`this is C` in `C`), resolved
+        // by the listener at the operator's own left — the keyword pushes
+        // no row, so the nearest row below belongs to an older expression
+        // and must not decide the verdict. The listener's verdict span
+        // already anchors at the keyword and extends through the written
+        // type; `at` needs no re-anchor.
         // The target side folds like the operand side
         // ([`Self::bind_declared_type`]): the verdict reads the resolved
         // interface type — `x is IntAlias` over an `int` operand is
@@ -1919,7 +2010,10 @@ impl<'a> Engine<'a> {
         // operand is the same silence (the prefix answers no subtype
         // question — the under-report direction every unresolved side
         // already takes).
-        let operand_ty = self.type_check_operand_ty();
+        let operand_ty = match keyword_operand {
+            Some((ty, _)) => ty,
+            None => self.type_check_operand_ty(),
+        };
         if operand_ty == Ty::Unknown
             || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)
@@ -1934,10 +2028,13 @@ impl<'a> Engine<'a> {
             // The `is Null` family (`_checkAllTypeChecks`'s `Null` arm)
             // — unless the operand is the `null` literal, where the
             // check is constant instead (the same walk's `null` arm:
-            // `Null <: Null` answers `true`).
-            let null_literal = self
-                .operand_row()
-                .is_some_and(|row| row.ty == Ty::Null && matches!(row.shape, RowShape::Value));
+            // `Null <: Null` answers `true`). The literal's row is the
+            // operand's own — a keyword operand (`this is Null`) has no
+            // row and the stale one below must not stand in.
+            let null_literal = keyword_operand.is_none()
+                && self
+                    .operand_row()
+                    .is_some_and(|row| row.ty == Ty::Null && matches!(row.shape, RowShape::Value));
             if null_literal {
                 // `Null <: T` decides the literal check's polarity.
                 Some(self.name_subtype(Ty::Null, checked))
@@ -4584,6 +4681,68 @@ impl<'a> Engine<'a> {
     /// The source byte at a UTF-16 offset.
     pub(crate) fn byte_at(&self, utf16: u32) -> Option<u8> {
         self.source.as_bytes().get(self.byte_of(utf16)).copied()
+    }
+
+    /// The `ConstructorFieldInitializer` node span whose written field name
+    /// (or bare `this` head) is `name_range`: the name through the assigned
+    /// expression's last token. The upstream report anchors `.at(initializer)`
+    /// — the whole node (error_verifier.dart:5572-5586), never the bare
+    /// selector. The walk rides the token table: the `=` after the name, then
+    /// the value runs to the first depth-0 `,` / `;` / list-closing `)` /
+    /// body-opening `{` (comments and whitespace are outside the token table;
+    /// nested brackets stay balanced), and a `this.` head widens the start to
+    /// the keyword (the node's own offset). A shape without the `=` degrades
+    /// to the name's own range.
+    pub(crate) fn initializer_node_span(&self, name_range: SourceRange) -> SourceRange {
+        let toks = self.tokens.as_slice();
+        let mut at = toks.partition_point(|t| t.utf16_offset < name_range.end());
+        if !toks.get(at).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Equal) {
+            return name_range;
+        }
+        // `this.x = v` node offset: the keyword two tokens before the name
+        // (`this` `.` `x`); a bare-name initializer keeps the name's offset.
+        let mut offset = name_range.offset;
+        if at >= 2
+            && toks[at - 1].kind == dartq_scanner::TokenKind::Period
+            && toks[at - 2].kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::This)
+            && toks[at - 2].utf16_offset < offset
+        {
+            offset = toks[at - 2].utf16_offset;
+        }
+        let mut depth: u32 = 0;
+        let mut end = name_range.end();
+        at += 1;
+        while let Some(t) = toks.get(at) {
+            match t.kind {
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenBracket
+                | dartq_scanner::TokenKind::OpenBrace => depth += 1,
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseBracket
+                | dartq_scanner::TokenKind::CloseBrace
+                    if depth > 0 =>
+                {
+                    depth -= 1;
+                }
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseBrace
+                    if depth == 0 =>
+                {
+                    break;
+                }
+                dartq_scanner::TokenKind::Comma | dartq_scanner::TokenKind::Semicolon
+                    if depth == 0 =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            end = self.utf16_of(t.byte_offset + t.byte_len);
+            at += 1;
+        }
+        SourceRange {
+            offset,
+            length: end.saturating_sub(offset),
+        }
     }
 
     /// The bare-identifier spelling at `range`, when the bytes before it

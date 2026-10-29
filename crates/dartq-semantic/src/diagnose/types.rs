@@ -1756,6 +1756,15 @@ pub(crate) struct Engine<'a> {
     /// bound variable). Armed by the events that arm [`Self::armed_ty`]
     /// and read only while that arm is unconsumed at the pattern sites.
     pub(crate) armed_ty_span: Option<SourceRange>,
+    /// The last closed type-arguments group's end offset (UTF-16, the
+    /// `>` included), latched by the listener's `end_type_arguments`.
+    /// The is-check verdict's whole-expression span extends the armed
+    /// type's extent to this group (`x is List<int>` ends at `>`), the
+    /// oracle's `.at(node)` anchor — the armed slot alone stops at the
+    /// head identifier (`handle_type` carries the name token only).
+    /// Stale groups stay harmless: the verdict reads it only past the
+    /// `is` operator, which an operand-side group never crosses.
+    pub(crate) type_args_group_end: Option<u32>,
     /// The open variable-declaration group's declared type (one
     /// `parse_type` per group), for the initializer checks.
     pub(crate) pending_decl_ty: Option<Ty>,

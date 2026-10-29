@@ -2426,7 +2426,16 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::LabelDeclaration => {
                 if let Some(name) = name {
-                    engine.pending_label = Some((name, token.range));
+                    // The row's anchor is the `Label` node — the written name
+                    // plus its colon (upstream `dead_code_verifier.dart`'s
+                    // `diag.unusedLabel…at(label)`, the label identifier's
+                    // `Label` wrapper). The parser fires at the colon, so the
+                    // `:` immediately follows the name token.
+                    let mut range = token.range;
+                    if engine.byte_at(range.end()) == Some(b':') {
+                        range.length += 1;
+                    }
+                    engine.pending_label = Some((name, range));
                 }
             }
             C::LabelReference => {
@@ -4274,11 +4283,50 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         // The verdict row anchors the whole `is` expression — the oracle's
-        // `_checkAllTypeChecks` reports on the IsExpression node, whose
-        // offset is the operand's (`returnValue is Future<…>` reports at
-        // the operand, never at the operator token).
-        let verdict_at = engine.operand_row().map_or(is_operator.range, |row| row.range);
-        engine.check_type_check(verdict_at, not.is_some());
+        // `_checkAllTypeChecks` reports `.at(node)` (`IsExpressionImpl`):
+        // the operand's start through the written type's end, never the
+        // bare operand (`null is! Null` spans all 13 columns). The type's
+        // extent rides the armed slot (head + `?`) extended by this
+        // target's closed type-arguments group (`List<int>` ends at `>` —
+        // `handle_type` carries the head token only).
+        //
+        // The `this`/`super` keyword pushes no row, so the keyword face
+        // resolves at the operator's own left — a stale row below must
+        // not stand in as the operand, and the span anchors at the
+        // keyword.
+        let keyword_operand = engine.keyword_operand_ty(is_operator.range.offset);
+        let type_end = |mut end: u32| -> u32 {
+            if let Some(span) = engine.armed_ty_span
+                && span.offset >= is_operator.range.end()
+            {
+                end = end.max(span.end());
+            }
+            if let Some(args_end) = engine.type_args_group_end
+                && args_end > end
+                && args_end > is_operator.range.end()
+            {
+                end = args_end;
+            }
+            end
+        };
+        let verdict_at = if let Some((_, range)) = keyword_operand {
+            type_end(range.end())
+                .checked_sub(range.offset)
+                .map(|length| SourceRange {
+                    offset: range.offset,
+                    length,
+                })
+                .unwrap_or(range)
+        } else {
+            engine.operand_row().map_or(is_operator.range, |row| {
+                let end = type_end(row.range.end());
+                SourceRange {
+                    offset: row.range.offset,
+                    length: end - row.range.offset,
+                }
+            })
+        };
+        engine.check_type_check(verdict_at, keyword_operand, not.is_some());
         engine.const_capture.not_constant(is_operator.range);
         // An `is` expression is statically `bool` — the enclosing condition
         // checkpoint spares the operand row.
@@ -6643,6 +6691,10 @@ impl ParserListener for DiagnoseListener<'_> {
             let engine = &mut self.engine;
             // #1314 FAM13: the group closed.
             engine.type_arg_depth = engine.type_arg_depth.saturating_sub(1);
+            // The is-check verdict's whole-expression span extends the
+            // armed type to this group's `>` (`x is List<int>`) — the
+            // last closed group at the verdict site, the is-target's own.
+            engine.type_args_group_end = Some(end.range.end());
         }
         self.engine.end_type_arguments(count, begin, end);
     }

@@ -926,6 +926,16 @@ impl<'a> Engine<'a> {
             } else {
                 raw_text.to_string()
             };
+            // The diagnostic's `{0}` is the element's `displayName`, whose
+            // shape never carries the accessor suffix or the unnamed-head
+            // selector: a setter's element name is the bare spelling (`_foo`,
+            // not `_foo=`), and a written `.new` head renders as its
+            // container alone (element.dart's `displayName`: `name == 'new'`
+            // answers the enclosing class name).
+            let display_text = match name_text.strip_suffix('=') {
+                Some(bare) if bare != "new" => bare.to_string(),
+                _ => name_text.clone(),
+            };
             // The `strict-inference` return-type face
             // (`_checkStrictInferenceReturnType`,
             // best_practices_verifier.dart:1587-1606): a top-level function
@@ -966,8 +976,8 @@ impl<'a> Engine<'a> {
                         } else {
                             site.range
                         };
-                        
-                        self.stage_usage(SemanticCode::UnusedElement, range, &name_text);
+
+                        self.stage_usage(SemanticCode::UnusedElement, range, &display_text);
                     }
                 }
                 DeclKind::Container => {
@@ -978,8 +988,8 @@ impl<'a> Engine<'a> {
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
                         && !element_used.contains(&bare)
                     {
-                        
-                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
                     }
                 }
                 DeclKind::Member {
@@ -1111,8 +1121,8 @@ impl<'a> Engine<'a> {
                         || member_used
                         || matches!(self.walk_super(container, site.name), Walk::Found(_));
                     if !spared {
-                        
-                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
                     }
                 }
                 DeclKind::Constructor { container } => {
@@ -1158,11 +1168,18 @@ impl<'a> Engine<'a> {
                         if !spared {
                             // The element's displayName qualifies the selector
                             // with its container (`E.foo`); the site stores the
-                            // selector spelling only. A provisional head never
+                            // selector spelling only. A written `.new` head
+                            // renders as the container alone (`displayName`'s
+                            // `name == 'new'` arm answers the enclosing name).
+                            // A provisional head never
                             // rewritten stays at the container spelling — the
                             // unnamed face is never visited (named-only gate).
                             let container_text = self.strings.resolve(container);
-                            let display = format!("{container_text}.{name_text}");
+                            let display = if name_text == "new" {
+                                container_text.to_string()
+                            } else {
+                                format!("{container_text}.{display_text}")
+                            };
                             self.stage_usage(SemanticCode::UnusedElement, site.range, &display);
                         }
                     }
@@ -1349,7 +1366,13 @@ impl<'a> Engine<'a> {
                     SemanticCode::UnusedElement
                 };
                 let name_text = self.strings.resolve(spelling).to_string();
-                self.stage_usage(code, range, &name_text);
+                // The `{0}` argument is the element `displayName`: never the
+                // setter's `=` suffix.
+                let display_text = match name_text.strip_suffix('=') {
+                    Some(bare) => bare.to_string(),
+                    None => name_text.clone(),
+                };
+                self.stage_usage(code, range, &display_text);
             }
         }
         // The element-attributed pool replaces the raw spelling set for the
