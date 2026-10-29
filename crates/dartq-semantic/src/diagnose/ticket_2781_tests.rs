@@ -45,7 +45,28 @@ fn invocation_rows(report: &FileReport) -> Vec<&'static str> {
 /// function-form spelling reduction), NOT in this invocation face — this
 /// pin is the cluster's repro and flips green the moment the capture
 /// carries the promotion.
-#[ignore = "dominant-cluster repro: flow promotion capture has no `is Function(Object)` step for a closure-read parameter — the owning face is dartq-flow's is-test promotion/type-capture, not this invocation face"]
+///
+/// #2783 evidence (flow pin
+/// `dartq_flow::tests::closure_read_captured_parameter_promotes_through_the_is_test`,
+/// green): the flow promotion IS recorded — the invoked callee's
+/// `FlowFact::ReadType` row carries the promoted `Base::Function` chain
+/// head. The blind face is this crate's consumer chain: the staged
+/// translation degrades the signature-less function head to
+/// `Ty::Unknown` (`staged_promotion_typed`, diagnose/types.rs, the #2174
+/// substitution — the semantic `Ty::Function` needs an interned
+/// `FnShapeId` the flow row does not carry), and the deferred invocation
+/// face answers non-callable on Unknown
+/// (`apply_deferred_invocation_faces`, diagnose/row_resolution.rs — its
+/// `Ty::Function => callable` arm is unreachable for flow-staged rows).
+/// The consumer fix (spell or mark the function-form promotion as
+/// callable at the deferred face) belongs to the semantic lane and flips
+/// this pin. Fixture fidelity note: the co19 original declares
+/// `Object error` (Utils/async_utils.dart:169) — the oracle's promotion
+/// step is valid only from a supertype of `dynamic Function(Object)`;
+/// when the consumer fix lands, keep this fixture oracle-faithful (the
+/// `Err` spelling admits no promotion step and the oracle itself
+/// reports there).
+#[ignore = "#2783: flow records the promotion (ReadType carries Base::Function — flow pin green); the semantic consumer chain is blind to it: staged_promotion_typed degrades the signature-less function head to Ty::Unknown (#2174) and apply_deferred_invocation_faces answers non-callable on Unknown. Fix the consumer face (semantic lane) to flip this pin; keep the fixture oracle-faithful (co19 declares Object error, not Err)."]
 #[test]
 fn closure_read_capture_promotes_for_the_invocation() {
     let report = report_ops(

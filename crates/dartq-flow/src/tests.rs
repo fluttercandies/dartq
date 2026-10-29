@@ -7732,6 +7732,51 @@ fn uncaptured_variable_still_promotes() {
     assert_eq!(promoted_tys(source).len(), 1, "{source:?}");
 }
 
+/// The co19 `Utils/async_utils.dart:177-185` shape (#2783's dominant
+/// cluster): a closure READS the enclosing function's parameter and
+/// type-tests it `is Function(Object)` INSIDE the closure, then invokes
+/// it. The official capture model records only WRITES as `captured` —
+/// reads ride `readCaptured` (upstream Dart SDK source,
+/// pkg/_fe_analyzer_shared/lib/src/type_inference/assigned_variables.dart:119-126,
+/// `deferNode`'s closure arm) — and the type-check promotion bails on the
+/// write-capture alone (`tryPromoteForTypeCheck`'s `info.writeCaptured`
+/// check, flow_analysis.dart:3189-3191), so the read-only captured
+/// parameter promotes and the invoked read carries the promoted face.
+/// dartq's mirror: the closure entry's conservative join feeds the
+/// closure's own writes as the capture half (`Interp::exec_begin`), the
+/// is-test gate skips only a `VarModel::captured` model, and the
+/// promotion lands as the chain head the [`FlowFact::ReadType`] row
+/// carries — the signature-less `Base::Function` face, the name-level
+/// lattice's spelling of the tested function form. The write-captured
+/// mirror is [`write_captured_variable_never_promotes`].
+#[test]
+fn closure_read_captured_parameter_promotes_through_the_is_test() {
+    let source = concat!(
+        "void run(void Function() action) {}\n",
+        "void f(Object error) {\n",
+        "  run(() {\n",
+        "    if (error is Function(Object)) {\n",
+        "      error(0);\n",
+        "    }\n",
+        "  });\n",
+        "}\n",
+    );
+    let call = source.find("error(0)").unwrap() as u32;
+    let ty = facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, ty)),
+            _ => None,
+        })
+        .find(|(offset, _)| *offset == call)
+        .map(|(_, ty)| ty)
+        .expect("read row at the invoked callee");
+    assert!(
+        matches!(ty.base, crate::ty::Base::Function) && !ty.nullable,
+        "the read-only captured parameter promotes to the function face: {source:?}"
+    );
+}
+
 /// An unknown-typed `??=` RHS writes the official's InvalidType face: it
 /// never PROMOTES (the valid-step gate's mutual-subtype check refuses the
 /// unknown), but it also never DEMOTES — `InvalidType <: everything`
