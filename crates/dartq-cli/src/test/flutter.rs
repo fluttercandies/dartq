@@ -388,11 +388,13 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                 .and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key)))
         })
         .collect();
+    let mut replayed_suites: Vec<PathBuf> = Vec::new();
     for (index, events) in replayed.into_iter().enumerate() {
         match events {
             Some(events) => {
                 slots[index] = Some(events);
                 stats.replayed += 1;
+                replayed_suites.push(plan.suites[index].abs.clone());
             }
             None => to_run.push(index),
         }
@@ -486,6 +488,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         tool_stderr = outcome.stderr;
     }
 
+    // Replayed suites keep durations rows recorded before they ever replayed
+    // (compile-era spans); drop those rows so they stop distorting the
+    // longest-first dispatch order and the durations table.
+    purge_replayed_durations(root, &replayed_suites);
     if let Some(cache) = cache.as_mut() {
         let indices: Vec<usize> = staged.keys().copied().collect();
         let files: Vec<PathBuf> = indices
@@ -1118,6 +1124,38 @@ fn block_duration(events: &[Json]) -> Option<u64> {
     Some(last.saturating_sub(first))
 }
 
+/// Drop durations rows for `replayed` suites (absolute paths): a replayed
+/// suite's row was written by a run that executed it under a different
+/// shape (typically a compile-era span), and keeping it distorts the
+/// longest-first dispatch order and the durations table for future runs.
+/// Rows of suites outside this run's selection are untouched; best effort —
+/// a read or write failure only costs balance on the next run.
+fn purge_replayed_durations(root: &Path, replayed: &[PathBuf]) {
+    if replayed.is_empty() {
+        return;
+    }
+    // The same path Durations::load resolves (private in dartq-test).
+    let path = root.join(".dart_tool").join("dartq").join("test").join("durations.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(mut millis) = serde_json::from_slice::<std::collections::BTreeMap<String, u64>>(&bytes) else {
+        return;
+    };
+    let before = millis.len();
+    for suite in replayed {
+        if let Ok(rel) = suite.strip_prefix(root) {
+            millis.remove(&rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    if millis.len() == before {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(&millis) {
+        let _ = dartq_test::stamp::write_atomic(&path, &bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,5 +1406,37 @@ mod tests {
             flutter_dart(Path::new("/sdk/bin/flutter")),
             PathBuf::from("/sdk/bin/cache/dart-sdk/bin/dart")
         );
+    }
+
+    /// Rows for suites the run replayed are stale by definition (recorded
+    /// under a different execution shape): they are dropped; rows of suites
+    /// that did execute, or that the run did not touch at all, survive.
+    #[test]
+    fn durations_purge_drops_only_replayed_rows() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let durations = root.join(".dart_tool/dartq/test/durations.json");
+        fs::create_dir_all(durations.parent().expect("dir")).expect("dir");
+        fs::write(
+            &durations,
+            br#"{"test/a_test.dart":4701,"test/b_test.dart":120,"test/c_test.dart":30}"#,
+        )
+        .expect("write");
+        let replayed = [root.join("test/a_test.dart"), root.join("test/c_test.dart")];
+        purge_replayed_durations(&root, &replayed);
+        let millis: std::collections::BTreeMap<String, u64> =
+            serde_json::from_slice(&fs::read(&durations).expect("read")).expect("json");
+        assert_eq!(millis.len(), 1);
+        assert_eq!(millis["test/b_test.dart"], 120, "dispatched suite keeps its row");
+        // A suite outside the package cannot forge a key.
+        purge_replayed_durations(&root, &[PathBuf::from("/elsewhere/d_test.dart")]);
+        let millis: std::collections::BTreeMap<String, u64> =
+            serde_json::from_slice(&fs::read(&durations).expect("read")).expect("json");
+        assert_eq!(millis.len(), 1);
+        // No file, or nothing to drop, is a no-op.
+        fs::remove_file(&durations).expect("rm");
+        purge_replayed_durations(&root, &replayed);
+        assert!(!durations.exists());
+        purge_replayed_durations(&root, &[]);
     }
 }

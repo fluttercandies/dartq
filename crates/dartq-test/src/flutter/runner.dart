@@ -446,9 +446,11 @@ Future<void> main(List<String> args) async {
       }));
   await executable.main((host.config['args']! as List<Object?>).cast<String>());
   final int code = exitCode;
-  for (final _Tester tester in List<_Tester>.of(host.testers)) {
-    await tester.stop();
-  }
+  // Kill every tester at once and wait for all of their streams to drain:
+  // serial stop()s would stack each tester's shutdown latency on the tail.
+  await Future.wait(<Future<void>>[
+    for (final _Tester tester in List<_Tester>.of(host.testers)) tester.stop(),
+  ]);
   await host.server.close(force: true);
   await stdout.flush();
   exit(code);
