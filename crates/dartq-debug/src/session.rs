@@ -1818,7 +1818,11 @@ impl DebugSession {
         if self.child_alive()? && self.flutter_child {
             self.stop_flutter_child();
             if self.child_alive()? {
+                #[cfg(unix)]
                 self.signal_child_group(libc::SIGTERM)?;
+                // windows: no process groups, so the SIGTERM rung is a no-op.
+                #[cfg(not(unix))]
+                self.signal_child_term()?;
                 self.wait_child_grace(Duration::from_secs(10))?;
             }
         }
@@ -1900,11 +1904,6 @@ impl DebugSession {
         {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn signal_child_group(&mut self) -> Result<()> {
         Ok(())
     }
 
