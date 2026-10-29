@@ -499,6 +499,20 @@ Future<void> main(List<String> args) async {
   }
   host.server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   host.server.listen(host.accept);
+  // Pre-warm one tester against the first chunk: its ~0.5 s spawn
+  // overlaps `executable.main`'s own startup, so the first suite finds an
+  // idle tester rather than paying the spawn in its window. A chunk that
+  // fails to compile (or a suite on a different chunk) is already
+  // handled by `acquire`'s existing paths — a dead tester frees its slot,
+  // a chunk-mismatch starts another.
+  if (host.chunks.isNotEmpty) {
+    final _Tester prewarm = _Tester(host, 0)..busy = false;
+    host.testers.add(prewarm);
+    unawaited(prewarm.start().catchError((Object _) {
+      // A failed prewarm costs nothing — the suite's acquire restarts one.
+      prewarm.dead = true;
+    }));
+  }
   registerPlatformPlugin(<Runtime>[Runtime.vm], () => _Platform(host));
   registerReporter(
       'json',
