@@ -782,15 +782,17 @@ impl FeatureGrants {
 
     /// The feature set `file` analyzes under at `version`: the version
     /// baseline with the owning owner's whitelist grants merged in, plus —
-    /// for package files whose owner carries no whitelist entry — the
-    /// governing options file's `enable-experiment` flags (#936).
+    /// for package files whose owner carries no whitelist entry, and for
+    /// ownerless files under a declaring options entry — the governing
+    /// options file's `enable-experiment` flags (#936).
     ///
     /// The options flags ride the *replace* posture, probed on the 3.13.1
     /// oracle (probe corpus: a grants-bearing package keeps its gate row
     /// with the flag requested, a grant-free one lifts): an
     /// `allowed_experiments.json` entry for the package replaces the
-    /// options experiments outright, and `dart:` libraries and ownerless
-    /// files never read them. The vendored 3.15-main provider
+    /// options experiments outright, and `dart:` libraries never read them,
+    /// while an ownerless file reads them through its governing entry (the
+    /// official `nonPackageFeatureSet` face). The vendored 3.15-main provider
     /// (`feature_set_provider.dart:59-79`) agrees — grants or context
     /// features, never both — so the pinned choice is uncontested. Flags
     /// re-restrict at the file's own version
@@ -908,10 +910,16 @@ impl FeatureGrants {
     }
 
     /// The options-flag merge tail of [`Self::granted`]: the deepest
-    /// governing options entry's decoded flags, applied only where the
-    /// oracle reads them (a package file with no whitelist entry; the
-    /// probe-pinned replace posture). No-op without options experiments —
-    /// the dominant workspace shape pays one boolean test.
+    /// governing options entry's decoded flags, applied where the oracle
+    /// reads them — a package file with no whitelist entry (the
+    /// probe-pinned replace posture), and an ownerless file under a
+    /// declaring options entry (the official `nonPackageFeatureSet`, set
+    /// from the same `enable-experiment` section by
+    /// `analysis_options_parser.dart`'s `_applyEnableExperiments` and read
+    /// in `file_state.dart` for every file the package table does not own;
+    /// the conformance chunk shape — nested case roots under a package-less
+    /// chunk floor — is exactly this face). No-op without options
+    /// experiments — the dominant workspace shape pays one boolean test.
     fn with_options_experiments(
         &self,
         experiments: &AllowedExperiments,
@@ -927,13 +935,22 @@ impl FeatureGrants {
         let Some(path) = files.path(file) else {
             return set;
         };
-        // `dart:`-owned files answer from their library's whitelist; a file
-        // outside every package keeps the plain baseline — the oracle reads
-        // context features only through the package branch.
+        // `dart:`-owned files answer from their library's whitelist.
         if path.starts_with(self.sdk_lib_root.as_ref()) {
             return set;
         }
         let Some(identity) = packages.containing(path) else {
+            // An ownerless file still reads the governing options entry's
+            // flags (`nonPackageFeatureSet`); with no declaring entry in its
+            // ancestry it keeps the plain baseline — the CLI context base
+            // rides owned files only.
+            if let Some(flags) = deepest_containing(&self.options_experiments, path)
+                .and_then(|entry| entry.as_deref())
+            {
+                for &feature in flags {
+                    set = set.with_experiment_for_version(version, feature);
+                }
+            }
             return set;
         };
         if experiments.for_package(identity.name.as_str()).is_some() {
@@ -2998,6 +3015,60 @@ mod tests {
         assert!(
             format!("{err:?}").contains("not a non-empty path relative"),
             "the degenerate-uri rule fires: {err:?}"
+        );
+    }
+
+    /// An ownerless file under a declaring options entry reads the entry's
+    /// flags — the official `nonPackageFeatureSet` face
+    /// (`analysis_options_parser.dart` `_applyEnableExperiments` sets it
+    /// from the same `enable-experiment` section; `file_state.dart` reads
+    /// it for every file the package table does not own). The conformance
+    /// census chunk — nested case roots, each with its own options file,
+    /// under a package-less chunk floor — is exactly this shape, and the
+    /// pre-fix early return dropped the flags there (`augment` scanned as
+    /// an identifier). Without a declaring entry in its ancestry the
+    /// baseline stands; the CLI context base stays an owned-file face.
+    #[test]
+    fn ownerless_file_reads_declaring_options_experiments() {
+        let tree = GrantTree::new("opts");
+        let sdk = tree.sdk(false);
+        let packages = IdentityTable::basic(&tree.root, None).expect("bare table");
+        let case_dir = tree.root.join("case");
+        std::fs::create_dir_all(case_dir.join("lib")).expect("dir");
+        std::fs::write(
+            case_dir.join("analysis_options.yaml"),
+            "analyzer:\n  enable-experiment:\n    - augmentations\n",
+        )
+        .expect("options file");
+        let config =
+            dartq_pub::PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+                .expect("empty config");
+        let options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>> =
+            [(case_dir.clone(), Arc::new(crate::analysis_options::AnalysisOptions::load(
+                &case_dir.join("analysis_options.yaml"),
+                &config,
+                &case_dir,
+            )))]
+            .into_iter()
+            .collect();
+        let grants = FeatureGrants::new(&sdk, "vm", &packages, &options, &[]);
+        let mut files = FileTable::new();
+        let file = files.intern(&case_dir.join("lib/test.dart"));
+        let version = LanguageVersion::new(3, 13);
+
+        let declared = grants.granted(&sdk.platform_metadata, &packages, &files, file, version);
+        assert!(
+            declared.is_enabled(dartq_language::Feature::Augmentations),
+            "a declaring options entry lifts the experiment for an ownerless file"
+        );
+
+        // The unregistered sibling keeps the plain baseline: no declaring
+        // entry anywhere in its ancestry, and the bare table grants nothing.
+        let outside = files.intern(&tree.root.join("elsewhere/lib/test.dart"));
+        let plain = grants.granted(&sdk.platform_metadata, &packages, &files, outside, version);
+        assert!(
+            !plain.is_enabled(dartq_language::Feature::Augmentations),
+            "the baseline stands without a declaring entry"
         );
     }
 }
