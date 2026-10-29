@@ -1,0 +1,26 @@
+// The oracle-shape spans for `non_constant_identifier_names`: the row
+// anchors at the identifier token's full span (`rule.reportLintForToken`),
+// never a width-0 mark. Cases mirror the conformance corpus faces
+// (NonConstantIdentifierNamesPatternsTest / the declaration face).
+//- lint: non_constant_identifier_names
+
+//- case: test_localVariable
+//- file: /lib/test.dart
+
+void f() {
+  var [!BarBaz!] = 1;
+}
+
+//- case: test_patternIfStatement
+//- file: /lib/test.dart
+
+void f(int x) {
+  if (x case var [!AB!]) {
+    print(AB);
+  }
+}
+
+//- case: test_parameter
+//- file: /lib/test.dart
+
+void g(int [!foo_bar!]) {}

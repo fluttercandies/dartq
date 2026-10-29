@@ -54,28 +54,24 @@ fn invocation_rows(report: &FileReport) -> Vec<&'static str> {
 /// translation degrades the signature-less function head to
 /// `Ty::Unknown` (`staged_promotion_typed`, diagnose/types.rs, the #2174
 /// substitution — the semantic `Ty::Function` needs an interned
-/// `FnShapeId` the flow row does not carry), and the deferred invocation
-/// face answers non-callable on Unknown
-/// (`apply_deferred_invocation_faces`, diagnose/row_resolution.rs — its
-/// `Ty::Function => callable` arm is unreachable for flow-staged rows).
-/// The consumer fix (spell or mark the function-form promotion as
-/// callable at the deferred face) belongs to the semantic lane and flips
-/// this pin. Fixture fidelity note: the co19 original declares
-/// `Object error` (Utils/async_utils.dart:169) — the oracle's promotion
-/// step is valid only from a supertype of `dynamic Function(Object)`;
-/// when the consumer fix lands, keep this fixture oracle-faithful (the
-/// `Err` spelling admits no promotion step and the oracle itself
-/// reports there).
-#[ignore = "#2783: flow records the promotion (ReadType carries Base::Function — flow pin green); the semantic consumer chain is blind to it: staged_promotion_typed degrades the signature-less function head to Ty::Unknown (#2174) and apply_deferred_invocation_faces answers non-callable on Unknown. Fix the consumer face (semantic lane) to flip this pin; keep the fixture oracle-faithful (co19 declares Object error, not Err)."]
+/// `FnShapeId` the flow row does not carry). The consumer face answers
+/// the shapeless head through the promotion-function-read set
+/// (`promotion_function_reads`, drained by
+/// `apply_deferred_invocation_faces`): a read the flow promoted to a
+/// function form is callable by the resolver's own decision order
+/// (function_expression_invocation_resolver.dart:67-79 — the promoted
+/// static type is a `FunctionTypeImpl`). Fixture fidelity: the co19
+/// original declares `Object error` (Utils/async_utils.dart:169) — the
+/// promotion step is valid only from a supertype of
+/// `dynamic Function(Object)`.
 #[test]
 fn closure_read_capture_promotes_for_the_invocation() {
     let report = report_ops(
         r#"
-class Err {}
 void run(void Function() action) {
   action();
 }
-void f(Err error) {
+void f(Object error) {
   run(() {
     if (error is Function(Object)) {
       error(0);

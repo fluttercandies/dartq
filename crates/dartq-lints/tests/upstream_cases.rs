@@ -48,6 +48,14 @@ upstream!(
     leading_newlines_in_multiline_strings,
     "leading_newlines_in_multiline_strings"
 );
+upstream!(
+    no_leading_underscores_for_local_identifiers,
+    "no_leading_underscores_for_local_identifiers"
+);
+upstream!(
+    non_constant_identifier_names,
+    "non_constant_identifier_names"
+);
 upstream!(prefer_is_not_empty, "prefer_is_not_empty");
 upstream!(prefer_is_not_operator, "prefer_is_not_operator");
 upstream!(unnecessary_new, "unnecessary_new");

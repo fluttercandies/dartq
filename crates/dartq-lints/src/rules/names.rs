@@ -355,6 +355,11 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
     }
 
     /// `hasLeadingUnderscore && !isJustUnderscores` (ascii_utils.dart:58-79).
+    /// The row anchors at the identifier itself (`rule.reportLintForToken`):
+    /// the start of the checked token plus the lexeme's own width — the
+    /// payload token is compound in the pattern/catch-formal shapes (its
+    /// span covers surrounding markup), while the name text is exactly the
+    /// lexeme (Dart identifiers are ASCII-only, the scanner's contract).
     fn report_underscored(c: &mut Check<'_>, token: u32) {
         let lexeme = c.lexeme(token);
         if !super::has_leading_underscore(lexeme) || super::is_just_underscores(lexeme) {
@@ -363,7 +368,7 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
         let Some(start) = super::utf16_start_of(c, token) else {
             return;
         };
-        c.report(start..start, &[lexeme]);
+        c.report(start..start + lexeme.len() as u32, &[lexeme]);
     }
 }
 
@@ -653,10 +658,14 @@ pub(crate) mod non_constant_identifier_names {
         if super::is_lower_camel_case(lexeme) {
             return;
         }
+        // The row anchors at the identifier itself
+        // (`rule.reportLintForToken`): the token's start plus the lexeme's
+        // own width — the payload token is compound in the pattern and
+        // formal shapes, while the name text is exactly the lexeme.
         let Some(start) = super::utf16_start_of(c, token) else {
             return;
         };
-        c.report(start..start, &[lexeme]);
+        c.report(start..start + lexeme.len() as u32, &[lexeme]);
     }
 }
 

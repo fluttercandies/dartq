@@ -2300,7 +2300,14 @@ impl<'a> Engine<'a> {
         // must not adjudicate `onTimeout: () => null`).
         let found = self.frames.iter().rev().find_map(|f| match &f.kind {
             FrameKind::Executable { ret, is_async, .. } => Some(match ret {
-                Some(ret) => Ok((ret.ty, ret.host, ret.name, ret.ctor, *is_async)),
+                Some(ret) => Ok((
+                    ret.ty,
+                    ret.host,
+                    ret.name,
+                    ret.display,
+                    ret.ctor,
+                    *is_async,
+                )),
                 None => Err(*is_async),
             }),
             _ => None,
@@ -2308,7 +2315,7 @@ impl<'a> Engine<'a> {
         let Some(found) = found else {
             return;
         };
-        let (to, host, name, ctor, is_async) = match found {
+        let (to, host, name, display, ctor, is_async) = match found {
             Ok(latched) => latched,
             Err(is_async) => {
                 self.check_closure_return(from, range, from_literal, is_async);
@@ -2358,6 +2365,7 @@ impl<'a> Engine<'a> {
                 StagedKind::Return {
                     host,
                     name,
+                    display,
                     ctor,
                     is_async,
                 },
@@ -2404,6 +2412,7 @@ impl<'a> Engine<'a> {
                     // The closure template has no name slot; the staging's
                     // third placeholder renders the interned empty string.
                     name: self.intern(""),
+                    display: None,
                     ctor: false,
                     is_async,
                 },

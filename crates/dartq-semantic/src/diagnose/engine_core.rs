@@ -223,6 +223,7 @@ impl<'a> Engine<'a> {
             deferred_call_rebinds: Vec::new(),
             deferred_bare_rebinds: Vec::new(),
             deferred_invocation_faces: Vec::new(),
+            promotion_function_reads: FxHashSet::default(),
             rebound_locals: FxHashMap::default(),
             clause_anchor: None,
             primary_constructors_enabled,
@@ -372,6 +373,7 @@ impl<'a> Engine<'a> {
             ctor_frame_len: 0,
             open_toplevel_site: None,
             open_member_setter: false,
+            open_member_accessor: false,
             open_member_static: false,
             pending_label: None,
             last_block_end: None,
@@ -1202,9 +1204,15 @@ impl<'a> Engine<'a> {
                 StagedKind::Assignment => (SemanticCode::InvalidAssignment, None),
                 StagedKind::Argument => (SemanticCode::ArgumentTypeNotAssignable, None),
                 StagedKind::Yield => (SemanticCode::YieldOfInvalidType, None),
-                StagedKind::Return { host, name, .. } => {
-                    (SemanticCode::ReturnOfInvalidType(host), Some(name))
-                }
+                StagedKind::Return {
+                    host,
+                    name,
+                    display,
+                    ..
+                } => (
+                    SemanticCode::ReturnOfInvalidType(host),
+                    Some(display.unwrap_or(name)),
+                ),
             };
             // The oracle anchors the assignability face at the whole
             // right-hand expression — a call operand reports over the
@@ -4696,7 +4704,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn initializer_node_span(&self, name_range: SourceRange) -> SourceRange {
         let toks = self.tokens.as_slice();
         let mut at = toks.partition_point(|t| t.utf16_offset < name_range.end());
-        if !toks.get(at).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Equal) {
+        if !toks.get(at).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Eq) {
             return name_range;
         }
         // `this.x = v` node offset: the keyword two tokens before the name
@@ -4715,16 +4723,16 @@ impl<'a> Engine<'a> {
         while let Some(t) = toks.get(at) {
             match t.kind {
                 dartq_scanner::TokenKind::OpenParen
-                | dartq_scanner::TokenKind::OpenBracket
-                | dartq_scanner::TokenKind::OpenBrace => depth += 1,
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => depth += 1,
                 dartq_scanner::TokenKind::CloseParen
-                | dartq_scanner::TokenKind::CloseBracket
-                | dartq_scanner::TokenKind::CloseBrace
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly
                     if depth > 0 =>
                 {
                     depth -= 1;
                 }
-                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseBrace
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseCurly
                     if depth == 0 =>
                 {
                     break;
@@ -4736,7 +4744,7 @@ impl<'a> Engine<'a> {
                 }
                 _ => {}
             }
-            end = self.utf16_of(t.byte_offset + t.byte_len);
+            end = self.utf16_of((t.byte_offset + t.byte_len) as usize);
             at += 1;
         }
         SourceRange {

@@ -1390,6 +1390,15 @@ pub fn fold_unit_with_ops<'t>(
             // staged type folds through a type alias first (`type_of`
             // answers the resolved interface type).
             FlowFact::ReadType { span, ty, args } => {
+                // The signature-less function head joins the deferred
+                // invocation face's callable set before the type row
+                // degrades to `Unknown` — a read the flow promoted to a
+                // function form IS callable (the resolver's promoted
+                // `FunctionTypeImpl` answer), and the `Ty` space has no
+                // spelling for the shapeless head.
+                if ty.base == FlowBase::Function {
+                    engine.promotion_function_reads.insert(span.range.offset);
+                }
                 let staged = staged_promotion_typed(
                     ty,
                     args,
@@ -4901,6 +4910,17 @@ mod ticket_2484_tests;
 #[cfg(test)]
 mod ticket_2489_tests;
 
+/// The #2778 pins: the `unnecessary_type_check` emission face matches the
+/// oracle's rows exactly — the whole-expression span (`.at(node)`, the
+/// operand's start through the written type's end, the type-arguments
+/// group included), the strict subtype gate (the declared-edge lattice
+/// answers the constant-true question; the assignability face's
+/// nullable-target Right Top never does — `num? a; a is int?` stays
+/// silent), and the keyword operand (`this`/`super` typed by the
+/// enclosing container, the row anchored at the keyword).
+#[cfg(test)]
+mod ticket_2778_tests;
+
 /// The #2497 pins: the extension-applicability instantiated-bound gate —
 /// an `on`-clause argument spelling the applied face's own parameter
 /// binds the receiver's argument and must satisfy the parameter's
@@ -5044,6 +5064,13 @@ mod ticket_2777_tests;
 /// arms).
 #[cfg(test)]
 mod ticket_2781_tests;
+
+/// The #2782 key-only-diff sweep's pins: one exact oracle row per fixed
+/// code — the span/message conventions (`displayName` shapes, the Label
+/// node, the whole-initializer node, the accessor host word, the `Type`
+/// literal face, the `()`-parenthesized witness).
+#[cfg(test)]
+mod ticket_2782_tests;
 
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.

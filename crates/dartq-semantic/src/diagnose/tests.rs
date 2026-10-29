@@ -6341,7 +6341,7 @@ fn sealed_class_switch_reports_missing_subclass() {
     );
     assert_eq!(
         missing.diagnostics[1].message,
-        "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'B'."
+        "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'B()'."
     );
 
     let covered = report(
@@ -7113,7 +7113,7 @@ fn enum_and_mixin_edges_split_the_sealed_class() {
     );
     assert_eq!(
         missing.diagnostics[0].message,
-        "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'M'."
+        "The type 'S' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'M()'."
     );
 }
 

@@ -3244,6 +3244,7 @@ impl<'a> Engine<'a> {
                 ty,
                 host,
                 name,
+                display: None,
                 name_span,
                 ctor: false,
             });
@@ -3307,7 +3308,25 @@ impl<'a> Engine<'a> {
     /// constructor wording (`returnOfInvalidTypeFromConstructor`: "can't
     /// be returned from the constructor 'E'") — a factory is a constructor
     /// element, never a method.
-    pub(crate) fn latch_factory_return(&mut self, container: StringId, name_span: SourceRange) {
+    pub(crate) fn latch_factory_return(
+        &mut self,
+        container: StringId,
+        head: StringId,
+        name_span: SourceRange,
+    ) {
+        // The message's `{2}` is the constructor element's `displayName`: a
+        // named factory head renders qualified (`C.named`), the container
+        // spelling and the `new` recovery head render bare.
+        let container_text = self.strings.resolve(container);
+        let head_text = self.strings.resolve(head);
+        let (name, display) = if head_text == container_text || head_text == "new" {
+            (container, None)
+        } else {
+            (
+                container,
+                Some(self.strings.intern(&format!("{container_text}.{head_text}"))),
+            )
+        };
         if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable { ret, .. } = &mut frame.kind
             && ret.is_none()
@@ -3315,7 +3334,8 @@ impl<'a> Engine<'a> {
             *ret = Some(ExecReturn {
                 ty: Ty::named(container),
                 host: ExecKind::Constructor,
-                name: container,
+                name,
+                display,
                 name_span,
                 ctor: true,
             });

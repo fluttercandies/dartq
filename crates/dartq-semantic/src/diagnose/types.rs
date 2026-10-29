@@ -537,6 +537,12 @@ pub(crate) struct ExecReturn {
     pub(crate) ty: Ty,
     pub(crate) host: ExecKind,
     pub(crate) name: StringId,
+    /// The message face's display name (`return_of_invalid_type`'s `{2}`):
+    /// a named factory qualifies its selector (`C.named`,
+    /// `ConstructorElement.displayName`). `None` keeps the bare `name` —
+    /// the identity key the formal tables and the self-reference credit
+    /// read stays untouched.
+    pub(crate) display: Option<StringId>,
     /// The declaring name's own range — the `body_might_complete_normally`
     /// family's anchor (the oracle reports at the declaring name for every
     /// shape that latches a return here; the block `{` is the closure
@@ -2653,6 +2659,16 @@ pub(crate) struct Engine<'a> {
     /// `invocation_of_non_function` row defers and re-decides on the
     /// flow face there.
     pub(crate) deferred_invocation_faces: Vec<(SourceRange, StringId)>,
+    /// The flow read rows whose promoted face is the signature-less
+    /// `Function` head (`FlowBase::Function`), keyed by the read's
+    /// offset. The signature-less head has no semantic `Ty` spelling (the
+    /// shape needs an interned `FnShapeId` the flow row cannot carry —
+    /// the read-type row itself degrades to `Unknown`), so the deferred
+    /// invocation face consults this set: a read the flow promoted to a
+    /// function form IS callable
+    /// (function_expression_invocation_resolver.dart:67-79 — the
+    /// promoted static type's `FunctionTypeImpl` answer).
+    pub(crate) promotion_function_reads: FxHashSet<u32>,
     /// Implicit-call initializers (`var f = promotedLocal(args)`): the
     /// callee's promoted read re-decides the send's result in pass 2 —
     /// the entry keys the declaring local's name-token offset, the
@@ -3397,6 +3413,11 @@ pub(crate) struct Engine<'a> {
     /// The member declaration's `set` head (`begin_method` latch; the
     /// member site's lookup spelling).
     pub(crate) open_member_setter: bool,
+    /// The member declaration's `get`/`set` head (`begin_method` latch):
+    /// the accessor face — upstream a `PropertyAccessorElement`, whose
+    /// return-check host word is `function`, never `method`
+    /// (error_verifier.dart:164-166, `EnclosingExecutableContext.isFunction`).
+    pub(crate) open_member_accessor: bool,
     /// The member/field declaration's `static` head (`begin_method` /
     /// `begin_fields` latch; the member site's static bit).
     pub(crate) open_member_static: bool,
@@ -4093,6 +4114,9 @@ pub(crate) enum StagedKind {
     Return {
         host: ExecKind,
         name: StringId,
+        /// The message face's display name when it differs from `name`
+        /// (a named factory's qualified `C.named`).
+        display: Option<StringId>,
         ctor: bool,
         is_async: bool,
     },

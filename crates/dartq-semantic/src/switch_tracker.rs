@@ -1041,7 +1041,17 @@ impl ExhaustivenessWorld for NameWorld<'_> {
 
     fn witness_text(&self, ty: &NameTy, fields: &[(Key, String)]) -> String {
         if fields.is_empty() {
-            return self.ty_text(ty);
+            // The instance-shape witness always carries the
+            // constructor-form parentheses, empty or not
+            // (`_BaseStaticType.witnessToDart`, static_type.dart:214-239 —
+            // `typeToDart` then `(` `)` even with no fields); the value
+            // faces (`null`, `_`, `true`, `E.c`) render bare.
+            return match ty {
+                NameTy::Named(..) | NameTy::NamedArgs(..) | NameTy::TopNonNullable => {
+                    format!("{}()", self.ty_text(ty))
+                }
+                _ => self.ty_text(ty),
+            };
         }
         let inner = fields
             .iter()

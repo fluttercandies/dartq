@@ -312,6 +312,14 @@ impl<'a> Engine<'a> {
     fn apply_deferred_invocation_faces(&mut self) {
         let deferred = std::mem::take(&mut self.deferred_invocation_faces);
         for (span, name) in deferred {
+            // The flow-promoted function form: the read's flow face IS the
+            // `Function` head — callable by definition
+            // (function_expression_invocation_resolver.dart:67-79), even
+            // though the staged type row spells `Unknown` (the shapeless
+            // head has no `Ty`).
+            if self.promotion_function_reads.contains(&span.offset) {
+                continue;
+            }
             let flow_ty = self.read_type_at(span);
             let callable = match flow_ty {
                 Some(ty) => match ty {
@@ -1625,7 +1633,18 @@ impl<'a> Engine<'a> {
                         Some(promoted) => promoted,
                         None => ty,
                     };
-                    if ty == Ty::UNKNOWN && self.sdk_collection_type_literal(row.name) {
+                    if ty == Ty::UNKNOWN && self.sdk_collection_type_literal(row.name)
+                        // The type-literal receiver face (`typedef c = String;
+                        // c > x`, `A < 1`): a bare name resolving to a TYPE
+                        // evaluates to the type object — its static type is
+                        // `Type`, which declares none of the user operators.
+                        // The alias-fold equality guards the shadowed face
+                        // (a local whose type folds from the same name never
+                        // answers here); the SDK-collection stub arm above
+                        // keeps its names-only posture.
+                        || (self.named_type_is_type(row.name)
+                            && ty == self.fold_alias_ty(Ty::named(row.name)))
+                    {
                         let Intent::Operator(_, op_range) = row.intent else {
                             return;
                         };
@@ -1670,7 +1689,11 @@ impl<'a> Engine<'a> {
                     && !Self::synthetic_reference(row.range)
                     && !self.keyword_bare_reference(row.range)
                 {
-                    self.emit_corrected(SemanticCode::UncheckedUseOfNullableValue, row.range, name_text);
+                    self.emit_unchecked_nullable(
+                        row.range,
+                        name_text,
+                        matches!(row.intent, Intent::Invoke),
+                    );
                 }
                 match row.intent {
                     Intent::Invoke => {
@@ -1804,9 +1827,13 @@ impl<'a> Engine<'a> {
                                 entry.kind == MemberKind::Field && !entry.is_static
                             });
                             if !own_field {
+                                // `.at(initializer)` — the whole
+                                // `ConstructorFieldInitializer` node, never
+                                // the bare field name.
+                                let range = self.initializer_node_span(row.range);
                                 self.emit(
                                     SemanticCode::InitializerForNonExistentField,
-                                    row.range,
+                                    range,
                                     name_text,
                                     "",
                                 );
@@ -3231,9 +3258,12 @@ impl<'a> Engine<'a> {
                 };
                 if reports {
                     let name_text = self.strings.resolve(row.name);
+                    // `.at(initializer)` — the whole node span (`x = 'foo'`,
+                    // `this.x = 0`), never the bare field name.
+                    let range = self.initializer_node_span(row.range);
                     self.emit(
                         SemanticCode::InitializerForNonExistentField,
-                        row.range,
+                        range,
                         name_text,
                         "",
                     );
@@ -3302,10 +3332,10 @@ impl<'a> Engine<'a> {
                     // the unchecked row, never an undefined getter).
                     if receiver_nullable {
                         let name_text = self.strings.resolve(row.name);
-                        self.emit_corrected(
-                            SemanticCode::UncheckedUseOfNullableValue,
+                        self.emit_unchecked_nullable(
                             row.range,
                             name_text,
+                            matches!(row.intent, Intent::Invoke),
                         );
                     }
                     // The operator-merged read resolved (#2618): the member
@@ -3363,10 +3393,10 @@ impl<'a> Engine<'a> {
                         FrozenFace::Absent => {
                             let name_text = self.strings.resolve(row.name);
                             if receiver_nullable {
-                                self.emit_corrected(
-                                    SemanticCode::UncheckedUseOfNullableValue,
+                                self.emit_unchecked_nullable(
                                     row.range,
                                     name_text,
+                                    matches!(row.intent, Intent::Invoke),
                                 );
                             } else {
                                 let type_text = self.strings.resolve(report_on).to_string();
@@ -3386,10 +3416,10 @@ impl<'a> Engine<'a> {
                 Walk::Missing => {
                     let name_text = self.strings.resolve(row.name);
                     if receiver_nullable {
-                        self.emit_corrected(
-                            SemanticCode::UncheckedUseOfNullableValue,
+                        self.emit_unchecked_nullable(
                             row.range,
                             name_text,
+                            matches!(row.intent, Intent::Invoke),
                         );
                     } else {
                         let type_text = self.strings.resolve(report_on).to_string();
@@ -3552,10 +3582,10 @@ impl<'a> Engine<'a> {
                 }
                 if receiver_nullable {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_corrected(
-                        SemanticCode::UncheckedUseOfNullableValue,
+                    self.emit_unchecked_nullable(
                         row.range,
                         name_text,
+                        matches!(row.intent, Intent::Invoke),
                     );
                 }
                 self.check_member_unused_result(
@@ -3583,10 +3613,10 @@ impl<'a> Engine<'a> {
             // answers the getter verdict, the write face the pair.
             let name_text = self.strings.resolve(row.name);
             if receiver_nullable {
-                self.emit_corrected(
-                    SemanticCode::UncheckedUseOfNullableValue,
+                self.emit_unchecked_nullable(
                     row.range,
                     name_text,
+                    matches!(row.intent, Intent::Invoke),
                 );
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
@@ -3765,10 +3795,10 @@ impl<'a> Engine<'a> {
         // reaches the `undefined_*` family, whatever the member face the
         // model decided the miss on.
         if receiver_nullable || future_or_nullable {
-            self.emit_corrected(
-                SemanticCode::UncheckedUseOfNullableValue,
+            self.emit_unchecked_nullable(
                 row.range,
                 name_text,
+                matches!(row.intent, Intent::Invoke),
             );
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
@@ -4437,10 +4467,10 @@ impl<'a> Engine<'a> {
             // answers without a dereference question — so the
             // `==`/Object arm below keeps its under-report.
             if receiver_nullable && !self.members.object_members.contains(&row.name) {
-                self.emit_corrected(
-                    SemanticCode::UncheckedUseOfNullableValue,
+                self.emit_unchecked_nullable(
                     row.range,
                     name_text,
+                    matches!(row.intent, Intent::Invoke),
                 );
             }
             return;
@@ -4453,10 +4483,10 @@ impl<'a> Engine<'a> {
         // `unchecked_use_of_nullable_value` code and never reaches the
         // `undefined_*` family.
         if receiver_nullable {
-            self.emit_corrected(
-                SemanticCode::UncheckedUseOfNullableValue,
+            self.emit_unchecked_nullable(
                 row.range,
                 name_text,
+                matches!(row.intent, Intent::Invoke),
             );
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
@@ -5139,10 +5169,10 @@ impl<'a> Engine<'a> {
                 );
                 if !extension_wins {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_corrected(
-                        SemanticCode::UncheckedUseOfNullableValue,
+                    self.emit_unchecked_nullable(
                         row.range,
                         name_text,
+                        matches!(row.intent, Intent::Invoke),
                     );
                 } else {
                     // The nullable-`on` extension resolved the access: the
@@ -5189,10 +5219,10 @@ impl<'a> Engine<'a> {
             // receiver non-null, so `receiver_nullable` is false there.
             ExtensionApp::UnsafeSingle if receiver_nullable => {
                 let name_text = self.strings.resolve(row.name);
-                self.emit_corrected(
-                    SemanticCode::UncheckedUseOfNullableValue,
+                self.emit_unchecked_nullable(
                     row.range,
                     name_text,
+                    matches!(row.intent, Intent::Invoke),
                 );
                 self.note_extension_ref(row);
                 true
@@ -5210,10 +5240,10 @@ impl<'a> Engine<'a> {
                 // the shared code).
                 if receiver_nullable {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_corrected(
-                        SemanticCode::UncheckedUseOfNullableValue,
+                    self.emit_unchecked_nullable(
                         row.range,
                         name_text,
+                        matches!(row.intent, Intent::Invoke),
                     );
                 }
                 true

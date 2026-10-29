@@ -947,6 +947,10 @@ impl ParserListener for DiagnoseListener<'_> {
             .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Identifier);
         let is_setter = get_or_set.and_then(|t| engine.text_of(t)) == Some("set");
         engine.open_member_setter = is_setter;
+        // The accessor face (`get`/`set` head): the return-check host word
+        // reads it (upstream `PropertyAccessorElement` answers `isFunction`,
+        // error_verifier.dart:164-166).
+        engine.open_member_accessor = get_or_set.is_some();
         engine.open_member_static = static_kw.is_some();
         engine.ctor_pending = None;
         engine.open_toplevel_site = None;
@@ -2635,7 +2639,11 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.factory_ret_open = false;
                     engine.factory_head = Some((token.range, false));
                     if let Some((container, _)) = engine.container_context() {
-                        engine.latch_factory_return(container, token.range);
+                        // The written head spelling rides along: a named
+                        // factory's display name is the qualified `C.named`
+                        // (`ConstructorElement.displayName`).
+                        let head = name.unwrap_or(container);
+                        engine.latch_factory_return(container, head, token.range);
                     }
                 }
                 if let Some(name) = name {
@@ -2643,7 +2651,19 @@ impl ParserListener for DiagnoseListener<'_> {
                     // function-typed RETURN annotation's stash is not a
                     // variable's.
                     engine.fn_stash_drop();
-                    engine.latch_return_type(ExecKind::Method, name, token.range);
+                    // The accessor face (`get`/`set`) is a
+                    // `PropertyAccessorElement` upstream — its return-check
+                    // host word is `function`, never `method`
+                    // (`EnclosingExecutableContext.isFunction`,
+                    // error_verifier.dart:164-166; the corpus face:
+                    // `I3 get a => null;` reports `... from the function
+                    // 'a'`).
+                    let host = if engine.open_member_accessor {
+                        ExecKind::Function
+                    } else {
+                        ExecKind::Method
+                    };
+                    engine.latch_return_type(host, name, token.range);
                     // #2430: the method header's declaring name joins the
                     // FAM10 pairing — its type-variable window lands in
                     // `method_exec_bounds` at the close, the bound-aware
@@ -2734,6 +2754,23 @@ impl ParserListener for DiagnoseListener<'_> {
                             *named = true;
                             engine.factory_head_anchors.insert(site, *head);
                         }
+                    }
+                    // The constructor's message display joins the selector
+                    // (`C.named`, `ConstructorElement.displayName`): the
+                    // head event latched the bare container; the selector
+                    // arrives here. A `new` selector keeps the bare face
+                    // (`displayName`'s `name == 'new'` arm answers the
+                    // container).
+                    if engine.strings.resolve(name) != "new"
+                        && let Some(frame) = engine.frames.last_mut()
+                        && let FrameKind::Executable { ret: Some(ret), .. } = &mut frame.kind
+                        && ret.ctor
+                    {
+                        ret.display = Some(engine.strings.intern(&format!(
+                            "{}.{}",
+                            engine.strings.resolve(container),
+                            engine.strings.resolve(name)
+                        )));
                     }
                 }
             }

@@ -3241,10 +3241,12 @@ impl<'a> Engine<'a> {
                 // The empty-name field-initializer face — oracle's
                 // `_checkForInvalidField` walks `''` against the field set,
                 // misses, and reports `initializer_for_non_existent_field`
-                // at the same span.
+                // at the same span: the whole `ConstructorFieldInitializer`
+                // node (`this = 0`), the keyword through the value's end.
+                let range = self.initializer_node_span(token.range);
                 self.emit(
                     SemanticCode::InitializerForNonExistentField,
-                    token.range,
+                    range,
                     "",
                     "",
                 );

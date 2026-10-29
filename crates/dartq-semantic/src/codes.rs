@@ -2537,6 +2537,34 @@ impl SemanticCode {
         self.dtype().severity()
     }
 
+    /// The unchecked-nullable family's per-site problem message (messages.yaml
+    /// `uncheckedMethodInvocationOfNullableValue` /
+    /// `uncheckedPropertyAccessOfNullableValue`, shared name
+    /// `uncheckedUseOfNullableValue`): a method invocation renders the
+    /// invoked-method text, every other access shape the property text —
+    /// upstream picks by the access node's own shape
+    /// (type_property_resolver.dart:128-148).
+    #[must_use]
+    pub fn unchecked_nullable_message(is_method: bool, name: &str) -> String {
+        if is_method {
+            format!("The method '{name}' can't be unconditionally invoked because the receiver can be 'null'.")
+        } else {
+            format!("The property '{name}' can't be unconditionally accessed because the receiver can be 'null'.")
+        }
+    }
+
+    /// The family's per-site correction: the call conditional for a method
+    /// invocation, the access conditional otherwise (messages.yaml, the
+    /// two shared-name variants).
+    #[must_use]
+    pub fn unchecked_nullable_correction(is_method: bool) -> &'static str {
+        if is_method {
+            "Try making the call conditional (using '?.') or adding a null check to the target ('!')."
+        } else {
+            "Try making the access conditional (using '?.') or adding a null check to the target ('!')."
+        }
+    }
+
     /// The verbatim oracle `problemMessage` with placeholders filled.
     #[must_use]
     #[expect(clippy::match_same_arms)] // rows follow the official code listing; bodies coincide by arity
