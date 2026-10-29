@@ -172,21 +172,21 @@ pub struct LibraryFeatureFacts {
     pub has_class_modifiers: bool,
 }
 
-/// The per-library `class-modifiers` posture: each analyzed library's
-/// `featureSet.isEnabled(Feature.class_modifiers)` — the defining file's
-/// settled language version (the `@dart` override applied) resolved through
-/// the feature registry (`class-modifiers`, `enabledIn: 3.0.0`). The
-/// engine builds one map per analyze over its live libraries; libraries
-/// absent from the map answer the modern posture (`true`) — what the
-/// synthetic `dart:` faces (no defining file) and any unattributed node
-/// carry upstream.
+/// The per-library language-feature postures the engine injects per
+/// analyze: `class_modifiers` (`enabledIn: 3.0.0`) and
+/// `wildcard_variables` (`enabledIn: 3.7.0`), each resolved from the
+/// defining file's settled language version (the `@dart` override
+/// applied) through the feature registry. Libraries absent from a map
+/// answer the modern posture (`true`) — what the synthetic `dart:` faces
+/// (no defining file) and any unattributed node carry upstream.
 #[derive(Clone, Debug, Default)]
 pub struct LibraryClassModifiers {
     has: rustc_hash::FxHashMap<LibraryId, bool>,
+    wildcards: rustc_hash::FxHashMap<LibraryId, bool>,
 }
 
 impl LibraryClassModifiers {
-    /// Records `lib`'s posture.
+    /// Records `lib`'s `class-modifiers` posture.
     pub fn insert(&mut self, lib: LibraryId, has_class_modifiers: bool) {
         self.has.insert(lib, has_class_modifiers);
     }
@@ -195,6 +195,19 @@ impl LibraryClassModifiers {
     #[must_use]
     pub fn is_enabled(&self, lib: LibraryId) -> bool {
         self.has.get(&lib).copied().unwrap_or(true)
+    }
+
+    /// Records `lib`'s `wildcard-variables` posture.
+    pub fn insert_wildcards(&mut self, lib: LibraryId, wildcard_variables: bool) {
+        self.wildcards.insert(lib, wildcard_variables);
+    }
+
+    /// `featureSet.isEnabled(Feature.wildcard_variables)` of `lib`
+    /// (dead_code_verifier.dart:73-81's `_wildCardVariablesEnabled` — a
+    /// `// @dart = 3.4` library does not treat a lone `_` as a wildcard).
+    #[must_use]
+    pub fn wildcards_enabled(&self, lib: LibraryId) -> bool {
+        self.wildcards.get(&lib).copied().unwrap_or(true)
     }
 }
 

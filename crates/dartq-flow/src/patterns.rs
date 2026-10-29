@@ -1,9 +1,10 @@
 //! Pattern events: alternative patterns for cases, if-case, and pattern
 //! variable declarations.
 
-use crate::ev::Ev;
+use crate::ev::{Ev, PatternShape};
 use crate::interp::{Expr, Frame, Interp, PatternKind, PatternState, Resolved, VarMeta};
 use crate::ty::{Base, Classification, Ty};
+use dartq_parser::TokenSpan;
 
 impl Interp<'_> {
     /// Handles one pattern-layer event.
@@ -17,13 +18,13 @@ impl Interp<'_> {
         if self.collecting()
             && matches!(
                 ev,
-                Ev::PatternBegin
-                    | Ev::PatternEnd
+                Ev::PatternBegin { .. }
+                    | Ev::PatternEnd { .. }
                     | Ev::ObjectPattern { .. }
-                    | Ev::ShapePattern
+                    | Ev::ShapePattern { .. }
                     | Ev::NullCheckPattern
-                    | Ev::BinaryOrPatternBegin
-                    | Ev::BinaryOrPatternEnd
+                    | Ev::BinaryOrPatternBegin { .. }
+                    | Ev::BinaryOrPatternEnd { .. }
                     | Ev::GuardBegin
                     | Ev::GuardEnd
             )
@@ -34,9 +35,27 @@ impl Interp<'_> {
             Ev::ObjectPattern { name, args } => {
                 self.matched_object_pattern(*name, *args, object_fields_irrefutable(_events, _i));
             }
-            Ev::BinaryOrPatternBegin => self.or_pattern_begin(),
-            Ev::BinaryOrPatternEnd => self.or_pattern_end(),
-            Ev::PatternBegin => {
+            Ev::BinaryOrPatternBegin { operator } => {
+                self.or_frame_begin(*operator);
+                self.or_pattern_begin();
+            }
+            Ev::BinaryOrPatternEnd { end } => {
+                self.or_pattern_end();
+                self.or_frame_end(*end);
+            }
+            Ev::PatternBegin { paren, .. } => {
+                // A parenthesized wrapper is grouping-transparent: no
+                // depth, no context open, no cannot-fail evidence (the
+                // wrapped real node supplies all three).
+                if *paren {
+                    return;
+                }
+                // The clause head parsed a real pattern node: the
+                // cannot-fail kill's evidence gate (a recovered clause
+                // closes its context with zero of these).
+                if let Some(pattern) = self.pattern.as_mut() {
+                    pattern.saw_node = true;
+                }
                 self.pattern_depth += 1;
                 if self.pattern_depth == 1 {
                     if self.pattern.is_some() {
@@ -75,28 +94,46 @@ impl Interp<'_> {
                             self.flush_null_shorts_above(self.consumer_base(1));
                         }
                         self.split_cur();
-                        // An if-case's scrutinee expression is on the stack.
-                        let popped = self.exprs.pop();
-                        let scrutinee = popped.as_ref().and_then(|e| e.reference);
-                        let scrutinee_ty = popped.map(|e| (e.ty, e.args));
+                        // The scrutinee face PEEKS, never pops: an if-case's
+                        // scrutinee expression sits on the stack, but a
+                        // declaration, assignment, or for-in head pattern
+                        // opens before its own value parses — the value
+                        // beneath belongs to an enclosing construct (a
+                        // sibling collection element inside `[0, for (var
+                        // (int i) = 1; ...)]`) and consuming it here
+                        // corrupts that construct's value accounting. The
+                        // pending value is consumed only when an if-case
+                        // adopts the context (`if_case_condition` /
+                        // `ThenBegin`).
+                        let peeked = self.exprs.last().cloned();
+                        let scrutinee = peeked.as_ref().and_then(|e| e.reference);
+                        let scrutinee_ty = peeked.as_ref().map(|e| (e.ty, e.args));
                         let unmatched = self.current.clone().set_unreachable(&mut self.reach);
                         self.vacuous_object = None;
                         self.vacuous_fields.clear();
                         self.pattern_binds.clear();
+                        self.or_join_epoch = 0;
+                        self.or_last_clean = None;
                         self.pattern = Some(PatternState {
                             kind: PatternKind::Decl,
                             unmatched,
                             scrutinee,
                             scrutinee_ty,
+                            scrutinee_pending: peeked.is_some(),
                             guard: None,
                             pre_guard: None,
                             pending_decls: Vec::new(),
                             shadowed: Vec::new(),
+                            cannot_fail: true,
+                            saw_node: false,
                         });
                     }
                 }
             }
-            Ev::PatternEnd => {
+            Ev::PatternEnd { paren } => {
+                if *paren {
+                    return;
+                }
                 self.pattern_depth = self.pattern_depth.saturating_sub(1);
             }
             Ev::ConstantPatternEnd => {
@@ -110,9 +147,18 @@ impl Interp<'_> {
                     return;
                 }
                 let Some(constant) = constant else {
+                    self.stand_down_may_fail();
                     return;
                 };
+                // A NON-reference matched value's equality check joins the
+                // chain upstream all the same (`promoteForEquality` keys on
+                // the matched value's TYPE, not its shape) — the flow
+                // lattice cannot answer it without a promotable reference,
+                // so the undecided face keeps the may-fail posture (the
+                // kill stands down — `case 1:` over `b ? 1 : 2` keeps the
+                // later members live).
                 let Some(var) = self.pattern_scrutinee() else {
+                    self.stand_down_may_fail();
                     return;
                 };
                 // Official `constantPattern_end` →
@@ -120,12 +166,19 @@ impl Interp<'_> {
                 // the implicit `== operand` runs `_equalityCheck` on
                 // (matched value type, constant type).
                 //
-                // A nullability-disjoint pair returns
-                // `_EqualityCheckHasKnownResult(areEqual: false)` — the match
-                // is guaranteed to fail, so the live matched state folds into
-                // the unmatched chain and `current` goes unreachable; the
-                // case body runs dead and anchors its row at the first body
-                // statement.
+                // A nullability-disjoint pair answers per
+                // `_equalityCheck`'s disjoint arm
+                // (flow_analysis.dart:7241-7258): `_GuaranteedNotEqual`
+                // under sound flow — the match is guaranteed to fail, so
+                // the live matched state folds into the unmatched chain
+                // and `current` goes unreachable; the case body runs dead
+                // and anchors its row at the first body statement.
+                // Disabled mode answers `_NoEqualityInformation` ("in
+                // weak mode it might produce an equal result") — the
+                // disjoint arm sits BEFORE the null-check arm upstream,
+                // so even a Null constant over a non-nullable matched
+                // value takes the plain may-fail join below, never the
+                // null-check face.
                 let (matched, matched_args) = {
                     let model = self.current.model(var);
                     (
@@ -133,8 +186,10 @@ impl Interp<'_> {
                         self.promoted_args_of(var, &model),
                     )
                 };
-                if self.disjoint_by_nullability(matched, constant.ty) {
+                let disjoint = self.disjoint_by_nullability(matched, constant.ty);
+                if disjoint && self.sound_flow {
                     let cur = self.current.clone();
+                    self.note_may_fail(&cur);
                     if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
                         let joined = self.join(Some(chain), Some(cur));
                         if let Some(pattern) = self.pattern.as_mut() {
@@ -147,17 +202,39 @@ impl Interp<'_> {
                     // non-null is invisible to the space world, so the flow
                     // row is the sole source. When the DECLARED type is
                     // already disjoint (`case null` over `int`), the
-                    // semantic layer's case-body row owns the report and a
-                    // flow row would duplicate it
-                    // (`switch_same_type_variable_pattern_chain_dead`'s
-                    // `case null` after a total `case A a2` — flow emits
-                    // once, semantic once, unless the kill stands down).
+                    // semantic layer's case-body row owns the report — a
+                    // SWITCH owner only: an if-case or standalone pattern
+                    // context has no semantic switch tracker behind it
+                    // (`if (x case null) {}` over a non-nullable `x`
+                    // folds its then-branch dead here, the oracle's
+                    // empty-then-block row), so the kill stands down
+                    // exclusively for the two switch kinds.
                     let declared = self
                         .vars
                         .get(var as usize)
                         .map_or(Ty::UNKNOWN, |meta| meta.ty);
-                    if !self.disjoint_by_nullability(declared, constant.ty) {
+                    let semantic_owns = self.disjoint_by_nullability(declared, constant.ty)
+                        && matches!(
+                            self.pattern.as_ref().map(|p| p.kind),
+                            Some(PatternKind::Switch | PatternKind::SwitchExpr)
+                        );
+                    if !semantic_owns {
                         self.unreachable_cur();
+                        if matches!(
+                            self.pattern.as_ref().map(|p| p.kind),
+                            Some(PatternKind::IfCase | PatternKind::Decl)
+                        ) {
+                            // The then branch's empty block is itself a
+                            // polled node under this fold (the branch
+                            // marker the `IfBegin` split reads). The
+                            // context still carries the pre-adoption
+                            // `Decl` kind here — the `IfCaseCondition`
+                            // marker flips it a step later — so `Decl`
+                            // marks too: a declaration context never
+                            // feeds an if branch, and the next `IfBegin`
+                            // resets the marker.
+                            self.if_branch_folded = true;
+                        }
                     }
                     return;
                 }
@@ -171,7 +248,11 @@ impl Interp<'_> {
                 // official marks that promoted state unreachable (it can never
                 // be non-null), which the join drops — an always-matching
                 // `case null` leaves the chain's reachability untouched.
-                if self.classify(constant.ty) == Classification::NullOrEquivalent {
+                // The face is mode-blind upstream (`_EqualityCheckIsNullCheck`
+                // rides the literal's null info, past the gated disjoint
+                // arm), and stays reachable only when the pair is NOT
+                // nullability-disjoint.
+                if !disjoint && self.classify(constant.ty) == Classification::NullOrEquivalent {
                     let (non_null, non_null_args) = self.promote_to_non_null(matched, matched_args);
                     let mut if_not_null = if non_null != matched {
                         self.current.clone().finish_type_test(
@@ -200,11 +281,13 @@ impl Interp<'_> {
                         self.pattern.as_ref().map(|p| p.kind),
                         Some(PatternKind::Switch | PatternKind::SwitchExpr)
                     ) {
+                        self.note_may_fail(&if_not_null);
                         if let Some(pattern) = self.pattern.as_mut() {
                             pattern.unmatched = if_not_null;
                         }
                         return;
                     }
+                    self.note_may_fail(&if_not_null);
                     if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
                         let joined = self.join(Some(chain), Some(if_not_null));
                         if let Some(pattern) = self.pattern.as_mut() {
@@ -218,6 +301,7 @@ impl Interp<'_> {
                 // on the same scrutinee state, so `current` joins the
                 // unmatched chain unchanged.
                 let cur = self.current.clone();
+                self.note_may_fail(&cur);
                 if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
                     let joined = self.join(Some(chain), Some(cur));
                     if let Some(pattern) = self.pattern.as_mut() {
@@ -225,7 +309,7 @@ impl Interp<'_> {
                     }
                 }
             }
-            Ev::ShapePattern => {
+            Ev::ShapePattern { shape } => {
                 // A top-level record/list/map/relational pattern can fail
                 // (the shape or comparison decides): the failure arm joins
                 // the pattern context's `unmatched` chain. Without the join
@@ -243,7 +327,23 @@ impl Interp<'_> {
                 if !self.collecting()
                     && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
                 {
+                    // The cannot-fail exemption (official `promoteForPattern`
+                    // flags, type_analyzer.dart:1294-1309): an empty map
+                    // pattern under sound flow analysis cannot fail once the
+                    // type test passes — `matchMayFailEvenIfCorrectType`
+                    // latches false — so a covered matched type joins
+                    // nothing and the following alternatives of the switch
+                    // read dead. Every other shape (non-empty map, list,
+                    // record, relational) keeps its may-fail join.
+                    if self.pattern_depth == 1
+                        && matches!(shape, PatternShape::Map { entries: 0 })
+                        && self.sound_flow
+                        && self.shape_head_covers()
+                    {
+                        return;
+                    }
                     let cur = self.current.clone();
+                    self.note_may_fail(&cur);
                     let joined = self.join(Some(chain), Some(cur));
                     if let Some(pattern) = self.pattern.as_mut() {
                         pattern.unmatched = joined;
@@ -255,7 +355,13 @@ impl Interp<'_> {
                 // matched value non-null (official `_handleNullCheckPattern`
                 // → `_handleNullTestPattern(matchesIfNull: false)`), the
                 // failure arm — the null path — joins `unmatched`.
-                if self.pattern_depth != 1 {
+                //
+                // Depth `> 1` rejects, `<= 1` accepts: a bare clause head
+                // (`case _?`) holds its own begin open here (depth 1), a
+                // paren-led one has the wrapper flagged transparent (depth
+                // 0) — both are the clause's spine; a field's sub-pattern
+                // (`case Point(x: _?)`) sits deeper.
+                if self.pattern_depth > 1 {
                     return;
                 }
                 let scrutinee_var = self.pattern_scrutinee();
@@ -270,8 +376,13 @@ impl Interp<'_> {
                         // A matched value already known non-null is
                         // guaranteed to match: the official promotes nothing
                         // and leaves `_unmatched` untouched (the arm cannot
-                        // fall through).
-                        let guaranteed = self.classify(matched) == Classification::NonNullable;
+                        // fall through). The guarantee is sound-only
+                        // (`nullCheckOrAssertPattern_begin`,
+                        // flow_analysis.dart:6223-6237: "the pattern might
+                        // not match … because sound flow analysis is
+                        // disabled") — a pre-3.9 unit keeps the null path.
+                        let guaranteed = self.sound_flow
+                            && self.classify(matched) == Classification::NonNullable;
                         let (non_null, non_null_args) =
                             self.promote_to_non_null(matched, matched_args);
                         if !guaranteed {
@@ -309,7 +420,11 @@ impl Interp<'_> {
                         let Some((ty, args)) = scrutinee_expr else {
                             return;
                         };
-                        let guaranteed = self.classify(ty) == Classification::NonNullable;
+                        // The same sound-only guarantee as the reference
+                        // arm (`nullCheckOrAssertPattern_begin`,
+                        // flow_analysis.dart:6223-6237).
+                        let guaranteed =
+                            self.sound_flow && self.classify(ty) == Classification::NonNullable;
                         if !guaranteed {
                             let before = self.current.clone();
                             self.join_unmatched(before);
@@ -362,6 +477,8 @@ impl Interp<'_> {
                 // layer resolved the property's declared return — a bare
                 // `var x` binder in an object pattern adopts it exactly
                 // like an inferred initializer's slot.
+                let staged = declared == Ty::UNKNOWN
+                    && self.inferred_locals.get(&token.range.offset).is_some();
                 let (declared, declared_args) = if declared == Ty::UNKNOWN {
                     self.inferred_locals
                         .get(&token.range.offset)
@@ -370,6 +487,14 @@ impl Interp<'_> {
                 } else {
                     (declared, declared_args)
                 };
+                // The staged binder cannot fail on its own field: the
+                // adopted type IS the property's resolved return, so the
+                // official field promote answers `coversMatchedType` (the
+                // matched value's type sits under the declared one) and
+                // joins nothing — the `||`-operand row over the
+                // alternation beside it still anchors
+                // (`Rectangle(:var areaAsInt || var areaAsInt)` over a
+                // `Shape` scrutinee).
                 let meta = VarMeta {
                     ty: declared,
                     args: declared_args,
@@ -434,27 +559,13 @@ impl Interp<'_> {
                         self.non_var_invalid_scrutinee_covers(declared, declared_args);
                     }
                 } else if !self.collecting()
+                    && !staged
                     && self.pattern_depth > 1
                     && declared != Ty::UNKNOWN
-                    && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
                 {
-                    // A typed sub-pattern nested in an object pattern tests
-                    // its own PROPERTY (`Obj(:NamedType f)` over a nullable
-                    // field) and can fail on that value alone — official
-                    // `analyzeObjectPattern` runs sub-patterns against the
-                    // shared `_unmatched` chain. When the enclosing head's
-                    // test is vacuous (an exact scrutinee type joins
-                    // nothing), this join is the ONLY unmatched path: skip
-                    // it and the else arm after `if (x case Obj(:T f))`
-                    // folds dead. The pre-test state joins (reachability —
-                    // the property variable is scoped to the matched arm,
-                    // so the else arm keeps the scrutinee's unpromoted
-                    // face, exactly the nested-failure posture).
-                    let cur = self.current.clone();
-                    let joined = self.join(Some(chain), Some(cur));
-                    if let Some(pattern) = self.pattern.as_mut() {
-                        pattern.unmatched = joined;
-                    }
+                    // A typed sub-pattern nested in a container field tests
+                    // its own property and can fail on that value alone.
+                    self.nested_typed_join();
                 }
             }
             Ev::AssignedVarPattern { name } => {
@@ -654,6 +765,7 @@ impl Interp<'_> {
                 && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
             {
                 let cur = self.current.clone();
+                self.note_may_fail(&cur);
                 let joined = self.join(Some(chain), Some(cur));
                 if let Some(pattern) = self.pattern.as_mut() {
                     pattern.unmatched = joined;
@@ -674,6 +786,11 @@ impl Interp<'_> {
         {
             if fields_irrefutable {
                 self.vacuous_cover_kills_chain();
+            } else {
+                // A refutable field under the dynamic head may fail
+                // (official `promoteForPattern`'s sub-pattern walk): the
+                // undecided face keeps the may-fail posture.
+                self.stand_down_may_fail();
             }
             return;
         }
@@ -767,7 +884,13 @@ impl Interp<'_> {
             };
             self.or_right_face = Some(face);
         }
-        if self.disjoint_by_nullability(matched, known) {
+        // The cannot-match kill (`promoteForPattern`'s verdict,
+        // flow_analysis.dart:6360-6383) is sound-only: BOTH classifyType
+        // arms gate on `soundFlowAnalysisEnabled` ("a new reasoning step
+        // that was added to flow analysis as part of the
+        // sound-flow-analysis feature"), so a pre-3.9 unit keeps the case
+        // body live however the nullabilities sit.
+        if self.sound_flow && self.disjoint_by_nullability(matched, known) {
             self.unreachable_cur();
         }
         if !self
@@ -825,11 +948,158 @@ impl Interp<'_> {
     /// Rejoins one state into the open pattern's unmatched chain (official
     /// `_unmatched = _join(_unmatched!, state)` at every may-fail arm).
     fn join_unmatched(&mut self, state: crate::model::State) {
+        self.note_may_fail(&state);
         if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
             let joined = self.join(Some(chain), Some(state));
             if let Some(pattern) = self.pattern.as_mut() {
                 pattern.unmatched = joined;
             }
+        }
+    }
+
+    /// Latches the open pattern's cannot-fail posture off (official
+    /// `promoteForPattern`'s joins): a join whose joined-in state is
+    /// locally reachable means the match can fail, so the clause close's
+    /// chain kill stands down. Joins of unreachable states are officially
+    /// no-ops on the chain's reachability (`_join` drops the unreachable
+    /// arm) — the posture stands. Every latch also bumps the may-fail
+    /// epoch ([`Interp::or_join_epoch`]).
+    fn note_may_fail(&mut self, state: &crate::model::State) {
+        if self.reach.locally_reachable(state.reach)
+            && let Some(pattern) = self.pattern.as_mut()
+        {
+            pattern.cannot_fail = false;
+            self.or_join_epoch += 1;
+        }
+    }
+
+    /// A typed sub-pattern nested in a container field (`Obj(:int f)`,
+    /// `case (int _,)`) tests its own property value and can fail on that
+    /// value alone — official `analyzeObjectPattern`/record analysis runs
+    /// sub-patterns against the shared `_unmatched` chain. When the
+    /// enclosing head's test is vacuous (an exact scrutinee type joins
+    /// nothing), this join is the ONLY unmatched path: skip it and the
+    /// else arm after `if (x case Obj(:T f))` folds dead. The pre-test
+    /// state joins (reachability — the property value is scoped to the
+    /// matched arm, so the else arm keeps the scrutinee's unpromoted
+    /// face, exactly the nested-failure posture).
+    fn nested_typed_join(&mut self) {
+        let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) else {
+            return;
+        };
+        let cur = self.current.clone();
+        self.note_may_fail(&cur);
+        let joined = self.join(Some(chain), Some(cur));
+        if let Some(pattern) = self.pattern.as_mut() {
+            pattern.unmatched = joined;
+        }
+    }
+
+    /// Stands the open pattern's cannot-fail posture down without a join:
+    /// a face the lattice cannot answer (a constant over a non-reference
+    /// matched value, a dynamic head with refutable fields) may fail
+    /// upstream, so the clause close's chain kill must not fire on it.
+    fn stand_down_may_fail(&mut self) {
+        if let Some(pattern) = self.pattern.as_mut() {
+            pattern.cannot_fail = false;
+        }
+    }
+
+    /// The empty-map pattern's coverage question (official
+    /// `coversMatchedType = isSubtypeOf(matchedType, knownType)`,
+    /// flow_analysis.dart:6399-6402 — the MATCHED type must sit under the
+    /// pattern's required type): the map-friendly matched faces
+    /// (`Map`-named, top, dynamic, Never) answer yes over the flow
+    /// lattice's record-free shape — a concrete non-map matched type (a
+    /// `List`, a named class, `Object`) answers no and keeps the may-fail
+    /// join.
+    fn shape_head_covers(&self) -> bool {
+        let (matched, matched_args) = match self.pattern_scrutinee() {
+            Some(var) => {
+                let model = self.current.model(var);
+                (
+                    self.promoted_type_of(var, &model),
+                    self.promoted_args_of(var, &model),
+                )
+            }
+            None => match self
+                .pattern
+                .as_ref()
+                .and_then(|p| p.scrutinee_ty)
+                .or_else(|| self.frame_scrutinee_ty())
+            {
+                Some((ty, args)) => (ty, args),
+                None => return false,
+            },
+        };
+        match matched.base {
+            Base::Unknown | Base::Dynamic | Base::Never => true,
+            Base::Name(name) => {
+                matched_args == crate::ty::EMPTY_ARGS
+                    && self.names.get(name as usize).is_some_and(|n| &**n == "Map")
+            }
+            _ => false,
+        }
+    }
+
+    /// Opens a logical-or alternation's dead-walk frame (official
+    /// `logicalOrPattern_begin`/`afterRightHandSideBegins`): when the LEFT
+    /// operand could not fail (no may-fail join latched its parse), the
+    /// right operand parses under the left branch's failure state —
+    /// unreachable — and its row anchors at the operator
+    /// (`handle_logicalOrPattern_afterLhs` →
+    /// `checkUnreachableNode(node.rightOperand)`).
+    fn or_frame_begin(&mut self, operator: TokenSpan) {
+        if self.collecting() || self.pattern.is_none() {
+            return;
+        }
+        let epoch = self.or_join_epoch;
+        // The left branch is clean when nothing latched since the pattern
+        // context opened (the first alternation: the left operand's own
+        // events are all that ran), or when the previous alternation
+        // closed clean at this same epoch (the left-nested `A || B || C`
+        // chain — the outer left is the inner or, and the inner or can
+        // fail only through its right operand's joins).
+        let left_clean = epoch == 0
+            || self
+                .or_last_clean
+                .is_some_and(|(end_epoch, clean)| end_epoch == epoch && clean);
+        let entry = self.current.clone();
+        self.or_frames.push(crate::interp::OrFrame {
+            operator,
+            entry,
+            epoch,
+            left_clean,
+        });
+        if left_clean {
+            self.unreachable_cur();
+            self.dead_code(operator);
+        }
+    }
+
+    /// Closes the frame: the right operand's row (official
+    /// `LogicalOrPattern.resolvePattern`'s `flowEnd(rightOperand)` with the
+    /// `parent is LogicalOrPattern` span — the row runs from the operator
+    /// to `rightOperand.end`, the operand's last token's end), and the
+    /// matched state restores to the left branch's
+    /// (`logicalOrPattern_end`'s `_join(_lhsMatched, _current)` collapses
+    /// to the left branch when the right walked unreachable). A window
+    /// anchored elsewhere keeps ownership (an enclosing dead context
+    /// latched first — official `visitNode` ignores later unreachable
+    /// nodes); the interval then continues through the arm's own close.
+    /// The close also publishes the right operand's cleanliness for a
+    /// following left-nested alternation.
+    fn or_frame_end(&mut self, end: u32) {
+        let Some(frame) = self.or_frames.pop() else {
+            return;
+        };
+        let right_clean = frame.epoch == self.or_join_epoch;
+        if right_clean {
+            self.or_last_clean = Some((self.or_join_epoch, true));
+        }
+        if frame.left_clean {
+            self.close_dead_row_to(frame.operator.range.offset, end);
+            self.current = frame.entry;
         }
     }
 
@@ -1016,6 +1286,8 @@ impl Interp<'_> {
         self.vacuous_object = None;
         self.vacuous_fields.clear();
         self.pattern_binds.clear();
+        self.or_join_epoch = 0;
+        self.or_last_clean = None;
         let chain = self
             .switch_frame()
             .and_then(|frame_index| match &self.stack[frame_index] {
@@ -1033,10 +1305,13 @@ impl Interp<'_> {
             unmatched,
             scrutinee: None,
             scrutinee_ty: None,
+            scrutinee_pending: false,
             guard: None,
             pre_guard: None,
             pending_decls: Vec::new(),
             shadowed: Vec::new(),
+            cannot_fail: true,
+            saw_node: false,
         });
     }
 
@@ -1054,7 +1329,18 @@ impl Interp<'_> {
             return;
         };
         let pattern_shadowed = std::mem::take(&mut pattern.shadowed);
-        let unmatched = self.apply_pattern_exit(pattern, has_guard);
+        // The cannot-fail kill (official `switchStatement_endAlternative`:
+        // `context._unmatched = _popPattern(guardInfo)` — the popped chain
+        // IS the pattern context's seed whenever no may-fail arm joined,
+        // and the seed started unreachable): a pattern that provably
+        // always matches leaves the chain dead, so every later member and
+        // the post-switch state read dead. A clause whose head produced
+        // no pattern node at all (a recovered expression) knows nothing:
+        // the kill stands down.
+        let (mut unmatched, kill) = self.apply_pattern_exit(pattern, has_guard);
+        if kill {
+            unmatched = unmatched.set_unreachable(&mut self.reach);
+        }
         if let Some(frame_index) = self.switch_frame() {
             let combined = self.current.clone();
             let prior = match &mut self.stack[frame_index] {
@@ -1098,7 +1384,15 @@ impl Interp<'_> {
             return;
         };
         let pattern_shadowed = std::mem::take(&mut pattern.shadowed);
-        let unmatched = self.apply_pattern_exit(pattern, false);
+        // The cannot-fail kill (same chain write as the statement face —
+        // official `switchStatement_endAlternative` runs for expression
+        // alternatives too): the next alternative's entry state is the
+        // dead chain, and its whole-arm row anchors there. The seen-node
+        // gate keeps a recovered arm (no pattern events) live.
+        let (mut unmatched, kill) = self.apply_pattern_exit(pattern, false);
+        if kill {
+            unmatched = unmatched.set_unreachable(&mut self.reach);
+        }
         if let Some(frame_index) = self.switch_frame()
             && let Frame::Switch {
                 unmatched: slot,
@@ -1115,12 +1409,19 @@ impl Interp<'_> {
     /// keyword): the standalone pattern context opened inside the condition
     /// is this if's clause context. Turning the kind here — at the
     /// condition's end — keeps `ThenBegin`'s adoption exact: an ordinary
-    /// if never sees an `IfCase` context and never adopts one.
+    /// if never sees an `IfCase` context and never adopts one. The peeked
+    /// scrutinee value is spent here: the clause machinery owns everything
+    /// past the condition.
     pub(crate) fn if_case_condition(&mut self) {
         if let Some(pattern) = self.pattern.as_mut()
             && pattern.kind == PatternKind::Decl
         {
             pattern.kind = PatternKind::IfCase;
+            let pending = pattern.scrutinee_pending;
+            pattern.scrutinee_pending = false;
+            if pending {
+                drop(self.exprs.pop());
+            }
         }
     }
 
@@ -1145,20 +1446,24 @@ impl Interp<'_> {
     }
 
     /// Applies a pattern's guard to split matched/unmatched, returning the
-    /// chained unmatched state (official `_popPattern`, fed by the clause's
-    /// `guardInfo` — flow_analysis.dart:8004-8042: the guard's true state
-    /// becomes the clause's matched state, the false state joins the
-    /// unmatched chain). The guard's own events ran on `current` between
-    /// `GuardBegin` and `GuardEnd` — its last branching event (e.g. the
-    /// type-test's `IsEnd`, `interp_expr.rs`) left `current` on the true arm
-    /// — so `current` IS the guard's ifTrue state and the `GuardBegin`
-    /// snapshot is its ifFalse.
+    /// chained unmatched state plus the pattern's final cannot-fail
+    /// posture (official `_popPattern`, fed by the clause's `guardInfo` —
+    /// flow_analysis.dart:8004-8042: the guard's true state becomes the
+    /// clause's matched state, the false state joins the unmatched chain).
+    /// The guard's own events ran on `current` between `GuardBegin` and
+    /// `GuardEnd` — its last branching event (e.g. the type-test's
+    /// `IsEnd`, `interp_expr.rs`) left `current` on the true arm — so
+    /// `current` IS the guard's ifTrue state and the `GuardBegin`
+    /// snapshot is its ifFalse. The guard can fail, so its join stands
+    /// the cannot-fail posture down (the pattern context is already
+    /// taken out of `self` here, so the posture latches locally).
     fn apply_pattern_exit(
         &mut self,
         mut pattern: PatternState,
         has_guard: bool,
-    ) -> crate::model::State {
+    ) -> (crate::model::State, bool) {
         let mut unmatched = pattern.unmatched;
+        let mut cannot_fail = pattern.cannot_fail && pattern.saw_node;
         if (has_guard || matches!(pattern.kind, PatternKind::Switch | PatternKind::SwitchExpr))
             && pattern.guard.take().is_some()
         {
@@ -1166,9 +1471,12 @@ impl Interp<'_> {
                 .pre_guard
                 .take()
                 .unwrap_or_else(|| self.current.clone());
+            if self.reach.locally_reachable(if_false.reach) {
+                cannot_fail = false;
+            }
             unmatched = self.join(Some(unmatched), Some(if_false));
         }
-        unmatched
+        (unmatched, cannot_fail)
     }
 }
 
@@ -1184,8 +1492,11 @@ fn object_fields_irrefutable(events: &[Ev], at: usize) -> bool {
     let mut depth = 0usize;
     for ev in events[..at].iter().rev() {
         match ev {
-            Ev::PatternEnd => depth += 1,
-            Ev::PatternBegin => {
+            // Parenthesized wrappers are grouping-transparent: their
+            // flagged pair cancels in the backward walk.
+            Ev::PatternEnd { paren: true } | Ev::PatternBegin { paren: true, .. } => {}
+            Ev::PatternEnd { paren: false } => depth += 1,
+            Ev::PatternBegin { paren: false, .. } => {
                 if depth == 0 {
                     return true;
                 }

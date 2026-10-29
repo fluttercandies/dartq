@@ -565,7 +565,14 @@ impl Interp<'_> {
                             _ => self.current.clone(),
                         };
                         let mut rhs_dead_entry = false;
-                        if self.classify(left.ty) == Classification::NonNullable {
+                        // The guaranteed-non-null kill is a sound-only
+                        // step (official `ifNullExpression_rightBegin`,
+                        // flow_analysis.dart:5857-5864: the nonNullable
+                        // arm's `setUnreachable` rides
+                        // `soundFlowAnalysisEnabled`; the nullOrEquivalent
+                        // skip kill above it is ungated).
+                        if self.sound_flow && self.classify(left.ty) == Classification::NonNullable
+                        {
                             self.unreachable_cur();
                             rhs_dead_entry = true;
                         }
@@ -1052,9 +1059,24 @@ impl Interp<'_> {
                     window.suppress();
                 }
             }
-            Ev::AsOperator => {
+            Ev::AsOperator { type_head } => {
                 let cast_ty = self.tested_ty.take().unwrap_or(Ty::UNKNOWN);
                 self.as_cast_pending = Some(cast_ty);
+                // The Never-operand cast's type head parks on the enclosing
+                // arm frame (the `AsEnd` latch above): first cast wins — a
+                // later cast in the same arm already sits inside the dead
+                // interval.
+                if let Some(Frame::Cond {
+                    never_cast,
+                    cast_tail,
+                    ..
+                }) = self.stack.last_mut()
+                {
+                    if *never_cast && cast_tail.is_none() {
+                        *cast_tail = Some(*type_head);
+                    }
+                    *never_cast = false;
+                }
             }
             Ev::AsEnd => {
                 self.in_as_cast = false;
@@ -1071,6 +1093,19 @@ impl Interp<'_> {
                 // operand tops the expr stack.
                 if self.pattern_depth == 0 {
                     let operand = self.pop_value();
+                    // A cast whose operand never completed inside a
+                    // conditional arm (`(throw 0) as T`): the arm's own
+                    // `flowEnd` owns the dead row (the cast type is the
+                    // first dead node, the row runs to the arm's end) —
+                    // latch for the `AsOperator` that follows with the
+                    // type's head token.
+                    if operand.ty == Ty::NEVER
+                        && matches!(self.stack.last(), Some(Frame::Cond { .. }))
+                    {
+                        if let Some(Frame::Cond { never_cast, .. }) = self.stack.last_mut() {
+                            *never_cast = true;
+                        }
+                    }
                     // Official `asExpression_end`
                     // (flow_analysis.dart:6451-6477): a cast whose operand
                     // type and cast type are disjoint by nullability is
@@ -1080,11 +1115,13 @@ impl Interp<'_> {
                     // executable node anchors the dead row (probed: `null
                     // as int`, `n as int` with `n: Null`, and `x as Null`
                     // all kill; a cast that ends the block reports nothing —
-                    // no following node to anchor). A cast operand that
-                    // never completes kills through its own `Ev::Exit`
-                    // before this point; the promotion below is the only
-                    // other reachability effect.
-                    if self.disjoint_by_nullability(operand.ty, cast_ty) {
+                    // no following node to anchor). The disjointness verdict
+                    // is sound-only (`:7611`: `if (!…Enabled) return
+                    // false`) — a pre-3.9 unit's cast never kills. A cast
+                    // operand that never completes kills through its own
+                    // `Ev::Exit` before this point; the promotion below is
+                    // the only other reachability effect.
+                    if self.sound_flow && self.disjoint_by_nullability(operand.ty, cast_ty) {
                         self.unreachable_cur();
                     }
                     if let Some(var) = operand.reference
@@ -1394,7 +1431,17 @@ impl Interp<'_> {
                         // lvalue keeps the invalid-unknown arm: the RHS
                         // could be anything, and `LUB(T1, InvalidType)`
                         // promotes nothing.
-                        if rhs_ty == Ty::UNKNOWN_NULLABLE && lhs_nn.base == Base::Function {
+                        // An unspellable RHS face: the unknown read, or the
+                        // bare-read spelling faces (#2835's tear-off stand-in,
+                        // the undefined-read's invalid name — both spell the
+                        // read's own name on the implicit-this slot). The
+                        // official RHS is the tear-off's real signature there,
+                        // whose LUB with the declared form is the declared
+                        // form itself (#2401).
+                        let rhs_unspellable = rhs_ty == Ty::UNKNOWN_NULLABLE
+                            || (rhs.prop.is_some()
+                                && matches!(rhs.ty.base, Base::Name(n) if rhs.name == Some(n)));
+                        if rhs_unspellable && lhs_nn.base == Base::Function {
                             (lhs_nn, lhs_nn_args)
                         } else if rhs_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN_NULLABLE {
                             // An information-less RHS (an SDK static's return
@@ -1442,6 +1489,45 @@ impl Interp<'_> {
                         write_span,
                         *plain && rhs_literal,
                     );
+                    // The condition-variable state rides ANY write
+                    // (language#1274: the state lives on the written
+                    // variable's new version — official
+                    // `conditionVariableState`'s `_write`). A plain write
+                    // whose RHS is the null-comparison/type-test split
+                    // binds its arms to the written local (the initializer
+                    // face's capture, [`Interp::cond_split`]'s replay); a
+                    // bare read of another condition variable chain-copies
+                    // its entry (`b = c`); every other write leaves the
+                    // new version stateless — the stale entry dies instead
+                    // of replaying through the write.
+                    if *plain {
+                        if rhs.test_split
+                            && let Some((if_true, if_false)) = &rhs.branches
+                            && let Some(tested) = self.cond_split_var.take()
+                        {
+                            self.cond_vars.insert(
+                                var,
+                                crate::interp::CondVarEntry {
+                                    tested,
+                                    version: self.current.model(tested).version,
+                                    if_true: if_true.clone(),
+                                    if_false: if_false.clone(),
+                                },
+                            );
+                        } else if let Some(entry) = rhs
+                            .reference
+                            .and_then(|src| self.cond_vars.get(&src).cloned())
+                        {
+                            self.cond_split_var.take();
+                            self.cond_vars.insert(var, entry);
+                        } else {
+                            self.cond_split_var.take();
+                            self.cond_vars.remove(&var);
+                        }
+                    } else {
+                        self.cond_split_var.take();
+                        self.cond_vars.remove(&var);
+                    }
                     // The assignment expression carries no promotable
                     // reference: official `_write` hands one back only under
                     // the experimental `inferenceUpdate4` feature
@@ -1496,6 +1582,8 @@ impl Interp<'_> {
                     then_state: None,
                     then_dead_entry,
                     else_dead_entry: false,
+                    never_cast: false,
+                    cast_tail: None,
                 });
                 self.current = if_true;
             }
@@ -1521,6 +1609,14 @@ impl Interp<'_> {
                     // arm expression itself — the same re-anchor
                     // `dead_arm_row` gives the collection-if arms.
                     self.dead_arm_row(then_begin.range.offset, *then_end);
+                } else {
+                    // A mid-arm death — a Never-operand cast whose type is
+                    // the first dead node (`(throw 0) as T`): official
+                    // `flowEnd(thenExpression)` reports from the type's
+                    // head to the arm's own end (the initializer-context
+                    // semantic face stages only the bare-initializer row;
+                    // the arm close owns this one).
+                    self.cast_tail_row(*then_end);
                 }
                 // The then arm ended: rejoin its open null-shorting before
                 // the state swap.
@@ -1562,6 +1658,10 @@ impl Interp<'_> {
                     // official's first dead node is the whole arm
                     // expression, so the row spans the operand whole.
                     self.dead_arm_row(else_begin.range.offset, *arm_end);
+                } else {
+                    // The else arm's mid-arm cast-tail death (the then arm's
+                    // twin above).
+                    self.cast_tail_row(*arm_end);
                 }
                 // The else arm ended: rejoin its open null-shorting before
                 // the arm join.
@@ -2366,7 +2466,8 @@ impl Interp<'_> {
                         // cannot kill the receiver-was-null path. A
                         // following section keeps the head short open
                         // (the one head context spans the whole cascade).
-                        let end_base = base - usize::from(owns_short && !next_is_section);
+                        let end_base =
+                            base.saturating_sub(usize::from(owns_short && !next_is_section));
                         while self.null_shorts.len() > end_base {
                             self.null_short_end();
                         }
@@ -2700,8 +2801,11 @@ impl Interp<'_> {
     /// promotable references too, fed the declared static type): a
     /// bottom tested type (`Never`) or a nullability-disjoint pair
     /// — one side `Null`-or-equivalent (`Null`, `Never?`), the other
-    /// non-nullable — makes the test a constant `false`. The same
-    /// refusal trio as
+    /// non-nullable — makes the test a constant `false`. The legs split
+    /// exactly as upstream: the bottom leg is mode-blind (`isBottomType`
+    /// is checked before the sound predicate), the nullability-disjoint
+    /// leg is sound-only (`:7611`: `if (!…Enabled) return false` — a
+    /// pre-3.9 unit keeps the arm live). The same refusal trio as
     /// [`Interp::is_test_guaranteed`] applies: an unknown/dynamic/void
     /// face on either side is never a dead-branch producer (the
     /// name-level lattice's optimism must not certify the mark).
@@ -2711,15 +2815,18 @@ impl Interp<'_> {
         {
             return false;
         }
-        self.ops.is_bottom(tested) || self.disjoint_by_nullability(operand_ty, tested)
+        self.ops.is_bottom(tested)
+            || (self.sound_flow && self.disjoint_by_nullability(operand_ty, tested))
     }
 
     /// Whether a non-reference operand's type test is guaranteed to
     /// succeed (official `_isTypeCheckGuaranteedToSucceedWithSoundNullSafety`
     /// — upstream Dart SDK source,
     /// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:9149-9155
-    /// — `isSubtypeOf(staticType, checkedType)` under sound flow). The
-    /// answer deads a branch, so the boundary refuses: a dynamic tested
+    /// — `soundFlowAnalysisEnabled && isSubtypeOf(staticType, checkedType)`,
+    /// :7645: the whole predicate is sound-only, so a pre-3.9 unit never
+    /// folds the test to `true`). The answer deads a branch, so the
+    /// boundary refuses: a dynamic tested
     /// spelling or an unknown/void operand face is never a dead-branch
     /// producer (the name-level lattice's top-type optimism would
     /// otherwise certify the mark — the same refusal trio
@@ -2738,14 +2845,15 @@ impl Interp<'_> {
         {
             return false;
         }
-        self.ops.is_subtype_typed(
-            operand_ty,
-            operand_args,
-            tested,
-            tested_args,
-            self.args,
-            self.names,
-        )
+        self.sound_flow
+            && self.ops.is_subtype_typed(
+                operand_ty,
+                operand_args,
+                tested,
+                tested_args,
+                self.args,
+                self.names,
+            )
     }
 
     /// A successful type test on `var`: returns (matched, unmatched)
@@ -2834,9 +2942,12 @@ impl Interp<'_> {
         let unmatched = if self.ops.is_bottom(factored) {
             // The bottom-remainder arm is dead — `response is! T` on a
             // `response` already proved `T` leaves nothing below. The
-            // official `_finishTypeTest` keeps `promotedTypes` untouched
-            // (typeIfFalse is null, flow_analysis.dart:4160-4163), so the
-            // chain still reads the pre-test promotion. The name-level
+            // official arms it through `ifFalseIsUnreachable`
+            // (flow_analysis.dart:3211-3219: `typeIfFalse = null`, then
+            // "If not sound, it might still be reachable" — the mark rides
+            // `soundFlowAnalysisEnabled`), so a pre-3.9 unit keeps the
+            // else live with the promotion chain untouched (the
+            // `typeIfFalse = null` posture `current.clone()` carries). The name-level
             // deliberate-divergence boundary (#2204 C) wants the dead
             // remainder's member reads to face the *declared* type — the
             // receiver row's `read_type_at` override would otherwise
@@ -2858,7 +2969,14 @@ impl Interp<'_> {
                     },
                 );
             }
-            dead
+            if self.sound_flow {
+                dead
+            } else {
+                // "If not sound, it might still be reachable"
+                // (flow_analysis.dart:3214): the else keeps the pre-test
+                // state (`typeIfFalse = null`, no unreachable mark).
+                self.current.clone()
+            }
         } else {
             // A `FutureOr<R>` remainder `R` (factorType rule 3, the
             // `Future<R> <: what` arm) is the argument node itself: its
@@ -2874,20 +2992,29 @@ impl Interp<'_> {
                     .map_or(previous_args, |arg| arg.args),
                 _ => previous_args,
             };
-            // Official `isValidPromotionStep`: the factor output is a
-            // subtype of `previous` by construction, so the step is valid
-            // exactly when `previous` is not a subtype of it (no mutual
-            // subtypes, no repeats). The instantiated face decides —
+            // Official `isValidPromotionStep`
+            // (flow_analysis.dart:5989-6003): the factor output is a
+            // subtype of `previous` by construction, so the sound-mode
+            // step is valid exactly when `previous` is not a subtype of
+            // it (no mutual subtypes, no repeats); disabled mode refuses
+            // only a repeated promotion to the same type
+            // (`newType != previousType`). The instantiated face decides —
             // `factor` keeps `previous`'s written-argument tree, which the
             // typed compare reads.
-            let factored = if self.ops.is_subtype_typed(
-                previous,
-                previous_args,
-                factored,
-                factored_args,
-                self.args,
-                self.names,
-            ) {
+            let factored = if self.sound_flow {
+                if self.ops.is_subtype_typed(
+                    previous,
+                    previous_args,
+                    factored,
+                    factored_args,
+                    self.args,
+                    self.names,
+                ) {
+                    None
+                } else {
+                    Some(factored)
+                }
+            } else if (factored, factored_args) == (previous, previous_args) {
                 None
             } else {
                 Some(factored)
@@ -2934,11 +3061,16 @@ impl Interp<'_> {
             // != null` the then-branch.
             expr.bool_value = Some(!inverted);
             expr.branches = None;
-        } else if (left_null && self.classify(right.ty) == Classification::NonNullable)
-            || (right_null && self.classify(left.ty) == Classification::NonNullable)
+        } else if self.sound_flow
+            && ((left_null && self.classify(right.ty) == Classification::NonNullable)
+                || (right_null && self.classify(left.ty) == Classification::NonNullable))
         {
             // Disjoint by nullability: known not-equal — `==` kills the
-            // then-branch, `!=` the else-branch.
+            // then-branch, `!=` the else-branch. The verdict is
+            // `_equalityCheck`'s gated arm
+            // (flow_analysis.dart:7241-7258): `_GuaranteedNotEqual` under
+            // sound flow, `_NoEqualityInformation` otherwise — the same
+            // shared function the constant-pattern face rides.
             expr.bool_value = Some(inverted);
             expr.branches = None;
         } else {

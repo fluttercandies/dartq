@@ -67,7 +67,7 @@ use dartq_types::{
 
 use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
-use crate::model::{ArgListId, ArgPool, ContainerKind, MemberKind, MicroKind, Ty};
+use crate::model::{ArgListId, ArgPool, ContainerKind, FnSig, MemberKind, MicroKind, Ty};
 
 /// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
 /// and bare `Function`). Each snapshot owns its id space.
@@ -167,6 +167,17 @@ pub struct LibraryTypes {
     /// resolve registers no entry and keeps the opaque face (the
     /// under-report direction).
     typedef_shapes: FxHashMap<StringId, TypedefShape>,
+    /// Top-level function spelling → the tear-off signature flattened
+    /// into this snapshot's lattice (#2835): the flow's staged bare-read
+    /// spelling resolves here — `map_name`'s arm returns the real
+    /// function type (the declared return over the formal columns,
+    /// unwritten leaves reading `dynamic`, the analyzer element's face),
+    /// so an `is`-test over the tear-off folds through the resolved
+    /// Function rule. Built beside `typedef_shapes` by the same
+    /// translation; a signature whose leaves resolve nowhere registers
+    /// no entry and the spelling keeps the opaque face (the under-report
+    /// direction).
+    fn_shapes: FxHashMap<StringId, TypeId>,
     /// Each registered container's own parameter ids → their declared
     /// spellings, in declaration order (`List`'s first id → `E`): the
     /// receiver-instantiation environment ([`ResolvedTypeOps::instance_env`])
@@ -515,6 +526,8 @@ impl LibraryTypes {
             typedef_targets,
             typedef_shapes: FxHashMap::default(),
             aliases: Vec::new(),
+            top_fns: Vec::new(),
+            fn_shapes: FxHashMap::default(),
             type_params,
             type_param_scope: FxHashSet::default(),
             param_names,
@@ -782,6 +795,7 @@ impl LibraryTypes {
         // library's units and the import sweep) — a co-alias chain needs
         // its target's registration first.
         registry.resolve_typedef_shapes(&table, index, strings);
+        registry.resolve_top_fn_shapes(&table, index, strings);
         let Registry {
             registry,
             decl_params,
@@ -789,6 +803,7 @@ impl LibraryTypes {
             non_containers,
             typedef_targets,
             typedef_shapes,
+            fn_shapes,
             type_params,
             type_param_scope,
             param_names,
@@ -1008,6 +1023,7 @@ impl LibraryTypes {
             lossy_overloads,
             typedef_targets,
             typedef_shapes,
+            fn_shapes,
             param_names,
             type_params,
             type_param_scope,
@@ -1085,6 +1101,12 @@ struct Registry {
     /// [`Registry::resolve_typedef_shapes`] iterates to its fixpoint
     /// (a co-alias chain resolves once its target's shape lands).
     aliases: Vec<(StringId, FileId)>,
+    /// Every captured-signature top-level function as `(name, file)` —
+    /// the pass [`Registry::resolve_top_fn_shapes`] flattens into
+    /// [`LibraryTypes::fn_shapes`].
+    top_fns: Vec<(StringId, FileId)>,
+    /// See [`LibraryTypes::fn_shapes`].
+    fn_shapes: FxHashMap<StringId, TypeId>,
     /// Type-parameter spellings → their synthetic parameter ids: the
     /// `TypeKind::TypeParameter` map the adapter answers instead of
     /// `Invalid` for a `T`-shaped name (#2186 S4-C).
@@ -1227,6 +1249,14 @@ impl Registry {
             );
             if !container_like {
                 self.non_containers.insert(name);
+                // A captured-signature top-level function joins the
+                // tear-off shape worklist (#2835): its spelling is what
+                // the flow's staged bare-read resolves through. Getters
+                // (no formal table) read their return type, never a
+                // tear-off — they stay out.
+                if decl.kind == MicroKind::TopLevelFn && decl.formals.is_some() {
+                    self.top_fns.push((name, file));
+                }
                 // A bare `typedef A = B;` resolves `A` to `B` at the oracle's
                 // face — capture the RHS head so `map_name` chases it instead
                 // of minting an opaque declaration (subtype.dart's `C c = a`
@@ -1323,6 +1353,112 @@ impl Registry {
         }
     }
 
+    /// Flattens every captured-signature top-level function's tear-off
+    /// face into `fn_shapes` (#2835) — the resolution target of the
+    /// flow's staged bare-read spelling. Mirrors
+    /// [`Self::resolve_typedef_shapes`]'s under-report discipline: a
+    /// leaf that maps to nothing (an unresolved head, a `Null` spelling)
+    /// drops the whole shape and the spelling keeps its opaque
+    /// `non_containers` face; a generic function's tear-off instantiates
+    /// to bounds this snapshot cannot spell, so it registers nothing.
+    /// First-writer-wins keeps the visible spelling's declaration
+    /// authoritative, the registry's own discipline — and a name a
+    /// same-spelled container registered never enters (the registry arm
+    /// of [`ResolvedTypeOps::map_name_walk`] runs first).
+    fn resolve_top_fn_shapes(
+        &mut self,
+        table: &TypeTable,
+        index: &ElementIndex,
+        strings: &StringTable,
+    ) {
+        for (name, file) in std::mem::take(&mut self.top_fns) {
+            if self.fn_shapes.contains_key(&name) || !self.non_containers.contains(&name) {
+                continue;
+            }
+            if let Some(shape) = self.top_fn_shape(table, index, strings, name, file) {
+                self.fn_shapes.insert(name, shape);
+            }
+        }
+    }
+
+    /// One top-level function's tear-off shape: `None` keeps the
+    /// spelling's opaque face (the under-report direction — a dropped
+    /// declaration, a generic signature, any leaf that maps to nothing).
+    fn top_fn_shape(
+        &mut self,
+        table: &TypeTable,
+        index: &ElementIndex,
+        strings: &StringTable,
+        name: StringId,
+        file: FileId,
+    ) -> Option<TypeId> {
+        let elements = index.get(file)?;
+        let decl = elements.decl(name)?;
+        let sig = FnSig::of_top_decl(decl)?;
+        // A generic function's tear-off instantiates to bounds this
+        // snapshot cannot spell — it registers nothing.
+        if sig.type_params != 0 {
+            return None;
+        }
+        let pool = elements.type_args();
+        let return_type = self.flatten_leaf(table, pool, strings, sig.return_ty, name, &[])?;
+        let mut positional = Vec::with_capacity(sig.formals.positional.len());
+        for formal in &sig.formals.positional {
+            positional.push(self.flatten_leaf(table, pool, strings, formal.ty, name, &[])?);
+        }
+        let mut named = Vec::with_capacity(sig.formals.named.len());
+        for formal in &sig.formals.named {
+            named.push(NamedMember {
+                name: strings.resolve(formal.name).to_string(),
+                ty: self.flatten_leaf(table, pool, strings, formal.ty, name, &[])?,
+                required: false,
+            });
+        }
+        // The whole positional list is the required count — the same
+        // normalization `flatten_rhs` applies to the written
+        // `Ty::Function` shapes, so both sides of an is-test normalize
+        // identically.
+        table
+            .intern_function(
+                UninternedFunction {
+                    return_type,
+                    type_parameters: Vec::new(),
+                    positional,
+                    named,
+                    required_positional: u32::try_from(sig.formals.positional.len())
+                        .unwrap_or(u32::MAX),
+                },
+                false,
+            )
+            .ok()
+    }
+
+    /// One composite-shape leaf's snapshot face: the tops read the faces
+    /// they are (an unwritten column's captured `Unknown`/the written
+    /// `dynamic` reads `dynamic`, a written `void` reads `void`,
+    /// `Never` reads itself — every one a real signature column, unlike
+    /// a bare top-level RHS) and everything else chases the full leaf
+    /// resolution ([`Self::flatten_rhs`]). A refused leaf (an unresolved
+    /// head, `Null`) drops the enclosing shape.
+    fn flatten_leaf(
+        &mut self,
+        table: &TypeTable,
+        pool: &ArgPool,
+        strings: &StringTable,
+        ty: Ty,
+        alias: StringId,
+        own_params: &[StringId],
+    ) -> Option<TypeId> {
+        match ty {
+            Ty::Unknown | Ty::Dynamic => Some(table.intern(UninternedType::Dynamic, false)),
+            Ty::Void => Some(table.intern(UninternedType::Void, false)),
+            Ty::Never => Some(table.intern(UninternedType::Never, false)),
+            ty => self
+                .flatten_rhs(table, pool, strings, ty, alias, own_params)
+                .map(|(id, _)| id),
+        }
+    }
+
     /// Translates one element-model RHS (`Ty` over the declaring unit's
     /// [`ArgPool`]) into the snapshot's lattice, `?` stripped. `alias` is
     /// the alias being registered (the cycle guard — an RHS naming its own
@@ -1372,23 +1508,26 @@ impl Registry {
             }
             Ty::Function { shape, nullable } => {
                 let shape = pool.function_shape(shape);
-                let return_ty = self
-                    .flatten_rhs(table, pool, strings, shape.return_ty, alias, own_params)?
-                    .0;
+                // The signature's leaves read the element faces: an
+                // unwritten column IS `dynamic` (`typedef fx(x)` captures
+                // `dynamic Function(dynamic)`, the analyzer element's
+                // face) and a written `void` return is the top it is —
+                // the shapeless-leaf refusal below is the TOP-level bare
+                // face's, not a signature column's. A leaf naming an
+                // unresolvable head still drops the whole shape (the
+                // under-report direction).
+                let return_ty =
+                    self.flatten_leaf(table, pool, strings, shape.return_ty, alias, own_params)?;
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for &formal in &shape.positional {
-                    positional.push(
-                        self.flatten_rhs(table, pool, strings, formal, alias, own_params)?
-                            .0,
-                    );
+                    positional
+                        .push(self.flatten_leaf(table, pool, strings, formal, alias, own_params)?);
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for &(formal_name, formal) in &shape.named {
                     named.push(NamedMember {
                         name: strings.resolve(formal_name).to_string(),
-                        ty: self
-                            .flatten_rhs(table, pool, strings, formal, alias, own_params)?
-                            .0,
+                        ty: self.flatten_leaf(table, pool, strings, formal, alias, own_params)?,
                         required: false,
                     });
                 }
@@ -1472,6 +1611,24 @@ impl Registry {
         if name == alias {
             // A self-referential RHS never resolves.
             return None;
+        }
+        // The two kind-level spellings the registry cannot carry (`Null` /
+        // `Never` — the query-time [`Self::builtin_spelling`] face): asked
+        // BEFORE the non-container chase, the same precedence `map_name`
+        // keeps (builtin spellings stand between the registry and the
+        // alias/opaque tail). An SDK names-only stub puts `Never` in
+        // `non_containers` with no model behind it, and the chase below
+        // would drop the enclosing shape on every `Never` column (`typedef
+        // Fun(Never a, Never b)` landed nothing — the tear-off is-check
+        // pairs stayed live the oracle folds). A registered container of
+        // the same spelling is its own declaration and shadows here, the
+        // query-time registry-first posture.
+        if !self.registry.contains_key(&name) {
+            match strings.resolve(name) {
+                "Null" => return Some((table.intern(UninternedType::Null, false), true)),
+                "Never" => return Some((table.intern(UninternedType::Never, nullable), false)),
+                _ => {}
+            }
         }
         if self.non_containers.contains(&name) {
             if let Some(entry) = self.typedef_shapes.get(&name) {
@@ -1887,6 +2044,21 @@ pub struct ResolvedTypeOps<'a> {
     /// rather than one shared argument-less declaration (#2288's spurious
     /// `is`-check dead rows).
     opaque: RefCell<FxHashMap<(StringId, usize), TypeDeclId>>,
+    /// Frame-local function tear-off shapes registered during the fold
+    /// (#2852): the diagnosing listener answers a container-less bare read
+    /// resolving to a frame-local function by flattening the frame capture's
+    /// signature pieces into this map under the spelling — the resolution
+    /// target of the staged name, the local sibling of the snapshot's
+    /// top-level `fn_shapes`. Registered here, not in the snapshot, because
+    /// the element model carries no local declarations: the shape only
+    /// exists once the diagnosing pass has walked the declaring frame (the
+    /// #2842 capture at its close). Last-writer-wins keeps the innermost
+    /// same-spelled declaration authoritative — the shadowing order the
+    /// listener's frame walk resolves by. A name here answers ONLY at
+    /// `map_name`'s final miss (no container, alias, type parameter, or
+    /// top-level spelling shares it), so type-space resolutions keep
+    /// today's faces.
+    local_fn_shapes: RefCell<FxHashMap<StringId, TypeId>>,
     /// The registry inverted (`TypeDeclId` → declared spelling), built on
     /// the first structural answer that maps back into the diagnosing
     /// pool ([`Self::instance_env`]).
@@ -1932,6 +2104,7 @@ impl<'a> ResolvedTypeOps<'a> {
             file,
             system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy),
             name_ty: RefCell::new(Vec::new()),
+            local_fn_shapes: RefCell::new(FxHashMap::default()),
             overload_ids: RefCell::new(FxHashSet::default()),
             closed: RefCell::new(FxHashMap::default()),
             opaque: RefCell::new(FxHashMap::default()),
@@ -2489,6 +2662,14 @@ impl<'a> ResolvedTypeOps<'a> {
             return builtin;
         }
         if self.snapshot.non_containers.contains(&name) {
+            // The tear-off face (#2835): a captured-signature top-level
+            // function's spelling resolves to its flattened signature,
+            // so the flow's staged bare-read operand folds through the
+            // resolved Function rule. Registered only when the shape
+            // exists — everything else keeps the opaque faces below.
+            if let Some(&shape) = self.snapshot.fn_shapes.get(&name) {
+                return self.with_question(shape, nullable);
+            }
             // The flattened RHS shapes land first: an argument-bearing,
             // function, record, or parameterized alias use reads its RHS
             // whole — the written arguments substitute the alias's own
@@ -2525,7 +2706,156 @@ impl<'a> ResolvedTypeOps<'a> {
             let mapped = self.opaque_args(written, arena, names);
             return self.opaque_ty(chased, mapped, nullable);
         }
+        // The frame-local tear-off face (#2852): a spelling the whole
+        // type-space chain above missed but the diagnosing pass registered
+        // as a frame-local function's tear-off (the listener stages the
+        // bare read's own spelling only where its frame walk resolved the
+        // capture) answers the flattened signature — the same arm
+        // `fn_shapes` gives a top-level function. Sitting at the final miss
+        // keeps every type-space face intact: a same-spelled container,
+        // alias, type parameter, or top-level declaration resolves exactly
+        // as before, and an unregistered spelling still reads `Invalid`
+        // (the 0c vacuous arm the callers gate on).
+        if let Some(&shape) = self.local_fn_shapes.borrow().get(&name) {
+            return self.with_question(shape, nullable);
+        }
         self.invalid
+    }
+
+    /// Registers one frame-local function's tear-off shape (#2852): the
+    /// diagnosing listener passes the frame capture's signature pieces (the
+    /// return type, the positional formals with their required count, and
+    /// the `(name, type, required)` named section, all `Ty`s over `pool`)
+    /// and the spelling flattens into the snapshot's lattice under `name`.
+    /// `false` when any column carries no real face — an unresolved head or
+    /// a `Null` leaf, the same under-report drop [`Registry::flatten_leaf`]
+    /// applies — the caller keeps the read unstaged and its unknown face
+    /// stands.
+    pub(crate) fn register_local_fn_shape(
+        &self,
+        name: StringId,
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty, bool)],
+        required_positional: u16,
+        pool: &ArgPool,
+    ) -> bool {
+        let Some(return_type) = self.local_fn_leaf(return_ty, pool) else {
+            return false;
+        };
+        let mut positionals = Vec::with_capacity(positional.len());
+        for &formal in positional {
+            let Some(ty) = self.local_fn_leaf(formal, pool) else {
+                return false;
+            };
+            positionals.push(ty);
+        }
+        let mut named_members = Vec::with_capacity(named.len());
+        for &(formal, ty, required) in named {
+            let Some(mapped) = self.local_fn_leaf(ty, pool) else {
+                return false;
+            };
+            named_members.push(NamedMember {
+                name: self.strings.resolve(formal).to_string(),
+                ty: mapped,
+                required,
+            });
+        }
+        let Some(shape) = self
+            .snapshot
+            .table
+            .intern_function(
+                UninternedFunction {
+                    return_type,
+                    type_parameters: Vec::new(),
+                    positional: positionals,
+                    named: named_members,
+                    required_positional: u32::from(required_positional),
+                },
+                false,
+            )
+            .ok()
+        else {
+            return false;
+        };
+        self.local_fn_shapes.borrow_mut().insert(name, shape);
+        true
+    }
+
+    /// One signature column's snapshot face (#2852): the tops read the
+    /// faces they are (an unwritten column's captured `Unknown` and the
+    /// written `dynamic` read `dynamic` — the analyzer element's own face,
+    /// the convention [`Registry::flatten_leaf`] applies), a `Null` column
+    /// refuses, and everything else maps through the strict chain
+    /// ([`Self::map_ty_strict`]: a head with no real fact answers `None`,
+    /// never `Invalid`'s vacuous arm), with function/record columns
+    /// recursing structurally. A generic function column refuses — the
+    /// parameter facts live in the build-time registry this fold-time
+    /// flatten cannot mint — the under-report direction.
+    fn local_fn_leaf(&self, ty: Ty, pool: &ArgPool) -> Option<TypeId> {
+        match ty {
+            Ty::Unknown | Ty::Dynamic => Some(self.dynamic),
+            Ty::Void => Some(self.void),
+            Ty::Never => Some(self.snapshot.table.intern(UninternedType::Never, false)),
+            Ty::Null => None,
+            Ty::Named { .. } => self.map_ty_strict(ty, pool),
+            Ty::Record { shape, nullable } => {
+                let shape = pool.record_shape(shape);
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for &field in &shape.positional {
+                    positional.push(self.local_fn_leaf(field, pool)?);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for &(field_name, field) in &shape.named {
+                    named.push(NamedMember {
+                        name: self.strings.resolve(field_name).to_string(),
+                        ty: self.local_fn_leaf(field, pool)?,
+                        required: false,
+                    });
+                }
+                Some(
+                    self.snapshot
+                        .table
+                        .intern_record(UninternedRecord { positional, named }, nullable)
+                        .ok()?,
+                )
+            }
+            Ty::Function { shape, nullable } => {
+                let shape = pool.function_shape(shape);
+                if shape.type_params != 0 {
+                    return None;
+                }
+                let return_type = self.local_fn_leaf(shape.return_ty, pool)?;
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for &formal in &shape.positional {
+                    positional.push(self.local_fn_leaf(formal, pool)?);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for &(formal_name, formal) in &shape.named {
+                    named.push(NamedMember {
+                        name: self.strings.resolve(formal_name).to_string(),
+                        ty: self.local_fn_leaf(formal, pool)?,
+                        required: false,
+                    });
+                }
+                Some(
+                    self.snapshot
+                        .table
+                        .intern_function(
+                            UninternedFunction {
+                                return_type,
+                                type_parameters: Vec::new(),
+                                positional,
+                                named,
+                                required_positional: u32::try_from(shape.positional.len())
+                                    .unwrap_or(u32::MAX),
+                            },
+                            nullable,
+                        )
+                        .ok()?,
+                )
+            }
+        }
     }
 
     /// The written argument list of an opaque instantiation: each node

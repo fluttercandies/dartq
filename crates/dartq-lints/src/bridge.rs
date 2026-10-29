@@ -120,6 +120,7 @@ const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     augmentations_enabled: true,
     enhanced_parts_enabled: false,
     dot_shorthands_enabled: true,
+    sound_flow_analysis: true,
 };
 
 /// Parses `source` once (scanner → parser → arena) and yields the transient
@@ -3131,7 +3132,7 @@ impl ParserListener for AstListener {
         }
     }
 
-    fn end_binary_pattern(&mut self, operator: TokenSpan) {
+    fn end_binary_pattern(&mut self, operator: TokenSpan, _: TokenSpan) {
         self.b
             .patch_field(PayloadField::Operator, self.t(operator.id));
         self.end_last(NodeKind::BinaryPattern);

@@ -2188,7 +2188,36 @@ impl<'a> Engine<'a> {
         if self.written_ty_invalid(from) {
             return;
         }
-        let verdict = self.assignment_verdict(from, to, literal);
+        let stashed = self.stashed_fn_pair(&rhs_row, Some(&target_row), from, to);
+        let verdict = stashed
+            .as_ref()
+            .map(|(verdict, ..)| *verdict)
+            .or_else(|| self.assignment_verdict(from, to, literal));
+        if verdict == Some(false) && stashed.is_some() && !in_initializer {
+            // The stashed-signature rejection is final at the check: the
+            // from side is a concrete function shape (never a promotable
+            // read — the promotable twin keys on Unknown/Dynamic
+            // sources), and the teardown's re-decision runs on the
+            // interned Tys alone, which carry no parameter bounds. Emit
+            // with the teardown's own anchor and message shape — the
+            // message spells the deciding signatures (the oracle renders
+            // the resolved types' parameters, #2849).
+            let range = self
+                .invocation_span(range)
+                .or_else(|| self.property_access_span(range))
+                .unwrap_or(range);
+            let (_, from_sig, to_sig) = stashed.expect("checked above");
+            let (from_text, to_text) =
+                (self.fn_sig_display(&from_sig), self.fn_sig_display(&to_sig));
+            self.emit_non_promotion(
+                SemanticCode::InvalidAssignment,
+                range,
+                &from_text,
+                &to_text,
+                rhs_row.range.offset,
+            );
+            return;
+        }
         if verdict == Some(false) {
             if in_initializer {
                 let (from_text, to_text) = (self.ty_display(from), self.ty_display(to));
@@ -2340,7 +2369,34 @@ impl<'a> Engine<'a> {
             self.init_mark = None;
             return;
         }
-        let verdict = self.assignment_verdict(from, to, literal);
+        let stashed = self.stashed_fn_pair(row, None, from, to);
+        let verdict = stashed
+            .as_ref()
+            .map(|(verdict, ..)| *verdict)
+            .or_else(|| self.assignment_verdict(from, to, literal));
+        if verdict == Some(false) && stashed.is_some() {
+            // The stashed-signature rejection is final at the check (see
+            // [`Self::check_assignment`]'s direct-emit arm) — the
+            // teardown's re-decision on the interned Tys alone carries no
+            // parameter bounds. The message spells the deciding
+            // signatures (#2849).
+            let range = self
+                .invocation_span(row.range)
+                .or_else(|| self.property_access_span(row.range))
+                .unwrap_or(row.range);
+            let (_, from_sig, to_sig) = stashed.expect("checked above");
+            let (from_text, to_text) =
+                (self.fn_sig_display(&from_sig), self.fn_sig_display(&to_sig));
+            self.emit_non_promotion(
+                SemanticCode::InvalidAssignment,
+                range,
+                &from_text,
+                &to_text,
+                row.range.offset,
+            );
+            self.init_mark = None;
+            return;
+        }
         if verdict == Some(false)
             || (matches!(from, Ty::Unknown | Ty::Dynamic) && matches!(row.shape, RowShape::Bare(_)))
         {
@@ -2353,6 +2409,76 @@ impl<'a> Engine<'a> {
             self.stage(StagedKind::Assignment, row.range, from, to, literal);
         }
         self.init_mark = None;
+    }
+
+    /// The stashed-signature function-subtype verdict for an assignment
+    /// pair (#2834): a side whose row names a declaration carrying a
+    /// written function-type annotation (a formal, field, or top-level
+    /// variable — [`Engine::fn_var_sigs`]) upgrades to the stashed
+    /// signature, the only face that carries the annotation's own type
+    /// parameters WITH bounds (the interned `Ty::Function` keeps just
+    /// their count). Both sides must be function-shaped and a stash
+    /// must serve at least one; everything else keeps the ordinary
+    /// verdict ([`Self::assignment_verdict`]) — pairs the shape faces
+    /// already decide are unchanged. The deciding signatures ride the
+    /// answer (the byte-exact message renders them — the interned
+    /// shapes they may upgrade carry no parameter bounds, #2849).
+    fn stashed_fn_pair(
+        &self,
+        from_row: &Row,
+        to_row: Option<&Row>,
+        from: Ty,
+        to: Ty,
+    ) -> Option<(bool, Box<FnVarSig>, Box<FnVarSig>)> {
+        let from_stash = self.stash_sig_of(from_row);
+        let to_stash = to_row.and_then(|row| self.stash_sig_of(row));
+        if from_stash.is_none() && to_stash.is_none() {
+            return None;
+        }
+        let from_sig = from_stash.or_else(|| self.function_shape_sig(from))?;
+        let to_sig = to_stash.or_else(|| self.function_shape_sig(to))?;
+        let verdict = self.fn_sig_subtype(&from_sig, &to_sig)?;
+        Some((verdict, from_sig, to_sig))
+    }
+
+    /// The stashed written signature a bare, unqualified row's
+    /// declaration carries, when it carries one at all.
+    fn stash_sig_of(&self, row: &Row) -> Option<Box<FnVarSig>> {
+        if row.qualified || !matches!(row.shape, RowShape::Bare(_)) {
+            return None;
+        }
+        self.fn_var_sigs.get(&row.name).cloned()
+    }
+
+    /// The alias-instantiated written-signature claim (#2849): a formal
+    /// whose written annotation is a parameterized function-RHS alias use
+    /// (`F<int>` over `typedef F<X> = void Function<Y extends X>()`)
+    /// joins [`Engine::fn_var_sigs`] with the INSTANTIATED signature —
+    /// the same entry the written `void Function<Y extends int>()`
+    /// spelling binds. The element model keeps the annotation's resolved
+    /// type: a use with arguments instantiates the alias's right-hand
+    /// type, the arguments substituted into it bounds included (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+    /// named_type_resolver.dart `_instantiateElement` →
+    /// `TypeAliasElementImpl.instantiateImpl`). The stash is the only
+    /// face carrying parameters WITH bounds (#2834's junction), so the
+    /// assignment pair's `relateTypeParameters` equality rule decides
+    /// over real bounds where the interned count-only fold stayed
+    /// silent. A bare-alias use, a non-alias annotation, and a capture
+    /// miss (a foreign head, or a typedef the parse has not registered
+    /// yet — the capture walks in declaration order, the same posture
+    /// [`Engine::alias_fn_sig`] documents) bind nothing: the count-only
+    /// under-report posture stays.
+    pub(crate) fn stash_alias_instantiated_formal(&mut self, formal: StringId) {
+        let Some(Ty::Named { name, args, .. }) = self.formal_written else {
+            return;
+        };
+        if args == ArgListId::EMPTY {
+            return;
+        }
+        if let Some(sig) = self.instantiated_alias_sig(name, args) {
+            self.fn_var_sigs.insert(formal, sig);
+        }
     }
 
     /// The return check (`rtv.dart:209-249` sync matrix, `:258-289`
@@ -2801,7 +2927,14 @@ impl<'a> Engine<'a> {
                 RowShape::Receiver(Receiver::Created { name, kind })
                     if *kind != ContainerKind::Extension =>
                 {
-                    Ty::named(*name)
+                    // The expression's static type is the instantiated head:
+                    // `Box<int>()` is `Box<int>`, not the bare fold-sentinel
+                    // `Box` — the args-aware assignability matrix decides the
+                    // difference (#2838's raw-type arm reads a raw head as
+                    // its to-bounds defaults, which reports a written
+                    // creation against its own instantiation).
+                    self.creation_row_ty(*name, false, row.range.offset)
+                        .unwrap_or_else(|| Ty::named(*name))
                 }
                 _ => row.ty,
             }
@@ -3372,23 +3505,7 @@ impl<'a> Engine<'a> {
         }
         let world = self.name_world();
         let value = NameTy::from_semantic(ctx.scrutinee);
-        dq_probe!(
-            "[switch] scrutinee={} value={:?} cases={} expr={} switch_kw={}",
-            self.ty_display(ctx.scrutinee),
-            value,
-            ctx.cases.len(),
-            ctx.is_expression,
-            ctx.switch_kw.offset
-        );
-        for (i, c) in ctx.cases.iter().enumerate() {
-            dq_probe!(
-                "[switch]   case[{}] space={:?} guarded={} anchor={}",
-                i,
-                c.space,
-                c.guarded,
-                c.anchor.offset
-            );
-        }
+        for (i, c) in ctx.cases.iter().enumerate() {}
         let cases: Vec<Case<NameTy>> = ctx
             .cases
             .iter()
@@ -3422,21 +3539,20 @@ impl<'a> Engine<'a> {
         for anchor in unreachable {
             self.emit(SemanticCode::UnreachableSwitchCase, anchor, "", "");
         }
-        // The flow-dead member rows (statement switches only — a switch
+        // The dead member faces (statement switches only — a switch
         // expression's covered arms carry `unreachable_switch_case` at the
-        // arrow alone). The official chain is flow-side: a member whose
-        // unguarded alternative always matches (its space covers the whole
-        // scrutinee — `case _`, a variable pattern over the same type)
-        // drives the flow `unmatched` state unreachable, so every later
-        // member head is entered dead (the keyword row, the bare `case`
-        // token) and its member body dies with it (dead_code_verifier.dart's
-        // SwitchMember faces). A member whose own space is disjoint from
-        // the scrutinee never matches — only its body dies. The
-        // default-driven chain is the flow layer's (#868), so this chain
-        // stops at the first `default` member. Exhaustiveness-only coverage
-        // (a duplicate constant over a fully covered scrutinee) is NOT
-        // flow-dead — the oracle pins that to `unreachable_switch_case`
-        // alone.
+        // arrow alone). The total-match chain — an unguarded member whose
+        // space covers the whole scrutinee (`case _`, a variable pattern
+        // over the same type) driving every later member head and body
+        // dead — is the flow layer's fact (`analyzeSwitchStatement`'s dead
+        // `unmatched` state, translated at the diagnose `DeadCode` arm);
+        // staging it here too doubled every row. This walk keeps the face
+        // the flow layer defers here: a member whose own space is
+        // nullability-disjoint from the scrutinee never matches, so only
+        // its body dies (the official's `_EqualityCheckHasKnownResult`
+        // known-false arm). Exhaustiveness-only coverage (a duplicate
+        // constant over a fully covered scrutinee) is NOT flow-dead — the
+        // oracle pins that to `unreachable_switch_case` alone.
         if !ctx.is_expression && !cases.is_empty() {
             let total = |index: usize| {
                 matches!(
@@ -3488,20 +3604,19 @@ impl<'a> Engine<'a> {
                         && crate::switch_tracker::restriction_disjoint_from(&world, space, value)
                 }
             };
+            // The total-match handoff line: from the first unguarded
+            // total member on, every later head and body is chain-dead
+            // and the flow fact stages those rows — `body_dies` below
+            // applies only to the members before it (staging them too
+            // doubled the rows).
             let chain_start = (0..ctx.cases.len())
                 .find(|&index| !ctx.cases[index].guarded && total(index))
                 .map_or(ctx.cases.len(), |index| index + 1);
-            let chain_end = ctx.default_pos.unwrap_or(ctx.cases.len());
-            for (index, case) in ctx.cases.iter().enumerate() {
-                let in_chain = index >= chain_start && index < chain_end;
-                let body_dead = !in_chain && !case.guarded && body_dies(index);
-                if !in_chain && !body_dead {
-                    continue;
-                }
-                if in_chain {
-                    self.emit(SemanticCode::DeadCode, case.anchor, "", "");
-                }
-                if let Some(body) = case.body {
+            for (index, case) in ctx.cases.iter().enumerate().take(chain_start) {
+                if !case.guarded
+                    && let Some(body) = case.body
+                    && body_dies(index)
+                {
                     self.emit(SemanticCode::DeadCode, body, "", "");
                 }
             }
@@ -3728,10 +3843,88 @@ impl<'a> Engine<'a> {
         if sup == Ty::Null {
             return Some(false);
         }
+        // Right Nullable (subtype.dart 453-454): `S <: T?` needs `S <: T`
+        // (the `Null` leg decided above), and `S? <: T?` strips to
+        // `S <: T` (347-348). The assignable face's into-`T?` Right-Top
+        // leniency — every source "assigns" into a nullable target — is
+        // the assignment posture, not this relation, and a shape slot
+        // must not read it (`double? <: int?` is false: the
+        // f1-misfit tear-off pair stays informative, the oracle's
+        // silence). The stripped pair re-enters the ordinary ask; the
+        // nullable source against a non-nullable target keeps its
+        // rejection there.
+        let (sub, sup) = if matches!(
+            sup,
+            Ty::Named { nullable: true, .. }
+                | Ty::Record { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+        ) {
+            (Self::non_nullable_ty(sub), Self::non_nullable_ty(sup))
+        } else {
+            (sub, sup)
+        };
         self.assignable(sub, sup, false)
     }
 
     pub(crate) fn fn_sig_subtype(&self, from: &FnVarSig, to: &FnVarSig) -> Option<bool> {
+        // The generic-function-type bounds face — `relateTypeParameters`
+        // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/element/
+        // type_system.dart:1581-1635), which `_isFunctionSubtypeOf` runs
+        // ahead of its return/formal checks (subtype.dart:338-350): the
+        // signatures' own type-parameter counts must match, and each
+        // parameter's written bound must be EQUAL on both sides —
+        // `isEqualTo`, a mutual-subtype question over the pair, with the
+        // sides' own parameters unified by position (upstream
+        // instantiates both signatures with one shared fresh set, so the
+        // source's `T` in a bound compares against the target's
+        // parameter of the same index, whatever its name). A bound
+        // written on neither side needs no ask; one written on exactly
+        // one side reads `dynamic` against the other
+        // (`bound1 ??= DynamicTypeImpl.instance`). This is an equality,
+        // not a bounds direction: `void Function<Y extends num>()` is a
+        // subtype of `void Function<Y extends int>()` in NEITHER
+        // direction. A count-only entry (no name — the interned shape
+        // records just the `<...>` group's size) has an unknown bound
+        // and never decides (`None`, the under-report direction).
+        if from.params.len() != to.params.len() {
+            return Some(false);
+        }
+        if !from.params.is_empty() {
+            let unify: FxHashMap<StringId, Ty> = from
+                .params
+                .iter()
+                .zip(to.params.iter())
+                .filter(|((from_name, _), (to_name, _))| {
+                    *from_name != StringId::NONE && *to_name != StringId::NONE
+                })
+                .map(|((from_name, _), (to_name, _))| (*from_name, Ty::named(*to_name)))
+                .collect();
+            for ((from_name, from_bound), (to_name, to_bound)) in
+                from.params.iter().zip(to.params.iter())
+            {
+                let (bound_from, bound_to) = (*from_bound, *to_bound);
+                if bound_from.is_none() && bound_to.is_none() {
+                    // Both unwritten: the implicit bounds coincide and no
+                    // ask is needed.
+                    continue;
+                }
+                if *from_name == StringId::NONE || *to_name == StringId::NONE {
+                    // A count-only entry's bound is unknown (never
+                    // `dynamic`) — no ask is honest.
+                    return None;
+                }
+                let from_bound = self.subst_ty(bound_from.unwrap_or(Ty::Dynamic), &unify);
+                let to_bound = bound_to.unwrap_or(Ty::Dynamic);
+                match (
+                    self.slot_subtype(from_bound, to_bound),
+                    self.slot_subtype(to_bound, from_bound),
+                ) {
+                    (Some(true), Some(true)) => {}
+                    (Some(false), _) | (_, Some(false)) => return Some(false),
+                    _ => return None,
+                }
+            }
+        }
         // A target return face naming a type this file cannot spell (a
         // generic callee's own inference parameter — `then<R>`'s
         // `FutureOr<R> Function(T)`) is an inference-site constraint, not
@@ -3810,12 +4003,35 @@ impl<'a> Engine<'a> {
     }
 
     /// The written function-type display for the message slots: the
-    /// return type, `Function(`, the positional list with the optional
-    /// tail bracketed, the named section braced with its `required`
-    /// keywords (`void Function({required int x})`).
+    /// return type, `Function`, the signature's own type parameters
+    /// (`void Function<Y extends num>()`), the positional list with the
+    /// optional tail bracketed, and the named section braced with its
+    /// `required` keywords (`void Function({required int x})`).
+    /// Count-only parameter entries carry no names and render nothing —
+    /// the interned shape never recorded them.
     pub(crate) fn fn_sig_display(&self, sig: &FnVarSig) -> String {
         let mut text = self.ty_display(sig.return_ty);
-        text.push_str(" Function(");
+        text.push_str(" Function");
+        let params: Vec<&(StringId, Option<Ty>)> = sig
+            .params
+            .iter()
+            .filter(|(name, _)| *name != StringId::NONE)
+            .collect();
+        if !params.is_empty() {
+            text.push('<');
+            for (index, (name, bound)) in params.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                text.push_str(self.strings.resolve(*name));
+                if let Some(bound) = bound {
+                    text.push_str(" extends ");
+                    text.push_str(&self.ty_display(*bound));
+                }
+            }
+            text.push('>');
+        }
+        text.push('(');
         let required = usize::from(sig.required_positional);
         for (index, ty) in sig.positional.iter().enumerate() {
             if index > 0 {
@@ -4137,7 +4353,7 @@ impl<'a> Engine<'a> {
         if from_name == to_name {
             // Same head, differing written arguments: the covariant
             // interface rule decides through the boundary pool.
-            return self.covariant_args(from_args, to_args);
+            return self.covariant_args(from_name, from_args, to_args);
         }
         // Distinct non-primitive heads: the supertype-graph walk decides.
         // A definite miss is the reportable assignability face
@@ -4280,9 +4496,19 @@ impl<'a> Engine<'a> {
     /// decidable mismatch breaks the pair; one undecidable element (a
     /// distinct-name pair an unseen subclass edge could still relate)
     /// suppresses the whole — the under-report direction. An arity
-    /// mismatch is the `wrong_number` family's written residue; the
-    /// assignability face stays silent on it.
-    pub(crate) fn covariant_args(&self, from: ArgListId, to: ArgListId) -> Option<bool> {
+    /// mismatch between two WRITTEN instantiations is the `wrong_number`
+    /// family's written residue; the assignability face stays silent on
+    /// it. A raw head against a written instantiation is different
+    /// residue: the raw side reads as its instantiate-to-bounds defaults
+    /// (`instantiateToBounds`, type_system.dart:719-731 — the oracle's
+    /// resolved types never disagree in arity, #2838), filled through the
+    /// bounds snapshot's fixpoint and decided by the same element rule.
+    pub(crate) fn covariant_args(
+        &self,
+        head: StringId,
+        from: ArgListId,
+        to: ArgListId,
+    ) -> Option<bool> {
         // The narrow borrow ([`Engine::function_shape_sig`]'s pattern): the
         // slots copy out and the pool guard drops before the element
         // verdicts — each re-enters [`Engine::assignable`] and the chain
@@ -4291,6 +4517,29 @@ impl<'a> Engine<'a> {
         let (from, to) = {
             let pool = self.boundary.pool();
             (pool.get(from).to_vec(), pool.get(to).to_vec())
+        };
+        let (from, to) = if from.len() != to.len() {
+            // The raw-type arm (#2838): exactly one side EMPTY. A
+            // written-vs-written mismatch stays the `wrong_number`
+            // family's, and a fill that misses the written count (a
+            // foreign head, a poisoned bound) keeps the silence.
+            let (raw_first, written): (bool, Vec<Ty>) = match (from.is_empty(), to.is_empty()) {
+                (true, false) => (true, to),
+                (false, true) => (false, from),
+                _ => return None,
+            };
+            let defaults = self.bounds.itb_default_args(self.strings, head)?;
+            if defaults.len() != written.len() {
+                return None;
+            }
+            let filled: Vec<Ty> = defaults.iter().map(|tree| self.tree_ty(tree)).collect();
+            if raw_first {
+                (filled, written)
+            } else {
+                (written, filled)
+            }
+        } else {
+            (from, to)
         };
         if from.len() != to.len() {
             return None;
@@ -4364,17 +4613,27 @@ impl<'a> Engine<'a> {
                 shape,
                 nullable: false,
             } => {
-                let (return_ty, positional, named) = {
+                let (type_params, return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
+                        shape.type_params,
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
                 };
                 Some(Box::new(FnVarSig {
-                    params: Box::default(),
+                    // The interned shape carries only the type-parameter
+                    // count — anonymous entries (no name, no bound) feed
+                    // the count rule of [`Engine::fn_sig_subtype`];
+                    // their bounds are unknown and never decide. Named,
+                    // bounded entries exist only through the
+                    // written-signature stash (`fn_var_sigs`) and the
+                    // alias faces the bounds capture serves.
+                    params: (0..usize::from(type_params))
+                        .map(|_| (StringId::NONE, None))
+                        .collect(),
                     required_positional: u16::try_from(positional.len()).unwrap_or(u16::MAX),
                     positional: positional.into(),
                     named: named.iter().map(|(name, ty)| (*name, *ty, false)).collect(),
@@ -4413,14 +4672,24 @@ impl<'a> Engine<'a> {
     /// written right-hand shape with the alias's own type parameters
     /// substituted by the written arguments — the instantiation the
     /// written-shape face cannot carry (its leaves stay the parameter
-    /// names). `None` on an arity residue (the `wrong_number` family's
-    /// business), when the written capture failed, or when the head is no
-    /// function-RHS alias.
+    /// names). The RHS's own type variables ride the instantiated
+    /// signature (#2838: `F<int>` over `typedef F<X> = void Function<Y
+    /// extends X>()` reads `void Function<Y extends int>()` — the count
+    /// and equality rules of [`Engine::fn_sig_subtype`] decide over the
+    /// real populated params), each bound substituted like every other
+    /// RHS piece; a poisoned bound reads unwritten (`None` — the
+    /// `dynamic` arm). `None` on an arity residue (the `wrong_number`
+    /// family's business), when the written capture failed, or when the
+    /// head is no function-RHS alias.
     fn instantiated_alias_sig(&self, name: StringId, args: ArgListId) -> Option<Box<FnVarSig>> {
-        let params: Box<[StringId]> = match self.bounds.alias_fn_shape(name) {
-            Some((params, ..)) => params.iter().map(|(param, ..)| *param).collect(),
-            None => return None,
-        };
+        let (params, rhs_vars): (Box<[StringId]>, Box<[(StringId, Option<TypeTree>, bool)]>) =
+            match self.bounds.alias_fn_shape(name) {
+                Some((params, rhs_vars, ..)) => (
+                    params.iter().map(|(param, ..)| *param).collect(),
+                    rhs_vars.iter().cloned().collect(),
+                ),
+                None => return None,
+            };
         let written: Vec<Ty> = {
             let pool = self.boundary.pool();
             pool.get(args).to_vec()
@@ -4431,7 +4700,19 @@ impl<'a> Engine<'a> {
         let map: FxHashMap<StringId, Ty> = params.iter().copied().zip(written).collect();
         let sig = self.alias_fn_sig(name)?;
         Some(Box::new(FnVarSig {
-            params: Box::default(),
+            params: rhs_vars
+                .iter()
+                .map(|(var, bound, poisoned)| {
+                    let bound = if *poisoned {
+                        None
+                    } else {
+                        bound
+                            .as_ref()
+                            .map(|tree| self.subst_ty(self.tree_ty(tree), &map))
+                    };
+                    (*var, bound)
+                })
+                .collect(),
             positional: sig
                 .positional
                 .iter()

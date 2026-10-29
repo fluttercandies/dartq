@@ -6043,10 +6043,198 @@ fn specify_nonobvious_local_variable_types_gate() {
             .is_empty()
     );
 
+    // A zero-argument bare call is the invocation face
+    // (`pkg/linter/lib/src/util/obvious_types.dart` :229-233 — a
+    // `MethodInvocation` is never obvious except `toString`): it reports
+    // like any call initializer.
     let f = Fixture::parse("void f() {\n  var h = bar();\n}\nString bar() => '';\n");
+    assert_eq!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .len(),
+        1
+    );
+}
+
+/// The upstream for-each faces
+/// (`SpecifyNonObviousLocalVariableTypesTest.test_forEach_inferredList` /
+/// `test_forEach_listWithNonObviousElement`): an untyped loop variable
+/// over a non-obvious iterable reports at the `var i` declaration
+/// (keyword through name); a typed list literal iterable stays silent
+/// (`test_forEach_noDeclaredType`), as does a written loop-variable type
+/// (`test_forEach_typedList`).
+#[test]
+fn specify_nonobvious_for_each_loop_variable() {
+    let f = Fixture::parse(
+        "f() {\n  for (var i in [1, 2, \"Hello\".length]) {\n    print(i);\n  }\n}\n",
+    );
+    let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let var = tok(&f.source, &f.tokens, "var", 0);
+    assert_eq!(
+        lints[0].range,
+        utf16_at(&f, var)..utf16_at(&f, var) + 5,
+        "{lints:?}"
+    );
+
+    let f = Fixture::parse(
+        "f() {\n  int j = \"Hello\".length;\n  for (var i in [j, 1, j + 1]) { }\n}\n",
+    );
+    let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let var = tok(&f.source, &f.tokens, "var", 0);
+    assert_eq!(
+        lints[0].range,
+        utf16_at(&f, var)..utf16_at(&f, var) + 5,
+        "{lints:?}"
+    );
+
+    let f = Fixture::parse("f() {\n  for (var i in <int>[1, 2, 3]) { }\n}\n");
     assert!(
         f.run(&one_rule("specify_nonobvious_local_variable_types"))
             .is_empty()
+    );
+
+    let f = Fixture::parse("f() {\n  for (int i in <int>[1, 2, 3]) { }\n}\n");
+    assert!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .is_empty()
+    );
+
+    // The written `dynamic` face stays in play (the `DynamicType` gate):
+    // the report opens at the written run — `for ([!dynamic i!] in ...)`.
+    let f = Fixture::parse("f() {\n  int j = 0;\n  for (dynamic i in [j + 1]) {}\n}\n");
+    let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let dynamic = tok(&f.source, &f.tokens, "dynamic", 0);
+    assert_eq!(
+        lints[0].range,
+        utf16_at(&f, dynamic)..utf16_at(&f, dynamic) + 9,
+        "{lints:?}"
+    );
+}
+
+/// The bare-element comma boundary: a collection element's bare-name
+/// `Send` leaf tiles through its unconsumed follower token, and the
+/// element comma is that follower — it still separates, so `[j, 1]`
+/// stays two segments in the element fold (`collection_elements`'
+/// separator scan). With a `String j` local the upstream fold is the
+/// `_sameOrNull` mismatch (`obvious_types.dart` :14-15, :140-148 —
+/// String against the `1` int), so the literal is non-obvious and both
+/// faces report per oracle: `for (var i in [j, 1])` at `var i` (the
+/// `test_forEach_listWithNonObviousElement` fold without the `j + 1`
+/// element) and `var x = [j, 1];` at the keyword.
+#[test]
+fn specify_nonobvious_bare_element_comma_boundary() {
+    let f = Fixture::parse("f() {\n  String j = '';\n  for (var i in [j, 1]) { }\n}\n");
+    let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let var = tok(&f.source, &f.tokens, "var", 0);
+    assert_eq!(
+        lints[0].range,
+        utf16_at(&f, var)..utf16_at(&f, var) + 5,
+        "{lints:?}"
+    );
+
+    let f = Fixture::parse("f() {\n  String j = '';\n  var x = [j, 1];\n}\n");
+    let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let var = tok(&f.source, &f.tokens, "var", 0);
+    assert_eq!(
+        lints[0].range,
+        utf16_at(&f, var)..utf16_at(&f, var),
+        "{lints:?}"
+    );
+}
+
+/// The upstream generic-invocation faces
+/// (`test_genericInvocation_paramIsType` /
+/// `test_genericInvocation_typeNeededForInference` /
+/// `test_genericInvocation_typeParamProvided`): a `bar(...)` initializer
+/// whose parameter is a type — with or without an explicit type argument —
+/// is non-obvious and reports at the keyword anchor (the list head, a
+/// zero-width range); the typed `_ok` shapes stay silent. The invocation
+/// face also gates the for-each iterable (`for (var i in bar())`).
+#[test]
+fn specify_nonobvious_generic_invocation_faces() {
+    for (source, keyword) in [
+        (
+            "String f() {\n  final h = bar('');\n  return h;\n}\n\nT bar<T>(T d) => d;\n",
+            "final",
+        ),
+        (
+            "f() {\n  var h = bar('');\n  return h;\n}\n\nT bar<T>(dynamic d) => d;\n",
+            "var",
+        ),
+        (
+            "String f() {\n  var h = bar<String>('');\n  return h;\n}\n\nT bar<T>(dynamic d) => d;\n",
+            "var",
+        ),
+    ] {
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
+        assert_eq!(lints.len(), 1, "{source} {lints:?}");
+        let kw = tok(&f.source, &f.tokens, keyword, 0);
+        assert_eq!(
+            lints[0].range,
+            utf16_at(&f, kw)..utf16_at(&f, kw),
+            "{source} {lints:?}"
+        );
+    }
+
+    let f = Fixture::parse(
+        "String f() {\n  String h = bar('');\n  return h;\n}\n\nT bar<T>(T d) => d;\n",
+    );
+    assert!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .is_empty()
+    );
+
+    let f = Fixture::parse("void f() {\n  for (var i in bar()) {}\n}\nString bar() => '';\n");
+    assert_eq!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .len(),
+        1
+    );
+}
+
+/// The invocation-face boundary: a same-file class head is the
+/// instance-creation face — a non-generic `A()` stays silent, a raw
+/// generic `A()` reports (`test_instanceCreation_generic` /
+/// `test_instanceCreation_nonGeneric`); `toString()` keeps the upstream
+/// exception; an unresolved head is the invocation face.
+#[test]
+fn specify_nonobvious_invocation_face_boundaries() {
+    let f = Fixture::parse("f() {\n  var a = A();\n}\n\nclass A {}\n");
+    assert!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .is_empty()
+    );
+
+    let f = Fixture::parse("f() {\n  var a = A(1);\n}\n\nclass A<X> {\n  A(X x);\n}\n");
+    assert_eq!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .len(),
+        1
+    );
+
+    let f = Fixture::parse("f() {\n  var a = A();\n}\n\nclass A<X> {}\n");
+    assert_eq!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .len(),
+        1
+    );
+
+    let f = Fixture::parse("class C {\n  void m() {\n    var s = toString();\n  }\n}\n");
+    assert!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .is_empty()
+    );
+
+    let f = Fixture::parse("void f() {\n  var x = gone();\n}\n");
+    assert_eq!(
+        f.run(&one_rule("specify_nonobvious_local_variable_types"))
+            .len(),
+        1
     );
 }
 

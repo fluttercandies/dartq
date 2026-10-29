@@ -10,6 +10,20 @@
 use super::*;
 
 impl Engine<'_> {
+    /// The created head's instantiated static type at `offset`: the written
+    /// explicit type arguments (`C<int>()`'s `<int>`, keyed on the callee
+    /// row) applied to the bare fold-sentinel head, or `None` when the row
+    /// registered no written arguments.
+    pub(crate) fn creation_row_ty(
+        &self,
+        name: StringId,
+        nullable: bool,
+        offset: u32,
+    ) -> Option<Ty> {
+        let (_, tys) = self.call_type_args.iter().find(|(r, _)| *r == offset)?;
+        Some(self.boundary.args.borrow_mut().named(name, nullable, tys))
+    }
+
     /// `ty` with the creation row's explicit type arguments applied when
     /// `ty` is the bare head of a `Created` receiver at `row`; every other
     /// shape returns unchanged.
@@ -32,9 +46,6 @@ impl Engine<'_> {
             return ty;
         }
         let offset = self.rows.get(row).map_or(u32::MAX, |r| r.range.offset);
-        let Some((_, tys)) = self.call_type_args.iter().find(|(r, _)| *r == offset) else {
-            return ty;
-        };
-        self.boundary.args.borrow_mut().named(name, nullable, tys)
+        self.creation_row_ty(name, nullable, offset).unwrap_or(ty)
     }
 }

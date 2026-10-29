@@ -373,6 +373,26 @@ impl NullAwareKind {
     }
 }
 
+/// The verifier face a dead null-aware chain answers
+/// (dead_code_verifier.dart's call-site split): the climb faces extend
+/// through the parent chain, the cascade faces hold only while the first
+/// section's body stays bare (`verifyCascadeExpression`'s
+/// extraction/invocation/index-expression gate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeadChainKind {
+    /// `?.member` — `verifyNullAwareAccess` (`a?.x.gg` reports the whole
+    /// climbed chain).
+    Member,
+    /// `?.[i]` / `?[i]` — `verifyReceiverIndexExpression`.
+    Index,
+    /// `?..member` first cascade section — `verifyCascadeExpression`'s
+    /// property-extraction / method-invocation body gate.
+    CascadeMember,
+    /// `?..[i]` first cascade section (the `?..` stand-in question) — the
+    /// same gate's index-expression arm.
+    CascadeIndex,
+}
+
 /// A typed receiver recorded at member-merge time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Receiver {
@@ -476,6 +496,24 @@ pub(crate) struct Frame {
     /// it (#1758). Keyed alongside `var_types` so the scope walk answers it
     /// the same way.
     pub(crate) fn_formal_rets: FxHashMap<StringId, Ty>,
+    /// The local-function tear-off capture (#2842): a declared local
+    /// function's own value IS its tear-off, and its signature is only
+    /// whole at the function's own frame close — so it rides the
+    /// ENCLOSING frame here, keyed by name, dropped with the scope (the
+    /// same lifetime the name's `locals` entry has). Filled by
+    /// [`Engine::capture_local_fn_tearoff`], read by
+    /// [`Engine::local_fn_sig`].
+    pub(crate) local_fn_sigs: FxHashMap<StringId, Box<FnVarSig>>,
+    /// The frame's own formal list's optional-positional boundary: the
+    /// required-formal count latched when `[` opens (the no-capture arm
+    /// of [`Engine::fn_capture_optional_group`], the frame's own depth-1
+    /// list only). The tear-off capture's required/optional split; `None`
+    /// when the list has no optional group.
+    pub(crate) formal_optional_from: Option<u16>,
+    /// A `{` opened in the frame's own formal list: the named section the
+    /// tear-off capture refuses (the closure capture's named-poison
+    /// precedent — the declared-face model carries no named-formal face).
+    pub(crate) formal_named: bool,
     /// `type_params` length to truncate back to when this frame closes.
     pub(crate) type_mark: usize,
     /// The row-stack length when this frame opened: type parameters that
@@ -1776,6 +1814,34 @@ pub(crate) struct Engine<'a> {
     /// Stale groups stay harmless: the verdict reads it only past the
     /// `is` operator, which an operand-side group never crosses.
     pub(crate) type_args_group_end: Option<u32>,
+    /// The most recently completed written bracket type's extent: a
+    /// generalized function type (`void Function(int, [List<T>])
+    /// Function(int x)` — the trailing formal list, its names, and the
+    /// formals' closing paren extend past the armed head and any
+    /// type-arguments group) or a record type (`(int, int)`). Latched by
+    /// the listener's `end_function_type`/`end_record_type`; the is-check
+    /// verdict extends its span through it — the oracle's `.at(node)`
+    /// ends at the TypeAnnotation's endToken, the bracket group's
+    /// closer. Stale writes stay harmless: the verdict reads it only
+    /// when the production starts past the `is` operator, which source
+    /// order never lets an earlier declaration cross.
+    pub(crate) written_ty_span: Option<SourceRange>,
+    /// The closer-pushed operand row's opener: the literal faces
+    /// (parenthesized expression, record/list/set/map literal) push the
+    /// operand's expression row at the closing bracket, but the oracle's
+    /// `.at(node)` anchors at the node offset — the opening bracket
+    /// (`(null is int) is bool` anchors at `(`, not `)`). Stored as
+    /// `(close_offset, open_offset)`, consumed by the is-check verdict
+    /// when the operand row sits at the recorded close; any other face
+    /// overwrites or consumes it first.
+    pub(crate) literal_row_open: Option<(u32, u32)>,
+    /// The last closed formal-parameter list's closer end offset, for
+    /// generalized-function-type kinds. `end_function_type` carries the
+    /// `Function` keyword and the trailing `?`, never the formals' `)`
+    /// the type's written extent ends at — this latch (written by the
+    /// listener's `end_formal_parameters`, which always fires for the
+    /// same production immediately before) supplies it.
+    pub(crate) fn_formal_closer_end: Option<u32>,
     /// The open variable-declaration group's declared type (one
     /// `parse_type` per group), for the initializer checks.
     pub(crate) pending_decl_ty: Option<Ty>,
@@ -3137,9 +3203,18 @@ pub(crate) struct Engine<'a> {
     pub(crate) record_type_depth: u32,
     /// Null-aware chains over definitely-unassigned nullable locals (the
     /// `_verifyUnassignedVariable` face, dead_code_verifier.dart:460-505):
-    /// `(operator offset, chain end, receiver read span)` latched at the
-    /// operator, resolved at teardown when the flow facts are in.
-    pub(crate) dead_null_chains: Vec<(u32, u32, SourceRange)>,
+    /// `(operator offset, chain end, receiver read span, root kind, grown by
+    /// a later section)` latched at the operator, resolved at teardown when
+    /// the flow facts are in. The kind carries the verifier face the chain
+    /// answers: `Member`/`Index` climb through the parent chain
+    /// (`verifyNullAwareAccess` / `verifyReceiverIndexExpression`),
+    /// `CascadeMember`/`CascadeIndex` fire only while the cascade's first
+    /// section body stays bare (`verifyCascadeExpression`'s body-class
+    /// gate). The growth bit marks a cascade chain a later section already
+    /// extended (`verifyCascadeExpression` reports operator..cascade end) —
+    /// a write then targets a later section, a node the verifier never
+    /// sees, so the write retires nothing.
+    pub(crate) dead_null_chains: Vec<(u32, u32, SourceRange, DeadChainKind, bool)>,
     /// `e!` over a local's read whose walk-time type decides nothing (the
     /// operand is the declared nullable/dynamic shape): `(read span, bang
     /// span)` re-decided at teardown against the flow's promoted type —
@@ -5011,6 +5086,109 @@ impl<'a> Engine<'a> {
         matches!(ty, Ty::Named { nullable: true, .. })
     }
 
+    /// The potentially-nullable verdict (`isPotentiallyNullable = !
+    /// isNonNullable`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type_system.dart:1161-1179 — the
+    /// receiver gate `type_property_resolver.dart`'s nullable branch and
+    /// the bare-invocation face both read): true for every `?`-suffixed
+    /// spelling (named — `Never?` included, a question-suffixed Never is
+    /// NOT the `Null` instance and keeps the unchecked code — function,
+    /// and record), and for a `?`-less type-parameter reference whose
+    /// declared bound is nullable or absent (the implicit `Object?`,
+    /// walked post-walk through the executable windows' capture
+    /// [`Engine::param_bound_of`] — a container's own parameter spelling
+    /// reads non-nullable, the closure-formal schema's leaked-parameter
+    /// discipline). False for `dynamic`, `void`,
+    /// and the sentinel — the top faces are suffix-less; and for the
+    /// `Null` type itself: it IS potentially nullable upstream, but its
+    /// dereference rows swap to `invalid_use_of_null_value`
+    /// (`nullable_dereference_verifier.dart:55-58`), so it stays OUT of
+    /// this predicate's consumers rather than routing `Null` receivers
+    /// into the unchecked code.
+    pub(crate) fn potentially_nullable(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Named { nullable: true, .. }
+            | Ty::Function { nullable: true, .. }
+            | Ty::Record { nullable: true, .. } => true,
+            Ty::Named {
+                name,
+                nullable: false,
+                ..
+            } => self.param_bound_potentially_nullable(name),
+            _ => false,
+        }
+    }
+
+    /// Whether a `?`-less type-parameter spelling reads potentially
+    /// nullable through its declared bound (the `isNonNullable`
+    /// TypeParameterType arm recursing): an unbounded parameter (the
+    /// implicit `Object?`) and a nullable-or-top bound answer yes, a
+    /// strictly non-nullable bound no. One level of parameter-to-parameter
+    /// bounds (`T extends S`) walks through, the loop cap keeping a cyclic
+    /// capture from hanging the pass (a cycle falls out non-nullable, the
+    /// under-report direction). The bound table is the EXECUTABLE windows'
+    /// post-walk capture alone: a container's own parameter spelling
+    /// deliberately reads non-nullable here — under a raw receiver the
+    /// callee's schema leaves such formals `dynamic` (the closure-formal
+    /// solver's leaked-parameter discipline), and this layer cannot tell
+    /// a leaked schema spelling from a user-annotated one (the
+    /// under-report direction, the class-generic census rows).
+    fn param_bound_potentially_nullable(&self, name: StringId) -> bool {
+        let mut next = self.exec_param_bound(name);
+        for _ in 0..4 {
+            let Some(ty) = next else { return false };
+            match ty {
+                Ty::Named { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+                | Ty::Record { nullable: true, .. } => return true,
+                Ty::Named {
+                    name: param,
+                    nullable: false,
+                    ..
+                } => {
+                    if self.future_or_potentially_nullable(ty) {
+                        return true;
+                    }
+                    next = self.exec_param_bound(param);
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// [`Engine::param_bound_of`] restricted to executable-owned windows:
+    /// a window whose owning name declares a CONTAINER in this unit is the
+    /// container header's own capture (a class, mixin, or extension
+    /// declaration latches `pending_exec_name` the same way a function
+    /// does) and stays out — its parameter spellings are the callee-schema
+    /// face the closure-formal solver keeps `dynamic` under a raw
+    /// receiver, never a scope-parameter verdict this predicate answers.
+    fn exec_param_bound(&self, name: StringId) -> Option<Ty> {
+        let implicit_object = || Ty::Named {
+            name: self.intern("Object"),
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        for (owner, window) in self
+            .exec_bounds
+            .iter()
+            .chain(self.method_exec_bounds.iter())
+        {
+            if let Some((_, bound)) = window.iter().find(|(param, _)| *param == name) {
+                if self
+                    .index
+                    .get(self.file)
+                    .is_some_and(|elements| elements.container(*owner).is_some())
+                {
+                    continue;
+                }
+                return Some(bound.unwrap_or_else(implicit_object));
+            }
+        }
+        None
+    }
+
     /// A `?`-suffixed named type joined onto an `e!` junction is its
     /// non-null projection; every other shape is already its own
     /// `promoteToNonNull` form (`dynamic` stays, `Null` has no modeled
@@ -5068,6 +5246,16 @@ impl<'a> Engine<'a> {
         }
     }
 }
+
+// The #2815 pins (the B2 unchecked-nullable family). Registered here,
+// not in `diagnose.rs` (the #2807 lane's file this wave), via `#[path]`:
+// the module stays inside the `diagnose` subtree so the test rig's
+// `pub(super)` items remain visible. Moving the declaration into
+// `diagnose.rs`'s sibling block is a mechanical follow-up for whoever
+// owns that file next.
+#[cfg(test)]
+#[path = "ticket_2815_tests.rs"]
+mod ticket_2815_tests;
 
 #[cfg(test)]
 mod extension_type_ctors {

@@ -593,6 +593,32 @@ impl<'a> Engine<'a> {
     /// the name-level model does not type on the receiver row — the
     /// receiver's own non-nullability is not the read's (#2172's
     /// `groupSetsBy`/`groupBy` rows).
+    /// Drops the dead null-aware chains the assignment writes through (the
+    /// live verifier reports no dead face for any null-aware WRITE —
+    /// `verifyReceiverIndexExpression` fires on the read form only, and the
+    /// assignment path carries no `verifyNullAwareAccess` call): the chain
+    /// whose extent contains the write target's row is that target's own
+    /// chain (`list?..last = 0`, `c1?[0] = 1`), so the write retires it.
+    pub(crate) fn cancel_dead_chains_on_write(&mut self, operator: Token) {
+        let limit = operator.range.offset;
+        // The nearest row ending before `=` is the write target's own tail
+        // (receiver, operator, or value row — the `?[` write parses leave
+        // only an operator-intent row, so no shape filter here): a chain
+        // counts as the write's own only when its extent covers that row.
+        let Some(target) = self.rows.iter().rev().find(|row| row.range.end() <= limit) else {
+            return;
+        };
+        let (start, end) = (target.range.offset, target.range.end());
+        self.dead_null_chains
+            .retain(|&(op, chain_end, _, _, grown)| {
+                // A cascade chain a later section already grew covers the write
+                // only through that later section — the verifier reports
+                // operator..cascade end there (`a?..foo()..x = 1` keeps its row);
+                // the root section's own write is the one that retires a chain.
+                !(op <= end && start <= chain_end && !grown)
+            });
+    }
+
     pub(crate) fn check_dead_null_assignment(&mut self, operator: Token) {
         if self.text_of(operator) != Some("??=") {
             return;
@@ -939,6 +965,14 @@ impl<'a> Engine<'a> {
         // one — the all-or-nothing group is a `PatternVariableDeclaration`
         // face, while the official visits a case pattern's variables
         // individually (each is its own local element).
+        //
+        // An if-case binder takes the same individual posture without the
+        // arm scope (#2858): its declaring context pops at the root
+        // pattern's completion — long before the then-branch reads the
+        // binder — so the sentinel's switch-slot arithmetic would strand
+        // every read. The row registers ungrouped and the site join below
+        // patches in the same-name spelling pair.
+        let mut if_case_site = false;
         let group = if matches!(kind, LocalKind::PatternVariable) {
             let depth = self.switch.switches.len();
             if self.switch.case_sink_open
@@ -947,10 +981,13 @@ impl<'a> Engine<'a> {
                 && depth <= u16::MAX as usize
             {
                 Some(u32::MAX - depth as u32)
+            } else if self.switch.if_case_window {
+                if_case_site = true;
+                None
             } else if let Some(group) = self.pattern_group_open {
                 Some(group)
             } else {
-                self.pattern_group_seq += 1;
+                self.pattern_group_seq += 2;
                 self.pattern_group_open = Some(self.pattern_group_seq);
                 Some(self.pattern_group_seq)
             }
@@ -968,6 +1005,74 @@ impl<'a> Engine<'a> {
             group,
             retired: false,
         });
+        if if_case_site {
+            self.join_pattern_site_binder(self.locals.len() - 1);
+        }
+    }
+
+    /// Joins the pattern-site binder row at `index` with its same-name
+    /// sibling — the non-window pattern sites (if-case patterns here, the
+    /// for-in pattern heads through [`Self::convert_window_binder_to_site`],
+    /// #2858): the official verifier visits each
+    /// `visitDeclaredVariablePattern` binder as its own local
+    /// (unused_local_elements_verifier.dart:565-579), while one logical-or
+    /// element's same-name spellings stay one element upstream
+    /// (`UsedLocalElements.addElement`) — a use of any spelling spares the
+    /// pair, an unused spelling reports. The scan stops at the most recent
+    /// same-name pattern row of the live frame window: an ungrouped
+    /// sibling mints a join group over the pair, a joined sibling extends
+    /// its group (the `p || p || p` chain), and a window or sentinel row
+    /// stays untouched (a declaration's all-or-nothing set and a case
+    /// header's arm scope are other sites' contracts).
+    fn join_pattern_site_binder(&mut self, index: usize) {
+        let Some(&lo) = self.frame_local_marks.last() else {
+            return;
+        };
+        let name = self.locals[index].name;
+        let Some(offset) = self.locals[lo..index]
+            .iter()
+            .rposition(|decl| decl.name == name && matches!(decl.kind, LocalKind::PatternVariable))
+        else {
+            return;
+        };
+        let sibling = lo + offset;
+        match self.locals[sibling].group {
+            None => {
+                // The odd id space: window groups mint even
+                // (`pattern_group_seq` steps by 2), so a site join never
+                // collides with a live window and the parity tells the two
+                // apart here.
+                self.pattern_group_seq += 2;
+                let group = self.pattern_group_seq + 1;
+                self.locals[sibling].group = Some(group);
+                self.locals[index].group = Some(group);
+            }
+            Some(group) if group < PATTERN_ARM_SCOPE_BASE && group % 2 == 1 => {
+                self.locals[index].group = Some(group);
+            }
+            _ => {}
+        }
+    }
+
+    /// Converts one for-in pattern-head row from its window group to the
+    /// per-binder site form (#2858): `for (var (a, b) in xs)` parses its
+    /// head as a bare pattern with no `PatternVariableDeclaration`
+    /// wrapper, so the head's binders register into the all-or-nothing
+    /// window before `handle_for_in_loop_parts` names the head a pattern
+    /// one — the conversion retags them individually and patches the
+    /// same-name spelling join. Rows outside a window group (the
+    /// declarator form's plain local, a stray sentinel) stay untouched.
+    pub(crate) fn convert_window_binder_to_site(&mut self, index: usize) {
+        if !matches!(self.locals[index].kind, LocalKind::PatternVariable) {
+            return;
+        }
+        match self.locals[index].group {
+            Some(group) if group < PATTERN_ARM_SCOPE_BASE => {
+                self.locals[index].group = None;
+                self.join_pattern_site_binder(index);
+            }
+            _ => {}
+        }
     }
 
     /// A top-level statement declaration joins the open statement-list

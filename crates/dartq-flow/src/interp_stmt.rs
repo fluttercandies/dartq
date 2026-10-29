@@ -110,6 +110,11 @@ impl Interp<'_> {
                 {
                     if let Some(pattern) = self.pattern.as_mut() {
                         pattern.kind = PatternKind::IfCase;
+                        let pending = pattern.scrutinee_pending;
+                        pattern.scrutinee_pending = false;
+                        if pending {
+                            drop(self.exprs.pop());
+                        }
                     }
                     self.if_case_then();
                     return true;
@@ -129,6 +134,18 @@ impl Interp<'_> {
                 // The condition's own query (official
                 // `handle_ifStatement_conditionEnd`, type_analyzer.dart:1191).
                 self.condition_operand(&cond);
+                // The fold marker the branch's own empty block reads: a
+                // pattern-disjoint kill (`if (x case null) {}` over a
+                // non-nullable x, marked at `ConstantPatternEnd`) or a
+                // constant condition (`if (false) {}`) provably ends the
+                // iteration — the then-branch's empty block IS a polled
+                // node there (official `visitBlock`) and reports its
+                // braces. An `is!`-same-type fold keeps the old posture:
+                // its empty block stays silent (oracle-probed), so the
+                // marker resets here — this if's condition is a plain
+                // expression (the clause-adopting path returned above) —
+                // and rides only a literal condition.
+                self.if_branch_folded = cond.bool_value.is_some();
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::If {
                     branch: if_false,
@@ -895,10 +912,22 @@ impl Interp<'_> {
                 self.current = unmatched;
                 self.case_pattern_begin(true);
             }
-            Ev::SwitchExprCasePattern => {
+            Ev::SwitchExprCasePattern { begin } => {
                 if self.collecting() {
                     return true;
                 }
+                // The arm check (official `handleSwitchBeforeAlternative`'s
+                // `checkUnreachableNode(case_)` — the first dead node is
+                // the whole arm): a dead chain entering the arm anchors the
+                // interval at the arm's first token. The pattern's own
+                // faces keep `current` dead (a live entry stays live), so
+                // the poll reads the entry posture either way. Firing
+                // after the pattern's events (the recorder is post-order;
+                // the arm-start token only rides this event) leaves one
+                // divergence from the official single-row rule: an or
+                // operand row inside an ALREADY-dead arm reports on its
+                // own instead of folding into the arm's row.
+                self.dead_code(*begin);
                 // The matched-value query fires at the pattern match: the
                 // chain below is the match-time one (`case_pattern_end_expr`
                 // updates it right after), and the clause's anchor token
@@ -917,7 +946,11 @@ impl Interp<'_> {
                 // join the combined group state.
                 self.case_pattern_end_expr();
             }
-            Ev::SwitchExprCaseEnd { has_guard, begin } => {
+            Ev::SwitchExprCaseEnd {
+                has_guard,
+                begin,
+                end,
+            } => {
                 if self.collecting() {
                     // The case value — and the guard's value behind it,
                     // when present — leaves the stack here in every mode
@@ -944,6 +977,11 @@ impl Interp<'_> {
                         });
                     }
                 }
+                // The dead arm's whole-range row (official
+                // `finishExpressionCase`'s `flowEnd(case_)` — the arm was
+                // the first dead node, so the row spans the arm's own
+                // extent, trimmed to the separator).
+                self.dead_arm_row(begin.range.offset, *end);
                 // Official decision order (flow_analysis.dart:1776-1786):
                 // pattern → guard → `switch_endAlternative` → body. The
                 // parser delivers the guard after the pattern-close anchor
@@ -1466,17 +1504,20 @@ impl Interp<'_> {
                 self.close_standalone_pattern();
             }
             Ev::Block { kind, span } => {
-                // An empty block directly inside an if branch anchors
-                // nothing: the branch body's traversal visits NODES
-                // (`checkUnreachableNode`), and an empty `{}` has none to
-                // visit — `if (x is! int) {}` keeps its dead then branch
-                // silent (oracle-probed). A loop-body `{}` is itself
-                // polled (probe table J u1/u4 report its row), so only the
-                // branch frame suppresses; any other empty block keeps the
+                // A statement block is itself a polled node (official
+                // `visitBlock`'s `checkUnreachableNode`): an if branch a
+                // provable fold killed (the pattern-disjoint or constant
+                // condition marker) reports even an empty `{}` — the row
+                // is the braces, closed by the branch's own
+                // `flowEnd(ifTrue)`. Other empty if-branch blocks keep the
+                // old posture (`if (x is! int) {}` stays silent,
+                // oracle-probed); a live branch's poll is a no-op (the
+                // reachability gate), and non-empty blocks keep the
                 // pre-existing poll.
                 if matches!(kind, BlockKind::Statement)
                     && (!matches!(self.stack.last(), Some(Frame::If { .. }))
-                        || !matches!(events.get(i + 1), Some(Ev::EndBlock { .. })))
+                        || !matches!(events.get(i + 1), Some(Ev::EndBlock { .. }))
+                        || self.if_branch_folded)
                 {
                     self.dead_code(*span);
                 }

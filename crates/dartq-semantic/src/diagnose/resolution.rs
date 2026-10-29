@@ -91,17 +91,22 @@ impl<'a> Engine<'a> {
                 // Uint8List>` at the use site, not `BlobColumn` (the same
                 // stand-for-the-whole rule the function/record arms apply);
                 // the use-site `?` joins the right-hand's own (`typedef B =
-                // A<int>?` is nullable on both spellings).
+                // A<int>?` is nullable on both spellings). A parameterized
+                // chain hop continues the substitution face (a bare co-alias
+                // landing on a generic function-RHS alias folds whole); an
+                // unfoldable head keeps the written shape.
                 Ty::Named {
                     name: next,
                     nullable: rhs_nullable,
                     args,
                 } => {
-                    return Ty::Named {
-                        name: next,
-                        nullable: rhs_nullable | head_nullable,
-                        args,
-                    };
+                    return self
+                        .fold_parameterized_alias(next, rhs_nullable | head_nullable, args)
+                        .unwrap_or(Ty::Named {
+                            name: next,
+                            nullable: rhs_nullable | head_nullable,
+                            args,
+                        });
                 }
                 // A non-named right-hand side stands for the use whole
                 // (`typedef V = void Function();`): the use-site `?` joins.
@@ -650,7 +655,7 @@ impl<'a> Engine<'a> {
             }
             let args = std::mem::take(&mut pending_args);
             let subst_args: Vec<TypeTree> = args.iter().map(|a| subst_tree(a, &subst)).collect();
-            if let Some((params, ret, positional, named, required_positional)) =
+            if let Some((params, _rhs_type_params, ret, positional, named, required_positional)) =
                 self.bounds.alias_fn_shape(cur)
             {
                 subst.clear();
@@ -2793,6 +2798,21 @@ impl<'a> Engine<'a> {
         if matches!(target, RefTarget::Member { .. }) && ty != Ty::UNKNOWN {
             self.query_type_rows.push((range, ty));
         }
+        // #2859: the assignment-side literal/closure face. An inferred
+        // local's initializer decides the local's static type at the
+        // declaration (the oracle binds `var x = {1, 2, 3}` as `Set<int>`
+        // — `VariableElementImpl.type` from the initializer's
+        // `staticType`), and the read row carries it: the every-check
+        // verdict (`x is Set<int>`), the operator faces, and the
+        // `var`-inference window all read this slot. An initializer the
+        // face cannot spell (a bare read, a send, a typed literal — its
+        // own row already bound the exact face) keeps the unknown
+        // sentinel, the under-report direction every untyped slot holds.
+        let ty = if ty == Ty::UNKNOWN && matches!(info, BareInfo::Plain { .. }) {
+            self.initializer_literal_ty(name)
+        } else {
+            ty
+        };
         self.push_row(Row {
             name,
             range,
@@ -2802,6 +2822,335 @@ impl<'a> Engine<'a> {
             write_op: None,
             ty,
         });
+    }
+
+    /// The inferred local's initializer static type at a bare read: a
+    /// `var` declarator whose initializer is an untyped collection
+    /// literal or a block-bodied function literal carries the
+    /// initializer's own static type (`typed_literal_resolver.dart`'s
+    /// no-context resolution — the same conventions #2854 pinned for the
+    /// direct is-check operand, now feeding the declaration's slot). The
+    /// window is the declaration's own: the tracked local's name token
+    /// ([`Self::resolve_local`], the same frame-correct walk the usage
+    /// credit runs) followed by `=` and the expression's first group. A
+    /// group's later declarators (`var x, y = {}`) skip the `=`-less
+    /// names the same gate. [`Ty::UNKNOWN`] — the suppress-everything
+    /// sentinel — for every other shape.
+    fn initializer_literal_ty(&self, name: StringId) -> Ty {
+        let Some(hit) = self.resolve_local(name) else {
+            return Ty::UNKNOWN;
+        };
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(self.locals[hit as usize].range.end());
+        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        // A plain declarator init only: `var x = <expr>`.
+        if bytes.get(at) != Some(&b'=') || bytes.get(at + 1) == Some(&b'=') {
+            return Ty::UNKNOWN;
+        }
+        at += 1;
+        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        // An explicit `const` rides the literal (`var x = const {1};`).
+        if bytes
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with(b"const"))
+        {
+            at += 5;
+            while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                at += 1;
+            }
+        }
+        match bytes.get(at) {
+            Some(b'[' | b'{') => self.collection_init_ty(bytes, at),
+            Some(b'(') => self.closure_init_ty(bytes, at),
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// The untyped collection initializer's inferred type: the close
+    /// bracket's `untyped_literals` kind decides the head, the element
+    /// leaves' least row type the arguments — the same conventions
+    /// `collection_operand_ty` runs at a direct is-check operand. A
+    /// missing kind stays unknown: a typed literal's own row already
+    /// bound the exact face, and a read that textually precedes its
+    /// same-named declaration finds no key (the close event only
+    /// latches at parse time).
+    fn collection_init_ty(&self, bytes: &[u8], open: usize) -> Ty {
+        let Some(close) = matching_bracket_fwd(bytes, open) else {
+            return Ty::UNKNOWN;
+        };
+        let Some(&kind) = self.untyped_literals.get(&self.utf16_of(close)) else {
+            return Ty::UNKNOWN;
+        };
+        let dynamic = Ty::Dynamic;
+        let (head, args) = match kind {
+            // The empty `{}` literal's map default (`literal_return_ty`'s
+            // no-context arm).
+            UntypedLiteral::EmptyBraces => (
+                self.collection_heads[2],
+                self.boundary.intern_list(&[dynamic, dynamic]),
+            ),
+            UntypedLiteral::List => (
+                self.collection_heads[0],
+                self.boundary
+                    .intern_list(&[self.init_leaf_least_ty(bytes, open + 1, close)]),
+            ),
+            UntypedLiteral::SetElements => (
+                self.collection_heads[1],
+                self.boundary
+                    .intern_list(&[self.init_leaf_least_ty(bytes, open + 1, close)]),
+            ),
+            UntypedLiteral::MapEntries => {
+                let (key, value) = self.init_entry_leaf_tys(bytes, open + 1, close);
+                (
+                    self.collection_heads[2],
+                    self.boundary.intern_list(&[key, value]),
+                )
+            }
+        };
+        Ty::Named {
+            name: head,
+            nullable: false,
+            args,
+        }
+    }
+
+    /// The element leaves' least row type over the literal's inner span:
+    /// each top-level comma segment's own completion row (a primitive
+    /// literal's declared primitive, a bare local's declared type, a
+    /// typed nested literal's face), folded to the least type the
+    /// lattice can stand. A segment without an exact leaf row forces
+    /// `dynamic` — the under-report that decides every provable ask and
+    /// refuses every unprovable one.
+    fn init_leaf_least_ty(&self, bytes: &[u8], start: usize, end: usize) -> Ty {
+        let leaves: Vec<Option<Ty>> = value_comma_segments(bytes, start, end)
+            .into_iter()
+            .map(|(s, e)| self.leaf_row_ty_in(bytes, s, e))
+            .collect();
+        if leaves.iter().any(|leaf| leaf.is_none()) {
+            return Ty::Dynamic;
+        }
+        self.init_leaf_least_from(leaves.into_iter().flatten().collect())
+    }
+
+    /// The map entry leaves' key/value least types: each segment's
+    /// top-level colon splits the sides, a colonless leaf (a spread, a
+    /// control-flow element) keeps both sides `dynamic`.
+    fn init_entry_leaf_tys(&self, bytes: &[u8], start: usize, end: usize) -> (Ty, Ty) {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for (s, e) in value_comma_segments(bytes, start, end) {
+            match value_top_level_colon(bytes, s, e) {
+                Some(colon) => {
+                    keys.push(self.leaf_row_ty_in(bytes, s, colon));
+                    values.push(self.leaf_row_ty_in(bytes, colon + 1, e));
+                }
+                None => {
+                    keys.push(None);
+                    values.push(None);
+                }
+            }
+        }
+        let fold = |tys: Vec<Option<Ty>>| -> Ty {
+            if tys.iter().any(|ty| ty.is_none()) {
+                return Ty::Dynamic;
+            }
+            self.init_leaf_least_from(tys.into_iter().flatten().collect())
+        };
+        (fold(keys), fold(values))
+    }
+
+    /// The leaf segment's completion row type: the last non-type-use row
+    /// inside the segment's span, its push-time type only. The row stack
+    /// answers first, the fold-drained queue second — a list literal's
+    /// element rows drain into `deferred_miss_rows` at its close event
+    /// (the set/map leaves stay on the stack), and a drained sub-literal's
+    /// rows always predate every in-span stack row, so the stack hit IS
+    /// the later push. A row without an exact type — a send, an untyped
+    /// read — is no exact face and answers `None`.
+    fn leaf_row_ty_in(&self, bytes: &[u8], start: usize, end: usize) -> Option<Ty> {
+        let start = trim_value_ws(bytes, start, end.min(bytes.len()));
+        let end = end.min(bytes.len());
+        if start >= end {
+            return None;
+        }
+        let (s16, e16) = (self.utf16_of(start), self.utf16_of(end));
+        let in_span = |row: &Row| {
+            row.range.offset >= s16
+                && row.range.end() <= e16
+                && !matches!(row.shape, RowShape::TypeUse(..))
+        };
+        let ty = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| in_span(row))
+            .or_else(|| {
+                self.deferred_miss_rows
+                    .iter()
+                    .rev()
+                    .find(|row| in_span(row))
+            })
+            .map(|row| row.ty)?;
+        (ty != Ty::UNKNOWN && ty != Ty::Dynamic).then_some(ty)
+    }
+
+    /// The collected leaf types' least face (`least_leaf_ty_from`'s
+    /// convention): one exact type keeps itself, `int` mixed with
+    /// `double` lifts to `num`, everything else — `Null` leaves,
+    /// differing faces — keeps `dynamic` (the oracle's `Object?`/`Object`
+    /// lifts are provability-equal: every target those accept, `dynamic`
+    /// accepts, and every target those refuse, `dynamic` refuses).
+    fn init_leaf_least_from(&self, tys: Vec<Ty>) -> Ty {
+        let int = Ty::named(self.members.primitive_ids[0]);
+        let double = Ty::named(self.members.primitive_ids[1]);
+        let mut first: Option<Ty> = None;
+        let mut diverse = false;
+        let mut other_face = false;
+        for ty in tys {
+            if ty == Ty::Dynamic {
+                return Ty::Dynamic;
+            }
+            if ty != int && ty != double {
+                other_face = true;
+            }
+            match first {
+                None => first = Some(ty),
+                Some(prev) if prev != ty => diverse = true,
+                Some(_) => {}
+            }
+        }
+        match first {
+            None => Ty::Dynamic,
+            Some(ty) if !diverse => ty,
+            // The int/double pair is the one diverse fold the lattice
+            // can name (`num`); every other mix stays `dynamic`.
+            Some(_) if !other_face => Ty::named(self.members.primitive_ids[2]),
+            Some(_) => Ty::Dynamic,
+        }
+    }
+
+    /// The block-bodied function literal initializer's written-signature
+    /// face — the `closure_operand_ty` conventions: the plain positional
+    /// shapes only, the written formal annotations as the parameter
+    /// columns (an unannotated formal keeps the official element's
+    /// `dynamic` column, an unresolved annotation head refuses the whole
+    /// face), the return `dynamic` — the block body's inferred return is
+    /// a flow face the row model does not carry, and `dynamic` in the
+    /// operand's own column decides every return-top ask and refuses
+    /// every mismatching one. An arrow body (its return column is the
+    /// body expression's type — no `dynamic` stand-in answers for it), a
+    /// generic literal, a named-formal section, or a brace inside the
+    /// formal group refuses.
+    fn closure_init_ty(&self, bytes: &[u8], paren_open: usize) -> Ty {
+        let Some(paren_close) = matching_bracket_fwd(bytes, paren_open) else {
+            return Ty::UNKNOWN;
+        };
+        let mut after = paren_close + 1;
+        while bytes.get(after).is_some_and(|b| b.is_ascii_whitespace()) {
+            after += 1;
+        }
+        if bytes.get(after) != Some(&b'{') {
+            return Ty::UNKNOWN;
+        }
+        // A `<...>` group head before the `(` is a generic literal: its
+        // own parameters ride no declared face here.
+        let mut head = paren_open;
+        while head > 0 && bytes[head - 1].is_ascii_whitespace() {
+            head -= 1;
+        }
+        if head > 0 && bytes[head - 1] == b'>' {
+            return Ty::UNKNOWN;
+        }
+        // A named-formal section (`{...}`) or any brace inside the group
+        // is no plain positional shape.
+        if (paren_open + 1..paren_close).any(|i| bytes[i] == b'{') {
+            return Ty::UNKNOWN;
+        }
+        // The group's written formals: each top-level comma segment's
+        // trailing identifier is the formal's name, the head before it
+        // the written annotation (its type-use row starts the segment and
+        // only `?`/whitespace separates it from the name). A trailing
+        // comma's empty tail segment is legal and skipped.
+        let mut segments = value_comma_segments(bytes, paren_open + 1, paren_close);
+        let tail_empty = match segments.last() {
+            Some((s, e)) => trim_value_ws(bytes, *s, *e) >= *e,
+            None => false,
+        };
+        if tail_empty {
+            segments.pop();
+        }
+        let mut positional = Vec::new();
+        for (s, e) in segments {
+            let seg_end = value_default_cut(bytes, s, e);
+            let seg_start = trim_value_ws(bytes, s, seg_end);
+            if seg_start >= seg_end {
+                return Ty::UNKNOWN;
+            }
+            let mut name_end = seg_end;
+            while name_end > seg_start {
+                let b = bytes[name_end - 1];
+                if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                    name_end -= 1;
+                } else {
+                    break;
+                }
+            }
+            if name_end == seg_end {
+                // No identifier tail (`covariant`-only residue, a
+                // malformed group): refuse.
+                return Ty::UNKNOWN;
+            }
+            let head_start = trim_value_ws(bytes, seg_start, name_end);
+            if head_start >= name_end {
+                // No written annotation: the official element's
+                // `dynamic` column.
+                positional.push(Ty::Dynamic);
+                continue;
+            }
+            let (s16, e16) = (self.utf16_of(head_start), self.utf16_of(name_end));
+            let Some(&(range, name)) = self
+                .type_uses
+                .iter()
+                .find(|(r, _)| r.offset == s16 && r.end() <= e16)
+            else {
+                return Ty::UNKNOWN;
+            };
+            // Only `?` and whitespace may ride between the head token and
+            // the formal's name.
+            let mut cursor = self.byte_of(range.end());
+            let mut nullable = false;
+            while cursor < name_end {
+                match bytes[cursor] {
+                    b if b.is_ascii_whitespace() => cursor += 1,
+                    b'?' if !nullable => {
+                        nullable = true;
+                        cursor += 1;
+                    }
+                    _ => return Ty::UNKNOWN,
+                }
+            }
+            // An unresolved annotation head is the oracle's InvalidType
+            // formal — the closure's own static type goes invalid with it
+            // and every verdict stays informative.
+            if !self.named_type_is_type(name) {
+                return Ty::UNKNOWN;
+            }
+            positional.push(Ty::Named {
+                name,
+                nullable,
+                args: crate::model::ArgListId::EMPTY,
+            });
+        }
+        let positional: Vec<Ty> = positional
+            .into_iter()
+            .map(|ty| self.fold_alias_ty(ty))
+            .collect();
+        self.boundary
+            .intern_function_ty(0, Ty::Dynamic, &positional, &[], false)
     }
 
     /// An identifier after a dot, awaiting the merge at the dot event.
@@ -3310,6 +3659,21 @@ impl<'a> Engine<'a> {
                 if self.members.builtin_types.contains(&name) {
                     return;
                 }
+                // #2832: a type-position identifier that names a local is a
+                // read of that local — the oracle's `visitNamedType` runs
+                // `_useIdentifierElement` on the resolved element in every
+                // type position (unused_local_elements_verifier.dart
+                // :243-246/:402-423; an `is` operand is the one exclusion),
+                // so `f(a<b, c>(d))` with `b`/`c` locals spares both
+                // declarations the `unused_local_variable` row beside the
+                // argument face's own reports. No `local_hits` entry rides:
+                // the write-discard conversions key on value rows, and a
+                // type-position mention is an unconditional use upstream.
+                if self.is_type_pos == 0
+                    && let Some(hit) = self.resolve_local(name)
+                {
+                    self.locals[hit as usize].uses += 1;
+                }
                 // #1595/#1596: the plain resolver path's three answers
                 // (named_type_resolver.dart:190-330 + reportNullOrNonTypeElement
                 // :730-810). A creation head never reaches the plain path —
@@ -3502,7 +3866,8 @@ impl<'a> Engine<'a> {
     /// `reportNullOrNonTypeElement` tail :780-806): a resolving non-type
     /// element reports `not_a_type` unless it is a local variable or local
     /// function (the `referenced_before_declaration` face, outside this
-    /// engine), a multiply-defined element stays silent
+    /// engine — EXCEPT inside a type-argument group, where the argument
+    /// face wins the decision order, #2832), a multiply-defined element stays silent
     /// (`InvalidType` with no report), and a miss keeps the existing
     /// `undefined_class` machinery. The container step is the face the
     /// expression lookup lacks: `InstanceScope.lookup`
@@ -3534,11 +3899,21 @@ impl<'a> Engine<'a> {
         // A formal parameter in type position reports (`FormalParameterElement`
         // is not a local variable — the golden face `x isn't a type` on the
         // method's own parameter); a local variable or catch parameter
-        // routes to the referenced-before face and stays silent.
+        // routes to the referenced-before face and stays silent — except
+        // inside a type-argument group, where the resolver's decision order
+        // puts the argument face first (`_isTypeInTypeArgumentList` guards
+        // `nonTypeAsTypeArgument` before the LocalVariableElement /
+        // LocalFunctionElement arm, named_type_resolver.dart:659-691): a
+        // method-instantiation or annotation argument naming any local
+        // spelling reports `non_type_as_type_argument` (co19
+        // ambiguities_A01_t01, `f(a<b, c>(d))` with `b`/`c` locals).
         if let Some(index) = self.resolve_local(name) {
             let decl = &self.locals[index as usize];
             return match decl.kind {
                 LocalKind::Parameter { .. } => {
+                    (TypeResolution::NonType, Some((self.file, decl.range)))
+                }
+                _ if self.type_arg_depth > 0 => {
                     (TypeResolution::NonType, Some((self.file, decl.range)))
                 }
                 _ => (TypeResolution::Type, None),
@@ -3774,4 +4149,137 @@ impl<'a> Engine<'a> {
             );
         }
     }
+}
+
+/// The byte offset of the bracket matching the opener at `open` — a
+/// depth walk over `()[]{}` with string contents skipped (the forward
+/// twin of the literal faces' back walk). `None` when unbalanced.
+fn matching_bracket_fwd(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Top-level comma segments of `[start, end)`: a depth walk over
+/// `()[]{}` with string contents skipped — the same split the literal
+/// element faces run at a direct operand.
+fn value_comma_segments(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let end = end.min(bytes.len());
+    let mut segments = Vec::new();
+    let mut seg_start = start;
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                segments.push((seg_start, i));
+                seg_start = i + 1;
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push((seg_start, end));
+    segments
+}
+
+/// The first top-level `:` in `[start, end)`, string contents skipped —
+/// the map-entry leaf's key/value split.
+fn value_top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let end = end.min(bytes.len());
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 => return Some(i),
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The end of a formal segment's signature part: the first top-level `=`
+/// (the default value's head), or `end`.
+fn value_default_cut(bytes: &[u8], start: usize, end: usize) -> usize {
+    let end = end.min(bytes.len());
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'=' if depth == 0 => return i,
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    end
+}
+
+/// The first significant byte at or after `start`.
+fn trim_value_ws(bytes: &[u8], start: usize, end: usize) -> usize {
+    let end = end.min(bytes.len());
+    let mut start = start.min(end);
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    start
 }

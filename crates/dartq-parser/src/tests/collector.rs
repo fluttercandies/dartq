@@ -220,7 +220,7 @@ impl ParserListener for Collector {
     fn begin_binary_pattern(&mut self, _: TokenSpan) {
         self.log.push(("begin", "binary_pattern"));
     }
-    fn end_binary_pattern(&mut self, _: TokenSpan) {
+    fn end_binary_pattern(&mut self, _: TokenSpan, _: TokenSpan) {
         self.log.push(("end", "binary_pattern"));
     }
     fn handle_relational_pattern(&mut self, _: TokenSpan) {

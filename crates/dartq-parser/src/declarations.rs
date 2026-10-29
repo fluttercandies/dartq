@@ -10,6 +10,7 @@
 //! the `DirectiveContext` ordering checks at the official call sites.
 
 use dartq_scanner::{Keyword, TokenKind};
+use dartq_source::SourceRange;
 
 use crate::listener::{
     ConstructorReferenceContext, DeclarationHeaderKind, DeclarationKind, IdentifierContext,
@@ -916,6 +917,43 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     }
 
     // ------------------------------------------------------------------
+    // declaration name
+    // ------------------------------------------------------------------
+
+    /// Annotation junk in a declaration-name position, official
+    /// `ClassOrMixinOrExtensionIdentifierContext.ensureIdentifier` /
+    /// `EnumDeclarationIdentifierContext.ensureIdentifier` branch 3
+    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/
+    /// identifier_context_impl.dart): `@meta` is not keyword-shaped and
+    /// sits outside the templates' insert-before keep-sets, so it is
+    /// reported and consumed in doubt —
+    /// `rewriter.insertSyntheticIdentifier(identifier)` splices the
+    /// synthetic name AFTER the junk, at the follower's offset, leaving
+    /// the junk behind the parse pointer. The generic
+    /// [`Parser::ensure_identifier`] table instead parks its synthetic at
+    /// the junk's own offset (the `@` reads as a statement start there),
+    /// which re-anchors every downstream header face on the `@` — the
+    /// official zero-width name carries the reports FORWARD onto the junk
+    /// identifier that follows it (`findNonZeroLengthToken`, util.dart:56;
+    /// corpus Primary-constructors grammar_A06_t01: the oracle anchors the
+    /// class/mixin/enum/extension-type header rows on `meta`, never the
+    /// `@`).
+    fn ensure_declaration_name(&mut self, context: IdentifierContext) -> TokenSpan {
+        if self.peek_kind() == TokenKind::At {
+            let at = self.peek_span();
+            self.report(msg::missing_identifier(), at);
+            self.cursor.advance(); // the junk — consumed in doubt
+            let follower = self.peek_span();
+            let id = self
+                .cursor
+                .insert_synthetic(TokenKind::Identifier, follower.range.offset);
+            self.cursor.advance(); // the synthetic name
+            return self.span_of(id);
+        }
+        self.ensure_identifier(context)
+    }
+
+    // ------------------------------------------------------------------
     // enum
     // ------------------------------------------------------------------
 
@@ -939,7 +977,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::missing_identifier(), at);
             self.synthetic(TokenKind::Identifier, at.range.offset)
         } else {
-            self.ensure_identifier(IdentifierContext::EnumDeclaration)
+            self.ensure_declaration_name(IdentifierContext::EnumDeclaration)
         };
         // Official parseEnum passes inDeclaration: true, allowsVariance: true
         // (parser_impl.dart:2629): the header accepts variance modifiers.
@@ -1270,7 +1308,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         } else {
             None
         };
-        let name = self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
+        let name =
+            self.ensure_declaration_name(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
         // Official parseClassOrNamedMixinApplication passes inDeclaration:
         // true, allowsVariance: true (parser_impl.dart:2981): the header
         // accepts variance modifiers (covers named mixin applications too —
@@ -1772,7 +1811,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 self.peek_span(),
             );
         }
-        let name = self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
+        let name =
+            self.ensure_declaration_name(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
         // Official parseMixin passes inDeclaration: true, allowsVariance: true
         // (parser_impl.dart:3412): the header accepts variance modifiers.
         let type_param = self.compute_type_param_or_arg_on_lt(true);
@@ -2085,8 +2125,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
             n
         } else {
-            self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration)
+            self.ensure_declaration_name(IdentifierContext::ClassOrMixinOrExtensionDeclaration)
         };
+        // The token right after the name, pre-type-parameters: the
+        // verifier's synthesized empty formal list lands its synthetic `()`
+        // at `name.next.charOffset` (`endExtensionTypeDeclaration` →
+        // `_syntheticFormalParameterList(builder.name)` → `insertParens`,
+        // ast_builder.dart:1590-1597, token_stream_rewriter.dart:29-59), so
+        // the no-parentheses representation face anchors here, zero length.
+        self.ext_type_name_next = Some(self.peek_span());
         let type_param = self.compute_type_param_or_arg_on_lt(false);
         type_param.parse_variables(self, false);
         self.listener
@@ -2096,6 +2143,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             const_keyword,
             augment.is_none(),
         );
+        self.ext_type_name_next = None;
 
         let implements_seen = self.parse_implements_clause();
         let _ = implements_seen;
@@ -2197,7 +2245,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 None
             };
             if self.peek_kind() == TokenKind::OpenParen {
-                if kind == DeclarationKind::ExtensionType && allow_representation {
+                // Not augmentation-gated: the verifier runs its shape checks
+                // whenever the constructor head parsed — the AST builder
+                // keeps the PrimaryConstructorDeclaration for augmentations
+                // too (ast_builder.dart:6484-6496), so a bad representation
+                // shape reports on `augment extension type E(this.x)` the
+                // same as on an introductory declaration.
+                if kind == DeclarationKind::ExtensionType {
                     self.rep_field_check = Some(crate::parser::RepFieldCheck::default());
                 }
                 self.parse_formal_parameters_required_opt(
@@ -2207,7 +2261,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 if let Some(state) = rep {
                     // `_checkForExtensionTypeRepresentationErrorCodes`
                     // (error_verifier.dart:5356-5460; primary constructors
-                    // feature disabled arm).
+                    // feature disabled arm). The verifier runs whenever the
+                    // constructor parsed — augmentations included: the AST
+                    // builder keeps the PrimaryConstructorDeclaration for
+                    // any parsed `(`/`.` head (ast_builder.dart:6484-6496),
+                    // so the shape checks are not augmentation-gated.
                     if state.count == 0 {
                         // `expectedRepresentationField` anchors on
                         // `formalParameterList.leftParenthesis.next`
@@ -2221,14 +2279,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         if let Some(comma) = state.comma_after_first {
                             self.report(msg::multiple_representation_fields(), comma);
                         }
-                    } else if state.this_or_super {
-                        // Reported at the this/super keyword; the keyword span
-                        // is not carried in the state, so anchor at the
-                        // parameter's modifier or the formals begin.
-                        self.report(
-                            msg::expected_representation_field(),
-                            state.modifier.unwrap_or(begin),
-                        );
+                    } else if let Some(kw) = state.this_or_super {
+                        // The initializing-formal faces anchor on the
+                        // `this`/`super` keyword itself
+                        // (error_verifier.dart:5384-5393; oracle
+                        // regress_53625 53|24 spans `this`).
+                        self.report(msg::expected_representation_field(), kw);
                     } else if let Some(delim) = state.delimiter {
                         // The verifier reads the left delimiter only in the
                         // primary-constructors-disabled arm
@@ -2242,9 +2298,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         // The verifier's `expectedRepresentationField` for a
                         // function-typed representation field only runs with
                         // primary constructors disabled (the 3.13 oracle runs
-                        // the feature and accepts the declaring parameter).
+                        // the feature and accepts the declaring parameter),
+                        // and anchors on `inner.beginToken` — the formal's
+                        // first token, the modifier or type, never the
+                        // list's `(` (error_verifier.dart:5433-5439; oracle
+                        // declaring_parameter_pre_feature 41|19 spans
+                        // `var`).
                         if !self.features.primary_constructors_enabled {
-                            self.report(msg::expected_representation_field(), begin);
+                            self.report(
+                                msg::expected_representation_field(),
+                                state.first_begin.unwrap_or(begin),
+                            );
                         }
                     } else if let Some(m) = state.modifier {
                         let lexeme = self.cursor.lexeme(m.id);
@@ -2270,10 +2334,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     );
                 }
                 if kind == DeclarationKind::ExtensionType {
-                    // `_checkForExtensionTypeRepresentationErrorCodes`: the
-                    // synthesized empty formal list has no representation
-                    // field (error_verifier.dart:5366).
-                    self.report(msg::expected_representation_field(), self.peek_span());
+                    // `endPrimaryConstructor` synthesizes the empty formal
+                    // list for a parsed-but-parameterless constructor head
+                    // (ast_builder.dart:2709-2712): `insertParens` places the
+                    // synthetic `()` at the offset of the token after the
+                    // type name — the `.` that opened the constructor — and
+                    // the verifier's empty-list arm then anchors on the
+                    // synthetic `)`, zero length. Not augmentation-gated:
+                    // the constructor parsed, so the verifier runs
+                    // (oracle Augmentations extension_types_A01_t02 19|27).
+                    let at = TokenSpan {
+                        range: SourceRange {
+                            offset: begin.range.offset,
+                            length: 0,
+                        },
+                        ..begin
+                    };
+                    self.report(msg::expected_representation_field(), at);
                 }
                 let at = self.peek_span();
                 self.listener.handle_no_formal_parameters(
@@ -2307,19 +2384,61 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 constructor_name,
             );
         } else {
-            if kind == DeclarationKind::ExtensionType {
-                // The 3.13 oracle reports the missing primary constructor for
-                // every extension type without a representation — including
-                // augmentations (no augmentation gating there) — and the
-                // verifier's synthesized empty formal list additionally yields
-                // `expectedRepresentationField`. The report anchors on the
-                // parser pointer (official :3876 `token`, the last consumed
-                // token — the declaration name when the `{` follows it).
-                self.report(
-                    msg::missing_primary_constructor(),
-                    self.last_consumed_anchor(),
-                );
-                self.report(msg::expected_representation_field(), self.peek_span());
+            if kind == DeclarationKind::ExtensionType && allow_representation {
+                // Both no-representation faces are introductory-only. The
+                // parser's `missingPrimaryConstructor` is gated on
+                // `allowExtensionTypeRepresentation` (official :3831-3834 —
+                // augmentations carry no representation to be missing), and
+                // the verifier never sees an augmentation here either: with
+                // no parsed constructor head the AST builder leaves the
+                // augmentation's namePart a NameWithTypeParameters — the
+                // synthesized empty formal list is intro-only
+                // (ast_builder.dart:1590-1597) — so the check returns before
+                // the empty-list arm (error_verifier.dart:5360-5362).
+                // Oracle: every `augment extension type E {}` row set is
+                // silent on both codes (co19 Augmentations suite).
+                // Official `reportRecoverableError` on the primary
+                // constructor position token (parser_impl.dart:3833),
+                // anchored per `findNonZeroLengthToken` (util.dart:56-61): a
+                // real name/type-parameter tail anchors on itself (the
+                // backward walk of [`Parser::last_consumed_anchor`]); a
+                // zero-width synthetic name — annotation junk consumed at
+                // the name position — walks FORWARD to the first real token
+                // instead (the junk identifier the spliced name points at),
+                // where the oracle anchors the row (Primary-constructors
+                // grammar_A06_t01 45|17|4).
+                let at = match self.cursor.last_consumed_id() {
+                    Some(id) if self.span_of(id).range.length > 0 => self.last_consumed_anchor(),
+                    _ => {
+                        let mut at = self.peek_span();
+                        let mut n = 0usize;
+                        while at.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
+                            n += 1;
+                            at = self.look_span_at(n);
+                        }
+                        at
+                    }
+                };
+                self.report(msg::missing_primary_constructor(), at);
+                // The verifier's synthesized empty formal list
+                // (`_syntheticFormalParameterList(builder.name)` →
+                // `insertParens`) gives the synthetic `()` the offset of the
+                // token after the type name, zero length
+                // (token_stream_rewriter.dart:38-59) — the empty-list arm
+                // then anchors on the synthetic `)` there. The anchor is the
+                // pre-type-parameters follower (oracle
+                // no_primary_constructor 4|19 = the `<`), captured at the
+                // name step by the extension-type caller.
+                if let Some(next) = self.ext_type_name_next.take() {
+                    let at = TokenSpan {
+                        range: SourceRange {
+                            offset: next.range.offset,
+                            length: 0,
+                        },
+                        ..next
+                    };
+                    self.report(msg::expected_representation_field(), at);
+                }
             } else if let Some(c) = const_keyword {
                 if self.features.primary_constructors_enabled {
                     match kind {

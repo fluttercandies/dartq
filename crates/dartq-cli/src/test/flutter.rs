@@ -522,9 +522,9 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         let (stock_tx, stock_rx) = std::sync::mpsc::channel::<(usize, SuiteBlock)>();
         let mut stock_late = Vec::new();
         let drain_stock = |stats: &mut Stats,
-                               slots: &mut Vec<Option<Vec<Json>>>,
-                               staged: &mut FxHashMap<usize, String>,
-                               cache: &mut Option<dartq_test::Cache>|
+                           slots: &mut Vec<Option<Vec<Json>>>,
+                           staged: &mut FxHashMap<usize, String>,
+                           cache: &mut Option<dartq_test::Cache>|
          -> io::Result<()> {
             while let Ok((index, block)) = stock_rx.try_recv() {
                 stats.ran += 1;
@@ -550,10 +550,17 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                 let tx = stock_tx.clone();
                 let indices = stock_early.clone();
                 Some(scope.spawn(move || {
-                    run_shards(plan, args, &indices, index_of, recipe, &mut |index, block| {
-                        tx.send((index, block))
-                            .map_err(|_| io::Error::other("stock consumer closed"))
-                    })
+                    run_shards(
+                        plan,
+                        args,
+                        &indices,
+                        index_of,
+                        recipe,
+                        &mut |index, block| {
+                            tx.send((index, block))
+                                .map_err(|_| io::Error::other("stock consumer closed"))
+                        },
+                    )
                 }))
             };
             drop(stock_tx);
@@ -569,9 +576,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                     // verdict is delivered too (it must not rerun stock),
                     // and a cached red would replay a failure as fact.
                     if tally(&block.events).green {
-                        if let (Some(cache), Some(key)) =
-                            (cache.as_mut(), keys[index].as_deref())
-                        {
+                        if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
                             cache.stage(key, &block.events)?;
                             staged.insert(index, key.to_owned());
                         }
@@ -583,9 +588,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             // Wait for the stock shards and drain what they left.
             let mut early_leftover = None;
             if let Some(handle) = stock_handle {
-                match handle.join().unwrap_or_else(|_| {
-                    Err(io::Error::other("a stock shard panicked"))
-                }) {
+                match handle
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("a stock shard panicked")))
+                {
                     Ok(outcome) => early_leftover = Some(outcome),
                     Err(error) => return Err(error),
                 }
@@ -616,17 +622,24 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         };
     }
     if !to_run.is_empty() {
-        let outcome = run_shards(plan, &args, &to_run, &index_of, recipe.as_ref(), &mut |index, block| {
-            stats.ran += 1;
-            if complete(&block) && tally(&block.events).green {
-                if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
-                    cache.stage(key, &block.events)?;
-                    staged.insert(index, key.to_owned());
+        let outcome = run_shards(
+            plan,
+            &args,
+            &to_run,
+            &index_of,
+            recipe.as_ref(),
+            &mut |index, block| {
+                stats.ran += 1;
+                if complete(&block) && tally(&block.events).green {
+                    if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
+                        cache.stage(key, &block.events)?;
+                        staged.insert(index, key.to_owned());
+                    }
                 }
-            }
-            slots[index] = Some(block.events);
-            emit(&mut slots, &mut outputs, &mut totals)
-        })?;
+                slots[index] = Some(block.events);
+                emit(&mut slots, &mut outputs, &mut totals)
+            },
+        )?;
         for (index, events) in outcome.lost {
             stats.ran += 1;
             slots[index] = Some(events);

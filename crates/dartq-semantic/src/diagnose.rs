@@ -383,6 +383,7 @@ pub(crate) fn dq_probe_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("DQ_PROBE").is_some())
 }
 
+#[allow(unused_macros)] // the R53 probe facility: call sites are stripped before commit
 macro_rules! dq_probe {
     ($($arg:tt)*) => {
         if crate::diagnose::dq_probe_enabled() {
@@ -399,6 +400,7 @@ mod collection_literal;
 mod const_eval_faces;
 mod creation_args;
 mod engine_core;
+mod extension_types;
 mod ffi;
 mod index_result;
 mod invocation;
@@ -1183,6 +1185,14 @@ pub fn fold_unit_with_ops<'t>(
             if let Some(ops) = ops {
                 flow.set_ops(ops as &dyn dartq_flow::TypeOps);
             }
+            // The sound-flow posture (#2837): the unit's settled feature
+            // set (`features` — the `@dart` override applied, the same
+            // channel `field_promotion_enabled` rides) decides whether the
+            // sound-only folds arm (`Feature.sound_flow_analysis`,
+            // `enabledIn: 3.9.0` — a `// @dart = 3.8` unit stands them
+            // down, exactly like `type_analyzer_options.dart:20` wires
+            // `soundFlowAnalysisEnabled` upstream).
+            flow.set_sound_flow(features.sound_flow_analysis);
             flow
         },
         pending_exit: None,
@@ -1242,11 +1252,6 @@ pub fn fold_unit_with_ops<'t>(
     for fact in &facts {
         match *fact {
             FlowFact::DeadCode { span } => {
-                dq_probe!(
-                    "[dead-fact] offset={} len={} token_kind_probe",
-                    span.range.offset,
-                    span.range.length
-                );
                 // The `??` right operand's dedicated row
                 // (`_checkForDeadNullCoalesce`'s
                 // `dead_null_aware_expression`) coexists with the generic
@@ -1496,11 +1501,12 @@ pub fn fold_unit_with_ops<'t>(
     // promoted receiver's static type is no longer `?`-suffixed).
     let chains = std::mem::take(&mut engine.dead_null_chains);
     let mut chain_rows = Vec::with_capacity(chains.len());
-    for (op_offset, chain_end, recv) in chains {
+    for (op_offset, chain_end, recv, ..) in chains {
         let promoted_non_null = promotions
             .promoted(recv)
             .is_some_and(Ty::is_strictly_non_nullable);
-        if promoted_non_null || !unassigned.staged(recv) {
+        let unassigned_ok = unassigned.staged(recv);
+        if promoted_non_null || !unassigned_ok {
             continue;
         }
         let code = SemanticCode::DeadCode;
@@ -5050,6 +5056,158 @@ mod ticket_2790_tests;
 #[cfg(test)]
 mod ticket_2784_tests;
 
+/// The #2859 assignment-side inference pins: an inferred local's
+/// untyped collection or block-closure initializer writes the
+/// initializer's own static type into the read row — `var x = {1, 2,
+/// 3}; x is Set<int>` folds, mismatching targets stay informative, and
+/// an annotated initializer keeps its exact written face.
+#[cfg(test)]
+mod ticket_2859_tests;
+
+/// The #2854 S1c operand pins: the completed send's declared return,
+/// the untyped collection literal's inferred element type, and the
+/// closure literal's written-signature function type reaching the
+/// `unnecessary_type_check` verdict — matching pairs fold, non-matching
+/// pairs stay informative.
+#[cfg(test)]
+mod ticket_2854_tests;
+
+/// The #2843 R4 pins: the relational-pattern gate at the operator token,
+/// the object-pattern nullable-matched head at the type name, and the
+/// extension-type `this{}` block's `Object?` parameter default.
+#[cfg(test)]
+mod ticket_2843_tests;
+
+/// The #2842 local-function tear-off pins: the frame-captured signature
+/// is the operand's static type at an `is`-check (the matching pairs
+/// fold, non-matching stays informative, the optional-formal boundary
+/// rides the capture, a shadowing variable's read never takes the
+/// channel, and the top-level face stays green over the shared
+/// conversion).
+#[cfg(test)]
+mod ticket_2842_tests;
+
+/// The #2848 parameterized-alias fold-chain pins: the old-style generic
+/// alias folds through the bounds capture at a `with-arguments` use
+/// (matching tear-off pairs report, misfits and raw uses stay
+/// informative), the qualified member tear-off (typed receiver, `super`)
+/// types as the member's declared signature, the nested generic groups
+/// ride both sides' shapes, and an alias-returning member's pieces fold
+/// to the resolved face.
+#[cfg(test)]
+mod ticket_2848_tests;
+
+/// The #2855 strict-subtype pins: the over-proved `unnecessary_type_check`
+/// extras the verdict arms answered where the oracle stays informative —
+/// the mixin-application alias's substituted faces, the concrete
+/// tear-off's alias instantiation, and the generic member's variable
+/// leaf.
+#[cfg(test)]
+mod ticket_2855_tests;
+
+/// The #2805 usage-cluster pins: the close-frame `unused_local_variable`
+/// verdicts for the pattern/for-in faces — case-header binders report
+/// individually (same-name join aside), the for-in loop variable's
+/// body-read rule, the closure capture credit, and the pattern-declaration
+/// statement's all-or-nothing group.
+#[cfg(test)]
+mod ticket_2805_tests;
+
+/// The #2858 registration-context pins: the binders declared outside any
+/// `PatternVariableDeclaration` wrapper — for-in pattern heads, if-case
+/// patterns, pattern assignments — walk the frame locals individually
+/// (same-name or-element join aside), a declaration after an if-case
+/// opens its own window, and an assignment binder registers no row.
+#[cfg(test)]
+mod ticket_2858_tests;
+
+/// The #2840 span-extent pins: the is-check verdict's whole-expression
+/// span runs through a written function type's trailing formal list and
+/// a record type's own closer, and anchors at the operand's opening
+/// bracket when a literal face pushed the operand row at its closer.
+#[cfg(test)]
+mod ticket_2840_tests;
+
+/// The #2814 statement-form operand pins: the for-in iterable and spread
+/// operand faces of `unchecked_use_of_nullable_value` derive at the
+/// teardown join (token-table windows, single-row discipline) and
+/// re-decide against the flow's read-type rows; the guard, null-aware,
+/// and non-nullable negatives stay silent.
+#[cfg(test)]
+mod ticket_2814_tests;
+
+/// The #2834 generic-function-type subtyping bounds pins: the
+/// signatures' own type parameters decide through `relateTypeParameters`
+/// (equal counts, EQUAL bounds via mutual subtype, parameters unified by
+/// position) at the argument and assignment faces, with the count-only
+/// posture staying silent.
+#[cfg(test)]
+mod ticket_2834_tests;
+
+/// The #2838 alias-capture and raw-type compare pins: a generic
+/// function-type alias RHS keeps the declaring parameters and rides its
+/// own variables on the signature (the instantiation substitutes them),
+/// and a raw head at a same-head assignability pair reads as its
+/// instantiate-to-bounds defaults.
+#[cfg(test)]
+mod ticket_2838_tests;
+
+/// The #2849 annotation-fold seam pins: a formal whose written
+/// annotation is a parameterized function-RHS alias use joins the
+/// written-signature stash with the instantiated signature (the
+/// element model's resolved annotation type, bounds substituted), so
+/// the equality rule decides over real bounds in both directions.
+#[cfg(test)]
+mod ticket_2849_tests;
+
+/// The #2841 nonfunction-typedef-as-constructor pins: a bare callee
+/// spelling a grounded non-function alias routes to the aliased class's
+/// creation face (the raw-constructor inference answers over the alias's
+/// own parameters, `could_not_infer` at the spelling, no invocation row),
+/// a satisfiable or argument-bearing alias creation stays silent, a
+/// genuine non-function callee and a local shadowing the alias keep the
+/// invocation report, and a function-type alias keeps its registry
+/// verdict.
+#[cfg(test)]
+mod ticket_2841_tests;
+
+/// The #2813 bare-read is-check pins: the old-style function-typed alias
+/// (`typedef fx(x, );`) captures its synthesized right-hand face, and the
+/// `unnecessary_type_check` verdict folds the corpus's `topx is! fx`
+/// shape through the official function faces (non-matching pairs and
+/// local reads stay informative).
+#[cfg(test)]
+mod ticket_2813_tests;
+
+/// The #2832 method type-argument pins: a type argument that names a
+/// local reports `non_type_as_type_argument` at the identifier AND
+/// credits the local a read (the `unused_local_variable` face's
+/// `visitNamedType` join), while a true type argument stays silent.
+#[cfg(test)]
+mod ticket_2832_tests;
+
+/// The #2836 cast-initializer pins: a local whose initializer is an
+/// `as`-cast expression is judged on read accounting like every other
+/// local — unread reports `unused_local_variable`, read stays silent.
+#[cfg(test)]
+mod ticket_2836_tests;
+
+/// The #2835 dead-arm pins: the container-less bare-read's tear-off face
+/// (the listener's `TopLevelFn` staging else-branch over the resolved
+/// snapshot's `fn_shapes`) folds the `if (topx is! fx) throw 'bad';`
+/// shape's dead_code half — matching pairs dead the throw arm,
+/// non-matching pairs, local reads, and getter reads stay live.
+#[cfg(test)]
+mod ticket_2835_tests;
+
+/// The #2852 dead-arm pins: the frame-local function's tear-off face (the
+/// listener's capture-walk staging branch over the adapter's fold-time
+/// `local_fn_shapes`) folds the `if (gi is! Fun) throw 'bad';` shape's
+/// dead_code half beside #2842's verdict row — non-matching pairs and
+/// local-variable reads (plain or shadowing) stay live.
+#[cfg(test)]
+mod ticket_2852_tests;
+
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.
 #[cfg(test)]
@@ -5105,3 +5263,21 @@ mod scope_inference_tests;
 mod sdk_exposure_tests;
 #[cfg(test)]
 mod ticket_2789_tests;
+/// The #2828 dead-tail pins: the wildcard-variables language gate on the
+/// `_`-named local-function `dead_code` face, and the as-cast tail in
+/// conditional-expression arms.
+#[cfg(test)]
+mod ticket_2828_tests;
+/// The #2831 pins: the raw-constructor inference face (greatest-closure
+/// seed + extends re-check) and the nested bounded-head site queueing.
+#[cfg(test)]
+mod ticket_2831_tests;
+
+/// The #2851 const-condition dead-arm pins: the whole-branch statement
+/// spans and the element-extent arm rows the literal-condition faces
+/// already emit, the const-variable and non-condition live negatives,
+/// the #2814/#2805 adjacent-face no-cross-talk contract, and the
+/// flow-owned seam census (for-element constant condition, assigned-bool
+/// condition variable, live-if empty block).
+#[cfg(test)]
+mod ticket_2851_tests;

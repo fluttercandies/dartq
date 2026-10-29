@@ -868,7 +868,7 @@ impl GapPass {
             | Ev::EmptyBody
             | Ev::StmtEnd { .. }
             | Ev::IsOperator { .. }
-            | Ev::AsOperator
+            | Ev::AsOperator { .. }
             | Ev::NoInitializer
             | Ev::InitializerBegin
             | Ev::LocalFnName { .. }
@@ -892,13 +892,13 @@ impl GapPass {
             | Ev::CaseExprBegin { .. }
             | Ev::CaseNoWhen
             | Ev::CaseEnd { .. }
-            | Ev::SwitchExprCasePattern
-            | Ev::PatternBegin
-            | Ev::PatternEnd
+            | Ev::SwitchExprCasePattern { .. }
+            | Ev::PatternBegin { .. }
+            | Ev::PatternEnd { .. }
             | Ev::ObjectPattern { .. }
-            | Ev::ShapePattern
-            | Ev::BinaryOrPatternBegin
-            | Ev::BinaryOrPatternEnd
+            | Ev::ShapePattern { .. }
+            | Ev::BinaryOrPatternBegin { .. }
+            | Ev::BinaryOrPatternEnd { .. }
             | Ev::NullCheckPattern
             | Ev::ConstantPatternBegin
             | Ev::ConstantPatternEnd

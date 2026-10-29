@@ -62,6 +62,16 @@ pub struct ParserFeatures {
     /// always parses the shorthand shape; when off, the head anchors report
     /// `experiment_not_enabled` (`Parser::report_dot_shorthands_gate`).
     pub dot_shorthands_enabled: bool,
+    /// The sound-flow-analysis posture (`enabledIn: 3.9.0`, expired — the
+    /// analyzer wires it as `soundFlowAnalysisEnabled:
+    /// featureSet.isEnabled(Feature.sound_flow_analysis)`,
+    /// type_analyzer_options.dart:20). No grammar face: the flow-analysis
+    /// replay reads it through the fold's `ParserFeatures` — a pre-3.9
+    /// unit (a `// @dart = 3.8` library) analyzes with the sound-only
+    /// folds (nullability-disjoint test/cast failures, trivially
+    /// satisfied checks, `??` RHS kills, pattern cannot-match kills)
+    /// standing down.
+    pub sound_flow_analysis: bool,
 }
 
 impl ParserFeatures {
@@ -73,6 +83,7 @@ impl ParserFeatures {
         augmentations_enabled: false,
         enhanced_parts_enabled: false,
         dot_shorthands_enabled: false,
+        sound_flow_analysis: false,
     };
 
     /// Folds a [`FeatureSet`] into the parser's plain flags.
@@ -106,6 +117,9 @@ impl ParserFeatures {
             Feature::Augmentations => self.augmentations_enabled = true,
             Feature::EnhancedParts => self.enhanced_parts_enabled = true,
             Feature::DotShorthands => self.dot_shorthands_enabled = true,
+            // Not a grammar gate: the fold carries the posture for the
+            // flow-analysis replay (the field's doc).
+            Feature::SoundFlowAnalysis => self.sound_flow_analysis = true,
             // Lexical only: `triple-shift` decides in the scanner
             // (`>>>` as one token); the parser sees its effect through
             // the token stream (the module docs' division of labor).
@@ -127,7 +141,6 @@ impl ParserFeatures {
             | Feature::PrivateNamedParameters
             | Feature::NativeAssets
             | Feature::GetterSetterError
-            | Feature::SoundFlowAnalysis
             | Feature::NullAwareElements
             | Feature::InferenceUsingBounds
             | Feature::WildcardVariables
@@ -187,12 +200,15 @@ mod tests {
     /// bit without its registry truth — or a stance flip — fails here.
     #[test]
     fn fold_matches_the_registry_truth_across_versions() {
-        const MATRIX: [dartq_language::LanguageVersion; 9] = [
+        const MATRIX: [dartq_language::LanguageVersion; 10] = [
             dartq_language::LanguageVersion::new(2, 12),
             dartq_language::LanguageVersion::new(2, 16),
             dartq_language::LanguageVersion::new(2, 19),
             dartq_language::LanguageVersion::new(2, 99),
             dartq_language::LanguageVersion::new(3, 0),
+            // The sound-flow-analysis boundary's two sides (the #2837
+            // posture: a `// @dart = 3.8` unit folds the bit off).
+            dartq_language::LanguageVersion::new(3, 8),
             dartq_language::LanguageVersion::new(3, 9),
             dartq_language::LanguageVersion::new(3, 10),
             dartq_language::LanguageVersion::new(3, 12),
@@ -217,6 +233,7 @@ mod tests {
                 augmentations_enabled: shipped(Feature::Augmentations, version),
                 enhanced_parts_enabled: shipped(Feature::EnhancedParts, version),
                 dot_shorthands_enabled: shipped(Feature::DotShorthands, version),
+                sound_flow_analysis: shipped(Feature::SoundFlowAnalysis, version),
             };
             assert_eq!(folded, expected, "parser fold drifts at {version}");
         }

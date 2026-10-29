@@ -595,11 +595,14 @@ fn augment_extension_on_int_identifier_path() {
     );
 }
 
-/// `augment extension type ET {}`: the extension-type declaration reparses
-/// after the field fallback, so the primary-constructor pair fires —
-/// `missing_primary_constructor` anchored on the parser pointer and
-/// `expected_representation_field` on the body token (r5:
-/// `top_level_declarations.dart`; one point, two codes).
+/// `augment extension type ET {}`: with the augmentations scanner feature
+/// OFF (this suite's engine posture), `augment` is an identifier and the
+/// field-fallback reparse enters the extension-type head with no augment
+/// keyword — an introductory declaration, so the primary-constructor pair
+/// fires (r5: `top_level_declarations.dart`; one point, two codes). With
+/// the feature ON the augment gate suppresses both faces (pinned in
+/// `ticket_2807_extension_type_pair`; the co19 Augmentations suite's oracle
+/// row sets are silent on both codes).
 #[test]
 fn augment_extension_type_representation_pair() {
     assert_codes_engine(

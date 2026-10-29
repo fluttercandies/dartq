@@ -113,22 +113,6 @@ pub mod model;
 pub mod record;
 pub mod ty;
 
-// TEMPORARY R53 differential probes — `DQ_PROBE` env-gated eprintln, zero
-// output when unset; every call site is stripped before commit.
-pub fn dq_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DQ_PROBE").is_some())
-}
-
-#[macro_export]
-macro_rules! dq_probe {
-    ($($arg:tt)*) => {
-        if $crate::dq_probe_enabled() {
-            eprintln!($($arg)*);
-        }
-    };
-}
-
 mod async_gap;
 mod forward;
 mod interp;
@@ -152,3 +136,15 @@ mod ticket_2626_tests;
 
 #[cfg(test)]
 mod ticket_2798_tests;
+
+#[cfg(test)]
+mod ticket_2828_tests;
+
+#[cfg(test)]
+mod ticket_2837_tests;
+
+#[cfg(test)]
+mod ticket_2830_tests;
+
+#[cfg(test)]
+mod ticket_2850_tests;

@@ -13,9 +13,12 @@
 //! did not parse faithfully — a clause count mismatch, an unclaimed root
 //! at body time, a poisoned tree, an extension type's header — is `open`
 //! and contributes no entry: the consumer keeps the name-level edges, the
-//! under-report direction. Named mixin applications never finalize their
-//! header (no body-begin event, the diagnosing capture's own shape) and
-//! contribute nothing either.
+//! under-report direction. A named mixin application's header finalizes at
+//! its end event (no body-begin fires for `class C = S with M;`); its
+//! with-clause roots are claimed like any container's, so the alias's
+//! written faces edge the snapshot (`class MyTypedef<K, V> = A with
+//! Mixin1<K>, Mixin2<V>` edges `MyTypedef<num, String> → Mixin1<num>` —
+//! the substituted instantiation the subtype verdict reads).
 //!
 //! Unlike the `crate::bounds` index — which records only containers with
 //! a type-variable window, the boundedness checks' only subjects — the
@@ -439,10 +442,13 @@ impl ParserListener for CaptureListener<'_, '_> {
         _implements: Option<Token>,
         _end: Token,
     ) {
-        // No body-begin finalizes the alias's header; the end event drops
-        // it like the diagnosing capture's own shape — the alias's trees
-        // contribute no entry and the name-level edges stand.
-        self.header = None;
+        // No body-begin fires for `class C = S with M;` — the end event is
+        // the alias's finalization point. Finalizing here edges the
+        // snapshot with the alias's written faces (the substituted mixin
+        // application the subtype verdict reads); an unfaithful clause set
+        // keeps the `open` bit and contributes no entry, the name-level
+        // edges standing as before.
+        self.finish_header();
     }
 
     fn begin_mixin_declaration(

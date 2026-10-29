@@ -240,6 +240,7 @@ pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
     augmentations_enabled: true,
     enhanced_parts_enabled: false,
     dot_shorthands_enabled: true,
+    sound_flow_analysis: true,
 };
 
 const _: () = assert!(

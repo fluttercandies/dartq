@@ -711,7 +711,9 @@ fn dead_cast_tail_owns_the_initializer_row() {
             crate::ev::Ev::Exit { end: tspan(24) },
             crate::ev::Ev::AsBegin { span: tspan(26) },
             crate::ev::Ev::AsEnd,
-            crate::ev::Ev::AsOperator,
+            crate::ev::Ev::AsOperator {
+                type_head: tspan(27),
+            },
             crate::ev::Ev::InitializerEnd,
             crate::ev::Ev::VarDeclEnd,
             crate::ev::Ev::StmtEnd { end: 33 },
@@ -787,7 +789,9 @@ fn dead_cast_tail_owns_the_initializer_row() {
             crate::ev::Ev::Exit { end: tspan(24) },
             crate::ev::Ev::AsBegin { span: tspan(26) },
             crate::ev::Ev::AsEnd,
-            crate::ev::Ev::AsOperator,
+            crate::ev::Ev::AsOperator {
+                type_head: tspan(27),
+            },
             crate::ev::Ev::ExprStmt { span: tspan(22) },
             crate::ev::Ev::StmtEnd { end: 33 },
             crate::ev::Ev::ExecEnd {
@@ -2800,12 +2804,15 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::SwitchExprBlockBegin,
         // `1 when b => e` — pattern, separator, guard, then the value.
         Ev::SwitchExprCaseBegin,
-        Ev::PatternBegin,
+        Ev::PatternBegin {
+            span: span(3),
+            paren: false,
+        },
         Ev::ConstantPatternBegin,
         Ev::OtherExpr { span: span(3) },
         Ev::ConstantPatternEnd,
-        Ev::PatternEnd,
-        Ev::SwitchExprCasePattern,
+        Ev::PatternEnd { paren: false },
+        Ev::SwitchExprCasePattern { begin: span(3) },
         Ev::GuardBegin,
         Ev::Bool { value: true },
         Ev::GuardEnd,
@@ -2813,17 +2820,22 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::SwitchExprCaseEnd {
             has_guard: true,
             begin: span(3),
+            end: 5,
         },
         // `_ => e`.
         Ev::SwitchExprCaseBegin,
-        Ev::PatternBegin,
+        Ev::PatternBegin {
+            span: span(5),
+            paren: false,
+        },
         Ev::Wildcard { token: span(5) },
-        Ev::PatternEnd,
-        Ev::SwitchExprCasePattern,
+        Ev::PatternEnd { paren: false },
+        Ev::SwitchExprCasePattern { begin: span(5) },
         Ev::OtherExpr { span: span(6) },
         Ev::SwitchExprCaseEnd {
             has_guard: false,
             begin: span(5),
+            end: 7,
         },
         Ev::SwitchExprBlockEnd,
     ];
@@ -3140,10 +3152,13 @@ fn pattern_assignment_writes_targets() {
         },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
-        Ev::PatternBegin,
+        Ev::PatternBegin {
+            span: span(1),
+            paren: false,
+        },
         Ev::AssignedVarPattern { name: 0 },
         Ev::AssignedVarPattern { name: 1 },
-        Ev::PatternEnd,
+        Ev::PatternEnd { paren: false },
         Ev::OtherExpr { span: span(3) },
         Ev::OtherExpr { span: span(4) },
         Ev::RecordLitEnd { count: 2 },
@@ -3196,7 +3211,10 @@ fn pattern_declaration_declares_assigned() {
         range: SourceRange { offset, length: 1 },
     };
     let events = vec![
-        Ev::PatternBegin,
+        Ev::PatternBegin {
+            span: span(0),
+            paren: false,
+        },
         Ev::DeclaredVarPattern {
             name: 0,
             is_final: false,
@@ -3207,7 +3225,7 @@ fn pattern_declaration_declares_assigned() {
             is_final: false,
             token: span(2),
         },
-        Ev::PatternEnd,
+        Ev::PatternEnd { paren: false },
         Ev::OtherExpr { span: span(1) },
         Ev::OtherExpr { span: span(2) },
         Ev::RecordLitEnd { count: 2 },

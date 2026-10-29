@@ -140,6 +140,13 @@ pub(crate) struct PatternState {
     /// projection exactly as the variable path does — no promotable
     /// reference exists, so only the binder (and the unmatched join) care.
     pub scrutinee_ty: Option<(Ty, u32)>,
+    /// The open PEEKED (not popped) a value as the scrutinee face: only an
+    /// if-case adoption consumes it (the scrutinee is spent when the clause
+    /// machinery takes over). A declaration, assignment, or for-in head
+    /// pattern opens BEFORE its own value parses — the value beneath (a
+    /// sibling collection element, the for-header replay's floor) belongs
+    /// to an enclosing construct and must stay on the stack.
+    pub scrutinee_pending: bool,
     /// The pattern's `when`-guard expression, if one fired.
     pub guard: Option<crate::interp_expr::Expr>,
     /// The state at `GuardBegin`: the guard-false arm for the close's
@@ -154,6 +161,49 @@ pub(crate) struct PatternState {
     /// in the guard and the then statement only (`if (p case Sub p) ...
     /// else p.other` reads the OUTER `p` in the else branch).
     pub shadowed: Vec<(u32, Option<u32>)>,
+    /// Whether the pattern provably always matches (official
+    /// `promoteForPattern`'s `coversMatchedType` posture: the official's
+    /// per-clause `_unmatched` chain seeds unreachable, and a pattern
+    /// whose walk joins no reachable failure arm leaves it that way —
+    /// every later alternative and the post-switch join read dead).
+    /// Latched false by every reachable may-fail join (`join_unmatched`
+    /// and the direct chain writes), and by a `when` guard (its false arm
+    /// is an unmatched path). The clause close kills the switch frame's
+    /// chain when it still stands.
+    pub cannot_fail: bool,
+    /// Whether the clause's head actually parsed a pattern node: a
+    /// recovered clause can close its context with zero pattern events,
+    /// and the cannot-fail kill stands down for it (an unknown head may
+    /// always fail).
+    pub saw_node: bool,
+}
+
+/// One open logical-or alternation (`A || B`): the right operand's entry
+/// state is the LEFT branch's failure state (official
+/// `logicalOrPattern_afterLhs`, flow_analysis.dart:6104-6106) — a left
+/// branch that provably always matches walks the right operand dead, and
+/// the operand row spans `[operator, right end)`
+/// (dead_code_verifier.dart:321-323).
+pub(crate) struct OrFrame {
+    /// The `||` token: the open window's anchor.
+    pub operator: TokenSpan,
+    /// The state at the operator (the left branch's matched state): the
+    /// close restores it when the right operand walked dead (official
+    /// `logicalOrPattern_end`'s `_join(lhsMatched, rhs)` collapses to the
+    /// lhs arm).
+    pub entry: State,
+    /// The may-fail epoch at the operator (see
+    /// [`Interp::or_join_epoch`]): the close reads whether the right
+    /// operand latched any join of its own.
+    pub epoch: u32,
+    /// Whether the left branch always matches — no may-fail join latched
+    /// since the enclosing pattern context opened (or since a preceding
+    /// sibling alternation's clean close): the right operand's walk runs
+    /// unreachable when it stands (official `logicalOrPattern_begin`'s
+    /// `_unmatched = _current.setUnreachable()` seed stays unreachable
+    /// exactly then, and `afterRightHandSideBegins` walks the right
+    /// operand under it).
+    pub left_clean: bool,
 }
 
 /// Replay frames (official `_FlowContext` subclasses).
@@ -195,6 +245,17 @@ pub(crate) enum Frame {
         then_dead_entry: bool,
         /// Same latch for the else arm, taken at the colon.
         else_dead_entry: bool,
+        /// A cast whose operand never completed just closed in the arm now
+        /// parsing (`Ev::AsEnd`'s operand face): the NEXT `AsOperator` parks
+        /// the cast type's head on [`Self::cast_tail`].
+        never_cast: bool,
+        /// The arm's first Never-operand cast type head (official
+        /// `flowEnd(thenExpression)`/`flowEnd(elseExpression)`'s dead row,
+        /// type_analyzer.dart:2588/2616 — `dead_code_verifier.dart`'s first
+        /// dead node is the cast's type annotation, the row runs to the
+        /// arm's own end). First cast wins: a later cast in the same arm is
+        /// already inside the dead interval.
+        cast_tail: Option<TokenSpan>,
     },
     Branch {
         branch: State,
@@ -439,6 +500,7 @@ impl Default for DeclCtx {
 /// One captured condition-variable binding (language#1274): the split
 /// states saved at `final b = v != null;` (or `==`, or a type test),
 /// replayed when `b` reads as a condition operand.
+#[derive(Clone)]
 pub(crate) struct CondVarEntry {
     /// The tested variable.
     pub tested: u32,
@@ -913,6 +975,15 @@ pub(crate) enum Covered {
 )]
 pub(crate) struct Interp<'o> {
     pub(crate) ops: &'o dyn TypeOps,
+    /// The unit's sound-flow-analysis posture (official
+    /// `soundFlowAnalysisEnabled`, mounted from the recorder at
+    /// `exec_end`): the sound-only folds consult it at each gated site —
+    /// the guaranteed-fail/succeed predicates, the bottom-factor dead
+    /// arm, the promotion-step rule, the `??`/null-aware skip kills, the
+    /// cast disjointness kill, and the pattern cannot-match faces.
+    /// Construction-default `true` (the modern posture every version ≥
+    /// 3.9 carries).
+    pub(crate) sound_flow: bool,
     /// The recorder's written-argument arena (index 0 reserved empty):
     /// `Ev::Type` rows carry ids into it and the promotion gate compares
     /// the trees structurally (#611 step 4).
@@ -1015,6 +1086,10 @@ pub(crate) struct Interp<'o> {
     /// an initializer whose expression IS that fold binds the split to
     /// the declared local.
     pub(crate) cond_split_var: Option<u32>,
+    /// The open if's condition provably killed its then branch (a
+    /// pattern-disjoint kill or a constant condition): the branch's own
+    /// empty block is a polled node there and reports its braces.
+    pub(crate) if_branch_folded: bool,
     /// The condition variables (language#1274, official
     /// `restoreConditionVariableState`): a bool local bound from a
     /// null-comparison or type-test split replays the split's
@@ -1166,6 +1241,29 @@ pub(crate) struct Interp<'o> {
     /// snapshot source. Cleared at every pattern-context open.
     pub(crate) pattern_binds: Vec<u32>,
 
+    /// Open logical-or alternation frames ([`OrFrame`]), innermost last:
+    /// a left branch that provably always matches walks the right
+    /// operand dead and reports `[operator, right end)`
+    /// (official `handle_logicalOrPattern_afterLhs` +
+    /// `LogicalOrPattern.resolvePattern`'s `flowEnd(rightOperand)`).
+    pub(crate) or_frames: Vec<OrFrame>,
+
+    /// The may-fail epoch: latching joins ([`Interp::note_may_fail`])
+    /// bump it; pattern-context opens zero it. An alternation's left
+    /// branch "always matches" reads as `epoch == 0` (nothing joined
+    /// since the context opened — the left operand's events are all
+    /// that ran) or as a preceding adjacent alternation's clean close
+    /// (`or_last_clean`, the left-nested `A || B || C` chain whose
+    /// outer left is the inner or). The field-level event stream is
+    /// post-order, so operand boundaries are unobservable directly —
+    /// the epoch is the observable stand-in.
+    pub(crate) or_join_epoch: u32,
+    /// The epoch at the most recent alternation's close, with whether
+    /// its right operand latched nothing (`right_clean`): the next
+    /// alternation opening at the same epoch is left-nested on it and
+    /// inherits the cleanliness. `None` outside an alternation chain.
+    pub(crate) or_last_clean: Option<(u32, bool)>,
+
     /// Open null-shorting contexts (official `_NullAwareAccessContext`
     /// stack, flow_analysis.dart:9664): each entry is the skip-path state
     /// captured when a `?.`/`?[`/`?..` was reached — the pre-promotion
@@ -1314,6 +1412,7 @@ impl<'o> Interp<'o> {
     ) -> Self {
         Self {
             ops,
+            sound_flow: true,
             args,
             boundaries,
             closed: &NO_CLOSED,
@@ -1344,6 +1443,7 @@ impl<'o> Interp<'o> {
             coll_if: Vec::new(),
             binding_journal: Vec::new(),
             cond_split_var: None,
+            if_branch_folded: false,
             cond_vars: std::collections::HashMap::new(),
             local_fns: FxHashSet::default(),
             prop_slots: FxHashMap::default(),
@@ -1379,6 +1479,9 @@ impl<'o> Interp<'o> {
             vacuous_object: None,
             vacuous_fields: Vec::new(),
             pattern_binds: Vec::new(),
+            or_frames: Vec::new(),
+            or_join_epoch: 0,
+            or_last_clean: None,
             init_exec_depth: None,
             null_shorts: Vec::new(),
             cascade_head_open: false,
@@ -1565,29 +1668,6 @@ impl<'o> Interp<'o> {
             }
         }
         self.top_level.get(&name_id).copied().map(Resolved::Top)
-    }
-
-    /// TEMPORARY R53 probe helper: a flow [`Ty`] as readable text (the
-    /// interned head resolved through the body's name table), so probe
-    /// lines carry type names instead of opaque `Name(id)` debug.
-    pub(crate) fn probe_ty(&self, ty: Ty) -> String {
-        let head = match ty.base {
-            crate::ty::Base::Name(id) => self
-                .names
-                .get(id as usize)
-                .map_or_else(|| "?".to_string(), |n| n.to_string()),
-            crate::ty::Base::Dynamic => "dynamic".to_string(),
-            crate::ty::Base::Void => "void".to_string(),
-            crate::ty::Base::Never => "Never".to_string(),
-            crate::ty::Base::Null => "Null".to_string(),
-            crate::ty::Base::Function => "Function".to_string(),
-            crate::ty::Base::Unknown => "%unknown".to_string(),
-        };
-        if ty.nullable {
-            format!("{head}?")
-        } else {
-            head
-        }
     }
 
     /// Records a write (real or collect mode) and updates the flow state.
@@ -1856,7 +1936,11 @@ impl<'o> Interp<'o> {
         }
         match self.classify(ty) {
             Classification::NullOrEquivalent => self.unreachable_cur(),
-            Classification::NonNullable => {
+            Classification::NonNullable if self.sound_flow => {
+                // The skip path dies "assuming sound null safety"
+                // (official `_nullAwareAccess_rightBegin`,
+                // flow_analysis.dart:7694-7698 — the kill rides
+                // `soundFlowAnalysisEnabled`).
                 shortcut = shortcut.set_unreachable(&mut self.reach);
             }
             _ => {}
@@ -1954,13 +2038,23 @@ impl<'o> Interp<'o> {
     /// base`) close: the chain's own `?` (`x?.m(g()?.n)`'s outer short
     /// beside an argument's) ends at its access event, not here — the
     /// official `nullShortingTargetDepth` bound (type_analyzer.dart:804-827)
-    /// mapped onto the event stream.
+    /// mapped onto the event stream. An open cascade's head short sits at
+    /// or below its frame's base (`cascadeExpression_afterTarget`'s
+    /// context ends at the cascade's own end, never at an inner
+    /// consumer's), so the innermost open cascade's base floors the flush.
     pub(crate) fn flush_null_shorts_above(&mut self, exprs_base: usize) {
-        while self
-            .null_shorts
-            .last()
-            .is_some_and(|short| short.exprs_depth > exprs_base)
-        {
+        let cascade_floor = self
+            .stack
+            .iter()
+            .rev()
+            .find_map(|frame| match frame {
+                Frame::Cascade { exprs_base, .. } => Some(*exprs_base),
+                _ => None,
+            })
+            .unwrap_or(0);
+        while self.null_shorts.last().is_some_and(|short| {
+            short.exprs_depth > exprs_base && short.exprs_depth > cascade_floor
+        }) {
             self.null_short_end();
         }
     }
@@ -2262,6 +2356,75 @@ impl<'o> Interp<'o> {
                     range: SourceRange {
                         offset: arm_start,
                         length: arm_end - arm_start,
+                    },
+                },
+            });
+        }
+    }
+
+    /// Closes the interval when the first dead node IS the node whose
+    /// `flowEnd` just ran (official dead_code_verifier.dart:237-246 —
+    /// `node == firstDeadNode`): the row runs from the anchor through
+    /// `min_end` (the closing node's own end — the logical-or operand's
+    /// `node.end`), extended by any further dead extent the interval
+    /// reached (nested dead operands). A window anchored elsewhere keeps
+    /// ownership (an enclosing dead context latched first — `visitNode`
+    /// ignores later unreachable nodes); a live walk opened nothing.
+    pub(crate) fn close_dead_row_to(&mut self, offset: u32, min_end: u32) {
+        let anchored = self
+            .dead
+            .as_ref()
+            .is_some_and(|window| window.anchor.range.offset == offset);
+        if !anchored {
+            return;
+        }
+        let window = self.dead.take();
+        if let Some(window) = window {
+            let end = window.trim_end.unwrap_or(window.end).max(min_end);
+            if end > offset {
+                self.emit(FlowFact::DeadCode {
+                    span: TokenSpan {
+                        id: 0,
+                        range: SourceRange {
+                            offset,
+                            length: end - offset,
+                        },
+                    },
+                });
+            }
+        }
+    }
+
+    /// The conditional arm's mid-arm cast-tail row (official
+    /// `flowEnd(thenExpression)`/`flowEnd(elseExpression)`,
+    /// type_analyzer.dart:2588/2616): a Never-operand cast inside the arm
+    /// parked its type head on the [`Frame::Cond`] — the cast type is the
+    /// first dead node, and the row runs to the arm's own end. An
+    /// entry-dead arm reports its whole-range row instead
+    /// ([`Self::dead_arm_row`]); a live arm without the Never cast parks
+    /// nothing and this is a no-op.
+    pub(crate) fn cast_tail_row(&mut self, arm_end: u32) {
+        let head = match self.stack.last_mut() {
+            Some(Frame::Cond {
+                never_cast,
+                cast_tail,
+                ..
+            }) => {
+                *never_cast = false;
+                cast_tail.take()
+            }
+            _ => None,
+        };
+        let Some(head) = head.filter(|_| !self.reachable()) else {
+            return;
+        };
+        if arm_end > head.range.offset {
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: head.id,
+                    range: SourceRange {
+                        offset: head.range.offset,
+                        length: arm_end - head.range.offset,
                     },
                 },
             });
@@ -3315,8 +3478,12 @@ impl Interp<'_> {
         // opening an interval, so the loop's exit path is unaffected (a
         // live condition keeps the tail row-free, probe u3) and a wholly
         // dead loop folds the updaters into its own row instead (probe
-        // u5).
-        if !self.reachable() && !had_dead {
+        // u5). First-dead-wins: a window still OPEN when the updaters
+        // begin (an anchor inside the body — the element poll of a
+        // fold-killed for-element) owns the updaters too (the official
+        // `_visitNode` never re-anchors onto a later node); a CLOSED row
+        // leaves the updaters first-dead.
+        if !self.reachable() && !had_dead && self.dead.is_none() {
             let mut begin: Option<TokenSpan> = None;
             let mut last: Option<u32> = None;
             for event in &events[bounds.upd.clone()] {

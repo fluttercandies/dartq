@@ -365,6 +365,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         mut parameter_kind: FormalParameterKind,
         member_kind: MemberKind,
     ) {
+        // The formal's node begin, pre-metadata: the extension-type
+        // function-typed representation face anchors on `inner.beginToken`
+        // (error_verifier.dart:5433-5439).
+        let node_begin = self.peek_span();
         self.parse_metadata_star();
         let start = self.peek_span();
 
@@ -1010,9 +1014,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         {
             if state.count == 0 {
                 state.modifier = var_final_or_const;
-                state.this_or_super = this_keyword.is_some() || super_keyword.is_some();
+                state.this_or_super = this_keyword.or(super_keyword);
                 state.fn_typed = before_inline_function_type.is_some();
                 state.has_type = !matches!(type_info, TypeInfo::NoType);
+                state.first_begin = Some(node_begin);
             }
             state.count += 1;
         }

@@ -285,14 +285,24 @@ impl ComplexType {
         let starter_count = self.type_variable_starters.len();
 
         // Pass 1: begin events + type variables, outermost `Function` first.
-        let mut type_variable_ends: Vec<TokenSpan> = Vec::with_capacity(starter_count);
+        // The scan runs under declaration semantics (official
+        // `computeTypeParamOrArg(t.head, /* inDeclaration = */ true)`,
+        // type_info_impl.dart:631-638).
+        let mut type_variable_next: Vec<TokenId> = Vec::with_capacity(starter_count);
         for starter in self.type_variable_starters.iter().rev() {
             parser.listener.begin_function_type(start);
             let mark = parser.cursor.mark();
             parser.cursor.jump_to(*starter + 1);
-            let type_param = parser.compute_type_param_or_arg_on_lt(false);
-            let end = type_param.parse_variables(parser, false);
-            type_variable_ends.push(end);
+            let type_param = parser.compute_type_param_or_arg_on_lt(true);
+            type_param.parse_variables(parser, false);
+            // The walk pass continues at the group's FOLLOWER — the official
+            // `token = typeVariableEndGroups[endGroupIndex]` feeding
+            // `parseFormalParametersRequiredOpt` reads the end group's
+            // successor (type_info_impl.dart:704-712). The consumed closer
+            // may be a split remainder (a side-table id the mark/reset below
+            // discards), so navigate by the first REAL token after the
+            // consume — always a scanned-table id.
+            type_variable_next.push(parser.real_id(parser.cursor.real_pos()));
             parser.cursor.reset(mark);
         }
 
@@ -318,10 +328,12 @@ impl ComplexType {
             let function_token = parser.peek_span();
             parser.cursor.advance();
             if parser.peek_kind() == TokenKind::Lt {
-                // Skip type parameters; they were parsed in pass 1.
-                let type_end = type_variable_ends[starter_count - 1 - i];
-                parser.skip_to_token(type_end.id);
-                parser.cursor.advance();
+                // Skip type parameters; they were parsed in pass 1. Land ON
+                // the group's follower — the formal parameters' `(` — the
+                // official walk reading the end group's successor
+                // (type_info_impl.dart:704-712).
+                let follower = type_variable_next[starter_count - 1 - i];
+                parser.skip_to_token(follower);
             }
             end = parser.parse_formal_parameters_required_opt(MemberKind::GeneralizedFunctionType);
             let mut question = None;

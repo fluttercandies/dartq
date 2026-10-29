@@ -1114,6 +1114,11 @@ fn plugin_conflict_rows(
 /// only); a non-map section reports `invalid_section_format` instead and
 /// never reaches this row. Distinct loaded files yield once (two keys
 /// sharing one options file are one parse, officially too).
+///
+/// The rows carry no YAML ignore-comment face: the pinned oracle runs
+/// `IgnoreInfo.forYaml` only in the pubspec validator
+/// (pubspec_validator.dart:80-83) — analysis-options diagnostics pass
+/// through analyzer_cli unfiltered (driver.dart:276-306).
 fn inner_plugins_rows(engine: &Engine) -> Vec<Diagnostic> {
     let context_root = engine.packages().workspace_root();
     let mut inner: Vec<&analysis_options::AnalysisOptions> = engine
@@ -1130,16 +1135,13 @@ fn inner_plugins_rows(engine: &Engine) -> Vec<Diagnostic> {
         .into_iter()
         .filter_map(|options| {
             let file = table.try_file_id(&options.file_path)?;
-            let row = analysis_options::OptionsIssue::plugins_in_inner_options(
-                &context_root.display().to_string(),
-                options.plugins_section_anchor(),
+            Some(
+                analysis_options::OptionsIssue::plugins_in_inner_options(
+                    &context_root.display().to_string(),
+                    options.plugins_section_anchor(),
+                )
+                .to_diagnostic(file),
             )
-            .to_diagnostic(file);
-            // The YAML ignore-comment face over the options file's own text
-            // — the same face every options-file row passes (the
-            // `IgnoreInfo.forYaml` filter, upstream Dart SDK source,
-            // `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart` :80-83).
-            (!options.ignored_at(row.range.offset, row.code.name)).then_some(row)
         })
         .collect()
 }
@@ -3557,53 +3559,41 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The inner-options plugins row's ignore face: the options file's own
-    /// YAML `# ignore_for_file:` citation drops the row before it joins the
-    /// output; a wrong-code citation keeps it (the same `IgnoreInfo.forYaml`
-    /// filter the oracle's YAML validators run,
-    /// pubspec_validator.dart:80-83).
+    /// The inner-options plugins row has no YAML ignore-comment face: the
+    /// pinned oracle runs `IgnoreInfo.forYaml` only in the pubspec
+    /// validator (pubspec_validator.dart:80-83) — analysis-options
+    /// diagnostics pass through analyzer_cli unfiltered (driver.dart
+    /// :276-306) — so a `# ignore_for_file:` citation naming the row's
+    /// code keeps the row.
     #[test]
-    fn run_overlaid_inner_plugins_row_honors_yaml_ignore_comments() {
-        let mount = |name: &str, citation: &str| {
-            let root = workspace(name, &[("lib/test.dart", "void f() {}\n")]);
-            let root = root.canonicalize().expect("canonical root");
-            std::fs::write(
-                root.join("lib/analysis_options.yaml"),
-                format!("{citation}plugins:\n  custom_lint:\n    path: .\n"),
-            )
-            .expect("inner options");
-            std::fs::write(
-                root.join("analysis_options.yaml"),
-                "plugins:\n  root_plugin:\n    path: .\n",
-            )
-            .expect("root options");
-            let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
-            let mut engine = Engine::new(config).expect("engine");
-            let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
-            let rows: usize = run
-                .diagnostics
+    fn run_overlaid_inner_plugins_row_reports_despite_yaml_ignore_comment() {
+        let root = workspace(
+            "analyze_inner_plugins_ignore_kept",
+            &[("lib/test.dart", "void f() {}\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        std::fs::write(
+            root.join("lib/analysis_options.yaml"),
+            "# ignore_for_file: plugins_in_inner_options\nplugins:\n  custom_lint:\n    path: .\n",
+        )
+        .expect("inner options");
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "plugins:\n  root_plugin:\n    path: .\n",
+        )
+        .expect("root options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+        assert_eq!(
+            run.diagnostics
                 .iter()
                 .filter(|d| d.code.name == "plugins_in_inner_options")
-                .count();
-            std::fs::remove_dir_all(&root).ok();
-            rows
-        };
-        // The file-wide citation names the row's code: silent.
-        assert_eq!(
-            mount(
-                "analyze_inner_plugins_ignored",
-                "# ignore_for_file: plugins_in_inner_options\n"
-            ),
-            0
+                .count(),
+            1,
+            "the ignore-comment citation does not suppress the options row"
         );
-        // A wrong-code citation names nothing: the row reports.
-        assert_eq!(
-            mount(
-                "analyze_inner_plugins_kept",
-                "# ignore_for_file: some_other_code\n"
-            ),
-            1
-        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The inner-plugins face through the real pipeline: an inner options

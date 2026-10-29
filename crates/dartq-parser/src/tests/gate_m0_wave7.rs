@@ -317,8 +317,9 @@ fn stray_close_paren_after_enum_type_parameters_reports_once() {
 /// `extension type E) {}`: the extension-type head carries its own
 /// missing-primary-constructor rows (the parser's
 /// `missingPrimaryConstructor` on the last consumed token plus the
-/// verifier's `expectedRepresentationField` on the pending token,
-/// production `parse_primary_constructor_opt`), then the header recovery
+/// verifier's `expectedRepresentationField` on the synthesized empty
+/// formal list — zero length at the token after the name, here the `)`),
+/// production `parse_primary_constructor_opt`, then the header recovery
 /// reports the stray `)` once — the same one-row shape as the class face.
 #[test]
 fn stray_close_paren_after_extension_type_name_reports_once() {
@@ -326,7 +327,7 @@ fn stray_close_paren_after_extension_type_name_reports_once() {
         "extension type E) {}",
         &[
             ("missing_primary_constructor", 15, 16),
-            ("expected_representation_field", 16, 17),
+            ("expected_representation_field", 16, 16),
             ("unexpected_token", 16, 17),
         ],
         "stray ) after extension type name",

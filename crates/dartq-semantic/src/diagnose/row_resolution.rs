@@ -992,6 +992,24 @@ impl<'a> Engine<'a> {
                     recv
                 };
                 let recv = self.tolerant_receiver(promotions, row, recv);
+                // The compound/prefix/postfix operator applied to a MEMBER's
+                // own result (#2815 R2 — `b.a.y += 0` over `A.y: int?`): the
+                // application reads the member's static type unconditionally
+                // and reports the shared unchecked code at the operator token
+                // naming the base operator. A nullable RECEIVER keeps the
+                // selector-anchored read face's own row (the member sites'
+                // gate) — this face fires only when the receiver reads clean
+                // and the member's result is the nullable operand.
+                if let Some((op_text, op_range, is_method)) = self.adjacent_operator(row)
+                    && matches!(recv, Receiver::Typed { ty, .. } if !self.potentially_nullable(ty))
+                    && let Ok(index) = self
+                        .member_reads
+                        .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                    && let Some(result) = self.chained_read_static_ty(&self.member_reads[index])
+                    && self.potentially_nullable(result)
+                {
+                    self.emit_unchecked_nullable(op_range, op_text, is_method);
+                }
                 self.resolve_member_row(promotions, row, recv);
             }
             RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
@@ -1624,67 +1642,151 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
-                // A direct operator application on a declared-typed receiver
-                // (`c + d`, `c[i] = v`). The flow promotion's face re-decides
-                // first (#2241's join, the same face the member walk's
-                // receiver verdict reads): `if (sub is List) sub[i]` resolves
-                // `[]` against the promoted `List`, not the declared
-                // `Object?`. An opaque staged marker carries only the
-                // nullability decision (#2174) — the parse-time type's
-                // non-null form stands. A type whose static type the model
-                // leaves unknown is the SDK projection's names-only stub —
-                // for the dart:core collection heads that is the generic
-                // class type literal (`List < 1`), and the operator applies
-                // to the literal's static type `Type`, which declares none
-                // of the user operators (the `A < 1` container face's
-                // decision, one resolution grade down).
-                if matches!(row.intent, Intent::Operator(..)) {
-                    // The promotion-latched initializer's re-bind (#2539): an
-                    // implicitly typed local whose initializer's member row
-                    // re-derived under a promoted receiver (`final v =
-                    // t.value` past `t is Sub` — the base getter's declared
-                    // `Object` at parse time, the override's `BigInt` after
-                    // the re-decision) carries the corrected face only in
-                    // the re-bind map. The operator verdict reads the same
-                    // corrected static type the receiver faces read
-                    // (`rebound_read_face` outranks the parse bind; a live
-                    // promotion at the read still outranks both).
+                // The receiver faces that read the row's flow-corrected
+                // static type (#2815): the direct operator application on a
+                // declared-typed receiver (`c + d`, `c[i] = v`), the bare
+                // invocation's callee (`f1()` over a `Function?` local), and
+                // the compound/prefix/postfix applications the row model
+                // stages no marker for (`x += 1`, `-x`, `x++` — read through
+                // the token table's adjacency). The flow promotion's face
+                // re-decides first (#2241's join, the same face the member
+                // walk's receiver verdict reads): `if (sub is List) sub[i]`
+                // resolves `[]` against the promoted `List`, not the
+                // declared `Object?`. An opaque staged marker carries only
+                // the nullability decision (#2174) — the parse-time type's
+                // non-null form stands.
+                //
+                // The promotion-latched initializer's re-bind (#2539): an
+                // implicitly typed local whose initializer's member row
+                // re-derived under a promoted receiver (`final v = t.value`
+                // past `t is Sub` — the base getter's declared `Object` at
+                // parse time, the override's `BigInt` after the re-decision)
+                // carries the corrected face only in the re-bind map. The
+                // verdicts below read the same corrected static type the
+                // receiver faces read (`rebound_read_face` outranks the
+                // parse bind; a live promotion at the read still outranks
+                // both).
+                let adjacent = self.adjacent_operator(row);
+                if matches!(row.intent, Intent::Operator(..) | Intent::Invoke) || adjacent.is_some()
+                {
                     let ty = self.rebound_read_face(row.range).unwrap_or(ty);
                     let ty = match promotions.promoted(row.range) {
                         Some(Ty::Unknown) => Self::non_null_form(ty),
                         Some(promoted) => promoted,
                         None => ty,
                     };
-                    if ty == Ty::UNKNOWN && self.sdk_collection_type_literal(row.name)
-                        // The type-literal receiver face (`typedef c = String;
-                        // c > x`, `A < 1`): a bare name resolving to a TYPE
-                        // evaluates to the type object — its static type is
-                        // `Type`, which declares none of the user operators.
-                        // The alias-fold equality guards the shadowed face
-                        // (a local whose type folds from the same name never
-                        // answers here); the SDK-collection stub arm above
-                        // keeps its names-only posture.
-                        || (self.named_type_is_type(row.name)
-                            && ty == self.fold_alias_ty(Ty::named(row.name)))
-                    {
-                        let Intent::Operator(_, op_range) = row.intent else {
-                            return;
-                        };
-                        let (read, write) = self.operator_spellings(row);
-                        for spelling in [read, write].into_iter().flatten() {
-                            if spelling == self.intern("==")
-                                || self
-                                    .index
-                                    .get(self.file)
-                                    .is_some_and(|f| f.has_extension_member(spelling))
-                            {
-                                continue;
+                    // A trailing null-assert (`xs![index]`, `f!()`) promotes
+                    // the face the same way the chained receiver walk's own
+                    // `!` probe does (`null_asserted_after`).
+                    let ty = self.null_asserted_after(row.range, ty);
+                    if let Intent::Operator(_, op_range) = row.intent {
+                        // The nullable-dereference face on the operator's own
+                        // receiver (#2815 R2 — binary_expression_resolver's
+                        // `isNullable` tail and the compound/index/unary
+                        // twins): a potentially-nullable operand reports the
+                        // shared unchecked code at the operator token and
+                        // never reaches the undefined-operator family. An
+                        // extension whose `on` type covers the NULLABLE
+                        // spelling resolves the application (the `Single`
+                        // verdict — the same suppression the member sites
+                        // take); `UnsafeSingle` keeps the report.
+                        if self.potentially_nullable(ty)
+                            && !self.null_aware_members.contains(&row.range.offset)
+                            // A `?[` index shorts the same way a `?.` member
+                            // access does: the bracket's null-aware merge
+                            // marks the folded value row, not this receiver
+                            // row — the `?` itself is the probe.
+                            && self.byte_at(self.skip_whitespace(row.range.end())) != Some(b'?')
+                            && !self.operator_face_extension_resolved(ty, row)
+                        {
+                            let Intent::Operator(op, _) = row.intent else {
+                                return;
+                            };
+                            let op_text = self.strings.resolve(op).to_string();
+                            // The index family takes the method text (the
+                            // oracle's exact variant) anchored at the OPENING
+                            // bracket — the row's bracket span covers the
+                            // whole group; the binary family's operator text
+                            // is renderer debt (zero Jaccard effect) and
+                            // stands on the property variant.
+                            let is_index = op == self.intern("[]");
+                            let anchor = if is_index {
+                                SourceRange {
+                                    offset: op_range.offset,
+                                    length: 1,
+                                }
+                            } else {
+                                op_range
+                            };
+                            self.emit_unchecked_nullable(anchor, &op_text, is_index);
+                        } else if ty == Ty::UNKNOWN && self.sdk_collection_type_literal(row.name)
+                            // The type-literal receiver face (`typedef c =
+                            // String; c > x`, `A < 1`): a bare name resolving
+                            // to a TYPE evaluates to the type object — its
+                            // static type is `Type`, which declares none of
+                            // the user operators. The alias-fold equality
+                            // guards the shadowed face (a local whose type
+                            // folds from the same name never answers here);
+                            // the SDK-collection stub arm above keeps its
+                            // names-only posture.
+                            || (self.named_type_is_type(row.name)
+                                && ty == self.fold_alias_ty(Ty::named(row.name)))
+                        {
+                            let (read, write) = self.operator_spellings(row);
+                            for spelling in [read, write].into_iter().flatten() {
+                                if spelling == self.intern("==")
+                                    || self
+                                        .index
+                                        .get(self.file)
+                                        .is_some_and(|f| f.has_extension_member(spelling))
+                                {
+                                    continue;
+                                }
+                                let op_text = self.strings.resolve(spelling).to_string();
+                                self.emit(
+                                    SemanticCode::UndefinedOperator,
+                                    op_range,
+                                    &op_text,
+                                    "Type",
+                                );
                             }
-                            let op_text = self.strings.resolve(spelling).to_string();
-                            self.emit(SemanticCode::UndefinedOperator, op_range, &op_text, "Type");
+                        } else {
+                            self.check_operator_expr(ty, row);
                         }
-                    } else {
-                        self.check_operator_expr(ty, row);
+                    } else if let Some((op_text, op_range, is_method)) = adjacent {
+                        // The compound/prefix/postfix face (#2815 R2 —
+                        // assignment_expression_resolver.dart:232-278, the
+                        // increment twins): the application reads its operand
+                        // unconditionally, so a potentially-nullable operand
+                        // reports the shared unchecked code at the operator
+                        // token naming the BASE operator (`x += 1` reports
+                        // the method '+', `x++` the method '+').
+                        if self.potentially_nullable(ty)
+                            && !self.null_aware_members.contains(&row.range.offset)
+                            && !self.operator_face_extension_resolved(ty, row)
+                        {
+                            self.emit_unchecked_nullable(op_range, op_text, is_method);
+                        }
+                    } else if row.intent == Intent::Invoke
+                        && (self.local_decl_at_read.contains_key(&row.range.offset)
+                            || self.read_offset_is_member(row.range.offset))
+                        && self.potentially_nullable(ty)
+                        && self.invoke_callee_function_shaped(ty)
+                    {
+                        // The bare invocation's callee gate (#2815 R2a —
+                        // function_expression_invocation_resolver.dart:
+                        // 53-70): a callee whose resolved type IS a function
+                        // type (`Function?`, a nullable function shape, an
+                        // alias folding to one, a parameter spelling through
+                        // a function bound, `Never?` — question-suffixed
+                        // Never, pinned by the oracle corpus) reports the
+                        // shared unchecked code at the callee expression.
+                        // Only variable reads fire (a local, a parameter, an
+                        // implicit-this member) — a top-level function's own
+                        // invocation resolves. The function message variant
+                        // is renderer debt (zero Jaccard effect); the
+                        // property text stands.
+                        self.emit_unchecked_nullable(row.range, name_text, false);
                     }
                 }
             }
@@ -1897,6 +1999,160 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// The operator token adjacent to a non-operator read/write row (#2815
+    /// R2): the suffix face — a compound-assignment (`+=`, `<<=`, …) or
+    /// postfix `++`/`--` token directly after the row's span — or the
+    /// prefix face — a `++`/`--`/`~`/`-` token directly before it, unary
+    /// by the token ahead of the operator (an operand-ending token makes
+    /// `-` the binary minus whose RIGHT operand this row is; `~` has no
+    /// binary spelling, `~/` is its own token). The row model stages no
+    /// marker for these applications, so the pass reads the token table
+    /// — the same stream `mark_assignment`'s own candidate rule walks.
+    /// `None` for every other adjacency (a plain `=` among them: a plain
+    /// assignment reads nothing unconditionally; `??=` guards its write).
+    /// The returned triple is the BASE operator's spelling (`+=` reports
+    /// the method '+'), the operator token's span, and the method-text
+    /// pick (every shape in this family takes the method variant).
+    fn adjacent_operator(&self, row: &Row) -> Option<(&'static str, SourceRange, bool)> {
+        let tokens = self.tokens.as_slice();
+        let span = |token: &dartq_scanner::Token| SourceRange {
+            offset: token.utf16_offset,
+            // Operator lexemes are ASCII: the UTF-16 length is the byte
+            // length.
+            length: token.byte_len,
+        };
+        let at = tokens.partition_point(|t| t.utf16_offset < row.range.end());
+        let suffix = tokens.get(at).and_then(|token| {
+            let (text, is_method) = match token.kind {
+                dartq_scanner::TokenKind::PlusPlus | dartq_scanner::TokenKind::PlusEq => {
+                    ("+", true)
+                }
+                dartq_scanner::TokenKind::MinusMinus | dartq_scanner::TokenKind::MinusEq => {
+                    ("-", true)
+                }
+                dartq_scanner::TokenKind::StarEq => ("*", true),
+                dartq_scanner::TokenKind::SlashEq => ("/", true),
+                dartq_scanner::TokenKind::PercentEq => ("%", true),
+                dartq_scanner::TokenKind::TildeSlashEq => ("~/", true),
+                dartq_scanner::TokenKind::LtLtEq => ("<<", true),
+                dartq_scanner::TokenKind::GtGtEq => (">>", true),
+                dartq_scanner::TokenKind::GtGtGtEq => (">>>", true),
+                dartq_scanner::TokenKind::AmpersandEq => ("&", true),
+                dartq_scanner::TokenKind::BarEq => ("|", true),
+                dartq_scanner::TokenKind::CaretEq => ("^", true),
+                _ => return None,
+            };
+            Some((text, span(token), is_method))
+        });
+        if suffix.is_some() {
+            return suffix;
+        }
+        let before = tokens.partition_point(|t| t.utf16_offset < row.range.offset);
+        let token = before.checked_sub(1).and_then(|index| tokens.get(index))?;
+        let unary = match token.kind {
+            dartq_scanner::TokenKind::PlusPlus => true,
+            dartq_scanner::TokenKind::MinusMinus => true,
+            dartq_scanner::TokenKind::Tilde => true,
+            dartq_scanner::TokenKind::Minus => before
+                .checked_sub(2)
+                .and_then(|index| tokens.get(index))
+                .is_none_or(|prev| !Self::operand_ending_kind(prev.kind)),
+            _ => false,
+        };
+        if !unary {
+            return None;
+        }
+        // The oracle's operator-name spellings (messages.yaml): unary minus
+        // is `unary-` (never the binary `-`), the increments report their
+        // base operator.
+        let text = match token.kind {
+            dartq_scanner::TokenKind::PlusPlus => "+",
+            dartq_scanner::TokenKind::Minus => "unary-",
+            dartq_scanner::TokenKind::Tilde => "~",
+            _ => "-",
+        };
+        Some((text, span(token), true))
+    }
+
+    /// Whether the token kind can END an operand (the unary-minus
+    /// discriminator: `a - x` makes `x` the binary's right operand; `-x`
+    /// makes it the negation's receiver). Interpolated-set-literal and
+    /// postfix edges (`}` ahead of `-`, an `++` before it) are not
+    /// distinguishable at token level — the block/statement readings win,
+    /// the documented divergence for those recovery shapes.
+    fn operand_ending_kind(kind: dartq_scanner::TokenKind) -> bool {
+        use dartq_scanner::TokenKind as K;
+        matches!(
+            kind,
+            K::Identifier
+                | K::Int
+                | K::Double
+                | K::Hexadecimal
+                | K::String
+                | K::StringInterpolationIdentifier
+                | K::CloseParen
+                | K::CloseSquare
+                | K::Keyword(dartq_scanner::Keyword::This)
+                | K::Keyword(dartq_scanner::Keyword::Super)
+                | K::Keyword(dartq_scanner::Keyword::True)
+                | K::Keyword(dartq_scanner::Keyword::False)
+                | K::Keyword(dartq_scanner::Keyword::Null)
+        )
+    }
+
+    /// Whether an extension application resolves the operator face a row
+    /// spells against the NULLABLE receiver `ty` (the #2815 R2 gate's
+    /// suppression): only the `Single` verdict — a face whose `on` type
+    /// covers the nullable spelling — resolves; `UnsafeSingle` (applicable
+    /// through the non-null projection alone) keeps the unchecked report,
+    /// the same split the member sites encode.
+    fn operator_face_extension_resolved(&mut self, ty: Ty, row: &Row) -> bool {
+        let (read, write) = self.operator_spellings(row);
+        let Ty::Named { name, .. } = ty else {
+            return false;
+        };
+        [read, write].into_iter().flatten().any(|spelling| {
+            spelling == self.intern("==")
+                || matches!(
+                    self.extension_application(name, ty, spelling, false, true),
+                    ExtensionApp::Single
+                )
+        })
+    }
+
+    /// Whether a bare invocation's callee type is function-shaped (the
+    /// #2815 R2a gate — upstream `resolveToBound(receiverType) is
+    /// FunctionTypeImpl`): a nullable function shape (directly or through
+    /// a type-alias fold), the bare `Function` head spelled with `?`, a
+    /// `?`-less parameter whose bound walks to one of those, and `Never?`
+    /// — the question-suffixed Never the oracle corpus pins to the
+    /// function face (`Never? x; x()` reports the function text).
+    fn invoke_callee_function_shaped(&self, ty: Ty) -> bool {
+        let function_name = self.intern("Function");
+        let never_name = self.intern("Never");
+        let mut ty = Some(self.fold_alias_ty(ty));
+        for _ in 0..4 {
+            match ty {
+                Some(Ty::Function { .. }) => return true,
+                Some(Ty::Named {
+                    name,
+                    nullable: true,
+                    ..
+                }) => return name == function_name || name == never_name,
+                Some(Ty::Named {
+                    name,
+                    nullable: false,
+                    ..
+                }) => match self.param_bound_of(name) {
+                    Some(bound) => ty = Some(self.fold_alias_ty(bound)),
+                    None => return false,
+                },
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Emits a type-position row from its push-time verdict snapshot.
@@ -2692,6 +2948,17 @@ impl<'a> Engine<'a> {
                 .chain(crate::member_face::CORE_INTERFACE_MEMBERS.iter())
                 .any(|(head, _)| *head == self.strings.resolve(container))
             && self.is_invalid_ty(Ty::named(container))
+            // A potentially-nullable receiver keeps the member face
+            // (#2815 R1): the scope-parameter and bound probes this bail
+            // reads are parse-time tables — empty at pass 2 — so a `?`-
+            // less parameter spelling or a nullable alias head would read
+            // as an invalid container here. The nullable verdict's own
+            // bound walk (the post-walk captures) decides; its false arm
+            // keeps the InvalidType posture unchanged.
+            && !self.potentially_nullable(match &recv {
+                Receiver::Typed { ty, .. } => *ty,
+                _ => Ty::UNKNOWN,
+            })
         {
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
@@ -2783,7 +3050,30 @@ impl<'a> Engine<'a> {
                         // (the parse-time `record_recv_tys` credit's pass-2
                         // twin — a getter-chained receiver whose face only
                         // this arm re-derives, `prev._value?.copyWith()`).
+                        // A NULLABLE record face dereferences
+                        // unconditionally first (#2815 R1c — a record
+                        // typedef's `?`-suffixed instance reports the
+                        // shared unchecked code at the selector; an
+                        // `Object` member stays exempt).
                         Some(face @ Ty::Record { .. }) => {
+                            if matches!(face, Ty::Record { nullable: true, .. })
+                                && !self.null_aware_members.contains(&row.range.offset)
+                                && !self.members.object_members.contains(&row.name)
+                            {
+                                let name_text = self.strings.resolve(row.name);
+                                self.emit_unchecked_nullable(
+                                    row.range,
+                                    name_text,
+                                    matches!(row.intent, Intent::Invoke),
+                                );
+                                self.record_miss(
+                                    row.name,
+                                    row.range,
+                                    true,
+                                    use_kind_of(&row.intent),
+                                );
+                                return;
+                            }
                             self.credit_record_extension_use(face, row.name, row.range.offset);
                             return;
                         }
@@ -2797,7 +3087,13 @@ impl<'a> Engine<'a> {
                 // side table (`record_recv_tys`) is the only holder of the
                 // face. The shape application credits the declaring
                 // extension's member (the resolution itself stays silent,
-                // matching the oracle's resolved access).
+                // matching the oracle's resolved access). A NULLABLE record
+                // receiver dereferences unconditionally instead (#2815 R1c
+                // — `(int, String)? r; r.foo(0)` reports the shared
+                // unchecked code at the selector: a non-nullable `on (int,
+                // String)` face never applies to the nullable spelling),
+                // an `Object` member excepted (the nullable branch's first
+                // lookup hits it).
                 if !self_named
                     && matches!(
                         row.intent,
@@ -2808,6 +3104,19 @@ impl<'a> Engine<'a> {
                         .iter()
                         .find(|(offset, _)| *offset == row.range.offset)
                 {
+                    if matches!(record, Ty::Record { nullable: true, .. })
+                        && !self.null_aware_members.contains(&row.range.offset)
+                        && !self.members.object_members.contains(&row.name)
+                    {
+                        let name_text = self.strings.resolve(row.name);
+                        self.emit_unchecked_nullable(
+                            row.range,
+                            name_text,
+                            matches!(row.intent, Intent::Invoke),
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
                     self.credit_record_extension_use(record, row.name, row.range.offset);
                     return;
                 }
@@ -3099,6 +3408,32 @@ impl<'a> Engine<'a> {
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
+    /// Whether the read at `offset` names a MEMBER access — a merged
+    /// `receiver.member` read ([`Engine::member_reads`]) or a bare read
+    /// published as [`RefTarget::Member`] (an implicit-this field). The
+    /// promotion-eligibility guard reads it (#2815 R3): the flow layer
+    /// resolves by name and can stage a same-named variable's promotion
+    /// row at a selector span, but a member access's nullability verdict
+    /// reads its own accessor's promotion alone (the promotable-field
+    /// substitution decides eligibility; upstream reads the condition's
+    /// resolved static type through the accessor element, never a shadow
+    /// variable — `bool_expression_verifier.dart:44-73`'s member gate).
+    fn read_offset_is_member(&self, offset: u32) -> bool {
+        if self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&offset))
+            .is_ok()
+        {
+            return true;
+        }
+        self.refs
+            .binary_search_by(|published| published.range.offset.cmp(&offset))
+            .is_ok_and(|at| {
+                self.refs[at].range.offset == offset
+                    && matches!(self.refs[at].target, RefTarget::Member { .. })
+            })
+    }
+
     /// Instance access through a declaration-typed receiver (`this.m`, `c.m`
     /// on a `C c`). A clean walk that misses reports the member family
     /// (`undefined_method`/`_getter`/`_setter` by access intent); a broken
@@ -3165,7 +3500,12 @@ impl<'a> Engine<'a> {
         // over `_DataRecord<ValueT>`): the alias folds to the record the
         // shape application resolves through — no container exists to
         // walk, and the record-extension face owns the access (silent,
-        // the oracle's resolved send).
+        // the oracle's resolved send). A NULLABLE folded record dereferences
+        // unconditionally instead (#2815 R1c — `typedef R = (int, String)?;`
+        // `r.foo(0)` reports the shared unchecked code at the selector
+        // before any extension consult: a non-nullable `on (int, String)`
+        // face never applies to the nullable spelling, the same split the
+        // member sites' `receiver_nullable` gate encodes).
         if let Receiver::Typed { ty, .. } = recv
             && matches!(
                 row.intent,
@@ -3174,6 +3514,19 @@ impl<'a> Engine<'a> {
             && matches!(self.fold_alias_ty(ty), Ty::Record { .. })
         {
             let folded = self.fold_alias_ty(ty);
+            if matches!(folded, Ty::Record { nullable: true, .. })
+                && !self.null_aware_members.contains(&row.range.offset)
+                && !self.members.object_members.contains(&row.name)
+            {
+                let name_text = self.strings.resolve(row.name);
+                self.emit_unchecked_nullable(
+                    row.range,
+                    name_text,
+                    matches!(row.intent, Intent::Invoke),
+                );
+                self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                return;
+            }
             self.credit_record_extension_use(folded, row.name, row.range.offset);
             return;
         }
@@ -3185,7 +3538,8 @@ impl<'a> Engine<'a> {
         // promoted non-null static type, not `C?`).
         let mut receiver_nullable = match &recv {
             Receiver::Typed { ty, .. } => {
-                Self::is_nullable_ty(*ty) && !self.null_aware_members.contains(&row.range.offset)
+                self.potentially_nullable(*ty)
+                    && !self.null_aware_members.contains(&row.range.offset)
             }
             _ => false,
         };
@@ -3245,12 +3599,20 @@ impl<'a> Engine<'a> {
         // promotion to a strictly non-null face, reads a non-null receiver
         // — a `Null` or nullable promoted head (the `== null` branch)
         // keeps the verdict.
+        // A MEMBER access's receiver read never reads this face (#2815
+        // R3): the flow layer resolves by name and can stage a variable
+        // promotion row at a selector span (a getter, a public or non-
+        // final field, an enum-prefixed target — none promotable), but
+        // the oracle reads the accessor's own promotion only
+        // (`isPropertyPromotable`, field_promotability.dart:70-76) — the
+        // promotable-field arm above is the one legitimate stand-down.
         if receiver_nullable
             && let Some(read_span) = self
                 .promoted_recv_reads
                 .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
                 .ok()
                 .map(|index| self.promoted_recv_reads[index].1)
+            && !self.read_offset_is_member(read_span.offset)
             && let Some(promoted) = promotions.promoted(read_span)
             && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
         {
@@ -4448,7 +4810,62 @@ impl<'a> Engine<'a> {
             .map(|(name, members)| (*name, *members));
         let Some((_, members)) = core.or_else(|| symbol_face.then_some(("", &SYMBOL_MEMBERS[..])))
         else {
-            return; // not a known primitive: suppress as before
+            // Not a known primitive — an UNDECIDABLE receiver head (`Never`
+            // through the names-only stub, a `?`-less type-parameter
+            // spelling): the potentially-nullable verdict alone still
+            // reports (#2815 R1 — `type_property_resolver`'s nullable branch
+            // never reaches the member question), the nullability predicate
+            // itself deciding parameter-hood. An applicable extension face
+            // resolves first (the nullable branch's own order — only a
+            // face whose `on` spelling covers the nullable receiver answers
+            // `Single` and suppresses; `UnsafeSingle` keeps the report, the
+            // same split the member sites encode); a merely-unresolvable
+            // name answers `false` in the predicate (the oracle's
+            // InvalidType posture) and keeps the suppression.
+            let app = self.extension_application(
+                container,
+                Ty::named(container),
+                row.name,
+                matches!(row.intent, Intent::Write | Intent::ReadWrite),
+                receiver_nullable,
+            );
+            // An UNNAMED extension's application face rides its own member
+            // map (the pool above carries named declarations only): a hit
+            // resolves the access the same `Single` way.
+            let unnamed_face_resolves = self
+                .unnamed_extension_members()
+                .is_some_and(|members| members.contains_key(&row.name));
+            // A receiver riding a nullable-own-param face's own parameter
+            // (`extension<T> on T?`'s `T`): the member-gated consult above
+            // answers on the ACCESSED member, so a face the receiver's own
+            // type is armed by never shows up for a member it does not
+            // declare. The oracle instantiates the parameter at the
+            // application site and resolves the access against the
+            // instantiation — a question the name level cannot carry — so
+            // the armed face suppresses on the type itself (the same
+            // type-level verdict `extension_application`'s own-param arm
+            // encodes, read here without the member gate).
+            let own_param_armed = receiver_nullable
+                && self.accessible_extension_faces().iter().any(|(face, _)| {
+                    face.on_type_nullable
+                        && face.on_type == Some(container)
+                        && face.type_param_names.contains(&container)
+                });
+            if receiver_nullable
+                && !self.members.object_members.contains(&row.name)
+                && !unnamed_face_resolves
+                && !matches!(app, ExtensionApp::Single)
+                && !own_param_armed
+            {
+                let name_text = self.strings.resolve(row.name);
+                self.emit_unchecked_nullable(
+                    row.range,
+                    name_text,
+                    matches!(row.intent, Intent::Invoke),
+                );
+                self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            }
+            return;
         };
         if resolve_container(
             self.graph,
@@ -4718,13 +5135,15 @@ impl<'a> Engine<'a> {
             return None;
         };
         let (head, receiver_ty, receiver_nullable) = match recv {
-            Receiver::Typed { type_name, ty, .. } => (*type_name, *ty, Self::is_nullable_ty(*ty)),
+            Receiver::Typed { type_name, ty, .. } => {
+                (*type_name, *ty, self.potentially_nullable(*ty))
+            }
             Receiver::This { container, kind } => {
                 let ty = self.this_static_ty(*container, *kind);
                 let Ty::Named { name, .. } = ty else {
                     return None;
                 };
-                (name, ty, Self::is_nullable_ty(ty))
+                (name, ty, self.potentially_nullable(ty))
             }
             Receiver::Created {
                 name,

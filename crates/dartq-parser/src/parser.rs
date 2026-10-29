@@ -182,6 +182,13 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// (analyzer `error_verifier` `_checkForExtensionTypeRepresentationErrorCodes`,
     /// error_verifier.dart:5356-5460).
     pub(crate) rep_field_check: Option<RepFieldCheck>,
+    /// The token after an extension type's name, captured before the type
+    /// parameters parse: the no-representation face anchors the verifier's
+    /// synthesized empty formal list here (`insertParens` places the
+    /// synthetic `()` at `name.next.charOffset`, zero length). Set by the
+    /// extension-type declaration parser for the duration of its
+    /// primary-constructor step only.
+    pub(crate) ext_type_name_next: Option<TokenSpan>,
     /// UTF-16 offset from which the enclosing statement loop drains the
     /// spill run of a primary bracket error. Set when a closer adopted by
     /// [`crate::recovery`] is the scanner's synthetic for an unmatched
@@ -206,7 +213,15 @@ pub(crate) struct RepFieldCheck {
     pub(crate) comma_after_first: Option<TokenSpan>,
     pub(crate) delimiter: Option<TokenSpan>,
     pub(crate) modifier: Option<TokenSpan>,
-    pub(crate) this_or_super: bool,
+    /// The first formal's `this`/`super` keyword: the representation-field
+    /// face anchors on the keyword itself
+    /// (`_checkForExtensionTypeRepresentationErrorCodes`,
+    /// error_verifier.dart:5384-5393).
+    pub(crate) this_or_super: Option<TokenSpan>,
+    /// The first formal's begin token, metadata-excluded: the
+    /// function-typed arm anchors `expectedRepresentationField` on
+    /// `inner.beginToken` (`error_verifier.dart:5433-5439`).
+    pub(crate) first_begin: Option<TokenSpan>,
     pub(crate) fn_typed: bool,
     pub(crate) has_type: bool,
 }
@@ -250,6 +265,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             last_parameter_count: 0,
             synthetic_formals: false,
             rep_field_check: None,
+            ext_type_name_next: None,
             spill_after: None,
             spill_scan_floor: 0,
         }
@@ -601,6 +617,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             last_parameter_count: self.last_parameter_count,
             synthetic_formals: self.synthetic_formals,
             rep_field_check: None,
+            ext_type_name_next: None,
             spill_after: self.spill_after,
             spill_scan_floor: self.spill_scan_floor,
         }

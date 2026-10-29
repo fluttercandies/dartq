@@ -1679,7 +1679,15 @@ fn collection_elements(c: &Check<'_>, literal: u32) -> Vec<Vec<u32>> {
         return Vec::new();
     }
     // The separator commas: a `,` token inside the literal's run covered
-    // by no piece row.
+    // by no piece row. Coverage is strict-interior only — the bare-send
+    // follower faces sit ON the comma rather than around it (the
+    // send-leaf span contract: a bare-name `Send` leaf's span extends
+    // through its unconsumed follower token, the element comma when the
+    // next element follows directly, and the `NoTypeArguments` leaf fired
+    // at that same follower anchors exactly on it), so a row ending
+    // exactly at the comma is the follower, never content. An interior
+    // comma (a nested literal's, a call's) sits strictly inside its
+    // root's span. The comma still separates (`[j, 1]` is two segments).
     let tokens = c.unit.ast.token_range(literal);
     let mut separators = Vec::new();
     for token in tokens.start..tokens.end {
@@ -1689,32 +1697,52 @@ fn collection_elements(c: &Check<'_>, literal: u32) -> Vec<Vec<u32>> {
         let comma = crate::rules::byte_span_of_token(c, token);
         let covered = rows.iter().any(|&row| {
             let piece = c.byte_span(row);
-            piece.start <= comma.start && comma.end <= piece.end
+            piece.start <= comma.start && comma.end < piece.end
         });
         if !covered {
-            separators.push(comma.start);
+            separators.push(comma);
         }
     }
     // Group: a separator between the running segment end and the next
     // row's start splits the run (row ids ascend per element — a piece
-    // contained in an earlier row's span never trips the boundary).
+    // contained in an earlier row's span never trips the boundary). No row
+    // strictly contains a separator (uncovered by the scan above), so the
+    // rows sitting ON one — the extension `Send` ends exactly at it, the
+    // `NoTypeArguments` leaf starts exactly at it — join the segment (the
+    // tear-off group reads them) without extending its content end past
+    // the separator. A zero-width row (the follower-anchored
+    // `NoArguments` sentinel) is likewise never content: it joins the
+    // open segment without opening one or extending its end.
     let mut elements = Vec::new();
     let mut current: Vec<u32> = Vec::new();
     let mut end = 0usize;
     for row in rows {
         let piece = c.byte_span(row);
+        if piece.is_empty() {
+            if !current.is_empty() {
+                current.push(row);
+            }
+            continue;
+        }
         if !current.is_empty()
             && separators
                 .iter()
-                .any(|&sep| end <= sep && sep < piece.start)
+                .any(|sep| end <= sep.start && sep.start < piece.start)
         {
             elements.push(core::mem::take(&mut current));
             end = 0;
         }
-        end = end.max(piece.end);
+        if !separators
+            .iter()
+            .any(|sep| sep.start == piece.start || sep.end == piece.end)
+        {
+            end = end.max(piece.end);
+        }
         current.push(row);
     }
-    elements.push(current);
+    if !current.is_empty() {
+        elements.push(current);
+    }
     elements
 }
 

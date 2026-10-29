@@ -62,13 +62,26 @@ pub(super) struct RigImport<'a> {
 /// Diagnoses `source` with the resolved-type snapshot mounted and no
 /// prelude — the fixture declares every member-bearing class it names.
 pub(super) fn report_ops_bare(source: &str) -> FileReport {
-    report_ops_with(source, &[])
+    report_ops_with(source, &[], None)
 }
 
 /// [`report_ops`] with `imports` mounted as sibling libraries the main
 /// unit imports (prefixed or plain); the prelude rides the main unit.
 pub(super) fn report_ops_imports(source: &str, imports: &[RigImport<'_>]) -> FileReport {
-    report_ops_with(&format!("{CORE_PRELUDE}{source}"), imports)
+    report_ops_with(&format!("{CORE_PRELUDE}{source}"), imports, None)
+}
+
+/// [`report_ops`] with the analyzed library's `wildcard-variables` posture
+/// pinned (the engine's per-library feature channel,
+/// [`LibraryClassModifiers::insert_wildcards`]): `false` models a pre-3.7
+/// library (`// @dart = 3.4`), where a lone `_` is an ordinary name, not a
+/// wildcard.
+pub(super) fn report_ops_wildcards(source: &str, wildcard_variables: bool) -> FileReport {
+    report_ops_with(
+        &format!("{CORE_PRELUDE}{source}"),
+        &[],
+        Some(wildcard_variables),
+    )
 }
 
 fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::ScanResult {
@@ -87,7 +100,7 @@ fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::Scan
     scanned
 }
 
-fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
+fn report_ops_with(source: &str, imports: &[RigImport<'_>], wildcards: Option<bool>) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
@@ -188,6 +201,10 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
     let types =
         LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
     let ops = ResolvedTypeOps::new(&types, &strings, file);
+    let mut class_modifiers = LibraryClassModifiers::default();
+    if let Some(wildcard_variables) = wildcards {
+        class_modifiers.insert_wildcards(lib, wildcard_variables);
+    }
     let fold = fold_unit_with_ops(
         source,
         &scanned.tokens,
@@ -199,7 +216,7 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
         &namespaces,
         &index,
         StrictModes::default(),
-        &LibraryClassModifiers::default(),
+        &class_modifiers,
         set.is_enabled(Feature::InferenceUpdate2),
         Some(&ops),
     );

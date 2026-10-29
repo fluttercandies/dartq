@@ -3062,7 +3062,11 @@ mod pins {
     /// #2189-a identity guard: a later sibling switch at the same stack
     /// depth is never the declaring switch — its arm's read of the same
     /// name binds the OUTER declaration, and the first switch's arm
-    /// variable keeps only its own arm's use. No row on either.
+    /// variable keeps only its own arm's use. No row on either `e`. The
+    /// second switch's own binder `z` is never read and reports
+    /// individually (#2805: a case-header binder exempts only same-name
+    /// siblings of its switch — the first arm's used `e` no longer spares
+    /// it, the official per-binder `visitDeclaredVariablePattern` rule).
     #[test]
     fn later_sibling_switch_does_not_revive_the_arm_binding() {
         let source = "class B {\n\
@@ -3082,7 +3086,8 @@ mod pins {
                       \x20 sink(x);\n\
                       \x20 sink(y);\n\
                       }\n";
-        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+        let z = source.find("var z").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(source), vec![(z, 1)], "{source:?}");
     }
 
     /// The `unused_field` rows of `report`, as (offset, name-token length)

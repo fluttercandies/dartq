@@ -1,5 +1,100 @@
 use super::*;
 
+/// The frame-local function tear-off capture a bare read resolves to
+/// (#2852), innermost frame first: a frame whose `local_fn_sigs` holds the
+/// name answers the #2842 capture (joined at the declaring frame's close),
+/// and a plain local of the same spelling shadows every outer one — the
+/// read is that local's own value, the flow's own scope resolution answers
+/// it, never a staged row. The listener-side mirror of the capture walk:
+/// the frame stack is listener-visible, so the resolution needs no
+/// engine-side seam.
+fn local_fn_tear_off_sig(engine: &Engine<'_>, name: StringId) -> Option<super::types::FnVarSig> {
+    for frame in engine.frames.iter().rev() {
+        if let Some(sig) = frame.local_fn_sigs.get(&name) {
+            return Some((**sig).clone());
+        }
+        if frame.locals.contains(&name) {
+            return None;
+        }
+    }
+    None
+}
+
+/// The relational pattern's nullable-matched verdict (#2843). The matched
+/// type is the open switch's scrutinee exactly when every frame above the
+/// root is a logical-or/and operand (`PatternFrame::binary` — the operands
+/// keep the scrutinee as their matched type); record, list, map, and
+/// object field frames carry property columns the name level never
+/// descends into, and a pattern under one stays silent (the under-report
+/// direction). `==`/`!=` never report: both spell `operator ==`, which
+/// every type resolves on `Object` (type_property_resolver.dart's
+/// Object-lookup arm). An applicable extension operator resolves the read
+/// silent (the `operator >`-on-`int?` pin); an `on int` face under a
+/// nullable receiver is the oracle's not-applicable arm for the pattern
+/// face (`int?` is not a subtype of `int`) — the read stays unchecked, the
+/// `UnsafeSingle` verdict. The row anchors at the operator token, its
+/// length the lexeme's own width.
+impl DiagnoseListener<'_> {
+    fn check_relational_pattern_nullable(&mut self, operator: Token) {
+        let engine = &mut self.engine;
+        if !engine
+            .switch
+            .pattern_stack
+            .iter()
+            .skip(1)
+            .all(|frame| frame.binary.is_some())
+        {
+            return;
+        }
+        let scrutinee = engine
+            .switch
+            .switches
+            .last()
+            .map_or(Ty::Unknown, |ctx| ctx.scrutinee);
+        if !engine.potentially_nullable(scrutinee) {
+            return;
+        }
+        let Some(op_text) = engine.text_of(operator) else {
+            return;
+        };
+        if op_text == "==" || op_text == "!=" {
+            return;
+        }
+        // The extension walk runs on the alias-folded face: `typedef A =
+        // int?` reaches `int`'s extensions through `int`, never through
+        // the alias spelling. A record/function/unknown face keeps the
+        // under-report posture.
+        let face = engine.fold_alias_ty(scrutinee);
+        let Ty::Named { name, .. } = face else {
+            return;
+        };
+        let op_id = engine.intern(op_text);
+        if !matches!(
+            engine.extension_application(name, face, op_id, false, true),
+            ExtensionApp::None | ExtensionApp::UnsafeSingle,
+        ) {
+            return;
+        }
+        // The operator-face rendering (messages.yaml
+        // `uncheckedOperatorInvocationOfNullableValue`, the shared
+        // `unchecked_use_of_nullable_value` name): the exact oracle text,
+        // built at the site — the shared helper renders the
+        // property/method variants only.
+        let code = SemanticCode::UncheckedUseOfNullableValue;
+        engine.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            format!(
+                "The operator '{op_text}' can't be unconditionally invoked \
+                 because the receiver can be 'null'."
+            ),
+            engine.file,
+            operator.range,
+            Some("Try adding a null check to the target ('!').".to_string()),
+        ));
+    }
+}
+
 impl ParserListener for DiagnoseListener<'_> {
     // —— frames: containers ——————————————————————————————————————————
 
@@ -706,6 +801,27 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.armed_ty_unresolved = false;
             }
         }
+        // The written record type's extent: `(` through the matching `)`
+        // (the parser guarantees the closer, real or recovery-synthetic),
+        // extended by the trailing `?` when it belongs to the type — the
+        // same bracket end the is-check verdict's span takes (`(1, 2) is
+        // (int, int)` ends at the type's `)`).
+        let closer_end = question.map_or_else(
+            || {
+                engine
+                    .tokens
+                    .matching_end(left_paren.id as usize)
+                    .and_then(|close| engine.tokens.get(close))
+                    .map_or(left_paren.range.end(), |t| {
+                        engine.utf16_of((t.byte_offset + t.byte_len) as usize)
+                    })
+            },
+            |q| q.range.end(),
+        );
+        engine.written_ty_span = Some(SourceRange {
+            offset: left_paren.range.offset,
+            length: closer_end - left_paren.range.offset,
+        });
     }
 
     fn begin_record_type_entry(&mut self, _first: Token) {
@@ -803,7 +919,7 @@ impl ParserListener for DiagnoseListener<'_> {
         &mut self,
         count: usize,
         _begin: Token,
-        _end: Token,
+        end: Token,
         kind: dartq_parser::MemberKind,
     ) {
         self.engine.var_formal_region_end();
@@ -823,6 +939,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // method's own formals close (defaults-window closures predate it).
         if kind == dartq_parser::MemberKind::GeneralizedFunctionType {
             engine.fn_type_formal_lists = engine.fn_type_formal_lists.saturating_sub(1);
+            // The written function type's formals closed — the closer is
+            // the type's own end when no `?` follows (`end_function_type`
+            // carries the keyword and the `?`, never this paren). The
+            // event always fires for the same production immediately
+            // before `end_function_type`, inner lists before outer, so
+            // the latch pairs one-to-one.
+            engine.fn_formal_closer_end = Some(end.range.end());
         }
         engine.arm_no_such_method();
         // The `==` question adjudicates at the outermost list's close.
@@ -1331,11 +1454,15 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.pop_frame();
         engine.finish_local_fn_site();
         // An `_`-named local function is dead code over the whole
-        // declaration, used or not (DeadCodeVerifier's
-        // visitFunctionDeclaration, dead_code_verifier.dart:72-82 — the
-        // wildcard-variables posture).
+        // declaration, used or not — but only with the wildcard-variables
+        // feature enabled for the library (DeadCodeVerifier's
+        // visitFunctionDeclaration, dead_code_verifier.dart:72-82: the
+        // `_wildCardVariablesEnabled` gate over `library.featureSet`; a
+        // `// @dart = 3.4` file treats `_` as an ordinary name and stays
+        // silent — the preWildcards census rows).
         if let Some((start, wildcard)) = engine.local_fn_wildcard.pop()
             && wildcard
+            && engine.class_modifiers.wildcards_enabled(engine.lib)
         {
             let range = SourceRange {
                 offset: start,
@@ -1512,6 +1639,26 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         self.flow()
             .handle_for_in_loop_parts(await_kw, for_kw, left_paren, pattern_keyword, in_kw);
+
+        // The pattern-head form's binders (#2858): `for (var (a, b) in xs)`
+        // parses its head as a bare pattern — no `PatternVariableDeclaration`
+        // wrapper — so the official verifier visits each binder individually
+        // (unused_local_elements_verifier.dart:565-579), never the
+        // all-or-nothing window the registration opened. `pattern_keyword`
+        // is the only event naming the head a pattern one (it arrives after
+        // the pattern: the `in` disambiguates the head), and the head's rows
+        // are the only tracked rows above the loop frame's mark — a closure
+        // in the iterable truncated its own rows at its frame pop. The
+        // window dies with the head: a body declaration opens its own.
+        if pattern_keyword.is_some() {
+            let engine = &mut self.engine;
+            if let Some(&lo) = engine.frame_local_marks.last() {
+                for index in lo..engine.locals.len() {
+                    engine.convert_window_binder_to_site(index);
+                }
+            }
+            engine.pattern_group_open = None;
+        }
 
         // No frame opens here: the loop variable's declaration events fire
         // BEFORE this event (the parser detects the `in` while parsing the
@@ -2216,6 +2363,82 @@ impl ParserListener for DiagnoseListener<'_> {
                                 );
                             }
                         }
+                    } else if let Some(sig) = local_fn_tear_off_sig(engine, name) {
+                        // The container-less bare read's LOCAL tear-off face
+                        // (the #2852 sibling): a frame-local function the
+                        // read resolves to stages its OWN spelling at the
+                        // read's offset — the same channel the top-level arm
+                        // below rides, with the shape registered fold-time
+                        // beside the adapter (`map_name`'s final-miss arm
+                        // resolves it; the element model carries no local
+                        // declarations, so the snapshot's build-time walk
+                        // cannot see one). The capture is the #2842
+                        // product: a read before the declaration's frame
+                        // close or a refused capture (generic, named
+                        // formals, async/generator) finds nothing and keeps
+                        // the unknown face, and a plain local variable's
+                        // read answers through the flow's own scope first
+                        // (it never consults the staged row — the walk
+                        // above refuses it too). Registration gates
+                        // staging: a signature whose columns map nowhere
+                        // stays unstaged, since an unregistered staged
+                        // name would read `Invalid`'s vacuous arm at the
+                        // fold — a false dead branch.
+                        let pool = engine.boundary.args.borrow();
+                        let staged = engine.ops.is_some_and(|ops| {
+                            ops.register_local_fn_shape(
+                                name,
+                                sig.return_ty,
+                                &sig.positional,
+                                &sig.named,
+                                sig.required_positional,
+                                &pool,
+                            )
+                        });
+                        drop(pool);
+                        if staged {
+                            let lexeme = engine.strings.resolve(name).to_string();
+                            let base = self.flow().intern_name(&lexeme);
+                            self.flow().stage_this_member_type(
+                                token.range.offset,
+                                FlowTy {
+                                    base: FlowBase::Name(base),
+                                    nullable: false,
+                                },
+                            );
+                        }
+                    } else if let Some(decl) = engine.top_level_decl(name)
+                        && decl.kind == MicroKind::TopLevelFn
+                        && decl.formals.is_some()
+                        && decl.type_params == 0
+                    {
+                        // The container-less bare read's tear-off face
+                        // (the #2835 sibling): a top-level function the
+                        // scope resolves stages its OWN spelling at the
+                        // read's offset — the resolved snapshot's
+                        // `fn_shapes` is what the spelling folds through
+                        // (`map_name` answers the declared signature), so
+                        // the operand rides the flow's existing is-test
+                        // consumer honestly (a matching alias pair folds
+                        // constant, a non-matching one stays live). The
+                        // gate admits only the tear-off shape the
+                        // name-level lattice cannot spell: a local or a
+                        // top-level variable's read answers through the
+                        // flow's own resolution first (it never consults
+                        // the staged row), and a getter's read is its
+                        // return type, never a tear-off. A generic
+                        // function's tear-off instantiates to bounds the
+                        // snapshot does not register, so it keeps the
+                        // unknown face.
+                        let lexeme = engine.strings.resolve(name).to_string();
+                        let base = self.flow().intern_name(&lexeme);
+                        self.flow().stage_this_member_type(
+                            token.range.offset,
+                            FlowTy {
+                                base: FlowBase::Name(base),
+                                nullable: false,
+                            },
+                        );
                     }
                 }
             }
@@ -2374,6 +2597,16 @@ impl ParserListener for DiagnoseListener<'_> {
                                 table.positional.push(sig);
                             }
                         }
+                    } else {
+                        // The alias-instantiated claim (#2849): a written
+                        // parameterized function-RHS alias annotation
+                        // (`F<int>`) binds the same stash entry its
+                        // instantiated function type would — the element
+                        // model's resolved annotation type, bounds
+                        // substituted (upstream Dart SDK source,
+                        // pkg/analyzer/lib/src/dart/resolver/
+                        // named_type_resolver.dart `_instantiateElement`).
+                        engine.stash_alias_instantiated_formal(name);
                     }
                     let type_level =
                         engine.fn_type_formal_lists > 0 || engine.formal_list_depth > 1;
@@ -3526,7 +3759,20 @@ impl ParserListener for DiagnoseListener<'_> {
                     })
                     .unwrap_or_else(|| end.range.end())
             });
-        engine.merge_member(is_null_aware, token.range, chain_end);
+        // A named selector is Identifier- or keyword-lexeme shaped; the
+        // recovery folds (`?.{`) produce a literal token there instead.
+        let member_ident = engine
+            .tokens
+            .get(token.id as usize + 1)
+            .is_some_and(|member| {
+                matches!(
+                    member.kind,
+                    dartq_scanner::TokenKind::Identifier
+                        | dartq_scanner::TokenKind::Keyword(_)
+                        | dartq_scanner::TokenKind::OpenSquare
+                )
+            });
+        engine.merge_member(is_null_aware, token.range, chain_end, member_ident);
         // The explicit-receiver member read's declared face stages for the
         // flow's member-access fold (the implicit-this stage's sibling):
         // the name-level fold cannot walk the receiver's members, so a
@@ -3602,7 +3848,18 @@ impl ParserListener for DiagnoseListener<'_> {
                     })
                     .unwrap_or_else(|| end.range.end())
             });
-        engine.merge_member(is_null_aware, operator.range, chain_end);
+        let member_ident = engine
+            .tokens
+            .get(operator.id as usize + 1)
+            .is_some_and(|member| {
+                matches!(
+                    member.kind,
+                    dartq_scanner::TokenKind::Identifier
+                        | dartq_scanner::TokenKind::Keyword(_)
+                        | dartq_scanner::TokenKind::OpenSquare
+                )
+            });
+        engine.merge_member(is_null_aware, operator.range, chain_end, member_ident);
         // The merged row is the section's selector: its discarded value
         // reports at this token even when the target's type is unknown to
         // the model (the official walk answers on the section node).
@@ -3993,6 +4250,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.const_capture.assignment(operator.range);
         engine.mark_assignment(operator);
         engine.check_assignment(operator);
+        engine.cancel_dead_chains_on_write(operator);
         engine.check_dead_null_assignment(operator);
         engine.nsm_poison();
     }
@@ -4376,6 +4634,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // not stand in as the operand, and the span anchors at the
         // keyword.
         let keyword_operand = engine.keyword_operand_ty(is_operator.range.offset);
+        // The literal faces push the operand's row at the closing bracket;
+        // the oracle's `.at(node)` anchors at the node offset — the
+        // opening bracket. Consumed here: any face's write survives only
+        // until the first verdict reads it, and a row at another offset
+        // (a member access over the group, a bare read) never matches.
+        let literal_open = engine.literal_row_open.take();
         let type_end = |mut end: u32| -> u32 {
             if let Some(span) = engine.armed_ty_span
                 && span.offset >= is_operator.range.end()
@@ -4387,6 +4651,20 @@ impl ParserListener for DiagnoseListener<'_> {
                 && args_end > is_operator.range.end()
             {
                 end = args_end;
+            }
+            // The written bracket type's own end — a function type's
+            // trailing formal list (`void Function(int, [List<T>])
+            // Function(int x)` ends at the outer formals' `)`, the armed
+            // slot stops at the last formal's head token) or a record
+            // type's closer (`(int, int)`): the TypeAnnotation's endToken,
+            // the same extent the oracle's `.at(node)` span takes. The
+            // enclosing call's paren never enters — the slot ends at the
+            // type production's own closer.
+            if let Some(span) = engine.written_ty_span
+                && span.offset >= is_operator.range.end()
+                && span.end() > end
+            {
+                end = span.end();
             }
             end
         };
@@ -4400,10 +4678,13 @@ impl ParserListener for DiagnoseListener<'_> {
                 .unwrap_or(range)
         } else {
             engine.operand_row().map_or(is_operator.range, |row| {
+                let start = literal_open
+                    .filter(|&(close, _)| close == row.range.offset)
+                    .map_or(row.range.offset, |(_, open)| open);
                 let end = type_end(row.range.end());
                 SourceRange {
-                    offset: row.range.offset,
-                    length: end - row.range.offset,
+                    offset: start,
+                    length: end - start,
                 }
             })
         };
@@ -5380,10 +5661,23 @@ impl ParserListener for DiagnoseListener<'_> {
                 if Engine::is_nullable_ty(ty) {
                     // The `c1?[0]` dead-chain candidate: a null-aware index
                     // over a local's nullable read, resolved at teardown
-                    // (`_verifyUnassignedVariable`'s index face).
-                    engine
-                        .dead_null_chains
-                        .push((question_range.offset, close.range.end(), recv));
+                    // (`_verifyUnassignedVariable`'s index face). The root
+                    // kind fixes the verifier face: a plain `?[`/`?.[` answers
+                    // `verifyReceiverIndexExpression`'s climb, a `?..[`
+                    // cascade section answers `verifyCascadeExpression`'s
+                    // bare-body gate.
+                    let chain_kind = if question.is_some() {
+                        crate::diagnose::types::DeadChainKind::Index
+                    } else {
+                        crate::diagnose::types::DeadChainKind::CascadeIndex
+                    };
+                    engine.dead_null_chains.push((
+                        question_range.offset,
+                        close.range.end(),
+                        recv,
+                        chain_kind,
+                        false,
+                    ));
                 }
             }
         }
@@ -5644,8 +5938,8 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
-    fn end_binary_pattern(&mut self, operator: Token) {
-        self.flow().end_binary_pattern(operator);
+    fn end_binary_pattern(&mut self, operator: Token, end: Token) {
+        self.flow().end_binary_pattern(operator, end);
     }
 
     fn handle_cast_pattern(&mut self, operator: Token) {
@@ -5748,6 +6042,13 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_relational_pattern(&mut self, operator: Token) {
+        // The nullable-matched gate (#2843): `case > 0` / `case < y` over a
+        // nullable matched value reports the shared unchecked code — the
+        // relational arm of the official member resolution
+        // (resolver.dart `resolveRelationalPatternOperator` feeds
+        // `typePropertyResolver.resolve` with the matched type as the
+        // receiver, `propertyErrorEntity: node.operator`).
+        self.check_relational_pattern_nullable(operator);
         // The shape's failure arm joins the flow's unmatched chain — a
         // top-level `case == 5`/`case > 0` can fail, so the code after an
         // if-case stays live (flow_analysis.dart's pattern dispatch).
@@ -6096,6 +6397,55 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         }
         engine.close_object_fields(head, &fields);
+        // The nullable-matched head's field reads (#2843): the object
+        // pattern resolves each getter on the head's OWN required type
+        // (type_analyzer.dart `analyzeObjectPattern` →
+        // `resolveObjectPatternPropertyGet`, `receiverType: requiredType`)
+        // — a typedef-aliased or bound-nullable head (`typedef A = int?`,
+        // `T extends int?`) reads every field over a potentially-nullable
+        // receiver and reports the shared unchecked code at the pattern's
+        // type name (`propertyErrorEntity: objectPattern.type`, the span
+        // `p.Type` covers when the head is prefixed). The nullable arm's
+        // silence set: `Object` members and `==` resolve, an applicable
+        // extension face resolves (`on int?` twins win the nullable
+        // bucket) — a found getter never pairs with `undefined_getter`
+        // (the arm's `_reportedGetterError`), and the head's own members
+        // never answer a nullable receiver, so the member walk stays out.
+        // An `on int` face under the nullable receiver is the oracle's
+        // not-applicable arm (`int?` is not a subtype of `int`) — the
+        // `UnsafeSingle` verdict reports.
+        if let Some(head) = head {
+            let face = engine.fold_alias_ty(Ty::named(head));
+            if engine.potentially_nullable(face)
+                && let Ty::Named {
+                    name: face_name, ..
+                } = face
+            {
+                let eq = engine.intern("==");
+                let ty_end = second_identifier
+                    .map_or(first_identifier.range.end(), |token| token.range.end());
+                let ty_span = SourceRange {
+                    offset: first_identifier.range.offset,
+                    length: ty_end - first_identifier.range.offset,
+                };
+                for field in &fields {
+                    let Some((getter, _)) = field.getter else {
+                        continue;
+                    };
+                    if getter == eq || engine.members.object_members.contains(&getter) {
+                        continue;
+                    }
+                    if !matches!(
+                        engine.extension_application(face_name, face, getter, false, true),
+                        ExtensionApp::None | ExtensionApp::UnsafeSingle,
+                    ) {
+                        continue;
+                    }
+                    let name_text = engine.strings.resolve(getter).to_string();
+                    engine.emit_unchecked_nullable(ty_span, &name_text, false);
+                }
+            }
+        }
         // An object pattern's fields are member reads, not record slots.
         engine.pattern_bind_dirty = true;
         // The bound variables' flow slots take the same declared face
@@ -6197,20 +6547,33 @@ impl ParserListener for DiagnoseListener<'_> {
         // only under-report undefined-name, never false-positive). The
         // usage cluster tracks it as a pattern variable: the enclosing
         // `PatternVariableDeclaration` group reports all-or-nothing.
+        //
+        // An assignment-pattern binder (`(a, b) = …`) declares nothing
+        // (#2858): every variable pattern there refers to an existing
+        // local, the official verifier creates no element for it, and the
+        // write never counts as a use (the verifier's write arm skips
+        // `LocalVariableElement`) — so the usage cluster registers no row:
+        // reads after the assignment credit the original declarations, the
+        // write spares nothing. The shadow record still fires (the typed
+        // binder's declared-type write reverts at the case-member close),
+        // and the type/exhaustiveness faces below are binder-shape faces,
+        // not declaration faces.
         if let Some(name) = engine.name_of(variable) {
             engine.last_pattern_variable = Some((name, variable.range));
-            // A binder in an if-case condition that shadows an outer
-            // tracked local retires with its case scope: a read after the
-            // statement counts for the outer declaration
-            // (`T? e; if (x case C(:var e)) {...} print(e);`).
-            let shadows_local = engine.cond_mark.is_some()
-                && engine.cond_case
-                && engine.resolve_local(name).is_some();
             engine.note_pattern_shadow(name);
-            engine.add_tracked_local(name, variable.range, LocalKind::PatternVariable);
-            if shadows_local {
-                let index = engine.locals.len() - 1;
-                engine.note_pattern_binder(index, variable.range.offset);
+            if !in_assignment_pattern {
+                // A binder in an if-case condition that shadows an outer
+                // tracked local retires with its case scope: a read after the
+                // statement counts for the outer declaration
+                // (`T? e; if (x case C(:var e)) {...} print(e);`).
+                let shadows_local = engine.cond_mark.is_some()
+                    && engine.cond_case
+                    && engine.resolve_local(name).is_some();
+                engine.add_tracked_local(name, variable.range, LocalKind::PatternVariable);
+                if shadows_local {
+                    let index = engine.locals.len() - 1;
+                    engine.note_pattern_binder(index, variable.range.offset);
+                }
             }
             // The DeclaredVariable kind of `checkPatternNeverMatchesValueType`
             // (type_analyzer.dart:723-756) reads the still-armed declared
@@ -6504,9 +6867,6 @@ impl ParserListener for DiagnoseListener<'_> {
         };
         if let Some(token) = default_kw {
             ctx.default_kw = Some(token.range);
-            if ctx.default_pos.is_none() {
-                ctx.default_pos = Some(ctx.cases.len());
-            }
         }
         // Only a case-headed member owns the last captured case; a
         // `default` member pushes no case, and its body must not ride the
@@ -7146,6 +7506,11 @@ impl ParserListener for DiagnoseListener<'_> {
             .untyped_literals
             .insert(right.range.offset, UntypedLiteral::List);
         engine.push_value_row(right);
+        // The row sits at the `]` — the is-check verdict anchors the
+        // literal operand at the literal's own `[` (the ListLiteral's
+        // node offset). A typed literal's row already spans the whole
+        // literal and took the early return above.
+        engine.literal_row_open = Some((right.range.offset, left.range.offset));
     }
 
     fn begin_literal_set_or_map(&mut self, _left: Token, const_keyword: Option<Token>) {
@@ -7255,6 +7620,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // shape stays opaque (a recovery shape the oracle
                     // itself types `dynamic`).
                     engine.push_value_row(right);
+                    engine.literal_row_open = Some((right.range.offset, left.range.offset));
                     return;
                 }
             };
@@ -7297,6 +7663,11 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.check_map_literal_entries(left, right, k, v);
         }
         engine.push_value_row(right);
+        // The row sits at the `}` — the is-check verdict anchors the
+        // literal operand at the literal's own `{` (the node offset). A
+        // typed literal's row already spans the whole literal and took
+        // the early return above.
+        engine.literal_row_open = Some((right.range.offset, left.range.offset));
     }
 
     fn handle_literal_map_entry(
@@ -7371,6 +7742,13 @@ impl ParserListener for DiagnoseListener<'_> {
             write_op: None,
             ty: inner_ty,
         });
+        // The row sits at the `)` — the is-check verdict anchors the
+        // parenthesized operand at its `(` (the oracle's `.at(node)`,
+        // the ParenthesizedExpression's own offset). A recovery shape
+        // with no open bracket keeps the opaque face.
+        if open_offset != u32::MAX {
+            engine.literal_row_open = Some((token.range.offset, open_offset));
+        }
         engine.const_capture.parenthesized_end();
     }
 
@@ -7402,6 +7780,14 @@ impl ParserListener for DiagnoseListener<'_> {
         // per `(`); leaving it would misattribute a nested literal's labels
         // to its parent.
         let names: Vec<StringId> = engine.record_literal_names.pop().unwrap_or_default();
+        // Peeked before `record_field_tys` pops the window: the literal's
+        // own `(`, the anchor the is-check verdict reads when this row
+        // becomes an operand (the oracle's `.at(node)` sits at the
+        // RecordLiteral's offset, not its `)`).
+        let open_offset = engine
+            .record_marks
+            .last()
+            .map_or(u32::MAX, |(_, open)| open.range.offset);
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
             let failed = engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
             let payload = engine.record_payload(&fields, &names);
@@ -7437,6 +7823,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.push_record_row(token, positional, named);
             }
             None => engine.push_value_row(token),
+        }
+        if open_offset != u32::MAX {
+            engine.literal_row_open = Some((token.range.offset, open_offset));
         }
     }
 
@@ -8265,6 +8654,38 @@ impl ParserListener for DiagnoseListener<'_> {
                     },
                     Vec::new(),
                 );
+            } else if !self.engine.formal_has_default
+                && member_kind == dartq_parser::MemberKind::PrimaryConstructor
+                && matches!(
+                    self.engine.container_context(),
+                    Some((_, ContainerKind::ExtensionType))
+                )
+            {
+                // The #2843 extension-type face: an untyped representation
+                // formal reads `Object?` — the implicit final representation
+                // field's declared type (the same face the collector's member
+                // entry carries) — so the primary constructor body's reads of
+                // the formal run the nullable walk. The body sits after the
+                // formal's close, so the rebind here precedes every read; a
+                // default value keeps the dynamic posture, mirroring the
+                // collector's face.
+                if let Some(name_id) = self.engine.name_of(name) {
+                    let object_ty = Ty::Named {
+                        name: self.engine.intern("Object"),
+                        nullable: true,
+                        args: ArgListId::EMPTY,
+                    };
+                    self.engine.bind_var_type(name_id, object_ty);
+                }
+                let base = self.flow().intern_name("Object");
+                self.flow().stage_inferred_local(
+                    name.range.offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable: true,
+                    },
+                    Vec::new(),
+                );
             }
         }
         self.flow().end_formal_parameter(
@@ -8645,6 +9066,26 @@ impl ParserListener for DiagnoseListener<'_> {
         // expands nullable); a nested function-typed formal's close is
         // not the RHS's own and leaves the latch alone.
         self.engine.bounds.alias_rhs_question(question.is_some());
+        // The written extent's true end: the trailing `?` when it belongs
+        // to this starter, else the formals' closing paren the formal
+        // latch carries. The pass-2 walk fires innermost-first, so the
+        // outer type's close lands last and the slot holds the full
+        // written shape (`void Function(int, [List<T>]) Function(int x)`
+        // ends at the outer formals' `)`).
+        let engine = &mut self.engine;
+        let written_end = question.map_or_else(
+            || {
+                engine
+                    .fn_formal_closer_end
+                    .take()
+                    .unwrap_or(function.range.end())
+            },
+            |q| q.range.end(),
+        );
+        engine.written_ty_span = Some(SourceRange {
+            offset: function.range.offset,
+            length: written_end - function.range.offset,
+        });
     }
 
     fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
@@ -8756,15 +9197,19 @@ impl ParserListener for DiagnoseListener<'_> {
         // An assigned-variable pattern is a reference: the pattern
         // assignment resolves the name through the enclosing scope, and a
         // miss is the oracle's `undefined_identifier` at the name
-        // (`[a, var d] = y;` reports `a` — the event is the whole use, so
-        // the verdict emits here instead of a deferred row).
+        // (`[a, var d] = y;` reports `a` — the verdict emits here instead
+        // of a deferred row). The write never counts as a use (#2858): the
+        // official verifier never visits an assigned-variable pattern
+        // (`AssignedVariablePatternImpl`'s `visitChildren2` is empty, no
+        // verifier override) and the write path skips
+        // `LocalVariableElement` — a pattern-assignment write spares
+        // nothing, so the hit only proves the name defined.
         let engine = &mut self.engine;
         let Some(name) = engine.name_of(variable) else {
             return;
         };
         engine.last_pattern_variable = Some((name, variable.range));
-        if let Some(hit) = engine.resolve_local(name) {
-            engine.locals[hit as usize].uses += 1;
+        if engine.resolve_local(name).is_some() {
             return;
         }
         let BareInfo::Missing { on_opaque, .. } = engine.resolve_bare(name).0 else {
@@ -9125,13 +9570,6 @@ impl ParserListener for DiagnoseListener<'_> {
                         nullable,
                     },
                     Vec::new(),
-                );
-                dq_probe!(
-                    "[destructure-stage] name={} off={} ty={}?{}",
-                    self.engine.strings.resolve(name),
-                    span.offset,
-                    lexeme,
-                    nullable
                 );
             }
         }

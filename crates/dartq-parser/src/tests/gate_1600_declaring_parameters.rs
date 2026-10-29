@@ -215,14 +215,15 @@ fn pre_feature_const_heads_take_the_unexpected_token_face() {
     }
     // `extension type const E {}` reports the missing primary constructor
     // on the name and the representation-field gap at the body at every
-    // language version; never the `const` face (oracle 4|22, 4|24).
+    // language version; never the `const` face (oracle 4|22, 4|24 — the
+    // representation gap is the zero-length synthesized `(` at the body).
     for features in [pre_feature_features(), latest_features()] {
         let (got, _) = rows_with("extension type const E {}\n", features);
         assert_eq!(
             got,
             [
                 row("missing_primary_constructor", 21, 22),
-                row("expected_representation_field", 23, 24),
+                row("expected_representation_field", 23, 23),
             ],
             "extension type const head: {got:?}"
         );

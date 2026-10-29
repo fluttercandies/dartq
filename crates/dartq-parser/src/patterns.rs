@@ -217,7 +217,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     self.cursor.advance();
                     // Left associative: RHS one level up.
                     token = self.parse_pattern_at(context, level + 1);
-                    self.listener.end_binary_pattern(operator);
+                    self.listener.end_binary_pattern(operator, token);
                 }
                 _ => {
                     // Some other operator that doesn't belong in a pattern.

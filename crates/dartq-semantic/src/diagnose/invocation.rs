@@ -36,6 +36,7 @@ impl<'a> Engine<'a> {
         is_null_aware: bool,
         op_range: SourceRange,
         chain_end: u32,
+        member_ident: bool,
     ) {
         // F-H arg-window displacement: a completed send's callee placeholder
         // is the member row this merge must fold, but recovery shapes can
@@ -411,19 +412,70 @@ impl<'a> Engine<'a> {
                 let inside_chain = self
                     .dead_null_chains
                     .iter()
-                    .any(|(op, end, _)| *op <= op_range.offset && op_range.offset <= *end);
+                    .any(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end);
                 let rooted = is_null_aware && was_local && Self::is_nullable_ty(receiver_ty);
                 if inside_chain || rooted {
-                    match self
-                        .dead_null_chains
-                        .iter_mut()
-                        .find(|(op, end, _)| *op <= op_range.offset && op_range.offset <= *end)
-                    {
-                        Some((_, end, _)) => *end = (*end).max(chain_end),
+                    // The root kind fixes the verifier face the chain answers
+                    // (dead_code_verifier.dart's call-site split): a `?..`
+                    // section head answers `verifyCascadeExpression`, whose
+                    // body-class gate holds only while the section stays one
+                    // bare selector; a plain `?.` member answers
+                    // `verifyNullAwareAccess`'s parent climb.
+                    let root_kind = if is_section {
+                        crate::diagnose::types::DeadChainKind::CascadeMember
+                    } else {
+                        crate::diagnose::types::DeadChainKind::Member
+                    };
+                    // The boundary test needs the chain's own end BEFORE any
+                    // growth: a cascade-kind chain dies when a plain `.`
+                    // continuation selector lands at its end (the section
+                    // body chained — `?..foo().length`), while a section head
+                    // (`..x27`) grows the extent to cover the later sections
+                    // (`verifyCascadeExpression` reports operator..cascade
+                    // end) and retires the root section's own write face —
+                    // the write then targets a later section, which the
+                    // verifier never sees.
+                    let containing = self.dead_null_chains.iter().position(|(op, end, ..)| {
+                        *op <= op_range.offset && op_range.offset <= *end
+                    });
+                    match containing {
+                        Some(index) => {
+                            let (_, end, _, kind, _) = self.dead_null_chains[index];
+                            let boundary = op_range.offset >= end;
+                            match kind {
+                                crate::diagnose::types::DeadChainKind::Member
+                                | crate::diagnose::types::DeadChainKind::Index => {
+                                    self.dead_null_chains[index].1 =
+                                        self.dead_null_chains[index].1.max(chain_end);
+                                }
+                                crate::diagnose::types::DeadChainKind::CascadeMember
+                                | crate::diagnose::types::DeadChainKind::CascadeIndex => {
+                                    if is_section {
+                                        self.dead_null_chains[index].1 =
+                                            self.dead_null_chains[index].1.max(chain_end);
+                                        self.dead_null_chains[index].4 = true;
+                                    } else if boundary {
+                                        self.dead_null_chains.remove(index);
+                                    }
+                                }
+                            }
+                        }
                         None => {
-                            if rooted {
-                                self.dead_null_chains
-                                    .push((op_range.offset, chain_end, recv_span));
+                            // The member face needs a real selector: the
+                            // parser folds `?.{ ... }`'s recovery braces
+                            // into a literal "member", a shape the official
+                            // parser never produces (its recovery drops the
+                            // body) — no chain roots there. Cascade roots
+                            // keep their latch: the bare-body gate and the
+                            // write cancellation key on it.
+                            if rooted && (is_section || member_ident) {
+                                self.dead_null_chains.push((
+                                    op_range.offset,
+                                    chain_end,
+                                    recv_span,
+                                    root_kind,
+                                    false,
+                                ));
                             }
                         }
                     }
@@ -3290,11 +3342,13 @@ impl<'a> Engine<'a> {
     }
 
     /// The tear-off signature of an argument row: a bare unqualified read
-    /// of a same-file top-level function carries the function's own
-    /// signature as its type-as-a-value (the row's `Ty` stays `Unknown` —
-    /// the model has no function variant; the signature is the structural
-    /// face). Getters carry no formals and synthesize nothing; member and
-    /// prefixed tear-offs stay untyped (under-report). Only a value READ
+    /// of a same-file top-level function — or of a declared local
+    /// function, whose own value IS the tear-off (#2842) — carries the
+    /// function's own signature as its type-as-a-value (the row's `Ty`
+    /// stays `Unknown` — the model has no function variant; the signature
+    /// is the structural face). Getters carry no formals and synthesize
+    /// nothing; member and prefixed tear-offs stay untyped (under-report).
+    /// Only a value READ
     /// qualifies: a completed send's callee row keeps its bare shape (the
     /// send flips `intent` to [`Intent::Invoke`] alone), so an ungated
     /// shape check reads `use(f())`'s call result as a tear-off of `f`
@@ -3303,6 +3357,15 @@ impl<'a> Engine<'a> {
     pub(crate) fn tear_off_sig(&self, row: &Row) -> Option<Box<FnVarSig>> {
         if row.qualified || row.intent != Intent::Read {
             return None;
+        }
+        // A declared local FUNCTION's own value IS the tear-off (#2842):
+        // the frame capture answers before the shadow refusals — the read
+        // carries the declaration's own signature (the formal-compare
+        // face here and the type-check operand face alike). A plain local
+        // of the same spelling finds no capture in
+        // [`Engine::local_fn_sig`] and falls to the refusal below.
+        if let Some(sig) = self.local_fn_sig(row.name) {
+            return Some(Box::new(sig.clone()));
         }
         // A frame local shadows any same-spelled top-level declaration (the
         // scope precedence `resolve_bare` applies): the read is the local's
@@ -3826,6 +3889,100 @@ impl<'a> Engine<'a> {
             return None;
         }
         Some((params.into_boxed_slice(), seeds))
+    }
+
+    /// #2831 P1 — the raw-constructor inference face: an unnamed creation
+    /// (`A()`) with no explicit type arguments and no downward context (no
+    /// enclosing argument list — an outer call flows its formal downward —
+    /// and no annotated declaration being initialized) seeds every
+    /// parameter with the greatest closure of its bound
+    /// ([`Bounds::check_creation_inference`]) and reports at the
+    /// constructor name one `could_not_infer` row per failing parameter —
+    /// the extends-clause origin's `_formatConstraints` line — plus the
+    /// creation-site `type_argument_not_matching_bounds` twin the failed
+    /// inference's kept types carry (upstream Dart SDK source,
+    /// type_arguments_verifier.dart:342-540: the implicit arguments are
+    /// the erroneous types the solver kept, `_typeArgumentErrorNode`
+    /// anchors at the NamedType itself with no written argument, and the
+    /// `ConstructorName` parent denies the super-bounded pass, so the twin
+    /// spells the un-inverted seed). Emitted eagerly at the creation's
+    /// close: the bounds snapshot consult is rebuild-aware, and a bound
+    /// forward-referencing a later declaration keeps the under-report.
+    pub(crate) fn check_creation_inference(&mut self, callee: usize) {
+        let (container, range) = {
+            let Some(row) = self.rows.get(callee) else {
+                return;
+            };
+            let RowShape::Bare(BareInfo::Container {
+                name,
+                kind: ContainerKind::Class,
+            }) = &row.shape
+            else {
+                return;
+            };
+            if row.qualified {
+                return;
+            }
+            (*name, row.range)
+        };
+        self.check_creation_inference_at(container, range, true);
+    }
+
+    /// #2841 — the alias-callee route's inference half: a bare
+    /// non-function alias spelling is the aliased class's unnamed creation
+    /// with implicit arguments, and the face keys the ALIAS's own
+    /// parameters (upstream infers the alias application's arguments, so
+    /// the `could_not_infer` text spells the alias's type variable —
+    /// `nonfunction_FutureOr_l1_t02` 86:3). The creation-site
+    /// `type_argument_not_matching_bounds` twin stays out: upstream's twin
+    /// is the EXPANDED creation's class-side check (the kept seeds mapped
+    /// through the alias RHS against the class's parameters — the corpus
+    /// twin spells the class parameter `X`, not the alias's `X1`), a face
+    /// the alias-side rows cannot spell; the under-report posture holds
+    /// until the bounds creation-site arm owns the expanded args.
+    pub(crate) fn check_alias_creation_inference(&mut self, head: StringId, range: SourceRange) {
+        self.check_creation_inference_at(head, range, false);
+    }
+
+    /// The shared inference tail (`head` keys the snapshot declaration —
+    /// a class for the creation face, a type alias for the alias-callee
+    /// route; `emit_twin` gates the class-side twin rows).
+    fn check_creation_inference_at(&mut self, head: StringId, range: SourceRange, emit_twin: bool) {
+        if !self.arg_levels.is_empty() || self.pending_decl_ty.is_some() {
+            return;
+        }
+        // The explicit-argument peek is non-consuming: the generic walk
+        // below still reads (and takes) the latch through `call_args_for`.
+        if self
+            .call_type_args
+            .iter()
+            .any(|(at, _)| *at == range.offset)
+        {
+            return;
+        }
+        let rows = self.bounds.check_creation_inference(self.strings, head);
+        for row in &rows {
+            let detail = format!(
+                "\n\nTried to infer '{}' for '{}' which doesn't work:\n  \
+                 Type parameter '{}' is declared to extend '{}' producing '{}'.\n\n\
+                 Consider passing explicit type argument(s) to the generic.\n\n",
+                row.seed, row.parameter, row.parameter, row.raw_bound, row.bound
+            );
+            let message = SemanticCode::CouldNotInfer.message(&row.parameter, &detail);
+            self.emit_message_with_correction(SemanticCode::CouldNotInfer, range, message);
+        }
+        if !emit_twin {
+            return;
+        }
+        for row in &rows {
+            self.emit3(
+                SemanticCode::TypeArgumentNotMatchingBounds,
+                range,
+                &row.seed,
+                &row.parameter,
+                &row.bound,
+            );
+        }
     }
 
     /// The generic inference-failure face (`couldNotInfer`, upstream Dart
@@ -4411,15 +4568,6 @@ impl<'a> Engine<'a> {
             if rejects {
                 let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
-                dq_probe!(
-                    "[arg-type] offset={} from={} to={} (rebound={} read_at={} captured={})",
-                    range.offset,
-                    from_text,
-                    to_text,
-                    rebound.is_some(),
-                    self.ty_display(*ty) != from_text,
-                    self.ty_display(*ty)
-                );
                 // The const-constructor face precedes the assignability row —
                 // the oracle's constant evaluator runs the invocation's
                 // argument check before the general assignability verifier
@@ -6188,8 +6336,14 @@ impl<'a> Engine<'a> {
             }
             _ => formals,
         };
-        let Some(row) = self.rows.get(callee) else {
-            return;
+        // Scoped: the #2831 P1 call below needs `&mut self` to emit, so
+        // the callee-row borrow ends at the copied range and re-opens
+        // after the emitting face (which pushes no rows).
+        let callee_range = {
+            let Some(row) = self.rows.get(callee) else {
+                return;
+            };
+            row.range
         };
         // The implicit-`call` face (the callee's type names a container
         // whose `call` method answers — bare `body(inner)` over
@@ -6210,7 +6364,18 @@ impl<'a> Engine<'a> {
             implicit_call = Some((ret, params));
             Some(formals)
         });
+        // #2831 P1 — the raw-constructor inference face runs before the
+        // formal table's early return: a ctor-less class's implicit
+        // default has no captured formals, and this face needs none (the
+        // `could_not_infer` seam below only admits its pinned
+        // outer-call shape and never reaches here for the corpus's bare
+        // statement creations). The engine-side wrapper owns the shape,
+        // context, and explicit-argument guards and emits both rows.
+        self.check_creation_inference(callee);
         let Some(formals) = formals else {
+            return;
+        };
+        let Some(row) = self.rows.get(callee) else {
             return;
         };
         // The required-named coverage (`RequiredParametersVerifier._check`,
@@ -6242,7 +6407,6 @@ impl<'a> Engine<'a> {
             // `required this._error` formal reports `'error'` upstream.
             .map(|f| self.formal_public_name(f.name))
             .collect();
-        let callee_range = row.range;
         // #1314 FAM10: the callee's declared type parameters (same-file
         // generic executables) admit the inference substitution — a
         // parameter type that is exactly a type parameter checks and
@@ -7115,14 +7279,6 @@ impl<'a> Engine<'a> {
                     // ctor-level `ctor_body_open` latch answers for it.
                     let in_ctor_initializers =
                         self.ctor_pending.is_some() && body_brace.is_none() && !self.ctor_body_open;
-                    dq_probe!(
-                        "[kw-recv] is_super={} instance={} body_brace={:?} ctor_body_open={} -> in_init={}",
-                        is_super,
-                        instance,
-                        body_brace.is_some(),
-                        self.ctor_body_open,
-                        in_ctor_initializers
-                    );
                     if !*instance || in_ctor_initializers {
                         return ReceiverState::Invalid;
                     }
@@ -7235,13 +7391,41 @@ impl<'a> Engine<'a> {
                 // destructure; every other callee shape (a variable, a
                 // member) keeps its spelling and the leg below never fires
                 // for it.
-                if let Some(spelled) = self.bare_creation_head_name(row.range)
-                    && self.alias_head_grounded(spelled) == Some(false)
+                //
+                // A GROUNDED alias (the RHS resolves a constructible class)
+                // is the opposite verdict: the spelling is the aliased
+                // class's unnamed creation with implicit arguments —
+                // upstream routes the alias constructor invocation through
+                // the aliased type (`A()` under `typedef A<X extends ...> =
+                // C<X>;` is `C<inferred>()`, so no invocation report and
+                // the raw-constructor inference face decides the span,
+                // #2841). A local shadowing the alias keeps the ordinary
+                // callee faces — the spelling then names the variable, not
+                // the type. The alias-capture gate keeps foreign aliases
+                // (no this-file capture) on their existing verdict.
+                match self
+                    .bare_creation_head_name(row.range)
+                    .map(|spelled| (spelled, self.alias_head_grounded(spelled)))
                 {
-                    let name_text = self.strings.resolve(spelled).to_string();
-                    let range = row.range;
-                    self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
-                    return;
+                    Some((spelled, Some(false))) => {
+                        let name_text = self.strings.resolve(spelled).to_string();
+                        let range = row.range;
+                        self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
+                        return;
+                    }
+                    Some((spelled, Some(true)))
+                        if self.bounds.alias_named_shape(spelled).is_some()
+                            && !self
+                                .frames
+                                .iter()
+                                .rev()
+                                .any(|f| f.locals.contains(&row.name)) =>
+                    {
+                        let range = row.range;
+                        self.check_alias_creation_inference(spelled, range);
+                        return;
+                    }
+                    _ => {}
                 }
                 let Ty::Named {
                     name,
@@ -8592,12 +8776,23 @@ impl<'a> Engine<'a> {
         {
             let args = tree.args.iter().map(|arg| self.tree_ty(arg)).collect();
             self.completed_group = Some((tree.head, tree.range.offset, args));
+            // The site itself keeps its outermost anchor (the head through
+            // the group closer); the #2831 P2 queueing below must read the
+            // tree after the move, so the arguments clone here.
             self.pending_bounded_checks.push(PendingBoundedCheck::Site {
                 head: tree.head,
-                args: tree.args,
+                args: tree.args.clone(),
                 in_scope: self.type_params.clone(),
                 site: tree.range,
             });
+            // #2831 P2 — every nested bounded head checks as its own site:
+            // upstream runs `checkNamedType` at every `NamedType`
+            // including nested ones (type_arguments_verifier.dart:243-247),
+            // and the outermost-only capture died at heads the snapshot
+            // cannot answer (an alias outer head). Only in-file container
+            // heads with written arguments queue — a raw nested head has
+            // no instantiation to check and a foreign head no facts.
+            self.queue_nested_bounded_sites(&tree.args);
         }
         // The #1351 capture: the open typedef RHS's group closed.
         self.bounds.alias_end_group(range);
@@ -8837,6 +9032,29 @@ impl<'a> Engine<'a> {
         };
         if matches!(target.shape, RowShape::Bare(_) | RowShape::Member { .. }) {
             self.deferred_args.push((base - 1, count, range));
+        }
+    }
+
+    /// #2831 P2 — the nested bounded heads of a captured annotation site:
+    /// each in-file container argument head queues its own
+    /// [`PendingBoundedCheck::Site`] (the whole subtree's span is the
+    /// context row's anchor, the same face the outermost head takes),
+    /// pre-order like the upstream `visitNamedType` walk. A poisoned or
+    /// argument-less nested head never queues — `check_site_inner`
+    /// suppresses those anyway; recursion still descends through heads
+    /// the snapshot cannot answer (their own arguments may nest container
+    /// heads deeper).
+    fn queue_nested_bounded_sites(&mut self, args: &[crate::bounds::TypeTree]) {
+        for arg in args {
+            if !arg.poisoned && !arg.args.is_empty() && self.bounds.has_capture(arg.head) {
+                self.pending_bounded_checks.push(PendingBoundedCheck::Site {
+                    head: arg.head,
+                    args: arg.args.clone(),
+                    in_scope: self.type_params.clone(),
+                    site: arg.range,
+                });
+            }
+            self.queue_nested_bounded_sites(&arg.args);
         }
     }
 

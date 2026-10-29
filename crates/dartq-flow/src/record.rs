@@ -144,6 +144,10 @@ pub struct Flow<'t> {
     buffer: Option<Vec<Ev>>,
     /// Open `Ev::Block` event indices, for end-of-block span widening.
     block_events: Vec<usize>,
+    /// Parenthesized patterns whose own begin/end pair was flagged
+    /// transparent (see `handle_parenthesized_pattern`): the matching
+    /// `PatternEnd` records its `paren` flag per pending counter.
+    pending_pattern_ends: usize,
     /// The do-while body's last token: distinguishes the block-body
     /// `while`-part start (the closing brace) from the keyword start.
     do_body_end: Option<Token>,
@@ -151,6 +155,20 @@ pub struct Flow<'t> {
     do_body_is_block: bool,
     /// Executable nesting depth inside the active recording.
     exec_depth: usize,
+    /// A cascade begin is one event old: the fingerprint's first half.
+    /// A section with no selector event between its begin and its `Send`
+    /// is the parser's bail (`?..{`, `..{`, `?..(p) { ... }` — no grammar
+    /// gives a cascade section such a body), re-parsed as a sibling
+    /// statement the official recovery never produces.
+    cascade_probe_arm: bool,
+    /// A selector-less cascade section was seen and its recovered block is
+    /// expected: the flag survives the statement-trailer events between
+    /// the cascade's close and the block's re-parse, and arms the drop.
+    method_block_arm: bool,
+    /// Depth of the recovered anonymous-method block currently dropped:
+    /// its statement events (the `return` among them) never reach the
+    /// replay, matching the official section body's containment.
+    method_block_drop: u32,
     /// The then-arm boundary latched by
     /// [`Flow::end_conditional_expression_then_arm`], consumed by the
     /// argless colon call that follows it.
@@ -222,6 +240,11 @@ pub struct Flow<'t> {
     /// (`begin_is_operator_type` clears, `end_is_operator_type` latches):
     /// the is-continuation dead row's anchor (see [`Ev::IsOperator`]).
     is_type_head: Option<Token>,
+    /// The cast type's head token of the as-cast now parsing
+    /// (`begin_as_operator_type` clears, `end_as_operator_type` latches):
+    /// the conditional-arm cast-tail dead row's anchor (see
+    /// [`Ev::AsOperator`]).
+    as_type_head: Option<Token>,
     /// Inside a local-function statement (between its `begin` and `end`
     /// hooks): gates [`Ev::LocalFnName`] to the statement's own name —
     /// the name event fires before the body, so nested declarations
@@ -260,6 +283,21 @@ pub struct Flow<'t> {
     /// name-level default: `exec_end` falls back to a stack-local
     /// [`NameTypeOps`], so tests and unmounted callers replay unchanged.
     ops: Option<&'t dyn crate::ty::TypeOps>,
+    /// The unit's sound-flow-analysis posture (official
+    /// `TypeAnalyzerOptions.soundFlowAnalysisEnabled` —
+    /// `featureSet.isEnabled(Feature.sound_flow_analysis)`,
+    /// type_analyzer_options.dart:20; `enabledIn: 3.9.0`, expired): the
+    /// consumer sets it through [`Flow::set_sound_flow`] from the unit's
+    /// settled feature set before the parse. A pre-3.9 unit (`// @dart =
+    /// 3.8`) carries `false`, standing down every sound-only reasoning
+    /// step in the replay (flow_analysis.dart gates each site:
+    /// `_isTypeCheckGuaranteedToFailWithSoundNullSafety` :7611, the
+    /// succeed twin :7645, `tryPromoteForTypeCheck`'s bottom-factor arm
+    /// :3218, `isValidPromotionStep` :5989, `ifNullExpression_rightBegin`
+    /// :5861, the null-aware-entry twin :6203, `promoteForPattern`'s
+    /// cannot-match arms :6364/:6376, `nullCheckOrAssertPattern_begin`
+    /// :6223). `true` (the modern default) keeps every fold armed.
+    sound_flow: bool,
     /// The recording [`Flow::begin_variable_initializer`] opened for a
     /// declaration outside any executable (a field or top-level
     /// initializer is its own executable — the official folds it):
@@ -328,9 +366,13 @@ impl<'t> Flow<'t> {
             pending_label_token: None,
             buffer: None,
             block_events: Vec::new(),
+            pending_pattern_ends: 0,
             do_body_end: None,
             do_body_is_block: false,
             exec_depth: 0,
+            cascade_probe_arm: false,
+            method_block_arm: false,
+            method_block_drop: 0,
             cond_then: None,
             boundaries: Vec::new(),
             tv_open: 0,
@@ -342,11 +384,13 @@ impl<'t> Flow<'t> {
             top_last_type: None,
             type_head: None,
             is_type_head: None,
+            as_type_head: None,
             in_local_fn: false,
             top_decl: None,
             container_depth: 0,
             closed: crate::ty::ClosedNames::default(),
             ops: None,
+            sound_flow: true,
             initializer_world: 0,
             init_starts: Vec::new(),
             facts: Vec::new(),
@@ -746,6 +790,17 @@ impl<'t> Flow<'t> {
         self.ops = Some(ops);
     }
 
+    /// Sets the unit's sound-flow-analysis posture (the official
+    /// `soundFlowAnalysisEnabled`, the `Feature.sound_flow_analysis` fold
+    /// of the unit's settled feature set — a `// @dart = 3.8` library
+    /// carries `false`). Set once after construction, before the parse,
+    /// beside [`Flow::set_ops`]: a mid-parse swap would split one unit's
+    /// verdicts across two worlds. `true` (the construction default)
+    /// keeps every sound-only fold armed.
+    pub fn set_sound_flow(&mut self, sound_flow: bool) {
+        self.sound_flow = sound_flow;
+    }
+
     /// Executables of this unit whose replay exhausted the step budget and
     /// bailed (see [`crate::interp::STEP_BUDGET_PER_EVENT`]) — the bounded
     /// marker the engine can count and surface. Zero on healthy units.
@@ -856,6 +911,29 @@ impl<'t> Flow<'t> {
     }
 
     fn record(&mut self, ev: Ev) {
+        // Inside the recovered anonymous-method block everything drops
+        // (see `cascade_probe_arm`); its `Block`/`EndBlock` frames never
+        // reach here — `begin_block`/`end_block` consumed them.
+        if self.method_block_drop > 0 {
+            return;
+        }
+        // The selector-less-section fingerprint: no selector event between
+        // the section's begin and its recovery window. Real sections carry
+        // the member `Ident` (or a bracket selector) between the two — a
+        // bare `Send` (`?..{`) or an `ArgumentsBegin` window (`?..(p) {`
+        // parsed as a call) is the parser's bail, and the body it
+        // re-parses as a sibling statement arms the drop (`begin_block`).
+        if self.cascade_probe_arm {
+            self.cascade_probe_arm = false;
+            if matches!(
+                ev,
+                Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin
+            ) {
+                self.method_block_arm = true;
+            }
+        } else if matches!(ev, Ev::CascadeBegin { .. }) {
+            self.cascade_probe_arm = true;
+        }
         if let Some(buffer) = self.buffer.as_mut() {
             buffer.push(ev);
         }
@@ -885,6 +963,12 @@ impl<'t> Flow<'t> {
 
     /// Executable begin: starts a recording or nests inside the active one.
     fn exec_begin(&mut self, is_closure: bool) {
+        // A nested executable inside the dropped block: keep the depth
+        // ledger balanced, record nothing (see `begin_cascade`).
+        if self.method_block_drop > 0 {
+            self.exec_depth += 1;
+            return;
+        }
         match self.buffer.as_mut() {
             None => {
                 self.buffer = Some(Vec::new());
@@ -910,6 +994,10 @@ impl<'t> Flow<'t> {
             self.record(Ev::ExecEnd { is_expr, end });
             return;
         }
+        // Backstop: a recovered-block drop can never outlive its own
+        // executable (the block is a sibling statement inside it).
+        self.method_block_arm = false;
+        self.method_block_drop = 0;
         let Some(events) = self.buffer.take() else {
             return;
         };
@@ -930,6 +1018,9 @@ impl<'t> Flow<'t> {
         let fallback = NameTypeOps;
         let ops = self.ops.unwrap_or(&fallback);
         let mut interp = Interp::new(ops, &self.type_args, &self.boundaries);
+        // The unit's sound-flow posture (`Flow::set_sound_flow`) — the
+        // replay's sound-only folds read it at each gated site.
+        interp.sound_flow = self.sound_flow;
         // The unit's top-level read face (captured so far — declarations
         // parsed after this executable under-report there), and the closed
         // declarations the switch-end verdict reads.
@@ -1308,6 +1399,23 @@ impl ParserListener for Flow<'_> {
     // —— blocks and asserts ——————————————————————————————————————————————
 
     fn begin_block(&mut self, token: Token, kind: BlockKind) {
+        // The recovered anonymous-method block: a bailed cascade section
+        // (`?..{`, `..{`, `?..(p) { ... }` — no grammar gives a cascade
+        // section such a body) re-parses its braces as a sibling
+        // statement. The official parser's recovery drops the section
+        // body instead, so its flow model never sees this block —
+        // recording it would let its `return` kill the enclosing path
+        // (the wave-3 E2 over-kill face). Drop it wholesale, nested
+        // blocks included.
+        if self.method_block_drop > 0 {
+            self.method_block_drop += 1;
+            return;
+        }
+        if self.method_block_arm && matches!(kind, BlockKind::Statement) {
+            self.method_block_arm = false;
+            self.method_block_drop = 1;
+            return;
+        }
         // The finally marker rides the finally block's BEGIN (official
         // `tryFinallyStatement_finallyBegin`): the finally context must be
         // open before the body's events replay. The parser's own
@@ -1338,6 +1446,15 @@ impl ParserListener for Flow<'_> {
     }
 
     fn end_block(&mut self, _count: usize, begin: Token, end: Token, _kind: BlockKind) {
+        // The dropped block's own close: nothing was recorded at its
+        // begin, so no span widening or ledger pop applies.
+        if self.method_block_drop > 0 {
+            self.method_block_drop -= 1;
+            return;
+        }
+        // A real block closed before the armed one arrived: the recovery
+        // re-parse can no longer be pending.
+        self.method_block_arm = false;
         if let (Some(buffer), Some(index)) = (&mut self.buffer, self.block_events.pop())
             && let Some(Ev::Block { span, .. }) = buffer.get_mut(index)
         {
@@ -2217,8 +2334,8 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::SwitchExprCaseBegin);
     }
 
-    fn handle_switch_expression_case_pattern(&mut self, _token: Token) {
-        self.record(Ev::SwitchExprCasePattern);
+    fn handle_switch_expression_case_pattern(&mut self, token: Token) {
+        self.record(Ev::SwitchExprCasePattern { begin: token });
     }
 
     fn end_switch_expression_case(
@@ -2226,13 +2343,18 @@ impl ParserListener for Flow<'_> {
         begin: Token,
         when: Option<Token>,
         _arrow: Token,
-        _end: Token,
+        end: Token,
     ) {
         self.record(Ev::SwitchExprCaseEnd {
             has_guard: when.is_some(),
             // The alternative's first token: the matched-type row's clause
             // anchor (#1349).
             begin,
+            // The separator's start (`,`, `;`, or `}`): a dead arm's
+            // whole-range row ends here (upstream `flowEnd(case_)` spans
+            // `case.offset..case.end`; the corpus style keeps the
+            // separator tight against the expression).
+            end: end.range.offset,
         });
     }
 
@@ -2478,15 +2600,24 @@ impl ParserListener for Flow<'_> {
     }
 
     fn begin_as_operator_type(&mut self, operator: Token) {
+        // The cast type's head latch opens fresh (the `is` twin's
+        // discipline at `begin_is_operator_type`): a stale head from an
+        // earlier construct must not anchor a type-less recovery's arm row.
+        self.as_type_head = None;
         self.record(Ev::AsBegin { span: operator });
     }
 
-    fn end_as_operator_type(&mut self, _operator: Token) {
+    fn end_as_operator_type(&mut self, operator: Token) {
+        // The cast type parsed just before this hook, so the statement-head
+        // latch holds its first token (see [`Flow::type_head`]); a
+        // type-less recovery keeps the `as` operator itself.
+        self.as_type_head = Some(self.type_head.unwrap_or(operator));
         self.record(Ev::AsEnd);
     }
 
-    fn handle_as_operator(&mut self, _operator: Token) {
-        self.record(Ev::AsOperator);
+    fn handle_as_operator(&mut self, operator: Token) {
+        let type_head = self.as_type_head.take().unwrap_or(operator);
+        self.record(Ev::AsOperator { type_head });
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
@@ -2722,12 +2853,11 @@ impl ParserListener for Flow<'_> {
     }
 
     fn begin_cascade(&mut self, operator: Token) {
-        self.record(Ev::CascadeBegin {
-            null_aware: matches!(
-                self.kind(operator),
-                Some(dartq_scanner::TokenKind::QuestionPeriodPeriod)
-            ),
-        });
+        let null_aware = matches!(
+            self.kind(operator),
+            Some(dartq_scanner::TokenKind::QuestionPeriodPeriod)
+        );
+        self.record(Ev::CascadeBegin { null_aware });
     }
 
     fn handle_cascade_access(&mut self, _operator: Token, _end: Token, is_null_aware: bool) {
@@ -2793,12 +2923,43 @@ impl ParserListener for Flow<'_> {
 
     // —— patterns ————————————————————————————————————————————————————————
 
-    fn begin_pattern(&mut self, _token: Token) {
-        self.record(Ev::PatternBegin);
+    fn begin_pattern(&mut self, token: Token) {
+        self.record(Ev::PatternBegin {
+            span: token,
+            paren: false,
+        });
     }
 
     fn end_pattern(&mut self, _token: Token) {
-        self.record(Ev::PatternEnd);
+        // A grouping-transparent parenthesized wrapper: its begin was
+        // flagged by `handle_parenthesized_pattern`, flag its end too.
+        let paren = self.pending_pattern_ends > 0;
+        if paren {
+            self.pending_pattern_ends -= 1;
+        }
+        self.record(Ev::PatternEnd { paren });
+    }
+
+    fn handle_parenthesized_pattern(&mut self, left_paren: Token) {
+        // `(p)` is pure grouping: official flow analysis never opens a
+        // pattern context for the wrapper (the parser's
+        // `handleParenthesizedPattern` is a no-op there), so the wrapped
+        // pattern's coverage must be read at the clause's own level. Flag
+        // this wrapper's own `PatternBegin`/`PatternEnd` pair transparent —
+        // the events stay (the postfix `?`/`!`/`as` operators still parse
+        // after the wrapper closes and anchor on the surrounding level).
+        let offset = left_paren.range.offset;
+        if let Some(buffer) = self.buffer.as_mut() {
+            for ev in buffer.iter_mut().rev() {
+                if let Ev::PatternBegin { span, paren } = ev
+                    && span.range.offset == offset
+                {
+                    *paren = true;
+                    break;
+                }
+            }
+        }
+        self.pending_pattern_ends += 1;
     }
 
     fn begin_constant_pattern(&mut self, _const_keyword: Option<Token>) {
@@ -2834,13 +2995,18 @@ impl ParserListener for Flow<'_> {
 
     fn begin_binary_pattern(&mut self, operator: Token) {
         if self.token_text(operator) == Some("||") {
-            self.record(Ev::BinaryOrPatternBegin);
+            self.record(Ev::BinaryOrPatternBegin { operator });
         }
     }
 
-    fn end_binary_pattern(&mut self, operator: Token) {
+    fn end_binary_pattern(&mut self, operator: Token, end: Token) {
         if self.token_text(operator) == Some("||") {
-            self.record(Ev::BinaryOrPatternEnd);
+            // The right operand's last token (`parse_pattern_at`'s
+            // returned `token`): the operand row runs to its end
+            // (official `flowEnd(rightOperand)`'s `node.end`).
+            self.record(Ev::BinaryOrPatternEnd {
+                end: end.range.end(),
+            });
         }
     }
 
@@ -2897,19 +3063,29 @@ impl ParserListener for Flow<'_> {
     /// A record pattern's close: the shape test can fail — the refutable
     /// context's unmatched chain needs the failure arm.
     fn handle_record_pattern(&mut self, _left_paren: Token, _count: usize) {
-        self.record(Ev::ShapePattern);
+        self.record(Ev::ShapePattern {
+            shape: crate::ev::PatternShape::Record,
+        });
     }
 
     fn handle_list_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
-        self.record(Ev::ShapePattern);
+        self.record(Ev::ShapePattern {
+            shape: crate::ev::PatternShape::List,
+        });
     }
 
-    fn handle_map_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
-        self.record(Ev::ShapePattern);
+    fn handle_map_pattern(&mut self, count: usize, _left: Token, _right: Token) {
+        self.record(Ev::ShapePattern {
+            shape: crate::ev::PatternShape::Map {
+                entries: count as u32,
+            },
+        });
     }
 
     fn handle_relational_pattern(&mut self, _operator: Token) {
-        self.record(Ev::ShapePattern);
+        self.record(Ev::ShapePattern {
+            shape: crate::ev::PatternShape::Relational,
+        });
     }
 
     fn handle_null_check_pattern(&mut self, _question: Token) {

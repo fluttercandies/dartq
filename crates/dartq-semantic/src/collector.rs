@@ -270,6 +270,14 @@ struct PendingTypedef {
     /// group closes) — the use-site substitution face zips the written
     /// arguments against it.
     type_param_names: Vec<StringId>,
+    /// The old-style head's return type, latched at the name identifier
+    /// (`typedef int fx(int)` — `int` parses between `typedef` and the
+    /// name). The modern `=` arm never reads it (its RHS arms later).
+    return_ty: Ty,
+    /// The old-style alias's formal list (depth-0 `FunctionTypeAlias`
+    /// group, [`Builder::attach_formals`]' typedef arm) — the columns of
+    /// the synthesized function type `end_typedef` interns.
+    formals: Option<Box<Formals>>,
 }
 
 /// An `augment` executable under construction (`begin_method` /
@@ -1963,6 +1971,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             && slot.is_none()
         {
             *slot = Some(Box::new(formals));
+        } else if let Some(pending) = &mut self.pending_typedef
+            && pending.formals.is_none()
+        {
+            // An old-style alias's own group (`typedef fx(x, );` — the
+            // depth-0 `FunctionTypeAlias` list): the columns of the
+            // function type `end_typedef` synthesizes as the alias's
+            // right-hand face.
+            pending.formals = Some(Box::new(formals));
         }
     }
 
@@ -1971,25 +1987,52 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// Attaches the closed depth-1 count to the declaration it belongs to;
     /// `false` when nothing was open to receive it (a container header —
     /// [`Builder::open_container`] then consumes [`Builder::
-    /// header_type_params`]).
-    fn attach_type_param_count(&mut self) -> bool {
+    /// header_type_params`]). `group_end` is the group's closing offset: a
+    /// group that closed BEFORE the declaration's own name rode its return
+    /// type (`void Function<A>() m(int x)`) — the executable's
+    /// genericity is only the group written after the name (`m<T>(...)`),
+    /// and latching the return-type group would type a non-generic
+    /// executable as generic (the tear-off freshening gate would then
+    /// drop its face). An unrecoverable name keeps the attach (the
+    /// pre-slot posture).
+    fn attach_type_param_count(&mut self, group_end: u32) -> bool {
         if self.executable_header_done {
             return false;
         }
         let count = self.type_param_count;
         if let Some(pending) = &mut self.pending_member {
-            pending.type_params = count;
-            pending.type_param_names = std::mem::take(&mut self.type_var_group);
-            pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
+            if pending
+                .shape
+                .as_ref()
+                .map_or(true, |(_, _, range)| range.offset < group_end)
+            {
+                pending.type_params = count;
+                pending.type_param_names = std::mem::take(&mut self.type_var_group);
+                pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
+            }
         } else if let Some(pending) = &mut self.pending_top {
-            pending.type_params = count;
-            // A generic top-level function's spellings ride the declaration
-            // in declaration order — the cross-file closure-formal solver
-            // pairs explicit type arguments against them positionally.
-            pending.type_param_names = std::mem::take(&mut self.type_var_group);
-            std::mem::take(&mut self.type_var_bounds);
+            if pending
+                .name
+                .as_ref()
+                .map_or(true, |(_, range)| range.offset < group_end)
+            {
+                pending.type_params = count;
+                // A generic top-level function's spellings ride the declaration
+                // in declaration order — the cross-file closure-formal solver
+                // pairs explicit type arguments against them positionally.
+                pending.type_param_names = std::mem::take(&mut self.type_var_group);
+                std::mem::take(&mut self.type_var_bounds);
+            }
         } else if let Some(pending) = &mut self.pending_typedef {
-            pending.type_params = count;
+            // The declaring group closes before the right-hand side parses
+            // (the parameters follow the name, the RHS follows `=`), so the
+            // first depth-1 close seals the count — a function-type RHS
+            // with its OWN `<...>` group (`typedef F22<T> = Function<A>(...)
+            // Function(int x);`) closes a second depth-1 window whose count
+            // must not overwrite the declaration's.
+            if pending.type_params == 0 {
+                pending.type_params = count;
+            }
         } else if let Some(open) = self.containers.last_mut() {
             open.type_params = count;
         } else {
@@ -3119,10 +3162,20 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 }
             }
             IdentifierContext::TypedefDeclaration => {
-                if let Some(pending) = &mut builder.pending_typedef
-                    && pending.name.is_none()
+                if builder
+                    .pending_typedef
+                    .as_ref()
+                    .is_some_and(|pending| pending.name.is_none())
                 {
+                    // The old-style head's return type parses between
+                    // `typedef` and the name (`typedef int fx(int)`) — the
+                    // armed type is it, exactly the executable-name latch's
+                    // discipline. The modern `=` arm never reads the latch
+                    // (its RHS arms and takes later).
+                    let armed = builder.take_armed();
+                    let pending = builder.pending_typedef.as_mut().expect("checked");
                     pending.name = name_with_range;
+                    pending.return_ty = armed;
                 }
             }
             IdentifierContext::MetadataReference => {
@@ -3233,7 +3286,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut self.builder;
         if builder.type_group_depth == 1 {
             builder.type_group_close = Some(builder.span_of(end));
-            if !builder.attach_type_param_count() {
+            if !builder.attach_type_param_count(builder.span_of(end).offset) {
                 // A container header: the count carries into the container's
                 // `begin_*_declaration` open (official order — the type
                 // variables parse before `beginClassDeclaration`).
@@ -3244,9 +3297,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // substitution face zips the written arguments against them. The
         // count's attach above consumed the buffer only for a pending
         // member; a typedef's group survives it, so the take lands here
-        // (after the attach, matching the count's routing).
+        // (after the attach, matching the count's routing). The declaring
+        // group closes before the right-hand side parses (the parameters
+        // follow the name, the RHS follows `=`), so the FIRST depth-1
+        // close seals the spellings — a function-type RHS with its own
+        // `<...>` group (`typedef F22<T> = Function<A>(List<T> x)
+        // Function(int x);`) closes a second depth-1 window whose
+        // spellings must not overwrite the declaration's (the fold's
+        // use-site substitution zips against these names).
         if builder.type_group_depth == 1
             && let Some(pending) = &mut builder.pending_typedef
+            && pending.type_param_names.is_empty()
         {
             pending.type_param_names = std::mem::take(&mut builder.type_var_group);
         }
@@ -3727,6 +3788,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             name: None,
             type_params: 0,
             type_param_names: Vec::new(),
+            return_ty: Ty::UNKNOWN,
+            formals: None,
         });
         // The typedef opens a fresh declaration header: a preceding
         // declaration's (or a previous typedef RHS's) closed formal list
@@ -4216,7 +4279,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             // RHS parses after the name and completes before this event, so
             // `take_armed` answers it (modern `=` form only — the old-style
             // function-typed spelling carries its shape in no single armed
-            // annotation and stays `Unknown`). A parameterized alias captures
+            // annotation). A parameterized alias captures
             // its RHS in the same written shape — the parameter spellings
             // ride as bare `Ty::Named` leaves — and the substitution faces
             // apply the use-site written arguments at the read sites (the
@@ -4225,7 +4288,41 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             // through this type.
             let var_ty = match equals {
                 Some(_) => builder.take_armed(),
-                None => Ty::UNKNOWN,
+                None => {
+                    // The old-style function-typed spelling (`typedef fx(x,
+                    // );`, no `=`): the alias's right-hand face is the
+                    // synthesized function type — the head's latched return
+                    // type over the depth-0 formal list, the same first-class
+                    // `Ty::Function` the modern `= R Function(...)` arm
+                    // interns. An omitted annotation reads `dynamic` here
+                    // (the analyzer element's face for every unwritten
+                    // column — `typedef fx(x)` is `dynamic
+                    // Function(dynamic)`), not the executable capture's
+                    // `Unknown`: the RHS is a TYPE, and its consumers (the
+                    // alias fold's verdict asks, the resolved snapshot's
+                    // `typedef_shapes`) must see the official leaves. A
+                    // GENERIC old-style alias (`typedef int f1<T>([T? c]);`)
+                    // synthesizes the same written shape — the parameter
+                    // spellings ride as bare `Ty::Named` leaves exactly
+                    // like a parameterized `=` alias's captured RHS — so
+                    // the diagnosing fold's use-site substitution
+                    // (`instantiate_alias`) answers `f1<int>` whole. No
+                    // captured formal list (recovery never ran the group)
+                    // stays `Unknown` too.
+                    if let Some(formals) = pending.formals.as_deref() {
+                        let leaf = |ty: Ty| if ty == Ty::UNKNOWN { Ty::Dynamic } else { ty };
+                        let positional: Vec<Ty> =
+                            formals.positional.iter().map(|f| leaf(f.ty)).collect();
+                        let named: Vec<(StringId, Ty)> =
+                            formals.named.iter().map(|f| (f.name, leaf(f.ty))).collect();
+                        let return_ty = leaf(pending.return_ty);
+                        builder
+                            .type_args
+                            .function(0, return_ty, &positional, &named, false)
+                    } else {
+                        Ty::UNKNOWN
+                    }
+                }
             };
             builder.decl_kinds.push(AugTarget {
                 container: None,
@@ -4575,6 +4672,25 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // layer's formal patch resolves it against the super
                 // constructor's formals at the use site.
                 Ty::Never
+            } else if ty == Ty::UNKNOWN
+                && default_value.is_none()
+                && builder
+                    .containers
+                    .last()
+                    .is_some_and(|open| open.kind == ContainerKind::ExtensionType)
+            {
+                // An extension type's untyped representation formal reads
+                // `Object?`, never `dynamic` — the declaring formal is
+                // implicitly `final`, and the element model's default
+                // branch gives it `Object?` (the this-block bodies read
+                // `x` against `Object?`, the representation type spells
+                // `Object?`). A written default value keeps the
+                // declared-default `dynamic` posture.
+                Ty::Named {
+                    name: builder.strings.intern("Object"),
+                    nullable: true,
+                    args: ArgListId::EMPTY,
+                }
             } else {
                 ty
             },
@@ -4621,7 +4737,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             // ordinary member walk (extension_type's interface includes the
             // representation's getter). Register it as a Field; a body
             // member redeclaring the name reports the duplicate upstream
-            // (keep-first leaves the rep entry untouched).
+            // (keep-first leaves the rep entry untouched). The member face
+            // reads the formal's own type — the untyped spelling's
+            // `Object?` default rides along, so this-block reads over `x`
+            // check against `Object?`.
+            let rep_ty = formal.ty;
             open.members.or_insert_with(name, || MemberEntry {
                 kind: MemberKind::Field,
                 is_static: false,
@@ -4631,7 +4751,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 type_params: 0,
                 type_param_names: Box::default(),
                 type_param_bounds: Box::default(),
-                var_ty: ty,
+                var_ty: rep_ty,
                 return_ty: Ty::UNKNOWN,
                 formals: None,
                 annotations: Box::default(),
@@ -4749,9 +4869,16 @@ mod tests {
             Ty::named(id(&strings, "int")),
             "the parameterized RHS captures in the written shape"
         );
+        // #2813: the old-style function-typed alias captures its
+        // synthesized right-hand face (the unwritten return reads
+        // `dynamic`) instead of the pre-capture `Unknown`.
         assert_eq!(
-            elements.decl(id(&strings, "Old")).expect("Old").var_ty,
-            Ty::UNKNOWN
+            elements
+                .decl(id(&strings, "Old"))
+                .expect("Old")
+                .var_ty
+                .render(&strings, elements.type_args()),
+            "dynamic Function(int)"
         );
     }
 
@@ -4971,6 +5098,46 @@ mod tests {
         let n = positional("n");
         assert_eq!(n[0].ty, Ty::named(id(&strings, "int")));
         assert_eq!(n[1].ty, Ty::named(id(&strings, "bool")));
+    }
+
+    /// An old-style function-typed alias (`typedef fx(x, );`, no `=`)
+    /// captures its right-hand face as the synthesized first-class
+    /// [`Ty::Function`] — the written return type over the formal
+    /// columns, an omitted annotation reading `dynamic` (the analyzer
+    /// element's face; `typedef fx(x)` IS `dynamic Function(dynamic)`,
+    /// #2813). The named-only and optional-positional spellings capture
+    /// their own columns, and a generic old-style alias synthesizes with
+    /// its own parameter riding the columns as a bare leaf (the
+    /// use-site instantiation substitutes it — `fg<int>` reads
+    /// `dynamic Function(int)`, #2848).
+    #[test]
+    fn old_style_typedef_captures_the_synthesized_function_shape() {
+        let strings = StringTable::new();
+        let elements = build(
+            "typedef fx(x, ); \
+             typedef fz({z,}); \
+             typedef int fi(int i, ); \
+             typedef fg<T>(T x); \
+             typedef fm = void Function(int);",
+            &strings,
+        );
+        let rendered = |name: &str| {
+            elements
+                .decl(id(&strings, name))
+                .unwrap()
+                .var_ty
+                .render(&strings, elements.type_args())
+        };
+        // No written column anywhere: `dynamic Function(dynamic)`.
+        assert_eq!(rendered("fx"), "dynamic Function(dynamic)");
+        // A named-only list keeps its column on the named side.
+        assert_eq!(rendered("fz"), "dynamic Function({dynamic z})");
+        // A written return and formal ride as captured.
+        assert_eq!(rendered("fi"), "int Function(int)");
+        // A generic old-style alias keeps its parameter as the column leaf.
+        assert_eq!(rendered("fg"), "dynamic Function(T)");
+        // The modern `=` arm is untouched: the RHS as armed.
+        assert_eq!(rendered("fm"), "void Function(int)");
     }
 
     /// Generic function-type annotations capture the written shape the

@@ -953,7 +953,12 @@ impl<'a> Engine<'a> {
     /// `begin_optional_formal_parameters` inside the open capture: `[`
     /// opens the optional-positional group, `{` the named one. The same
     /// event arms the claim section when no capture is open — the outer
-    /// formal list's own group.
+    /// formal list's own group. The no-capture arm also latches the
+    /// frame's own list's section split for the local-function tear-off
+    /// capture (#2842): `[` records the required-formal count so far (the
+    /// optional-positional boundary), `{` poisons the capture (no
+    /// named-formal face). A nested list — a function-typed formal's own
+    /// parameters — is not the frame's.
     pub(crate) fn fn_capture_optional_group(&mut self, opener: &str) {
         if let Some(capture) = self.fn_type_capture.last_mut() {
             capture.section = if opener == "[" {
@@ -963,6 +968,26 @@ impl<'a> Engine<'a> {
             };
         } else {
             self.fn_formal_named_section = opener == "{";
+            // The frame's own list (#2842): the section split latches on
+            // the executable frame the formals bind into.
+            if self.formal_list_depth == 1 {
+                let named = opener == "{";
+                let required = (!named).then(|| {
+                    let mark = *self.frame_local_marks.last().unwrap_or(&0);
+                    let count = self.locals[mark..]
+                        .iter()
+                        .filter(|decl| matches!(decl.kind, LocalKind::Parameter { .. }))
+                        .count();
+                    u16::try_from(count).unwrap_or(u16::MAX)
+                });
+                if let Some(frame) = self.frames.last_mut() {
+                    if named {
+                        frame.formal_named = true;
+                    } else {
+                        frame.formal_optional_from = required;
+                    }
+                }
+            }
         }
     }
 

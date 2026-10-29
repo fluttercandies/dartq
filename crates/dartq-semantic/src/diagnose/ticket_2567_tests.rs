@@ -157,7 +157,11 @@ fn report_prefixed(other_src: &str, main_src: &str) -> FileReport {
 /// The corpus `??=` shape (`filename ??= path.basename(file.path)` —
 /// archive's zip encoder): a prefixed callee's concrete return types
 /// the assignment compatible — no invalid-assignment face, and the
-/// prefix itself never leaks as the RHS type face.
+/// prefix itself never leaks as the RHS type face. The trailing
+/// `field.missing` read reports the oracle's unchecked row (#2815's
+/// promotion discipline: a public, non-final field never promotes, even
+/// past a `??=` of non-null right-hand side), so the row set is exactly
+/// that one face.
 #[test]
 fn prefixed_callee_return_feeds_the_assign_rebind() {
     let report = report_prefixed(
@@ -171,8 +175,11 @@ fn prefixed_callee_return_feeds_the_assign_rebind() {
            }\n\
          }\n",
     );
-    assert!(
-        report.diagnostics.is_empty(),
+    assert_eq!(
+        messages(&report),
+        vec![
+            "unchecked_use_of_nullable_value: The property 'missing' can't be unconditionally accessed because the receiver can be 'null'."
+        ],
         "prefixed-callee ??= mis-reports: {:?}",
         messages(&report)
     );

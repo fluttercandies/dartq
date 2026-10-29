@@ -757,8 +757,8 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().begin_binary_pattern(operator);
     }
 
-    fn end_binary_pattern(&mut self, operator: Token) {
-        self.0.borrow_mut().end_binary_pattern(operator);
+    fn end_binary_pattern(&mut self, operator: Token, end: Token) {
+        self.0.borrow_mut().end_binary_pattern(operator, end);
     }
 
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {

@@ -295,13 +295,25 @@ pub enum Ev {
     SwitchExprBlockBegin,
     SwitchExprBlockEnd,
     SwitchExprCaseBegin,
-    SwitchExprCasePattern,
+    /// The arm's pattern region boundary (fired after the pattern parses,
+    /// carrying the arm's first token): a dead arm's whole-range row
+    /// anchors here (official `handleSwitchBeforeAlternative`'s
+    /// `checkUnreachableNode(case_)` — the first dead node is the arm
+    /// itself).
+    SwitchExprCasePattern {
+        begin: TokenSpan,
+    },
     SwitchExprCaseEnd {
         has_guard: bool,
         /// The alternative's first token: the matched-type row's clause
         /// anchor (the parser delivers no `case` keyword face on the
         /// switch-expression path).
         begin: TokenSpan,
+        /// The separator's start offset (the `,`/`}` directly after the
+        /// body expression): a dead arm's row ends here — the official
+        /// `flowEnd(case_)` spans `case.offset..case.end` and the case
+        /// node's end is the expression's end.
+        end: u32,
     },
     AssertBegin {
         span: TokenSpan,
@@ -394,7 +406,17 @@ pub enum Ev {
         span: TokenSpan,
     },
     AsEnd,
-    AsOperator,
+    /// The cast's completion (official `handleAssignmentExpression`-order:
+    /// `endAsOperatorType` then `handleAsOperator`). `type_head` is the
+    /// cast type's first token (the `as` operator's own token when
+    /// recovery parsed no type): the arm-close dead-row's anchor — a
+    /// Never-typed operand's exit inside a conditional arm leaves the cast
+    /// type the first dead node (`dead_code_verifier.dart`'s `_visitNode`
+    /// at the `TypeAnnotation` child), and the arm's `flowEnd`
+    /// (type_analyzer.dart:2588/2616) ends the row at the arm's own end.
+    AsOperator {
+        type_head: TokenSpan,
+    },
     Assign {
         plain: bool,
         /// `??=` (official `ifNullExpression_*` wiring on the
@@ -574,8 +596,26 @@ pub enum Ev {
     },
 
     // —— patterns ——
-    PatternBegin,
-    PatternEnd,
+    /// A pattern's open, at its first token (`(` of `(int i)`, `[` of
+    /// `[a, b]`). The span is the header-partition anchor: a pattern
+    /// assignment's target group starts at that token, so a C-style `for`
+    /// updater like `(i) = (i + 1)` partitions its whole assignment — the
+    /// unspanned `AssignedVarPattern`/`PatternAssign` events ride inside —
+    /// into the updater region (upstream for_resolver.dart resolves it
+    /// through the ordinary assignment machinery; the loop keeps its
+    /// condition's both arms and exits normally).
+    PatternBegin {
+        span: TokenSpan,
+        /// A parenthesized wrapper (`(p)`): grouping-transparent — flow
+        /// analysis never opens a pattern context for it, so the replay
+        /// gives it no depth, no context open and no cannot-fail evidence.
+        paren: bool,
+    },
+    PatternEnd {
+        /// The closing half of a parenthesized wrapper (see
+        /// [`Ev::PatternBegin`'s `paren`]): no depth to unwind.
+        paren: bool,
+    },
     /// An object pattern's head: `Some` in `case Some():`. The head type
     /// constrains the matched value (official `analyzeObjectPattern`'s
     /// `promoteForPattern`, shared type_analyzer.dart:1749-1772), so the
@@ -598,12 +638,24 @@ pub enum Ev {
     /// identical one (official `analyzeLogicalOrPattern` joins the
     /// branches' promotions; a name-level model spells the join only
     /// when both branches promote to the same face).
-    BinaryOrPatternBegin,
+    BinaryOrPatternBegin {
+        /// The `||` operator token: a right operand whose left branch
+        /// provably always matches walks dead (official
+        /// `handle_logicalOrPattern_afterLhs`'s `checkUnreachableNode`
+        /// under the left's failure state), and its row spans
+        /// `[operator, right-operand end)`
+        /// (dead_code_verifier.dart:321-323).
+        operator: TokenSpan,
+    },
     /// The alternation's close: a right branch that changed the
     /// scrutinee's model against the open's latch leaves a union the
     /// model cannot spell — the pre-pattern model restores (no
     /// promotion); an unchanged model keeps the shared promotion.
-    BinaryOrPatternEnd,
+    /// `end` is the right operand's end offset (its last token's end):
+    /// the operand row spans `[operator, right end)`.
+    BinaryOrPatternEnd {
+        end: u32,
+    },
     /// A pattern shape whose match can fail without pinning a named type:
     /// record, list, map, and relational patterns. At the top level of a
     /// refutable context the failure arm joins the pattern context's
@@ -611,7 +663,15 @@ pub enum Ev {
     /// the else arm reads unreachable and code after an `if (v case (a, b))`
     /// folds dead). Sub-patterns constrain their own field, not the
     /// scrutinee — the depth gate in the handler keeps them out.
-    ShapePattern,
+    ShapePattern {
+        /// The shape's kind: the empty-map cover face (`{}` with no
+        /// entries under sound flow) reads it — a shape whose head test
+        /// covers the matched type cannot fail, so it leaves the
+        /// unmatched chain dead for the following members (official
+        /// `analyzeMapPattern`'s `promoteForPattern`
+        /// `coversMatchedType`/`matchMayFailEvenIfCorrectType` gates).
+        shape: PatternShape,
+    },
     /// A null-check pattern (`sub?`): the matched arm promotes the matched
     /// value non-null; the failure arm (the null path) joins `unmatched`.
     NullCheckPattern,
@@ -634,6 +694,29 @@ pub enum Ev {
     },
     GuardBegin,
     GuardEnd,
+}
+
+/// The shape families a [`Ev::ShapePattern`] close can carry (official
+/// `analyzeRecordPattern` / `analyzeListPattern` / `analyzeMapPattern` /
+/// the relational dispatch — each answers its own may-fail question).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternShape {
+    /// `(fields...)` — a zero-field record over a record-compatible
+    /// matched type cannot fail (official `coversMatchedType` gate,
+    /// every sub-pattern irrefutable).
+    Record,
+    /// `[elements...]`.
+    List,
+    /// `{entries...}` — an empty map pattern under sound flow can only
+    /// fail on its type test (type_analyzer.dart:1296-1300).
+    Map {
+        /// The written entry count: the sound-flow empty-map face
+        /// (`matchMayFailEvenIfCorrectType` latches false at zero entries)
+        /// keys on it.
+        entries: u32,
+    },
+    /// `== e` / `< e` / …: always may fail (the comparison decides).
+    Relational,
 }
 
 /// Binary operators the flow engine distinguishes.
@@ -686,6 +769,7 @@ impl Ev {
             | Ev::Break { span, .. }
             | Ev::Continue { span, .. }
             | Ev::OtherExpr { span }
+            | Ev::PatternBegin { span, .. }
             | Ev::This { span } => Some(*span),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),
             Ev::Ident { token, .. } | Ev::Wildcard { token } => Some(*token),

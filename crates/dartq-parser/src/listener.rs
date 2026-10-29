@@ -698,7 +698,7 @@ pub trait ParserListener {
     fn handle_null_assert_pattern(&mut self, bang: Token) {}
     fn handle_null_check_pattern(&mut self, question: Token) {}
     fn begin_binary_pattern(&mut self, operator: Token) {}
-    fn end_binary_pattern(&mut self, operator: Token) {}
+    fn end_binary_pattern(&mut self, operator: Token, end: Token) {}
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {}
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {}
     /// A `key: value` map-pattern entry's key expression is about to be

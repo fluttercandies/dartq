@@ -996,10 +996,8 @@ pub fn seed_test_cache(recipe: &Recipe, root: &Path) {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            (name.starts_with("chunk")
-                && name.ends_with(".dill")
-                && !name.ends_with(".seed.dill"))
-            .then(|| (entry.metadata().map_or(0, |meta| meta.len()), path))
+            (name.starts_with("chunk") && name.ends_with(".dill") && !name.ends_with(".seed.dill"))
+                .then(|| (entry.metadata().map_or(0, |meta| meta.len()), path))
         })
         .max_by_key(|(size, _)| *size);
     let Some((size, kernel)) = largest else {

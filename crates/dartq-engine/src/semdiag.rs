@@ -535,14 +535,16 @@ pub(crate) fn build_index(facts: &FxHashMap<FileId, Arc<UnitFacts>>) -> ElementI
     index
 }
 
-/// The per-library `class-modifiers` posture (#1294): every live engine
-/// library's defining file's settled version (the `@dart` override applied)
-/// resolved through the feature registry (`class-modifiers`, `enabledIn
-/// 3.0.0`). Built once per analyze beside the element index and shared by
-/// reference through the whole fan-out; the graph's synthetic `dart:` face
-/// nodes have no engine-library mapping (`ResolvedGraph::graph_ids`) and
-/// stay absent — [`LibraryClassModifiers`] answers them the modern posture,
-/// which is what the platform libraries carry upstream.
+/// The per-library language-feature postures (#1294's `class-modifiers`,
+/// plus `wildcard-variables` for the dead_code wildcard gate): every live
+/// engine library's defining file's settled version (the `@dart` override
+/// applied) resolved through the feature registry (`class-modifiers`,
+/// `enabledIn 3.0.0`; `wildcard-variables`, `enabledIn 3.7.0`). Built once
+/// per analyze beside the element index and shared by reference through the
+/// whole fan-out; the graph's synthetic `dart:` face nodes have no
+/// engine-library mapping (`ResolvedGraph::graph_ids`) and stay absent —
+/// [`LibraryClassModifiers`] answers them the modern posture, which is what
+/// the platform libraries carry upstream.
 pub(crate) fn build_class_modifiers(
     state: &mut EngineState,
     resolved: &ResolvedGraph,
@@ -568,37 +570,42 @@ pub(crate) fn build_class_modifiers(
         let state = &*state;
         defining_files
             .par_iter()
-            .map(|&(_, defining)| class_modifiers_of(state, defining))
+            .map(|&(_, defining)| feature_posture_of(state, defining))
             .collect()
     };
     let mut posture = LibraryClassModifiers::default();
     for (&(graph_library, defining), resolved) in defining_files.iter().zip(resolved) {
-        let enabled = match resolved {
-            Posture::Cached(enabled) => enabled,
+        let (class_modifiers, wildcards) = match resolved {
+            Posture::Cached(class_modifiers, wildcards) => (class_modifiers, wildcards),
             Posture::Scanned(key, face) => {
-                let enabled = face.features.is_enabled(Feature::ClassModifiers);
+                let class_modifiers = face.features.is_enabled(Feature::ClassModifiers);
+                let wildcards = face.features.is_enabled(Feature::WildcardVariables);
                 state.cache_scanned(key, face);
-                enabled
+                (class_modifiers, wildcards)
             }
             Posture::Degraded(face) => {
                 state.residency_degrades.record(&[(defining, face)]);
-                true
+                (true, true)
             }
         };
-        posture.insert(graph_library, enabled);
+        posture.insert(graph_library, class_modifiers);
+        posture.insert_wildcards(graph_library, wildcards);
     }
     posture
 }
 
-/// `Feature::ClassModifiers` at `file`'s settled version: the persisted
+/// The feature posture bits at `file`'s settled version: the persisted
 /// scan face when cached, else a local re-derivation the caller persists
 /// under the facts key — the same miss shape the fold's
 /// own member loop and the apply-phase recompute follow, so a warm-start or
 /// evicted face is derived exactly once per analyze and later consumers
 /// hit.
-fn class_modifiers_of(state: &EngineState, file: FileId) -> Posture {
+fn feature_posture_of(state: &EngineState, file: FileId) -> Posture {
     if let Some(face) = state.settled_face(file) {
-        return Posture::Cached(face.features.is_enabled(Feature::ClassModifiers));
+        return Posture::Cached(
+            face.features.is_enabled(Feature::ClassModifiers),
+            face.features.is_enabled(Feature::WildcardVariables),
+        );
     }
     let content = state.residency[&file].content;
     let key = l1::facts_key(&state.grants(), file, content);
@@ -626,10 +633,10 @@ fn class_modifiers_of(state: &EngineState, file: FileId) -> Posture {
 }
 
 /// One defining file's posture answer, resolved off-thread and applied in
-/// order: a cached face's flag, a fresh scan face to persist, or a pairing
+/// order: a cached face's flags, a fresh scan face to persist, or a pairing
 /// miss's degrade row (the modern posture).
 enum Posture {
-    Cached(bool),
+    Cached(bool, bool),
     Scanned(FactsKey, ScannedFace),
     Degraded(&'static str),
 }

@@ -126,7 +126,6 @@ impl SwitchTracker {
             scrutinee,
             cases: Vec::new(),
             default_kw: None,
-            default_pos: None,
             pending_root: None,
             if_case_member_scrutinee: member_scrutinee,
             has_invalid_type: false,
@@ -175,7 +174,6 @@ impl SwitchTracker {
             scrutinee,
             cases: Vec::new(),
             default_kw: None,
-            default_pos: None,
             pending_root: None,
             if_case_member_scrutinee: None,
             has_invalid_type: false,
@@ -478,11 +476,6 @@ pub(crate) struct SwitchCtx {
     /// token, `constant_verifier.dart:1141-1148`); `None` when the switch
     /// has no default.
     pub(crate) default_kw: Option<SourceRange>,
-    /// The case-head count that precedes the first `default` member (the
-    /// chain split: the flow layer owns the default-driven dead members,
-    /// so the exhaustiveness-driven chain stops there); `None` when the
-    /// switch has no default.
-    pub(crate) default_pos: Option<usize>,
     /// The captured coverage of an in-flight switch-expression case (the
     /// space latches at the pattern's completion, the guard and anchor at
     /// the case's end). Statement cases capture in one step and leave this
