@@ -5,7 +5,10 @@
 //! (`diagnostics/<code>/…` → that code) and for every code appearing in
 //! either side's rows. It passes for an entry iff its rows for that entry
 //! match exactly on both sides; a case whose id prefix names an entry counts
-//! for it even when neither side reports the code.
+//! for it even when neither side reports the code. Prefix families resolve
+//! case-insensitively (the SDK corpus spells some lint families in camelCase
+//! where the registry folds them to lowercase), and census-verified corpus
+//! grouping ids (`exclusions`) get no row by design and never warn.
 
 use crate::materialize::LoadedCase;
 use crate::registry::{Entry, Kind, Registry};
@@ -75,11 +78,12 @@ pub fn compute(registry: &Registry, cases: &[LoadedCase], run: &Comparison) -> V
             }
         }
         for key in &attributed {
-            let Some(entry) = entries.get_mut(key) else {
-                // A code registered under neither the diagnostic nor the
-                // lint namespace has no status row; feature ids only ever
-                // arrive through case prefixes.
-                if !matches!(key, (Kind::Feature, _)) && !known_code(&entries, &key.1) {
+            let Some(entry) = resolve(&entries, key).and_then(|k| entries.get_mut(&k)) else {
+                // A code registered under neither the diagnostic nor the lint
+                // namespace has no status row; feature ids only ever arrive
+                // through case prefixes. Census-verified corpus grouping ids
+                // are accounted exclusions, not gaps.
+                if is_unregistered(&entries, key) {
                     unregistered.insert(key.1.clone());
                 }
                 continue;
@@ -104,7 +108,7 @@ pub fn compute(registry: &Registry, cases: &[LoadedCase], run: &Comparison) -> V
     if !unregistered.is_empty() {
         let sample: Vec<&String> = unregistered.iter().take(5).collect();
         eprintln!(
-            "warn: {} codes in rows match no registry entry (no status row), e.g. {}",
+            "warn: {} case codes/families match no registry entry (no status row), e.g. {}",
             unregistered.len(),
             sample
                 .iter()
@@ -148,6 +152,28 @@ fn known_code(entries: &BTreeMap<(Kind, String), Entry>, code: &str) -> bool {
     entries
         .keys()
         .any(|(_, id)| id == code)
+}
+
+/// The registry key an attributed key lands on: an exact hit, else a
+/// case-folded hit (the SDK corpus spells some lint families in camelCase
+/// where the registry folds them to lowercase).
+fn resolve(entries: &BTreeMap<(Kind, String), Entry>, key: &(Kind, String)) -> Option<(Kind, String)> {
+    if entries.contains_key(key) {
+        return Some(key.clone());
+    }
+    let folded = key.1.to_lowercase();
+    if folded != key.1 && entries.contains_key(&(key.0, folded.clone())) {
+        return Some((key.0, folded));
+    }
+    None
+}
+
+/// Whether a registry-missing attributed key is a genuine accounting gap
+/// (warned) rather than a designed exclusion.
+fn is_unregistered(entries: &BTreeMap<(Kind, String), Entry>, key: &(Kind, String)) -> bool {
+    !matches!(key, (Kind::Feature, _))
+        && !known_code(entries, &key.1)
+        && !crate::exclusions::is_excluded(&key.1)
 }
 
 fn rows_for<'a>(rows: &'a [Row], code: &str) -> Vec<&'a Row> {
@@ -566,5 +592,60 @@ mod tests {
         assert!(parse("nonsense").is_err());
         assert!(parse("diagnostic\tx\t1\t2\t3\t4\t5\tbogus").is_err());
         assert!(parse("kind\tx\t1\t2\t3\t4\t5\tgreen").is_err());
+    }
+
+    #[test]
+    fn camel_case_family_resolves_to_folded_registry_entry() {
+        let reg = Registry::load(
+            "",
+            "RuleMeta { name: \"prefer_iterable_wheretype\", group: Group::Standalone },\n",
+            "features:\n",
+        )
+        .expect("registry");
+        let cases = vec![loaded("lints/prefer_iterable_whereType/t", "var x = 1;\n")];
+        let run = Comparison::new(
+            BTreeMap::from([("lints/prefer_iterable_whereType/t".to_string(), Expected::Rows(vec![]))]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let map = stats_map(&compute(&reg, &cases, &run));
+        assert_eq!(map["lint/prefer_iterable_wheretype"], (1, 1, 0, 0, 0, "green"));
+        assert!(!map.contains_key("lint/prefer_iterable_whereType"));
+    }
+
+    #[test]
+    fn grouping_label_family_is_excluded_not_warned() {
+        // `constructor_body` is a census-verified grouping label: no
+        // registry entry, cases emit other codes, no warn, no status row.
+        assert!(crate::exclusions::is_excluded("constructor_body"));
+        let reg = registry();
+        let entries = &reg.entries;
+        let key = (Kind::Diagnostic, "constructor_body".to_string());
+        assert!(resolve(entries, &key).is_none());
+        assert!(!is_unregistered(entries, &key));
+        // The same shape with a non-excluded unknown code is a genuine gap.
+        let unknown = (Kind::Diagnostic, "totally_unknown_code".to_string());
+        assert!(resolve(entries, &unknown).is_none());
+        assert!(is_unregistered(entries, &unknown));
+        // Feature ids stay outside the warn regardless.
+        let feature = (Kind::Feature, "feat_x".to_string());
+        assert!(!is_unregistered(entries, &feature));
+    }
+
+    #[test]
+    fn case_folded_row_code_resolves() {
+        let reg = Registry::load(
+            "C\tcode_a\tX\tY\tZ\ttrue\tm\tf\n",
+            "RuleMeta { name: \"no_runtimetype_tostring\", group: Group::Standalone },\n",
+            "features:\n",
+        )
+        .expect("registry");
+        let entries = &reg.entries;
+        let key = (Kind::Lint, "no_runtimeType_toString".to_string());
+        assert_eq!(resolve(entries, &key), Some((Kind::Lint, "no_runtimetype_tostring".to_string())));
+        // Exact hits win without folding.
+        let exact = (Kind::Diagnostic, "code_a".to_string());
+        assert_eq!(resolve(entries, &exact), Some(exact.clone()));
+        assert_eq!(resolve(entries, &(Kind::Diagnostic, "code_A".to_string())), Some(exact));
     }
 }

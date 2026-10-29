@@ -17,6 +17,7 @@ mod analyze_json;
 mod case;
 mod dart;
 mod docs;
+mod exclusions;
 mod features_extract;
 mod lints_extract;
 mod manifest;
