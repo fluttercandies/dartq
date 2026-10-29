@@ -162,6 +162,18 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// `LocalVariableDeclaration` (:1011-1050) inserts on a statement
     /// start — a reserved non-statement word (`var class = 1;`) keeps the
     /// tolerant consume face, exactly like upstream.
+    ///
+    /// `MetadataReference` and its continuation flavors (:1055-1120): the
+    /// keyword is never eaten as the annotation name when it heads a
+    /// statement, class member, or top-level declaration — the synthetic
+    /// name splices in front of it so the annotation carries an empty name
+    /// and the keyword stays for the declaration/statement parse (oracle
+    /// partial_code/annotation `@ assert (true);` / `@ var x;`:
+    /// `missing_identifier` at the keyword, `undefined_annotation` on the
+    /// empty name). `ImportPrefixDeclaration` branch 3 (:706-716): a
+    /// declaration head after `as` splices a synthetic prefix (`import
+    /// 'a.dart' as class A {}` — `;` anchored at `as`, the class parses at
+    /// top level).
     fn reserved_name_recovery_at(
         &self,
         context: crate::listener::IdentifierContext,
@@ -189,6 +201,27 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             }
             crate::listener::IdentifierContext::LocalVariableDeclaration => {
                 self.looks_like_statement_start_at(0)
+            }
+            crate::listener::IdentifierContext::MetadataReference
+            | crate::listener::IdentifierContext::MetadataContinuation
+            | crate::listener::IdentifierContext::MetadataContinuationAfterTypeArguments => {
+                self.looks_like_statement_start_at(0)
+                    || self.looks_like_start_of_next_top_level_declaration_at(0)
+            }
+            crate::listener::IdentifierContext::ImportPrefixDeclaration => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+                    && !matches!(
+                        self.cursor.look_kind(1),
+                        TokenKind::Semicolon
+                            | TokenKind::Eof
+                            | TokenKind::Keyword(
+                                Keyword::If
+                                    | Keyword::Show
+                                    | Keyword::Hide
+                                    | Keyword::Deferred
+                                    | Keyword::As
+                            )
+                    )
             }
             _ => false,
         }
@@ -252,16 +285,36 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // `library enum;` and `int class = 42;` take the
         // `expected_identifier_but_got_keyword` face (oracle
         // issue_48371_prime1 / keyword_named_top_level_fields line 9).
-        if matches!(
-            peek.kind,
-            TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
-        ) && matches!(
-            context,
-            crate::listener::IdentifierContext::LibraryName
-                | crate::listener::IdentifierContext::TopLevelVariableDeclaration
-                | crate::listener::IdentifierContext::Combinator
-                | crate::listener::IdentifierContext::LocalVariableDeclaration
-        ) && self.reserved_name_recovery_at(context)
+        // Reserved words route every name-inserting context through the
+        // recovery template; the import-prefix position additionally takes
+        // the insert for BUILT-IN top-level heads before the built-in name
+        // face — `ImportPrefixIdentifierContext` branch 3
+        // (identifier_context_impl.dart:706-716) precedes branch 2, and the
+        // oracle carries `missing_identifier` for `as set` / `as import` /
+        // `as mixin M {}` (partial_code/import_directive), while the
+        // branch-2 face survives when the follower continues the clause
+        // (`as mixin;`).
+        let keyword_name_insert = match peek.kind {
+            TokenKind::Keyword(kw) => match kw.style() {
+                dartq_scanner::KeywordStyle::Reserved => matches!(
+                    context,
+                    crate::listener::IdentifierContext::LibraryName
+                        | crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                        | crate::listener::IdentifierContext::Combinator
+                        | crate::listener::IdentifierContext::LocalVariableDeclaration
+                        | crate::listener::IdentifierContext::MetadataReference
+                        | crate::listener::IdentifierContext::MetadataContinuation
+                        | crate::listener::IdentifierContext::MetadataContinuationAfterTypeArguments
+                        | crate::listener::IdentifierContext::ImportPrefixDeclaration
+                ),
+                dartq_scanner::KeywordStyle::BuiltIn => {
+                    context == crate::listener::IdentifierContext::ImportPrefixDeclaration
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if keyword_name_insert && self.reserved_name_recovery_at(context)
         {
             self.report(msg::missing_identifier(), peek.span);
             let id = self
@@ -779,7 +832,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             if synthetic {
                 // Scanner-synthesized closer parked at the wrong spot (EOF
                 // for an unclosed `(`): relocate it (:5035-5037).
-                return self.move_synthetic_close(open, close_id, TokenKind::CloseParen, ")");
+                return self.move_synthetic_close(open, TokenKind::CloseParen, ")");
             }
             let at = self.peek_span();
             self.report(msg::expected_token(")"), at);
@@ -804,17 +857,26 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// the relocated offset (it reads `begin.endGroup.charOffset`); the
     /// enclosing parse resumes at the current token. The begin id latches
     /// [`Self::unmatched_reported`] so the parse-end pass skips the pair.
+    ///
+    /// The relocation point latches the spill mark: tokens stranded behind
+    /// it (a run of closers/commas the enclosing jumps consume silently)
+    /// are the spill run, and the mark arms the ensureSemicolon
+    /// relocation-anchor override — a construct that resumes here and
+    /// consumes nothing real beyond it anchors past the mark (sii-probes
+    /// double_dollar: the `;` on the resumed `$$` head), while a recovery
+    /// that mints its own zero-width tail walks back instead
+    /// (oracle for_each_statement in_block: the body `;` on the iterable's
+    /// `}`, not the resume token).
     pub(crate) fn move_synthetic_close(
         &mut self,
         open: TokenSpan,
-        close_id: crate::token_id::TokenId,
         kind: TokenKind,
         lexeme: &'static str,
     ) -> TokenSpan {
-        self.spill_after = Some(self.span_of(close_id).range.offset);
         let at = self.peek_span();
         self.report_unmatched_row(lexeme, at);
         self.unmatched_reported.push(open.id);
+        self.spill_after = Some(at.range.offset);
         let id = self.cursor.insert_synthetic(kind, at.range.offset);
         self.cursor.advance();
         self.span_of(id)
@@ -1041,41 +1103,44 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// Three official details live here. The report anchors on
     /// `findPreviousNonZeroLengthToken(token)` (`parser_impl.dart:5106`,
     /// helper at `:11400`) — the last consumed token, walked back over
-    /// zero-width synthetics (an inserted identifier in front of the
-    /// insertion point must not capture the anchor) — and the diag spans
-    /// that token, so `void f() { x }` reports at the `x`, offset 11
-    /// length 1. The message text is the shared `EXPECTED_TOKEN` problem
-    /// text `Expected to find ';'.`: the 3.13.1 oracle's machine output for
-    /// this face (`dart analyze --format=machine` probe); the 3.15 source
-    /// passes `diag.expectedAfterButGot` (`:5107`), which surfaces as the
-    /// same analyzer shared code. Finally the inserted `;` drains
-    /// everything queued in front of it, so the parse resumes at the token
-    /// the official stream carries as `token.next`.
+    /// zero-width synthetics — and the diag spans that token, so
+    /// `void f() { x }` reports at the `x`, offset 11 length 1. The
+    /// walk-back crosses every zero-width inserted token, including a
+    /// relocated scanner closer the recovery consumed — but when a
+    /// relocation (an adopted closer or a spill mark) resumed the parse
+    /// ahead of the construct's tail and the construct consumed nothing
+    /// real beyond it, the frozen oracle anchors past the relocation on the
+    /// resume token instead (`findNonZeroLengthToken` over the resume
+    /// point, `util.dart`; the #2024 drain pins and sii-probes
+    /// double_dollar) — while a recovery that mints its own zero-width tail
+    /// after the resume point ends the walk on the construct's real tail
+    /// (`f() { for (var a in {} }` anchors the body `;` on the iterable's
+    /// `}`: the missing-identifier insert is the walk's starting synthetic).
+    /// The message text is the shared `EXPECTED_TOKEN` problem text
+    /// `Expected to find ';'.`: the 3.13.1 oracle's machine output for this
+    /// face (`dart analyze --format=machine` probe); the 3.15 source passes
+    /// `diag.expectedAfterButGot` (`:5107`), which surfaces as the same
+    /// analyzer shared code. Finally the inserted `;` drains everything
+    /// queued in front of it, so the parse resumes at the token the
+    /// official stream carries as `token.next`.
     pub(crate) fn ensure_semicolon(&mut self) -> TokenSpan {
         if let Some(id) = self.cursor.opt_kind(TokenKind::Semicolon) {
             return self.span_of(id);
         }
         let at = self.peek_span();
         let mut anchor = self.last_consumed_anchor();
-        // #2024 recovery anchor: a relocation (an adopted scanner closer or
-        // the spill mark of a primary bracket error) moves the parse past
-        // the walked-back token, and the recovery row anchors on the token
-        // the parse resumed at — the official walk-back starts from the
-        // construct's last token, which after a relocation is the resume
-        // token (upstream Dart SDK source,
-        // pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart,
-        // `ensureSemicolon`/`rewriteAndRecover` anchor behavior; frozen
-        // oracle 0c9fda4b L85 anchors the `;` row on the token following
-        // the recovery point).
-        if self
-            .spill_after
-            .is_some_and(|mark| anchor.range.offset <= mark)
+        // Relocation override: only while the construct consumed nothing
+        // beyond the relocation — a parser-inserted tail (id past the real
+        // table) means the walk-back legitimately crosses it.
+        let minted_tail = self
+            .cursor
+            .last_consumed_id()
+            .is_some_and(|id| (id as usize) >= self.table.len());
+        if !minted_tail
+            && self
+                .spill_after
+                .is_some_and(|mark| anchor.range.offset <= mark)
         {
-            // `findNonZeroLengthToken` over the resume token (upstream Dart
-            // SDK source, pkg/_fe_analyzer_shared/lib/src/parser/util.dart):
-            // a zero-width synthetic at the resume point must not capture
-            // the anchor — the official walk-back never returns a
-            // zero-width token.
             let mut n = 0usize;
             let mut forward = at;
             while forward.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {

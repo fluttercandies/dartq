@@ -1081,7 +1081,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // declaration-rest recovery consumes the enclosing block's `}` on the
         // way, so the stall point is detected up front: the first `}` inside
         // the group.
-        self.report_for_parts_stall(left_paren);
+        // Up-front stall detection (:10369-10373), latched not reported: the
+        // official landing report belongs to the C-style
+        // `parseForLoopPartsRest` alone — the for-in tail reports through
+        // `ensureCloseParen`/`moveSynthetic` instead and the oracle carries
+        // no `unexpectedToken` on those shapes (partial_code/for_each_statement
+        // `await for (A a in break; }`: `)` at the iterable, body parses on).
+        let stall = self.for_parts_stall_span(left_paren);
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             ExprStmtOrDecl::PatternHead { pattern_keyword } => {
@@ -1098,6 +1104,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                             pattern_keyword,
                             equals,
                         );
+                    self.report_stall(stall);
                     self.parse_for_rest(for_kw, left_paren);
                 } else {
                     self.parse_for_in_rest(
@@ -1125,6 +1132,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         Some((identifier, identifier_pos)),
                     );
                 } else {
+                    self.report_stall(stall);
                     self.parse_for_rest(for_kw, left_paren);
                 }
             }
@@ -1136,8 +1144,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// :10369-10373): with a scanner-pinned synthetic `(` closer the parts
     /// parse can never land on the group's closer, and the declaration-rest
     /// recovery would consume the enclosing block's `}` on the way, so the
-    /// first `}` inside the group is reported before it is eaten.
-    pub(crate) fn report_for_parts_stall(&mut self, left_paren: TokenSpan) {
+    /// first `}` inside the group is located before it is eaten. Returns the
+    /// stall span without reporting — only the C-style rest arm reports it
+    /// ([`Self::report_stall`]).
+    pub(crate) fn for_parts_stall_span(&mut self, left_paren: TokenSpan) -> Option<TokenSpan> {
         if let Some(end_id) = self.cursor.table_matching_end(left_paren.id)
             && self.cursor.resolve(end_id).1
         {
@@ -1148,12 +1158,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     break;
                 }
                 if kind == TokenKind::CloseCurly {
-                    let stall = self.look_span_at(n);
-                    self.report(msg::unexpected_token(self.cursor.lexeme(stall.id)), stall);
-                    break;
+                    return Some(self.look_span_at(n));
                 }
                 n += 1;
             }
+        }
+        None
+    }
+
+    /// Reports a latched [`Self::for_parts_stall_span`] row.
+    pub(crate) fn report_stall(&mut self, stall: Option<TokenSpan>) {
+        if let Some(stall) = stall {
+            self.report(msg::unexpected_token(self.cursor.lexeme(stall.id)), stall);
         }
     }
 

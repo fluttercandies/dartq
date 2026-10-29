@@ -2084,10 +2084,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             close
         };
         // Same up-front stall detection as the statement form
-        // (`report_for_parts_stall`): a scanner-pinned synthetic `(` closer
-        // would otherwise be consumed by the declaration-rest recovery
-        // before `parse_for_loop_parts_rest` could report the landing.
-        self.report_for_parts_stall(left_paren);
+        // (`for_parts_stall_span`), latched not reported: only the C-style
+        // rest arm carries the official landing row — the for-in tail
+        // reports through `ensureCloseParen`/`moveSynthetic`.
+        let stall = self.for_parts_stall_span(left_paren);
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             crate::statements::ExprStmtOrDecl::PatternHead { pattern_keyword } => {
@@ -2101,6 +2101,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             pattern_keyword,
                             equals,
                         );
+                    self.report_stall(stall);
                     self.parse_for_loop_parts_rest(for_kw, left_paren);
                     false
                 } else {
@@ -2132,6 +2133,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     );
                     true
                 } else {
+                    self.report_stall(stall);
                     self.parse_for_loop_parts_rest(for_kw, left_paren);
                     false
                 }

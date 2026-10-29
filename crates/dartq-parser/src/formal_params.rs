@@ -730,13 +730,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // name the tail ensure consumes; a GFT member keeps the
                 // tail-ensure face (its handleNoName gate is
                 // `beforeInlineFunctionType == null`-gated,
-                // parser_impl.dart:2343).
+                // parser_impl.dart:2343). A `=>` behind the suffix is the
+                // lambda-as-parameter shape (`forEach((final value) => e)`,
+                // lints corpus doc snippets): the parameter list closes at
+                // the arrow — `expected_token ')'` anchors on it
+                // (:2347's ensure consumed the name slot at the `(`), so the
+                // synthetic name belongs here too.
                 if !in_function_type {
                     let post = self
                         .cursor
                         .table_matching_end(self.peek_id())
                         .map(|end| self.kind_at(self.offset_of(end) + 1));
-                    if post.is_some_and(Self::is_formal_boundary_kind) {
+                    if post.is_some_and(|kind| {
+                        Self::is_formal_boundary_kind(kind) || kind == TokenKind::Function
+                    }) {
                         phantom_name = Some(at);
                     }
                 }
