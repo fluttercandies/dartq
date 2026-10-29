@@ -48,5 +48,6 @@ mod ticket_2807_extension_type_pair;
 mod ticket_2862_tests;
 mod ticket_2863_tests;
 mod ticket_2880_tests;
+mod ticket_2884_tests;
 mod type_compute;
 mod types;

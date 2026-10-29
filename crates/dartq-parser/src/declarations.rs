@@ -426,6 +426,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// `parseClassModifiers` + `_handleModifiersForClassDeclaration`
     /// bookkeeping. The cursor is rewound to `modifier_start`, the walk
     /// consumes the modifiers, and the captured tokens are returned.
+    ///
+    /// Duplicate modifiers never fall through into the class-name lane: the
+    /// walk consumes every occurrence, records the first, and reports one
+    /// `duplicated_modifier` row per later occurrence (upstream
+    /// `_parseModifiers`, modifier_context.dart:351-389 — duplicate recovery
+    /// in the per-keyword handlers `_parseAbstract` :406, `_parseAugment`
+    /// :437, `_parseConst` :457, `_parseCovariant` :491, `_parseExternal`
+    /// :529, `_parseFinal` :543, `_parseLate` :575, `_parseRequired` :598,
+    /// `_parseStatic` :626, `_parseVar` :645). The const/external/
+    /// extraneous faces anchor on the FIRST recorded token and fire after
+    /// the walk, in the official `parseClassModifiers` order (:125-135:
+    /// const, external, covariant, late, required, static, var).
     fn parse_class_modifiers(
         &mut self,
         modifier_start: crate::cursor::CursorMark,
@@ -435,66 +447,106 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let mut mods = ClassModifiers::default();
         loop {
             match self.peek_kind() {
-                TokenKind::Keyword(Keyword::Abstract) if mods.abstract_kw.is_none() => {
+                TokenKind::Keyword(Keyword::Abstract) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if mods.final_kw.is_some() || mods.covariant.is_some() {
-                        let earlier = mods
-                            .final_kw
-                            .map(|t| self.cursor.lexeme(t.id))
-                            .or_else(|| mods.covariant.map(|t| self.cursor.lexeme(t.id)))
-                            .unwrap_or("var");
-                        self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                    if mods.abstract_kw.is_some() {
+                        self.report(msg::duplicated_modifier("abstract"), t);
+                    } else {
+                        if mods.final_kw.is_some() || mods.covariant.is_some() {
+                            let earlier = mods
+                                .final_kw
+                                .map(|t| self.cursor.lexeme(t.id))
+                                .or_else(|| mods.covariant.map(|t| self.cursor.lexeme(t.id)))
+                                .unwrap_or("var");
+                            self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                        }
+                        mods.abstract_kw = Some(t);
                     }
-                    mods.abstract_kw = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Augment) if mods.augment.is_none() => {
+                TokenKind::Keyword(Keyword::Augment) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    mods.augment = Some(t);
+                    if mods.augment.is_some() {
+                        self.report(msg::duplicated_modifier("augment"), t);
+                    } else {
+                        mods.augment = Some(t);
+                    }
                 }
-                TokenKind::Keyword(Keyword::Final) if mods.final_kw.is_none() => {
+                TokenKind::Keyword(Keyword::Final) => {
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if mods.final_kw.is_some() {
+                        self.report(msg::duplicated_modifier("final"), t);
+                    } else {
+                        if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("final", "late"), t);
+                        }
+                        mods.final_kw = Some(t);
+                    }
+                }
+                TokenKind::Keyword(Keyword::Late) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     if mods.late_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("final", "late"), t);
+                        self.report(msg::duplicated_modifier("late"), t);
+                    } else {
+                        mods.late_kw = Some(t);
                     }
-                    mods.final_kw = Some(t);
-                }
-                TokenKind::Keyword(Keyword::Late) if mods.late_kw.is_none() => {
-                    let t = self.peek_span();
-                    self.cursor.advance();
-                    mods.late_kw = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Const) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::const_class(), t);
+                    if mods.const_kw.is_some() {
+                        self.report(msg::duplicated_modifier("const"), t);
+                    } else {
+                        mods.const_kw = Some(t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::External) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::external_class(), t);
+                    if mods.external.is_some() {
+                        self.report(msg::duplicated_modifier("external"), t);
+                    } else {
+                        mods.external = Some(t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Covariant) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("covariant"), t);
+                    if mods.covariant.is_some() {
+                        self.report(msg::duplicated_modifier("covariant"), t);
+                    } else {
+                        mods.covariant = Some(t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Required) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("required"), t);
+                    if mods.required.is_some() {
+                        self.report(msg::duplicated_modifier("required"), t);
+                    } else {
+                        mods.required = Some(t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Static) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("static"), t);
+                    if mods.static_kw.is_some() {
+                        self.report(msg::duplicated_modifier("static"), t);
+                    } else {
+                        mods.static_kw = Some(t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Var) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("var"), t);
+                    if mods.var_kw.is_some() {
+                        self.report(msg::duplicated_modifier("var"), t);
+                    } else {
+                        mods.var_kw = Some(t);
+                    }
                 }
                 // Pseudo-keywords already captured by the dispatch walk
                 // (`sealed`/`base`/`interface`): consume them here so the
@@ -505,6 +557,30 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 _ => break,
             }
         }
+        // Post-walk faces on the first recorded tokens (`parseClassModifiers`
+        // modifier_context.dart:125-135; `reportTopLevelModifierError`
+        // :676-700 dispatches const/external onto the `class` keyword).
+        if let Some(t) = mods.const_kw {
+            self.report(msg::const_class(), t);
+        }
+        if let Some(t) = mods.external {
+            self.report(msg::external_class(), t);
+        }
+        if let Some(t) = mods.covariant {
+            self.report(msg::extraneous_modifier("covariant"), t);
+        }
+        if let Some(t) = mods.late_kw {
+            self.report(msg::extraneous_modifier("late"), t);
+        }
+        if let Some(t) = mods.required {
+            self.report(msg::extraneous_modifier("required"), t);
+        }
+        if let Some(t) = mods.static_kw {
+            self.report(msg::extraneous_modifier("static"), t);
+        }
+        if let Some(t) = mods.var_kw {
+            self.report(msg::extraneous_modifier("var"), t);
+        }
         let _ = keyword;
         mods
     }
@@ -513,6 +589,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// ModifierError` shape: const/external are reported against the
     /// declaration keyword). Also the base walk of the directive modifier
     /// families (`directives::parse_directive_modifiers`).
+    ///
+    /// Duplicate modifiers never fall through into the name/declaration
+    /// lane: every occurrence is consumed, the first is recorded, and each
+    /// later one reports exactly one `duplicated_modifier` row (upstream
+    /// `_parseModifiers`, modifier_context.dart:351-389 over
+    /// `parseEnumModifiers` :140, `parseMixinModifiers` :168,
+    /// `parseExtensionModifiers` :154, `parseTopLevelKeywordModifiers` :183
+    /// and `parseTypedefModifiers` :314 — duplicate recovery in the
+    /// per-keyword handlers `_parseAbstract` :406, `_parseAugment` :437,
+    /// `_parseConst` :457, `_parseCovariant` :491, `_parseExternal` :529,
+    /// `_parseFinal` :543, `_parseLate` :575, `_parseRequired` :598,
+    /// `_parseStatic` :626, `_parseVar` :645). The recorded first tokens
+    /// keep the family rows (`final enum`, `final mixin`, the directive
+    /// `final`/`augment` extraneous rows) anchored on the first occurrence.
     pub(crate) fn parse_declaration_modifiers(
         &mut self,
         modifier_start: crate::cursor::CursorMark,
@@ -525,58 +615,107 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 TokenKind::Keyword(Keyword::Const) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("const"), t);
+                    if mods.const_kw.is_some() {
+                        self.report(msg::duplicated_modifier("const"), t);
+                    } else {
+                        mods.const_kw = Some(t);
+                        self.report(msg::extraneous_modifier("const"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::External) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    match self.cursor.lexeme(keyword.id) {
-                        "enum" => self.report(msg::external_enum(), t),
-                        "typedef" => self.report(msg::external_typedef(), t),
-                        _ => self.report(msg::extraneous_modifier("external"), t),
+                    if mods.external.is_some() {
+                        self.report(msg::duplicated_modifier("external"), t);
+                    } else {
+                        mods.external = Some(t);
+                        match self.cursor.lexeme(keyword.id) {
+                            "enum" => self.report(msg::external_enum(), t),
+                            "typedef" => self.report(msg::external_typedef(), t),
+                            _ => self.report(msg::extraneous_modifier("external"), t),
+                        }
                     }
                 }
                 TokenKind::Keyword(Keyword::Abstract) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("abstract"), t);
+                    if mods.abstract_kw.is_some() {
+                        self.report(msg::duplicated_modifier("abstract"), t);
+                    } else {
+                        mods.abstract_kw = Some(t);
+                        self.report(msg::extraneous_modifier("abstract"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Covariant) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("covariant"), t);
+                    if mods.covariant.is_some() {
+                        self.report(msg::duplicated_modifier("covariant"), t);
+                    } else {
+                        mods.covariant = Some(t);
+                        self.report(msg::extraneous_modifier("covariant"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Late) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("late"), t);
+                    if mods.late_kw.is_some() {
+                        self.report(msg::duplicated_modifier("late"), t);
+                    } else {
+                        mods.late_kw = Some(t);
+                        self.report(msg::extraneous_modifier("late"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Required) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("required"), t);
+                    if mods.required.is_some() {
+                        self.report(msg::duplicated_modifier("required"), t);
+                    } else {
+                        mods.required = Some(t);
+                        self.report(msg::extraneous_modifier("required"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Static) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("static"), t);
+                    if mods.static_kw.is_some() {
+                        self.report(msg::duplicated_modifier("static"), t);
+                    } else {
+                        mods.static_kw = Some(t);
+                        self.report(msg::extraneous_modifier("static"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Var) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("var"), t);
+                    if mods.var_kw.is_some() {
+                        self.report(msg::duplicated_modifier("var"), t);
+                    } else {
+                        mods.var_kw = Some(t);
+                        self.report(msg::extraneous_modifier("var"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Final) => {
                     // Captured: the declaration family decides whether `final`
                     // is an error (`final enum`, `final mixin`) or silently
                     // accepted (extension, official parseExtensionModifiers).
-                    mods.final_kw = Some(self.peek_span());
+                    let t = self.peek_span();
                     self.cursor.advance();
+                    if mods.final_kw.is_some() {
+                        self.report(msg::duplicated_modifier("final"), t);
+                    } else {
+                        mods.final_kw = Some(t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Augment) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    mods.augment = Some(t);
+                    if mods.augment.is_some() {
+                        self.report(msg::duplicated_modifier("augment"), t);
+                    } else {
+                        mods.augment = Some(t);
+                    }
                 }
                 // Pseudo-keywords already captured (and reported where
                 // invalid) by the dispatch walk: consume and move on.
@@ -2634,20 +2773,39 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 }
 
 /// Modifier tokens captured by the shared declaration-modifier walk.
+/// `augment`/`final_kw` are consumed by the declaration families; the rest
+/// are first-token records driving the duplicate recovery (the second
+/// occurrence reports `duplicated_modifier` and stays unrecorded).
 #[derive(Default)]
 pub(crate) struct DeclModifiers {
     pub(crate) augment: Option<TokenSpan>,
     pub(crate) final_kw: Option<TokenSpan>,
+    const_kw: Option<TokenSpan>,
+    external: Option<TokenSpan>,
+    abstract_kw: Option<TokenSpan>,
+    covariant: Option<TokenSpan>,
+    late_kw: Option<TokenSpan>,
+    required: Option<TokenSpan>,
+    static_kw: Option<TokenSpan>,
+    var_kw: Option<TokenSpan>,
 }
 
-/// Modifier tokens captured by the class-modifier walk.
+/// Modifier tokens captured by the class-modifier walk. Unlisted modifiers
+/// are first-token records for the post-walk faces and the duplicate
+/// recovery (the second occurrence reports `duplicated_modifier` and stays
+/// unrecorded).
 #[derive(Default)]
 struct ClassModifiers {
     abstract_kw: Option<TokenSpan>,
     augment: Option<TokenSpan>,
+    const_kw: Option<TokenSpan>,
+    covariant: Option<TokenSpan>,
+    external: Option<TokenSpan>,
     final_kw: Option<TokenSpan>,
     late_kw: Option<TokenSpan>,
-    covariant: Option<TokenSpan>,
+    required: Option<TokenSpan>,
+    static_kw: Option<TokenSpan>,
+    var_kw: Option<TokenSpan>,
 }
 
 fn msg_block_kind_class() -> crate::message::BlockKind {
