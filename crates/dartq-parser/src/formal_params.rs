@@ -659,6 +659,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // .next!` (parser_impl.dart:2326), the suffix opener, not the name.
         let mut inline_anchor: Option<TokenSpan> = None;
         let mut type_param = TypeParamOrArg::None;
+        // The name-less `(`-suffix face (official OPEN_PAREN arm,
+        // parser_impl.dart:2233): a formal whose parameter list follows with
+        // no name in between — `void (int x)`, `(int x)` — reports
+        // `missing_identifier` at the `(` (the formalParameterDeclaration
+        // keep-set branch) and carries a synthetic name; a this/super
+        // receiver (`this.field(int value)`) carries the receiver's name.
+        let mut phantom_name: Option<TokenSpan> = None;
+        let mut step_receiver_head = false;
         let before_probe = self.cursor.mark();
         if this_keyword.is_none() {
             let tentative_name = is_identifier(self.peek_kind());
@@ -700,9 +708,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     inline_name = Some(name);
                     before_inline_function_type = Some(name);
                 }
-            } else if self.peek_kind() == TokenKind::OpenParen
-                && matches!(type_info, TypeInfo::NoType)
-            {
+            } else if self.peek_kind() == TokenKind::OpenParen {
                 if let Some(t) = var_final_or_const
                     && member_kind != MemberKind::PrimaryConstructor
                 {
@@ -710,11 +716,30 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // walk-end gate owns the `extraneous_modifier` half.
                     self.report(msg::function_typed_parameter_var(), t);
                 }
-                // Untyped shape: `before` is the `(` itself, which is also
-                // the upstream anchor (`beforeType.next!`).
+                // `before` is the `(` itself, which is also the upstream
+                // anchor (`beforeType.next!`).
                 let at = self.peek_span();
                 before_inline_function_type = Some(at);
                 inline_anchor = Some(at);
+                // A parameter-list boundary behind the suffix means there is
+                // no name slot at all — the name-less face: the row anchors
+                // on the `(` with a synthetic name (oracle
+                // `void f(void (int x)) {}` / `void f((int x)) {}`: one
+                // `missing_identifier` at the `(`). An identifier means the
+                // record-type parameter reading (`((int, int) r)`), whose
+                // name the tail ensure consumes; a GFT member keeps the
+                // tail-ensure face (its handleNoName gate is
+                // `beforeInlineFunctionType == null`-gated,
+                // parser_impl.dart:2343).
+                if !in_function_type {
+                    let post = self
+                        .cursor
+                        .table_matching_end(self.peek_id())
+                        .map(|end| self.kind_at(self.offset_of(end) + 1));
+                    if post.is_some_and(Self::is_formal_boundary_kind) {
+                        phantom_name = Some(at);
+                    }
+                }
             }
             // The unified parse below re-walks from the type start (official
             // `parseType(beforeType)`). An untyped walked formal re-walks
@@ -725,6 +750,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             } else {
                 self.cursor.reset(before_probe);
             }
+        } else if self.peek_kind() == TokenKind::OpenParen
+            || (is_identifier(self.peek_kind())
+                && self.cursor.look_kind(1) == TokenKind::OpenParen)
+        {
+            // Function-typed field formal `String this.field(int value)`:
+            // the official OPEN_PAREN arm consumes the suffix with the
+            // receiver's name as the tentative name (`beforeInlineFunction
+            // Type` = the name token, parser_impl.dart:2229/:2233). The
+            // receiver walk leaves the cursor on the name.
+            let name = self.peek_span();
+            inline_name = Some(name);
+            before_inline_function_type = Some(name);
+            inline_anchor = Some(self.look_span_at(1));
+            step_receiver_head = true;
         }
 
         let mut var_or_final = None;
@@ -774,8 +813,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         if let Some(before) = before_inline_function_type {
             // Official :2294-2331: re-walk the return type, then the
             // name-relative type variables, then the parameter list.
+            if step_receiver_head {
+                // The receiver walk left the cursor past the type; the
+                // re-walk restarts at the type head and steps the receiver
+                // head (`this`/`super` + `.`) before the name.
+                self.cursor.reset(before_type);
+            }
             self.listener.begin_function_typed_formal_parameter(before);
             type_info.parse_type(self);
+            if step_receiver_head {
+                self.cursor.advance(); // `this`/`super`
+                self.cursor.advance(); // `.`
+            }
             if self.peek_kind() != TokenKind::Lt && self.peek_kind() != TokenKind::OpenParen {
                 // Step over the name onto its `<...>`/`(` suffix.
                 self.cursor.advance();
@@ -854,7 +903,30 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // parameters in function types keep the 3.15 arm this crate
         // already pinned, and `this.`/`super.` formals (`FieldInitializer`
         // context) always ensure a name (parser_impl.dart:2371).
-        let name = if let Some(n) = inline_name {
+        let name = if let Some(at) = phantom_name {
+            // Name-less `(`-suffix face: one `missing_identifier` at the `(`
+            // and a synthetic name spliced in front of the already-parsed
+            // suffix (official ensureIdentifier's keep-set branch — the
+            // insert-without-consuming posture — reached at :2349 after the
+            // suffix parse).
+            self.report(msg::missing_identifier(), at);
+            let id = self
+                .cursor
+                .insert_synthetic(TokenKind::Identifier, at.range.offset);
+            // drain_to consumes through the synthetic (the ensureSemicolon
+            // idiom), leaving the cursor on the post-group token.
+            self.cursor.drain_to(id);
+            let span = self.span_of(id);
+            self.listener
+                .handle_identifier(span, IdentifierContext::FormalParameterDeclaration);
+            span
+        } else if let Some(n) = inline_name {
+            if step_receiver_head {
+                // The official receiver face consumes the name through
+                // ensureIdentifier (:2349), which fires its identifier
+                // event — after the type and parameter events, like here.
+                self.listener.handle_identifier(n, name_context);
+            }
             n
         } else if !(before_inline_function_type.is_some()
             || name_context != IdentifierContext::FormalParameterDeclaration
@@ -950,5 +1022,22 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             parameter_kind,
             member_kind,
         );
+    }
+
+    /// Whether `kind` closes a formal's parameter list with nothing after
+    /// it that could still name the formal: the name-less `(`-suffix face
+    /// (the token classes the parameter-list loop itself accepts as the
+    /// group tail).
+    fn is_formal_boundary_kind(kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Comma
+                | TokenKind::CloseParen
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+                | TokenKind::Eq
+                | TokenKind::Colon
+                | TokenKind::Eof
+        )
     }
 }

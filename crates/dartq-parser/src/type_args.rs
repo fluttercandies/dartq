@@ -809,15 +809,27 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     };
                     n += len;
                 }
-                if self.kind_at(offset + n) != TokenKind::OpenParen {
-                    return 0;
-                }
-                let Some(end) = self.cursor.table_matching_end(self.real_id(offset + n)) else {
-                    return 0;
-                };
-                n = self.offset_of(end) - offset + 1;
-                if self.kind_at(offset + n) == TokenKind::Question {
-                    n += 1;
+                if self.kind_at(offset + n) == TokenKind::OpenParen {
+                    let Some(end) = self.cursor.table_matching_end(self.real_id(offset + n))
+                    else {
+                        return 0;
+                    };
+                    n = self.offset_of(end) - offset + 1;
+                    if self.kind_at(offset + n) == TokenKind::Question {
+                        n += 1;
+                    }
+                } else {
+                    // Bare `Function` head — not a GFT intro: the official
+                    // computeType(required) reads it as `simpleType` /
+                    // `simpleNullableType` (type_info.dart:305-330), so the
+                    // skip covers the head plus its nullable `?`. Without
+                    // this arm a type-argument entry like `List<Function?>`
+                    // scanned as length 0, the whole `<...>` group was
+                    // rejected, and the `?` fell to the expression layer as
+                    // a conditional (the expected-token ':' cascade).
+                    if self.kind_at(offset + n) == TokenKind::Question {
+                        n += 1;
+                    }
                 }
                 // computeRest loops the whole `Function <...>? (...) ?`
                 // suffix chain (`Function() Function()` is ONE type,

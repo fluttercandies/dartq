@@ -1,6 +1,6 @@
 //! Recovery primitive tests.
 
-use super::collector::{Collector, latest_features, setup};
+use super::collector::{Collector, latest_features, scan_ok, setup};
 
 #[test]
 fn ensure_identifier_synthesizes_on_error() {
@@ -695,4 +695,105 @@ fn pin_report_dedup_identical_row_once_same_triple_different_text_distinct() {
         ],
         "one ';' row and the distinct-text ',' row, in report order"
     );
+}
+
+// —— #2779 recovery-cluster pins (census trio: expected_token /
+// missing_identifier / missing_const_final_var_or_type) ————————————————
+
+/// Whole-unit parse errors as sorted `(code, start, end)` UTF-16 spans.
+fn unit_error_spans(source: &'static str) -> Vec<(String, u32, u32)> {
+    let (table, text) = scan_ok(source);
+    let collector: &'static mut Collector = Box::leak(Box::new(Collector::default()));
+    let mut p = crate::Parser::new(text, table, latest_features(), &mut *collector);
+    p.parse_unit();
+    let mut errors = collector.errors.clone();
+    errors.sort();
+    errors
+}
+
+/// Type-argument entry `Function?` (bare `Function` head + nullable `?`):
+/// the group scan's `skipType` covers the head and its `?` (official
+/// computeType(required) `simpleNullableType`, type_info.dart:305-330), so
+/// the `<...>` group is a real type-argument group and the `?` never falls
+/// to the expression layer. Frozen census faces (nnbd static_errors
+/// family, one shared preamble line failing 198+ cases):
+/// `List<Function?> funcList = [];` in a body used to cascade
+/// `missing_identifier` at the `>` plus `missing_identifier` +
+/// `expected_token ':'` at the `;`.
+#[test]
+fn pin_type_arg_bare_function_question_is_a_type() {
+    for source in [
+        "void main() {\n  List<Function?> x = [];\n}\n",
+        "void f(List<Function?> x) {}\n",
+        "void main() {\n  List<List<Function?>> x = [];\n}\n",
+        "void main() {\n  Map<String, Function?> w = {};\n}\n",
+        "typedef F = List<Function?>;\n",
+    ] {
+        assert!(
+            unit_error_spans(source).is_empty(),
+            "{source:?} must parse clean"
+        );
+    }
+    // The plain entry stays a type (fast-shape and bare-head forms).
+    for source in [
+        "void main() {\n  List<Function> x = [];\n}\n",
+        "void main() {\n  Function? f;\n}\n",
+    ] {
+        assert!(
+            unit_error_spans(source).is_empty(),
+            "{source:?} must parse clean"
+        );
+    }
+}
+
+/// Name-less `(`-suffix formals (official OPEN_PAREN arm +
+/// formalParameterDeclaration keep-set ensure, parser_impl.dart:2233/:2349):
+/// one `missing_identifier` anchored on the `(` that opens the formal's
+/// parameter list, the suffix consumed, no further rows. Frozen census rows
+/// (FragmentOffsetTest formalParameterFragment_missingName{,2}):
+/// `void f(void (int x)) {}` → 2:13, `void f((int x)) {}` → 2:8.
+#[test]
+fn pin_formal_missing_name_before_params_anchors_on_the_open_paren() {
+    assert_eq!(
+        unit_error_spans("void f(void (int x)) {}\n"),
+        vec![("missing_identifier".to_string(), 12, 13)],
+        "typed face: the row anchors on the parameter-list opener"
+    );
+    assert_eq!(
+        unit_error_spans("void f((int x)) {}\n"),
+        vec![("missing_identifier".to_string(), 7, 8)],
+        "untyped face: the row anchors on the parameter-list opener"
+    );
+    assert_eq!(
+        unit_error_spans("void f(void (int x), int y) {}\n"),
+        vec![("missing_identifier".to_string(), 12, 13)],
+        "the parameter list continues after the synthetic name"
+    );
+    // The typed true-junk name slot keeps its handleNoName face (the
+    // pre-#2779 pin): the junk stays for the tail ensureCloseParen, no
+    // missing_identifier.
+    assert_eq!(
+        unit_error_spans("void f(int 5) {}\n"),
+        vec![("expected_token".to_string(), 11, 12)],
+    );
+}
+
+/// Function-typed field formals (official OPEN_PAREN arm over the receiver
+/// walk, parser_impl.dart:2211/:2233): `this.field(int value)` consumes the
+/// parameter list as the function-type suffix and stays silent — census
+/// face NonErrorResolverTest fieldFormalParameter_functionTyped_named,
+/// previously `expected_token '}'` at the `(`.
+#[test]
+fn pin_function_typed_field_formal_parses_silently() {
+    for source in [
+        "class C {\n  C({String this.field(int value)});\n}\n",
+        "class C {\n  C({String this.field(int value) = f});\n}\n",
+        "class C {\n  C({this.field(int value)});\n}\n",
+    ] {
+        assert_eq!(
+            unit_error_spans(source),
+            vec![],
+            "{source:?} must parse clean"
+        );
+    }
 }
