@@ -273,7 +273,11 @@ mod tests {
         let (code, ranges) = strip(marked).expect("strips");
         assert_eq!(code, "case A(a: int a_b):\ncase A(a: int a_b?):\n");
         assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[0].range, 14..17, "`a_b` starts after `case A(a: int `");
+        assert_eq!(
+            ranges[0].range,
+            14..17,
+            "`a_b` starts after `case A(a: int `"
+        );
         assert_eq!(ranges[0].text, "a_b");
         assert_eq!(ranges[1].text, "a_b");
         let second_line = "case A(a: int a_b):\n".len() as u32;

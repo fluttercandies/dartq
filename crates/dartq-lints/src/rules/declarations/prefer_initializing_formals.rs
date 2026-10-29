@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, container_name_token};
+use super::{Check, NodeKind, PayloadField, RuleSpec, container_name_token};
 use crate::rules::{NONE_TOKEN, token_seq_equal};
 use dartq_semantic::model::Ty;
 
@@ -195,13 +195,14 @@ fn face_initializers<'a>(
         }
         let entry = window.end - 1;
         if c.kind(entry) != NodeKind::Assignment
-            || c.field_token(entry, PayloadField::Operator).map(|op| c.lexeme(op)) != Some("=")
+            || c.field_token(entry, PayloadField::Operator)
+                .map(|op| c.lexeme(op))
+                != Some("=")
         {
             continue;
         }
         let pieces = assignment_pieces(c, initializer, entry);
-        let Some((field, param, start_row, end_row)) = convertible_assignment(c, &pieces)
-        else {
+        let Some((field, param, start_row, end_row)) = convertible_assignment(c, &pieces) else {
             continue;
         };
         out.push((field, param, start_row, end_row));
@@ -249,8 +250,7 @@ fn face_body<'a>(c: &Check<'a>, body: u32, out: &mut Vec<(&'a str, &'a str, u32,
     for container in containers {
         for assignment in c.collect_direct(container) {
             if c.kind(assignment) != NodeKind::Assignment
-                || c
-                    .field_token(assignment, PayloadField::Operator)
+                || c.field_token(assignment, PayloadField::Operator)
                     .map(|op| c.lexeme(op))
                     != Some("=")
             {
@@ -481,12 +481,10 @@ fn finish(
         if field_name != param_name {
             continue;
         }
-        let Some(&(_, param_written)) = params.iter().find(|(name, _)| *name == param_name)
-        else {
+        let Some(&(_, param_written)) = params.iter().find(|(name, _)| *name == param_name) else {
             continue;
         };
-        let Some(&(_, field_written)) = fields.iter().find(|(name, _)| *name == field_name)
-        else {
+        let Some(&(_, field_written)) = fields.iter().find(|(name, _)| *name == field_name) else {
             continue;
         };
         // The subtype gate (upstream :163): the resolved declared
@@ -497,8 +495,7 @@ fn finish(
             Some(true) => {}
             Some(false) => continue,
             None => {
-                let (Some(param_type), Some(field_type)) = (param_written, field_written)
-                else {
+                let (Some(param_type), Some(field_type)) = (param_written, field_written) else {
                     continue; // an unwritten type has no comparable spelling
                 };
                 if !token_seq_equal(c, param_type, field_type) {

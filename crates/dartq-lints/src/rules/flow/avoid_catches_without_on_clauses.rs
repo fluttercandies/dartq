@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, last_child};
+use super::{Check, NodeKind, PayloadField, RuleSpec, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_catches_without_on_clauses.dart:30-104`
 /// — a bare `catch` clause (no `on`) reports at the `catch` keyword
@@ -85,8 +85,7 @@ fn check(c: &mut Check<'_>) {
     for row in window.clone() {
         // The collapse keeps one rethrow kind (the statement form
         // covers `=> rethrow` bodies too).
-        if c.kind(row) == NodeKind::RethrowStatement
-            && nested_catch.is_none_or(|first| row < first)
+        if c.kind(row) == NodeKind::RethrowStatement && nested_catch.is_none_or(|first| row < first)
         {
             valid = true;
             break;
@@ -172,9 +171,8 @@ fn shadowed_by_nearer_binder(c: &Check<'_>, row: u32, catch_clause: u32, name: &
             NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
                 c.collect_direct(next).into_iter().any(|kid| {
                     c.kind(kid) == NodeKind::DeclaredVariablePattern
-                        && c.field(kid, PayloadField::Variable).is_some_and(|v| {
-                            v != crate::rules::NONE_TOKEN && c.lexeme(v) == name
-                        })
+                        && c.field(kid, PayloadField::Variable)
+                            .is_some_and(|v| v != crate::rules::NONE_TOKEN && c.lexeme(v) == name)
                 })
             }
             _ => false,
@@ -205,8 +203,7 @@ fn statement_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
         }
         NodeKind::PatternVarDeclStatement => c.children(stmt).any(|descendant| {
             c.kind(descendant) == NodeKind::DeclaredVariablePattern
-                && c
-                    .field(descendant, PayloadField::Variable)
+                && c.field(descendant, PayloadField::Variable)
                     .is_some_and(|v| v != crate::rules::NONE_TOKEN && c.lexeme(v) == name)
         }),
         NodeKind::LabeledStatement => c

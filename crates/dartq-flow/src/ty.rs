@@ -438,13 +438,18 @@ pub trait TypeOps {
 /// written `right` refuses, matching the raw-to-instantiated direction.
 pub(crate) fn name_args_subtype(left_args: u32, right_args: u32, arena: &[Vec<ArgTy>]) -> bool {
     let ls = arena.get(left_args as usize).map_or(&[][..], Vec::as_slice);
-    let rs = arena.get(right_args as usize).map_or(&[][..], Vec::as_slice);
+    let rs = arena
+        .get(right_args as usize)
+        .map_or(&[][..], Vec::as_slice);
     match (ls.is_empty(), rs.is_empty()) {
         (_, true) => true,
         (true, false) => false,
         (false, false) => {
             ls.len() == rs.len()
-                && ls.iter().zip(rs).all(|(a, b)| name_entry_subtype(a, b, arena))
+                && ls
+                    .iter()
+                    .zip(rs)
+                    .all(|(a, b)| name_entry_subtype(a, b, arena))
         }
     }
 }
@@ -479,8 +484,12 @@ pub(crate) fn name_args_admit(
     declared_args: u32,
     arena: &[Vec<ArgTy>],
 ) -> bool {
-    let ts = arena.get(tested_args as usize).map_or(&[][..], Vec::as_slice);
-    let ds = arena.get(declared_args as usize).map_or(&[][..], Vec::as_slice);
+    let ts = arena
+        .get(tested_args as usize)
+        .map_or(&[][..], Vec::as_slice);
+    let ds = arena
+        .get(declared_args as usize)
+        .map_or(&[][..], Vec::as_slice);
     match (ts.is_empty(), ds.is_empty()) {
         (_, true) => true,
         (true, false) => tested_base == Base::Never,

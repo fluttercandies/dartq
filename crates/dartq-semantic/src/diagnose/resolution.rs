@@ -68,7 +68,9 @@ impl<'a> Engine<'a> {
         // (`Predicate<String>` reads `bool Function(String)`); every other
         // arg-bearing use keeps the written shape.
         if args != ArgListId::EMPTY {
-            return self.fold_parameterized_alias(name, nullable, args).unwrap_or(ty);
+            return self
+                .fold_parameterized_alias(name, nullable, args)
+                .unwrap_or(ty);
         }
         let (mut head, mut head_nullable) = (name, nullable);
         for _ in 0..8 {
@@ -224,9 +226,7 @@ impl<'a> Engine<'a> {
             }
             _ => return None,
         };
-        if decl.kind != MicroKind::TypeAlias
-            || decl.type_params == 0
-            || decl.var_ty == Ty::UNKNOWN
+        if decl.kind != MicroKind::TypeAlias || decl.type_params == 0 || decl.var_ty == Ty::UNKNOWN
         {
             return None;
         }
@@ -274,7 +274,10 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|&arg| self.substitute_alias_rhs(arg, subst))
                     .collect();
-                self.boundary.args.borrow_mut().named(name, nullable, &substituted)
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &substituted)
             }
             Ty::Record { shape, nullable } => {
                 let (positional, named) = {
@@ -288,7 +291,9 @@ impl<'a> Engine<'a> {
                     .collect();
                 let named: Vec<(StringId, Ty)> = named
                     .iter()
-                    .map(|&(field_name, field)| (field_name, self.substitute_alias_rhs(field, subst)))
+                    .map(|&(field_name, field)| {
+                        (field_name, self.substitute_alias_rhs(field, subst))
+                    })
                     .collect();
                 self.boundary
                     .args
@@ -352,7 +357,10 @@ impl<'a> Engine<'a> {
                 args,
             } => {
                 let list: Vec<Ty> = self.boundary.pool().get(args).to_vec();
-                self.boundary.args.borrow_mut().named(name, own || nullable, &list)
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, own || nullable, &list)
             }
             Ty::Record {
                 shape,
@@ -451,12 +459,10 @@ impl<'a> Engine<'a> {
         // import prefix's own library, the same face `prefixed_container`
         // gives containers.
         if let Some((prefix, tail)) = self.split_prefixed_spelling(name) {
-            return match self.namespaces.lookup_prefixed(
-                self.graph,
-                self.lib,
-                prefix,
-                tail,
-            ) {
+            return match self
+                .namespaces
+                .lookup_prefixed(self.graph, self.lib, prefix, tail)
+            {
                 Lookup::Found(NamespaceEntry::Decl(owner)) => {
                     let decl = self.index.get(owner)?.decl(tail)?;
                     self.alias_decl_rhs(owner, decl)
@@ -490,7 +496,9 @@ impl<'a> Engine<'a> {
                     return None;
                 }
                 let file = self.graph.unit_files(libs[0]).iter().copied().find(|&f| {
-                    self.index.get(f).is_some_and(|unit| unit.decl(name).is_some())
+                    self.index
+                        .get(f)
+                        .is_some_and(|unit| unit.decl(name).is_some())
                 })?;
                 let decl = self.index.get(file)?.decl(name)?;
                 (file, decl)
@@ -1457,8 +1465,7 @@ impl<'a> Engine<'a> {
                 // `Receiver::Typed`'s written arguments substitute the
                 // container parameters the member's formals spell. `None`
                 // keeps the declared table byte-identical.
-                let env =
-                    recv_ty.and_then(|ty| self.member_recv_env(ty, container, &entry));
+                let env = recv_ty.and_then(|ty| self.member_recv_env(ty, container, &entry));
                 if let Some(env) = env {
                     return match entry.formals.as_deref() {
                         Some(formals) => Some(std::borrow::Cow::Owned(
@@ -1520,62 +1527,66 @@ impl<'a> Engine<'a> {
             return None;
         }
         let written: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
-        let mut map: Vec<(StringId, Ty)> = if let Some(params) =
-            self.bounds.container_params(container)
-        {
-            let names: Vec<StringId> = params.iter().map(|(param, ..)| *param).collect();
-            if names.len() != written.len() {
-                return None;
-            }
-            names.into_iter().zip(written).collect()
-        } else {
-            // A foreign container's parameters spell nowhere in this unit.
-            // The owner's element model carries the spellings in
-            // declaration order (`Container::type_param_names`, #2502) —
-            // freshly collected SDK faces and current persisted payloads
-            // zip the receiver's written arguments onto them directly, the
-            // exact pairing the oracle's receiver-type instantiation reads
-            // (`V putIfAbsent(K key, ...)` substitutes by the declaration
-            // `[K, V]`, never by the order the signature spells them).
-            let (found, owner) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                container,
-            )?;
-            if !found.type_param_names.is_empty() {
-                if found.type_param_names.len() != written.len() {
+        let mut map: Vec<(StringId, Ty)> =
+            if let Some(params) = self.bounds.container_params(container) {
+                let names: Vec<StringId> = params.iter().map(|(param, ..)| *param).collect();
+                if names.len() != written.len() {
                     return None;
                 }
-                found.type_param_names.iter().copied().zip(written).collect()
+                names.into_iter().zip(written).collect()
             } else {
-                // A pre-field persisted payload spells none — the legacy
-                // name-forced rule binds when the member's own signature
-                // spells exactly the declaring parameter set, in first-seen
-                // order (`Map<K,V>`'s `forEach(action(K,V))` spells `K`/`V`
-                // once each; `Iterable<E>`'s `fold` spells `E` in
-                // `combine`). A count mismatch — the member never names
-                // every parameter — keeps the under-report (the written
-                // arguments cannot pair).
-                let mut free: Vec<StringId> = Vec::new();
-                let mut collect = |ty: Ty| {
-                    self.member_free_params(ty, entry, owner, &mut free);
-                };
-                collect(entry.var_ty);
-                collect(entry.return_ty);
-                if let Some(formals) = entry.formals.as_deref() {
-                    for formal in formals.positional.iter().chain(formals.named.iter()) {
-                        collect(formal.ty);
+                // A foreign container's parameters spell nowhere in this unit.
+                // The owner's element model carries the spellings in
+                // declaration order (`Container::type_param_names`, #2502) —
+                // freshly collected SDK faces and current persisted payloads
+                // zip the receiver's written arguments onto them directly, the
+                // exact pairing the oracle's receiver-type instantiation reads
+                // (`V putIfAbsent(K key, ...)` substitutes by the declaration
+                // `[K, V]`, never by the order the signature spells them).
+                let (found, owner) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )?;
+                if !found.type_param_names.is_empty() {
+                    if found.type_param_names.len() != written.len() {
+                        return None;
                     }
+                    found
+                        .type_param_names
+                        .iter()
+                        .copied()
+                        .zip(written)
+                        .collect()
+                } else {
+                    // A pre-field persisted payload spells none — the legacy
+                    // name-forced rule binds when the member's own signature
+                    // spells exactly the declaring parameter set, in first-seen
+                    // order (`Map<K,V>`'s `forEach(action(K,V))` spells `K`/`V`
+                    // once each; `Iterable<E>`'s `fold` spells `E` in
+                    // `combine`). A count mismatch — the member never names
+                    // every parameter — keeps the under-report (the written
+                    // arguments cannot pair).
+                    let mut free: Vec<StringId> = Vec::new();
+                    let mut collect = |ty: Ty| {
+                        self.member_free_params(ty, entry, owner, &mut free);
+                    };
+                    collect(entry.var_ty);
+                    collect(entry.return_ty);
+                    if let Some(formals) = entry.formals.as_deref() {
+                        for formal in formals.positional.iter().chain(formals.named.iter()) {
+                            collect(formal.ty);
+                        }
+                    }
+                    if usize::from(found.type_params) != free.len() || free.len() != written.len() {
+                        return None;
+                    }
+                    free.into_iter().zip(written).collect()
                 }
-                if usize::from(found.type_params) != free.len() || free.len() != written.len() {
-                    return None;
-                }
-                free.into_iter().zip(written).collect()
-            }
-        };
+            };
         map.retain(|(param, _)| !entry.type_param_names.contains(param));
         (!map.is_empty()).then_some(map)
     }
@@ -1712,7 +1723,6 @@ impl<'a> Engine<'a> {
     /// member face (own-file container chain), the extension pool, enum
     /// synthesized members, then the scoped library lookup.
     pub(crate) fn resolve_bare(&self, name: StringId) -> (BareInfo, RefTarget) {
-
         // Innermost frame first: a pattern binder's var_types slot and a
         // tracked local resolve per-frame, so a binder shadowing an
         // outer SAME-NAMED local (`if (x case var x?)` rebinds `x` to the
@@ -2632,7 +2642,8 @@ impl<'a> Engine<'a> {
         if let Some(hit) = self.resolve_local(name) {
             let hit = hit as usize;
             self.locals[hit].uses += 1;
-            self.local_decl_at_read.insert(range.offset, self.locals[hit].range.offset);
+            self.local_decl_at_read
+                .insert(range.offset, self.locals[hit].range.offset);
             self.local_hits.insert(range.offset, hit as u32);
         }
         // The official self-reference exclusions (`_useIdentifierElement`):
@@ -3244,12 +3255,7 @@ impl<'a> Engine<'a> {
                 // at the same span: the whole `ConstructorFieldInitializer`
                 // node (`this = 0`), the keyword through the value's end.
                 let range = self.initializer_node_span(token.range);
-                self.emit(
-                    SemanticCode::InitializerForNonExistentField,
-                    range,
-                    "",
-                    "",
-                );
+                self.emit(SemanticCode::InitializerForNonExistentField, range, "", "");
             }
         }
         let recv = match self.container_context() {

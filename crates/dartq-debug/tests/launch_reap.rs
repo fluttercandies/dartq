@@ -22,7 +22,11 @@ fn failed_launches_reap_the_child() {
     let dir = std::env::temp_dir().join(format!("dartq-debug-launch-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     // A unique sleep duration tags the child in the process table.
-    let tag = format!("{}.{}", 600 + std::process::id() % 1000, std::process::id() % 97);
+    let tag = format!(
+        "{}.{}",
+        600 + std::process::id() % 1000,
+        std::process::id() % 97
+    );
     let silent = fake_dart(&dir, "silent-dart", &format!("exec sleep {tag}"));
     let exits = fake_dart(&dir, "exiting-dart", "echo no banner here\nexit 3");
 
@@ -41,14 +45,20 @@ fn failed_launches_reap_the_child() {
     let exited = DebugSession::launch(config);
     unsafe { std::env::remove_var("DARTQ_DART_BIN") };
 
-    assert!(matches!(timed_out, Err(Error::LaunchTimeout)), "got {:?}", timed_out.err());
+    assert!(
+        matches!(timed_out, Err(Error::LaunchTimeout)),
+        "got {:?}",
+        timed_out.err()
+    );
     let table = std::process::Command::new("ps")
         .args(["-Ao", "args"])
         .output()
         .expect("run ps");
     let table = String::from_utf8_lossy(&table.stdout);
     assert!(
-        !table.lines().any(|line| line.trim() == format!("sleep {tag}")),
+        !table
+            .lines()
+            .any(|line| line.trim() == format!("sleep {tag}")),
         "the silent child (`sleep {tag}`) must be killed and reaped"
     );
 

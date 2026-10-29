@@ -1,4 +1,7 @@
-use super::{Check, EXTERNAL_MEMBER_BIT, NodeKind, RuleSpec, constructor_name_part, container_name_node, modifier_keyword, type_name_echo};
+use super::{
+    Check, EXTERNAL_MEMBER_BIT, NodeKind, RuleSpec, constructor_name_part, container_name_node,
+    modifier_keyword, type_name_echo,
+};
 
 /// Official: `pkg/linter/lib/src/rules/use_primary_constructors.dart` —
 /// a class or enum without any constructor reports at the container

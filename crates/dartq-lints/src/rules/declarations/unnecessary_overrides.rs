@@ -1,5 +1,8 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
-use crate::rules::{MemberQuery, has_doc_comment, member_annotations, member_is_concrete, member_matches, same_file_ancestors, token_seq_equal, type_before};
+use super::{Check, NodeKind, PayloadField, RuleSpec, member_declaration_name, operator_name};
+use crate::rules::{
+    MemberQuery, has_doc_comment, member_annotations, member_is_concrete, member_matches,
+    same_file_ancestors, token_seq_equal, type_before,
+};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_overrides.dart`
 /// — an override whose body is exactly a super forward with the same
@@ -35,11 +38,8 @@ use crate::rules::{MemberQuery, has_doc_comment, member_annotations, member_is_c
 /// annotation names (the element-face posture). The noSuchMethod and
 /// doc-comment skips (:76-79) port directly. Message:
 /// `diagnostic.g.dart` `unnecessaryOverrides`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_overrides",
-    &[NodeKind::Method],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("unnecessary_overrides", &[NodeKind::Method], check,);
 
 fn check(c: &mut Check<'_>) {
     // Static skip (:56) — header ModSet bit (static is bit 3).
@@ -106,8 +106,9 @@ fn check(c: &mut Check<'_>) {
                                 let inherited_op = operator_name(c, member)
                                     .and_then(|row| c.field_token(row, PayloadField::Name))
                                     .map(|t| c.lexeme(t));
-                                let own_op =
-                                    c.field_token(name_row, PayloadField::Name).map(|t| c.lexeme(t));
+                                let own_op = c
+                                    .field_token(name_row, PayloadField::Name)
+                                    .map(|t| c.lexeme(t));
                                 inherited_op.is_some() && inherited_op == own_op
                             }
                             None => !member_matches(c, member, query, &name).is_empty(),
@@ -638,9 +639,7 @@ fn arguments_match_parameters(
         pos_args.push(c.lexeme(c.head_token(rows[i])));
         i += 1;
     }
-    if pos_args.len() != positional.len()
-        || pos_args.iter().zip(positional).any(|(a, p)| a != p)
-    {
+    if pos_args.len() != positional.len() || pos_args.iter().zip(positional).any(|(a, p)| a != p) {
         return false;
     }
     if named_args.len() != named.len() {

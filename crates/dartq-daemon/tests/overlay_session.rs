@@ -218,7 +218,11 @@ fn two_agents_edit_and_delta_over_one_base() {
         1,
     );
     h.step(
-        &request(14, "dartq/check", json!({"paths": ["lib"], "agent_id": "A"})),
+        &request(
+            14,
+            "dartq/check",
+            json!({"paths": ["lib"], "agent_id": "A"}),
+        ),
         1,
     );
     let error = answer_error(&h, 14);
@@ -234,7 +238,11 @@ fn two_agents_edit_and_delta_over_one_base() {
         1,
     );
     h.step(
-        &request(16, "dartq/check", json!({"paths": ["lib"], "agent_id": "B"})),
+        &request(
+            16,
+            "dartq/check",
+            json!({"paths": ["lib"], "agent_id": "B"}),
+        ),
         1,
     );
     assert_eq!(answer_error(&h, 16)["code"], -32602);
@@ -522,7 +530,10 @@ fn tombstone_excludes_view_and_commit_deletes() {
         ),
         1,
     );
-    h.step(&request(9, "dartq/overlay.commit", json!({"agent_id": "T"})), 1);
+    h.step(
+        &request(9, "dartq/overlay.commit", json!({"agent_id": "T"})),
+        1,
+    );
     assert!(
         !main_dart.exists(),
         "the committed tombstone deletes the worktree file"

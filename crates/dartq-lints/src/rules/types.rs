@@ -301,7 +301,7 @@ fn written_display(c: &Check<'_>, row: u32) -> String {
 pub(crate) mod avoid_shadowing_type_parameters {
     use dartq_parser::MemberKind;
 
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_shadowing_type_parameters.dart:38-152`
     /// — a type parameter whose name equals a type parameter of an enclosing
@@ -318,23 +318,22 @@ pub(crate) mod avoid_shadowing_type_parameters {
     /// feature face. Message: `diagnostic.g.dart`
     /// `avoidShadowingTypeParameters`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_shadowing_type_parameters",
-    &[
+        "avoid_shadowing_type_parameters",
+        &[
             NodeKind::LocalFunctionDeclaration,
             NodeKind::FunctionExpression,
             NodeKind::Method,
             NodeKind::FunctionType,
             NodeKind::FunctionTypedFormalParameter,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         // Static methods have nothing above them to shadow (:76-85).
         if c.kind(node) == NodeKind::Method
-            && c.field(node, PayloadField::DeclarationKind)
-                == Some(MemberKind::StaticMethod as u32)
+            && c.field(node, PayloadField::DeclarationKind) == Some(MemberKind::StaticMethod as u32)
         {
             return;
         }
@@ -431,7 +430,10 @@ pub(crate) mod avoid_shadowing_type_parameters {
 pub(crate) mod library_private_types_in_public_api {
     use crate::rules::type_before;
 
-    use super::{PayloadField, Check, NodeKind, RuleSpec, first_type_child, member_name_typed, record_type_fields, type_argument_rows, type_arguments_row};
+    use super::{
+        Check, NodeKind, PayloadField, RuleSpec, first_type_child, member_name_typed,
+        record_type_fields, type_argument_rows, type_arguments_row,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/library_private_types_in_public_api.dart:41-246`
     /// — a `_`-private named type used in a public API signature reports at
@@ -452,10 +454,10 @@ pub(crate) mod library_private_types_in_public_api {
     /// under-report). Message: `diagnostic.g.dart`
     /// `libraryPrivateTypesInPublicApi`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "library_private_types_in_public_api",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+        "library_private_types_in_public_api",
+        &[NodeKind::CompilationUnit],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1095,10 +1097,10 @@ pub(crate) mod avoid_annotating_with_dynamic {
     /// documented face); the augmentation guard walks to the first
     /// declaration-family ancestor, false at a block boundary (:66-76).
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_annotating_with_dynamic",
-    &[NodeKind::FormalParameter],
-    check,
-);
+        "avoid_annotating_with_dynamic",
+        &[NodeKind::FormalParameter],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1160,7 +1162,9 @@ mod tests {
     fn run_semantic(source: &str, rule: &str) -> Vec<crate::engine::Lint> {
         use dartq_language::{FeatureSet, LanguageVersion};
         use dartq_parser::ParserFeatures;
-        use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
+        use dartq_resolution::{
+            LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces,
+        };
         use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
         use dartq_source::{FileTable, StringTable};
 
@@ -2461,10 +2465,10 @@ pub(crate) mod prefer_constructors_over_static_methods {
     /// are not creations of the class. Message: `diagnostic.g.dart`
     /// `preferConstructorsOverStaticMethods`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_constructors_over_static_methods",
-    &[NodeKind::Method],
-    check,
-);
+        "prefer_constructors_over_static_methods",
+        &[NodeKind::Method],
+        check,
+    );
 
     /// The static `ModSet` bit (bridge `mod_bits`).
     const STATIC_BIT: u16 = 1 << 3;
@@ -2675,7 +2679,10 @@ pub(crate) mod strict_top_level_inference {
 
     use crate::engine::Check;
     use crate::registry::RuleSpec;
-    use crate::rules::{MemberQuery, get_set_token, initialized_identifier_name, member_annotations, same_file_ancestors, utf16_token_span, variables_declaration_keyword};
+    use crate::rules::{
+        MemberQuery, get_set_token, initialized_identifier_name, member_annotations,
+        same_file_ancestors, utf16_token_span, variables_declaration_keyword,
+    };
 
     const PROBLEM: &str = "Missing type annotation.";
     const ADD_TYPE_CORRECTION: &str = "Try adding a type annotation.";
@@ -2717,16 +2724,16 @@ pub(crate) mod strict_top_level_inference {
     /// polarity ports: a function-typed formal (:176-186) or a formal
     /// with a written type (:183) stops the whole parameter list.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "strict_top_level_inference",
-    &[
+        "strict_top_level_inference",
+        &[
             NodeKind::TopLevelMethod,
             NodeKind::Method,
             NodeKind::Constructor,
             NodeKind::Factory,
             NodeKind::VariablesDeclaration,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3631,7 +3638,10 @@ pub(crate) mod type_annotate_public_apis {
     use crate::engine::Check;
     use crate::registry::RuleSpec;
     use crate::rules::expressions::{query_site, static_type_faces as faces};
-    use crate::rules::{first_child, get_set_token, initialized_identifier_name, is_just_underscores, type_before, variables_declaration_keyword};
+    use crate::rules::{
+        first_child, get_set_token, initialized_identifier_name, is_just_underscores, type_before,
+        variables_declaration_keyword,
+    };
 
     use super::member_name_typed;
 
@@ -3671,8 +3681,8 @@ pub(crate) mod type_annotate_public_apis {
     /// word) is not a `FunctionTypeAlias` and never enters the face.
     /// Message: `diagnostic.g.dart` `typeAnnotatePublicApis`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "type_annotate_public_apis",
-    &[
+        "type_annotate_public_apis",
+        &[
             NodeKind::TopLevelFields,
             NodeKind::Fields,
             NodeKind::TopLevelMethod,
@@ -3681,8 +3691,8 @@ pub(crate) mod type_annotate_public_apis {
             NodeKind::Constructor,
             NodeKind::PrimaryConstructor,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -3840,8 +3850,7 @@ pub(crate) mod type_annotate_public_apis {
         }
         let is_setter = get_set_token(c, node) == Some("set");
         let index_setter = c.kind(name) == NodeKind::OperatorName
-            && c
-                .field(name, PayloadField::Name)
+            && c.field(name, PayloadField::Name)
                 .is_some_and(|op| c.lexeme(op) == "[]=");
         if return_type_missing(c, node, name) && !is_setter && !index_setter {
             let token = match c.kind(name) {
@@ -4090,7 +4099,9 @@ pub(crate) mod type_annotate_public_apis {
 
 pub(crate) mod prefer_void_to_null {
     use super::{Check, NodeKind, RuleSpec, member_name_typed, prefixed_type};
-    use crate::rules::{MemberQuery, body_members, member_matches, same_file_ancestors, type_before};
+    use crate::rules::{
+        MemberQuery, body_members, member_matches, same_file_ancestors, type_before,
+    };
 
     /// The `augment` `ModSet` bit (bridge `mod_bits`).
     const AUGMENT_BIT: u16 = 1 << 1;
@@ -4117,11 +4128,8 @@ pub(crate) mod prefer_void_to_null {
     /// resolves through the prefix upstream and stays silent here (the
     /// documented under-report face). Message: `diagnostic.g.dart`
     /// `preferVoidToNull`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_void_to_null",
-    &[NodeKind::Type],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("prefer_void_to_null", &[NodeKind::Type], check,);
 
     fn check(c: &mut Check<'_>) {
         let row = c.node();
@@ -4342,11 +4350,7 @@ pub(crate) mod no_raw_types {
     /// (`List<dynamic>`); a function/record bound renders as a
     /// `Function`/`(...)` placeholder. Message: `diagnostic.g.dart`
     /// `noRawTypes`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_raw_types",
-    &[NodeKind::Type],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("no_raw_types", &[NodeKind::Type], check,);
 
     fn check(c: &mut Check<'_>) {
         let row = c.node();
@@ -4399,7 +4403,10 @@ pub(crate) mod no_raw_types {
 }
 
 pub(crate) mod always_specify_types {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, raw_generic_face, type_arguments_row};
+    use super::{
+        Check, NodeKind, PayloadField, RuleSpec, TYPE_FAMILY, first_type_child, raw_generic_face,
+        type_arguments_row,
+    };
     use crate::rules::{is_just_underscores, variables_declaration_keyword};
 
     const PROBLEM: &str = "Missing type annotation.";
@@ -4434,15 +4441,15 @@ pub(crate) mod always_specify_types {
     /// and prefixed spellings); the `@optionalTypeArgs` and `is`-parent
     /// exemptions follow the upstream faces.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "always_specify_types",
-    &[
+        "always_specify_types",
+        &[
             NodeKind::Type,
             NodeKind::VariablesDeclaration,
             NodeKind::FormalParameter,
             NodeKind::DeclaredVariablePattern,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -4577,7 +4584,8 @@ pub(crate) mod always_specify_types {
         let row = c.node();
         // Receiver formals are the Field/Super formal visitors upstream and
         // never enter (:135 registration).
-        if c.field(row, PayloadField::Receiver).unwrap_or(crate::rules::NONE_TOKEN)
+        if c.field(row, PayloadField::Receiver)
+            .unwrap_or(crate::rules::NONE_TOKEN)
             != crate::rules::NONE_TOKEN
         {
             return;
@@ -4636,7 +4644,10 @@ pub(crate) mod always_specify_types {
 }
 
 pub(crate) mod avoid_futureor_void {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows, type_arguments_row, type_sibling_before};
+    use super::{
+        Check, NodeKind, PayloadField, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows,
+        type_arguments_row, type_sibling_before,
+    };
     use crate::rules::NONE_TOKEN;
 
     /// The variance of a type position (the upstream `VarianceChecker`
@@ -4681,8 +4692,8 @@ pub(crate) mod avoid_futureor_void {
     /// keep the documented under-report face. Message: `diagnostic.g.dart`
     /// `avoidFutureorVoid`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_futureor_void",
-    &[
+        "avoid_futureor_void",
+        &[
             NodeKind::TopLevelMethod,
             NodeKind::Method,
             NodeKind::VariablesDeclaration,
@@ -4697,8 +4708,8 @@ pub(crate) mod avoid_futureor_void {
             NodeKind::ExtensionDeclaration,
             NodeKind::NamedMixinApplication,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -5017,10 +5028,10 @@ pub(crate) mod erase_dart_type_extension_types {
     /// anchors at the `is` operator, so the report span opens at the
     /// operand to keep the official's whole-expression shape.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "erase_dart_type_extension_types",
-    &[NodeKind::IsExpression],
-    check,
-);
+        "erase_dart_type_extension_types",
+        &[NodeKind::IsExpression],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -5048,7 +5059,10 @@ pub(crate) mod erase_dart_type_extension_types {
 // ports it once and the two rules carry only their predicate tables and
 // message templates. All name-level approximations are registered here once.
 
-use crate::rules::{NONE_TOKEN, initialized_identifier_name, same_file_declaration, slice, variables_declaration_keyword};
+use crate::rules::{
+    NONE_TOKEN, initialized_identifier_name, same_file_declaration, slice,
+    variables_declaration_keyword,
+};
 
 /// The library-type spellings one leak rule watches and the calls that
 /// count as a release. Upstream the predicates are interface questions
@@ -5416,8 +5430,7 @@ fn leak_valid_use(
             // `visitConstructorFieldInitializer` (:222-228): the field is
             // initialized in some constructor's initializer list.
             NodeKind::FieldInitializer if candidate.field => {
-                if c
-                    .field(row, PayloadField::Name)
+                if c.field(row, PayloadField::Name)
                     .is_some_and(|name| name != NONE_TOKEN && c.lexeme(name) == candidate.name)
                 {
                     return true;
@@ -5426,11 +5439,9 @@ fn leak_valid_use(
             // `visitFieldFormalParameter` (:231-241): `this.name` declares
             // or assigns the field (fields only, :232).
             NodeKind::FormalParameter if candidate.field => {
-                if c
-                    .field(row, PayloadField::Receiver)
+                if c.field(row, PayloadField::Receiver)
                     .is_some_and(|kw| kw != NONE_TOKEN && c.lexeme(kw) == "this")
-                    && c
-                        .field(row, PayloadField::Name)
+                    && c.field(row, PayloadField::Name)
                         .is_some_and(|name| name != NONE_TOKEN && c.lexeme(name) == candidate.name)
                 {
                     return true;
@@ -5794,14 +5805,14 @@ pub(crate) mod cancel_subscriptions {
     /// clause is watched (the header spells the interface). Message:
     /// `diagnostic.g.dart` `cancelSubscriptions`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "cancel_subscriptions",
-    &[
+        "cancel_subscriptions",
+        &[
             NodeKind::Fields,
             NodeKind::VariablesDeclaration,
             NodeKind::PrimaryConstructor,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         leak_detector_check(c, &CANCEL_PREDICATES);
@@ -5822,14 +5833,14 @@ pub(crate) mod close_sinks {
     /// this rule local-only there, the documented version drift the
     /// lints-new corpus pins. Message: `diagnostic.g.dart` `closeSinks`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "close_sinks",
-    &[
+        "close_sinks",
+        &[
             NodeKind::Fields,
             NodeKind::VariablesDeclaration,
             NodeKind::PrimaryConstructor,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         leak_detector_check(c, &CLOSE_PREDICATES);
@@ -5837,8 +5848,11 @@ pub(crate) mod close_sinks {
 }
 
 pub(crate) mod tighten_type_of_initializing_formals {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, leak_formal_rows};
-    use crate::rules::{NONE_TOKEN, TypeFace, body_members, initialized_identifier_name, same_file_ancestors, slice, type_face, variables_declaration_keyword};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, leak_formal_rows};
+    use crate::rules::{
+        NONE_TOKEN, TypeFace, body_members, initialized_identifier_name, same_file_ancestors,
+        slice, type_face, variables_declaration_keyword,
+    };
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/tighten_type_of_initializing_formals.dart`
@@ -5867,10 +5881,10 @@ pub(crate) mod tighten_type_of_initializing_formals {
     /// BinaryExpression`, :77 — a parenthesized condition skips).
     /// Message: `diagnostic.g.dart` `tightenTypeOfInitializingFormals`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "tighten_type_of_initializing_formals",
-    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
-    check,
-);
+        "tighten_type_of_initializing_formals",
+        &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -5927,8 +5941,7 @@ pub(crate) mod tighten_type_of_initializing_formals {
         else {
             return;
         };
-        if c
-            .field(condition, PayloadField::Operator)
+        if c.field(condition, PayloadField::Operator)
             .is_none_or(|op| c.lexeme(op) != "!=")
         {
             return;
@@ -5980,9 +5993,7 @@ pub(crate) mod tighten_type_of_initializing_formals {
         }) else {
             return;
         };
-        let receiver = c
-            .field(param, PayloadField::Receiver)
-            .unwrap_or(NONE_TOKEN);
+        let receiver = c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
         if receiver == NONE_TOKEN {
             return;
         }
@@ -7367,10 +7378,10 @@ pub(crate) mod unsafe_variance {
     /// so the port registers unconditionally and enables by name only.
     /// Message: `diagnostic.g.dart` `unsafeVariance`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unsafe_variance",
-    &[NodeKind::Method, NodeKind::VariablesDeclaration],
-    check,
-);
+        "unsafe_variance",
+        &[NodeKind::Method, NodeKind::VariablesDeclaration],
+        check,
+    );
 
     /// The static `ModSet` bit (bridge `mod_bits`; the member flags share the
     /// `STATIC` position with the field face).
@@ -7687,11 +7698,13 @@ fn argument_mapping(c: &Check<'_>, row: u32, count: usize) -> Option<Vec<Mapping
     Some(
         parameters
             .iter()
-            .map(|&parameter| match c.field(parameter, PayloadField::Variance) {
-                Some(token) if c.lexeme(token) == "in" => Mapping::Inverse,
-                Some(token) if c.lexeme(token) == "inout" => Mapping::InOut,
-                _ => Mapping::Same,
-            })
+            .map(
+                |&parameter| match c.field(parameter, PayloadField::Variance) {
+                    Some(token) if c.lexeme(token) == "in" => Mapping::Inverse,
+                    Some(token) if c.lexeme(token) == "inout" => Mapping::InOut,
+                    _ => Mapping::Same,
+                },
+            )
             .collect(),
     )
 }

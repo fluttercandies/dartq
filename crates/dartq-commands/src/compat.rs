@@ -135,7 +135,8 @@ pub fn compat(
     }
     let mut matrix: Vec<AxisInput> = Vec::with_capacity(sdk_roots.len());
     for root in sdk_roots {
-        let (axis, axis_notices) = analyze_axis(root, &config, &graph, &config_dir, &analysis_root)?;
+        let (axis, axis_notices) =
+            analyze_axis(root, &config, &graph, &config_dir, &analysis_root)?;
         matrix.push(axis);
         notices.extend(axis_notices);
     }
@@ -758,10 +759,17 @@ mod tests {
         // The plain resolution: the same target's missing `dart:ui` is the
         // one ERROR, and it flips the axis.
         let plain = fixture("embedder_plain");
-        std::fs::write(plain.join("lib/a.dart"), "import 'dart:ui';\nclass Foo {}\n")
-            .expect("lib file");
-        let (report, _) = compat(&plain, &plain.join("lib/a.dart"), &[plain.join("sdks/clean")])
-            .expect("the plain axis answers");
+        std::fs::write(
+            plain.join("lib/a.dart"),
+            "import 'dart:ui';\nclass Foo {}\n",
+        )
+        .expect("lib file");
+        let (report, _) = compat(
+            &plain,
+            &plain.join("lib/a.dart"),
+            &[plain.join("sdks/clean")],
+        )
+        .expect("the plain axis answers");
         assert!(!report.matrix[0].compatible, "dart:ui does not exist");
         let failure = report.matrix[0]
             .first_failure

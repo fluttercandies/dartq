@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use crate::client::{StreamEvent, VmClient};
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Breakpoint, BoundField, Event, EventKind, ExceptionPauseMode, Frame, Instance, InstanceKind,
+    BoundField, Breakpoint, Event, EventKind, ExceptionPauseMode, Frame, Instance, InstanceKind,
     IsolateRef, ScriptRef, SentinelKind, Stack, StepOption, ValueOrSentinel, VmObject,
 };
 use crate::ring::Ring;
@@ -648,8 +648,10 @@ impl DebugSession {
             // that cannot even name an isolate yet. The wait floors at
             // 10 s: once the banner arrived the VM is up, and isolate
             // spawn is quick even on a slow device.
-            let budget =
-                config.launch_timeout.saturating_sub(started.elapsed()).max(Duration::from_secs(10));
+            let budget = config
+                .launch_timeout
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_secs(10));
             session.wait_for_main_isolate(budget)?;
         }
         Ok(session)
@@ -722,9 +724,11 @@ impl DebugSession {
     /// (`deadline`, #2587), so the whole phase is bounded however
     /// many isolates there are to seed.
     fn handshake(&mut self, output_streams: bool, deadline: Instant) -> Result<()> {
-        let version: crate::protocol::Version = self
-            .client
-            .call_typed("getVersion", json!({}), self.handshake_rpc_timeout(deadline)?)?;
+        let version: crate::protocol::Version = self.client.call_typed(
+            "getVersion",
+            json!({}),
+            self.handshake_rpc_timeout(deadline)?,
+        )?;
         if version.major != SUPPORTED_MAJOR {
             return Err(Error::VersionIncompatible {
                 expected_major: SUPPORTED_MAJOR,
@@ -746,9 +750,9 @@ impl DebugSession {
                 Err(error) => return Err(error),
             }
         }
-        let vm: crate::protocol::Vm = self
-            .client
-            .call_typed("getVM", json!({}), self.handshake_rpc_timeout(deadline)?)?;
+        let vm: crate::protocol::Vm =
+            self.client
+                .call_typed("getVM", json!({}), self.handshake_rpc_timeout(deadline)?)?;
         // System isolates are tracked for completeness but are not
         // debug targets; only user isolates get their pause state.
         for isolate in vm.system_isolates {
@@ -877,7 +881,10 @@ impl DebugSession {
                 self.seed_from_vm()?;
                 continue;
             }
-            match self.client.next_event(remaining.min(Duration::from_millis(20))) {
+            match self
+                .client
+                .next_event(remaining.min(Duration::from_millis(20)))
+            {
                 Ok(Some(event)) => self.absorb_event(event),
                 Ok(None) => {}
                 Err(Error::Closed) if self.process.is_some() => {
@@ -895,21 +902,22 @@ impl DebugSession {
     /// #2587); the post-restart re-seed passes a far-future deadline
     /// and is bounded by `rpc_timeout` alone.
     fn seed_pause_state(&mut self, isolate: &str, deadline: Instant) -> Result<()> {
-        let timeout = self.config.rpc_timeout.min(
-            deadline.saturating_duration_since(Instant::now()),
-        );
-        let fetched: crate::protocol::Isolate = match self.client.call_typed(
-            "getIsolate",
-            json!({ "isolateId": isolate }),
-            timeout,
-        ) {
-            Ok(fetched) => fetched,
-            Err(Error::Sentinel { .. }) => {
-                self.forget_isolate(isolate);
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        let timeout = self
+            .config
+            .rpc_timeout
+            .min(deadline.saturating_duration_since(Instant::now()));
+        let fetched: crate::protocol::Isolate =
+            match self
+                .client
+                .call_typed("getIsolate", json!({ "isolateId": isolate }), timeout)
+            {
+                Ok(fetched) => fetched,
+                Err(Error::Sentinel { .. }) => {
+                    self.forget_isolate(isolate);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
         if let Some(root) = fetched.root_lib {
             self.root_libs.insert(isolate.to_owned(), root.id);
         }
@@ -1107,7 +1115,9 @@ impl DebugSession {
         self.poll_events()?;
         self.pause_events.remove(isolate);
         let mark = self.events.pushed();
-        let value = self.client.call("resume", params, self.config.rpc_timeout)?;
+        let value = self
+            .client
+            .call("resume", params, self.config.rpc_timeout)?;
         check_success(&value)?;
         Ok(mark)
     }
@@ -1459,7 +1469,8 @@ impl DebugSession {
                         "isolate {isolate_id} reports no root library (not Runnable yet?)"
                     ))
                 })?;
-                self.root_libs.insert(isolate_id.clone(), library_id.clone());
+                self.root_libs
+                    .insert(isolate_id.clone(), library_id.clone());
                 library_id
             }
         };
@@ -1993,7 +2004,8 @@ impl DebugSession {
             }
             kind if is_pause_kind(kind) => {
                 if let Some(id) = isolate_id {
-                    self.pause_events.insert(id.to_owned(), (seq, event.clone()));
+                    self.pause_events
+                        .insert(id.to_owned(), (seq, event.clone()));
                 }
             }
             EventKind::Resume => {
@@ -2050,7 +2062,8 @@ impl DebugSession {
         self.auto_resumes.remove(id);
         self.root_libs.remove(id);
         self.breakpoints.retain(|(isolate, _), _| isolate != id);
-        self.breakpoint_specs.retain(|(isolate, _), _| isolate != id);
+        self.breakpoint_specs
+            .retain(|(isolate, _), _| isolate != id);
         if self.main_isolate.as_deref() == Some(id) {
             // Deterministic re-election: the lowest-numbered user
             // isolate (the VM numbers isolates in spawn order).
@@ -2148,7 +2161,11 @@ impl DebugSession {
     /// adapter: `true`, or a non-zero `int`/`double`; everything else
     /// (including `null` and strings) is falsy. `Err` carries why the
     /// condition could not be evaluated.
-    fn condition_holds(&mut self, isolate: &str, condition: &str) -> std::result::Result<bool, String> {
+    fn condition_holds(
+        &mut self,
+        isolate: &str,
+        condition: &str,
+    ) -> std::result::Result<bool, String> {
         match self.evaluate_in_frame(Some(isolate), 0, condition) {
             Ok(VmObject::Instance(instance)) => Ok(match instance.kind {
                 InstanceKind::Bool => instance.value_as_string.as_deref() == Some("true"),
@@ -2450,10 +2467,14 @@ fn banner_in(line: &[u8]) -> Option<String> {
     const FLUTTER_TAIL: &str = " is available at: ";
     const FLUTTER_PREFIX: &str = "A Dart VM Service on ";
     let uri = if let Some(start) = text.find(DART_MARKER) {
-        text[start + DART_MARKER.len()..].split_whitespace().next()?
+        text[start + DART_MARKER.len()..]
+            .split_whitespace()
+            .next()?
     } else if let Some(rest) = text.strip_prefix(FLUTTER_PREFIX) {
         let separator = rest.rfind(FLUTTER_TAIL)?;
-        rest[separator + FLUTTER_TAIL.len()..].split_whitespace().next()?
+        rest[separator + FLUTTER_TAIL.len()..]
+            .split_whitespace()
+            .next()?
     } else {
         return None;
     };
@@ -2526,11 +2547,7 @@ fn find_flutter_binary() -> Result<PathBuf> {
 
 /// One lookup shared by both toolchains: the explicit override, then
 /// every `PATH` entry.
-fn find_binary(
-    override_var: &str,
-    name: &str,
-    missing: fn(String) -> Error,
-) -> Result<PathBuf> {
+fn find_binary(override_var: &str, name: &str, missing: fn(String) -> Error) -> Result<PathBuf> {
     if let Some(explicit) = std::env::var_os(override_var) {
         let path = PathBuf::from(explicit);
         if is_executable(&path) {
@@ -2883,8 +2900,14 @@ http://127.0.0.1:9002/A=/\r"
             banner_in(b"The Dart Tooling Daemon is available at: ws://127.0.0.1:1234/ab=/"),
             None
         );
-        assert_eq!(banner_in(b"A DevTools server is available at: http://127.0.0.1:9/"), None);
-        assert_eq!(banner_in(b"A Dart VM Service on macOS never finished"), None);
+        assert_eq!(
+            banner_in(b"A DevTools server is available at: http://127.0.0.1:9/"),
+            None
+        );
+        assert_eq!(
+            banner_in(b"A Dart VM Service on macOS never finished"),
+            None
+        );
     }
 
     #[test]
@@ -3097,6 +3120,9 @@ http://127.0.0.1:9002/A=/\r"
             }
         }
         assert_eq!(banner.as_deref(), Some("http://127.0.0.1:8181/AbC=/"));
-        assert!(data.windows(b"hello".len()).any(|window| window == b"hello"));
+        assert!(
+            data.windows(b"hello".len())
+                .any(|window| window == b"hello")
+        );
     }
 }

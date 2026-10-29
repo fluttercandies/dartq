@@ -198,7 +198,10 @@ mod tests {
     #[test]
     fn locate_spells_inside_relative_and_outside_absolute() {
         let root = Path::new("/proj/pkg");
-        assert_eq!(locate(root, &root.join("lib/src/deep/a.dart")), "lib/src/deep/a.dart");
+        assert_eq!(
+            locate(root, &root.join("lib/src/deep/a.dart")),
+            "lib/src/deep/a.dart"
+        );
         assert_eq!(locate(root, &root.join("main.dart")), "main.dart");
         // No `package:` form, no leading `./`: a plain tail only.
         assert_eq!(locate(root, &root.join("lib/a.dart")), "lib/a.dart");
@@ -207,7 +210,10 @@ mod tests {
             locate(root, Path::new("/pub-cache/hosted/x/lib/a.dart")),
             "/pub-cache/hosted/x/lib/a.dart"
         );
-        assert_eq!(locate(root, Path::new("/proj/other/lib/a.dart")), "/proj/other/lib/a.dart");
+        assert_eq!(
+            locate(root, Path::new("/proj/other/lib/a.dart")),
+            "/proj/other/lib/a.dart"
+        );
         // The root itself strips to an empty tail: absolute.
         assert_eq!(locate(root, root), "/proj/pkg");
     }
@@ -230,7 +236,10 @@ mod tests {
             common_root(&files(&["lib/a.dart", "test/b.dart"])),
             Some(PathBuf::from("/w/pkg"))
         );
-        assert_eq!(common_root(&files(&["main.dart"])), Some(PathBuf::from("/w/pkg")));
+        assert_eq!(
+            common_root(&files(&["main.dart"])),
+            Some(PathBuf::from("/w/pkg"))
+        );
         assert_eq!(common_root(&[]), None);
         // Disjoint trees degrade to the filesystem root: no root.
         assert_eq!(

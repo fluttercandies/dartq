@@ -22,7 +22,11 @@ pub struct RunResult {
 /// Runs a child to completion under the watchdog. Polls `ps` once per
 /// second; above the RSS ceiling or past the timeout the child is killed
 /// and `killed` is set.
-pub fn run(command: &mut Command, timeout: Duration, rss_limit_kb: u64) -> std::io::Result<RunResult> {
+pub fn run(
+    command: &mut Command,
+    timeout: Duration,
+    rss_limit_kb: u64,
+) -> std::io::Result<RunResult> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let pid = child.id();
@@ -95,7 +99,9 @@ mod tests {
     #[test]
     fn runs_to_completion_and_captures_output() {
         let result = run(
-            Command::new("/bin/sh").arg("-c").arg("echo hello; echo err >&2"),
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("echo hello; echo err >&2"),
             Duration::from_secs(30),
             RSS_LIMIT_KB,
         )

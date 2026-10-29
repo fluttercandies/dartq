@@ -5,10 +5,8 @@ use dartq_debug::{DebugSession, Error, LaunchConfig};
 
 #[test]
 fn launch_reports_missing_dart_binary() {
-    let missing = std::env::temp_dir().join(format!(
-        "dartq-debug-missing-dart-{}",
-        std::process::id()
-    ));
+    let missing =
+        std::env::temp_dir().join(format!("dartq-debug-missing-dart-{}", std::process::id()));
     assert!(!missing.exists(), "test path must not exist");
     let previous = std::env::var_os("DARTQ_DART_BIN");
     // SAFETY: this test binary contains exactly one test, so no other

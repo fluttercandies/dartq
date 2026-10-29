@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// `expected_token`: the official trio told apart by the quoted token the
 /// message names — `InsertSemicolon` (`;` lands after the report, never
 /// after an `await` identifier used outside `async`), `ReplaceWithArrow`

@@ -162,8 +162,7 @@ fn local_unrelated_function_pair_stays_clean() {
          void t(A Function(S) f) {\n  A Function(S) p = f;\n  if (p is R Function(S)) {\n    p;\n  }\n}\n",
     );
     assert!(
-        !has(&report, "unnecessary_type_check")
-            && !has(&report, "invalid_assignment"),
+        !has(&report, "unnecessary_type_check") && !has(&report, "invalid_assignment"),
         "{:?}",
         code_names(&report)
     );

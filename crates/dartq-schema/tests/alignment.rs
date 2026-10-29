@@ -123,10 +123,7 @@ fn impact_symbol_table_value_without_path_form_is_named() {
 #[test]
 fn dropped_version_stamp_is_named() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
-    value
-        .as_object_mut()
-        .expect("object")
-        .remove("v");
+    value.as_object_mut().expect("object").remove("v");
     let violation = violation_of(&value.to_string(), Domain::Impact);
     assert_eq!(violation.path, "v");
     assert_eq!(violation.found, "missing");
@@ -334,10 +331,7 @@ fn wrong_version_key_is_named() {
 fn schema_documents_carry_the_version_constants() {
     let impact = dartq_schema::impact_schema();
     assert_eq!(impact["$schema"], "http://json-schema.org/draft-07/schema#");
-    assert_eq!(
-        impact["properties"]["v"]["const"],
-        SCHEMA_VERSION_IMPACT
-    );
+    assert_eq!(impact["properties"]["v"]["const"], SCHEMA_VERSION_IMPACT);
     let diagnostics = dartq_schema::diagnostics_schema();
     assert_eq!(
         diagnostics["$schema"],

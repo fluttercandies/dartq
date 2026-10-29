@@ -101,10 +101,7 @@ mod tests {
             "the registration-side since, not the yaml state version"
         );
         assert_eq!(removed_since("avoid_unstable_final_fields"), Some(None));
-        assert_eq!(
-            removed_since("unsafe_html").flatten(),
-            Some("3.7.0")
-        );
+        assert_eq!(removed_since("unsafe_html").flatten(), Some("3.7.0"));
     }
 
     /// Deprecated rules register in the SDK's registry (the options faces

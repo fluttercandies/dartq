@@ -28,8 +28,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use dartq_debug::{
-    BreakpointLocationSpec, BreakpointSpec, DebugSession, EventBatch, ExpandLimits,
-    ExceptionPauseMode, LaunchConfig, SessionConfig, StepOption, StoppedReason, VmObject,
+    BreakpointLocationSpec, BreakpointSpec, DebugSession, EventBatch, ExceptionPauseMode,
+    ExpandLimits, LaunchConfig, SessionConfig, StepOption, StoppedReason, VmObject,
 };
 
 fn fixture() -> PathBuf {
@@ -133,10 +133,7 @@ fn complex_debug_session() {
         other => panic!("hit1 expected breakpoint, got {other:?}"),
     }
     assert_eq!(snap1.location.line, Some(56));
-    assert!(
-        !snap1.stack.is_empty(),
-        "stack summary empty on real stop"
-    );
+    assert!(!snap1.stack.is_empty(), "stack summary empty on real stop");
 
     // Hit 2: conditional breakpoint (i==2), three raw hits collapsed.
     let snap2 = resume_tagged(&mut session, "hit2");

@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, last_child};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/control_flow_in_finally.dart:24-107`
 /// — `break`/`continue`/`return` inside a `finally` block reports, unless
@@ -58,9 +58,7 @@ fn check(c: &mut Check<'_>) {
     let Some(finally_block) = last_child(c, try_node) else {
         return;
     };
-    if c.kind(finally_block) != NodeKind::Block
-        || c.path.get(try_idx + 1) != Some(&finally_block)
-    {
+    if c.kind(finally_block) != NodeKind::Block || c.path.get(try_idx + 1) != Some(&finally_block) {
         return;
     }
     // The switch-member tiling overlaps windows (each member's window
@@ -110,7 +108,8 @@ fn semicolon_end(c: &Check<'_>, node: u32) -> Option<u32> {
     // has an empty payload (fields.rs), so its raw slot always read 0
     // (no label to skip past).
     let targeted = matches!(c.kind(node), NodeKind::Break | NodeKind::Continue)
-        && c.field(node, PayloadField::HasTarget).is_some_and(|bit| bit != 0);
+        && c.field(node, PayloadField::HasTarget)
+            .is_some_and(|bit| bit != 0);
     if targeted {
         probe += 1;
     }

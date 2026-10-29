@@ -429,9 +429,5 @@ extension E on C {
 }
 ",
     );
-    assert!(
-        report.diagnostics.is_empty(),
-        "{:?}",
-        code_names(&report)
-    );
+    assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
 }

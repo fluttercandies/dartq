@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The `// ignore: <code>` row for the diagnostic at `range`: spliced
 /// into the previous line's ignore comment when one is there (the new
 /// code first, the official insertion point), else inserted above the
@@ -281,7 +280,12 @@ pub fn ignore_options_edit(code: &str, text: &str) -> Option<(u32, u32, String)>
 /// The byte offset and indentation of the first line under `until` whose
 /// content starts with `key` at exactly `indent` columns (`None` when
 /// absent).
-pub(crate) fn yaml_key_line(text: &str, key: &str, indent: usize, until: usize) -> Option<(usize, usize)> {
+pub(crate) fn yaml_key_line(
+    text: &str,
+    key: &str,
+    indent: usize,
+    until: usize,
+) -> Option<(usize, usize)> {
     let mut cursor = 0usize;
     while cursor < until && cursor < text.len() {
         let line_end = text[cursor..].find('\n').map_or(text.len(), |i| cursor + i);

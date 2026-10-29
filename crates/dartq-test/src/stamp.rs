@@ -214,7 +214,11 @@ fn stamp_file(
         facts: facts.clone(),
         refs: refs.clone(),
     };
-    let entry = Entry { digest, facts, refs };
+    let entry = Entry {
+        digest,
+        facts,
+        refs,
+    };
     Ok(Some((entry, stamp)))
 }
 
@@ -241,7 +245,10 @@ fn stat_fields(meta: &std::fs::Metadata) -> ((i64, u32), (i64, u32), u64) {
         t.ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or((0, 0), |d| {
-                (i64::try_from(d.as_secs()).unwrap_or(i64::MAX), d.subsec_nanos())
+                (
+                    i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                    d.subsec_nanos(),
+                )
             })
     };
     (time(meta.modified()), time(meta.created()), 0)
@@ -335,10 +342,18 @@ mod tests {
         let index = root.join(".dart_tool/dartq/index.json");
         let mut stamps = Stamps::load(&index);
         let missing = root.join("lib/missing.dart");
-        stamps.stamp(files.iter().cloned().chain([missing.clone()]).collect()).expect("stamp");
+        stamps
+            .stamp(files.iter().cloned().chain([missing.clone()]).collect())
+            .expect("stamp");
         let a = stamps.get(&root.join("lib/a.dart")).expect("a");
         assert_eq!(a.facts.as_ref().expect("facts").uris, ["b.dart"]);
-        assert!(stamps.get(&root.join("pubspec.yaml")).expect("yaml").facts.is_none());
+        assert!(
+            stamps
+                .get(&root.join("pubspec.yaml"))
+                .expect("yaml")
+                .facts
+                .is_none()
+        );
         assert!(stamps.contains(&missing) && stamps.get(&missing).is_none());
         stamps.save(&index).expect("save");
 
@@ -348,6 +363,9 @@ mod tests {
         write("lib/b.dart", "class C {}\n");
         let mut again = Stamps::load(&index);
         again.stamp(vec![root.join("lib/b.dart")]).expect("stamp");
-        assert_ne!(again.get(&root.join("lib/b.dart")).expect("b").digest, before);
+        assert_ne!(
+            again.get(&root.join("lib/b.dart")).expect("b").digest,
+            before
+        );
     }
 }

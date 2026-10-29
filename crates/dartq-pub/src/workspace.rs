@@ -654,14 +654,28 @@ mod tests {
         assert_eq!(layout.root, root);
         assert_eq!(
             layout.members,
-            vec![root.join("examples").join("mid"), root.join("examples").join("mid").join("cockpit")]
+            vec![
+                root.join("examples").join("mid"),
+                root.join("examples").join("mid").join("cockpit")
+            ]
         );
 
         // …and from a subdirectory of it (no pubspec met until the member).
-        std::fs::create_dir_all(root.join("examples").join("mid").join("cockpit").join("lib"))
-            .expect("mkdir");
-        let layout = find_workspace_root(&root.join("examples").join("mid").join("cockpit").join("lib"))
-            .expect("the nested member's subdirectory resolves");
+        std::fs::create_dir_all(
+            root.join("examples")
+                .join("mid")
+                .join("cockpit")
+                .join("lib"),
+        )
+        .expect("mkdir");
+        let layout = find_workspace_root(
+            &root
+                .join("examples")
+                .join("mid")
+                .join("cockpit")
+                .join("lib"),
+        )
+        .expect("the nested member's subdirectory resolves");
         assert_eq!(layout.root, root);
     }
 

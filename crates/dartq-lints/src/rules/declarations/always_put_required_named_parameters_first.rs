@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, narrow_u32};
+use super::{Check, NodeKind, PayloadField, RuleSpec, narrow_u32};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/always_put_required_named_parameters_first.dart:31-92`
 /// — a required named parameter written after a non-required named
@@ -70,9 +70,7 @@ fn super_parameters_are_in_order(c: &Check<'_>, list: u32) -> bool {
     let names: Vec<&str> = c
         .collect_direct(list)
         .into_iter()
-        .filter(|&param| {
-            c.kind(param) == NodeKind::FormalParameter && is_super_formal(c, param)
-        })
+        .filter(|&param| c.kind(param) == NodeKind::FormalParameter && is_super_formal(c, param))
         .filter(|&param| {
             matches!(
                 c.field(param, PayloadField::FormalParameterKind),
@@ -183,8 +181,7 @@ fn has_required_annotation(c: &Check<'_>, list: u32, param: u32) -> bool {
     c.collect_direct(star).into_iter().any(|meta| {
         c.kind(meta) == NodeKind::Metadata
             && c.collect_direct(meta).into_iter().any(|piece| {
-                c.kind(piece) == NodeKind::Identifier
-                    && c.lexeme(c.head_token(piece)) == "required"
+                c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == "required"
             })
     })
 }

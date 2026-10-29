@@ -202,8 +202,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         // The peek now sits on the else-element's first
                         // token — the dead-arm row's anchor face.
                         let else_start = self.peek_span();
-                        self.listener
-                            .handle_else_control_flow(else_kw, else_start);
+                        self.listener.handle_else_control_flow(else_kw, else_start);
                         if !self.enter_depth() {
                             return Unwind::Done(self.peek_span());
                         }
@@ -648,10 +647,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // identifier context's `expectedIdentifierButGotKeyword`
                     // recovery). Other keywords still take the identifier
                     // path and report.
-                    let id = if matches!(
-                        self.peek_kind(),
-                        TokenKind::Keyword(Keyword::This)
-                    ) {
+                    let id = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::This)) {
                         let this_kw = self.peek_span();
                         self.cursor.advance();
                         self.listener

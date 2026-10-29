@@ -30,7 +30,10 @@ impl Json {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
-            Self::Object(fields) => fields.iter().find(|(name, _)| name == key).map(|(_, value)| value),
+            Self::Object(fields) => fields
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
             _ => None,
         }
     }
@@ -38,7 +41,10 @@ impl Json {
     /// The value under `key` of an object, mutably.
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Json> {
         match self {
-            Self::Object(fields) => fields.iter_mut().find(|(name, _)| name == key).map(|(_, value)| value),
+            Self::Object(fields) => fields
+                .iter_mut()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
             _ => None,
         }
     }
@@ -86,13 +92,17 @@ impl Json {
     /// `path` (keys from the root) as a string.
     #[must_use]
     pub fn str_at(&self, path: &[&str]) -> Option<&str> {
-        path.iter().try_fold(self, |value, key| value.get(key))?.as_str()
+        path.iter()
+            .try_fold(self, |value, key| value.get(key))?
+            .as_str()
     }
 
     /// `path` as an unsigned integer.
     #[must_use]
     pub fn u64_at(&self, path: &[&str]) -> Option<u64> {
-        path.iter().try_fold(self, |value, key| value.get(key))?.as_u64()
+        path.iter()
+            .try_fold(self, |value, key| value.get(key))?
+            .as_u64()
     }
 
     /// The event's `type`.
@@ -187,7 +197,9 @@ pub fn replace_all(event: &mut Json, pairs: &[(&str, &str)]) {
             }
         }
         Json::Array(items) => items.iter_mut().for_each(|item| replace_all(item, pairs)),
-        Json::Object(fields) => fields.iter_mut().for_each(|(_, value)| replace_all(value, pairs)),
+        Json::Object(fields) => fields
+            .iter_mut()
+            .for_each(|(_, value)| replace_all(value, pairs)),
         Json::Null | Json::Bool(_) | Json::Number(_) => {}
     }
 }
@@ -310,18 +322,36 @@ mod tests {
     /// Every id field is rewritten; nothing else moves.
     #[test]
     fn remap_rewrites_every_id() {
-        let mut group = parse(r#"{"group":{"id":5,"suiteID":2,"parentID":4,"name":"g"},"type":"group"}"#).expect("event");
-        let mut test = parse(r#"{"test":{"id":6,"suiteID":2,"groupIDs":[4,5]},"type":"testStart"}"#).expect("event");
-        let mut done = parse(r#"{"testID":6,"result":"success","type":"testDone"}"#).expect("event");
-        let mut root = parse(r#"{"group":{"id":4,"suiteID":2,"parentID":null},"type":"group"}"#).expect("event");
+        let mut group =
+            parse(r#"{"group":{"id":5,"suiteID":2,"parentID":4,"name":"g"},"type":"group"}"#)
+                .expect("event");
+        let mut test =
+            parse(r#"{"test":{"id":6,"suiteID":2,"groupIDs":[4,5]},"type":"testStart"}"#)
+                .expect("event");
+        let mut done =
+            parse(r#"{"testID":6,"result":"success","type":"testDone"}"#).expect("event");
+        let mut root = parse(r#"{"group":{"id":4,"suiteID":2,"parentID":null},"type":"group"}"#)
+            .expect("event");
         let mut shift = |id: u64| id + 100;
         for event in [&mut group, &mut test, &mut done, &mut root] {
             remap(event, &mut shift);
         }
-        assert_eq!(group.to_line(), r#"{"group":{"id":105,"suiteID":102,"parentID":104,"name":"g"},"type":"group"}"#);
-        assert_eq!(test.to_line(), r#"{"test":{"id":106,"suiteID":102,"groupIDs":[104,105]},"type":"testStart"}"#);
-        assert_eq!(done.to_line(), r#"{"testID":106,"result":"success","type":"testDone"}"#);
-        assert_eq!(root.to_line(), r#"{"group":{"id":104,"suiteID":102,"parentID":null},"type":"group"}"#);
+        assert_eq!(
+            group.to_line(),
+            r#"{"group":{"id":105,"suiteID":102,"parentID":104,"name":"g"},"type":"group"}"#
+        );
+        assert_eq!(
+            test.to_line(),
+            r#"{"test":{"id":106,"suiteID":102,"groupIDs":[104,105]},"type":"testStart"}"#
+        );
+        assert_eq!(
+            done.to_line(),
+            r#"{"testID":106,"result":"success","type":"testDone"}"#
+        );
+        assert_eq!(
+            root.to_line(),
+            r#"{"group":{"id":104,"suiteID":102,"parentID":null},"type":"group"}"#
+        );
     }
 
     #[test]
@@ -337,16 +367,24 @@ mod tests {
     /// keys and numbers stay as they were.
     #[test]
     fn replace_all_touches_only_strings() {
-        let mut event = parse(r#"{"suite":{"id":1,"path":"/a/test/x.dart"},"nest":["/a/y","keep",5],"type":"suite"}"#)
-            .expect("event");
+        let mut event = parse(
+            r#"{"suite":{"id":1,"path":"/a/test/x.dart"},"nest":["/a/y","keep",5],"type":"suite"}"#,
+        )
+        .expect("event");
         replace_all(&mut event, &[("/a", "/b")]);
         assert_eq!(event.str_at(&["suite", "path"]), Some("/b/test/x.dart"));
-        assert_eq!(event.get("nest").expect("nest").to_line(), r#"["/b/y","keep",5]"#);
+        assert_eq!(
+            event.get("nest").expect("nest").to_line(),
+            r#"["/b/y","keep",5]"#
+        );
         assert_eq!(event.u64_at(&["suite", "id"]), Some(1));
         let mut keyed = parse(r#"{"a/a":"/a","type":"print"}"#).expect("event");
         replace_all(&mut keyed, &[("/a", "/b")]);
         assert_eq!(keyed.to_line(), r#"{"a/a":"/b","type":"print"}"#);
         // A raw output line event round-trips as itself.
-        assert_eq!(shell("Shell: hi").to_line(), r#"{"type":"dartq.shell","message":"Shell: hi"}"#);
+        assert_eq!(
+            shell("Shell: hi").to_line(),
+            r#"{"type":"dartq.shell","message":"Shell: hi"}"#
+        );
     }
 }

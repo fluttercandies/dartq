@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use dartq_flow::ty::{Base, EMPTY_ARGS};
 use dartq_flow::{Flow, FlowFact, SharedFlow};
-use dartq_language::{FeatureSet, Feature, LanguageVersion};
+use dartq_language::{Feature, FeatureSet, LanguageVersion};
 use dartq_parser::{ParserFeatures, parse_unit_with};
 use dartq_resolution::{Combinators, ImportEdge, LibraryGraphBuilder, Namespaces};
 use dartq_scanner::{ScanConfig, scan};
@@ -100,12 +100,7 @@ fn unit_fold(source: &str, strings: &StringTable) -> UnitFold {
 /// row's `(base, nullable, args)` payload.
 fn read_type_at(facts: &[FlowFact], offset: usize) -> (Base, bool, u32) {
     for fact in facts {
-        if let FlowFact::ReadType {
-            span,
-            ty,
-            args,
-        } = fact
-        {
+        if let FlowFact::ReadType { span, ty, args } = fact {
             if span.range.offset as usize == offset {
                 return (ty.base, ty.nullable, *args);
             }
@@ -165,7 +160,10 @@ fn written_type_args_reach_listener_driven_rows() {
     let (flow, facts) = direct_drive(source, &scanned.tokens);
     let (base, nullable, direct_args) = read_type_at(&facts, read);
     assert!(!nullable);
-    assert_eq!(args, direct_args, "listener face diverged from direct drive");
+    assert_eq!(
+        args, direct_args,
+        "listener face diverged from direct drive"
+    );
     let flow = flow.borrow();
     let Base::Name(list_id) = base else {
         panic!("expected a named head, got {base:?}")
@@ -212,7 +210,10 @@ fn nested_type_args_reach_listener_driven_rows() {
     );
     let (flow, facts) = direct_drive(source, &scanned.tokens);
     let (_, _, direct_args) = read_type_at(&facts, read);
-    assert_eq!(args, direct_args, "listener face diverged from direct drive");
+    assert_eq!(
+        args, direct_args,
+        "listener face diverged from direct drive"
+    );
     let flow = flow.borrow();
     let tree = flow.type_args_at(direct_args);
     assert_eq!(tree.len(), 1, "one written argument: {tree:?}");

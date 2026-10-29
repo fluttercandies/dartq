@@ -1,4 +1,6 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces as faces,
+};
 use dartq_semantic::model::Ty;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_bool_literals_in_conditional_expressions.dart`
@@ -99,11 +101,7 @@ fn check(c: &mut Check<'_>) {
 /// covered end can swallow an enclosing terminator — the start is the
 /// condition run's earliest head, the end the else run's last real
 /// row's end.
-fn conditional_extent(
-    c: &Check<'_>,
-    node: u32,
-    question: u32,
-) -> Option<core::ops::Range<u32>> {
+fn conditional_extent(c: &Check<'_>, node: u32, question: u32) -> Option<core::ops::Range<u32>> {
     let start = condition_start(c, node, question)
         .map(|token| crate::rules::utf16_token_span(c, token).start)?;
     let end = super::prefer_if_null_operators::conditional_end(c, node);

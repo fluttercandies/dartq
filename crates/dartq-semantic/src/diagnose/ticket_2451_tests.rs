@@ -64,8 +64,7 @@ fn report(source: &str) -> FileReport {
         lib_main,
         core_file,
         &[
-            "Object", "String", "int", "bool", "double", "num", "List", "Map", "Iterable",
-            "void",
+            "Object", "String", "int", "bool", "double", "num", "List", "Map", "Iterable", "void",
         ],
     );
     let graph = builder.finish();
@@ -231,8 +230,7 @@ fn dynamic_element_chain_stays_silent() {
                   }\n";
     let names = code_names(&report(source));
     assert!(
-        !names.contains(&"unchecked_use_of_nullable_value")
-            && !names.contains(&"undefined_getter"),
+        !names.contains(&"unchecked_use_of_nullable_value") && !names.contains(&"undefined_getter"),
         "a dynamic element's member read stays silent: {names:?}"
     );
 }
@@ -251,8 +249,7 @@ fn nullable_missing_member_collapses_to_unchecked() {
     );
     let names = code_names(&report(&source));
     assert!(
-        names.contains(&"unchecked_use_of_nullable_value")
-            && !names.contains(&"undefined_getter"),
+        names.contains(&"unchecked_use_of_nullable_value") && !names.contains(&"undefined_getter"),
         "the nullable gate fires and no undefined_getter joins: {names:?}"
     );
 }

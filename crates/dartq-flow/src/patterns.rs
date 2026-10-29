@@ -172,8 +172,7 @@ impl Interp<'_> {
                 // be non-null), which the join drops — an always-matching
                 // `case null` leaves the chain's reachability untouched.
                 if self.classify(constant.ty) == Classification::NullOrEquivalent {
-                    let (non_null, non_null_args) =
-                        self.promote_to_non_null(matched, matched_args);
+                    let (non_null, non_null_args) = self.promote_to_non_null(matched, matched_args);
                     let mut if_not_null = if non_null != matched {
                         self.current.clone().finish_type_test(
                             self.ops,
@@ -272,8 +271,7 @@ impl Interp<'_> {
                         // guaranteed to match: the official promotes nothing
                         // and leaves `_unmatched` untouched (the arm cannot
                         // fall through).
-                        let guaranteed =
-                            self.classify(matched) == Classification::NonNullable;
+                        let guaranteed = self.classify(matched) == Classification::NonNullable;
                         let (non_null, non_null_args) =
                             self.promote_to_non_null(matched, matched_args);
                         if !guaranteed {
@@ -396,10 +394,7 @@ impl Interp<'_> {
                 // the matched arm promotes the matched value, the failure
                 // arm joins `unmatched` when the test can fail. `var x`
                 // (no written type) always matches and never joins.
-                if !self.collecting()
-                    && self.pattern_depth == 1
-                    && declared != Ty::UNKNOWN
-                {
+                if !self.collecting() && self.pattern_depth == 1 && declared != Ty::UNKNOWN {
                     if self.pattern_known_invalid(declared, declared_args) {
                         return;
                     }
@@ -486,10 +481,7 @@ impl Interp<'_> {
                 // chain to the semantic layer's chain-start emission — the
                 // flow kill here would duplicate those rows through the
                 // per-statement dead facts.
-                if !self.collecting()
-                    && self.pattern_depth == 1
-                    && declared != Ty::UNKNOWN
-                {
+                if !self.collecting() && self.pattern_depth == 1 && declared != Ty::UNKNOWN {
                     if self.pattern_known_invalid(declared, declared_args) {
                         return;
                     }
@@ -637,7 +629,12 @@ impl Interp<'_> {
         }
     }
 
-    pub(crate) fn matched_object_pattern(&mut self, name: u32, args: u32, fields_irrefutable: bool) {
+    pub(crate) fn matched_object_pattern(
+        &mut self,
+        name: u32,
+        args: u32,
+        fields_irrefutable: bool,
+    ) {
         // A top-level pattern constrains the matched value; a field's
         // sub-pattern constrains that field (the official sub-pattern face
         // runs under pushPropertySubpattern) and promotes nothing here.
@@ -670,7 +667,11 @@ impl Interp<'_> {
         // switch case's live-init chain dies like any other cover when no
         // property sub-pattern can fail either (`case dynamic(:var t)`);
         // a refutable field keeps the may-fail arm.
-        if self.names.get(name as usize).is_some_and(|n| &**n == "dynamic") {
+        if self
+            .names
+            .get(name as usize)
+            .is_some_and(|n| &**n == "dynamic")
+        {
             if fields_irrefutable {
                 self.vacuous_cover_kills_chain();
             }
@@ -710,12 +711,10 @@ impl Interp<'_> {
             // latched scrutinee type; the raw pattern head already spells
             // the required type, and no latched type at all may always
             // fail, so both directions join.
-            let covered = self
-                .frame_scrutinee_ty()
-                .is_some_and(|(ty, frame_args)| {
-                    self.ops
-                        .is_subtype_typed(ty, frame_args, known, args, self.args, self.names)
-                });
+            let covered = self.frame_scrutinee_ty().is_some_and(|(ty, frame_args)| {
+                self.ops
+                    .is_subtype_typed(ty, frame_args, known, args, self.args, self.names)
+            });
             if !covered {
                 let cur = self.current.clone();
                 self.join_unmatched(cur);
@@ -771,14 +770,10 @@ impl Interp<'_> {
         if self.disjoint_by_nullability(matched, known) {
             self.unreachable_cur();
         }
-        if !self.ops.is_subtype_typed(
-            matched,
-            matched_args,
-            known,
-            args,
-            self.args,
-            self.names,
-        ) {
+        if !self
+            .ops
+            .is_subtype_typed(matched, matched_args, known, args, self.args, self.names)
+        {
             self.join_unmatched(unmatched_arm);
         } else if self
             .ops
@@ -817,9 +812,10 @@ impl Interp<'_> {
             return;
         };
         let fields = std::mem::take(&mut self.vacuous_fields);
-        if fields.iter().any(|&field| {
-            self.ops.object_property_invalid(owner, field, self.names)
-        }) {
+        if fields
+            .iter()
+            .any(|&field| self.ops.object_property_invalid(owner, field, self.names))
+        {
             self.join_unmatched(state);
         } else {
             self.vacuous_cover_kills_chain();
@@ -844,7 +840,10 @@ impl Interp<'_> {
     /// Without the arm the type test's `factor(any, Invalid)` answers
     /// `Never` (subtype.dart's 0c arm) and every such pattern body deads.
     fn pattern_known_invalid(&mut self, known: Ty, args: u32) -> bool {
-        if !self.ops.is_invalid_typed(known, args, self.args, self.names) {
+        if !self
+            .ops
+            .is_invalid_typed(known, args, self.args, self.names)
+        {
             return false;
         }
         let cur = self.current.clone();
@@ -855,14 +854,15 @@ impl Interp<'_> {
     /// The statement-switch frame's latched scrutinee type (the scrutinee
     /// value's own ty at `SwitchBlockBegin`), with its written arguments.
     fn frame_scrutinee_ty(&self) -> Option<(Ty, u32)> {
-        self.switch_frame().and_then(|index| match &self.stack[index] {
-            Frame::Switch {
-                scrutinee_ty,
-                scrutinee_args,
-                ..
-            } => Some((*scrutinee_ty, *scrutinee_args)),
-            _ => None,
-        })
+        self.switch_frame()
+            .and_then(|index| match &self.stack[index] {
+                Frame::Switch {
+                    scrutinee_ty,
+                    scrutinee_args,
+                    ..
+                } => Some((*scrutinee_ty, *scrutinee_args)),
+                _ => None,
+            })
     }
 
     /// Whether the open standalone context (if-case, declaration) matches a
@@ -932,12 +932,16 @@ impl Interp<'_> {
         // folds its else dead without the join). No latched type at all
         // may always fail, so it joins too.
         if self.pattern.is_some() {
-            let covered = self
-                .frame_scrutinee_ty()
-                .is_some_and(|(ty, frame_args)| {
-                    self.ops
-                        .is_subtype_typed(ty, frame_args, declared, declared_args, self.args, self.names)
-                });
+            let covered = self.frame_scrutinee_ty().is_some_and(|(ty, frame_args)| {
+                self.ops.is_subtype_typed(
+                    ty,
+                    frame_args,
+                    declared,
+                    declared_args,
+                    self.args,
+                    self.names,
+                )
+            });
             if !covered {
                 let cur = self.current.clone();
                 self.join_unmatched(cur);

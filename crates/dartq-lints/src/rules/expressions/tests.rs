@@ -3,8 +3,7 @@ use dartq_ast::NodeKind;
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{
-    Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
-    Namespaces,
+    Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces,
 };
 use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
 use dartq_source::{FileTable, StringTable};
@@ -19,11 +18,7 @@ use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf1
 /// file's library: `Some((text, None))` plain, `Some((text,
 /// Some(prefix)))` deferred-prefixed, `None` no import edge. The
 /// context tables leak (`'static`); the tests are one-shot processes.
-fn run_semantic(
-    source: &str,
-    rule: &str,
-    dependency: Option<(&str, Option<&str>)>,
-) -> Vec<Lint> {
+fn run_semantic(source: &str, rule: &str, dependency: Option<(&str, Option<&str>)>) -> Vec<Lint> {
     let fixture = Fixture::parse(source);
     let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
     let mut files = FileTable::new();
@@ -263,9 +258,8 @@ fn prefer_is_not_reports_in_an_if_condition() {
 /// when the paren operand finalizes lazily (`!(a is int) && b`).
 #[test]
 fn prefer_is_not_reports_as_a_binary_left_operand() {
-    let f = Fixture::parse(
-        "void f(Object a, bool b) {\n  var r = !(a is int) && b;\n  print(r);\n}\n",
-    );
+    let f =
+        Fixture::parse("void f(Object a, bool b) {\n  var r = !(a is int) && b;\n  print(r);\n}\n");
     let lints = f.run(&one_rule("prefer_is_not_operator"));
     assert_eq!(lints.len(), 1);
     let bang = tok(&f.source, &f.tokens, "!", 0);
@@ -275,8 +269,7 @@ fn prefer_is_not_reports_as_a_binary_left_operand() {
 /// `is!` under a `!` already uses the operator (`test_isNot`).
 #[test]
 fn prefer_is_not_bare_is_bang_passes() {
-    let f =
-        Fixture::parse("void f(Object a) {\n  if (!(a is! int)) {\n    print(0);\n  }\n}\n");
+    let f = Fixture::parse("void f(Object a) {\n  if (!(a is! int)) {\n    print(0);\n  }\n}\n");
     assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
 }
 
@@ -688,8 +681,7 @@ fn if_null_production_statement_boundary_holds() {
 fn if_null_production_range_end_riders() {
     // `f()`'s own `)` is the arm's closer, not a swallowed follower —
     // stepping back over it would crop the range into `f(`.
-    let f =
-        Fixture::parse("int g() => 0;\nvoid f(int? x) {\n  var v = x == null ? g() : x;\n}\n");
+    let f = Fixture::parse("int g() => 0;\nvoid f(int? x) {\n  var v = x == null ? g() : x;\n}\n");
     let lints = f.run(&one_rule("prefer_if_null_operators"));
     assert_eq!(lints.len(), 1);
     let x = tok(&f.source, &f.tokens, "x", 2);
@@ -1238,39 +1230,39 @@ fn prefer_is_not_empty_reports_bang_is_empty() {
     assert_eq!(lints[0].range.end, utf16_at(&f, is_empty) + 7);
 }
 
-    /// A negated `isNotEmpty` (or any other property) passes.
-    #[test]
-    fn prefer_is_not_empty_other_property_passes() {
-        let f = Fixture::parse("void f(List<int> xs) { if (!xs.isNotEmpty) {} }");
-        assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
+/// A negated `isNotEmpty` (or any other property) passes.
+#[test]
+fn prefer_is_not_empty_other_property_passes() {
+    let f = Fixture::parse("void f(List<int> xs) { if (!xs.isNotEmpty) {} }");
+    assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
 
-        let f = Fixture::parse("void f(bool a, bool b) { if (!(a || b)) {} }");
-        assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
-    }
+    let f = Fixture::parse("void f(bool a, bool b) { if (!(a || b)) {} }");
+    assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
+}
 
-    /// `test_list_isEmpty_parens_not` /
-    /// `test_list_isEmpty_doubleParens_not` — the parenthesized operand
-    /// unwraps (`node.operand.unParenthesized`) and the report spans the
-    /// whole prefix expression through the outermost closing paren.
-    #[test]
-    fn prefer_is_not_empty_parenthesized_operand_reports() {
-        let f = Fixture::parse("var x = !([3].isEmpty);");
-        let lints = f.run(&one_rule("prefer_is_not_empty"));
-        assert_eq!(lints.len(), 1, "{lints:?}");
-        // ASCII source: the end sits one past the closing paren.
-        assert_eq!(
-            lints[0].range.end as usize,
-            f.source.find(')').expect("closing paren") + 1
-        );
+/// `test_list_isEmpty_parens_not` /
+/// `test_list_isEmpty_doubleParens_not` — the parenthesized operand
+/// unwraps (`node.operand.unParenthesized`) and the report spans the
+/// whole prefix expression through the outermost closing paren.
+#[test]
+fn prefer_is_not_empty_parenthesized_operand_reports() {
+    let f = Fixture::parse("var x = !([3].isEmpty);");
+    let lints = f.run(&one_rule("prefer_is_not_empty"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    // ASCII source: the end sits one past the closing paren.
+    assert_eq!(
+        lints[0].range.end as usize,
+        f.source.find(')').expect("closing paren") + 1
+    );
 
-        let f = Fixture::parse("var x = !(([4].isEmpty));");
-        let lints = f.run(&one_rule("prefer_is_not_empty"));
-        assert_eq!(lints.len(), 1, "{lints:?}");
-        assert_eq!(
-            lints[0].range.end as usize,
-            f.source.rfind(')').expect("outer closing paren") + 1
-        );
-    }
+    let f = Fixture::parse("var x = !(([4].isEmpty));");
+    let lints = f.run(&one_rule("prefer_is_not_empty"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].range.end as usize,
+        f.source.rfind(')').expect("outer closing paren") + 1
+    );
+}
 
 /// A string-literal receiver carries `isNotEmpty` on `String` and
 /// reports through the face query (:57-62).
@@ -1686,8 +1678,7 @@ fn unnecessary_this_reports_a_field_access() {
     assert_eq!(lints[0].range.end - lints[0].range.start, 4);
 
     // Inherited member — no declaration anywhere in the file.
-    let f =
-        Fixture::parse("class A { void f() {} }\nclass B extends A { void g() { this.f(); } }");
+    let f = Fixture::parse("class A { void f() {} }\nclass B extends A { void g() { this.f(); } }");
     assert_eq!(
         f.run(&one_rule("unnecessary_this")).len(),
         1,
@@ -1701,9 +1692,8 @@ fn unnecessary_this_reports_a_field_access() {
 /// the scope gates open.
 #[test]
 fn unnecessary_this_reports_in_a_getter_expression_body() {
-    let f = Fixture::parse(
-        "class W {\n  int width = 0;\n  int get doubled => this.width * 2;\n}\n",
-    );
+    let f =
+        Fixture::parse("class W {\n  int width = 0;\n  int get doubled => this.width * 2;\n}\n");
     let lints = f.run(&one_rule("unnecessary_this"));
     assert_eq!(lints.len(), 1);
     let this_kw = tok(&f.source, &f.tokens, "this", 0);
@@ -1847,12 +1837,7 @@ fn final_fields_reports_on_real_parse() {
 }
 
 /// An assignment statement over the field name, as a unit-level sibling.
-fn assignment_statement(
-    b: &mut dartq_ast::AstBuilder,
-    name_at: u32,
-    eq_at: u32,
-    value_at: u32,
-) {
+fn assignment_statement(b: &mut dartq_ast::AstBuilder, name_at: u32, eq_at: u32, value_at: u32) {
     b.begin(NodeKind::ExpressionStatement, name_at);
     b.begin(NodeKind::Assignment, name_at);
     b.patch(0, eq_at);
@@ -2062,50 +2047,49 @@ fn field_initializer_set_reports() {
     assert_eq!(field_hits(&bare).len(), 1);
     // `this.` form: the entry head is the `this` keyword; the name sits
     // two tokens later.
-    let this_form =
-        Fixture::build("class C {\n  int _x;\n  C() : this._x = 0;\n}\n", |b, t| {
-            b.begin(NodeKind::CompilationUnit, 0);
-            b.begin(NodeKind::TopLevelDeclaration, 0);
-            identifier(b, 1, 2);
-            b.begin(NodeKind::ClassDeclaration, 0);
-            b.patch(0, 0);
-            b.patch(1, NONE);
-            b.patch(2, NONE);
-            b.patch(3, NONE);
-            b.begin(NodeKind::DeclarationBody, 2);
-            b.begin(NodeKind::Fields, 2);
-            b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
-            b.begin(NodeKind::VariablesDeclaration, 3);
-            b.patch(0, NONE);
-            b.leaf_span(NodeKind::Type, 3, 4);
-            b.begin(NodeKind::InitializedIdentifier, 4);
-            identifier(b, 4, 5);
-            b.end(NodeKind::InitializedIdentifier, 5);
-            b.end(NodeKind::VariablesDeclaration, 6);
-            b.end(NodeKind::Fields, 6);
-            b.begin(NodeKind::Constructor, 6);
-            b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
-            b.patch(1, NONE);
-            b.patch(2, 7);
-            b.patch(3, 9);
-            identifier(b, 6, 7);
-            b.begin(NodeKind::FormalParameters, 7);
-            b.end(NodeKind::FormalParameters, 8);
-            b.begin(NodeKind::Initializers, 9);
-            b.begin(NodeKind::Initializer, 10);
-            b.begin(NodeKind::FieldInitializer, 13);
-            b.patch(0, 13);
-            b.leaf(NodeKind::LiteralInt, 15);
-            b.end(NodeKind::FieldInitializer, 16);
-            b.end(NodeKind::Initializer, 16);
-            b.end(NodeKind::Initializers, 16);
-            b.leaf(NodeKind::EmptyBody, 16);
-            b.end(NodeKind::Constructor, 17);
-            b.end(NodeKind::DeclarationBody, 17);
-            b.end(NodeKind::ClassDeclaration, 18);
-            b.end(NodeKind::TopLevelDeclaration, 18);
-            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
-        });
+    let this_form = Fixture::build("class C {\n  int _x;\n  C() : this._x = 0;\n}\n", |b, t| {
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.begin(NodeKind::TopLevelDeclaration, 0);
+        identifier(b, 1, 2);
+        b.begin(NodeKind::ClassDeclaration, 0);
+        b.patch(0, 0);
+        b.patch(1, NONE);
+        b.patch(2, NONE);
+        b.patch(3, NONE);
+        b.begin(NodeKind::DeclarationBody, 2);
+        b.begin(NodeKind::Fields, 2);
+        b.patch(0, dartq_parser::MemberKind::NonStaticField as u32);
+        b.begin(NodeKind::VariablesDeclaration, 3);
+        b.patch(0, NONE);
+        b.leaf_span(NodeKind::Type, 3, 4);
+        b.begin(NodeKind::InitializedIdentifier, 4);
+        identifier(b, 4, 5);
+        b.end(NodeKind::InitializedIdentifier, 5);
+        b.end(NodeKind::VariablesDeclaration, 6);
+        b.end(NodeKind::Fields, 6);
+        b.begin(NodeKind::Constructor, 6);
+        b.patch(0, dartq_parser::MemberKind::NonStaticMethod as u32);
+        b.patch(1, NONE);
+        b.patch(2, 7);
+        b.patch(3, 9);
+        identifier(b, 6, 7);
+        b.begin(NodeKind::FormalParameters, 7);
+        b.end(NodeKind::FormalParameters, 8);
+        b.begin(NodeKind::Initializers, 9);
+        b.begin(NodeKind::Initializer, 10);
+        b.begin(NodeKind::FieldInitializer, 13);
+        b.patch(0, 13);
+        b.leaf(NodeKind::LiteralInt, 15);
+        b.end(NodeKind::FieldInitializer, 16);
+        b.end(NodeKind::Initializer, 16);
+        b.end(NodeKind::Initializers, 16);
+        b.leaf(NodeKind::EmptyBody, 16);
+        b.end(NodeKind::Constructor, 17);
+        b.end(NodeKind::DeclarationBody, 17);
+        b.end(NodeKind::ClassDeclaration, 18);
+        b.end(NodeKind::TopLevelDeclaration, 18);
+        b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
+    });
     assert_eq!(field_hits(&this_form).len(), 1);
 }
 
@@ -2383,8 +2367,7 @@ fn enum_fields_pass() {
 /// `writeElement` is the field).
 #[test]
 fn cascade_section_write_blocks() {
-    let f =
-        Fixture::parse("class C {\n  int _x = 0;\n  void f(C o) {\n    o.._x = 1;\n  }\n}\n");
+    let f = Fixture::parse("class C {\n  int _x = 0;\n  void f(C o) {\n    o.._x = 1;\n  }\n}\n");
     assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
 }
 
@@ -2431,8 +2414,7 @@ fn local_namesake_write_passes() {
 /// A parameter namesake captures the same way.
 #[test]
 fn parameter_namesake_write_passes() {
-    let f =
-        Fixture::parse("class C {\n  int _x = 0;\n  void f(int _x) {\n    _x = 2;\n  }\n}\n");
+    let f = Fixture::parse("class C {\n  int _x = 0;\n  void f(int _x) {\n    _x = 2;\n  }\n}\n");
     assert_eq!(field_hits(&f).len(), 1);
 }
 
@@ -2442,8 +2424,7 @@ fn parameter_namesake_write_passes() {
 /// here and the bare-name posture keeps parity.
 #[test]
 fn pattern_assignment_only_mutation_reports() {
-    let f =
-        Fixture::parse("class C {\n  int _x = 0;\n  void f() {\n    (_x,) = (1,);\n  }\n}\n");
+    let f = Fixture::parse("class C {\n  int _x = 0;\n  void f() {\n    (_x,) = (1,);\n  }\n}\n");
     assert_eq!(field_hits(&f).len(), 1);
 }
 
@@ -2556,8 +2537,7 @@ fn unrelated_type_equality_reports_mismatched_scalars() {
 /// literal reports at the operator — the written-name operand face.
 #[test]
 fn unrelated_type_equality_reports_written_name_operand() {
-    let f =
-        Fixture::parse("void f(int someInt) {\n  var g4 = someInt == true;\n  print(g4);\n}\n");
+    let f = Fixture::parse("void f(int someInt) {\n  var g4 = someInt == true;\n  print(g4);\n}\n");
     let lints = f.run(&one_rule("unrelated_type_equality_checks"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
@@ -2731,8 +2711,7 @@ fn invalid_runtime_check_reports_dart_vs_js() {
 /// Without `dart:js_interop` the same syntax is not interop-classified.
 #[test]
 fn invalid_runtime_check_requires_js_interop_import() {
-    let f =
-        Fixture::parse("@JS\nclass JS {}\n\nclass Dart {\n  bool check() => this is JS;\n}");
+    let f = Fixture::parse("@JS\nclass JS {}\n\nclass Dart {\n  bool check() => this is JS;\n}");
     assert!(
         f.run(&one_rule("invalid_runtime_check_with_js_interop_types"))
             .is_empty()
@@ -2886,7 +2865,8 @@ fn js_rounded_ints_exact_literals_pass() {
 /// 3.13.1 SDK (#2095).
 #[test]
 fn unnecessary_lambdas_initializer_faces() {
-    let initializer = "void f() {\n  final handler = (int input) {\n    print(input);\n  };\n  handler(1);\n}\n";
+    let initializer =
+        "void f() {\n  final handler = (int input) {\n    print(input);\n  };\n  handler(1);\n}\n";
     assert!(
         Fixture::parse(initializer)
             .run(&one_rule("unnecessary_lambdas"))
@@ -3044,7 +3024,8 @@ fn prefer_null_aware_method_calls_operand_head_is_the_identifier() {
 #[test]
 fn prefer_null_aware_method_calls_resolution_faces() {
     // The member face: `p.m` resolves on the receiver's container.
-    let source = "class C {\n  int Function()? m;\n}\nvoid f(C p) {\n  p.m != null ? p.m!() : null;\n}\n";
+    let source =
+        "class C {\n  int Function()? m;\n}\nvoid f(C p) {\n  p.m != null ? p.m!() : null;\n}\n";
     assert_eq!(
         run_semantic(source, "prefer_null_aware_method_calls", None).len(),
         1
@@ -3094,7 +3075,8 @@ fn paren_imported_extension_member_faces() {
 /// silent under the old coordinates and reports 1 under UTF-16.
 #[test]
 fn semantic_query_coordinates_are_utf16() {
-    let source = "// \u{1F600} four-byte, two-unit glyph\nvoid f() async {\n  int x = 1;\n  await x;\n}\n";
+    let source =
+        "// \u{1F600} four-byte, two-unit glyph\nvoid f() async {\n  int x = 1;\n  await x;\n}\n";
     assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
 }
 
@@ -3108,7 +3090,8 @@ fn prefer_contains_const_identifier_bound() {
     // -1/0 matrix (prefer_contains.dart :73-124) — a bound off the
     // matrix or a non-indexOf operand stays silent upstream. `-1`
     // also covers the prefixed-literal face of the const read.
-    let source = "const kMinusOne = -1;\nvoid f(List<int> l) {\n  if (l.indexOf(1) <= kMinusOne) {}\n}\n";
+    let source =
+        "const kMinusOne = -1;\nvoid f(List<int> l) {\n  if (l.indexOf(1) <= kMinusOne) {}\n}\n";
     assert_eq!(run_semantic(source, "prefer_contains", None).len(), 1);
 }
 
@@ -3117,8 +3100,7 @@ fn prefer_contains_const_identifier_bound() {
 /// `parentType` check).
 #[test]
 fn prefer_contains_non_iterable_receiver_silent() {
-    let source =
-        "class X { int get length => 0; }\nvoid f(X x) {\n  if (x.length <= 3) {}\n}\n";
+    let source = "class X { int get length => 0; }\nvoid f(X x) {\n  if (x.length <= 3) {}\n}\n";
     assert!(run_semantic(source, "prefer_contains", None).is_empty());
 }
 
@@ -3170,7 +3152,8 @@ fn await_only_futures_static_type_gate() {
 /// `call` method reports; an operand without `call` stays silent.
 #[test]
 fn implicit_call_tearoffs_call_member_gate() {
-    let source = "class C {\n  void call() {}\n}\nvoid f() {\n  C c = C();\n  void Function() g = c;\n}\n";
+    let source =
+        "class C {\n  void call() {}\n}\nvoid f() {\n  C c = C();\n  void Function() g = c;\n}\n";
     assert_eq!(
         run_semantic(source, "implicit_call_tearoffs", None).len(),
         1
@@ -3262,8 +3245,7 @@ fn null_closures_this_receiver_and_user_container() {
 fn prefer_is_empty_receiver_gate() {
     let source = "void f(List<int> l) {\n  if (l.length == 0) {}\n}\n";
     assert_eq!(run_semantic(source, "prefer_is_empty", None).len(), 1);
-    let source =
-        "class X { int get length => 0; }\nvoid f(X x) {\n  if (x.length == 0) {}\n}\n";
+    let source = "class X { int get length => 0; }\nvoid f(X x) {\n  if (x.length == 0) {}\n}\n";
     assert!(run_semantic(source, "prefer_is_empty", None).is_empty());
 }
 
@@ -3287,8 +3269,7 @@ fn prefer_is_not_empty_member_gate() {
         run_semantic(source, "prefer_is_not_empty", None).is_empty(),
         "no binary `== false` arm upstream"
     );
-    let source =
-        "class X { bool get isEmpty => true; }\nvoid f(X x) {\n  if (!x.isEmpty) {}\n}\n";
+    let source = "class X { bool get isEmpty => true; }\nvoid f(X x) {\n  if (!x.isEmpty) {}\n}\n";
     assert!(
         run_semantic(source, "prefer_is_not_empty", None).is_empty(),
         "a user class without `isNotEmpty` stays silent"
@@ -3315,8 +3296,7 @@ fn unrelated_type_equality_checks_supertype_face() {
 /// field's written type.
 #[test]
 fn void_checks_assignment_target_resolution() {
-    let source =
-        "class C {\n  void v = null;\n  void m() {\n    int v = 1;\n    v = 2;\n  }\n}\n";
+    let source = "class C {\n  void v = null;\n  void m() {\n    int v = 1;\n    v = 2;\n  }\n}\n";
     assert!(run_semantic(source, "void_checks", None).is_empty());
     let source = "class C {\n  void v = null;\n  void m() {\n    this.v = 1;\n  }\n}\n";
     assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
@@ -3402,7 +3382,8 @@ fn unrelated_type_equality_pattern_face() {
         run_semantic(source, "unrelated_type_equality_checks", None).len(),
         1
     );
-    let source = "void f(int n) {\n  switch (n) {\n    case == 3:\n      print(0);\n      break;\n  }\n}\n";
+    let source =
+        "void f(int n) {\n  switch (n) {\n    case == 3:\n      print(0);\n      break;\n  }\n}\n";
     assert!(run_semantic(source, "unrelated_type_equality_checks", None).is_empty());
 }
 
@@ -3536,7 +3517,8 @@ fn implicit_call_tearoffs_return_and_argument_faces() {
         run_semantic(source, "implicit_call_tearoffs", None).len(),
         1
     );
-    let source = "class C {\n  void call() {}\n}\nvoid g(void Function() f) {}\nvoid h(C c) {\n  g(c);\n}\n";
+    let source =
+        "class C {\n  void call() {}\n}\nvoid g(void Function() f) {}\nvoid h(C c) {\n  g(c);\n}\n";
     assert_eq!(
         run_semantic(source, "implicit_call_tearoffs", None).len(),
         1
@@ -3555,7 +3537,8 @@ fn implicit_call_tearoffs_function_target_and_creation() {
         run_semantic(source, "implicit_call_tearoffs", None).len(),
         1
     );
-    let source = "class C {\n  void call() {}\n}\nvoid g(void Function() f) {}\nvoid h() {\n  g(C());\n}\n";
+    let source =
+        "class C {\n  void call() {}\n}\nvoid g(void Function() f) {}\nvoid h() {\n  g(C());\n}\n";
     assert_eq!(
         run_semantic(source, "implicit_call_tearoffs", None).len(),
         1

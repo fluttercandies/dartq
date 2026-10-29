@@ -20,7 +20,7 @@
 //! deliberate re-record). A plain run never writes the file.
 
 use crate::analyze_json;
-use crate::rows::{sort_rows, Row};
+use crate::rows::{Row, sort_rows};
 use crate::runner;
 use crate::watchdog;
 use std::collections::{BTreeMap, BTreeSet};
@@ -136,7 +136,9 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
         }
     }
     if dirs.is_empty() {
-        eprintln!("realworld: nothing measured — every selected package is absent from the pub cache (explicit skip)");
+        eprintln!(
+            "realworld: nothing measured — every selected package is absent from the pub cache (explicit skip)"
+        );
         return 77;
     }
     eprintln!(
@@ -169,16 +171,14 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
             }
         };
         // The oracle failing is an environment problem, not a dartq verdict.
-        let oracle_diags = match run_analyzer(
-            &mut runner::oracle_command(&dart_bin, &canonical),
-            "oracle",
-        ) {
-            Ok(diags) => diags,
-            Err(e) => {
-                eprintln!("error: the oracle failed on {name}: {e}");
-                return 2;
-            }
-        };
+        let oracle_diags =
+            match run_analyzer(&mut runner::oracle_command(&dart_bin, &canonical), "oracle") {
+                Ok(diags) => diags,
+                Err(e) => {
+                    eprintln!("error: the oracle failed on {name}: {e}");
+                    return 2;
+                }
+            };
         let (oracle_rows, oracle_outside) = attribute(&oracle_diags, &canonical);
         if oracle_outside > 0 {
             warn(&format!(
@@ -230,17 +230,12 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
                     }
                     Ok(()) => {
                         diff_n += 1;
-                        let hint = if *baseline
-                            == BaselineRow::recorded(name, &diff, "diff")
-                        {
+                        let hint = if *baseline == BaselineRow::recorded(name, &diff, "diff") {
                             " (unchanged divergence)".to_string()
                         } else {
                             " — run with --update-baseline to record".to_string()
                         };
-                        eprintln!(
-                            "realworld: {name} DIFF{}{hint}",
-                            diff.stats_line()
-                        );
+                        eprintln!("realworld: {name} DIFF{}{hint}", diff.stats_line());
                         "diff".to_string()
                     }
                 },
@@ -258,7 +253,10 @@ pub fn realworld_command(args: &RealworldArgs) -> i32 {
             eprintln!(
                 "error: baseline not recorded: {}",
                 if crashes.is_empty() {
-                    format!("{} package(s) regressed against the stored baseline", fail_n)
+                    format!(
+                        "{} package(s) regressed against the stored baseline",
+                        fail_n
+                    )
                 } else {
                     format!("dartq crashed on: {}", crashes.join(", "))
                 }
@@ -349,7 +347,9 @@ fn parse_packages(text: &str) -> Result<Vec<(String, String)>, String> {
             continue;
         }
         let Some((name, value)) = line.split_once('=') else {
-            return Err(format!("malformed entry (expected name = \"version\"): {line}"));
+            return Err(format!(
+                "malformed entry (expected name = \"version\"): {line}"
+            ));
         };
         let name = name.trim();
         let value = value.trim();
@@ -385,8 +385,9 @@ fn pub_cache_dir() -> Result<PathBuf, String> {
             return Ok(PathBuf::from(dir));
         }
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| "cannot locate the pub cache: neither $PUB_CACHE nor $HOME is set".to_string())?;
+    let home = std::env::var("HOME").map_err(|_| {
+        "cannot locate the pub cache: neither $PUB_CACHE nor $HOME is set".to_string()
+    })?;
     Ok(PathBuf::from(home).join(".pub-cache"))
 }
 
@@ -432,7 +433,9 @@ fn run_analyzer(command: &mut Command, label: &str) -> Result<Vec<analyze_json::
             let start = stderr.len().saturating_sub(300);
             stderr[start..].replace('\n', " | ")
         };
-        return Err(format!("{label} produced no diagnostics envelope; stderr tail: {tail}"));
+        return Err(format!(
+            "{label} produced no diagnostics envelope; stderr tail: {tail}"
+        ));
     }
     Ok(diags)
 }
@@ -498,17 +501,18 @@ struct PackageDiff {
 
 impl PackageDiff {
     fn is_green(&self) -> bool {
-        self.crash.is_none()
-            && self.missing == 0
-            && self.extra == 0
-            && self.message_only == 0
+        self.crash.is_none() && self.missing == 0 && self.extra == 0 && self.message_only == 0
     }
 
     /// A dartq crash: every oracle row is unreported and the package can
     /// never look green (jaccard pins to 0 even on a clean oracle side).
     fn crashed(oracle: &[Row], detail: String) -> PackageDiff {
         PackageDiff {
-            files: oracle.iter().map(|r| r.file.clone()).collect::<BTreeSet<_>>().len(),
+            files: oracle
+                .iter()
+                .map(|r| r.file.clone())
+                .collect::<BTreeSet<_>>()
+                .len(),
             oracle_rows: oracle.len(),
             missing: oracle.len(),
             jaccard: 0.0,
@@ -600,7 +604,8 @@ fn compare(oracle: &[Row], dartq: &[Row]) -> PackageDiff {
                 .map(|(o, d)| (o.clone(), d.clone())),
         );
         diff.missing += oracle_left.len() - pairs;
-        diff.missing_rows.extend(oracle_left[pairs..].iter().cloned());
+        diff.missing_rows
+            .extend(oracle_left[pairs..].iter().cloned());
         diff.extra += dartq_left.len() - pairs;
         diff.extra_rows.extend(dartq_left[pairs..].iter().cloned());
     }
@@ -878,7 +883,10 @@ mod tests {
         let found = resolve_package(&cache, "meta", "1.19.0").expect("present");
         assert_eq!(found, pkg);
         let err = resolve_package(&cache, "drift", "2.34.0").unwrap_err();
-        assert!(err.contains("dart pub cache add drift --version 2.34.0"), "{err}");
+        assert!(
+            err.contains("dart pub cache add drift --version 2.34.0"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&cache);
     }
 
@@ -938,9 +946,15 @@ mod tests {
             )]
         );
         assert_eq!(diff.missing, 1);
-        assert_eq!(diff.missing_rows, vec!["WARNING|c|lib/y.dart|3:1|1|m".to_string()]);
+        assert_eq!(
+            diff.missing_rows,
+            vec!["WARNING|c|lib/y.dart|3:1|1|m".to_string()]
+        );
         assert_eq!(diff.extra, 1);
-        assert_eq!(diff.extra_rows, vec!["ERROR|d|lib/z.dart|4:1|1|m".to_string()]);
+        assert_eq!(
+            diff.extra_rows,
+            vec!["ERROR|d|lib/z.dart|4:1|1|m".to_string()]
+        );
         // jaccard over full row texts: {a,b,c} vs {a,b',d} -> 1/5.
         assert!((diff.jaccard - 0.2).abs() < 1e-9, "{}", diff.jaccard);
         assert!(!diff.is_green());
@@ -989,17 +1003,30 @@ mod tests {
         };
         assert!(gate_check(&baseline, &current).is_ok());
         // Improvement: fine.
-        let improved = PackageDiff { extra: 0, jaccard: 0.8, ..current.clone() };
+        let improved = PackageDiff {
+            extra: 0,
+            jaccard: 0.8,
+            ..current.clone()
+        };
         assert!(gate_check(&baseline, &improved).is_ok());
         // Regression: extra grew.
-        let regressed = PackageDiff { extra: 2, ..current.clone() };
+        let regressed = PackageDiff {
+            extra: 2,
+            ..current.clone()
+        };
         assert!(gate_check(&baseline, &regressed).is_err());
         // Regression: a dartq-only row swapped for another (extra count
         // equal, jaccard dropped beyond the storage tolerance).
-        let swapped = PackageDiff { jaccard: 0.4, ..current.clone() };
+        let swapped = PackageDiff {
+            jaccard: 0.4,
+            ..current.clone()
+        };
         assert!(gate_check(&baseline, &swapped).is_err());
         // Rounding noise within the storage precision is not a regression.
-        let noisy = PackageDiff { jaccard: 0.49995, ..current };
+        let noisy = PackageDiff {
+            jaccard: 0.49995,
+            ..current
+        };
         assert!(gate_check(&baseline, &noisy).is_ok());
     }
 

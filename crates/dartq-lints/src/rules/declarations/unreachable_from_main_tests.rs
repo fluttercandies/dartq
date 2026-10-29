@@ -345,11 +345,7 @@ use dartq_source::{FileTable, StringTable};
 /// imports it unprefixed, and indexes it — the cross-file resolution
 /// face. The context tables leak (`'static`); the tests are one-shot
 /// processes.
-fn run_semantic(
-    source: &str,
-    rule: &str,
-    dependency: Option<&str>,
-) -> Vec<crate::engine::Lint> {
+fn run_semantic(source: &str, rule: &str, dependency: Option<&str>) -> Vec<crate::engine::Lint> {
     let mut fixture = Fixture::parse(source);
     // The unit path is a package lib file — the path-gated rules
     // (`avoid_renaming_method_parameters`' `isInLibDir`) register.
@@ -594,9 +590,7 @@ fn required_named_first_in_order_super_formals_pass() {
         "  const C({super.a, required super.b, required int x});\n",
         "}\n",
     );
-    assert!(
-        run_semantic(source, "always_put_required_named_parameters_first", None).is_empty()
-    );
+    assert!(run_semantic(source, "always_put_required_named_parameters_first", None).is_empty());
 }
 
 /// At most one named super-formal is trivially in order (:71) — no
@@ -611,9 +605,7 @@ fn required_named_first_single_super_formal_passes() {
         "  const C({super.key, required int x});\n",
         "}\n",
     );
-    assert!(
-        run_semantic(source, "always_put_required_named_parameters_first", None).is_empty()
-    );
+    assert!(run_semantic(source, "always_put_required_named_parameters_first", None).is_empty());
 }
 
 /// The written `super.named(...)` initializer selects the target

@@ -223,9 +223,9 @@ fn undefined_type_argument_is_test_deads_the_else() {
             .iter()
             .filter(|name| **name == "non_type_as_type_argument")
             .count()
-                >= 2,
-            "both undefined argument spellings report: {:?}",
-            report.diagnostics
+            >= 2,
+        "both undefined argument spellings report: {:?}",
+        report.diagnostics
     );
 }
 

@@ -669,7 +669,11 @@ impl<'a> Face<'a> {
         }
         // The factory lane's own formals (the #2687 argument-check face):
         // the same sorted-map encoding.
-        Self::sorted(self.strings, &mut self.inner, factory_formals.keys().copied());
+        Self::sorted(
+            self.strings,
+            &mut self.inner,
+            factory_formals.keys().copied(),
+        );
         for j in 0..self.inner.len() {
             let ctor_name = self.inner[j];
             self.name(ctor_name);
@@ -935,8 +939,10 @@ mod tests {
             "extension E<T extends int> on List<T> { int get probe => 1; }\n",
             &strings,
         );
-        let unbounded =
-            elements_of("extension E<T> on List<T> { int get probe => 1; }\n", &strings);
+        let unbounded = elements_of(
+            "extension E<T> on List<T> { int get probe => 1; }\n",
+            &strings,
+        );
         let [bounded_face] = &bounded.extension_faces[..] else {
             panic!("the bounded source collects one extension face");
         };

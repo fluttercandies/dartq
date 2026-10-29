@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{PayloadField, Check, RuleSpec};
+use super::{Check, PayloadField, RuleSpec};
 use crate::rules::{MemberQuery, NONE_TOKEN, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -191,8 +191,7 @@ fn object_member_kind(c: &Check<'_>, object: u32, name: &str) -> Option<&'static
             if !crate::rules::member_matches(c, member, MemberQuery::Getter, name).is_empty() {
                 return Some("getter");
             }
-            if !crate::rules::member_matches(c, member, MemberQuery::Variable, name).is_empty()
-            {
+            if !crate::rules::member_matches(c, member, MemberQuery::Variable, name).is_empty() {
                 return Some("field");
             }
         }
@@ -244,9 +243,7 @@ mod tests {
     fn other_field_shapes_are_silent() {
         assert!(run("void f(Object o) {\n  if (o case int i) {}\n}\n").is_empty());
         assert!(run("void f(Object o) {\n  if (o case int(:var isEven)) {}\n}\n").is_empty());
-        assert!(
-            run("void f(Object o) {\n  if (o case int(isEven:var other)) {}\n}\n").is_empty()
-        );
+        assert!(run("void f(Object o) {\n  if (o case int(isEven:var other)) {}\n}\n").is_empty());
     }
 
     /// `test_patternField_inheritedMethod` — the same-file chain
@@ -287,15 +284,15 @@ mod tests {
     /// official lookUp bail, :99-104).
     #[test]
     fn missing_member_is_silent() {
-        let source = "class B {\n  int y = 0;\n}\n\nvoid f(Object o) {\n  if (o case B(m:var m)) {}\n}\n";
+        let source =
+            "class B {\n  int y = 0;\n}\n\nvoid f(Object o) {\n  if (o case B(m:var m)) {}\n}\n";
         assert!(run(source).is_empty());
     }
 
     /// `test_recordDestructuring` — the record face spells `field`.
     #[test]
     fn record_destructuring_answers_the_field_word() {
-        let source =
-            "void f((int, {String name}) record) {\n  var (x, name: name) = record;\n}\n";
+        let source = "void f((int, {String name}) record) {\n  var (x, name: name) = record;\n}\n";
         let lints = run(source);
         assert_eq!(lints.len(), 1, "{lints:?}");
         assert_eq!(

@@ -1,6 +1,6 @@
 use rustc_hash::FxHashSet;
 
-use super::{PayloadField, Check, RuleSpec, container_name_token};
+use super::{Check, PayloadField, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
 use crate::rules::{initialized_identifier_name, member_name, rows_with_parent, utf16_token_span};
 use dartq_ast::NodeKind;
@@ -49,11 +49,8 @@ use dartq_ast::NodeKind;
 /// over-suppresses (the flutter-family approximation register). An
 /// unnamed extension has no name token to key a face flag with: it
 /// never reports, and its members judge on their own flags.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unreachable_from_main",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("unreachable_from_main", &[NodeKind::CompilationUnit], check,);
 
 /// The candidate class the widget-preview suppression reads (upstream
 /// `hasWidgetPreview`: constructors, top-level functions, and static
@@ -273,12 +270,7 @@ fn judge_container(
 /// Judges one constructor: the display name is `Type.written`, the
 /// unnamed face `Type.new` (upstream `nameForError`'s
 /// `self.name?.lexeme ?? 'new'`), anchored at the name token.
-fn judge_constructor(
-    c: &mut Check<'_>,
-    face: &ReachabilityFace<'_>,
-    row: u32,
-    container: &str,
-) {
+fn judge_constructor(c: &mut Check<'_>, face: &ReachabilityFace<'_>, row: u32, container: &str) {
     let written = constructor_name_node(c, row);
     let (name_token, member) = match written {
         Some(node) => {
@@ -449,8 +441,7 @@ fn carries_annotation(c: &Check<'_>, wrapper: u32, row: u32, name: &str) -> bool
         c.collect_direct(star).into_iter().any(|meta| {
             c.kind(meta) == NodeKind::Metadata
                 && c.collect_direct(meta).into_iter().any(|piece| {
-                    c.kind(piece) == NodeKind::Identifier
-                        && c.lexeme(c.head_token(piece)) == name
+                    c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == name
                 })
         })
     };

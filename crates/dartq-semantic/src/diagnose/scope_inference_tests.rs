@@ -5,7 +5,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): every shape is silent.
 
-use super::test_rig::{assert_silent, code_names, report_ops, report_ops_imports, rows, RigImport};
+use super::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows};
 
 /// `priority.index` on an enum-typed receiver resolves through the
 /// enum's implicit `Enum` interface — in an operator operand (the
@@ -222,7 +222,6 @@ fn a_declared_class_never_relates_to_a_core_primitive() {
     );
     assert_silent(&extension_type);
 }
-
 
 /// A class-head send resolves its named constructor before any member: the
 /// factory `MFT.read` IS the creation (silent, the created `MFT` flows),

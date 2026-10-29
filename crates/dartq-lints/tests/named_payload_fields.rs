@@ -13,8 +13,7 @@ use std::path::PathBuf;
 const BANNED: [&str; 2] = ["payload(", "payload_word("];
 
 fn rust_files_under(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries =
-        fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
     for entry in entries {
         let path = entry
             .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
@@ -42,11 +41,12 @@ fn rules_tree_has_no_raw_payload_reads() {
 
     let mut offenders: Vec<String> = Vec::new();
     for file in &files {
-        let text =
-            fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let text = fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
         for (idx, line) in text.lines().enumerate() {
             if let Some(banned) = BANNED.iter().find(|b| line.contains(*b)) {
-                let rel = file.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(file);
+                let rel = file
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(file);
                 offenders.push(format!(
                     "{}:{}: [{}] {}",
                     rel.display(),

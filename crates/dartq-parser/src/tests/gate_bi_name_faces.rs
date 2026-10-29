@@ -10,8 +10,8 @@
 use dartq_scanner::ScanConfig;
 
 use super::collector::{Collector, latest_features};
-use crate::parser::Parser;
 use crate::ParserFeatures;
+use crate::parser::Parser;
 
 /// Parses `source` with `features` and returns the scanner+parser rows as
 /// `(code, start, end)` sorted by offset plus the problem texts in emission
@@ -203,7 +203,9 @@ fn bi_name_type_parameter_template() {
     // The tolerant keyword face must not fire in addition (issue_45703
     // carries no expected_identifier_but_got_keyword at type parameters).
     assert!(
-        !rows.iter().any(|(c, _, _)| c == "expected_identifier_but_got_keyword"),
+        !rows
+            .iter()
+            .any(|(c, _, _)| c == "expected_identifier_but_got_keyword"),
         "type parameter carries no keyword face: {rows:?}"
     );
 }
@@ -239,7 +241,11 @@ fn bi_name_variance_pseudo_pair() {
         let (_, texts) = rows_and_texts_with(features, leaked(source));
         assert_builtin_text(
             &texts,
-            &format!("The built-in identifier '{0}' can't be used as a {1}.", if source.contains('<') { "out" } else { "inout" }, expected),
+            &format!(
+                "The built-in identifier '{0}' can't be used as a {1}.",
+                if source.contains('<') { "out" } else { "inout" },
+                expected
+            ),
             source,
         );
     }

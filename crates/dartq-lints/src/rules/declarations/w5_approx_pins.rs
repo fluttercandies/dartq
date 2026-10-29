@@ -79,9 +79,8 @@ fn deprecated_context_suppresses_uses() {
     assert_eq!(lints[0].message, "'C' is deprecated and shouldn't be used.");
 
     // A `@deprecated library` directive suppresses the whole unit.
-    let f = Fixture::parse(
-        "@deprecated\nlibrary lib;\n\n@deprecated\nclass C {}\n\nvoid f(C c) {}\n",
-    );
+    let f =
+        Fixture::parse("@deprecated\nlibrary lib;\n\n@deprecated\nclass C {}\n\nvoid f(C c) {}\n");
     assert!(
         f.run(&one_rule("deprecated_member_use_from_same_package"))
             .is_empty()

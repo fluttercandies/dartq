@@ -1,6 +1,8 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces as faces,
+};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/use_truncating_division.dart` — a `/`
@@ -73,8 +75,7 @@ fn check(c: &mut Check<'_>) {
     let [selector, tail @ ..] = &kids[pos + 1..] else {
         return;
     };
-    if c.kind(*selector) != NodeKind::Identifier || c.lexeme(c.head_token(*selector)) != "toInt"
-    {
+    if c.kind(*selector) != NodeKind::Identifier || c.lexeme(c.head_token(*selector)) != "toInt" {
         return;
     }
     let tail = match tail {

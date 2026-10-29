@@ -94,10 +94,7 @@ fn fixture() -> &'static Path {
 /// runs offline once the Flutter SDK cache is present.
 fn prepare_fixture() -> PathBuf {
     let started = Instant::now();
-    let root = std::env::temp_dir().join(format!(
-        "dartq-debug-flutter-e2e-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("dartq-debug-flutter-e2e-{}", std::process::id()));
     let bin = flutter_bin();
     // SAFETY: this runs exactly once, inside `OnceLock::get_or_init`;
     // every test in this binary reaches any environment access only
@@ -108,14 +105,15 @@ fn prepare_fixture() -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flutter_app");
     if !root.join("lib/main.dart").is_file() {
         run(
-            Command::new(&bin).args([
-                "create",
-                "--platforms=macos",
-                "--project-name",
-                "flutter_debug_fixture",
-                "--no-pub",
-            ])
-            .arg(&root),
+            Command::new(&bin)
+                .args([
+                    "create",
+                    "--platforms=macos",
+                    "--project-name",
+                    "flutter_debug_fixture",
+                    "--no-pub",
+                ])
+                .arg(&root),
             "flutter create",
         );
         std::fs::copy(source.join("pubspec.yaml"), root.join("pubspec.yaml"))
@@ -142,7 +140,9 @@ fn prepare_fixture() -> PathBuf {
 /// Runs a preparation command to completion, panicking with its output
 /// on failure.
 fn run(command: &mut Command, what: &str) {
-    let output = command.output().unwrap_or_else(|error| panic!("{what}: {error}"));
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("{what}: {error}"));
     assert!(
         output.status.success(),
         "{what} failed ({}):\n{}{}",
@@ -471,14 +471,16 @@ fn spawn_flutter_run_paused() -> (OwnedRun, String, Arc<Mutex<Vec<u8>>>) {
 fn extract_service_uri(line: &str) -> Option<String> {
     let rest = line.strip_prefix("A Dart VM Service on ")?;
     let separator = rest.rfind(" is available at: ")?;
-    Some(rest[separator + " is available at: ".len()..].trim().to_owned())
+    Some(
+        rest[separator + " is available at: ".len()..]
+            .trim()
+            .to_owned(),
+    )
 }
 
 /// Converts the banner http URI to its WebSocket form.
 fn banner_to_ws(uri: &str) -> String {
-    uri.trim_end_matches('/')
-        .replacen("http", "ws", 1)
-        + "/ws"
+    uri.trim_end_matches('/').replacen("http", "ws", 1) + "/ws"
 }
 
 /// The paused-on-start takeover: launch, arm breakpoints while the app
@@ -494,7 +496,10 @@ fn launch_takeover_and_build_frame_inspection() {
         .unwrap_or_else(|error| panic!("flutter launch failed: {error}"));
 
     assert!(!session.ws_uri().is_empty(), "ws uri recorded");
-    assert!(session.flutter_tool_attached(), "flutter tool behind the service");
+    assert!(
+        session.flutter_tool_attached(),
+        "flutter tool behind the service"
+    );
     let main = session.main_isolate().expect("main isolate").to_owned();
     // The tool wraps the service in DDS; the VM (and its system
     // isolates) are reachable alongside the app's user isolate.
@@ -563,7 +568,9 @@ fn launch_takeover_and_build_frame_inspection() {
     // Disarm before letting the app run: the ticker rebuilds this
     // build every second, and a live breakpoint here would pause the
     // app before the awaited output could ever print.
-    session.remove_breakpoint(None, &handle.id).expect("remove breakpoint");
+    session
+        .remove_breakpoint(None, &handle.id)
+        .expect("remove breakpoint");
     session.resume(None).expect("final resume");
     // The dart-define rode the launch; the app's startup marker and
     // the ticker prove the running app's output stream.
@@ -593,7 +600,10 @@ fn hot_reload_failure_recovery_and_breakpoint_survival() {
     // A source edit the tool must push: only the tool-orchestrated
     // reload carries it, and only the reassemble rebuild runs
     // ProbeApp.build again.
-    edit_main("const String reloadTag = 'v1';", "const String reloadTag = 'v2';");
+    edit_main(
+        "const String reloadTag = 'v1';",
+        "const String reloadTag = 'v2';",
+    );
     let reloaded = session.reload_sources(None, false).expect("reload v2");
     assert!(reloaded, "reload v2 reported success");
     wait_for_output(&mut session, "build:title=probe-v2");
@@ -603,8 +613,14 @@ fn hot_reload_failure_recovery_and_breakpoint_survival() {
     session.poll_events().expect("cursor before burst");
     let burst_cursor = session.stdout_since(0, usize::MAX).next_cursor;
     for (from, to) in [
-        ("const String reloadTag = 'v2';", "const String reloadTag = 'v3';"),
-        ("const String reloadTag = 'v3';", "const String reloadTag = 'v4';"),
+        (
+            "const String reloadTag = 'v2';",
+            "const String reloadTag = 'v3';",
+        ),
+        (
+            "const String reloadTag = 'v3';",
+            "const String reloadTag = 'v4';",
+        ),
     ] {
         edit_main(from, to);
         let reloaded = session.reload_sources(None, false).expect("burst reload");
@@ -641,8 +657,13 @@ fn hot_reload_failure_recovery_and_breakpoint_survival() {
     session.resume(None).expect("resume from echo hit");
 
     // A broken edit must fail as data, not kill the session.
-    edit_main("int probeEcho(int value) => value * 2;", "int probeEcho(int value) => value * 2 oops;");
-    let broken = session.reload_sources(None, false).expect_err("broken reload");
+    edit_main(
+        "int probeEcho(int value) => value * 2;",
+        "int probeEcho(int value) => value * 2 oops;",
+    );
+    let broken = session
+        .reload_sources(None, false)
+        .expect_err("broken reload");
     assert!(
         matches!(broken, Error::Rpc { .. }),
         "compile failure surfaces as an RPC error, got {broken:?}"
@@ -650,8 +671,13 @@ fn hot_reload_failure_recovery_and_breakpoint_survival() {
 
     // The session survived: fix the edit, reload, and the same
     // breakpoint still hits — hot reload keeps debug state.
-    edit_main("int probeEcho(int value) => value * 2 oops;", "int probeEcho(int value) => value * 3;");
-    let fixed = session.reload_sources(None, false).expect("reload after fix");
+    edit_main(
+        "int probeEcho(int value) => value * 2 oops;",
+        "int probeEcho(int value) => value * 3;",
+    );
+    let fixed = session
+        .reload_sources(None, false)
+        .expect("reload after fix");
     assert!(fixed, "reload after fix reported success");
     let hit = wait_for_pause_main(&mut session).expect("echo re-hit");
     match &hit.reason {
@@ -696,17 +722,31 @@ fn hot_restart_re_arms_breakpoints_and_resets_state() {
     }
 
     let outcome = session.hot_restart().expect("hot restart");
-    assert_eq!(outcome.re_armed.len(), 1, "the breakpoint re-armed: {outcome:?}");
+    assert_eq!(
+        outcome.re_armed.len(),
+        1,
+        "the breakpoint re-armed: {outcome:?}"
+    );
     assert!(outcome.dropped.is_empty(), "nothing dropped: {outcome:?}");
-    assert_eq!(session.breakpoints().count(), 1, "the session tracks the re-arm");
-    assert!(session.main_isolate().is_some(), "a post-restart main isolate exists");
+    assert_eq!(
+        session.breakpoints().count(),
+        1,
+        "the session tracks the re-arm"
+    );
+    assert!(
+        session.main_isolate().is_some(),
+        "a post-restart main isolate exists"
+    );
 
     // The re-armed breakpoint hits again (a ticker rebuild — the very
     // first frame after restart races the re-arm by design).
     let hit = wait_for_pause_main(&mut session).expect("re-armed hit");
     match &hit.reason {
         StoppedReason::Breakpoint { breakpoints } => assert!(
-            outcome.re_armed.iter().any(|re| breakpoints.contains(&re.id)),
+            outcome
+                .re_armed
+                .iter()
+                .any(|re| breakpoints.contains(&re.id)),
             "a re-armed breakpoint hit: {breakpoints:?}"
         ),
         other => panic!("expected a re-armed breakpoint hit, got {other:?}"),
@@ -719,7 +759,10 @@ fn hot_restart_re_arms_breakpoints_and_resets_state() {
     let cursor = session.stdout_since(0, usize::MAX).next_cursor;
     session.resume(None).expect("resume after restart hit");
     let post_restart = wait_for_output_from(&mut session, cursor, "tick:1");
-    assert!(post_restart.contains("home-build:ticks 0"), "in {post_restart}");
+    assert!(
+        post_restart.contains("home-build:ticks 0"),
+        "in {post_restart}"
+    );
 
     // Clean shutdown from the paused state (whichever pause the app is
     // in when we ask — the re-armed breakpoint pauses it every build).
@@ -773,15 +816,23 @@ fn attach_coexists_and_detaches_without_killing() {
 
     assert!(session.flutter_tool_attached(), "the tool is a co-client");
     let main = session.main_isolate().expect("main isolate").to_owned();
-    let start = session.wait_for_pause(&main).expect("start pause over attach");
+    let start = session
+        .wait_for_pause(&main)
+        .expect("start pause over attach");
     assert_eq!(start.reason, StoppedReason::Start);
 
     // A second concurrent dartq session on the same app: DDS holds
     // both, and either can act.
-    let mut second = DebugSession::attach_with(&ws, settings())
-        .expect("second concurrent session attaches");
-    assert!(second.main_isolate().is_some(), "the co-session sees isolates");
-    assert!(second.flutter_tool_attached(), "the co-session sees the tool");
+    let mut second =
+        DebugSession::attach_with(&ws, settings()).expect("second concurrent session attaches");
+    assert!(
+        second.main_isolate().is_some(),
+        "the co-session sees isolates"
+    );
+    assert!(
+        second.flutter_tool_attached(),
+        "the co-session sees the tool"
+    );
     drop(second);
 
     // Full takeover through the attach path: arm while held, release,

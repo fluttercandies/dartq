@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, narrow_u32, slice, static_type_faces};
+use super::{Check, NodeKind, PayloadField, RuleSpec, narrow_u32, slice, static_type_faces};
 use crate::rules::{body_members, same_file_declaration};
 
 /// Official: `upstream Dart SDK source,
@@ -238,8 +238,9 @@ fn constants_equal(
         right.end() - right.start() + 1,
     );
     let written = |range: &core::ops::RangeInclusive<u32>, len: u32| {
-        let lexemes: Vec<&str> =
-            (0..len).map(|offset| c.lexeme(range.start() + offset)).collect();
+        let lexemes: Vec<&str> = (0..len)
+            .map(|offset| c.lexeme(range.start() + offset))
+            .collect();
         dartq_semantic::const_eval::eval_written(&lexemes)
     };
     match (written(&left, left_len), written(&right, right_len)) {
@@ -249,8 +250,7 @@ fn constants_equal(
         (WrittenValue::NotEvaluable, WrittenValue::NotEvaluable) => {
             left_len == right_len
                 && (0..left_len).all(|offset| {
-                    let (left_tok, right_tok) =
-                        (left.start() + offset, right.start() + offset);
+                    let (left_tok, right_tok) = (left.start() + offset, right.start() + offset);
                     left_tok == right_tok || c.lexeme(left_tok) == c.lexeme(right_tok)
                 })
         }
@@ -304,9 +304,9 @@ fn param_has_required_annotation(c: &Check<'_>, params_row: u32, param: u32) -> 
 }
 
 fn annotation_named(c: &Check<'_>, meta: u32, name: &str) -> bool {
-    c.collect_direct(meta).into_iter().any(|piece| {
-        c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == name
-    })
+    c.collect_direct(meta)
+        .into_iter()
+        .any(|piece| c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == name)
 }
 
 /// The callee face per parent shape, resolved to its formal rows.
@@ -586,13 +586,7 @@ fn tearoff_variable_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'a>
             let Some(class_row) = same_file_declaration(c, class_name) else {
                 continue;
             };
-            return constructor_formals(
-                c,
-                class_row,
-                class_name,
-                Some(selector),
-                &mut Vec::new(),
-            );
+            return constructor_formals(c, class_row, class_name, Some(selector), &mut Vec::new());
         }
     }
     None
@@ -739,8 +733,7 @@ fn constructor_formals<'a>(
         })
         .or_else(|| {
             c.collect_direct(class_row).into_iter().find(|&kid| {
-                c.kind(kid) == NodeKind::PrimaryConstructor
-                    && primary_ctor_matches(c, kid, wanted)
+                c.kind(kid) == NodeKind::PrimaryConstructor && primary_ctor_matches(c, kid, wanted)
             })
         })?;
     // The factory-redirect walk: `= Target` resolves to the target
@@ -784,12 +777,7 @@ fn primary_ctor_matches(c: &Check<'_>, primary: u32, selector: Option<&str>) -> 
 /// Whether the constructor row names `class_name` (its anchor) with
 /// `selector` (the named face rides the `MethodDeclarationContinuation`
 /// identifier — declarations.rs `constructor_name_part` idiom).
-fn constructor_matches(
-    c: &Check<'_>,
-    ctor: u32,
-    class_name: &str,
-    selector: Option<&str>,
-) -> bool {
+fn constructor_matches(c: &Check<'_>, ctor: u32, class_name: &str, selector: Option<&str>) -> bool {
     if c.lexeme(c.head_token(ctor)) != class_name {
         return false;
     }
@@ -808,12 +796,7 @@ fn constructor_matches(
 /// Whether the factory row names `class_name` with `selector`: the row
 /// anchors at the `factory` keyword, the name rides one token later
 /// (three past a named selector — docs.rs `factory_name_token` idiom).
-fn factory_matches(
-    c: &Check<'_>,
-    factory: u32,
-    class_name: &str,
-    selector: Option<&str>,
-) -> bool {
+fn factory_matches(c: &Check<'_>, factory: u32, class_name: &str, selector: Option<&str>) -> bool {
     let head = c.head_token(factory);
     let count = narrow_u32(c.unit.tokens.len());
     let name = head + 1;
@@ -875,9 +858,7 @@ fn formals_of<'a>(c: &Check<'a>, owner: u32) -> Option<Formals<'a>> {
                         continue;
                     }
                     match formal_kind(c, row) {
-                        k if k
-                            == dartq_parser::FormalParameterKind::OptionalPositional as u32 =>
-                        {
+                        k if k == dartq_parser::FormalParameterKind::OptionalPositional as u32 => {
                             positional.push(row);
                         }
                         k if k == dartq_parser::FormalParameterKind::OptionalNamed as u32

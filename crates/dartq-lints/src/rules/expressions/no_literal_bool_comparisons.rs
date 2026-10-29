@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, same_file};
 use crate::rules::{byte_span_of_token, slice};
 
 /// Official: `pkg/linter/lib/src/rules/no_literal_bool_comparisons.dart:44-62`
@@ -102,8 +102,7 @@ fn non_null_bool_type(c: &Check<'_>, type_row: u32) -> bool {
     match c.kind(type_row) {
         NodeKind::Type => {
             let head = c.head_token(type_row);
-            c.lexeme(head) == "bool"
-                && c.byte_span(type_row).end == byte_span_of_token(c, head).end
+            c.lexeme(head) == "bool" && c.byte_span(type_row).end == byte_span_of_token(c, head).end
         }
         NodeKind::FunctionType => c
             .collect_direct(type_row)
@@ -169,8 +168,7 @@ fn member_face(c: &Check<'_>, rows: &[u32]) -> bool {
         return false;
     };
     let receiver_name = c.lexeme(c.head_token(receiver));
-    let Some(class_name) =
-        same_file::written_type(c, receiver, receiver_name).map(str::to_owned)
+    let Some(class_name) = same_file::written_type(c, receiver, receiver_name).map(str::to_owned)
     else {
         return false;
     };
@@ -194,7 +192,9 @@ fn member_is_bool(c: &Check<'_>, class_name: &str, name: &str) -> bool {
                         }
                         NodeKind::Identifier
                             if c.field(kid, PayloadField::Context)
-                                == Some(dartq_parser::IdentifierContext::FieldDeclaration as u32)
+                                == Some(
+                                    dartq_parser::IdentifierContext::FieldDeclaration as u32,
+                                )
                                 && c.lexeme(c.head_token(kid)) == name =>
                         {
                             return written.is_some_and(|row| non_null_bool_type(c, row));

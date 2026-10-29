@@ -1032,7 +1032,15 @@ mod tests {
             before: snapshot(&fx.strings, &["fa"]),
             after: snapshot(&fx.strings, &["fa", "fb"]),
         };
-        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change], |_| Vec::new());
+        let _ = impact(
+            1,
+            imports_of,
+            |_| "a.dart",
+            &tests,
+            &fx.strings,
+            &[change],
+            |_| Vec::new(),
+        );
     }
 
     /// An `imports_of` target beyond the id space is a caller bug that
@@ -1072,7 +1080,15 @@ mod tests {
             before: snapshot(&fx.strings, &["fa"]),
             after,
         };
-        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change], |_| Vec::new());
+        let _ = impact(
+            1,
+            imports_of,
+            |_| "a.dart",
+            &tests,
+            &fx.strings,
+            &[change],
+            |_| Vec::new(),
+        );
     }
 
     /// A member array that is not positionally parallel to its digests is
@@ -1091,7 +1107,15 @@ mod tests {
             before: snapshot(&fx.strings, &["fa"]),
             after,
         };
-        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change], |_| Vec::new());
+        let _ = impact(
+            1,
+            imports_of,
+            |_| "a.dart",
+            &tests,
+            &fx.strings,
+            &[change],
+            |_| Vec::new(),
+        );
     }
 
     /// The v2 verdict pin (#1561): a signature edit under a stable name —

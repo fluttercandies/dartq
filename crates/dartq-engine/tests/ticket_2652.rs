@@ -130,10 +130,7 @@ fn workspace() -> Fixture {
 
 /// One reference row as the comparable `(file tail, offset, length, kind)`
 /// tuple.
-fn row_shapes(
-    engine: &Engine,
-    answer: &SymbolAnswer<'_>,
-) -> Vec<(String, u32, u32, &'static str)> {
+fn row_shapes(engine: &Engine, answer: &SymbolAnswer<'_>) -> Vec<(String, u32, u32, &'static str)> {
     answer
         .refs
         .iter()

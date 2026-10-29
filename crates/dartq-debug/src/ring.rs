@@ -99,7 +99,9 @@ impl<T> Ring<T> {
     /// oldest first.
     pub fn entries_since(&self, cursor: u64) -> impl Iterator<Item = (u64, &T)> {
         let start = self.entries.partition_point(|(seq, _)| *seq < cursor);
-        self.entries.range(start..).map(|(seq, entry)| (*seq, entry))
+        self.entries
+            .range(start..)
+            .map(|(seq, entry)| (*seq, entry))
     }
 
     /// How many sequence numbers in `[start, end)` cannot be served

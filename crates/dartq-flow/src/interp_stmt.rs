@@ -7,9 +7,7 @@ use dartq_source::saturate_slot_u32;
 
 use crate::ev::{BlockKind, Ev};
 use crate::facts::FlowFact;
-use crate::interp::{
-    DeclCtx, Effects, Expr, Frame, Interp, LabeledEffects, PatternKind, VarMeta,
-};
+use crate::interp::{DeclCtx, Effects, Expr, Frame, Interp, LabeledEffects, PatternKind, VarMeta};
 use crate::model::{NIL, State, attach_finally_model};
 use crate::ty::Ty;
 
@@ -1097,8 +1095,7 @@ impl Interp<'_> {
                 // reads `x` promoted non-null inside the message (the
                 // null-check's false arm), and `assert(t != null, ...)`'s
                 // message reads `t` null.
-                let Some(Frame::Assert { cond_true, .. }) = self.stack.last_mut()
-                else {
+                let Some(Frame::Assert { cond_true, .. }) = self.stack.last_mut() else {
                     return true;
                 };
                 let cond = self.exprs.last();
@@ -1359,12 +1356,9 @@ impl Interp<'_> {
                             meta.ty = rhs.ty;
                             meta.args = rhs.args;
                         } else if matches!(rhs.ty.base, crate::ty::Base::Name(_))
-                            && self.ops.is_invalid_typed(
-                                rhs.ty,
-                                rhs.args,
-                                self.args,
-                                self.names,
-                            )
+                            && self
+                                .ops
+                                .is_invalid_typed(rhs.ty, rhs.args, self.args, self.names)
                         {
                             // The invalid-initializer face (the member-read
                             // twin of the unresolved-call face above): a
@@ -1385,9 +1379,7 @@ impl Interp<'_> {
                         {
                             meta.ty = rhs.ty;
                             meta.args = rhs.args;
-                        } else if rhs.this_recv
-                            && matches!(rhs.ty.base, crate::ty::Base::Name(_))
-                        {
+                        } else if rhs.this_recv && matches!(rhs.ty.base, crate::ty::Base::Name(_)) {
                             // The `this`-initializer face adopts whole even
                             // non-nullable: the staged read is the same
                             // answer the type layer computes for `this`
@@ -1886,9 +1878,7 @@ impl Interp<'_> {
     /// already restored at its close).
     fn switch_scope_close(&mut self, frame_index: usize) {
         let shadowed = match &mut self.stack[frame_index] {
-            Frame::Switch {
-                case_shadowed, ..
-            } => std::mem::take(case_shadowed),
+            Frame::Switch { case_shadowed, .. } => std::mem::take(case_shadowed),
             _ => return,
         };
         self.restore_bindings(&shadowed);

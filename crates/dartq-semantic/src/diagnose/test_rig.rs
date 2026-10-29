@@ -185,14 +185,8 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
     }
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
-    let types = LibraryTypes::build_with_clauses(
-        &graph,
-        &namespaces,
-        &index,
-        &strings,
-        lib,
-        &clauses,
-    );
+    let types =
+        LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
     let ops = ResolvedTypeOps::new(&types, &strings, file);
     let fold = fold_unit_with_ops(
         source,
@@ -261,7 +255,10 @@ pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport
             if decl.kind == MicroKind::TypeParam {
                 continue;
             }
-            if matches!(decl.kind, MicroKind::Class | MicroKind::Enum | MicroKind::Mixin) {
+            if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+            ) {
                 builder.declare_class(lib, name, unit_file, ClassModifiers::default());
             } else {
                 builder.declare(lib, name, unit_file);
@@ -278,14 +275,8 @@ pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport
     }
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
-    let types = LibraryTypes::build_with_clauses(
-        &graph,
-        &namespaces,
-        &index,
-        &strings,
-        lib,
-        &clauses,
-    );
+    let types =
+        LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
     let ops = ResolvedTypeOps::new(&types, &strings, aug_file);
     let fold = fold_unit_with_ops(
         augment_source,
@@ -324,5 +315,9 @@ pub(super) fn rows(report: &FileReport) -> Vec<String> {
 /// Asserts the report carries no diagnostics, naming every row otherwise.
 #[track_caller]
 pub(super) fn assert_silent(report: &FileReport) {
-    assert!(report.diagnostics.is_empty(), "expected no rows, got {:#?}", rows(report));
+    assert!(
+        report.diagnostics.is_empty(),
+        "expected no rows, got {:#?}",
+        rows(report)
+    );
 }

@@ -20,18 +20,15 @@ fn last_token_of(c: &Check<'_>, node: u32) -> u32 {
 }
 
 pub(crate) mod empty_statements {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_statements.dart:33-53` —
     /// report every `EmptyStatement` except one that "defines semantics":
     /// the last statement of a switch pattern case whose statements are all
     /// empty (the `case _: ;` idiom, `empty_statements.dart:34-46`).
     /// Message: `diagnostic.g.dart` `emptyStatements`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "empty_statements",
-    &[NodeKind::EmptyStatement],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("empty_statements", &[NodeKind::EmptyStatement], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -90,10 +87,10 @@ pub(crate) mod empty_constructor_bodies {
     /// and its completion window holds the statement rows. Emptiness is the
     /// empty window; the `}` is the body's last token.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "empty_constructor_bodies",
-    &[NodeKind::Constructor, NodeKind::PrimaryConstructorBody],
-    check,
-);
+        "empty_constructor_bodies",
+        &[NodeKind::Constructor, NodeKind::PrimaryConstructorBody],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -122,18 +119,15 @@ pub(crate) mod empty_constructor_bodies {
 }
 
 pub(crate) mod empty_catches {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_catches.dart:31-45` — an
     /// empty catch block with no comments before `}` reports at the block,
     /// unless the exception parameter is named with bare underscores
     /// (`catch (_)` is a deliberate discard, empty_catches.dart:33-38).
     /// Message: `diagnostic.g.dart` `emptyCatches`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "empty_catches",
-    &[NodeKind::CatchClause],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("empty_catches", &[NodeKind::CatchClause], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -142,16 +136,17 @@ pub(crate) mod empty_catches {
         // the formal is the first `FormalParameter` inside that wrapper;
         // hand-built tables carry it as a direct child. The name is
         // payload word 1 (the `FormalParameterEnd` layout).
-        let exception = c.collect_direct(node).into_iter().find_map(|kid| {
-            match c.kind(kid) {
+        let exception = c
+            .collect_direct(node)
+            .into_iter()
+            .find_map(|kid| match c.kind(kid) {
                 NodeKind::FormalParameter => Some(kid),
                 NodeKind::FormalParameters => c
                     .collect_direct(kid)
                     .into_iter()
                     .find(|&formal| c.kind(formal) == NodeKind::FormalParameter),
                 _ => None,
-            }
-        });
+            });
         if let Some(exception) = exception
             && let Some(name) = c.field(exception, PayloadField::Name)
             && super::is_just_underscores(c.lexeme(name))
@@ -179,16 +174,13 @@ pub(crate) mod empty_catches {
 }
 
 pub(crate) mod avoid_empty_else {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_empty_else.dart:32-41` — an
     /// `else` branch that is a non-synthetic empty statement reports at the
     /// empty statement. Message: `diagnostic.g.dart` `avoidEmptyElse`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_empty_else",
-    &[NodeKind::IfStatement],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("avoid_empty_else", &[NodeKind::IfStatement], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -463,12 +455,16 @@ mod tests {
     /// `catch (e)` still reports.
     #[test]
     fn empty_catches_production_wildcard_passes() {
-        assert!(Fixture::parse("void f() { try {} catch (_) {} }")
-            .run(&one_rule("empty_catches"))
-            .is_empty());
-        assert!(Fixture::parse("void f() { try {} catch (___) {} }")
-            .run(&one_rule("empty_catches"))
-            .is_empty());
+        assert!(
+            Fixture::parse("void f() { try {} catch (_) {} }")
+                .run(&one_rule("empty_catches"))
+                .is_empty()
+        );
+        assert!(
+            Fixture::parse("void f() { try {} catch (___) {} }")
+                .run(&one_rule("empty_catches"))
+                .is_empty()
+        );
         assert_eq!(
             Fixture::parse("void f() { try {} catch (e) {} }")
                 .run(&one_rule("empty_catches"))
@@ -476,9 +472,11 @@ mod tests {
             1
         );
         // An `on T catch (_)` clause reads the formal past the type.
-        assert!(Fixture::parse("void f() { try {} on Exception catch (_) {} }")
-            .run(&one_rule("empty_catches"))
-            .is_empty());
+        assert!(
+            Fixture::parse("void f() { try {} on Exception catch (_) {} }")
+                .run(&one_rule("empty_catches"))
+                .is_empty()
+        );
     }
 
     /// A comment before `}` keeps the block (empty_catches.dart:39-44).
@@ -512,7 +510,7 @@ mod tests {
 }
 
 pub(crate) mod prefer_asserts_with_message {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_asserts_with_message.dart`
@@ -525,16 +523,16 @@ pub(crate) mod prefer_asserts_with_message {
     /// payload word 0 discriminates the official's two registered faces
     /// (initializer / statement) from the expression-position assert the
     /// official never visits.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_asserts_with_message",
-    &[NodeKind::Assert],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("prefer_asserts_with_message", &[NodeKind::Assert], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         // Registered faces only: initializer (0) and statement (1).
-        if c.field(node, PayloadField::AssertKind).unwrap_or(NONE_TOKEN) > 1 {
+        if c.field(node, PayloadField::AssertKind)
+            .unwrap_or(NONE_TOKEN)
+            > 1
+        {
             return;
         }
         if c.field(node, PayloadField::Comma) == Some(NONE_TOKEN) {
@@ -567,7 +565,7 @@ pub(crate) mod prefer_asserts_with_message {
 }
 
 pub(crate) mod throw_in_finally {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/throw_in_finally.dart`
@@ -583,11 +581,8 @@ pub(crate) mod throw_in_finally {
     /// payload word 0 (`TOKEN_NONE` when absent) and the finally block
     /// tiles as the node's last child, so the chain test is the
     /// try-statement child on the path being that last child.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "throw_in_finally",
-    &[NodeKind::ThrowExpression],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("throw_in_finally", &[NodeKind::ThrowExpression], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -659,7 +654,7 @@ pub(crate) mod throw_in_finally {
 }
 
 pub(crate) mod unnecessary_breaks {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_breaks.dart`
     /// — a labeled-`break`-free `break` that is the last of more than one
@@ -674,11 +669,8 @@ pub(crate) mod unnecessary_breaks {
     /// `when` clause, so the last-statement test is a direct-child walk. A
     /// labeled break carries its label identifier as a child and is
     /// exempted by the label scan.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_breaks",
-    &[NodeKind::Break],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("unnecessary_breaks", &[NodeKind::Break], check,);
 
     fn check(c: &mut Check<'_>) {
         if !c.unit.features.patterns {
@@ -747,7 +739,7 @@ pub(crate) mod unnecessary_breaks {
 }
 
 pub(crate) mod unnecessary_final {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::{NONE_TOKEN, utf16_token_span};
 
     /// The two official message variants under one name
@@ -782,16 +774,16 @@ pub(crate) mod unnecessary_final {
     ///   [`NodeKind::PatternVarDeclStatement`] keyword — the official
     ///   `thisOrAncestorOfType` walk).
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_final",
-    &[
+        "unnecessary_final",
+        &[
             NodeKind::VariablesDeclaration,
             NodeKind::FormalParameter,
             NodeKind::FunctionTypedFormalParameter,
             NodeKind::ForInParts,
             NodeKind::DeclaredVariablePattern,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -949,7 +941,9 @@ pub(crate) mod unnecessary_final {
             report_at(c, keyword, name > keyword + 1);
             return;
         }
-        let keyword = c.field(node, PayloadField::PatternKeyword).unwrap_or(NONE_TOKEN);
+        let keyword = c
+            .field(node, PayloadField::PatternKeyword)
+            .unwrap_or(NONE_TOKEN);
         if keyword == NONE_TOKEN || c.lexeme(keyword) != "final" {
             return;
         }
@@ -1079,7 +1073,7 @@ pub(crate) mod unnecessary_final {
 }
 
 pub(crate) mod one_member_abstracts {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// `NodeHeader.flags` modifier-mask bit for the class-family `abstract`
@@ -1103,11 +1097,8 @@ pub(crate) mod one_member_abstracts {
     /// gates are wave-inert: `augment` is gated off at the scanner. The
     /// rule is `deprecated` upstream since 3.13 but stays registered and
     /// fires. Message: `diagnostic.g.dart` `oneMemberAbstracts`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "one_member_abstracts",
-    &[NodeKind::ClassDeclaration],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("one_member_abstracts", &[NodeKind::ClassDeclaration], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();

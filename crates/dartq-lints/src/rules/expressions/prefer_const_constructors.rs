@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice, static_type_faces};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice, static_type_faces};
 use crate::rules::{body_members, in_const_context, member_annotations, same_file_declaration};
 
 /// Official: `upstream Dart SDK source,
@@ -136,9 +136,8 @@ fn shorthand_send_face(c: &mut Check<'_>) -> bool {
     let Some(class_name) = shorthand_context_type(c) else {
         return true;
     };
-    if !crate::rules::const_ability::send_shorthand_able(
-        c.unit, class_name, selector, arguments,
-    ) || ctor_has_literal(c, class_name, (selector != "new").then_some(selector))
+    if !crate::rules::const_ability::send_shorthand_able(c.unit, class_name, selector, arguments)
+        || ctor_has_literal(c, class_name, (selector != "new").then_some(selector))
     {
         return true;
     }
@@ -157,9 +156,7 @@ fn shorthand_context_type<'a>(c: &'a Check<'_>) -> Option<&'a str> {
             NodeKind::VariablesDeclaration | NodeKind::InitializedIdentifier => {
                 declared_type_left_sibling(c, ancestor)
             }
-            NodeKind::TopLevelMethod
-            | NodeKind::Method
-            | NodeKind::LocalFunctionDeclaration => c
+            NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration => c
                 .collect_direct(ancestor)
                 .into_iter()
                 .find(|&kid| c.kind(kid) == NodeKind::Type),
@@ -188,20 +185,18 @@ fn send_face(c: &mut Check<'_>) {
         return;
     };
     let selector_row = kids[head];
-    let (start, selector) =
-        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
-            // `C.named(...)`: the class is the single-name receiver.
-            let selector = c.head_token(selector_row);
-            let Some(receiver) = static_type_faces::single_receiver(c, &kids[..head], selector)
-            else {
-                return;
-            };
-            (c.head_token(receiver), Some(c.lexeme(selector)))
-        } else {
-            // `C(...)`: the callee head is the class.
-            let head_token = c.head_token(selector_row);
-            (head_token, None)
+    let (start, selector) = if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
+        // `C.named(...)`: the class is the single-name receiver.
+        let selector = c.head_token(selector_row);
+        let Some(receiver) = static_type_faces::single_receiver(c, &kids[..head], selector) else {
+            return;
         };
+        (c.head_token(receiver), Some(c.lexeme(selector)))
+    } else {
+        // `C(...)`: the callee head is the class.
+        let head_token = c.head_token(selector_row);
+        (head_token, None)
+    };
     let Some((class_name, written_type_arguments)) =
         creation_header_names(c, start, c.head_token(arguments))
     else {
@@ -294,12 +289,7 @@ fn creation_args_end(c: &Check<'_>, node: u32) -> Option<u32> {
 /// row under the top-level wrapper; the context type read is the
 /// enclosing declarator's declared type or the enclosing function's
 /// return type.
-fn gate_generic(
-    c: &Check<'_>,
-    node: u32,
-    class_name: &str,
-    written_type_arguments: bool,
-) -> bool {
+fn gate_generic(c: &Check<'_>, node: u32, class_name: &str, written_type_arguments: bool) -> bool {
     if written_type_arguments {
         return false;
     }
@@ -347,9 +337,7 @@ fn context_mentions_type_variable(c: &Check<'_>, node: u32) -> bool {
             }
             // The function faces: the return type is the method's /
             // function's own `Type` child (`G<int> f() => …`).
-            NodeKind::TopLevelMethod
-            | NodeKind::Method
-            | NodeKind::LocalFunctionDeclaration => c
+            NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration => c
                 .collect_direct(row)
                 .into_iter()
                 .find(|&kid| c.kind(kid) == NodeKind::Type),
@@ -400,9 +388,9 @@ fn type_args_name_type_variables(c: &Check<'_>, ty: u32, vars: &[&str]) -> bool 
     let Some(args) = args else {
         return false;
     };
-    c.collect_direct(args).iter().any(|&arg| {
-        c.kind(arg) == NodeKind::Type && vars.contains(&c.lexeme(c.head_token(arg)))
-    })
+    c.collect_direct(args)
+        .iter()
+        .any(|&arg| c.kind(arg) == NodeKind::Type && vars.contains(&c.lexeme(c.head_token(arg))))
 }
 
 /// `element.metadata.hasLiteral` (:49/:72): the resolved constructor's
@@ -440,9 +428,7 @@ fn ctor_has_literal(c: &Check<'_>, class_name: &str, selector: Option<&str>) -> 
         let part = c.collect_direct(member).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
                 && c.field(kid, PayloadField::Context)
-                    == Some(
-                        dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32,
-                    )
+                    == Some(dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32)
         });
         let matches = match (unnamed, part.map(|p| c.lexeme(c.head_token(p)))) {
             (true, None | Some("new")) => true,

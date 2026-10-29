@@ -1,4 +1,3 @@
-
 //! The undefined-name/resolution family pins: the corpus differential
 //! between dartq and `dart analyze` (the `(severity, code, file,
 //! line:col)` Jaccard gate) burned down through three root patterns.
@@ -762,153 +761,153 @@ fn bare_call_miss_still_reports_when_no_extension_carries() {
     assert!(names.contains(&"undefined_method"), "{names:?}");
 }
 
-    // —— #2342: the broken-chain bare face + the dead-prefix creation head ——
+// —— #2342: the broken-chain bare face + the dead-prefix creation head ——
 
-    /// Diagnoses `source_m` whose supertype hop resolves through a
-    /// DECLARED but unindexed library (`Walk::ChainBroken` — the hop has a
-    /// namespace entry while its file carries no model; the two-file rig
-    /// skips the second file's index insertion, which is exactly the
-    /// synthetic-SDK-face posture `report_with_core_faces` spells).
-    fn report_with_unindexed_super(source_m: &str, source_a: &str) -> FileReport {
-        let strings = StringTable::new();
-        let mut files = FileTable::new();
-        let file_a = files.intern(Path::new("a.dart"));
-        let file_m = files.intern(Path::new("main.dart"));
-        let (scanned_a, features, _) = scan(source_a, file_a);
-        let (scanned_m, _, set) = scan(source_m, file_m);
-        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
-        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
-        let mut builder = LibraryGraphBuilder::new(&strings);
-        let lib_a = builder.intern("package:t/a.dart");
-        let lib_m = builder.intern("package:t/main.dart");
-        let mut index = ElementIndex::default();
-        index.insert(file_m, elements_m.clone());
-        for (name, _) in elements_a.declarations() {
-            builder.declare(lib_a, name, file_a);
-        }
-        for (name, decl) in elements_m.declarations() {
-            if decl.kind == MicroKind::TypeParam {
-                continue;
-            }
-            builder.declare(lib_m, name, file_m);
-        }
-        builder.import(
-            lib_m,
-            ImportEdge {
-                target: Some(lib_a),
-                prefix: None,
-                deferred: false,
-                combinators: Combinators::unfiltered(),
-            },
-        );
-        let graph = builder.finish();
-        let namespaces = Namespaces::build(&graph);
-        let fold = fold_unit(
-            source_m,
-            &scanned_m.tokens,
-            features,
-            &strings,
-            file_m,
-            lib_m,
-            &graph,
-            &namespaces,
-            &index,
-            StrictModes::default(),
-            &LibraryClassModifiers::default(),
-            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
-        );
-        let mut report = fold.report;
-        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
-        report
+/// Diagnoses `source_m` whose supertype hop resolves through a
+/// DECLARED but unindexed library (`Walk::ChainBroken` — the hop has a
+/// namespace entry while its file carries no model; the two-file rig
+/// skips the second file's index insertion, which is exactly the
+/// synthetic-SDK-face posture `report_with_core_faces` spells).
+fn report_with_unindexed_super(source_m: &str, source_a: &str) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file_a = files.intern(Path::new("a.dart"));
+    let file_m = files.intern(Path::new("main.dart"));
+    let (scanned_a, features, _) = scan(source_a, file_a);
+    let (scanned_m, _, set) = scan(source_m, file_m);
+    let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+    let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib_a = builder.intern("package:t/a.dart");
+    let lib_m = builder.intern("package:t/main.dart");
+    let mut index = ElementIndex::default();
+    index.insert(file_m, elements_m.clone());
+    for (name, _) in elements_a.declarations() {
+        builder.declare(lib_a, name, file_a);
     }
-
-    /// A bare miss inside a container whose supertype hop is
-    /// resolved-but-unindexed reports the member face: the oracle's
-    /// interface ends at the resolved part of the chain and still answers
-    /// the miss (probed: `class C extends Missing` + bare `zorch()` →
-    /// `undefined_method` for 'C'). The broken chain used to claim the
-    /// member face and silence the bare row (the star corpus's o-only
-    /// `undefined_method` family).
-    #[test]
-    fn broken_chain_bare_miss_reports_the_member_face() {
-        let source_m = "class C implements Foot { void f() { zorch(); } }";
-        let report = report_with_unindexed_super(source_m, "class Foot {}");
-        let spans = rows(&report);
-        let zorch = source_m.find("zorch").unwrap() as u32;
-        assert_eq!(spans, vec![("undefined_method", zorch)], "{spans:?}");
+    for (name, decl) in elements_m.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib_m, name, file_m);
     }
+    builder.import(
+        lib_m,
+        ImportEdge {
+            target: Some(lib_a),
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let fold = fold_unit(
+        source_m,
+        &scanned_m.tokens,
+        features,
+        &strings,
+        file_m,
+        lib_m,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    report
+}
 
-    /// The mirror half: a bare creation send of a scoped class inside the
-    /// same container resolves through the scope — the send is the class's
-    /// creation, never an implicit-this member (the drift corpus's
-    /// bare-creation `undefined_method` family, the retriage posture:
-    /// a `ChainBroken` member question falls through to the scope).
-    #[test]
-    fn broken_chain_bare_creation_resolves_the_scoped_class() {
-        let source_m = "class Thing {}\n\
+/// A bare miss inside a container whose supertype hop is
+/// resolved-but-unindexed reports the member face: the oracle's
+/// interface ends at the resolved part of the chain and still answers
+/// the miss (probed: `class C extends Missing` + bare `zorch()` →
+/// `undefined_method` for 'C'). The broken chain used to claim the
+/// member face and silence the bare row (the star corpus's o-only
+/// `undefined_method` family).
+#[test]
+fn broken_chain_bare_miss_reports_the_member_face() {
+    let source_m = "class C implements Foot { void f() { zorch(); } }";
+    let report = report_with_unindexed_super(source_m, "class Foot {}");
+    let spans = rows(&report);
+    let zorch = source_m.find("zorch").unwrap() as u32;
+    assert_eq!(spans, vec![("undefined_method", zorch)], "{spans:?}");
+}
+
+/// The mirror half: a bare creation send of a scoped class inside the
+/// same container resolves through the scope — the send is the class's
+/// creation, never an implicit-this member (the drift corpus's
+/// bare-creation `undefined_method` family, the retriage posture:
+/// a `ChainBroken` member question falls through to the scope).
+#[test]
+fn broken_chain_bare_creation_resolves_the_scoped_class() {
+    let source_m = "class Thing {}\n\
                         class C implements Foot { void f() { Thing(); } }";
-        let report = report_with_unindexed_super(source_m, "class Foot {}");
-        let names = code_names(&report);
-        assert!(names.is_empty(), "{names:?}");
-    }
+    let report = report_with_unindexed_super(source_m, "class Foot {}");
+    let names = code_names(&report);
+    assert!(names.is_empty(), "{names:?}");
+}
 
-    /// Negative pin: the member-SELECT face keeps its cascade suppression
-    /// over the same broken chain — `this.zorch()` stays silent (the row
-    /// face's frozen verdict owns that question; the bare-face fall-through
-    /// must not leak into it).
-    #[test]
-    fn broken_chain_member_select_keeps_the_cascade_silence() {
-        let source_m = "class C implements Foot { void f() { this.zorch(); } }";
-        let report = report_with_unindexed_super(source_m, "class Foot {}");
-        let names = code_names(&report);
-        assert!(names.is_empty(), "{names:?}");
-    }
+/// Negative pin: the member-SELECT face keeps its cascade suppression
+/// over the same broken chain — `this.zorch()` stays silent (the row
+/// face's frozen verdict owns that question; the bare-face fall-through
+/// must not leak into it).
+#[test]
+fn broken_chain_member_select_keeps_the_cascade_silence() {
+    let source_m = "class C implements Foot { void f() { this.zorch(); } }";
+    let report = report_with_unindexed_super(source_m, "class Foot {}");
+    let names = code_names(&report);
+    assert!(names.is_empty(), "{names:?}");
+}
 
-    /// `const fb.C<int>()` with `fb` in no scope: the head is the
-    /// NamedType's import prefix and its element is null — the oracle
-    /// reports `undefined_identifier` over the whole `fb.C` span and the
-    /// creation/type-argument faces never fire (probe: 1:17 length 4; the
-    /// head used to read `creation_with_non_type` at the prefix token).
-    #[test]
-    fn dead_prefix_const_creation_reports_identifier_face() {
-        let source = "class int {} void f() { const fb.C<int>(); }";
-        let report = report(source);
-        let spans = rows(&report);
-        let fb = source.find("fb").unwrap() as u32;
-        assert_eq!(spans, vec![("undefined_identifier", fb)], "{spans:?}");
-        let diagnostic = &report.diagnostics[0];
-        assert_eq!(diagnostic.range.length, 4, "{:?}", diagnostic.range);
-        assert_eq!(diagnostic.message, "Undefined name 'fb'.");
-    }
+/// `const fb.C<int>()` with `fb` in no scope: the head is the
+/// NamedType's import prefix and its element is null — the oracle
+/// reports `undefined_identifier` over the whole `fb.C` span and the
+/// creation/type-argument faces never fire (probe: 1:17 length 4; the
+/// head used to read `creation_with_non_type` at the prefix token).
+#[test]
+fn dead_prefix_const_creation_reports_identifier_face() {
+    let source = "class int {} void f() { const fb.C<int>(); }";
+    let report = report(source);
+    let spans = rows(&report);
+    let fb = source.find("fb").unwrap() as u32;
+    assert_eq!(spans, vec![("undefined_identifier", fb)], "{spans:?}");
+    let diagnostic = &report.diagnostics[0];
+    assert_eq!(diagnostic.range.length, 4, "{:?}", diagnostic.range);
+    assert_eq!(diagnostic.message, "Undefined name 'fb'.");
+}
 
-    /// The keyword-less shape `fb.C()` reports the same face at the prefix
-    /// token alone (probe: 1:11 length 2 — the invocation parse resolves
-    /// the target identifier first); the miss never reads
-    /// `undefined_class`.
-    #[test]
-    fn dead_prefix_implicit_creation_reports_identifier_at_prefix() {
-        let source = "void f() { fb.C(); }";
-        let report = report(source);
-        let spans = rows(&report);
-        let fb = source.find("fb").unwrap() as u32;
-        assert_eq!(spans, vec![("undefined_identifier", fb)], "{spans:?}");
-        assert_eq!(report.diagnostics[0].range.length, 2);
-    }
+/// The keyword-less shape `fb.C()` reports the same face at the prefix
+/// token alone (probe: 1:11 length 2 — the invocation parse resolves
+/// the target identifier first); the miss never reads
+/// `undefined_class`.
+#[test]
+fn dead_prefix_implicit_creation_reports_identifier_at_prefix() {
+    let source = "void f() { fb.C(); }";
+    let report = report(source);
+    let spans = rows(&report);
+    let fb = source.find("fb").unwrap() as u32;
+    assert_eq!(spans, vec![("undefined_identifier", fb)], "{spans:?}");
+    assert_eq!(report.diagnostics[0].range.length, 2);
+}
 
-    /// A dead prefix's continuation counts against nothing: the typedef's
-    /// own-name homonym must not own the group (the analyzer corpus's
-    /// `typedef GeneratedTypeConstraint = shared.GeneratedTypeConstraint<…>`
-    /// counted its argument against the typedef being declared —
-    /// `wrong_number_of_type_arguments` beside the prefix's
-    /// `undefined_identifier`; the oracle counts against nothing).
-    #[test]
-    fn dead_prefix_annotation_group_counts_against_nothing() {
-        let source = "class int {} typedef Ours = theirs.Ours<int>;";
-        let report = report(source);
-        let spans = rows(&report);
-        let theirs = source.find("theirs").unwrap() as u32;
-        assert_eq!(spans, vec![("undefined_identifier", theirs)], "{spans:?}");
-    }
+/// A dead prefix's continuation counts against nothing: the typedef's
+/// own-name homonym must not own the group (the analyzer corpus's
+/// `typedef GeneratedTypeConstraint = shared.GeneratedTypeConstraint<…>`
+/// counted its argument against the typedef being declared —
+/// `wrong_number_of_type_arguments` beside the prefix's
+/// `undefined_identifier`; the oracle counts against nothing).
+#[test]
+fn dead_prefix_annotation_group_counts_against_nothing() {
+    let source = "class int {} typedef Ours = theirs.Ours<int>;";
+    let report = report(source);
+    let spans = rows(&report);
+    let theirs = source.find("theirs").unwrap() as u32;
+    assert_eq!(spans, vec![("undefined_identifier", theirs)], "{spans:?}");
+}
 
 // —— #2351: the Map ctor-arity family (creation selector faces) ——————————
 //
@@ -939,11 +938,7 @@ fn map_class_segment_matching_arity_is_silent() {
         "class Map<K, V> { Map.fromIterables(a, b); }\
          class A {} class B {} void f() { Map<A, B>.fromIterables([], []); }",
     );
-    assert!(
-        report.diagnostics.is_empty(),
-        "{:?}",
-        code_names(&report)
-    );
+    assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
 }
 
 /// The class-segment mismatch keeps the base code and the class message —
@@ -1000,11 +995,7 @@ fn new_class_segment_faces_match_class_arity() {
         "class Map<K, V> { Map.fromIterables(a, b); }\
          class A {} class B {} void f() { new Map<A, B>.fromIterables([], []); }",
     );
-    assert!(
-        matched.diagnostics.is_empty(),
-        "{:?}",
-        code_names(&matched)
-    );
+    assert!(matched.diagnostics.is_empty(), "{:?}", code_names(&matched));
     let mismatched = report(
         "class Map<K, V> { Map.fromIterables(a, b); }\
          class A {} class B {} class C {} void f() { new Map<A, B, C>.fromIterables([], []); }",

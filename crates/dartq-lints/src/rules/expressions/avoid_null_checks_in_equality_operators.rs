@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice, value_run_end};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice, value_run_end};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_null_checks_in_equality_operators.dart`
 /// — inside an `operator ==` whose single parameter is nullable, the
@@ -125,8 +125,7 @@ fn check_binary(c: &mut Check<'_>, method: u32, param: &str) {
         "??" => operand_is_parameter(c, &left, method, param),
         "==" | "!=" => {
             (run_is_null_literal(c, &right) && operand_is_parameter(c, &left, method, param))
-                || (run_is_null_literal(c, &left)
-                    && operand_is_parameter(c, &right, method, param))
+                || (run_is_null_literal(c, &left) && operand_is_parameter(c, &right, method, param))
         }
         _ => false,
     };
@@ -341,8 +340,7 @@ fn params_contain(c: &Check<'_>, owner: u32, name: &str) -> bool {
         .any(|params| {
             c.collect_direct(params).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::FormalParameter
-                    && c
-                        .field(kid, PayloadField::Name)
+                    && c.field(kid, PayloadField::Name)
                         .filter(|&tok| tok != crate::rules::NONE_TOKEN)
                         .is_some_and(|tok| c.lexeme(tok) == name)
             })

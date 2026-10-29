@@ -25,10 +25,18 @@ impl Engine<'_> {
             self.fold_alias_ty(self.substitute_ty(declared, &keys))
         };
         let Some((params, seeds, ordered)) = self.closure_callee_params(recv, row.name) else {
-            return if raw.is_empty() { declared } else { raw_only(&raw) };
+            return if raw.is_empty() {
+                declared
+            } else {
+                raw_only(&raw)
+            };
         };
         if params.is_empty() {
-            return if raw.is_empty() { declared } else { raw_only(&raw) };
+            return if raw.is_empty() {
+                declared
+            } else {
+                raw_only(&raw)
+            };
         }
         let mut keys: FxHashMap<StringId, Ty> = seeds.into_iter().collect();
         // The send-close upward inference's solution joins after the
@@ -133,7 +141,6 @@ impl Engine<'_> {
                 let bound = if self_referential { Ty::Dynamic } else { bound };
                 raw.push((*param, bound));
             }
-            
         }
         raw
     }

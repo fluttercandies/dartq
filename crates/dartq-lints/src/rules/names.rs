@@ -8,7 +8,10 @@ use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
 use crate::registry::RuleSpec;
-use crate::rules::{has_leading_underscore, is_field_name_shortcut, is_just_underscores, is_lower_camel_case, is_upper_camel_case, utf16_token_span};
+use crate::rules::{
+    has_leading_underscore, is_field_name_shortcut, is_just_underscores, is_lower_camel_case,
+    is_upper_camel_case, utf16_token_span,
+};
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -51,8 +54,8 @@ pub(crate) mod camel_case_types {
     /// augmentation skips are wave-1 inert: `augment` is gated off at the
     /// scanner, so no augmentation declaration reaches the AST.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "camel_case_types",
-    &[
+        "camel_case_types",
+        &[
             NodeKind::ClassDeclaration,
             NodeKind::MixinDeclaration,
             NodeKind::EnumDeclaration,
@@ -60,8 +63,8 @@ pub(crate) mod camel_case_types {
             NodeKind::NamedMixinApplication,
             NodeKind::Typedef,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let Some(parent) = c.ancestor(1) else {
@@ -92,7 +95,7 @@ pub(crate) mod camel_case_types {
 }
 
 pub(crate) mod camel_case_extensions {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_extensions.dart:31-42`
     /// — a named extension's name must be `UpperCamelCase`. The name is
@@ -100,10 +103,10 @@ pub(crate) mod camel_case_extensions {
     /// (`extension: T, name: O, on: O`). Message:
     /// `diagnostic.g.dart` `camelCaseExtensions`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "camel_case_extensions",
-    &[NodeKind::ExtensionDeclaration],
-    check,
-);
+        "camel_case_extensions",
+        &[NodeKind::ExtensionDeclaration],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -126,7 +129,7 @@ pub(crate) mod camel_case_extensions {
 }
 
 pub(crate) mod constant_identifier_names {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/constant_identifier_names.dart:36-73`
     /// — `const` variables (fields, top-level, locals), enum constants, and
@@ -135,14 +138,14 @@ pub(crate) mod constant_identifier_names {
     /// shortcuts (`Foo(:name)`) are exempt. Message: `diagnostic.g.dart`
     /// `constantIdentifierNames`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "constant_identifier_names",
-    &[
+        "constant_identifier_names",
+        &[
             NodeKind::VariablesDeclaration,
             NodeKind::EnumElement,
             NodeKind::DeclaredVariablePattern,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -195,16 +198,13 @@ pub(crate) mod constant_identifier_names {
                     return;
                 };
                 if name == crate::rules::NONE_TOKEN
-                    || c
-                        .field(node, PayloadField::AugmentKeyword)
+                    || c.field(node, PayloadField::AugmentKeyword)
                         .is_some_and(|kw| kw != crate::rules::NONE_TOKEN)
                     || !c
                         .unit
                         .tokens
                         .get(name as usize)
-                        .is_some_and(|token| {
-                            token.kind == dartq_scanner::TokenKind::Identifier
-                        })
+                        .is_some_and(|token| token.kind == dartq_scanner::TokenKind::Identifier)
                 {
                     return;
                 }
@@ -227,7 +227,7 @@ pub(crate) mod constant_identifier_names {
 }
 
 pub(crate) mod no_leading_underscores_for_local_identifiers {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/no_leading_underscores_for_local_identifiers.dart:36-133`
     /// — local identifiers (local variables, catch parameters, non-named
@@ -238,8 +238,8 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
     /// element model and is not part of wave 1. Message: `diagnostic.g.dart`
     /// `noLeadingUnderscoresForLocalIdentifiers`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_leading_underscores_for_local_identifiers",
-    &[
+        "no_leading_underscores_for_local_identifiers",
+        &[
             NodeKind::VariablesDeclaration,
             NodeKind::CatchClause,
             NodeKind::FormalParameters,
@@ -247,8 +247,8 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
             NodeKind::LocalFunctionDeclaration,
             NodeKind::DeclaredVariablePattern,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -373,7 +373,7 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
 }
 
 pub(crate) mod non_constant_identifier_names {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, is_just_underscores};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, is_just_underscores};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `pkg/linter/lib/src/rules/non_constant_identifier_names.dart:36-169`
@@ -393,8 +393,8 @@ pub(crate) mod non_constant_identifier_names {
     /// name checks without the underscore exemption, a class primary
     /// constructor name with it.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "non_constant_identifier_names",
-    &[
+        "non_constant_identifier_names",
+        &[
             NodeKind::VariablesDeclaration,
             NodeKind::CatchClause,
             NodeKind::Constructor,
@@ -408,8 +408,8 @@ pub(crate) mod non_constant_identifier_names {
             NodeKind::RecordLiteral,
             NodeKind::RecordType,
         ],
-    check,
-);
+        check,
+    );
 
     #[expect(
         clippy::too_many_lines,
@@ -496,8 +496,7 @@ pub(crate) mod non_constant_identifier_names {
                     // Field formals (`this.x`) are skipped (:103-105); super
                     // formals keep the check (official skips only
                     // `FieldFormalParameter`).
-                    if c
-                        .field(child, PayloadField::Receiver)
+                    if c.field(child, PayloadField::Receiver)
                         .is_some_and(|recv| recv != NONE_TOKEN && c.lexeme(recv) == "this")
                     {
                         continue;
@@ -533,7 +532,8 @@ pub(crate) mod non_constant_identifier_names {
                 // ahead of it).
                 let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
                 let name = c.direct_children(node).iter().copied().find(|&ch| {
-                    c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
+                    c.kind(ch) == NodeKind::Identifier
+                        && c.field(ch, PayloadField::Context) == Some(ctx)
                 });
                 if let Some(name) = name {
                     check_plain(c, c.head_token(name), false);
@@ -556,7 +556,8 @@ pub(crate) mod non_constant_identifier_names {
                 // method-context identifier names are checked.
                 let ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
                 let name = c.direct_children(node).iter().copied().find(|&ch| {
-                    c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
+                    c.kind(ch) == NodeKind::Identifier
+                        && c.field(ch, PayloadField::Context) == Some(ctx)
                 });
                 if let Some(name) = name {
                     check_plain(c, c.head_token(name), false);
@@ -568,7 +569,8 @@ pub(crate) mod non_constant_identifier_names {
                 // constructors — just-underscores exempt).
                 let ctx = dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32;
                 let name = c.direct_children(node).iter().copied().find(|&ch| {
-                    c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
+                    c.kind(ch) == NodeKind::Identifier
+                        && c.field(ch, PayloadField::Context) == Some(ctx)
                 });
                 if let Some(name) = name {
                     let underscores_ok = c
@@ -639,11 +641,9 @@ pub(crate) mod non_constant_identifier_names {
         // identifier; the type's identifiers carry type-reference contexts
         // and must not be scanned.
         let ctx = dartq_parser::IdentifierContext::RecordFieldDeclaration as u32;
-        if let Some(name) =
-            c.direct_children(entry).iter().copied().find(|&ch| {
-                c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
-            })
-        {
+        if let Some(name) = c.direct_children(entry).iter().copied().find(|&ch| {
+            c.kind(ch) == NodeKind::Identifier && c.field(ch, PayloadField::Context) == Some(ctx)
+        }) {
             hits.push(c.head_token(name));
         }
     }
@@ -670,7 +670,7 @@ pub(crate) mod non_constant_identifier_names {
 }
 
 pub(crate) mod file_names {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/file_names.dart:24-42` — the file
     /// base name must be `lowercase_with_underscores`
@@ -683,11 +683,8 @@ pub(crate) mod file_names {
     /// the library's name into the part's own coordinates — the URI form
     /// (`part of 'foo.dart';`) carries the name lexically, the name form
     /// (`part of foo;`) is resolution-bound and stays silent.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "file_names",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("file_names", &[NodeKind::CompilationUnit], check,);
 
     fn check(c: &mut Check<'_>) {
         // A `part of` unit never judges its own name: the official reads
@@ -820,7 +817,7 @@ pub(crate) mod file_names {
 }
 
 pub(crate) mod no_wildcard_variable_uses {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use dartq_parser::IdentifierContext;
 
     /// Official: `pkg/linter/lib/src/rules/no_wildcard_variable_uses.dart:36-77`
@@ -840,11 +837,8 @@ pub(crate) mod no_wildcard_variable_uses {
     /// element binds no variable, so its uses are not wildcard-variable
     /// uses). Message:
     /// `diagnostic.g.dart` `noWildcardVariableUses`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_wildcard_variable_uses",
-    &[NodeKind::Identifier],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("no_wildcard_variable_uses", &[NodeKind::Identifier], check,);
 
     fn check(c: &mut Check<'_>) {
         // Feature gate: with wildcards on, `_` never binds, so there is no
@@ -882,7 +876,7 @@ pub(crate) mod no_wildcard_variable_uses {
 }
 
 pub(crate) mod avoid_types_as_parameter_names {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, utf16_start_of};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, utf16_start_of};
 
     /// The dart:core type names every scope resolves to a class (the bare
     /// lexical face of the official's element test — `ClassElement`
@@ -930,10 +924,10 @@ pub(crate) mod avoid_types_as_parameter_names {
     /// `test_constructor_primary_declaring` no-hit) and skips, an unmarked
     /// one keeps reporting (`test_constructor_primary_requiredPositional`).
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_types_as_parameter_names",
-    &[NodeKind::FormalParameter, NodeKind::TypeVariable],
-    check,
-);
+        "avoid_types_as_parameter_names",
+        &[NodeKind::FormalParameter, NodeKind::TypeVariable],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -1148,7 +1142,7 @@ pub(crate) mod avoid_types_as_parameter_names {
 }
 
 pub(crate) mod use_super_parameters {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::expressions::query_site;
     use crate::rules::types::leak_formal_rows;
     use crate::rules::{NONE_TOKEN, body_members};
@@ -1214,10 +1208,10 @@ pub(crate) mod use_super_parameters {
     /// feature gate reads the [`crate::engine::Features`] bit at check
     /// entry (:43-45).
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_super_parameters",
-    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
-    check,
-);
+        "use_super_parameters",
+        &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+        check,
+    );
 
     /// One constructor parameter: source-order index, written name, whether
     /// it sits in a `{...}` group (kind word 1|2), and the receiver keyword
@@ -3594,14 +3588,10 @@ pub(crate) fn class_like_members(c: &Check<'_>, owner: u32) -> Vec<u32> {
     // inert; class-like owners carry no elements-end word at all (the cut
     // is enum-only).
     let cut = match c.kind(owner) {
-        NodeKind::EnumDeclaration => {
-            match c.field(owner, PayloadField::ElementsEnd) {
-                Some(token) if token != crate::rules::NONE_TOKEN => {
-                    utf16_token_span(c, token).end
-                }
-                _ => 0,
-            }
-        }
+        NodeKind::EnumDeclaration => match c.field(owner, PayloadField::ElementsEnd) {
+            Some(token) if token != crate::rules::NONE_TOKEN => utf16_token_span(c, token).end,
+            _ => 0,
+        },
         _ => 0,
     };
     c.collect_direct(body)
@@ -3622,9 +3612,9 @@ pub(crate) fn class_like_members(c: &Check<'_>, owner: u32) -> Vec<u32> {
 /// filter is exact.
 fn constructor_name(c: &Check<'_>, ctor: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
-    c.collect_direct(ctor)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
+    c.collect_direct(ctor).into_iter().find(|&kid| {
+        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
+    })
 }
 
 /// No written name (the unnamed form, canonically `new`) or spelled
@@ -3649,14 +3639,14 @@ pub(crate) mod sort_unnamed_constructors_first {
     /// arms/reports identically. Message: `diagnostic.g.dart`
     /// `sortUnnamedConstructorsFirst`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "sort_unnamed_constructors_first",
-    &[
+        "sort_unnamed_constructors_first",
+        &[
             NodeKind::ClassDeclaration,
             NodeKind::EnumDeclaration,
             NodeKind::ExtensionTypeDeclaration,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3762,14 +3752,14 @@ pub(crate) mod sort_constructors_first {
     /// a body member, so it never appears in the member walk. Message:
     /// `diagnostic.g.dart` `sortConstructorsFirst`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "sort_constructors_first",
-    &[
+        "sort_constructors_first",
+        &[
             NodeKind::ClassDeclaration,
             NodeKind::EnumDeclaration,
             NodeKind::ExtensionTypeDeclaration,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3843,7 +3833,7 @@ pub(crate) mod sort_constructors_first {
 }
 
 pub(crate) mod matching_super_parameters {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::expressions::query_site;
     use crate::rules::types::leak_formal_rows;
     use crate::rules::{NONE_TOKEN, body_members};
@@ -3876,10 +3866,10 @@ pub(crate) mod matching_super_parameters {
     /// template carries single quotes); mirrored verbatim, the gate
     /// oracle is 3.13.1.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "matching_super_parameters",
-    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
-    check,
-);
+        "matching_super_parameters",
+        &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3900,8 +3890,7 @@ pub(crate) mod matching_super_parameters {
             .filter(|&param| {
                 c.field(param, PayloadField::Receiver)
                     .is_some_and(|kw| kw != NONE_TOKEN && c.lexeme(kw) == "super")
-                    && c
-                        .field(param, PayloadField::FormalParameterKind)
+                    && c.field(param, PayloadField::FormalParameterKind)
                         .is_some_and(|kind| matches!(kind, 0 | 3))
             })
             .collect();
@@ -4011,29 +4000,30 @@ pub(crate) mod matching_super_parameters {
         selector: Option<&str>,
     ) -> Option<Vec<String>> {
         let class_row = crate::rules::same_file_declaration(c, container)?;
-        let primary =
-            c.children(class_row).find(|&kid| {
-                if c.kind(kid) != NodeKind::PrimaryConstructor {
-                    return false;
-                }
-                // `HasConstructorName` decides named vs unnamed; the
-                // selector itself is the `Identifier` child with the
-                // PrimaryConstructorDeclaration context.
-                let named =
-                    c.field(kid, PayloadField::HasConstructorName) == Some(1);
-                match selector {
-                    None => !named,
-                    Some(want) => named && c.children(kid).any(|name_row| {
-                        c.kind(name_row) == NodeKind::Identifier
+        let primary = c.children(class_row).find(|&kid| {
+            if c.kind(kid) != NodeKind::PrimaryConstructor {
+                return false;
+            }
+            // `HasConstructorName` decides named vs unnamed; the
+            // selector itself is the `Identifier` child with the
+            // PrimaryConstructorDeclaration context.
+            let named = c.field(kid, PayloadField::HasConstructorName) == Some(1);
+            match selector {
+                None => !named,
+                Some(want) => {
+                    named
+                        && c.children(kid).any(|name_row| {
+                            c.kind(name_row) == NodeKind::Identifier
                             && c.field(name_row, PayloadField::Context)
                                 == Some(
                                     dartq_parser::IdentifierContext::PrimaryConstructorDeclaration
                                         as u32,
                                 )
                             && c.lexeme(c.head_token(name_row)) == want
-                    }),
+                        })
                 }
-            })?;
+            }
+        })?;
         let params = c
             .collect_direct(primary)
             .into_iter()
@@ -4097,7 +4087,9 @@ pub(crate) mod matching_super_parameters {
     #[cfg(test)]
     mod tests {
         use dartq_parser::ParserFeatures;
-        use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
+        use dartq_resolution::{
+            LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces,
+        };
         use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
         use dartq_source::{FileTable, StringTable};
 

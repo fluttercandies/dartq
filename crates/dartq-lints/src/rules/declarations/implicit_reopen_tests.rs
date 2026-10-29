@@ -118,9 +118,8 @@ fn induced_final_mixin_final_class_reports() {
 /// superclass induces `interface`; the modifier-less subclass reports.
 #[test]
 fn induced_interface_reports() {
-    let f = Fixture::parse(
-        "interface class I {}\nsealed class S extends I {}\nclass C extends S {}\n",
-    );
+    let f =
+        Fixture::parse("interface class I {}\nsealed class S extends I {}\nclass C extends S {}\n");
     let lints = f.run(&one_rule("implicit_reopen"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(

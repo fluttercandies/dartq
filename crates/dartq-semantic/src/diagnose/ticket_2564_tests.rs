@@ -130,8 +130,18 @@ class Holder {{
 "
     );
     let result = report(&source);
-    assert_eq!(count_code(&result, "undefined_method"), 0, "{:?}", messages(&result));
-    assert_eq!(count_code(&result, "undefined_getter"), 0, "{:?}", messages(&result));
+    assert_eq!(
+        count_code(&result, "undefined_method"),
+        0,
+        "{:?}",
+        messages(&result)
+    );
+    assert_eq!(
+        count_code(&result, "undefined_getter"),
+        0,
+        "{:?}",
+        messages(&result)
+    );
 }
 
 /// A genuine miss on the created type reports against the constructor's
@@ -152,7 +162,12 @@ class Holder {{
 "
     );
     let result = report(&source);
-    assert_eq!(count_code(&result, "undefined_method"), 1, "{:?}", messages(&result));
+    assert_eq!(
+        count_code(&result, "undefined_method"),
+        1,
+        "{:?}",
+        messages(&result)
+    );
     assert!(
         result
             .diagnostics
@@ -180,7 +195,12 @@ class Holder {{
 "
     );
     let result = report(&source);
-    assert_eq!(count_code(&result, "undefined_method"), 0, "{:?}", messages(&result));
+    assert_eq!(
+        count_code(&result, "undefined_method"),
+        0,
+        "{:?}",
+        messages(&result)
+    );
 }
 
 /// The implicit (no-keyword) creation with written type arguments keeps
@@ -197,7 +217,12 @@ class Holder {{
 "
     );
     let result = report(&source);
-    assert_eq!(count_code(&result, "undefined_method"), 0, "{:?}", messages(&result));
+    assert_eq!(
+        count_code(&result, "undefined_method"),
+        0,
+        "{:?}",
+        messages(&result)
+    );
 }
 
 fn messages(report: &FileReport) -> Vec<String> {
@@ -323,8 +348,18 @@ fn prefixed_const_creation_with_type_arguments_folds_created_type() {
                 }\n\
                 }\n";
     let rep = report_prefixed(main, lib, "fb");
-    assert_eq!(count_code(&rep, "undefined_method"), 0, "{:?}", messages(&rep));
-    assert_eq!(count_code(&rep, "undefined_getter"), 0, "{:?}", messages(&rep));
+    assert_eq!(
+        count_code(&rep, "undefined_method"),
+        0,
+        "{:?}",
+        messages(&rep)
+    );
+    assert_eq!(
+        count_code(&rep, "undefined_getter"),
+        0,
+        "{:?}",
+        messages(&rep)
+    );
 }
 
 /// A miss through the same prefixed spelling reports against the
@@ -347,7 +382,12 @@ fn prefixed_const_creation_miss_still_reports() {
                 }\n\
                 }\n";
     let rep = report_prefixed(main, lib, "fb");
-    assert_eq!(count_code(&rep, "undefined_method"), 1, "{:?}", messages(&rep));
+    assert_eq!(
+        count_code(&rep, "undefined_method"),
+        1,
+        "{:?}",
+        messages(&rep)
+    );
     assert!(
         rep.diagnostics
             .iter()

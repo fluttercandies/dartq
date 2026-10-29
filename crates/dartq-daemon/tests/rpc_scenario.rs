@@ -229,10 +229,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 let result = answer_result(h, 4);
                 assert_eq!(result["v"], 1);
                 assert!(
-                    result["diags"]
-                        .as_array()
-                        .expect("diagnostics")
-                        .is_empty(),
+                    result["diags"].as_array().expect("diagnostics").is_empty(),
                     "agent A's view is clean: {result}"
                 );
             },
@@ -426,9 +423,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     result["files"].as_array().expect("files").is_empty(),
                     "nothing imports b.dart"
                 );
-                assert!(
-                    result["tests"].as_array().expect("tests").is_empty()
-                );
+                assert!(result["tests"].as_array().expect("tests").is_empty());
                 assert_eq!(
                     result["envs"],
                     json!([{ "label": "default", "compatible": true }]),

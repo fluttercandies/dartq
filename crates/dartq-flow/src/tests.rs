@@ -1000,8 +1000,7 @@ fn switch_all_cases_exit() {
 /// heads, type_analyzer.dart:2614-2623).
 #[test]
 fn switch_stacked_heads_with_default_and_returning_body_emit_no_completion() {
-    let source =
-        "int f(int x) { switch (x) { case 1: case 2: return 1; default: return 0; } }";
+    let source = "int f(int x) { switch (x) { case 1: case 2: return 1; default: return 0; } }";
     assert!(completion_offsets(source).is_empty());
     // A three-head run sharing one body (petitparser whitespace.dart).
     let source = concat!(
@@ -1037,8 +1036,7 @@ fn switch_stacked_heads_with_default_and_returning_body_emit_no_completion() {
 #[test]
 fn switch_default_stacked_after_case_head_exhausts_the_chain() {
     // dio compute_io.dart's shape.
-    let source =
-        "int f(int x) { switch (x) { case 1: return 1; case 3: default: return 0; } }";
+    let source = "int f(int x) { switch (x) { case 1: return 1; case 3: default: return 0; } }";
     assert!(completion_offsets(source).is_empty());
     let source = "int f(int x) { switch (x) { case 1: case 2: default: return 0; } }";
     assert!(completion_offsets(source).is_empty());
@@ -1102,13 +1100,13 @@ fn switch_over_sealed_scrutinee_without_default_kills_exit() {
     assert!(completion_offsets(source).is_empty());
     // A `default`-less non-exhaustive switch over the same shape keeps the
     // post-switch path live — the completion row still fires.
-    let source =
-        "int f(int i) { switch (i) { case 1: return 0; case 2: return 1; } }";
+    let source = "int f(int i) { switch (i) { case 1: return 0; case 2: return 1; } }";
     assert_eq!(completion_offsets(source).len(), 1);
     // The same exhaustive shape over `bool` and an enum.
     let source = "int f(bool b) { switch (b) { case true: return 0; case false: return 1; } }";
     assert!(completion_offsets(source).is_empty());
-    let source = "enum E { a, b } int f(E e) { switch (e) { case E.a: return 0; case E.b: return 1; } }";
+    let source =
+        "enum E { a, b } int f(E e) { switch (e) { case E.a: return 0; case E.b: return 1; } }";
     assert!(completion_offsets(source).is_empty());
     // A sealed scrutinee whose cases leave a live path (a body falls
     // through) still completes — `isExhaustive` only drops the unmatched
@@ -4500,9 +4498,7 @@ fn if_null_types_as_lub_of_lhs_non_null_and_rhs() {
     // A live RHS of unknown nullability keeps the nullable face.
     let events = [
         declared(X, named_ty(INT, true)),
-        if_null(vec![
-            Ev::OtherExpr { span: tspan(2) },
-        ]),
+        if_null(vec![Ev::OtherExpr { span: tspan(2) }]),
     ]
     .concat();
     let interp = interp_of(&events);
@@ -6584,7 +6580,6 @@ fn object_pattern_promotes_scrutinee_for_case_body_reads() {
     assert_eq!(row(post as u32), "Option", "{rows:?}");
 }
 
-
 /// Refutable pattern shapes join their failure arm into the if-case's
 /// unmatched chain: the statement after `if (v case (int a, int b))` stays
 /// live (official `_unmatched` accumulates every can-fail shape's else arm —
@@ -6726,10 +6721,7 @@ fn never_exit_in_then_arm_does_not_dead_post_join_throw() {
     use crate::facts::FlowFact;
     // `void g(bool c) { if (c) { boom(); } throw 'end'; }`
     let events: Vec<Ev> = [
-        vec![
-            Ev::ExecBegin { is_closure: false },
-            Ev::BlockBodyBegin,
-        ],
+        vec![Ev::ExecBegin { is_closure: false }, Ev::BlockBodyBegin],
         vec![Ev::IfBegin { span: tspan(17) }],
         vec![Ev::OtherExpr { span: tspan(21) }],
         vec![
@@ -6785,10 +6777,7 @@ fn never_exit_still_anchors_the_next_statement() {
     use crate::facts::FlowFact;
     // `void g() { boom(); print('x'); }`
     let events: Vec<Ev> = [
-        vec![
-            Ev::ExecBegin { is_closure: false },
-            Ev::BlockBodyBegin,
-        ],
+        vec![Ev::ExecBegin { is_closure: false }, Ev::BlockBodyBegin],
         vec![
             Ev::OtherExpr { span: tspan(12) },
             Ev::Exit { end: tspan(17) },
@@ -7001,7 +6990,6 @@ fn constructor_initialized_final_receiver_never_promotes() {
     );
 }
 
-
 /// `Option<T> option; option is Some` — a raw tested type against a
 /// written generic declaration of a DIFFERENT base — promotes
 /// optimistically: whether `Some<dynamic>` stands below `Option<T>` is the
@@ -7052,7 +7040,10 @@ fn cross_base_raw_tested_against_written_declaration_promotes() {
 /// pins that key on where a promotion stands and what tree it carries.
 fn promoted_read_rows(
     source: &str,
-) -> (std::rc::Rc<std::cell::RefCell<crate::record::Flow<'_>>>, Vec<(u32, crate::ty::Ty, u32)>) {
+) -> (
+    std::rc::Rc<std::cell::RefCell<crate::record::Flow<'_>>>,
+    Vec<(u32, crate::ty::Ty, u32)>,
+) {
     let (flow, facts) = analyze(source);
     let rows = facts
         .into_iter()
@@ -7129,7 +7120,10 @@ fn opaque_nullable_inferred_local_takes_the_marker_promotion() {
 fn marker_promotion_demotes_on_a_null_write() {
     let source = "class C {\n  List<int>? field;\n  void m() {\n    var l = field;\n    if (l == null) return;\n    l = null;\n    l;\n  }\n}";
     let (_, rows) = promoted_read_rows(source);
-    assert!(rows.is_empty(), "the null write demotes the marker: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "the null write demotes the marker: {rows:?}"
+    );
 }
 
 /// A non-nullable spelled initializer face is NOT adopted: the unknown
@@ -7178,10 +7172,14 @@ fn if_null_assignment_through_constructor_promotes() {
     let foo = flow.borrow_mut().intern_name("Foo");
     assert_eq!(
         rows,
-        vec![(read, crate::ty::Ty {
-            base: crate::ty::Base::Name(foo),
-            nullable: false,
-        }, crate::ty::EMPTY_ARGS)],
+        vec![(
+            read,
+            crate::ty::Ty {
+                base: crate::ty::Base::Name(foo),
+                nullable: false,
+            },
+            crate::ty::EMPTY_ARGS
+        )],
         "{rows:?}"
     );
 }
@@ -7239,9 +7237,7 @@ fn initializer_closure_guarded_read_promotes_like_a_function_body() {
     // needles key at the `str` token offset.
     let expected: Vec<(u32, bool)> = ["str == null) return", "str.hashCode"]
         .iter()
-        .map(|needle| {
-            (source_offset(control, needle), needle.starts_with("str =="))
-        })
+        .map(|needle| (source_offset(control, needle), needle.starts_with("str ==")))
         .collect();
     assert_eq!(guarded_read_faces(control), expected, "{control:?}");
     let expected: Vec<(u32, bool)> = ["str == null) return", "str.hashCode"]
@@ -7318,12 +7314,6 @@ fn source_offset(source: &str, needle: &str) -> u32 {
 // —— #2241 family B: the unknown-face initializer adoption ——
 // —— #2241 family B: the unknown-face initializer adoption ——
 // —— #2241 family B: the unknown-face initializer adoption ——
-
-
-
-
-
-
 
 /// Read-type rows whose source text starts with `needle`, as
 /// `(offset, nullable)` pairs sorted by offset (ASCII sources: byte ==
@@ -7436,13 +7426,10 @@ fn case_body_local_promotes_through_null_check() {
         "  }\n",
         "}",
     );
-    let expected: Vec<(u32, bool)> = [
-        ("subs != null", true),
-        ("subs.length", false),
-    ]
-    .iter()
-    .map(|(needle, nullable)| (source_offset(source, needle), *nullable))
-    .collect();
+    let expected: Vec<(u32, bool)> = [("subs != null", true), ("subs.length", false)]
+        .iter()
+        .map(|(needle, nullable)| (source_offset(source, needle), *nullable))
+        .collect();
     assert_eq!(needle_faces(source, "subs"), expected, "{source:?}");
 }
 
@@ -7949,7 +7936,6 @@ fn assert_message_reads_the_condition_false_state() {
     assert!(promoted, "{source:?}");
 }
 
-
 // -- #2311 face pins ------------------------------------------------------------
 
 /// ② `x = x ?? const []` writes the LHS's non-null face *with its written
@@ -8320,8 +8306,7 @@ fn null_check_pattern_joins_the_pre_pattern_state() {
 /// the post-`if` read stays nullable.
 #[test]
 fn null_check_pattern_with_a_guard_keeps_the_nullable_join() {
-    let source =
-        "void f(Object? x) {\n  if (x case final y? when y.hashCode > 0) {\n    print(y);\n  }\n  x;\n}";
+    let source = "void f(Object? x) {\n  if (x case final y? when y.hashCode > 0) {\n    print(y);\n  }\n  x;\n}";
     let read = source.rfind("x;\n}").unwrap() as u32;
     let (_, ty) = read_types_of(source)
         .into_iter()
@@ -8360,7 +8345,8 @@ fn null_check_pattern_on_a_non_null_matched_value_is_a_no_op() {
 /// the resolved ops back-end).
 #[test]
 fn function_is_test_splits_the_arms() {
-    let source = "void f(void Function(int)? g) { if (g is void Function(int)) { g; } else { g; } }";
+    let source =
+        "void f(void Function(int)? g) { if (g is void Function(int)) { g; } else { g; } }";
     let promoted = promoted_tys(source);
     // True arm: the non-null `void Function(int)` face. Else arm: the
     // subtracted `Null` remainder reads as the nullable `Never` face
@@ -8404,8 +8390,7 @@ fn nullable_operand_keeps_both_is_test_arms_live() {
 /// hierarchy).
 #[test]
 fn is_dynamic_and_unknown_operand_never_guarantee() {
-    let tested_dynamic =
-        "void f(Object? x) { if ((x as int) is dynamic) {} else { x; } }";
+    let tested_dynamic = "void f(Object? x) { if ((x as int) is dynamic) {} else { x; } }";
     assert!(dead_snippets(tested_dynamic).is_empty());
     let unknown_operand = "void f() { if (g() is dynamic) {} else { h(); } }";
     assert!(dead_snippets(unknown_operand).is_empty());
@@ -8441,8 +8426,7 @@ fn is_bang_never_flips_the_dead_arm() {
 fn nullability_disjoint_test_deads_the_then_arm() {
     let null_operand = "void f(Object? x) { if ((x as Null) is int) { x; } else {} }";
     assert_eq!(dead_snippets(null_operand), ["{ x; }"]);
-    let null_equivalent_tested =
-        "void f(Object? x) { if ((x as int) is Never?) { x; } else {} }";
+    let null_equivalent_tested = "void f(Object? x) { if ((x as int) is Never?) { x; } else {} }";
     assert_eq!(dead_snippets(null_equivalent_tested), ["{ x; }"]);
     let potentially_nullable_operand =
         "void f(Object? x) { if ((x as int?) is Null) { x; } else { x; } }";
@@ -8488,8 +8472,7 @@ fn local_reference_is_never_deads_the_then_arm() {
 /// displacing it.
 #[test]
 fn promoted_reference_meeting_the_test_deads_the_else() {
-    let source =
-        "void f(Object x) { if (x is String) { if (x is String) {} else { x; } } }";
+    let source = "void f(Object x) { if (x is String) { if (x is String) {} else { x; } } }";
     assert_eq!(dead_snippets(source), ["{ x; }"]);
 }
 
@@ -8629,7 +8612,6 @@ fn switch_expr_non_null_case_values_bind_no_nullable_face() {
     );
 }
 
-
 /// The expression-switch scrutinee's promotion key survives the
 /// `return switch (n)` shape (#2538): every alternative emits its
 /// matched-type row (the teardown covering join's feed), the promoted
@@ -8650,4 +8632,3 @@ fn return_switch_expression_scrutinee_latches_matched_types() {
         "matched rows carry the promoted non-null face: {matched:?}"
     );
 }
-

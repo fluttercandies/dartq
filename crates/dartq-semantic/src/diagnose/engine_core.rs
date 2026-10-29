@@ -737,7 +737,9 @@ impl<'a> Engine<'a> {
                 // null-shorting face stands down, exactly like the walk's
                 // safe-`Single` verdict already did for the member row.
                 if member_read
-                    && self.extension_nullable_resolved.contains(&check.range.offset)
+                    && self
+                        .extension_nullable_resolved
+                        .contains(&check.range.offset)
                 {
                     continue;
                 }
@@ -1018,11 +1020,7 @@ impl<'a> Engine<'a> {
                                 }
                                 p -= 1;
                             }
-                            if depth == 0 {
-                                p
-                            } else {
-                                window_start
-                            }
+                            if depth == 0 { p } else { window_start }
                         }
                         None => window_start,
                     }
@@ -1071,7 +1069,8 @@ impl<'a> Engine<'a> {
                     let covers = |seen: &[Ty], promoted: Ty| {
                         seen.contains(&promoted)
                             || seen.iter().any(|ty| {
-                                *ty != promoted && self.assignable(*ty, promoted, false) == Some(true)
+                                *ty != promoted
+                                    && self.assignable(*ty, promoted, false) == Some(true)
                             })
                     };
                     for element in positional.iter_mut() {
@@ -1136,9 +1135,7 @@ impl<'a> Engine<'a> {
             // mounted run, and a synthetic unit test (no SDK) still
             // decides real pairs over them.
             let invalid_poison = |engine: &Self, ty: Ty| match ty {
-                Ty::Named { name, .. } => {
-                    !engine.core_head(name) && engine.written_ty_invalid(ty)
-                }
+                Ty::Named { name, .. } => !engine.core_head(name) && engine.written_ty_invalid(ty),
                 _ => false,
             };
             if matches!(check.kind, StagedKind::Argument)
@@ -1819,8 +1816,7 @@ impl<'a> Engine<'a> {
                 nullable: false,
                 args,
             };
-            return self.strict_subtype(value, sup, next)
-                && self.strict_subtype(future, sup, next);
+            return self.strict_subtype(value, sup, next) && self.strict_subtype(future, sup, next);
         }
         // Right FutureOr (subtype.dart 418-449): `S0 <: FutureOr<S1>`
         // iff `S0 <: Future<S1>` or `S0 <: S1` — the type-parameter
@@ -2142,11 +2138,8 @@ impl<'a> Engine<'a> {
         // The top-level function face (`tear_off_sig`'s value-read
         // gate): the signature interns whole.
         if let Some(sig) = self.tear_off_sig(operand) {
-            let named: Vec<(StringId, Ty)> = sig
-                .named
-                .iter()
-                .map(|(name, ty, _)| (*name, *ty))
-                .collect();
+            let named: Vec<(StringId, Ty)> =
+                sig.named.iter().map(|(name, ty, _)| (*name, *ty)).collect();
             return Some(self.boundary.intern_function_ty(
                 0,
                 sig.return_ty,
@@ -2439,135 +2432,58 @@ impl<'a> Engine<'a> {
         {
             return;
         }
-        let verdict = if checked == Ty::Dynamic {
-            Some(true)
-        } else if checked == Ty::Unknown || self.is_invalid_ty(checked) {
-            None
-        } else if checked == Ty::Null {
-            // The `is Null` family (`_checkAllTypeChecks`'s `Null` arm)
-            // — unless the operand is the `null` literal, where the
-            // check is constant instead (the same walk's `null` arm:
-            // `Null <: Null` answers `true`). The literal's row is the
-            // operand's own — a keyword operand (`this is Null`) has no
-            // row and the stale one below must not stand in.
-            let null_literal = keyword_operand.is_none()
-                && self
-                    .operand_row()
-                    .is_some_and(|row| row.ty == Ty::Null && matches!(row.shape, RowShape::Value));
-            if null_literal {
-                // `Null <: T` decides the literal check's polarity — the
-                // strict face (the official walk is
-                // `isSubtypeOf(Null, rightType)`, the same relation).
-                Some(self.resolved_subtype(Ty::Null, checked))
-            } else {
-                self.stage_type_check_null(at, negated);
-                return;
-            }
-        } else {
-            // A bare operand head against an argument-carrying checked
-            // type of the same head is informative: the bare side is
-            // `C<dynamic>` (upstream `TypeSystem::type_check_verdict` reads
-            // the operand's instantiated arguments — `C<dynamic> is
-            // C<DateTime>` is a real runtime question), and the wildcard
-            // the name-level lattice gives a bare side must not decide the
-            // constant-true verdict. The one provable shape stays: every
-            // checked argument accepting the `dynamic` row (`dynamic`
-            // itself and the bare/nullable `Object` — the only tops
-            // `dynamic <: T` answers) keeps the subtype question.
-            let object = self.intern("Object");
-            if let Ty::Named {
-                name: operand_name,
-                args: ArgListId::EMPTY,
-                ..
-            } = operand_ty
-                && let Ty::Named {
-                    name: checked_name,
-                    args: checked_args,
-                    ..
-                } = checked
-                && operand_name == checked_name
-                && checked_args != ArgListId::EMPTY
-            {
-                let accepts_dynamic = self.boundary.args.borrow().get(checked_args).iter().all(
-                    |&arg| match arg {
-                        Ty::Dynamic => true,
-                        Ty::Named {
-                            name,
-                            args: ArgListId::EMPTY,
-                            ..
-                        } => name == object,
-                        _ => false,
-                    },
-                );
-                if !accepts_dynamic {
+        let verdict =
+            if checked == Ty::Dynamic {
+                Some(true)
+            } else if checked == Ty::Unknown || self.is_invalid_ty(checked) {
+                None
+            } else if checked == Ty::Null {
+                // The `is Null` family (`_checkAllTypeChecks`'s `Null` arm)
+                // — unless the operand is the `null` literal, where the
+                // check is constant instead (the same walk's `null` arm:
+                // `Null <: Null` answers `true`). The literal's row is the
+                // operand's own — a keyword operand (`this is Null`) has no
+                // row and the stale one below must not stand in.
+                let null_literal = keyword_operand.is_none()
+                    && self.operand_row().is_some_and(|row| {
+                        row.ty == Ty::Null && matches!(row.shape, RowShape::Value)
+                    });
+                if null_literal {
+                    // `Null <: T` decides the literal check's polarity — the
+                    // strict face (the official walk is
+                    // `isSubtypeOf(Null, rightType)`, the same relation).
+                    Some(self.resolved_subtype(Ty::Null, checked))
+                } else {
+                    self.stage_type_check_null(at, negated);
                     return;
                 }
-            }
-            // A type-parameter argument position decides through the
-            // parameter's bound exactly as the oracle's verdict does
-            // (`List<T extends num> is List<num>` is constant-true,
-            // `List<T> is List<DateTime?>` is informative — the bare
-            // parameter's `T <: S` is provable only through its bound,
-            // subtype.dart:306-317): an operand argument spelling a bare
-            // type parameter the walk cannot resolve as a container keeps
-            // the verdict only when its bound (or a top checked argument)
-            // proves the pair. No recoverable bound is the unprovability
-            // itself — informative. The bound question asks the
-            // declared-edge lattice alone — [`Self::resolved_subtype`]'s
-            // slot matrix answers every nullable named target as a right
-            // top (the M1 approximation `num <: DateTime? == true`), which
-            // is not the strict provability the verdict needs. When every
-            // position is such a parameter and every bound proves the
-            // pair, the constant-true answer stands directly — the lattice
-            // ask below cannot spell the parameter side and would
-            // under-report the oracle's row.
-            let mut param_pair_true = false;
-            let mut non_param_position = false;
-            if let Ty::Named {
-                name: operand_name,
-                args: operand_args,
-                ..
-            } = operand_ty
-                && let Ty::Named {
-                    name: checked_name,
-                    args: checked_args,
+            } else {
+                // A bare operand head against an argument-carrying checked
+                // type of the same head is informative: the bare side is
+                // `C<dynamic>` (upstream `TypeSystem::type_check_verdict` reads
+                // the operand's instantiated arguments — `C<dynamic> is
+                // C<DateTime>` is a real runtime question), and the wildcard
+                // the name-level lattice gives a bare side must not decide the
+                // constant-true verdict. The one provable shape stays: every
+                // checked argument accepting the `dynamic` row (`dynamic`
+                // itself and the bare/nullable `Object` — the only tops
+                // `dynamic <: T` answers) keeps the subtype question.
+                let object = self.intern("Object");
+                if let Ty::Named {
+                    name: operand_name,
+                    args: ArgListId::EMPTY,
                     ..
-                } = checked
-                && operand_name == checked_name
-                && operand_args != ArgListId::EMPTY
-                && operand_args != checked_args
-            {
-                let operand_args = self.boundary.args.borrow().get(operand_args).to_vec();
-                let checked_args = self.boundary.args.borrow().get(checked_args).to_vec();
-                if operand_args.len() == checked_args.len() {
-                    param_pair_true = true;
-                    for (&operand_arg, &checked_arg) in
-                        operand_args.iter().zip(checked_args.iter())
-                    {
-                        let Ty::Named {
-                            name: param,
-                            args: ArgListId::EMPTY,
-                            ..
-                        } = operand_arg
-                        else {
-                            non_param_position = true;
-                            continue;
-                        };
-                        if resolve_container(
-                            self.graph,
-                            self.namespaces,
-                            self.index,
-                            self.lib,
-                            self.file,
-                            param,
-                        )
-                        .is_some()
-                        {
-                            non_param_position = true;
-                            continue;
-                        }
-                        // A top checked argument proves every operand side.
-                        let top = match checked_arg {
+                } = operand_ty
+                    && let Ty::Named {
+                        name: checked_name,
+                        args: checked_args,
+                        ..
+                    } = checked
+                    && operand_name == checked_name
+                    && checked_args != ArgListId::EMPTY
+                {
+                    let accepts_dynamic = self.boundary.args.borrow().get(checked_args).iter().all(
+                        |&arg| match arg {
                             Ty::Dynamic => true,
                             Ty::Named {
                                 name,
@@ -2575,41 +2491,118 @@ impl<'a> Engine<'a> {
                                 ..
                             } => name == object,
                             _ => false,
-                        };
-                        if top {
-                            continue;
-                        }
-                        // The gate owns TYPE-PARAMETER positions only: a
-                        // bare spelling that names no in-scope parameter
-                        // (`Null`'s identifier row, an unresolvable head)
-                        // is not a parameter with a bound to prove — it
-                        // defers to the strict ask below, which reads the
-                        // `Null` identity and the 0c faces itself.
-                        if !self.is_scope_param(param) {
-                            non_param_position = true;
-                            continue;
-                        }
-                        let bound = match self.param_bound_of(param) {
-                            Some(Ty::Dynamic) => return,
-                            Some(bound) => bound,
-                            None => return,
-                        };
-                        if !self.name_subtype(bound, checked_arg) {
-                            return;
+                        },
+                    );
+                    if !accepts_dynamic {
+                        return;
+                    }
+                }
+                // A type-parameter argument position decides through the
+                // parameter's bound exactly as the oracle's verdict does
+                // (`List<T extends num> is List<num>` is constant-true,
+                // `List<T> is List<DateTime?>` is informative — the bare
+                // parameter's `T <: S` is provable only through its bound,
+                // subtype.dart:306-317): an operand argument spelling a bare
+                // type parameter the walk cannot resolve as a container keeps
+                // the verdict only when its bound (or a top checked argument)
+                // proves the pair. No recoverable bound is the unprovability
+                // itself — informative. The bound question asks the
+                // declared-edge lattice alone — [`Self::resolved_subtype`]'s
+                // slot matrix answers every nullable named target as a right
+                // top (the M1 approximation `num <: DateTime? == true`), which
+                // is not the strict provability the verdict needs. When every
+                // position is such a parameter and every bound proves the
+                // pair, the constant-true answer stands directly — the lattice
+                // ask below cannot spell the parameter side and would
+                // under-report the oracle's row.
+                let mut param_pair_true = false;
+                let mut non_param_position = false;
+                if let Ty::Named {
+                    name: operand_name,
+                    args: operand_args,
+                    ..
+                } = operand_ty
+                    && let Ty::Named {
+                        name: checked_name,
+                        args: checked_args,
+                        ..
+                    } = checked
+                    && operand_name == checked_name
+                    && operand_args != ArgListId::EMPTY
+                    && operand_args != checked_args
+                {
+                    let operand_args = self.boundary.args.borrow().get(operand_args).to_vec();
+                    let checked_args = self.boundary.args.borrow().get(checked_args).to_vec();
+                    if operand_args.len() == checked_args.len() {
+                        param_pair_true = true;
+                        for (&operand_arg, &checked_arg) in
+                            operand_args.iter().zip(checked_args.iter())
+                        {
+                            let Ty::Named {
+                                name: param,
+                                args: ArgListId::EMPTY,
+                                ..
+                            } = operand_arg
+                            else {
+                                non_param_position = true;
+                                continue;
+                            };
+                            if resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                param,
+                            )
+                            .is_some()
+                            {
+                                non_param_position = true;
+                                continue;
+                            }
+                            // A top checked argument proves every operand side.
+                            let top = match checked_arg {
+                                Ty::Dynamic => true,
+                                Ty::Named {
+                                    name,
+                                    args: ArgListId::EMPTY,
+                                    ..
+                                } => name == object,
+                                _ => false,
+                            };
+                            if top {
+                                continue;
+                            }
+                            // The gate owns TYPE-PARAMETER positions only: a
+                            // bare spelling that names no in-scope parameter
+                            // (`Null`'s identifier row, an unresolvable head)
+                            // is not a parameter with a bound to prove — it
+                            // defers to the strict ask below, which reads the
+                            // `Null` identity and the 0c faces itself.
+                            if !self.is_scope_param(param) {
+                                non_param_position = true;
+                                continue;
+                            }
+                            let bound = match self.param_bound_of(param) {
+                                Some(Ty::Dynamic) => return,
+                                Some(bound) => bound,
+                                None => return,
+                            };
+                            if !self.name_subtype(bound, checked_arg) {
+                                return;
+                            }
                         }
                     }
                 }
-            }
-            // The wrong-arity checked head (`x is Response<int, int>` over
-            // the one-parameter class) reads the oracle's recovered
-            // `Response<Invalid>` interface — beside the arity row the
-            // type-arguments pass already reports — whose vacuous argument
-            // comparison (subtype.dart's 0c arm) answers the same-head
-            // question constant-true: the `is`/`is!` polarity rows fire
-            // (#2380's recv_arity probes — the oracle reports
-            // `unnecessary_type_check` on both polarities).
-            let arity_true =
-                if let (
+                // The wrong-arity checked head (`x is Response<int, int>` over
+                // the one-parameter class) reads the oracle's recovered
+                // `Response<Invalid>` interface — beside the arity row the
+                // type-arguments pass already reports — whose vacuous argument
+                // comparison (subtype.dart's 0c arm) answers the same-head
+                // question constant-true: the `is`/`is!` polarity rows fire
+                // (#2380's recv_arity probes — the oracle reports
+                // `unnecessary_type_check` on both polarities).
+                let arity_true = if let (
                     Ty::Named {
                         name: operand_name, ..
                     },
@@ -2628,36 +2621,35 @@ impl<'a> Engine<'a> {
                         self.lib,
                         self.file,
                         checked_name,
-                    )
-                {
+                    ) {
                     self.boundary.args.borrow().get(checked_args).len()
                         != container.type_params as usize
                 } else {
                     false
                 };
-            if arity_true {
-                Some(true)
-            } else if param_pair_true && !non_param_position {
-                Some(true)
-            } else if !self.resolved_subtype(operand_ty, checked) {
-                // A non-matching pair is informative — the official order
-                // has no subtype-negative verdict
-                // (`TypeSystem::type_check_verdict`'s doc): only the
-                // constant-true answer reports here, with `is!` mapping
-                // to the 'false' row below. The ask is
-                // [`Self::resolved_subtype`], the strict mirror of
-                // `TypeSystem.isSubtypeOf` — the name-level lattice
-                // alone cannot stand here: its same-head argument walk
-                // delegates to the assignability slot, whose legacy
-                // `Null` and top leniencies answer `Null → C` beyond
-                // the strict relation (`List<Null> is List<Object>` —
-                // the covariant argument leg asks `Null <: Object`,
-                // Left Null refuses, the oracle is silent).
-                return;
-            } else {
-                Some(true)
-            }
-        };
+                if arity_true {
+                    Some(true)
+                } else if param_pair_true && !non_param_position {
+                    Some(true)
+                } else if !self.resolved_subtype(operand_ty, checked) {
+                    // A non-matching pair is informative — the official order
+                    // has no subtype-negative verdict
+                    // (`TypeSystem::type_check_verdict`'s doc): only the
+                    // constant-true answer reports here, with `is!` mapping
+                    // to the 'false' row below. The ask is
+                    // [`Self::resolved_subtype`], the strict mirror of
+                    // `TypeSystem.isSubtypeOf` — the name-level lattice
+                    // alone cannot stand here: its same-head argument walk
+                    // delegates to the assignability slot, whose legacy
+                    // `Null` and top leniencies answer `Null → C` beyond
+                    // the strict relation (`List<Null> is List<Object>` —
+                    // the covariant argument leg asks `Null <: Object`,
+                    // Left Null refuses, the oracle is silent).
+                    return;
+                } else {
+                    Some(true)
+                }
+            };
         let Some(constant_true) = verdict else { return };
         let code = match (constant_true, negated) {
             (true, false) | (false, true) => SemanticCode::UnnecessaryTypeCheckTrue,
@@ -3231,7 +3223,11 @@ impl<'a> Engine<'a> {
                 (derived != Ty::UNKNOWN).then_some(derived)
             })
             .unwrap_or(Ty::UNKNOWN);
-        dq_probe!("[ifnull-init] lhs_face={:?} rhs_face={:?}", lhs_face, rhs_face);
+        dq_probe!(
+            "[ifnull-init] lhs_face={:?} rhs_face={:?}",
+            lhs_face,
+            rhs_face
+        );
         let face = match (lhs_face, rhs_face) {
             (a, b) if a == b => a,
             (Ty::UNKNOWN, b) => b,
@@ -3248,10 +3244,7 @@ impl<'a> Engine<'a> {
             // `argument_type_not_assignable`).
             (_, Ty::UNKNOWN) => return None,
             (
-                Ty::Named {
-                    name: l,
-                    ..
-                },
+                Ty::Named { name: l, .. },
                 Ty::Named {
                     name: r,
                     args: ra,
@@ -3411,12 +3404,10 @@ impl<'a> Engine<'a> {
     /// name the post-walk caller no longer holds — the under-report
     /// direction).
     pub(crate) fn param_bound_of(&self, name: StringId) -> Option<Ty> {
-        let implicit_object = || {
-            Ty::Named {
-                name: self.intern("Object"),
-                nullable: true,
-                args: ArgListId::EMPTY,
-            }
+        let implicit_object = || Ty::Named {
+            name: self.intern("Object"),
+            nullable: true,
+            args: ArgListId::EMPTY,
         };
         for window in self
             .exec_bounds
@@ -3939,11 +3930,16 @@ impl<'a> Engine<'a> {
             let num_id = self.members.primitive_ids[2];
             let container = |head| {
                 resolve_container(
-                    self.graph, self.namespaces, self.index, self.lib, self.file, head,
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    head,
                 )
             };
-            let shadowed = container(name).is_some()
-                && (name == num_id || container(num_id).is_none());
+            let shadowed =
+                container(name).is_some() && (name == num_id || container(num_id).is_none());
             if !shadowed {
                 if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
                     .iter()
@@ -4039,7 +4035,8 @@ impl<'a> Engine<'a> {
             }
             "clamp" if positional.len() == 2 => {
                 let all = |tys: &[Ty], head| {
-                    tys.iter().all(|t| *t != Ty::Never && self.name_subtype(*t, named_q(head)))
+                    tys.iter()
+                        .all(|t| *t != Ty::Never && self.name_subtype(*t, named_q(head)))
                 };
                 let operands = [recv_ty, positional[0], positional[1]];
                 if all(&operands, int) {
@@ -4173,8 +4170,7 @@ impl<'a> Engine<'a> {
         };
         // `Never` stays excluded (the upstream `!s.isBottom` cut) and
         // falls to `num`.
-        if right_ty != Ty::Never
-            && (right_invalid || self.name_subtype(right_ty, named_q(double)))
+        if right_ty != Ty::Never && (right_invalid || self.name_subtype(right_ty, named_q(double)))
         {
             return Ty::named(double);
         }
@@ -4301,8 +4297,7 @@ impl<'a> Engine<'a> {
         // expression: the oracle's argument/assignment rows anchor there
         // (`node.selector.end - …` at the expression head, never at a
         // mid-chain member token).
-        let is_ident_byte =
-            |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
         let mut expr_start = left.range.offset;
         loop {
             let Some(mut gap) = expr_start.checked_sub(1) else {
@@ -4314,9 +4309,7 @@ impl<'a> Engine<'a> {
                 _ => break,
             }
             let mut head = gap;
-            while head > 0
-                && self.byte_at(head - 1).is_some_and(is_ident_byte)
-            {
+            while head > 0 && self.byte_at(head - 1).is_some_and(is_ident_byte) {
                 head -= 1;
             }
             if head == gap {
@@ -5080,7 +5073,7 @@ impl<'a> Engine<'a> {
                             && bytes[at - 1] != b'.'
                 })
             });
-        
+
         latched
     }
 
@@ -5127,7 +5120,10 @@ impl<'a> Engine<'a> {
     pub(crate) fn initializer_node_span(&self, name_range: SourceRange) -> SourceRange {
         let toks = self.tokens.as_slice();
         let mut at = toks.partition_point(|t| t.utf16_offset < name_range.end());
-        if !toks.get(at).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Eq) {
+        if !toks
+            .get(at)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Eq)
+        {
             return name_range;
         }
         // `this.x = v` node offset: the keyword two tokens before the name
@@ -5204,7 +5200,7 @@ impl<'a> Engine<'a> {
         if !chars.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$') {
             return None;
         }
-        
+
         Some(self.intern(text))
     }
 
@@ -5220,7 +5216,11 @@ impl<'a> Engine<'a> {
         }
         let bytes = self.source.as_bytes();
         let mut start = open;
-        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'$') {
+        while start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || bytes[start - 1] == b'_'
+                || bytes[start - 1] == b'$')
+        {
             start -= 1;
         }
         if start == open {
@@ -5275,7 +5275,11 @@ impl<'a> Engine<'a> {
     /// row sits after that cascade's operator, and the source between the
     /// two operators stays inside one expression — no `;`, no block brace,
     /// no bracket closing past its own opener), else the popped `target`.
-    pub(crate) fn cascade_continuation_target(&self, operator: u32, target: SourceRange) -> SourceRange {
+    pub(crate) fn cascade_continuation_target(
+        &self,
+        operator: u32,
+        target: SourceRange,
+    ) -> SourceRange {
         let Some((prev_op, prev_target)) = self.cascade_last else {
             return target;
         };
@@ -5301,7 +5305,7 @@ impl<'a> Engine<'a> {
         if depth != 0 {
             return target;
         }
-        
+
         prev_target
     }
 

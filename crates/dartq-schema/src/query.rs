@@ -593,10 +593,7 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .remove("implementations");
-        minimal
-            .as_object_mut()
-            .expect("object")
-            .remove("deps");
+        minimal.as_object_mut().expect("object").remove("deps");
         minimal["decls"][0]
             .as_object_mut()
             .expect("object")

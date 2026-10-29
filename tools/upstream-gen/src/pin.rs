@@ -25,8 +25,8 @@ impl Pin {
     /// is two levels above this crate's manifest dir).
     pub fn load() -> Result<Pin, String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance/pin.toml");
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         Self::parse(&text).map_err(|e| format!("{}:{e}", path.display()))
     }
 
@@ -61,7 +61,9 @@ impl Pin {
         let sdk_version = sdk_version.ok_or("missing `sdk_version`")?;
         let sdk_revision = sdk_revision.ok_or("missing `sdk_revision`")?;
         if sdk_revision.len() != 40 || !sdk_revision.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!("`sdk_revision` `{sdk_revision}` is not a 40-hex git revision"));
+            return Err(format!(
+                "`sdk_revision` `{sdk_revision}` is not a 40-hex git revision"
+            ));
         }
         Ok(Pin {
             sdk_version,
@@ -135,7 +137,9 @@ mod tests {
     #[test]
     fn rejects_malformed_pins() {
         assert!(Pin::parse("sdk_version = \"3.13.7\"\n").is_err());
-        assert!(Pin::parse("sdk_revision = \"416e33b0ffaef062a60ec966bb8c82ed2b83f128\"\n").is_err());
+        assert!(
+            Pin::parse("sdk_revision = \"416e33b0ffaef062a60ec966bb8c82ed2b83f128\"\n").is_err()
+        );
         assert!(Pin::parse("sdk_version = \"3.13.7\"\nsdk_revision = \"abc\"\n").is_err());
         assert!(Pin::parse("sdk_version = 3.13.7\n").is_err());
         assert!(Pin::parse("surprise = \"x\"\n").is_err());
@@ -143,7 +147,8 @@ mod tests {
 
     #[test]
     fn header_revision_extracts_the_stamp() {
-        let doc = "# header\n# SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)\n";
+        let doc =
+            "# header\n# SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)\n";
         assert_eq!(
             header_revision(doc),
             Some("416e33b0ffaef062a60ec966bb8c82ed2b83f128")

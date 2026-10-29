@@ -31,7 +31,10 @@ impl Selector {
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let tokens = lex(text)?;
-        let mut parser = Parser { tokens: &tokens, at: 0 };
+        let mut parser = Parser {
+            tokens: &tokens,
+            at: 0,
+        };
         let node = parser.conditional()?;
         (parser.at == tokens.len()).then_some(node)
     }
@@ -47,7 +50,11 @@ impl Selector {
             Self::And(left, right) => left.evaluate(var) && right.evaluate(var),
             Self::Or(left, right) => left.evaluate(var) || right.evaluate(var),
             Self::Conditional(cond, yes, no) => {
-                if cond.evaluate(var) { yes.evaluate(var) } else { no.evaluate(var) }
+                if cond.evaluate(var) {
+                    yes.evaluate(var)
+                } else {
+                    no.evaluate(var)
+                }
             }
         }
     }
@@ -107,7 +114,9 @@ fn lex(text: &str) -> Option<Vec<Tok>> {
             b'&' if bytes.get(i + 1) == Some(&b'&') => (out.push(Tok::And), i += 2).1,
             c if c.is_ascii_alphabetic() || c == b'_' || c == b'-' => {
                 let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-') {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+                {
                     i += 1;
                 }
                 out.push(Tok::Ident(text[start..i].to_owned()));
@@ -143,7 +152,11 @@ impl Parser<'_> {
             return None;
         }
         let no = self.conditional()?;
-        Some(Selector::Conditional(Box::new(cond), Box::new(yes), Box::new(no)))
+        Some(Selector::Conditional(
+            Box::new(cond),
+            Box::new(yes),
+            Box::new(no),
+        ))
     }
 
     fn or(&mut self) -> Option<Selector> {
@@ -205,7 +218,13 @@ impl TagFilter {
         parts(include)?;
         let exclude = parts(exclude)?
             .into_iter()
-            .fold(Selector::None, |acc, next| if acc == Selector::None { next } else { Selector::Or(Box::new(acc), Box::new(next)) });
+            .fold(Selector::None, |acc, next| {
+                if acc == Selector::None {
+                    next
+                } else {
+                    Selector::Or(Box::new(acc), Box::new(next))
+                }
+            });
         Some(Self { exclude })
     }
 }
@@ -291,7 +310,10 @@ fn suite_meta(text: &str) -> Option<SuiteMeta> {
     let mut files = FileTable::new();
     let scanned = dartq_scanner::scan(
         source,
-        ScanConfig { enable_triple_shift: true, enable_augmentations: false },
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: false,
+        },
         files.intern(Path::new("suite.dart")),
     );
     let tokens = &scanned.tokens;
@@ -374,12 +396,16 @@ fn import_prefixes<'s>(source: &'s str, tokens: &TokenTable, mut at: usize) -> V
     let mut out = Vec::new();
     while at < slice.len() {
         match slice[at].kind {
-            TokenKind::Keyword(Keyword::Library | Keyword::Import | Keyword::Export | Keyword::Part) => {
+            TokenKind::Keyword(
+                Keyword::Library | Keyword::Import | Keyword::Export | Keyword::Part,
+            ) => {
                 let import = slice[at].kind == TokenKind::Keyword(Keyword::Import);
                 while at < slice.len() && slice[at].kind != TokenKind::Semicolon {
                     if import
                         && slice[at].kind == TokenKind::Keyword(Keyword::As)
-                        && slice.get(at + 1).is_some_and(|next| next.kind == TokenKind::Identifier)
+                        && slice
+                            .get(at + 1)
+                            .is_some_and(|next| next.kind == TokenKind::Identifier)
                     {
                         out.push(tokens.lexeme(source, at + 1));
                     }
@@ -390,7 +416,10 @@ fn import_prefixes<'s>(source: &'s str, tokens: &TokenTable, mut at: usize) -> V
             TokenKind::At => {
                 at += 1;
                 while at < slice.len()
-                    && matches!(slice[at].kind, TokenKind::Identifier | TokenKind::Keyword(_) | TokenKind::Period)
+                    && matches!(
+                        slice[at].kind,
+                        TokenKind::Identifier | TokenKind::Keyword(_) | TokenKind::Period
+                    )
                 {
                     at += 1;
                 }
@@ -406,7 +435,11 @@ fn import_prefixes<'s>(source: &'s str, tokens: &TokenTable, mut at: usize) -> V
 
 /// `[ 'a', "b", ]` (an optional `const` and type argument included) as
 /// the tag names; `None` for anything but string literals.
-fn string_list(source: &str, tokens: &TokenTable, (start, end): (usize, usize)) -> Option<Vec<String>> {
+fn string_list(
+    source: &str,
+    tokens: &TokenTable,
+    (start, end): (usize, usize),
+) -> Option<Vec<String>> {
     let slice = tokens.as_slice();
     let mut at = start;
     if slice[at].kind == TokenKind::Keyword(Keyword::Const) {
@@ -441,7 +474,11 @@ fn string_list(source: &str, tokens: &TokenTable, (start, end): (usize, usize)) 
 /// optional trailing comma allowed); `None` for interpolation or escapes.
 fn single_string(source: &str, tokens: &TokenTable, start: usize, end: usize) -> Option<String> {
     let slice = tokens.as_slice();
-    let end = if end > start && slice[end - 1].kind == TokenKind::Comma { end - 1 } else { end };
+    let end = if end > start && slice[end - 1].kind == TokenKind::Comma {
+        end - 1
+    } else {
+        end
+    };
     if start >= end {
         return None;
     }
@@ -476,7 +513,12 @@ mod tests {
     use super::*;
 
     fn filter(include: &[&str], exclude: &[&str]) -> TagFilter {
-        let own = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        let own = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
         TagFilter::new(&own(include), &own(exclude)).expect("valid selectors")
     }
 
@@ -500,8 +542,14 @@ mod tests {
         let src = b"@Tags(['slow', \"db\"])\nlibrary;\nimport 'package:test/test.dart';\nvoid main() {}\n";
         assert_eq!(select(src, &filter(&[], &["slow"])), Selection::Dropped);
         assert_eq!(select(src, &filter(&[], &["fast"])), Selection::Loaded);
-        assert_eq!(select(src, &filter(&[], &["db && !slow"])), Selection::Loaded);
-        assert_eq!(select(src, &filter(&[], &["fast", "db"])), Selection::Dropped);
+        assert_eq!(
+            select(src, &filter(&[], &["db && !slow"])),
+            Selection::Loaded
+        );
+        assert_eq!(
+            select(src, &filter(&[], &["fast", "db"])),
+            Selection::Dropped
+        );
         // Include selectors filter tests, never suites.
         assert_eq!(select(src, &filter(&["fast"], &[])), Selection::Loaded);
         assert!(TagFilter::new(&["a &&".to_owned()], &[]).is_none());
@@ -509,25 +557,46 @@ mod tests {
 
     #[test]
     fn test_on_is_evaluated_for_the_vm() {
-        let src = |sel: &str| format!("@TestOn('{sel}')\nlibrary;\nvoid main() {{}}\n").into_bytes();
+        let src =
+            |sel: &str| format!("@TestOn('{sel}')\nlibrary;\nvoid main() {{}}\n").into_bytes();
         let none = filter(&[], &[]);
         assert_eq!(select(&src("vm"), &none), Selection::Loaded);
         assert_eq!(select(&src("browser"), &none), Selection::Dropped);
         assert_eq!(select(&src("!js"), &none), Selection::Loaded);
-        assert_eq!(select(&src("windows"), &none), if cfg!(windows) { Selection::Loaded } else { Selection::Dropped });
+        assert_eq!(
+            select(&src("windows"), &none),
+            if cfg!(windows) {
+                Selection::Loaded
+            } else {
+                Selection::Dropped
+            }
+        );
         assert_eq!(select(&src("bad selector!"), &none), Selection::Unknown);
     }
 
     #[test]
     fn uncertain_metadata_is_unknown() {
         let none = filter(&[], &["slow"]);
-        assert_eq!(select(b"@Tags(kTags)\nlibrary;\nvoid main() {}\n", &none), Selection::Unknown);
-        assert_eq!(select(b"@Tags(['a$b'])\nlibrary;\nvoid main() {}\n", &none), Selection::Unknown);
-        assert_eq!(select(b"@Tags(['a'])\n@Tags(['b'])\nlibrary;\n", &none), Selection::Unknown);
+        assert_eq!(
+            select(b"@Tags(kTags)\nlibrary;\nvoid main() {}\n", &none),
+            Selection::Unknown
+        );
+        assert_eq!(
+            select(b"@Tags(['a$b'])\nlibrary;\nvoid main() {}\n", &none),
+            Selection::Unknown
+        );
+        assert_eq!(
+            select(b"@Tags(['a'])\n@Tags(['b'])\nlibrary;\n", &none),
+            Selection::Unknown
+        );
         // Annotations on a declaration are not suite metadata.
-        assert_eq!(select(b"@Tags(['slow'])\nvoid main() {}\n", &none), Selection::Loaded);
+        assert_eq!(
+            select(b"@Tags(['slow'])\nvoid main() {}\n", &none),
+            Selection::Loaded
+        );
         // A prefixed annotation through an import prefix.
-        let prefixed = b"@t.Tags(['slow'])\nlibrary;\nimport 'package:test/test.dart' as t;\nvoid main() {}\n";
+        let prefixed =
+            b"@t.Tags(['slow'])\nlibrary;\nimport 'package:test/test.dart' as t;\nvoid main() {}\n";
         assert_eq!(select(prefixed, &none), Selection::Dropped);
     }
 
@@ -553,14 +622,23 @@ mod tests {
         }
         // An empty list is one `Index` token to the scanner, not a group:
         // the runner decides, as it does for the truly unreadable forms.
-        for form in ["@Tags([])", "@Tags()", "@Tags('slow')", "@Tags([k])", "@Tags(['a\\tb'])"] {
+        for form in [
+            "@Tags([])",
+            "@Tags()",
+            "@Tags('slow')",
+            "@Tags([k])",
+            "@Tags(['a\\tb'])",
+        ] {
             assert_eq!(select(&src(form), &slow), Selection::Unknown, "{form}");
         }
         // A byte-order mark precedes the annotations; an `@` inside code is
         // not an annotation the runner reads.
         let bom: &[u8] = "\u{feff}@Tags(['slow'])\nlibrary;\n".as_bytes();
         assert_eq!(select(bom, &slow), Selection::Dropped);
-        assert_eq!(select(b"void main() { @Deprecated('x') f(); }\n", &slow), Selection::Loaded);
+        assert_eq!(
+            select(b"void main() { @Deprecated('x') f(); }\n", &slow),
+            Selection::Loaded
+        );
     }
 
     /// The selector grammar's remaining corners: nested conditionals,
@@ -579,13 +657,19 @@ mod tests {
         assert!(Selector::parse("a /* c */ ? b : c // tail").is_some());
         assert!(Selector::parse("a/*x*/&&b").is_some());
         assert!(Selector::parse("a /* /* nested */ */ && b").is_some());
-        assert!(Selector::parse("a /* /* nested */ && b").is_none(), "the inner comment never closed");
+        assert!(
+            Selector::parse("a /* /* nested */ && b").is_none(),
+            "the inner comment never closed"
+        );
         for bad in ["a ? b", "(a", "a b", "?a", "a:", "()"] {
             assert!(Selector::parse(bad).is_none(), "{bad}");
         }
         // An unreadable suite file is the runner's to report.
         assert_eq!(
-            select_all(&[std::path::PathBuf::from("/dartq/missing_test.dart")], &filter(&[], &[])),
+            select_all(
+                &[std::path::PathBuf::from("/dartq/missing_test.dart")],
+                &filter(&[], &[])
+            ),
             [Selection::Unknown]
         );
     }

@@ -87,7 +87,10 @@ fn isolate_golden_round_trips() {
     let isolate: Isolate = round_trip(golden);
     assert!(isolate.runnable);
     assert_eq!(isolate.name.as_deref(), Some("worker-isolate"));
-    assert_eq!(isolate.exception_pause_mode, Some(ExceptionPauseMode::Unhandled));
+    assert_eq!(
+        isolate.exception_pause_mode,
+        Some(ExceptionPauseMode::Unhandled)
+    );
     assert_eq!(isolate.breakpoints.len(), 1);
     assert!(isolate.breakpoints[0].resolved);
     assert!(matches!(
@@ -206,10 +209,8 @@ fn pause_breakpoint_event_golden_round_trips() {
 /// An `Instance` with every optional field at its default — the base
 /// for equality assertions on parsed values.
 fn minimal_instance() -> Instance {
-    serde_json::from_str(
-        r#"{"type":"@Instance","id":"","kind":"PlainInstance"}"#,
-    )
-    .expect("minimal instance parses")
+    serde_json::from_str(r#"{"type":"@Instance","id":"","kind":"PlainInstance"}"#)
+        .expect("minimal instance parses")
 }
 
 #[test]
@@ -230,22 +231,26 @@ fn breakpoint_locations_round_trip() {
     let resolved: BreakpointLocation = round_trip(
         r#"{"type":"SourceLocation","script":{"type":"@Script","id":"scripts/1","uri":"package:app/main.dart"},"tokenPos":145,"endTokenPos":145,"line":7,"column":3}"#,
     );
-    assert!(matches!(resolved, BreakpointLocation::Resolved(ref location) if location.end_token_pos == Some(145)));
+    assert!(
+        matches!(resolved, BreakpointLocation::Resolved(ref location) if location.end_token_pos == Some(145))
+    );
 
     let unresolved: BreakpointLocation = round_trip(
         r#"{"type":"UnresolvedSourceLocation","scriptUri":"package:app/main.dart","tokenPos":200,"line":11,"column":5}"#,
     );
     match unresolved {
         BreakpointLocation::Unresolved(location) => {
-            assert_eq!(location.script_uri.as_deref(), Some("package:app/main.dart"));
+            assert_eq!(
+                location.script_uri.as_deref(),
+                Some("package:app/main.dart")
+            );
             assert_eq!(location.line, Some(11));
             assert_eq!(location.column, Some(5));
         }
         other => panic!("expected unresolved location, got {other:?}"),
     }
 
-    let unknown: BreakpointLocation =
-        round_trip(r#"{"type":"SomethingElse","line":1}"#);
+    let unknown: BreakpointLocation = round_trip(r#"{"type":"SomethingElse","line":1}"#);
     assert_eq!(unknown, BreakpointLocation::Unknown);
 }
 
@@ -310,7 +315,10 @@ fn instance_golden_round_trips() {
     );
     assert_eq!(object.kind, InstanceKind::PlainInstance);
     assert_eq!(
-        object.class.as_ref().and_then(|class| class.name.as_deref()),
+        object
+            .class
+            .as_ref()
+            .and_then(|class| class.name.as_deref()),
         Some("Cart")
     );
     assert_eq!(object.fields.len(), 1);
@@ -333,13 +341,16 @@ fn list_and_map_instances_round_trip() {
     );
     assert_eq!(list.length, Some(2));
     assert_eq!(list.elements.len(), 2);
-    assert_eq!(list.elements[0], ValueOrSentinel::Instance(Box::new({
-        let mut instance = minimal_instance();
-        instance.id = "objects/11".to_owned();
-        instance.kind = InstanceKind::Int;
-        instance.value_as_string = Some("1".to_owned());
-        instance
-    })));
+    assert_eq!(
+        list.elements[0],
+        ValueOrSentinel::Instance(Box::new({
+            let mut instance = minimal_instance();
+            instance.id = "objects/11".to_owned();
+            instance.kind = InstanceKind::Int;
+            instance.value_as_string = Some("1".to_owned());
+            instance
+        }))
+    );
 
     let map: Instance = round_trip(
         r#"{
@@ -470,7 +481,9 @@ fn value_or_sentinel_round_trips() {
         "valueAsString": "3"
     });
     let parsed: ValueOrSentinel = serde_json::from_value(golden).expect("instance slot");
-    assert!(matches!(parsed, ValueOrSentinel::Instance(ref instance) if instance.id == "objects/7"));
+    assert!(
+        matches!(parsed, ValueOrSentinel::Instance(ref instance) if instance.id == "objects/7")
+    );
     let encoded = serde_json::to_value(&parsed).expect("re-encode instance slot");
     assert_eq!(encoded["type"], "Instance");
     assert_eq!(encoded["kind"], "Int");
@@ -549,19 +562,14 @@ fn event_without_timestamp_is_a_protocol_error() {
         r#"{"type":"Event","kind":"Resume","isolate":{"type":"@Isolate","id":"isolates/1"}}"#,
     );
     assert!(missing.is_err(), "an event without timestamp must fail");
-    let wrong_type = serde_json::from_str::<Event>(
-        r#"{"type":"Event","kind":"Resume","timestamp":"soon"}"#,
-    );
+    let wrong_type =
+        serde_json::from_str::<Event>(r#"{"type":"Event","kind":"Resume","timestamp":"soon"}"#);
     assert!(wrong_type.is_err(), "a non-integer timestamp must fail");
 }
 
 #[test]
 fn unknown_event_kind_round_trips() {
-    let event: Event = round_trip(
-        r#"{"type":"Event","kind":"FuturePauseKind","timestamp":1700000000000}"#,
-    );
-    assert_eq!(
-        event.kind,
-        EventKind::Other("FuturePauseKind".to_owned())
-    );
+    let event: Event =
+        round_trip(r#"{"type":"Event","kind":"FuturePauseKind","timestamp":1700000000000}"#);
+    assert_eq!(event.kind, EventKind::Other("FuturePauseKind".to_owned()));
 }

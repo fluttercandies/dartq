@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{byte_span_of_token, initialized_identifier_name, tail_token, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/use_rethrow_when_possible.dart:36-46`
@@ -144,12 +144,10 @@ fn shadowed_between(c: &Check<'_>, use_tok: u32, catch_clause: u32, name: &str) 
                 // The function name binds from its declaration on — it
                 // nests under the `FunctionName` child on the production
                 // tiling — and the parameters scope the whole body.
-                let names_decl =
-                    crate::rules::declarations::member_declaration_name(c, ancestor)
-                        .is_some_and(|decl| {
-                            c.lexeme(c.head_token(decl)) == name
-                                && c.byte_span(decl).start < use_start
-                        });
+                let names_decl = crate::rules::declarations::member_declaration_name(c, ancestor)
+                    .is_some_and(|decl| {
+                        c.lexeme(c.head_token(decl)) == name && c.byte_span(decl).start < use_start
+                    });
                 if names_decl || parameter_names(c, ancestor).contains(&name) {
                     return true;
                 }

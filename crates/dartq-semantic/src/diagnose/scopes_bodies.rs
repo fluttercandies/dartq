@@ -511,7 +511,7 @@ impl<'a> Engine<'a> {
                 // the left operand is the `[]` read, never the key.
                 .filter(|lhs| !self.is_index_key_row(lhs))
                 .is_some_and(|lhs| self.coalesce_operand_never_null(lhs));
-        
+
         if !non_null {
             return;
         }
@@ -911,7 +911,6 @@ impl<'a> Engine<'a> {
     /// official clause scope only under-reports undefined-name, the flat
     /// frame's documented direction.
     pub(crate) fn add_local(&mut self, name: StringId) {
-        
         if let Some(frame) = self.frames.last_mut() {
             frame.locals.insert(name);
         } else {
@@ -1276,7 +1275,10 @@ impl<'a> Engine<'a> {
                     nullable: false,
                     args,
                 },
-                Receiver::Typed { type_name: container, .. },
+                Receiver::Typed {
+                    type_name: container,
+                    ..
+                },
             ) if args == ArgListId::EMPTY
                 && matches!(self.walk_members(*container, callee_name), Walk::Found(ref entry)
                     if entry.kind == MemberKind::Method
@@ -1370,7 +1372,10 @@ impl<'a> Engine<'a> {
                 // reports the unchecked verdict the oracle reports). Every
                 // other head keeps the receiver-stand-in walk below.
                 let callee_own_param = match recv {
-                    Receiver::Typed { type_name: container, .. } => {
+                    Receiver::Typed {
+                        type_name: container,
+                        ..
+                    } => {
                         matches!(self.walk_members(container, callee_name), Walk::Found(ref entry)
                             if entry.kind == MemberKind::Method
                                 && entry.type_param_names.contains(&head))
@@ -1385,7 +1390,8 @@ impl<'a> Engine<'a> {
                     // inferred. When that argument's own type is beyond the
                     // model, the solution is unknown — `dynamic`, never the
                     // fresh-parameter `Object?` bound.
-                    if callee_row.is_some() && self.untyped_arg_constrains(&recv, callee_name, head) {
+                    if callee_row.is_some() && self.untyped_arg_constrains(&recv, callee_name, head)
+                    {
                         return None;
                     }
                     return Some(self.object_question());
@@ -1568,9 +1574,9 @@ impl<'a> Engine<'a> {
                                 let read = self.initializer_read_ty(&row);
                                 if read == Ty::Unknown
                                     && !row.qualified
-                                    && self.top_level_decl(row.name).is_some_and(|decl| {
-                                        matches!(decl.kind, MicroKind::Class)
-                                    })
+                                    && self
+                                        .top_level_decl(row.name)
+                                        .is_some_and(|decl| matches!(decl.kind, MicroKind::Class))
                                 {
                                     // A creation argument (`A()`): the
                                     // invocation's static type is the
@@ -1598,12 +1604,16 @@ impl<'a> Engine<'a> {
             let formal = match name {
                 Some(n) => formals.as_ref().and_then(|f| f.named_formal(*n)),
                 None => {
-                    let formal = formals.as_ref().and_then(|f| f.positional.get(positional_index));
+                    let formal = formals
+                        .as_ref()
+                        .and_then(|f| f.positional.get(positional_index));
                     positional_index += 1;
                     formal
                 }
             };
-            if let Some(formal) = formal && ty != Ty::Unknown {
+            if let Some(formal) = formal
+                && ty != Ty::Unknown
+            {
                 self.closure_unify_upward(formal.ty, ty, &params, &mut candidates);
             }
         }
@@ -1640,7 +1650,7 @@ impl<'a> Engine<'a> {
         // unsubstituted schema never did (`Bag<Und>`'s `T` is a provable
         // same-file type parameter, `Und` is not). Rejection keeps the
         // schema untouched — exactly the pre-existing route.
-(out != ty && self.schema_type_is_decidable(out)).then_some(out)
+        (out != ty && self.schema_type_is_decidable(out)).then_some(out)
     }
 
     /// The closure-return tally's recording half (the listener's return
@@ -1689,9 +1699,10 @@ impl<'a> Engine<'a> {
         if let RowShape::Member { recv } = &row.shape {
             let container = match recv {
                 Receiver::Typed { type_name, .. } => Some(*type_name),
-                Receiver::This { container, .. } | Receiver::Container { name: container, .. } => {
-                    Some(*container)
-                }
+                Receiver::This { container, .. }
+                | Receiver::Container {
+                    name: container, ..
+                } => Some(*container),
                 _ => None,
             };
             let valid = container.is_some_and(|container| {
@@ -1738,9 +1749,8 @@ impl<'a> Engine<'a> {
                     // to `Member` runs after the send): the receiver row sits
                     // directly below, and its bare face names it.
                     if matches!(recv, Receiver::Unknown)
-                        && let Some(below) = callee
-                            .checked_sub(1)
-                            .and_then(|index| self.rows.get(index))
+                        && let Some(below) =
+                            callee.checked_sub(1).and_then(|index| self.rows.get(index))
                         && let RowShape::Bare(info) = below.shape
                     {
                         Engine::receiver_of_bare(info)
@@ -1789,7 +1799,8 @@ impl<'a> Engine<'a> {
         let formals = match &recv {
             Receiver::Prefix { name: prefix } => {
                 let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(file)) =
-                    self.namespaces.lookup_prefixed(self.graph, self.lib, *prefix, row.name)
+                    self.namespaces
+                        .lookup_prefixed(self.graph, self.lib, *prefix, row.name)
                 else {
                     return;
                 };
@@ -1819,8 +1830,7 @@ impl<'a> Engine<'a> {
                 self.closure_unify_upward(formal.ty, *ty, &params, &mut candidates);
             }
         }
-        let param_index =
-            |name: StringId| params.iter().position(|(param, _)| *param == name);
+        let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
         let mut solutions: Vec<Option<Ty>> = vec![None; params.len()];
         let mut poisoned: FxHashSet<usize> = FxHashSet::default();
         for (param, ty) in candidates {
@@ -1888,7 +1898,12 @@ impl<'a> Engine<'a> {
     /// to the invalid face, whose greatest closure is the `Object?` the
     /// caller answers (`writeOptionalObject<T>(T? object, …)` over an
     /// unresolvable `Token?`).
-    fn untyped_arg_constrains(&mut self, recv: &Receiver, callee_name: StringId, param: StringId) -> bool {
+    fn untyped_arg_constrains(
+        &mut self,
+        recv: &Receiver,
+        callee_name: StringId,
+        param: StringId,
+    ) -> bool {
         let Some(formals) = self.callee_formals(recv, callee_name) else {
             return false;
         };
@@ -1902,7 +1917,10 @@ impl<'a> Engine<'a> {
             };
             let mut stack: Vec<Ty> = args.get(list).to_vec();
             while let Some(ty) = stack.pop() {
-                if let Ty::Named { name, args: list, .. } = ty {
+                if let Ty::Named {
+                    name, args: list, ..
+                } = ty
+                {
                     if name == param {
                         return true;
                     }
@@ -1985,7 +2003,11 @@ impl<'a> Engine<'a> {
         &self,
         recv: &Receiver,
         callee_name: StringId,
-    ) -> Option<(Vec<(StringId, Option<Ty>)>, Vec<(StringId, Ty)>, Option<usize>)> {
+    ) -> Option<(
+        Vec<(StringId, Option<Ty>)>,
+        Vec<(StringId, Ty)>,
+        Option<usize>,
+    )> {
         // The member send's parameters (mirrors the send-close solver):
         // method type-parameter names are authoritative; the declaring
         // container's own parameters join only for the receiver's own
@@ -2026,8 +2048,7 @@ impl<'a> Engine<'a> {
                             let pool = self.boundary.pool();
                             let args = pool.get(args);
                             if args.len() == container_params.len() {
-                                for ((param, _, _), ty) in
-                                    container_params.iter().zip(args.iter())
+                                for ((param, _, _), ty) in container_params.iter().zip(args.iter())
                                 {
                                     seeds.push((*param, *ty));
                                 }
@@ -2072,7 +2093,8 @@ impl<'a> Engine<'a> {
         // unit's unprefixed tables (a local `min` must not bind `math.min`).
         if let Receiver::Prefix { name: prefix } = *recv {
             let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(file)) =
-                self.namespaces.lookup_prefixed(self.graph, self.lib, prefix, callee_name)
+                self.namespaces
+                    .lookup_prefixed(self.graph, self.lib, prefix, callee_name)
             else {
                 return None;
             };
@@ -2110,7 +2132,11 @@ impl<'a> Engine<'a> {
     fn foreign_decl_params(
         &self,
         decl: &TopDecl,
-    ) -> Option<(Vec<(StringId, Option<Ty>)>, Vec<(StringId, Ty)>, Option<usize>)> {
+    ) -> Option<(
+        Vec<(StringId, Option<Ty>)>,
+        Vec<(StringId, Ty)>,
+        Option<usize>,
+    )> {
         if decl.kind != MicroKind::TopLevelFn || decl.type_params == 0 {
             return None;
         }
@@ -2126,7 +2152,7 @@ impl<'a> Engine<'a> {
                 Some(arity),
             ));
         }
-                let mut names: Vec<StringId> = Vec::new();
+        let mut names: Vec<StringId> = Vec::new();
         if let Some(formals) = decl.formals.as_deref() {
             for formal in formals.positional.iter().chain(formals.named.iter()) {
                 self.unprovable_leaves(formal.ty, &mut names, arity);
@@ -2167,8 +2193,11 @@ impl<'a> Engine<'a> {
             Ty::Function { shape, .. } => {
                 let pool = self.boundary.pool();
                 let shape = pool.function_shape(shape);
-                let (positional, named, return_ty) =
-                    (shape.positional.clone(), shape.named.clone(), shape.return_ty);
+                let (positional, named, return_ty) = (
+                    shape.positional.clone(),
+                    shape.named.clone(),
+                    shape.return_ty,
+                );
                 drop(pool);
                 for ty in positional {
                     self.unprovable_leaves(ty, out, cap);
@@ -2513,8 +2542,7 @@ impl<'a> Engine<'a> {
         else {
             return None;
         };
-        let pairs: Vec<(&'a ExtensionFace, FileId)> =
-            self.accessible_extension_faces().to_vec();
+        let pairs: Vec<(&'a ExtensionFace, FileId)> = self.accessible_extension_faces().to_vec();
         for (face, file) in pairs {
             if face.on_type != Some(head) {
                 continue;
@@ -2544,10 +2572,7 @@ impl<'a> Engine<'a> {
             // names and answer as written.
             if !face.type_param_names.is_empty() {
                 let on_ty = self.boundary.ty(file, face.on_ty);
-                let Ty::Named {
-                    args: on_args, ..
-                } = on_ty
-                else {
+                let Ty::Named { args: on_args, .. } = on_ty else {
                     continue;
                 };
                 let written = self.boundary.pool().get(args).to_vec();
@@ -2589,7 +2614,11 @@ impl<'a> Engine<'a> {
     /// apply: the foreign-pool projection and the field-type patch
     /// (same-file only; a foreign class's unannotated field formal stays
     /// `Unknown` and the schema stays silent — the under-report posture).
-    pub(crate) fn ctor_schema_formals(&self, class: StringId, selector: StringId) -> Option<Formals> {
+    pub(crate) fn ctor_schema_formals(
+        &self,
+        class: StringId,
+        selector: StringId,
+    ) -> Option<Formals> {
         let (container, owner) = resolve_container(
             self.graph,
             self.namespaces,
@@ -2805,7 +2834,10 @@ impl<'a> Engine<'a> {
                     })
                 }) {
                 Some(params) if !params.is_empty() => {
-                    let Ty::Named { args: recv_args, .. } = *ty else {
+                    let Ty::Named {
+                        args: recv_args, ..
+                    } = *ty
+                    else {
                         return Receiver::Unknown;
                     };
                     let recv_args = self.boundary.pool().get(recv_args).to_vec();
@@ -2882,9 +2914,10 @@ impl<'a> Engine<'a> {
         // index (the [`CORE_STATIC_RETURNS`] precedent for an unindexed
         // declared return).
         let head = self.strings.resolve(*type_name);
-        let Some((_, _, index, result)) = CHAIN_PRODUCER_GETTERS.iter().find(
-            |(container, getter, ..)| *container == head && self.intern(getter) == row.name,
-        ) else {
+        let Some((_, _, index, result)) = CHAIN_PRODUCER_GETTERS
+            .iter()
+            .find(|(container, getter, ..)| *container == head && self.intern(getter) == row.name)
+        else {
             return Receiver::Unknown;
         };
         let Ty::Named { args, .. } = *ty else {
@@ -3121,7 +3154,7 @@ impl<'a> Engine<'a> {
         } else {
             *declared
         };
-        
+
         let code = match ret {
             // (b)'s top faces: each is its own `FutureOr` base.
             Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void => return None,
@@ -3346,7 +3379,10 @@ impl<'a> Engine<'a> {
         } else {
             (
                 container,
-                Some(self.strings.intern(&format!("{container_text}.{head_text}"))),
+                Some(
+                    self.strings
+                        .intern(&format!("{container_text}.{head_text}")),
+                ),
             )
         };
         if let Some(frame) = self.frames.last_mut()

@@ -394,25 +394,25 @@ macro_rules! dq_probe {
 mod assignability;
 mod augmentations;
 mod best_practices_verifier;
-mod const_eval_faces;
 mod call_result;
 mod collection_literal;
+mod const_eval_faces;
 mod creation_args;
 mod engine_core;
-mod invocation;
+mod ffi;
 mod index_result;
+mod invocation;
 mod listener;
 mod never_send;
-mod ffi;
+mod operand_face;
+mod overrides;
 mod pattern_scope;
 mod primitive_lattice;
 mod receiver_face;
-mod send_result;
-mod operand_face;
-mod overrides;
 mod resolution;
 mod row_resolution;
 mod scopes_bodies;
+mod send_result;
 mod strict_faces;
 mod type_capture;
 pub(crate) mod types;
@@ -532,7 +532,6 @@ mod ticket_2241_tests;
 #[cfg(test)]
 mod ticket_2765_tests;
 
-
 /// The #2326 differential pins: the with-clause override producer wired
 /// from the three with-clause listener handlers — the written NamedType
 /// span anchors each `invalid_override` row (type arguments included),
@@ -551,8 +550,6 @@ mod ticket_2326_tests;
 /// the shared `tests` rig stays untouched.
 #[cfg(test)]
 mod ticket_const_family_tests;
-
-
 
 /// The #2337 differential pins: the `super.name` formal's associated-type
 /// face — a positional forward reads the super constructor's parameter at
@@ -604,7 +601,9 @@ mod ticket_2362_tests;
 
 pub(crate) use operand_face::OperandFace;
 pub(crate) use types::*;
-pub use types::{FileReport, MemberRef, MemberRefKind, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
+pub use types::{
+    FileReport, MemberRef, MemberRefKind, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef,
+};
 
 /// Parses an int literal body: decimal or `0x` hex, `_` separators
 /// stripped; `None` when the value exceeds `i64` (an unobservable edge —
@@ -1339,8 +1338,8 @@ pub fn fold_unit_with_ops<'t>(
                 // The span is UTF-16; the slice reads source bytes —
                 // convert so a wide char upstream cannot cut a character
                 // in half (#2594).
-                let name = &source[engine.byte_of(range.offset)
-                    ..engine.byte_of(range.end()).min(source.len())];
+                let name = &source
+                    [engine.byte_of(range.offset)..engine.byte_of(range.end()).min(source.len())];
                 let code = if is_late {
                     (definitely_unassigned)
                         .then_some(SemanticCode::DefinitelyUnassignedLateLocalVariable)
@@ -2184,7 +2183,9 @@ fn ignored_elements(rest: &str) -> Vec<Entry> {
             }
             let family_start = o;
             o += 1;
-            while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$') {
+            while o < n
+                && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$')
+            {
                 o += 1;
             }
             if o < n && !is_space(bytes[o]) && bytes[o] != b',' {
@@ -2201,11 +2202,15 @@ fn ignored_elements(rest: &str) -> Vec<Entry> {
                 // `plugin/name` (ignore_info.dart:398-423): the citation
                 // binds to the named plugin's diagnostics only.
                 o += 1;
-                if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_' || bytes[o] == b'$') {
+                if o == n
+                    || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_' || bytes[o] == b'$')
+                {
                     return entries;
                 }
                 o += 1;
-                while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$') {
+                while o < n
+                    && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$')
+                {
                     o += 1;
                 }
             }
@@ -3558,7 +3563,9 @@ fn resolves_as_core_type(lexeme: &str) -> bool {
     crate::member_face::CORE_TYPE_MEMBERS
         .iter()
         .any(|(name, _)| *name == lexeme)
-        || super::diagnose::types::EXTERNAL_CORE_TYPE_PARAMS.iter().any(|(name, _)| *name == lexeme)
+        || super::diagnose::types::EXTERNAL_CORE_TYPE_PARAMS
+            .iter()
+            .any(|(name, _)| *name == lexeme)
 }
 
 /// Whether an object-pattern clause (`C1(:var name)`) carries a property
@@ -3681,8 +3688,7 @@ fn undefined_in_scrutinee_chain(
     while j > 0 {
         j -= 1;
         let token = &slice[j];
-        if token.kind != dartq_scanner::TokenKind::Identifier
-            || tokens.lexeme(source, j) != lexeme
+        if token.kind != dartq_scanner::TokenKind::Identifier || tokens.lexeme(source, j) != lexeme
         {
             continue;
         }
@@ -3705,12 +3711,9 @@ fn undefined_in_scrutinee_chain(
                 }
                 k += 1;
             }
-            slice
-                .get(k)
-                .map(|t| (start, t.utf16_offset + t.byte_len))
+            slice.get(k).map(|t| (start, t.utf16_offset + t.byte_len))
         } else if j > 0
-            && slice[j - 1].kind
-                == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
+            && slice[j - 1].kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
         {
             // The iterable runs to the for-header's closing `)`.
             let Some(start) = slice.get(j + 1).map(|t| t.utf16_offset) else {
@@ -3735,9 +3738,7 @@ fn undefined_in_scrutinee_chain(
             continue;
         };
         return diagnostics.iter().any(|d| {
-            d.code.name.starts_with("undefined_")
-                && d.range.offset >= start
-                && d.range.offset < end
+            d.code.name.starts_with("undefined_") && d.range.offset >= start && d.range.offset < end
         });
     }
     false
@@ -3893,8 +3894,17 @@ fn synthesize_unknown_scrutinee_dead_cases(
             continue;
         }
         let Some(absorber) = switch_clause_absorber(
-            slice, tokens, source, strings, &clauses, &mut resolvable, graph, namespaces, index,
-            file, lib,
+            slice,
+            tokens,
+            source,
+            strings,
+            &clauses,
+            &mut resolvable,
+            graph,
+            namespaces,
+            index,
+            file,
+            lib,
         ) else {
             continue;
         };
@@ -4038,9 +4048,7 @@ fn build_switch_clauses(
             _ => {}
         }
     }
-    if !*statement
-        && let Some(arrow) = arm_arrow
-    {
+    if !*statement && let Some(arrow) = arm_arrow {
         clauses.push(SwitchClause {
             head: arm_start,
             pattern_end: arrow,
@@ -4374,17 +4382,6 @@ mod ticket_2231_tests;
 #[cfg(test)]
 mod ticket_2297_tests;
 
-
-
-
-
-
-
-
-
-
-
-
 /// The #2414 pins (U1/R1): the `?.` short-circuit's result nullability —
 /// `a?.b` types `B?` and the `?` propagates through the whole guarded
 /// chain (`a?.b.c` types `C?`), so the assignment, return, argument, and
@@ -4394,16 +4391,6 @@ mod ticket_2297_tests;
 #[cfg(test)]
 mod ticket_2414_tests;
 
-
-
-
-
-
-
-
-
-
-
 /// The #2433 pins (LAW A phase A3): a member face read through a
 /// parameterized receiver substitutes the receiver's WRITTEN type
 /// arguments — `Box<int> b; b.set(v)` checks `v` against `int`. Bare-head
@@ -4411,9 +4398,6 @@ mod ticket_2414_tests;
 /// one level deep.
 #[cfg(test)]
 mod ticket_2433_tests;
-
-
-
 
 /// The #2440 pins (LAW A phase A2): a closure literal passed where a
 /// `Function(...)`-typed formal is expected binds its implicit parameters
@@ -4426,31 +4410,6 @@ mod ticket_2433_tests;
 /// `unchecked_use_of_nullable_value` rows).
 #[cfg(test)]
 mod ticket_2440_tests;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// The #2481 pins: the `var`-inference window's extension-face receiver
 /// typing — a member read the merge-time field face leaves `Unknown`
@@ -4481,7 +4440,21 @@ mod ticket_2491_tests;
 #[cfg(test)]
 mod ticket_2471_tests;
 
-
+/// The #2159 pins: the `unused_field` read-attribution faces of the
+/// census's reads-side family — the `?.` chain's nested private-field
+/// read, the private-field read inside a getter body, the const-list
+/// field's read, the enum constant's access — each locks the oracle's
+/// `readMembers`/`unresolvedReadMembers` sparing against regression. The
+/// cross-part close itself lives at `semdiag.rs`'s
+/// `part_file_unused_field_closes_library_wide` (#2286).
+#[cfg(test)]
+mod ticket_2159_tests;
+/// The #2318 pins: the extension-member element-identity credit — a
+/// resolved implicit application spares its own member only, so
+/// same-spelled members of sibling extensions (and unresolved accesses)
+/// keep reporting.
+#[cfg(test)]
+mod ticket_2318_tests;
 /// The #2324 pins: the dead-coalesce operand faces (the `?.`-merged
 /// read/send keeps the null union, an invoked operand reads its send's
 /// declared result, a generic key send never anchors) and the extension
@@ -4490,6 +4463,21 @@ mod ticket_2471_tests;
 /// untouched.
 #[cfg(test)]
 mod ticket_2324_tests;
+/// The #2325 pins: a mixin application's member face substitutes the
+/// mixin's own type parameters with the application's written `with`
+/// arguments at the member-table fold — `XmlElement`'s `children` reads
+/// `XmlNodeList<XmlNode>`, never the mixin's `XmlNodeList<T>` spelling.
+#[cfg(test)]
+mod ticket_2325_tests;
+/// The #2329 pins: the annotation name's resolution order — locals, the
+/// container's type parameters, the own-container member face (own statics
+/// for class bodies, every own member inside an extension body), then the
+/// scoped top-level/import lookup. The climbed faces — the superclass
+/// `static const`, the own instance members, the method's own type
+/// parameters, the object members — never answer, so their names miss into
+/// `undefined_annotation` exactly where the 3.13.1 oracle reports.
+#[cfg(test)]
+mod ticket_2329_tests;
 /// The #2336 pins: the InvalidType-scrutinee gate over the switch
 /// exhaustiveness rows — a broken-import scrutinee (the oracle's
 /// `hasInvalidType` posture, constant_verifier.dart:1035/:1095) suppresses
@@ -4506,17 +4494,6 @@ mod ticket_2336_tests;
 /// unresolved pattern type) stays silent.
 #[cfg(test)]
 mod ticket_2340_tests;
-/// The #2359 pins: the body-position function-type capture — written
-/// function types inside block bodies intern real shapes so the
-/// shape-keyed sentinels decide same-signature type checks.
-#[cfg(test)]
-mod ticket_2359_tests;
-/// The #2318 pins: the extension-member element-identity credit — a
-/// resolved implicit application spares its own member only, so
-/// same-spelled members of sibling extensions (and unresolved accesses)
-/// keep reporting.
-#[cfg(test)]
-mod ticket_2318_tests;
 /// The #2344 pins: the member-read gate on the nullable-condition join —
 /// a staged condition at a member token decides on the property face
 /// alone, so a same-named promoted local never hides the member's
@@ -4524,6 +4501,11 @@ mod ticket_2318_tests;
 /// bare local face, and promotable-field promotions keep their verdicts.
 #[cfg(test)]
 mod ticket_2344_tests;
+/// The #2359 pins: the body-position function-type capture — written
+/// function types inside block bodies intern real shapes so the
+/// shape-keyed sentinels decide same-signature type checks.
+#[cfg(test)]
+mod ticket_2359_tests;
 /// The #2365 pins: the bare-identifier implicit-`call` invocation's
 /// result type — a callable class instance invoked bare types the send
 /// with the `call` method's return (substituted when the method is
@@ -4532,30 +4514,6 @@ mod ticket_2344_tests;
 /// non-callable callees and the dot-spelled control keep their faces.
 #[cfg(test)]
 mod ticket_2365_tests;
-/// The #2325 pins: a mixin application's member face substitutes the
-/// mixin's own type parameters with the application's written `with`
-/// arguments at the member-table fold — `XmlElement`'s `children` reads
-/// `XmlNodeList<XmlNode>`, never the mixin's `XmlNodeList<T>` spelling.
-#[cfg(test)]
-mod ticket_2325_tests;
-/// The #2329 pins: the annotation name's resolution order — locals, the
-/// container's type parameters, the own-container member face (own statics
-/// for class bodies, every own member inside an extension body), then the
-/// scoped top-level/import lookup. The climbed faces — the superclass
-/// `static const`, the own instance members, the method's own type
-/// parameters, the object members — never answer, so their names miss into
-/// `undefined_annotation` exactly where the 3.13.1 oracle reports.
-#[cfg(test)]
-mod ticket_2329_tests;
-/// The #2159 pins: the `unused_field` read-attribution faces of the
-/// census's reads-side family — the `?.` chain's nested private-field
-/// read, the private-field read inside a getter body, the const-list
-/// field's read, the enum constant's access — each locks the oracle's
-/// `readMembers`/`unresolvedReadMembers` sparing against regression. The
-/// cross-part close itself lives at `semdiag.rs`'s
-/// `part_file_unused_field_closes_library_wide` (#2286).
-#[cfg(test)]
-mod ticket_2159_tests;
 /// The #2405 pins: the `ambiguous_set_or_map_literal_both` over-report
 /// cluster — a typed `<int, dynamic>{}` entry value whose `<...>` group
 /// comma mis-split the leaf scan into a phantom set side. See the module
@@ -4576,6 +4534,17 @@ mod ticket_2406_tests;
 /// member targets, binary reads, and later genuine reads keep theirs.
 #[cfg(test)]
 mod ticket_2409_tests;
+/// The #2410 pins: the typedef RHS seam — the four RHS shapes that landed
+/// opaque at the chase site (an argument-bearing `Named`
+/// (`typedef A = List<int>`), a function shape (`typedef F = int
+/// Function(String)`), a record shape (`typedef R = (int, String)`), and a
+/// parameterized alias (`typedef P<T> = ...`)) now resolve through the
+/// snapshot's flattened RHS shapes, and a parameterized use substitutes its
+/// written arguments into the captured RHS at the diagnosing fold (the
+/// #2413 red-pin posture flips to the oracle's
+/// `argument_type_not_assignable`).
+#[cfg(test)]
+mod ticket_2410_tests;
 /// The #2413 pins: cross-library typedef call resolution (N5+N9 — a foreign
 /// file's alias resolves its callable signature at the use site) and the
 /// callable-class invocation return type (R4 — `c(3)` types as the `call`
@@ -4590,15 +4559,6 @@ mod ticket_2413_tests;
 /// against `({num? progress})` field-initializer faces the named shape.
 #[cfg(test)]
 mod ticket_2416_tests;
-/// The #2419 pins: every depth-0 formal-parameter group opens a fresh
-/// pool — sibling top-level `Function({…})` type literals (the
-/// `diagnostic.g.dart` const table, typedef RHSes) each clear the
-/// accumulated formals at their own begin, so named-formal reuse across
-/// independent GFT lists no longer reports `duplicate_definition`, while
-/// the within-list check, the executable-vs-annotation split, and the
-/// header latch for `<T>` after a GFT return annotation all hold.
-#[cfg(test)]
-mod ticket_2419_tests;
 /// The #2417 pins: the cross-file constructor-formals projection — a
 /// foreign container's `ctor_formals` table cloned verbatim carried
 /// `ArgListId`/`FnShapeId` slots that index the *foreign* `ArgPool`, so the
@@ -4608,31 +4568,15 @@ mod ticket_2419_tests;
 /// it. See the module for the upstream `resolve_container` owner contract.
 #[cfg(test)]
 mod ticket_2417_tests;
-/// The #2422 pins: the explicit-keyword unnamed creation (`const C(...)`,
-/// `new C(...)`) stacks its value row so a following member merge resolves
-/// against the class, the type-argumented unqualified invocation
-/// (`Undefined<X>(...)`) codes the method/function invocation face instead
-/// of `undefined_identifier`, and an invalid written type (a head that
-/// resolves to no type) asks no assignability question on the assignment,
-/// declaration-initializer, and return faces.
+/// The #2419 pins: every depth-0 formal-parameter group opens a fresh
+/// pool — sibling top-level `Function({…})` type literals (the
+/// `diagnostic.g.dart` const table, typedef RHSes) each clear the
+/// accumulated formals at their own begin, so named-formal reuse across
+/// independent GFT lists no longer reports `duplicate_definition`, while
+/// the within-list check, the executable-vs-annotation split, and the
+/// header latch for `<T>` after a GFT return annotation all hold.
 #[cfg(test)]
-mod ticket_2422_tests;
-/// The #2425 pins: the function-involved cross-family assignability face —
-/// `super('x')` against a function-typed formal (foreign or same-file)
-/// reports `argument_type_not_assignable` the way the oracle's
-/// `isAssignableTo` decides it, a function argument against a non-function
-/// formal reports, and the 'call' tearoff arm keeps a compatible callable
-/// class instance silent while an incompatible `call` signature reports.
-#[cfg(test)]
-mod ticket_2425_tests;
-/// The #2423 pins: the extension-pool family — the specificity step reads
-/// the applicable faces' full `on` types argument-wise (a non-nullable or
-/// subtype argument dominates its twin, so a single applicable face
-/// resolves instead of reading ambiguous), the genuine equal-`on`-type
-/// ambiguity stays, and a nested index-assignment target's index argument
-/// keeps its local read credit.
-#[cfg(test)]
-mod ticket_2423_tests;
+mod ticket_2419_tests;
 /// The #2420 pins: the supertype member walk survives the dead supertype
 /// hop — `extends Dead implements Live` still merges the live interface's
 /// members (the analyzer corpus's `AstNodeImpl extends SyntacticEntity
@@ -4642,6 +4586,37 @@ mod ticket_2423_tests;
 /// tables instead of the under-report.
 #[cfg(test)]
 mod ticket_2420_tests;
+/// The #2422 pins: the explicit-keyword unnamed creation (`const C(...)`,
+/// `new C(...)`) stacks its value row so a following member merge resolves
+/// against the class, the type-argumented unqualified invocation
+/// (`Undefined<X>(...)`) codes the method/function invocation face instead
+/// of `undefined_identifier`, and an invalid written type (a head that
+/// resolves to no type) asks no assignability question on the assignment,
+/// declaration-initializer, and return faces.
+#[cfg(test)]
+mod ticket_2422_tests;
+/// The #2423 pins: the extension-pool family — the specificity step reads
+/// the applicable faces' full `on` types argument-wise (a non-nullable or
+/// subtype argument dominates its twin, so a single applicable face
+/// resolves instead of reading ambiguous), the genuine equal-`on`-type
+/// ambiguity stays, and a nested index-assignment target's index argument
+/// keeps its local read credit.
+#[cfg(test)]
+mod ticket_2423_tests;
+/// The #2425 pins: the function-involved cross-family assignability face —
+/// `super('x')` against a function-typed formal (foreign or same-file)
+/// reports `argument_type_not_assignable` the way the oracle's
+/// `isAssignableTo` decides it, a function argument against a non-function
+/// formal reports, and the 'call' tearoff arm keeps a compatible callable
+/// class instance silent while an incompatible `call` signature reports.
+#[cfg(test)]
+mod ticket_2425_tests;
+/// The #2426 pins: the closure-formal inference's receiver-head gate — the
+/// unindexed receiver's first type argument stands in for `map`'s `E` only
+/// when the receiver's written head is provably a type — and the staged
+/// static type of `this` closing an exhaustive `switch (this)` body.
+#[cfg(test)]
+mod ticket_2426_tests;
 /// The #2429 pins: a prefixed supertype-clause face (`implements idl.X`)
 /// binds through the prefix's export scope — the @override gate spares a
 /// member the prefixed interface declares, reports one the interface lacks,
@@ -4649,12 +4624,6 @@ mod ticket_2420_tests;
 /// verdicts).
 #[cfg(test)]
 mod ticket_2429_tests;
-/// The #2426 pins: the closure-formal inference's receiver-head gate — the
-/// unindexed receiver's first type argument stands in for `map`'s `E` only
-/// when the receiver's written head is provably a type — and the staged
-/// static type of `this` closing an exhaustive `switch (this)` body.
-#[cfg(test)]
-mod ticket_2426_tests;
 /// The #2430 pins: the parameter-bound materialization at the
 /// nullability and never-match gates — a written bound (`T extends
 /// AstNodeImpl?`) decides the `?.`/`!`/null-comparison/null-check faces
@@ -4695,17 +4664,6 @@ mod ticket_2436_tests;
 /// `non_exhaustive` witness over the root is `Enum()` itself).
 #[cfg(test)]
 mod ticket_2439_tests;
-/// The #2410 pins: the typedef RHS seam — the four RHS shapes that landed
-/// opaque at the chase site (an argument-bearing `Named`
-/// (`typedef A = List<int>`), a function shape (`typedef F = int
-/// Function(String)`), a record shape (`typedef R = (int, String)`), and a
-/// parameterized alias (`typedef P<T> = ...`)) now resolve through the
-/// snapshot's flattened RHS shapes, and a parameterized use substitutes its
-/// written arguments into the captured RHS at the diagnosing fold (the
-/// #2413 red-pin posture flips to the oracle's
-/// `argument_type_not_assignable`).
-#[cfg(test)]
-mod ticket_2410_tests;
 /// The #2441 pins: one argument verdict — [`Engine::argument_verdict`] —
 /// behind every argument face (the two operator folds, the two
 /// const/enum-constructor walks, the fn-signature faces, and the staged
@@ -4719,6 +4677,14 @@ mod ticket_2410_tests;
 /// the same declared-edge lattice the switch tracker walks.
 #[cfg(test)]
 mod ticket_2441_tests;
+/// The #2442 pins: the analyzer-census member-resolution false-positive
+/// family — an extension `this` whose `on` name is the oracle's
+/// `InvalidType` (unresolvable through a broken export) stays silent on
+/// every member face; `Stream.transform` rides the frozen `dart:async`
+/// face; and the operator-merged row runs the same on-face union the
+/// plain tail does, naming the `on` type on a decidable miss.
+#[cfg(test)]
+mod ticket_2442_tests;
 /// The #2444 pins: the switch body-death cut narrowed to the
 /// nullability-disjoint face — a genuinely value-disjoint constant root
 /// (`case true` over an `int`, another enum's constant over an enum, a
@@ -4745,6 +4711,13 @@ mod ticket_2445_tests;
 /// for this shape (defense in depth kept).
 #[cfg(test)]
 mod ticket_2447_tests;
+/// The #2448 pins: the constant-pattern never-match anchor spans the full
+/// constant node — a qualified `case A.a:` row anchors `A.a` whole and an
+/// enum-constant `case E.a:` row anchors the full pattern node (the
+/// upstream `visitConstantPattern` `.at(node)` face), with the literal
+/// forms keeping their token anchors.
+#[cfg(test)]
+mod ticket_2448_tests;
 /// The #2449 pins: receiver static types for top-level-getter references
 /// and compound receiver chains (census F1) — the getter's declared
 /// return types the member and null-aware faces (`g.missing()`,
@@ -4753,46 +4726,13 @@ mod ticket_2447_tests;
 /// function read keeps the unknown tear-off face.
 #[cfg(test)]
 mod ticket_2449_tests;
-/// The #2442 pins: the analyzer-census member-resolution false-positive
-/// family — an extension `this` whose `on` name is the oracle's
-/// `InvalidType` (unresolvable through a broken export) stays silent on
-/// every member face; `Stream.transform` rides the frozen `dart:async`
-/// face; and the operator-merged row runs the same on-face union the
-/// plain tail does, naming the `on` type on a decidable miss.
+/// The #2450 pins: the invalid-scrutinee switch absorption over the
+/// unknown/invalid read faces (statements and expressions, the constant
+/// head skip) and the invalid-operand is-check promotion, plus the
+/// deleted undefined-tested always-true fold — both oracle arms of an
+/// `x is <undefined>` check stay live behind `type_test_with_undefined_name`.
 #[cfg(test)]
-mod ticket_2442_tests;
-/// The #2461 pins: chained member access through implicit-call sends
-/// (census family A4) — a value invocation over a `call`-bearing static
-/// type types the send with the call method's declared return (the
-/// bare-spelling face reads the callee's static type, not the
-/// information-less row type), so `body(ctx).effectiveBooleanValue`,
-/// `key!(ctx).atomize()`, the two-hop chain, and the `yield*` generator
-/// shape resolve through the call's return, and a member missing from
-/// that return reports on it.
-#[cfg(test)]
-mod ticket_2461_tests;
-/// The #2458 pins: comment trivia between the last literal element and
-/// the closing `}` is no element — a comment-only leaf segment no longer
-/// flips a context-less all-entry literal to
-/// `ambiguous_set_or_map_literal_both`, while a genuine mix still
-/// reports `_both` with its trailing comment intact.
-#[cfg(test)]
-mod ticket_2458_tests;
-/// The #2453 pins: the num-fallback binary-operator typing over an
-/// invalid/dynamic operand (census F5) — the resolved-left arithmetic
-/// fold refines through the `S <: double?` branch instead of degrading
-/// (`int - <invalid>` answers `double` and the downstream assignability
-/// faces fire), the non-refined operators keep the declared return, and
-/// the compound-assignment face types the augmented read the same way.
-#[cfg(test)]
-mod ticket_2453_tests;
-/// The #2448 pins: the constant-pattern never-match anchor spans the full
-/// constant node — a qualified `case A.a:` row anchors `A.a` whole and an
-/// enum-constant `case E.a:` row anchors the full pattern node (the
-/// upstream `visitConstantPattern` `.at(node)` face), with the literal
-/// forms keeping their token anchors.
-#[cfg(test)]
-mod ticket_2448_tests;
+mod ticket_2450_tests;
 /// The #2451 pins: closure parameters typed through generic iterable chains
 /// (`m.values.map((n) => …)`, an in-package getter's `List<E>` face) bind
 /// from the chain's element — the nullable element fires the
@@ -4801,31 +4741,21 @@ mod ticket_2448_tests;
 /// unchecked row the oracle emits.
 #[cfg(test)]
 mod ticket_2451_tests;
-/// The #2460 pins: the flow-promotion batch A2 — the two faces already
-/// oracle-exact (a `!` narrows the member receiver, a written non-nullable
-/// field reads non-null) ride active, and the four divergent faces
-/// (generator-yield staging, the `e!` assignment stager, the
-/// `staged_write_tys` inference-feed leak, the assert-message
-/// negated-condition state) ride `#[ignore]`d with their semantic fix
-/// sites named — the flow-side promotion facts are pinned green in
-/// `dartq-flow`'s own `ticket_2460_tests`.
+/// The #2453 pins: the num-fallback binary-operator typing over an
+/// invalid/dynamic operand (census F5) — the resolved-left arithmetic
+/// fold refines through the `S <: double?` branch instead of degrading
+/// (`int - <invalid>` answers `double` and the downstream assignability
+/// faces fire), the non-refined operators keep the declared return, and
+/// the compound-assignment face types the augmented read the same way.
 #[cfg(test)]
-mod ticket_2460_tests;
-/// The #2468 pins: the constant-pattern machinery arms for class static
-/// consts — `case A.a:` types the constant from the member's captured
-/// value and reports the never-match row the enum-only tail
-/// classification swallowed, a matching scrutinee stays silent, the enum
-/// form keeps its row, and the `const`-prefixed spelling anchors at the
-/// keyword the ConstantPattern node starts at.
+mod ticket_2453_tests;
+/// The #2458 pins: comment trivia between the last literal element and
+/// the closing `}` is no element — a comment-only leaf segment no longer
+/// flips a context-less all-entry literal to
+/// `ambiguous_set_or_map_literal_both`, while a genuine mix still
+/// reports `_both` with its trailing comment intact.
 #[cfg(test)]
-mod ticket_2468_tests;
-/// The #2450 pins: the invalid-scrutinee switch absorption over the
-/// unknown/invalid read faces (statements and expressions, the constant
-/// head skip) and the invalid-operand is-check promotion, plus the
-/// deleted undefined-tested always-true fold — both oracle arms of an
-/// `x is <undefined>` check stay live behind `type_test_with_undefined_name`.
-#[cfg(test)]
-mod ticket_2450_tests;
+mod ticket_2458_tests;
 /// The #2459 pins: the cascade-resolution leakage family A3 — a cascade
 /// section's RHS member chain resolves through its own receiver instead of
 /// the latched cascade target (`..sourceSpan = token.span` answers `span`
@@ -4836,6 +4766,33 @@ mod ticket_2450_tests;
 /// the bracket against the TARGET's type.
 #[cfg(test)]
 mod ticket_2459_tests;
+/// The #2460 pins: the flow-promotion batch A2 — the two faces already
+/// oracle-exact (a `!` narrows the member receiver, a written non-nullable
+/// field reads non-null) ride active, and the four divergent faces
+/// (generator-yield staging, the `e!` assignment stager, the
+/// `staged_write_tys` inference-feed leak, the assert-message
+/// negated-condition state) ride `#[ignore]`d with their semantic fix
+/// sites named — the flow-side promotion facts are pinned green in
+/// `dartq-flow`'s own `ticket_2460_tests`.
+#[cfg(test)]
+mod ticket_2460_tests;
+/// The #2461 pins: chained member access through implicit-call sends
+/// (census family A4) — a value invocation over a `call`-bearing static
+/// type types the send with the call method's declared return (the
+/// bare-spelling face reads the callee's static type, not the
+/// information-less row type), so `body(ctx).effectiveBooleanValue`,
+/// `key!(ctx).atomize()`, the two-hop chain, and the `yield*` generator
+/// shape resolve through the call's return, and a member missing from
+/// that return reports on it.
+#[cfg(test)]
+mod ticket_2461_tests;
+/// The #2462 pins: the is-check fold over argument-carrying types (census
+/// family A5) — differing written arguments keep the test live with both
+/// arms reachable, the provable same-type and covariant folds stay
+/// constant-true, the type-variable face stays conservative, and the
+/// nullability gate keeps its verdict.
+#[cfg(test)]
+mod ticket_2462_tests;
 /// The #2465 pins: the unused-element scan's extension-member and
 /// part-file shapes — a bare or explicit-`this` self-use inside an
 /// extension body and a member access through a universal
@@ -4846,6 +4803,36 @@ mod ticket_2459_tests;
 /// face the library-wide close merges.
 #[cfg(test)]
 mod ticket_2465_tests;
+/// The #2468 pins: the constant-pattern machinery arms for class static
+/// consts — `case A.a:` types the constant from the member's captured
+/// value and reports the never-match row the enum-only tail
+/// classification swallowed, a matching scrutinee stays silent, the enum
+/// form keeps its row, and the `const`-prefixed spelling anchors at the
+/// keyword the ConstantPattern node starts at.
+#[cfg(test)]
+mod ticket_2468_tests;
+/// The #2472 pins: instance-creation typing from the constructor's return
+/// (census families G4+G9) — an explicit-keyword creation with written
+/// type arguments folds to a receiver typed by the instantiated
+/// constructor return (`const ListEquality<Attr>().equals/hash(...)`
+/// resolves on `ListEquality<Attr>`, oracle-silent at every census site),
+/// a genuine miss on the created type still reports naming the
+/// constructor's type, and the initializing formal's named slot takes the
+/// field's declared type while the neighboring `absoluteFilePath:` slot
+/// keeps enforcing `String`.
+#[cfg(test)]
+mod ticket_2472_tests;
+/// The #2477 pins: the oracle's second-order derivations over undefined
+/// types (census G6+G8) — the undefined-scrutinee switch keeps its
+/// fall-through so `body_might_complete_normally` reports, the
+/// `FutureOr<Undefined> is Future<Undefined>` shape folds constant-true
+/// through the written-argument `Invalid` face, the bare two-argument
+/// dart:core `identical(v, null)` routes through the equality fold and
+/// deads the impossible branch on a non-nullable operand, and the
+/// keep-honest faces (a resolvable enum switch closes, well-typed and
+/// `dynamic` operands stay live) hold.
+#[cfg(test)]
+mod ticket_2477_tests;
 /// The #2478 pins: the const constructor's record initializer fields ride
 /// the potentially-constant gate — a formal-parameter reference of the
 /// enclosing const constructor is potentially constant, so the riverpod
@@ -4859,43 +4846,6 @@ mod ticket_2465_tests;
 /// verifier's shadowing fix in its owning lane).
 #[cfg(test)]
 mod ticket_2478_tests;
-/// The #2477 pins: the oracle's second-order derivations over undefined
-/// types (census G6+G8) — the undefined-scrutinee switch keeps its
-/// fall-through so `body_might_complete_normally` reports, the
-/// `FutureOr<Undefined> is Future<Undefined>` shape folds constant-true
-/// through the written-argument `Invalid` face, the bare two-argument
-/// dart:core `identical(v, null)` routes through the equality fold and
-/// deads the impossible branch on a non-nullable operand, and the
-/// keep-honest faces (a resolvable enum switch closes, well-typed and
-/// `dynamic` operands stay live) hold.
-#[cfg(test)]
-mod ticket_2477_tests;
-/// The #2462 pins: the is-check fold over argument-carrying types (census
-/// family A5) — differing written arguments keep the test live with both
-/// arms reachable, the provable same-type and covariant folds stay
-/// constant-true, the type-variable face stays conservative, and the
-/// nullability gate keeps its verdict.
-#[cfg(test)]
-mod ticket_2462_tests;
-/// The #2485 pins: behavior guards over the member-read credit loop's
-/// clone removal and the numeric shadow-guard's per-head verdict memo —
-/// the unshadowed core-numeric head keeps refining across repeated
-/// sends, a shadowing container declaration keeps the declared return,
-/// and a many-member-read file's extension-use adjudication is
-/// unchanged.
-#[cfg(test)]
-mod ticket_2485_tests;
-/// The #2472 pins: instance-creation typing from the constructor's return
-/// (census families G4+G9) — an explicit-keyword creation with written
-/// type arguments folds to a receiver typed by the instantiated
-/// constructor return (`const ListEquality<Attr>().equals/hash(...)`
-/// resolves on `ListEquality<Attr>`, oracle-silent at every census site),
-/// a genuine miss on the created type still reports naming the
-/// constructor's type, and the initializing formal's named slot takes the
-/// field's declared type while the neighboring `absoluteFilePath:` slot
-/// keeps enforcing `String`.
-#[cfg(test)]
-mod ticket_2472_tests;
 /// The #2484 pins: the listener-family residual batch (#2478/#2480) — the
 /// super/redirect initializer argument lists scan under the const
 /// constructor's `CtorScope` (a formal passed through `: super(f)` is
@@ -4907,6 +4857,14 @@ mod ticket_2472_tests;
 /// literal context alone.
 #[cfg(test)]
 mod ticket_2484_tests;
+/// The #2485 pins: behavior guards over the member-read credit loop's
+/// clone removal and the numeric shadow-guard's per-head verdict memo —
+/// the unshadowed core-numeric head keeps refining across repeated
+/// sends, a shadowing container declaration keeps the declared return,
+/// and a many-member-read file's extension-use adjudication is
+/// unchanged.
+#[cfg(test)]
+mod ticket_2485_tests;
 /// The #2489 pins: `unnecessary_type_check` reads the operand's resolved
 /// face — `FutureOr<UndefinedNav> rv; rv is Future<UndefinedNav>` folds
 /// constant-true through rule 6's legs plus the 0c `InvalidType`
@@ -5020,7 +4978,6 @@ mod ticket_2618_tests;
 #[cfg(test)]
 mod ticket_2687_tests;
 
-
 /// The operand-face pins: the numeric refinement reads an operand the
 /// engine cannot type as a gap that suppresses the fold (an untyped
 /// `static const` field, a declared member without a rendered type), not
@@ -5127,24 +5084,24 @@ mod exhaustive_dynamic_tests;
 #[cfg(test)]
 mod cascade_argument_tests;
 
-/// The engine faces the indexed SDK sources exposed (#2515).
-#[cfg(test)]
-mod sdk_exposure_tests;
-#[cfg(test)]
-mod receiver_face_tests;
-#[cfg(test)]
-mod flow_scope_tests;
-#[cfg(test)]
-mod scope_inference_tests;
 #[cfg(test)]
 mod closure_invalid_chain_tests;
 #[cfg(test)]
+mod extension_nullable_on_param_tests;
+#[cfg(test)]
 mod extension_param_on_type_tests;
 #[cfg(test)]
-mod extension_nullable_on_param_tests;
+mod flow_scope_tests;
+#[cfg(test)]
+mod foreign_alias_invocation_tests;
 #[cfg(test)]
 mod nullable_extension_condition_tests;
 #[cfg(test)]
-mod foreign_alias_invocation_tests;
+mod receiver_face_tests;
+#[cfg(test)]
+mod scope_inference_tests;
+/// The engine faces the indexed SDK sources exposed (#2515).
+#[cfg(test)]
+mod sdk_exposure_tests;
 #[cfg(test)]
 mod ticket_2789_tests;

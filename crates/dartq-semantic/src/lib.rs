@@ -140,8 +140,8 @@
 pub mod analysis;
 pub mod annotation;
 pub mod bounds;
-pub(crate) mod clause_capture;
 pub(crate) mod capture;
+pub(crate) mod clause_capture;
 pub mod codes;
 pub mod collector;
 pub mod const_eval;
@@ -153,8 +153,8 @@ pub mod model;
 pub mod persisted;
 pub mod resolved_ops;
 pub mod signature;
-pub mod ty_fold;
 pub(crate) mod switch_tracker;
+pub mod ty_fold;
 pub mod use_face;
 
 pub use analysis::{Analysis, Binding, BindingKind, CtorBinding, MemberBinding, analyze_unit};

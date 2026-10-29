@@ -903,8 +903,10 @@ impl<'a> Engine<'a> {
         // return (a stray `Function(` the formals never claimed): the
         // enclosing capture treats it as recovery poison; a clean close
         // leaves the outer signature intact.
-        self.fn_nested_unclaimed =
-            capture.in_params && capture.pending_formal.is_none() && capture.positional.is_empty() && capture.named.is_empty();
+        self.fn_nested_unclaimed = capture.in_params
+            && capture.pending_formal.is_none()
+            && capture.positional.is_empty()
+            && capture.named.is_empty();
         self.fn_capture_type(fn_ty, StringId::NONE, 0);
         // A body-position capture (#2359) arms its shape for the
         // annotation/test faces but claims no variable-signature stash: the
@@ -1248,7 +1250,8 @@ impl<'a> Engine<'a> {
             return;
         };
         let head_offset = head.range.offset;
-        self.call_type_args.retain(|(offset, _)| *offset < head_offset);
+        self.call_type_args
+            .retain(|(offset, _)| *offset < head_offset);
         self.call_type_args
             .push((head_offset, capture.members.into_boxed_slice()));
     }

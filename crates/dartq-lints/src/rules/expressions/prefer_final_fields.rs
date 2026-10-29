@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, same_file, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, same_file, slice};
 use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_file_ancestors};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_fields.dart` — a
@@ -39,11 +39,8 @@ use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_f
 /// - The cross-unit half of the official library scan
 ///   (`_fieldsFromParameters` — primary-constructor declaring formals,
 ///   :114-131) is out of the substrate and under-reports.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_final_fields",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("prefer_final_fields", &[NodeKind::CompilationUnit], check,);
 
 /// One candidate: the declaration node, its name, whether the
 /// declaration carries an initializer, and the enclosing class row (the
@@ -161,8 +158,7 @@ fn scan<'a>(
                     // name is the span head; hand-built tables keep the
                     // same head (see
                     // [`crate::rules::initialized_identifier_name`]).
-                    let Some(name_token) = crate::rules::initialized_identifier_name(c, var)
-                    else {
+                    let Some(name_token) = crate::rules::initialized_identifier_name(c, var) else {
                         continue;
                     };
                     let name = c.lexeme(name_token);
@@ -362,14 +358,12 @@ fn scope_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
         // The enclosing member's own parameters: the walk starts at the
         // unit root, so member rows sit on the path — a formal of the
         // same name captures every bare write in the body.
-        NodeKind::Method
-        | NodeKind::Constructor
-        | NodeKind::Factory
-        | NodeKind::TopLevelMethod => c
-            .collect_direct(node)
-            .into_iter()
-            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
-            .is_some_and(|params| parameters_bind(c, params, name)),
+        NodeKind::Method | NodeKind::Constructor | NodeKind::Factory | NodeKind::TopLevelMethod => {
+            c.collect_direct(node)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                .is_some_and(|params| parameters_bind(c, params, name))
+        }
         NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression => {
             function_name_binds(c, node, name)
                 || c.collect_direct(node)
@@ -390,8 +384,7 @@ fn scope_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
         NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
             c.collect_direct(node).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::DeclaredVariablePattern
-                    && c
-                        .field(kid, PayloadField::Variable)
+                    && c.field(kid, PayloadField::Variable)
                         .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
             })
         }
@@ -437,8 +430,7 @@ fn function_name_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
 fn pattern_binds(c: &Check<'_>, pattern: u32, name: &str) -> bool {
     c.children(pattern).any(|descendant| {
         c.kind(descendant) == NodeKind::DeclaredVariablePattern
-            && c
-                .field(descendant, PayloadField::Variable)
+            && c.field(descendant, PayloadField::Variable)
                 .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
     })
 }
@@ -452,8 +444,7 @@ fn parameters_bind(c: &Check<'_>, params: u32, name: &str) -> bool {
     c.collect_direct(params).into_iter().any(|param| {
         c.kind(param) == NodeKind::FormalParameter
             && c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN) == NONE_TOKEN
-            && c
-                .field(param, PayloadField::Name)
+            && c.field(param, PayloadField::Name)
                 .is_some_and(|tok| tok != NONE_TOKEN && c.lexeme(tok) == name)
     })
 }
@@ -526,8 +517,7 @@ fn sets_field(c: &Check<'_>, ctor: u32, name: &str) -> bool {
             let receiver = c.field(id, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
             receiver != NONE_TOKEN
                 && c.lexeme(receiver) == "this"
-                && c
-                    .field(id, PayloadField::Name)
+                && c.field(id, PayloadField::Name)
                     .is_some_and(|name_token| c.lexeme(name_token) == name)
         }
         NodeKind::Initializer => initializer_set_name(c, id) == Some(name),

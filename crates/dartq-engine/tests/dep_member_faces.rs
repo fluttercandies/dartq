@@ -53,8 +53,7 @@ class TokenClass {
 /// The workspace barrel: an export-only library over the dep file — the
 /// analyzer package's `lib/dart/ast/token.dart` shape (`library;` plus the
 /// `show`-filtered re-export).
-const BARREL: &str =
-    "export 'package:dep/src/scanner/token.dart' show Token, TokenClass;\n";
+const BARREL: &str = "export 'package:dep/src/scanner/token.dart' show Token, TokenClass;\n";
 
 /// The direct-import control: the same dep file reached without the barrel
 /// (the tracked dep-interface corpus's shape — the known-good baseline).
@@ -99,7 +98,12 @@ void h(TokenClass c) {
 /// unwritten (the resolution-resolves-but-load-fails shape), `dep_hosted=
 /// false` drops the hosted lock entry (the path-classified shape the lazy
 /// index skips — workspace-source posture).
-fn fixture(tag: &str, with_dep_entry: bool, dep_files: bool, dep_hosted: bool) -> (Engine, PathBuf) {
+fn fixture(
+    tag: &str,
+    with_dep_entry: bool,
+    dep_files: bool,
+    dep_hosted: bool,
+) -> (Engine, PathBuf) {
     let root = std::env::temp_dir().join(format!(
         "dartq-engine-dep-member-faces-{tag}-{}-{}",
         std::process::id(),
@@ -111,7 +115,10 @@ fn fixture(tag: &str, with_dep_entry: bool, dep_files: bool, dep_hosted: bool) -
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, content).expect("file");
     };
-    write("ws/pubspec.yaml", "name: ws\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n");
+    write(
+        "ws/pubspec.yaml",
+        "name: ws\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+    );
     // The hosted `dep` entry: the identity table classifies the package as
     // cache content (not workspace source) — the shape the lazy
     // dependency-interface index keys on (the dep-interface corpus's lock).
@@ -183,12 +190,11 @@ sdks:
         )
         .expect("valid config"),
     );
-    let lock = LockFile::parse(
-        &std::fs::read_to_string(ws.join("pubspec.lock")).expect("lock"),
-    )
-    .expect("valid lock");
-    let pubspec = Pubspec::parse(&std::fs::read_to_string(ws.join("pubspec.yaml")).expect("pubspec"))
-        .expect("pubspec");
+    let lock = LockFile::parse(&std::fs::read_to_string(ws.join("pubspec.lock")).expect("lock"))
+        .expect("valid lock");
+    let pubspec =
+        Pubspec::parse(&std::fs::read_to_string(ws.join("pubspec.yaml")).expect("pubspec"))
+            .expect("pubspec");
     let graph = build_graph(
         &config,
         &lock,
@@ -258,8 +264,7 @@ fn direct_dep_import_member_resolves() {
     let (mut engine, ws) = fixture("direct", true, true, true);
     let diagnostics = analyze_ws(&mut engine, &ws);
     assert!(
-        !codes_for(&diagnostics, &engine, "direct.dart")
-            .contains(&"undefined_getter"),
+        !codes_for(&diagnostics, &engine, "direct.dart").contains(&"undefined_getter"),
         "the direct dep import's member read must resolve: {:?}",
         codes_for(&diagnostics, &engine, "direct.dart")
     );

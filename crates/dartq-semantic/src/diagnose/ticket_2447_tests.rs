@@ -137,10 +137,7 @@ fn parameterized_prefixed_head_joins() {
 fn qualified_argument_leaf_joins() {
     let source = "Map<String, ast.AstNode> m;";
     let (elements, strings) = collect_elements(source);
-    let var_ty = &elements
-        .decl(strings.intern("m"))
-        .expect("declared")
-        .var_ty;
+    let var_ty = &elements.decl(strings.intern("m")).expect("declared").var_ty;
     let (_, _, args) = named_head(var_ty, &strings);
     let pool = elements.type_args().get(args);
     assert_eq!(pool.len(), 2, "{var_ty:?}");
@@ -254,11 +251,13 @@ fn sb_prefixed_formal_argument_stays_silent() {
                        }";
     let rep = report_dual(main_source, lib_source, "ast");
     assert!(
-        !rep
-            .diagnostics
+        !rep.diagnostics
             .iter()
             .any(|d| d.code.name == "argument_type_not_assignable"),
         "{:?}",
-        rep.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        rep.diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }

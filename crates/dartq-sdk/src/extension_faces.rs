@@ -34,9 +34,10 @@
 /// declaration excerpt)`. Each entry's library must be addressable — a name
 /// of the generated [`FLAT_LIBRARIES`] surface, so the consumer's synthetic
 /// `<dart:{library}>` face file pairs with a library the graph build knows.
-pub static EXTENSION_FACE_SOURCES: &[(&str, &str)] = &[(
-    "core",
-    r#"extension EnumName on Enum {
+pub static EXTENSION_FACE_SOURCES: &[(&str, &str)] = &[
+    (
+        "core",
+        r#"extension EnumName on Enum {
   external String get name;
 }
 extension EnumByName<T extends Enum> on Iterable<T> {
@@ -222,9 +223,10 @@ extension IterableExtensions<T> on Iterable<T> {
 // the excerpt's own import sees them through the `dart:collection` export
 // scope.
 "#,
-), (
-    "collection",
-    r#"abstract final class HashMap<K, V> implements Map<K, V> {
+    ),
+    (
+        "collection",
+        r#"abstract final class HashMap<K, V> implements Map<K, V> {
   external factory HashMap();
   external factory HashMap.from(Map other);
   external factory HashMap.of(Map<K, V> other);
@@ -296,7 +298,8 @@ base class UnmodifiableListView<E> implements List<E> {
   external UnmodifiableListView(Iterable<E> source);
 }
 "#,
-)];
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -312,7 +315,9 @@ mod tests {
     fn entries_reference_addressable_libraries() {
         for (library, source) in EXTENSION_FACE_SOURCES {
             assert!(
-                crate::FLAT_LIBRARIES.iter().any(|(name, _)| name == library),
+                crate::FLAT_LIBRARIES
+                    .iter()
+                    .any(|(name, _)| name == library),
                 "extension face library `{library}` is not an addressable dart: library"
             );
             assert!(!source.is_empty(), "extension face `{library}` is empty");
@@ -326,7 +331,10 @@ mod tests {
     fn library_names_are_unique() {
         let mut seen = std::collections::BTreeSet::new();
         for (library, _) in EXTENSION_FACE_SOURCES {
-            assert!(seen.insert(*library), "duplicate extension face `{library}`");
+            assert!(
+                seen.insert(*library),
+                "duplicate extension face `{library}`"
+            );
         }
     }
 

@@ -13,9 +13,9 @@ use std::path::Path;
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_resolution::{Combinators, ImportEdge, LibraryGraphBuilder, Namespaces};
 use dartq_scanner::{ScanConfig, scan};
+use dartq_semantic::MicroKind;
 use dartq_semantic::diagnose::{StrictModes, UnitFold, fold_unit};
 use dartq_semantic::library::ElementIndex;
-use dartq_semantic::MicroKind;
 use dartq_source::{FileTable, StringTable};
 
 const CORE_FACE: &[&str] = &["Object", "bool", "double", "int", "String", "Null"];

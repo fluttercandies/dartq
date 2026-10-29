@@ -203,7 +203,11 @@ fn dartq_analyze_answers_the_cli_document() {
         &request(4, "dartq/analyze", json!({ "target": "lib/main.dart" })),
         1,
     );
-    assert_eq!(answer_result(&h, 4), narrowed, "the relative target resolves");
+    assert_eq!(
+        answer_result(&h, 4),
+        narrowed,
+        "the relative target resolves"
+    );
 
     // A missing target is the CLI's own usage wording.
     h.step(
@@ -254,8 +258,7 @@ fn dartq_analyze_target_narrows_to_the_client_package() {
         "one broken row per package: {files:?} in {whole}"
     );
     assert!(
-        files.contains(&"packages/a/lib/main.dart")
-            && files.contains(&"packages/b/lib/main.dart"),
+        files.contains(&"packages/a/lib/main.dart") && files.contains(&"packages/b/lib/main.dart"),
         "both packages' rows, located against the workspace root: {files:?}"
     );
     assert_eq!(whole["root"], workspace.root.display().to_string());
@@ -326,12 +329,11 @@ fn two_package_workspace() -> Workspace {
     let config = std::sync::Arc::new(
         dartq_pub::PackageConfig::parse(&config.to_string()).expect("config parses"),
     );
-    let lock =
-        dartq_pub::LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n").expect("lock");
-    let pubspec = dartq_pub::Pubspec::parse(
-        &fs::read_to_string(root.join("pubspec.yaml")).expect("pubspec"),
-    )
-    .expect("pubspec parses");
+    let lock = dartq_pub::LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+        .expect("lock");
+    let pubspec =
+        dartq_pub::Pubspec::parse(&fs::read_to_string(root.join("pubspec.yaml")).expect("pubspec"))
+            .expect("pubspec parses");
     let graph = dartq_pub::build_graph(
         &config,
         &lock,
@@ -733,10 +735,7 @@ fn dartq_impact_matches_the_cli_report() {
         .collect();
     assert_eq!(
         symbols,
-        vec![
-            "lib/a.dart|Foo".to_string(),
-            "lib/a.dart|foo".to_string()
-        ],
+        vec!["lib/a.dart|Foo".to_string(), "lib/a.dart|foo".to_string()],
         "every face name, ASCII-sorted (the locator's located labels)"
     );
 
@@ -874,7 +873,11 @@ fn dartq_impact_environments_match_the_cli_face() {
     let mut h = spawn(&workspace, &store_root("rpc-impact-envs"));
 
     h.step(
-        &request(2, "dartq/impact", json!({ "path": main.display().to_string() })),
+        &request(
+            2,
+            "dartq/impact",
+            json!({ "path": main.display().to_string() }),
+        ),
         1,
     );
     let result = answer_result(&h, 2);
@@ -896,9 +899,15 @@ fn dartq_impact_environments_match_the_cli_face() {
     );
 
     // The relative path rides the read faces' resolution rule.
-    h.step(&request(3, "dartq/impact", json!({ "path": "lib/main.dart" })), 1);
+    h.step(
+        &request(3, "dartq/impact", json!({ "path": "lib/main.dart" })),
+        1,
+    );
     let relative = answer_result(&h, 3);
-    assert_eq!(relative["envs"], result["envs"], "the relative path resolves");
+    assert_eq!(
+        relative["envs"], result["envs"],
+        "the relative path resolves"
+    );
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -1001,10 +1010,7 @@ fn dartq_explain_answers_the_report() {
             { "path": "test/dog_test.dart" },
         ])
     );
-    assert_eq!(
-        result["tests"],
-        json!([{ "path": "test/dog_test.dart" }])
-    );
+    assert_eq!(result["tests"], json!([{ "path": "test/dog_test.dart" }]));
 
     // Delta mode: nothing was written through this session, so the
     // use/import/test rows all filter out while the declaration-site
@@ -1193,12 +1199,14 @@ fn dartq_compat_matches_the_cli_matrix() {
         "experiment_not_enabled_off_by_default"
     );
     assert_eq!(
-        matrix[0]["first_failure"]["file"],
-        "lib/a.dart",
+        matrix[0]["first_failure"]["file"], "lib/a.dart",
         "the failure file is the locator's root-relative spelling, matching the CLI matrix"
     );
     assert_eq!(matrix[0]["first_failure"]["line"], 1);
-    assert_eq!(matrix[0]["first_failure"]["col"], 11, "the `in` modifier span");
+    assert_eq!(
+        matrix[0]["first_failure"]["col"], 11,
+        "the `in` modifier span"
+    );
     assert_eq!(matrix[1]["sdk"], "3.13.1");
     assert_eq!(matrix[1]["compatible"], true);
     assert!(matrix[1].get("first_failure").is_none());
@@ -1534,7 +1542,11 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     );
     let result = answer_result(&h, 3);
     let files = result["files"].as_array().expect("files array");
-    assert_eq!(files.len(), 1, "the line comments address the hit file: {result}");
+    assert_eq!(
+        files.len(),
+        1,
+        "the line comments address the hit file: {result}"
+    );
     assert_eq!(files[0]["file"], fixable.display().to_string());
     let edits = files[0]["edits"].as_array().expect("edits array");
     assert_eq!(edits.len(), 2, "one line-comment offer per code");
@@ -1797,12 +1809,10 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
         "the built-in lint rows lead: {edits:?}"
     );
     assert!(
-        sources[..sources.len() - 1]
-            .iter()
-            .all(|source| matches!(
-                *source,
-                "builtin-lint" | "builtin-semantic" | "builtin-ignore"
-            )),
+        sources[..sources.len() - 1].iter().all(|source| matches!(
+            *source,
+            "builtin-lint" | "builtin-semantic" | "builtin-ignore"
+        )),
         "the built-in provenance spellings (the SDK face rides the daemon's fix pass): {sources:?}"
     );
     assert_eq!(
@@ -1943,26 +1953,18 @@ fn dartq_family_answers_one_to_one_over_the_fixture() {
         let result = answer_result(&h, id);
         // Every face stamps the compact vocabulary's `v`, except the
         // compat face's frozen `schema_version`.
-        let stamp = if result.get("v").is_some() { &result["v"] } else { &result["schema_version"] };
-        assert_eq!(
-            stamp, schema,
-            "{method} is schema-stamped: {result}"
-        );
+        let stamp = if result.get("v").is_some() {
+            &result["v"]
+        } else {
+            &result["schema_version"]
+        };
+        assert_eq!(stamp, schema, "{method} is schema-stamped: {result}");
     }
     // Each face answers its own shape, not a shared envelope.
     assert!(answer_result(&h, 2).get("files").is_some(), "index tallies");
-    assert!(
-        answer_result(&h, 3).get("diags").is_some(),
-        "check rows"
-    );
-    assert!(
-        answer_result(&h, 5).get("decls").is_some(),
-        "query rows"
-    );
-    assert!(
-        answer_result(&h, 6).get("sym").is_some(),
-        "impact report"
-    );
+    assert!(answer_result(&h, 3).get("diags").is_some(), "check rows");
+    assert!(answer_result(&h, 5).get("decls").is_some(), "query rows");
+    assert!(answer_result(&h, 6).get("sym").is_some(), "impact report");
     assert!(
         answer_result(&h, 7).get("declaration").is_some(),
         "explain report"

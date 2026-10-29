@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, for_in_binds, parameters_bind, statement_binds};
+use super::{
+    Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT,
+    for_in_binds, parameters_bind, statement_binds,
+};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_parameters.dart` —
 /// a parameter that is neither `final`/`const` nor reassigned in its
@@ -61,14 +64,11 @@ fn check(c: &mut Check<'_>) {
     };
     for param in parameter_rows(c, params) {
         // `isFinal || isConst` (:65-66) — `var` does not skip.
-        if storage_keyword(c, param).is_some_and(|kw| matches!(c.lexeme(kw), "final" | "const"))
-        {
+        if storage_keyword(c, param).is_some_and(|kw| matches!(c.lexeme(kw), "final" | "const")) {
             continue;
         }
         // A field/super formal is final without the modifier (:67-70).
-        let receiver = c
-            .field(param, PayloadField::Receiver)
-            .unwrap_or(NONE_TOKEN);
+        let receiver = c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN);
         if receiver != NONE_TOKEN {
             continue;
         }
@@ -284,9 +284,9 @@ fn mutates(c: &Check<'_>, node: u32, name: &str) -> bool {
                 .into_iter()
                 .find(|&kid| c.kind(kid) == NodeKind::ForParts);
             let head_shadowed = parts.is_some_and(|parts| binds_parts(c, parts, name));
-            c.collect_direct(node).into_iter().any(|kid| {
-                Some(kid) != parts.filter(|_| head_shadowed) && mutates(c, kid, name)
-            })
+            c.collect_direct(node)
+                .into_iter()
+                .any(|kid| Some(kid) != parts.filter(|_| head_shadowed) && mutates(c, kid, name))
         }
         NodeKind::ForIn | NodeKind::ForControlFlow => {
             !for_in_binds(c, node, name)

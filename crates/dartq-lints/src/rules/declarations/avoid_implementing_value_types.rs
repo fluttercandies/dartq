@@ -1,5 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, operator_name};
-use crate::rules::{SupertypeClause, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span};
+use super::{Check, NodeKind, PayloadField, RuleSpec, container_members, operator_name};
+use crate::rules::{
+    SupertypeClause, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span,
+};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_implementing_value_types.dart:36-60`
 /// — a class (:32, `addClassDeclaration`) whose `implements` clause
@@ -33,9 +35,7 @@ fn check(c: &mut Check<'_>) {
     let type_rows: Vec<u32> = c
         .collect_direct(node)
         .into_iter()
-        .take_while(|&kid| {
-            !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
-        })
+        .take_while(|&kid| !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody))
         .filter(|&kid| c.kind(kid) == NodeKind::Type)
         .collect();
     for ((name, clause), &type_row) in names.iter().zip(&type_rows) {

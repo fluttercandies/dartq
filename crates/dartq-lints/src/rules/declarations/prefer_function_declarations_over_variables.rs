@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::last_child;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_function_declarations_over_variables.dart:40-58`
@@ -50,9 +50,9 @@ fn check(c: &mut Check<'_>) {
     if c.kind(declaration) != NodeKind::VariablesDeclaration {
         return;
     }
-    let is_member = c.ancestor(2).is_some_and(|owner| {
-        matches!(c.kind(owner), NodeKind::Fields | NodeKind::TopLevelFields)
-    });
+    let is_member = c
+        .ancestor(2)
+        .is_some_and(|owner| matches!(c.kind(owner), NodeKind::Fields | NodeKind::TopLevelFields));
     if is_member {
         // The storage keyword: production parses store only `late` in
         // the payload word, so the shared head/payload/backward-walk
@@ -240,7 +240,6 @@ fn pattern_writes_name(c: &Check<'_>, node: u32, name: &str) -> bool {
         .into_iter()
         .filter(|&row| c.byte_span(row).end <= eq_start)
         .any(|row| {
-            c.kind(row) == NodeKind::AssignedVariablePattern
-                && c.lexeme(c.head_token(row)) == name
+            c.kind(row) == NodeKind::AssignedVariablePattern && c.lexeme(c.head_token(row)) == name
         })
 }

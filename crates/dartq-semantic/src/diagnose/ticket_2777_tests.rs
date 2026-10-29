@@ -19,8 +19,7 @@ use crate::model::MicroKind;
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{
-    ClassModifiers, Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder,
-    Namespaces,
+    ClassModifiers, Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces,
 };
 use dartq_scanner::{ScanConfig, ScanResult};
 use dartq_source::{FileId, FileTable, StringTable};
@@ -78,9 +77,7 @@ fn rendered(source: &str, report: &FileReport) -> Vec<String> {
             };
             format!(
                 "{severity}|{}|{line}:{col}|{}|{}",
-                d.code.name,
-                d.range.length,
-                d.message
+                d.code.name, d.range.length, d.message
             )
         })
         .collect()
@@ -160,7 +157,10 @@ fn diagnose(
             if decl.kind == MicroKind::TypeParam {
                 continue;
             }
-            if matches!(decl.kind, MicroKind::Class | MicroKind::Enum | MicroKind::Mixin) {
+            if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+            ) {
                 builder.declare_class(unit_lib, name, unit_file, ClassModifiers::default());
             } else {
                 builder.declare(unit_lib, name, unit_file);

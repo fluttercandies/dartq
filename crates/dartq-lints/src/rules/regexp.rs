@@ -55,10 +55,10 @@ pub(crate) mod valid_regexps {
     /// plain string literal, must parse as a regex under the `unicode:`
     /// flag's value. Message: `diagnostic.g.dart` `validRegexps`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "valid_regexps",
-    &[NodeKind::Send, NodeKind::NewExpression],
-    check,
-);
+        "valid_regexps",
+        &[NodeKind::Send, NodeKind::NewExpression],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();

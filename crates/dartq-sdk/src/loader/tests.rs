@@ -254,7 +254,10 @@ embedded_server_libraries:
     // `dart.library.<name>` true and imports directly, the `_`-forced-off
     // rule of libraries.json parsing does not apply.
     assert!(libraries["_http"].support_conditional_import);
-    assert_eq!(libraries["_http"].support_direct_import, Importability::Always);
+    assert_eq!(
+        libraries["_http"].support_direct_import,
+        Importability::Always
+    );
     assert!(libraries["core"].patches.is_empty());
 }
 
@@ -263,7 +266,10 @@ fn embedder_yaml_rejects_unusable_shapes() {
     for (yaml, needle) in [
         ("embedded_libs: [not, a, map]\n", "embedded_libs"),
         ("- just\n- a\n- list\n", "embedder yaml"),
-        ("embedded_libs:\n  \"dart:x\": [\"not\", \"a\", \"path\"]\n", "string"),
+        (
+            "embedded_libs:\n  \"dart:x\": [\"not\", \"a\", \"path\"]\n",
+            "string",
+        ),
         ("embedded_libs: {}\n", "maps no `dart:`"),
         (
             "embedded_libs:\n  \"only:other\": \"x.dart\"\n",

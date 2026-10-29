@@ -154,7 +154,10 @@ impl Draft {
 /// inline markup from the remainder, and resolves each marker's target
 /// line against the stripped text.
 fn build_block(path: &str, lines: &[(usize, String)]) -> Result<FileBlock, ParseError> {
-    let err = |line: usize, reason: String| ParseError { line, reason: format!("{path}: {reason}") };
+    let err = |line: usize, reason: String| ParseError {
+        line,
+        reason: format!("{path}: {reason}"),
+    };
     // Partition by original line position: marker lines come out, the
     // rest is the inline-marked body (`filtered` maps an original
     // position to its place in the body).
@@ -402,7 +405,10 @@ pub fn parse(text: &str) -> Result<FixtureDoc, ParseError> {
         reason: "no `//- lint:` header before the first case".into(),
     })?;
     if cases.is_empty() {
-        return Err(ParseError { line: 1, reason: "no cases".into() });
+        return Err(ParseError {
+            line: 1,
+            reason: "no cases".into(),
+        });
     }
     Ok(FixtureDoc { lint, cases })
 }
@@ -502,8 +508,18 @@ mod tests {
         let analyzed = doc.cases[0].analyzed("avoid_empty_else").expect("analyzed");
         assert_eq!(analyzed.expectations.len(), 1);
         assert_eq!(analyzed.expectations[0].code, "avoid_empty_else");
-        assert_eq!(analyzed.expectations[0].range, 25..26, "the `;` after `else`");
-        assert!(doc.cases[1].analyzed("avoid_empty_else").expect("analyzed").expectations.is_empty());
+        assert_eq!(
+            analyzed.expectations[0].range,
+            25..26,
+            "the `;` after `else`"
+        );
+        assert!(
+            doc.cases[1]
+                .analyzed("avoid_empty_else")
+                .expect("analyzed")
+                .expectations
+                .is_empty()
+        );
     }
 
     /// Case-level lint override and a supporting file block.
@@ -520,8 +536,8 @@ mod tests {
         .expect("parses");
         assert_eq!(doc.cases[0].files.len(), 2);
         assert_eq!(doc.cases[0].files[1].path, "/lib/part.dart");
-        let doc =
-            parse("//- lint: a\n//- case: overridden\n//- lint: b\nint x = [!1!];\n").expect("parses");
+        let doc = parse("//- lint: a\n//- case: overridden\n//- lint: b\nint x = [!1!];\n")
+            .expect("parses");
         assert_eq!(doc.cases[0].lint("a"), "b");
         assert_eq!(
             doc.cases[0].analyzed("a").expect("analyzed").expectations[0].code,
@@ -535,7 +551,9 @@ mod tests {
     fn grammar_failures_carry_lines() {
         assert_eq!(parse("//- lint: a\n//- lint: b\n").unwrap_err().line, 2);
         assert_eq!(
-            parse("//- lint: a\n//- nope: x\n//- case: c\nx;\n").unwrap_err().line,
+            parse("//- lint: a\n//- nope: x\n//- case: c\nx;\n")
+                .unwrap_err()
+                .line,
             2
         );
         assert!(parse("//- lint: a\n//- case: c\n").is_err(), "empty case");
@@ -559,12 +577,27 @@ mod tests {
         ))
         .expect("parses");
         let analyzed = doc.cases[0].analyzed("a").expect("analyzed");
-        assert_eq!(analyzed.code, "int xy = 1;\n// ordinary comment without carets\n");
-        assert_eq!(analyzed.expectations.len(), 2, "{:?}", analyzed.expectations);
+        assert_eq!(
+            analyzed.code,
+            "int xy = 1;\n// ordinary comment without carets\n"
+        );
+        assert_eq!(
+            analyzed.expectations.len(),
+            2,
+            "{:?}",
+            analyzed.expectations
+        );
         assert_eq!(analyzed.expectations[0].code, "some_rule");
-        assert_eq!(analyzed.expectations[0].range, 4..6, "the `^^` sits under `xy`");
+        assert_eq!(
+            analyzed.expectations[0].range,
+            4..6,
+            "the `^^` sits under `xy`"
+        );
         assert_eq!(analyzed.expectations[1].code, "some_other");
-        assert_eq!(analyzed.expectations[1].message.as_deref(), Some("watch out"));
+        assert_eq!(
+            analyzed.expectations[1].message.as_deref(),
+            Some("watch out")
+        );
         assert_eq!(
             analyzed.expectations[1].range,
             5..6,

@@ -117,8 +117,7 @@ pub fn index_export_schema() -> &'static Value {
 
 /// The stored relation spellings: the capture's five `RefKind`s — no
 /// `override` (a query-face widening, never a stored row kind).
-pub const EXPORT_REF_KINDS: &[&str] =
-    &["reference", "read", "invoked", "written", "read-written"];
+pub const EXPORT_REF_KINDS: &[&str] = &["reference", "read", "invoked", "written", "read-written"];
 
 /// The supertype clause spellings, `SuperClause` declaration order.
 pub const SUPER_CLAUSES: &[&str] = &["extends", "with", "on", "implements"];
@@ -192,8 +191,7 @@ const HEADER: &[&str] = &["v", "documents", "declarations"];
 const HEADER_FULL: &[&str] = &["occurrences", "supertypes"];
 
 const DOCUMENT: &[&str] = &["v", "path", "symbol_count"];
-const DOCUMENT_OPTIONAL: &[&str] =
-    &["symbols", "declarations", "occurrences", "supertypes"];
+const DOCUMENT_OPTIONAL: &[&str] = &["symbols", "declarations", "occurrences", "supertypes"];
 const DECLARATION: &[&str] = &["symbol", "kind", "name", "range"];
 const DECLARATION_OPTIONAL: &[&str] = &["container"];
 const OCCURRENCE: &[&str] = &["symbol", "kind", "range"];
@@ -277,7 +275,11 @@ fn validate_document(root: &serde_json::Map<String, Value>) -> Result<(), Schema
             let obj = object(row, &p)?;
             exact_fields(obj, SUPERTYPE, &[], &p)?;
             string(field(obj, "symbol", &p)?, &join(&p, "symbol"))?;
-            enum_spelling(field(obj, "clause", &p)?, &join(&p, "clause"), SUPER_CLAUSES)?;
+            enum_spelling(
+                field(obj, "clause", &p)?,
+                &join(&p, "clause"),
+                SUPER_CLAUSES,
+            )?;
             string(field(obj, "supertype", &p)?, &join(&p, "supertype"))?;
         }
     }
@@ -354,10 +356,7 @@ mod tests {
         occ_fields.sort_unstable();
         assert_eq!(schema_keys(occs), occ_fields);
         let supers = &schema["properties"]["supertypes"]["items"];
-        assert_eq!(
-            schema_keys(supers),
-            crate::support::const_names(SUPERTYPE)
-        );
+        assert_eq!(schema_keys(supers), crate::support::const_names(SUPERTYPE));
     }
 
     /// Both line shapes validate: the header (minimal/compact counts and

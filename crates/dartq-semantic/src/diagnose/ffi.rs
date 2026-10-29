@@ -112,9 +112,8 @@ impl<'a> Engine<'a> {
         }
         if text.ends_with("List")
             && (text.strip_suffix("List").unwrap_or_default().is_empty()
-                || FIXED_SIZE_INTEGER_TYPES.contains(
-                    &text.strip_suffix("List").unwrap_or_default(),
-                )
+                || FIXED_SIZE_INTEGER_TYPES
+                    .contains(&text.strip_suffix("List").unwrap_or_default())
                 || matches!(text, "Float32List" | "Float64List"))
         {
             return true;
@@ -186,10 +185,7 @@ impl<'a> Engine<'a> {
     /// `Struct`/`Union`/`AbiSpecificInteger`/`NativeCallable`. Depth- and
     /// visit-capped (the termination invariant — a cyclic recovery chain
     /// stops, never loops).
-    fn chain_reaches_ffi(
-        &self,
-        start: &[(StringId, &'a Container, FileId)],
-    ) -> bool {
+    fn chain_reaches_ffi(&self, start: &[(StringId, &'a Container, FileId)]) -> bool {
         let mut visited: FxHashSet<StringId> = FxHashSet::default();
         let mut work: Vec<(StringId, &'a Container, FileId)> = start.to_vec();
         while let Some((name, container, owner)) = work.pop() {
@@ -209,9 +205,7 @@ impl<'a> Engine<'a> {
             if visited.contains(&super_name) {
                 continue;
             }
-            if let Some((super_container, super_owner)) =
-                self.resolve_container_from(super_name)
-            {
+            if let Some((super_container, super_owner)) = self.resolve_container_from(super_name) {
                 work.push((super_name, super_container, super_owner));
             }
         }
@@ -408,8 +402,7 @@ impl<'a> Engine<'a> {
                 let Some(open) = args_text.find('{') else {
                     return (face, Some(args_span));
                 };
-                let Some(brace_close) =
-                    matching_close(args_text.as_bytes(), open, b'{', b'}')
+                let Some(brace_close) = matching_close(args_text.as_bytes(), open, b'{', b'}')
                 else {
                     return (face, Some(args_span));
                 };
@@ -429,8 +422,7 @@ impl<'a> Engine<'a> {
                         value[head_start..head_end].to_owned(),
                         SourceRange {
                             offset: utf16(cursor + vstart),
-                            length: utf16(cursor + vstart + value.len())
-                                - utf16(cursor + vstart),
+                            length: utf16(cursor + vstart + value.len()) - utf16(cursor + vstart),
                         },
                     ));
                 }
@@ -551,7 +543,10 @@ fn function_param_heads(text: &str) -> Vec<String> {
             b'>' => depth -= 1,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' if depth == 0 => {
                 let mut end = i + 1;
-                while bytes.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+                while bytes
+                    .get(end)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                {
                     end += 1;
                 }
                 if &text[i..end] == "Function" {
@@ -718,14 +713,38 @@ fn parse_array_dims(
 /// The keyword set whose presence before a field name means no written
 /// type annotation (`external var str;`).
 const NO_TYPE_KEYWORDS: &[&str] = &[
-    "var", "final", "const", "external", "static", "late", "covariant", "abstract",
+    "var",
+    "final",
+    "const",
+    "external",
+    "static",
+    "late",
+    "covariant",
+    "abstract",
 ];
 
 /// The native integer classes the field/annotation classifier maps onto
 /// the Dart `int` face (upstream `_primitiveIntegerNativeTypes`).
 const NATIVE_INT_TYPES: &[&str] = &[
-    "Int8", "Int16", "Int32", "Int64", "Uint8", "Uint16", "Uint32", "Uint64", "IntPtr", "Int",
-    "Uint", "Long", "LongLong", "ULong", "ULongLong", "Short", "SignedChar", "Char", "Size",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Uint8",
+    "Uint16",
+    "Uint32",
+    "Uint64",
+    "IntPtr",
+    "Int",
+    "Uint",
+    "Long",
+    "LongLong",
+    "ULong",
+    "ULongLong",
+    "Short",
+    "SignedChar",
+    "Char",
+    "Size",
 ];
 
 impl<'a> Engine<'a> {
@@ -784,7 +803,11 @@ impl<'a> Engine<'a> {
         let name_start = self.byte_of(name16);
         let bytes = self.source.as_bytes();
         let mut cursor = name_start;
-        while cursor > 0 && bytes.get(cursor - 1).is_some_and(|b| b.is_ascii_whitespace()) {
+        while cursor > 0
+            && bytes
+                .get(cursor - 1)
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
             cursor -= 1;
         }
         if cursor == 0 {
@@ -812,7 +835,10 @@ impl<'a> Engine<'a> {
                 return None;
             }
             let mut head_end = open;
-            while head_end > 0 && bytes.get(head_end - 1).is_some_and(|b| b.is_ascii_whitespace())
+            while head_end > 0
+                && bytes
+                    .get(head_end - 1)
+                    .is_some_and(|b| b.is_ascii_whitespace())
             {
                 head_end -= 1;
             }
@@ -880,10 +906,11 @@ impl<'a> Engine<'a> {
         let close = matching_close(text.as_bytes(), open, b'<', b'>')?;
         let (rel, len) = first_top_level_arg(&text[open + 1..close])?;
         let lead = text[open + 1 + rel..open + 1 + rel + len].len()
-            - text[open + 1 + rel..open + 1 + rel + len].trim_start().len();
+            - text[open + 1 + rel..open + 1 + rel + len]
+                .trim_start()
+                .len();
         let arg_start = start + open + 1 + rel + lead;
-        let arg_end = arg_start
-            + text[open + 1 + rel..open + 1 + rel + len].trim().len();
+        let arg_end = arg_start + text[open + 1 + rel..open + 1 + rel + len].trim().len();
         Some(SourceRange {
             offset: byte_offset_to_utf16(self.source, arg_start),
             length: byte_offset_to_utf16(self.source, arg_end)
@@ -950,7 +977,9 @@ impl<'a> Engine<'a> {
                 .is_some_and(|(_, owner)| self.owner_is_ffi(owner));
         }
         self.resolve_container_from(super_name)
-            .is_some_and(|(super_container, _)| self.ffi_extends_native_field_wrapper(super_container))
+            .is_some_and(|(super_container, _)| {
+                self.ffi_extends_native_field_wrapper(super_container)
+            })
     }
 }
 
@@ -979,12 +1008,7 @@ impl<'a> Engine<'a> {
         let in_compound = matches!(direct, "Struct" | "Union");
         if in_compound {
             if self.ffi_is_empty_compound(container) {
-                self.emit(
-                    SemanticCode::EmptyStruct,
-                    name_span,
-                    &name_text,
-                    direct,
-                );
+                self.emit(SemanticCode::EmptyStruct, name_span, &name_text, direct);
             }
             // Only `Struct` subclasses read the packed faces (upstream).
             if direct == "Struct" {
@@ -1215,7 +1239,9 @@ impl<'a> Engine<'a> {
             return;
         };
         for (index, site) in &sites {
-            let Some(member) = elements.container(name).and_then(|c| c.members.get(&site.name))
+            let Some(member) = elements
+                .container(name)
+                .and_then(|c| c.members.get(&site.name))
             else {
                 continue;
             };
@@ -1242,12 +1268,7 @@ impl<'a> Engine<'a> {
         superclass_text: &str,
     ) {
         if !member.is_external {
-            self.emit(
-                SemanticCode::FieldMustBeExternalInStruct,
-                name_span,
-                "",
-                "",
-            );
+            self.emit(SemanticCode::FieldMustBeExternalInStruct, name_span, "", "");
         }
         let Some(type_span) = self.ffi_type_span_before(name_span.offset) else {
             self.emit(SemanticCode::MissingFieldTypeInStruct, name_span, "", "");
@@ -1260,12 +1281,7 @@ impl<'a> Engine<'a> {
             args,
         } = member.var_ty
         else {
-            self.emit(
-                SemanticCode::MissingFieldTypeInStruct,
-                name_span,
-                "",
-                "",
-            );
+            self.emit(SemanticCode::MissingFieldTypeInStruct, name_span, "", "");
             return;
         };
         if nullable {
@@ -1348,9 +1364,9 @@ impl<'a> Engine<'a> {
                 }
                 // Variable-length arrays must be the compound's last
                 // external instance field.
-                let allow_variable =
-                    self.ffi_last_external_field(container, sites)
-                        .is_some_and(|offset| offset == name_span.offset);
+                let allow_variable = self
+                    .ffi_last_external_field(container, sites)
+                    .is_some_and(|offset| offset == name_span.offset);
                 self.ffi_validate_size_annotation(
                     site_index,
                     array_dimensions,
@@ -1361,8 +1377,7 @@ impl<'a> Engine<'a> {
             _ => {
                 if self.clause_entry_is_compound(head) {
                     if let Some((compound, _)) = self.ffi_compound_head(member.var_ty)
-                        && let Some((compound_container, _)) =
-                            self.resolve_container_from(compound)
+                        && let Some((compound_container, _)) = self.resolve_container_from(compound)
                         && self.ffi_is_empty_compound(compound_container)
                     {
                         let compound_text = self.strings.resolve(compound).to_owned();
@@ -1506,20 +1521,12 @@ impl<'a> Engine<'a> {
             .iter()
             .filter(|anno| {
                 self.strings.resolve(anno.name).rsplit('.').next() == Some("Array")
-                    || self
-                        .strings
-                        .resolve(anno.name)
-                        .starts_with("Array.")
+                    || self.strings.resolve(anno.name).starts_with("Array.")
             })
             .cloned()
             .collect();
         if array_annos.is_empty() {
-            self.emit(
-                SemanticCode::MissingSizeAnnotationCarray,
-                type_span,
-                "",
-                "",
-            );
+            self.emit(SemanticCode::MissingSizeAnnotationCarray, type_span, "", "");
             return;
         }
         for extra in array_annos.iter().skip(1) {
@@ -1555,7 +1562,10 @@ impl<'a> Engine<'a> {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
             .collect::<String>();
         if NATIVE_INT_TYPES.contains(&head.as_str())
-            || matches!(head.as_str(), "Float" | "Double" | "Bool" | "Pointer" | "Array")
+            || matches!(
+                head.as_str(),
+                "Float" | "Double" | "Bool" | "Pointer" | "Array"
+            )
         {
             return true;
         }
@@ -1588,11 +1598,8 @@ impl<'a> Engine<'a> {
             .map(|(index, site)| (index, site.clone()))
             .collect();
         for (index, site) in sites.iter() {
-            let native_annos: Vec<FfiDeclAnno> = self
-                .ffi_native_annos(*index)
-                .into_iter()
-                .cloned()
-                .collect();
+            let native_annos: Vec<FfiDeclAnno> =
+                self.ffi_native_annos(*index).into_iter().cloned().collect();
             if native_annos.is_empty() {
                 continue;
             }
@@ -1626,7 +1633,10 @@ impl<'a> Engine<'a> {
         }
         let instance_member = matches!(
             &site.kind,
-            DeclKind::Member { is_static: false, .. }
+            DeclKind::Member {
+                is_static: false,
+                ..
+            }
         );
         let (var_ty, return_ty, formals) = self.ffi_decl_types(site);
         let Some(sig) = anno.face.sig.as_ref() else {
@@ -1635,16 +1645,14 @@ impl<'a> Engine<'a> {
             if instance_member {
                 return;
             }
-            let is_executable = matches!(
-                site.kind,
-                DeclKind::TopLevelFn
-            ) || matches!(
-                &site.kind,
-                DeclKind::Member {
-                    kind: MemberKind::Method | MemberKind::Getter | MemberKind::Setter,
-                    ..
-                }
-            );
+            let is_executable = matches!(site.kind, DeclKind::TopLevelFn)
+                || matches!(
+                    &site.kind,
+                    DeclKind::Member {
+                        kind: MemberKind::Method | MemberKind::Getter | MemberKind::Setter,
+                        ..
+                    }
+                );
             if is_executable {
                 let inferred_ret = if matches!(return_ty, Ty::Void) {
                     self.intern("Void")
@@ -1716,10 +1724,7 @@ impl<'a> Engine<'a> {
 
     /// The declared faces of a `@Native` site: the variable type (fields),
     /// the return type (executables), and the formal table.
-    fn ffi_decl_types(
-        &self,
-        site: &DeclSite,
-    ) -> (Ty, Ty, Option<&'a Box<Formals>>) {
+    fn ffi_decl_types(&self, site: &DeclSite) -> (Ty, Ty, Option<&'a Box<Formals>>) {
         let Some(elements) = self.index.get(self.file) else {
             return (Ty::UNKNOWN, Ty::UNKNOWN, None);
         };
@@ -1881,7 +1886,10 @@ impl<'a> Engine<'a> {
         if instance_field {
             self.emit(SemanticCode::NativeFieldNotStatic, site.range, "", "");
         }
-        let Ty::Named { name: dart_head, .. } = var_ty else {
+        let Ty::Named {
+            name: dart_head, ..
+        } = var_ty
+        else {
             return;
         };
         let Some(native_ty) = native_ty else {
@@ -2085,8 +2093,8 @@ impl<'a> Engine<'a> {
             }
         }
         let native_ret_text = self.strings.resolve(ret_head).to_owned();
-        let void_like = matches!(native_ret_text.as_str(), "Void")
-            || self.ffi_valid_pointer_like(ret_head);
+        let void_like =
+            matches!(native_ret_text.as_str(), "Void") || self.ffi_valid_pointer_like(ret_head);
         if void_like {
             if invocation.args.len() == 2 {
                 self.emit(
@@ -2099,7 +2107,12 @@ impl<'a> Engine<'a> {
             return;
         }
         if invocation.args.len() == 1 {
-            self.emit(SemanticCode::MissingExceptionValue, invocation.head, callee, "");
+            self.emit(
+                SemanticCode::MissingExceptionValue,
+                invocation.head,
+                callee,
+                "",
+            );
             return;
         }
         let exceptional = &invocation.args[1].1;
@@ -2265,12 +2278,7 @@ impl<'a> Engine<'a> {
         if let Some(written) = self.ffi_type_arg(invocation)
             && let Some((dart_ret, dart_params)) = self.ffi_type_arg_shape(&written)
         {
-            if !self.ffi_compatible_functions(
-                &dart_ret,
-                &dart_params,
-                &sig_ret,
-                &sig_params,
-            ) {
+            if !self.ffi_compatible_functions(&dart_ret, &dart_params, &sig_ret, &sig_params) {
                 let dart_display = self.ffi_render_function(&dart_ret, &dart_params);
                 let native_display = self.ffi_render_function(&sig_ret, &sig_params);
                 let written = written.display.to_string();
@@ -2340,7 +2348,12 @@ impl<'a> Engine<'a> {
         };
         if !self.ffi_valid_native_type(head, false, false) {
             let name = format!("{}.create", self.strings.resolve(recv));
-            self.emit(SemanticCode::NonConstantTypeArgument, invocation.whole, &name, "");
+            self.emit(
+                SemanticCode::NonConstantTypeArgument,
+                invocation.whole,
+                &name,
+                "",
+            );
         }
     }
 
@@ -2405,12 +2418,7 @@ impl<'a> Engine<'a> {
             .iter()
             .any(|site| site.name == target && site.annotations.contains(&self.intern("Native")));
         if !annotated {
-            self.emit(
-                SemanticCode::ArgumentMustBeNative,
-                shape.range,
-                "",
-                "",
-            );
+            self.emit(SemanticCode::ArgumentMustBeNative, shape.range, "", "");
         }
     }
 
@@ -2470,11 +2478,7 @@ impl<'a> Engine<'a> {
     /// `_validateAddressPosition` + `_validateAddressReceiver`: the read
     /// must sit in a leaf-native argument list, and its receiver must be
     /// a legal shape.
-    fn ffi_check_address_read(
-        &mut self,
-        read: &FfiAddressRead,
-        invocations: &[FfiInvocation],
-    ) {
+    fn ffi_check_address_read(&mut self, read: &FfiAddressRead, invocations: &[FfiInvocation]) {
         // The position face: some argument expression contains the read.
         let container = invocations.iter().find(|invocation| {
             invocation.args.iter().any(|(_, shape)| {
@@ -2482,9 +2486,7 @@ impl<'a> Engine<'a> {
                     && read.recv_span.end() <= shape.range.end()
             })
         });
-        let leaf = container.is_some_and(|invocation| {
-            self.ffi_invocation_is_leaf(invocation)
-        });
+        let leaf = container.is_some_and(|invocation| self.ffi_invocation_is_leaf(invocation));
         if !leaf {
             self.emit(SemanticCode::AddressPosition, read.selector, "", "");
         }
@@ -2521,16 +2523,12 @@ impl<'a> Engine<'a> {
         self.decl_sites.iter().any(|site| {
             site.name == invocation.callee
                 && site.annotations.contains(&self.intern("Native"))
-                && self
-                    .ffi_decl_annos
-                    .values()
-                    .flatten()
-                    .any(|anno| {
-                        anno.name == self.intern("Native")
-                            && anno.face.is_leaf
-                            && anno.at.offset < site.range.offset
-                            && site.range.offset - anno.at.offset < 512
-                    })
+                && self.ffi_decl_annos.values().flatten().any(|anno| {
+                    anno.name == self.intern("Native")
+                        && anno.face.is_leaf
+                        && anno.at.offset < site.range.offset
+                        && site.range.offset - anno.at.offset < 512
+                })
         })
     }
 
@@ -2637,8 +2635,7 @@ impl<'a> Engine<'a> {
                     _ => None,
                 };
                 let ret = heads(&fn_shape.return_ty)?;
-                let params: Vec<StringId> =
-                    fn_shape.positional.iter().filter_map(heads).collect();
+                let params: Vec<StringId> = fn_shape.positional.iter().filter_map(heads).collect();
                 Some((ret, params))
             }
             Ty::Named { name, .. } => {
@@ -2665,8 +2662,11 @@ impl<'a> Engine<'a> {
         };
         let ret = heads(&decl.return_ty)?;
         let formals = decl.formals.as_ref()?;
-        let params: Vec<StringId> =
-            formals.positional.iter().filter_map(|f| heads(&f.ty)).collect();
+        let params: Vec<StringId> = formals
+            .positional
+            .iter()
+            .filter_map(|f| heads(&f.ty))
+            .collect();
         Some((ret, params))
     }
 
@@ -2722,10 +2722,11 @@ impl<'a> Engine<'a> {
             "Void" => dart_head == "void",
             "Handle" => true,
             "Pointer" | "Array" => {
-                dart_head == native_text || self.clause_entry_is_compound(match dart_ty {
-                    Ty::Named { name, .. } => name,
-                    _ => StringId::NONE,
-                })
+                dart_head == native_text
+                    || self.clause_entry_is_compound(match dart_ty {
+                        Ty::Named { name, .. } => name,
+                        _ => StringId::NONE,
+                    })
             }
             _ => self.clause_entry_is_compound(match dart_ty {
                 Ty::Named { name, .. } => name,

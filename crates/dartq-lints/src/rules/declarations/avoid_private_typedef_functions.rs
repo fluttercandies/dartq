@@ -36,10 +36,7 @@ fn check(c: &mut Check<'_>) {
         let aliased = c.collect_direct(node).into_iter().find(|&kid| {
             matches!(
                 c.kind(kid),
-                NodeKind::Type
-                    | NodeKind::FunctionType
-                    | NodeKind::RecordType
-                    | NodeKind::VoidType
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType | NodeKind::VoidType
             )
         });
         if c.kind(aliased.unwrap_or(node)) != NodeKind::FunctionType {

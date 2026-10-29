@@ -412,9 +412,8 @@ impl SnapshotStore {
         // sweep below unrecords exactly what it deletes, so the flush face
         // stays O(changed) across ticks instead of resetting per save.
         let mut written = self.lock_written();
-        written.retain(|&(generation_dir, stamp), _| {
-            generation_dir != dir || stamp == tables_stamp
-        });
+        written
+            .retain(|&(generation_dir, stamp), _| generation_dir != dir || stamp == tables_stamp);
         let records = written.entry((dir, tables_stamp)).or_default();
         let mut written_bytes = encoded_tables.len() as u64;
         for entry in changed {

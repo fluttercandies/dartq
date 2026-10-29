@@ -576,8 +576,9 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
         };
         // `reference_rows`: only the primary declaration's use sites (its
         // target pair, the family widening admitted).
-        let references =
-            primary.map_or(0, |hit| refs.iter().filter(|row| in_scope(hit, row)).count());
+        let references = primary.map_or(0, |hit| {
+            refs.iter().filter(|row| in_scope(hit, row)).count()
+        });
         // Both graph joins sort and dedup by label text — `importers_of`
         // keeps one entry per import directive, so a duplicated directive
         // repeats the importer and the raw row length overcounts. Distinct
@@ -715,8 +716,11 @@ fn other_row<'d, 'f>(
     strings: &StringTable,
 ) -> OtherDeclRow {
     let surface = decls_of(hit.file);
-    let container = (hit.decl.container != DeclRow::NONE)
-        .then(|| strings.resolve(surface[hit.decl.container as usize].name).to_owned());
+    let container = (hit.decl.container != DeclRow::NONE).then(|| {
+        strings
+            .resolve(surface[hit.decl.container as usize].name)
+            .to_owned()
+    });
     OtherDeclRow {
         file: file_label_of(hit.file).to_owned(),
         kind: decl_kind_name(hit.decl.kind).to_owned(),
@@ -1457,10 +1461,7 @@ mod tests {
         // The aliased faces: probed with the member's name they would
         // answer the same-named container's rows — the member arm must
         // never consult them.
-        let aliased = vec![(
-            TargetRef::Decl(fx.file_a, repo),
-            SuperClause::Extends,
-        )];
+        let aliased = vec![(TargetRef::Decl(fx.file_a, repo), SuperClause::Extends)];
         let aliased_ctors = vec![ConstructorFact {
             name: "m".to_owned(),
             signature: "m()".to_owned(),
@@ -1474,10 +1475,7 @@ mod tests {
             target_name: m,
             target_container: container,
             kind: RefKind::Invoked,
-            range: SourceRange {
-                offset,
-                length: 1,
-            },
+            range: SourceRange { offset, length: 1 },
             qualifier: StringId::NONE,
         };
         let refs = vec![
@@ -1640,12 +1638,22 @@ mod tests {
         // The line face under test: offset/10 + 1.
         // a.dart (the test file): the fake — a member of Holder.
         let surface_a = vec![
-            row(fx.strings.intern("Holder"), DeclKind::Class, 0, DeclRow::NONE),
+            row(
+                fx.strings.intern("Holder"),
+                DeclKind::Class,
+                0,
+                DeclRow::NONE,
+            ),
             row(fx.foo, DeclKind::Field, 300, 0),
         ];
         // b.dart: the private container's member.
         let surface_b = vec![
-            row(fx.strings.intern("_Priv"), DeclKind::Class, 100, DeclRow::NONE),
+            row(
+                fx.strings.intern("_Priv"),
+                DeclKind::Class,
+                100,
+                DeclRow::NONE,
+            ),
             row(fx.foo, DeclKind::Method, 200, 0),
         ];
         // c.dart: the public lib declaration.
@@ -1735,7 +1743,12 @@ mod tests {
         let surface_a = vec![row(under, DeclKind::TopLevelFn, 0, DeclRow::NONE)];
         // b.dart: the public container's same-named member.
         let surface_b = vec![
-            row(fx.strings.intern("Repo"), DeclKind::Class, 100, DeclRow::NONE),
+            row(
+                fx.strings.intern("Repo"),
+                DeclKind::Class,
+                100,
+                DeclRow::NONE,
+            ),
             row(under, DeclKind::Method, 200, 0),
         ];
         let (importers, tests) = graphs();

@@ -905,10 +905,7 @@ fn sweep_sockets(dir: &Path, live: &[PathBuf]) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension() != Some("sock".as_ref())
-            || live.contains(&path)
-            || young_bind(&path)
-        {
+        if path.extension() != Some("sock".as_ref()) || live.contains(&path) || young_bind(&path) {
             continue;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -1018,7 +1015,9 @@ impl EventLog {
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|value| {
-                value["ts"].as_u64().is_some_and(|ts| u128::from(ts) >= since_ms)
+                value["ts"]
+                    .as_u64()
+                    .is_some_and(|ts| u128::from(ts) >= since_ms)
             })
             .filter(|value| handle.is_none_or(|wanted| value["handle"].as_str() == Some(wanted)))
             .map(|value| (value["seq"].as_u64().unwrap_or_default(), value))
@@ -1363,7 +1362,10 @@ mod tests {
         let swept = sweep_sockets(&dir, &[claimed.clone()]);
         assert_eq!(swept, [dead.clone()], "only the old unclaimed socket goes");
         assert!(!dead.exists(), "the dead socket was removed");
-        assert!(young.exists(), "a fresh bind sits inside the bring-up grace");
+        assert!(
+            young.exists(),
+            "a fresh bind sits inside the bring-up grace"
+        );
         assert!(claimed.exists(), "a live record's socket is claimed");
         assert!(dir.join("notes.txt").exists(), "non-socket files stay");
         std::fs::remove_dir_all(&home).ok();
@@ -2102,9 +2104,15 @@ mod tests {
         // (seq 3) ahead of its earlier twin (seq 2).
         assert_eq!(seqs(log.read_newest(None, 0, usize::MAX)), [4, 3, 2, 1]);
         // The handle filter rides the same order.
-        assert_eq!(seqs(log.read_newest(Some("session"), 0, usize::MAX)), [3, 2, 1]);
+        assert_eq!(
+            seqs(log.read_newest(Some("session"), 0, usize::MAX)),
+            [3, 2, 1]
+        );
         // The `ts` floor is inclusive and measured in the log's ms.
-        assert_eq!(seqs(log.read_newest(Some("session"), 2_000, usize::MAX)), [3, 2]);
+        assert_eq!(
+            seqs(log.read_newest(Some("session"), 2_000, usize::MAX)),
+            [3, 2]
+        );
         assert_eq!(
             seqs(log.read_newest(Some("session"), 2_001, usize::MAX)),
             Vec::<u64>::new(),

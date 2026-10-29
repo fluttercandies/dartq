@@ -174,10 +174,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// declaration head after `as` splices a synthetic prefix (`import
     /// 'a.dart' as class A {}` — `;` anchored at `as`, the class parses at
     /// top level).
-    fn reserved_name_recovery_at(
-        &self,
-        context: crate::listener::IdentifierContext,
-    ) -> bool {
+    fn reserved_name_recovery_at(&self, context: crate::listener::IdentifierContext) -> bool {
         match context {
             crate::listener::IdentifierContext::LibraryName
             | crate::listener::IdentifierContext::TopLevelVariableDeclaration => {
@@ -191,10 +188,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         TokenKind::Semicolon
                             | TokenKind::Comma
                             | TokenKind::Keyword(
-                                Keyword::If
-                                    | Keyword::As
-                                    | Keyword::Show
-                                    | Keyword::Hide
+                                Keyword::If | Keyword::As | Keyword::Show | Keyword::Hide
                             )
                             | TokenKind::Eof
                     )
@@ -314,8 +308,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             },
             _ => false,
         };
-        if keyword_name_insert && self.reserved_name_recovery_at(context)
-        {
+        if keyword_name_insert && self.reserved_name_recovery_at(context) {
             self.report(msg::missing_identifier(), peek.span);
             let id = self
                 .cursor
@@ -1438,7 +1431,11 @@ fn keyword_as_name_message(
     };
     let lexeme = cursor.lexeme(view.span.id);
     let built_in_face = matches!(kw.style(), dartq_scanner::KeywordStyle::BuiltIn)
-        || (variance_enabled && matches!(kw, dartq_scanner::Keyword::Inout | dartq_scanner::Keyword::Out));
+        || (variance_enabled
+            && matches!(
+                kw,
+                dartq_scanner::Keyword::Inout | dartq_scanner::Keyword::Out
+            ));
     if built_in_face {
         use crate::message::msg::BuiltInNameKind;
         let kind = match context {

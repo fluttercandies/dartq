@@ -100,20 +100,25 @@ fn deep_record_type_matches_oracle_per_level_rows() {
         listener.errors.len(),
         600,
         "the row set is exactly the oracle's — no stack_overflow, no other noise: {:?}",
-        listener.error_codes().iter().skip(599).take(3).collect::<Vec<_>>()
+        listener
+            .error_codes()
+            .iter()
+            .skip(599)
+            .take(3)
+            .collect::<Vec<_>>()
     );
     assert!(
-        listener
-            .errors
-            .iter()
-            .all(|(c, _, _)| c == code),
+        listener.errors.iter().all(|(c, _, _)| c == code),
         "every row is the per-level record-type diagnostic"
     );
     // Reports unwind innermost-first: the innermost `)` sits at UTF-16 offset
     // 615 (`typedef T = ` is 12 chars plus 600 open parens), the outermost at
     // 1214 — the oracle's 1:616 → 1:1215 columns, one-based.
     assert_eq!(listener.errors[0].1, 615, "innermost level's closer first");
-    assert_eq!(listener.errors[599].1, 1214, "outermost level's closer last");
+    assert_eq!(
+        listener.errors[599].1, 1214,
+        "outermost level's closer last"
+    );
 }
 
 /// Deep-but-valid nested type arguments (`A<A<...>>`, 600 levels) are VALID
@@ -122,9 +127,8 @@ fn deep_record_type_matches_oracle_per_level_rows() {
 /// no false-positive `stack_overflow` on valid code.
 #[test]
 fn deep_valid_type_arguments_produce_zero_diagnostics() {
-    let source: &'static str = Box::leak(
-        format!("{}int{} x;", "A<".repeat(600), ">".repeat(600)).into_boxed_str(),
-    );
+    let source: &'static str =
+        Box::leak(format!("{}int{} x;", "A<".repeat(600), ">".repeat(600)).into_boxed_str());
     let (table, text) = scan_ok(source);
     let mut listener = Collector::default();
     {
@@ -155,12 +159,7 @@ fn deep_valid_type_arguments_produce_zero_diagnostics() {
 #[test]
 fn deep_nested_function_typed_formals_parse_silently() {
     let source: &'static str = Box::leak(
-        format!(
-            "void f({}{}) {{}}",
-            "void g(".repeat(600),
-            ")".repeat(600)
-        )
-        .into_boxed_str(),
+        format!("void f({}{}) {{}}", "void g(".repeat(600), ")".repeat(600)).into_boxed_str(),
     );
     // `parse_formal_parameter` carries the largest frame on any descent path,
     // so the pin parses on a dedicated wide-stack thread: the assertion
@@ -571,13 +570,23 @@ fn initializer_turn_cap_latches_on_parked_queue() {
     let mut listener = Collector::default();
     {
         let mut parser = Parser::new(text, table, latest_features(), &mut listener);
-        parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Colon, 0);
+        parser
+            .cursor
+            .insert_synthetic(dartq_scanner::TokenKind::Colon, 0);
         for _ in 0..2500 {
             let at = 3; // past the real `: x`, at the EOF pin
-            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Identifier, at);
-            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Eq, at);
-            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Identifier, at);
-            parser.cursor.insert_synthetic(dartq_scanner::TokenKind::Comma, at);
+            parser
+                .cursor
+                .insert_synthetic(dartq_scanner::TokenKind::Identifier, at);
+            parser
+                .cursor
+                .insert_synthetic(dartq_scanner::TokenKind::Eq, at);
+            parser
+                .cursor
+                .insert_synthetic(dartq_scanner::TokenKind::Identifier, at);
+            parser
+                .cursor
+                .insert_synthetic(dartq_scanner::TokenKind::Comma, at);
         }
         parser.parse_initializers_opt();
         assert!(

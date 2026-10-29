@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{is_statement_row, slice};
 
 /// Official: `pkg/linter/lib/src/rules/use_test_throws_matchers.dart`
@@ -20,11 +20,8 @@ use crate::rules::{is_statement_row, slice};
 /// still reports. Under-report: `fail` re-exported through a helper
 /// package with no direct test-framework import stays silent. Message:
 /// `diagnostic.g.dart` `useTestThrowsMatchers`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_test_throws_matchers",
-    &[NodeKind::TryStatement],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("use_test_throws_matchers", &[NodeKind::TryStatement], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -106,9 +103,7 @@ fn imports_test_package(c: &Check<'_>) -> bool {
             && crate::rules::directives::written_uri(c, row).is_some_and(|(_, uri)| {
                 uri.strip_prefix("package:")
                     .and_then(|rest| rest.split('/').next())
-                    .is_some_and(|package| {
-                        matches!(package, "test" | "test_api" | "flutter_test")
-                    })
+                    .is_some_and(|package| matches!(package, "test" | "test_api" | "flutter_test"))
             })
     })
 }

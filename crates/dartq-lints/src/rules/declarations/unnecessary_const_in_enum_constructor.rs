@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, modifier_keyword};
+use super::{
+    Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT,
+    modifier_keyword,
+};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_const_in_enum_constructor.dart`
 /// — an explicit `const` on an enum constructor reports at the keyword

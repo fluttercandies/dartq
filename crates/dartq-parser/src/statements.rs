@@ -2148,9 +2148,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         match next {
             // Empty list pattern `[]` (the scanner's fused INDEX token).
             TokenKind::Index => Some(self.real_id(next_offset)),
-            TokenKind::OpenSquare | TokenKind::OpenCurly => {
-                self.group_close_id_at(next_offset)
-            }
+            TokenKind::OpenSquare | TokenKind::OpenCurly => self.group_close_id_at(next_offset),
             // Record or parenthesized pattern — only when no `<...>` group
             // was consumed (`<T>(...)` is a generic invocation, not a
             // pattern).

@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, query_site, slice};
+use super::{Check, NodeKind, PayloadField, query_site, slice};
 
 /// Reads through transparent `(...)` wrappers to the expression root
 /// row (the content is the wrapper window's last row).
@@ -69,11 +69,7 @@ pub(crate) fn expr_type(
 /// `NoArguments` piece can tile outside the run), so `send_parts`
 /// fails on it — the single-`Identifier` prefix is a plain read and
 /// answers at the flow row (`type_of`), not the callee face.
-fn send_type(
-    c: &Check<'_>,
-    analysis: &dartq_semantic::Analysis<'_>,
-    run: &[u32],
-) -> Option<Ty> {
+fn send_type(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) -> Option<Ty> {
     let pos = run.iter().rposition(|&row| c.kind(row) == NodeKind::Send)?;
     let plain_read = |c: &Check<'_>| {
         // The plain read answers at the flow row (`type_of`) of the
@@ -114,11 +110,7 @@ fn send_type(
 /// The bare property-access face (`a.b`): the selector rides on the
 /// whole-access marker's last token; the receiver must be one exact
 /// name directly before it.
-fn access_type(
-    c: &Check<'_>,
-    analysis: &dartq_semantic::Analysis<'_>,
-    run: &[u32],
-) -> Option<Ty> {
+fn access_type(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) -> Option<Ty> {
     let pos = run
         .iter()
         .rposition(|&row| c.kind(row) == NodeKind::DotAccess)?;
@@ -204,10 +196,7 @@ pub(crate) fn is_nullable(ty: Ty) -> bool {
 /// The written-target gate the implicit-cast contexts share: the type
 /// must decide, and it is neither `dynamic`/`void` nor `Object?` (the
 /// official `_check` exemptions).
-pub(crate) fn typed_non_dynamic_target(
-    analysis: &dartq_semantic::Analysis<'_>,
-    ty: Ty,
-) -> bool {
+pub(crate) fn typed_non_dynamic_target(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
     match ty {
         Ty::Named { name, nullable, .. } => {
             let name = analysis.strings().resolve(name);
@@ -341,8 +330,7 @@ pub(crate) fn receiver_family(
         && c.kind(*only) == NodeKind::Identifier
     {
         let receiver_name = c.lexeme(c.head_token(*only));
-        let written =
-            crate::rules::expressions::same_file::written_type(c, *only, receiver_name)?;
+        let written = crate::rules::expressions::same_file::written_type(c, *only, receiver_name)?;
         if crate::rules::expressions::same_file::declares_type(c, written) {
             return Some(false);
         }
@@ -414,9 +402,7 @@ pub(crate) fn receiver_type_name(
         }
         _ => {}
     }
-    match expr_type(c, analysis, receiver_run)
-        .or_else(|| access_type(c, analysis, receiver_run))
-    {
+    match expr_type(c, analysis, receiver_run).or_else(|| access_type(c, analysis, receiver_run)) {
         Some(Ty::Named { name, .. }) => Some(analysis.strings().resolve(name).to_owned()),
         _ => None,
     }

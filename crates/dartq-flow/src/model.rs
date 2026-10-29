@@ -548,7 +548,9 @@ impl State {
                 // step legs below still run over the declared pair.
                 let literal_admit = literal_rhs
                     && written == Ty::UNKNOWN
-                    && !candidates.iter().any(|&(existing, _)| existing == declared_non_null)
+                    && !candidates
+                        .iter()
+                        .any(|&(existing, _)| existing == declared_non_null)
                     && ops.is_subtype_typed(
                         declared_non_null,
                         declared_args,
@@ -581,7 +583,9 @@ impl State {
                     && declared_non_null.base == Base::Function
                     && current.base == Base::Function
                     && current.nullable
-                    && !candidates.iter().any(|&(existing, _)| existing == declared_non_null);
+                    && !candidates
+                        .iter()
+                        .any(|&(existing, _)| existing == declared_non_null);
                 if literal_admit || function_admit {
                     candidates.push((declared_non_null, declared_args));
                 }
@@ -626,8 +630,7 @@ impl State {
             if let Some((_, args)) = candidates.iter().find(|(c, _)| *c == written) {
                 let args = *args;
                 promoted = add_promoted(ops, lists, promoted, written, args, arena, names);
-            } else if let Some((promoted_to, args)) =
-                unique_subtype(ops, &candidates, arena, names)
+            } else if let Some((promoted_to, args)) = unique_subtype(ops, &candidates, arena, names)
             {
                 promoted = add_promoted(ops, lists, promoted, promoted_to, args, arena, names);
             }
@@ -691,8 +694,7 @@ impl State {
         }
         let mut new_promoted = model.promoted;
         if let Some((promoted, args)) = promoted {
-            new_promoted =
-                add_promoted(ops, lists, model.promoted, promoted, args, arena, names);
+            new_promoted = add_promoted(ops, lists, model.promoted, promoted, args, arena, names);
         }
         self.with_model(
             var,
@@ -1136,9 +1138,7 @@ fn consider(
     let a = ops.is_subtype_typed(written, written_args, candidate, args, arena, names);
     let b = ops.is_subtype_typed(candidate, args, current, current_args, arena, names);
     let c = ops.is_subtype_typed(current, current_args, candidate, args, arena, names);
-    if a && b && !c
-        && !out.iter().any(|&(existing, _)| existing == candidate)
-    {
+    if a && b && !c && !out.iter().any(|&(existing, _)| existing == candidate) {
         out.push((candidate, args));
     }
 }

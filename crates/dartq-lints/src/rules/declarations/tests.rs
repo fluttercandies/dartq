@@ -2984,9 +2984,8 @@ fn annotate_overrides_annotated_operator_stays_silent() {
 /// `arguments: [member.name!]` — the setter element's name).
 #[test]
 fn annotate_overrides_setter_reports_equals_suffix() {
-    let f = Fixture::parse(
-        "class A { set x(int v) {} }\nclass B extends A {\n  set x(int v) {}\n}",
-    );
+    let f =
+        Fixture::parse("class A { set x(int v) {} }\nclass B extends A {\n  set x(int v) {}\n}");
     let lints = f.run(&one_rule("annotate_overrides"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
@@ -3039,8 +3038,7 @@ fn avoid_renaming_reports_renamed_parameters_in_lib() {
 
 #[test]
 fn avoid_renaming_gates() {
-    let source =
-        "class A { void foo(int aa) {} }\nclass B extends A {\n  void foo(int cc) {}\n}";
+    let source = "class A { void foo(int aa) {} }\nclass B extends A {\n  void foo(int cc) {}\n}";
     // Outside `lib/` the official rule never registers its visitors
     // (`avoid_renaming_method_parameters.dart:33` —
     // `if (!context.isInLibDir) return;`).
@@ -3300,8 +3298,7 @@ fn declare_return_types_old_typedef_reports() {
 /// `TokenType.INDEX_EQ` guard) and a written return type passes.
 #[test]
 fn declare_return_types_operators_pass() {
-    let f =
-        Fixture::parse("class C { operator []=(int i, int v) {} int operator +(int o) => 1; }");
+    let f = Fixture::parse("class C { operator []=(int i, int v) {} int operator +(int o) => 1; }");
     assert!(f.run(&one_rule("always_declare_return_types")).is_empty());
 }
 
@@ -3541,9 +3538,8 @@ fn only_static_members_field_and_const_faces() {
 /// (:43-53).
 #[test]
 fn only_static_members_inherited_instance_members_seal() {
-    let f = Fixture::parse(
-        "class Base { int five = 5; }\nclass E extends Base { static void m() {} }",
-    );
+    let f =
+        Fixture::parse("class Base { int five = 5; }\nclass E extends Base { static void m() {} }");
     assert!(
         f.run(&one_rule("avoid_classes_with_only_static_members"))
             .is_empty()
@@ -3981,9 +3977,8 @@ fn types_on_closure_parameters_suffix_form() {
 /// or non-function contexts never do (:494-502).
 #[test]
 fn types_on_closure_parameters_assignment_and_misses() {
-    let f = Fixture::parse(
-        "void Function(int) f = (x) => 1;\nvoid g() {\n  f = (int x) => 2;\n}\n",
-    );
+    let f =
+        Fixture::parse("void Function(int) f = (x) => 1;\nvoid g() {\n  f = (int x) => 2;\n}\n");
     let lints = f.run(&one_rule("avoid_types_on_closure_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let int_tok = tok(&f.source, &f.tokens, "int", 1);
@@ -4020,7 +4015,8 @@ fn types_on_closure_parameters_function_type_annotation_passes() {
 /// semantics) keeps the documented under-report posture.
 #[test]
 fn types_on_closure_parameters_signature_face() {
-    let source = "class C { void each(void Function(int) f) {} void run(C c) { c.each((int e) => e); } }\n";
+    let source =
+        "class C { void each(void Function(int) f) {} void run(C c) { c.each((int e) => e); } }\n";
     let f = Fixture::parse(source);
     let lints = f.run_semantic(&one_rule("avoid_types_on_closure_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
@@ -4063,9 +4059,8 @@ fn initialize_in_field_declaration_faces() {
     let y = tok(&f.source, &f.tokens, "y", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, y));
 
-    let f = Fixture::parse(
-        "class C(int x) {\n  this : v = 0, l2 = x;\n  late int l2;\n  int v;\n}\n",
-    );
+    let f =
+        Fixture::parse("class C(int x) {\n  this : v = 0, l2 = x;\n  late int l2;\n  int v;\n}\n");
     assert!(
         f.run(&one_rule("initialize_in_field_declaration"))
             .is_empty()
@@ -4370,8 +4365,7 @@ fn factory_shape_reports_at_root_name() {
 /// reports at its name.
 #[test]
 fn redirect_chain_reports_at_root_name() {
-    let f =
-        Fixture::parse("class C {\n  C.a();\n  C.b() : this.a();\n  C.c() : this.b();\n}\n");
+    let f = Fixture::parse("class C {\n  C.a();\n  C.b() : this.a();\n  C.c() : this.b();\n}\n");
     let lints = f.run(&one_rule("use_primary_constructors"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let a = tok(&f.source, &f.tokens, "a", 0);
@@ -4601,9 +4595,8 @@ fn top_level_function_faces_report() {
     assert_eq!(lints[0].range.start, utf16_at(&f, dynamic));
     assert_eq!(lints[0].range.end, utf16_at(&f, o) + 1);
 
-    let mut f = Fixture::parse(
-        "void g(int a, String s) {}\nvoid h(bool a) {\n  assert(a, 'msg');\n}\n",
-    );
+    let mut f =
+        Fixture::parse("void g(int a, String s) {}\nvoid h(bool a) {\n  assert(a, 'msg');\n}\n");
     f.features.primary_constructors = false;
     let lints = f.run(&one_rule("prefer_final_parameters"));
     let messages: Vec<&str> = lints.iter().map(|lint| lint.message.as_ref()).collect();
@@ -4905,9 +4898,8 @@ fn async_return_closure_faces() {
 /// the constructor's parameter reports at the `assert` keyword.
 #[test]
 fn prefer_asserts_reports_a_leading_assert() {
-    let f = Fixture::parse(
-        "class C {\n  int? f;\n  C({this.f}) {\n    assert(f != null);\n  }\n}\n",
-    );
+    let f =
+        Fixture::parse("class C {\n  int? f;\n  C({this.f}) {\n    assert(f != null);\n  }\n}\n");
     let lints = f.run(&one_rule("prefer_asserts_in_initializer_lists"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
@@ -4922,8 +4914,7 @@ fn prefer_asserts_reports_a_leading_assert() {
 /// access silences the assert.
 #[test]
 fn prefer_asserts_instance_access_passes() {
-    let f =
-        Fixture::parse("class C {\n  C() {\n    assert(m());\n  }\n  bool m() => true;\n}\n");
+    let f = Fixture::parse("class C {\n  C() {\n    assert(m());\n  }\n  bool m() => true;\n}\n");
     assert!(
         f.run(&one_rule("prefer_asserts_in_initializer_lists"))
             .is_empty()
@@ -5091,8 +5082,7 @@ fn avoid_positional_bool_primary_constructor_reports() {
 /// lists never reach the rule (`test_anonymousFunction`).
 #[test]
 fn avoid_positional_bool_generic_function_type_faces() {
-    let f =
-        Fixture::parse("class C {\n  void m(void Function(bool p1, bool p2) callback) {}\n}\n");
+    let f = Fixture::parse("class C {\n  void m(void Function(bool p1, bool p2) callback) {}\n}\n");
     let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let p2 = tok(&f.source, &f.tokens, "bool", 1);
@@ -5299,8 +5289,7 @@ fn use_declaring_parameters_initializer_assigns_reports() {
 /// reports at the parameter name.
 #[test]
 fn use_declaring_parameters_body_assigns_reports() {
-    let f =
-        Fixture::parse("class C(int i) {\n  int i = 0;\n  this {\n    this.i = i;\n  }\n}\n");
+    let f = Fixture::parse("class C(int i) {\n  int i = 0;\n  this {\n    this.i = i;\n  }\n}\n");
     let lints = f.run(&one_rule("use_declaring_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let name = tok(&f.source, &f.tokens, "i", 0);
@@ -5401,9 +5390,8 @@ fn use_setters_to_change_properties_gate() {
         f.run(&one_rule("use_setters_to_change_properties"))
             .is_empty()
     );
-    let f = Fixture::parse(
-        "class A {\n  int x = 0;\n\n  void setLocal(int x) {\n    x = 1;\n  }\n}\n",
-    );
+    let f =
+        Fixture::parse("class A {\n  int x = 0;\n\n  void setLocal(int x) {\n    x = 1;\n  }\n}\n");
     assert!(
         f.run(&one_rule("use_setters_to_change_properties"))
             .is_empty()
@@ -5771,8 +5759,7 @@ fn collection_spelling_spread_and_if_participate() {
         f.run(&one_rule("specify_nonobvious_local_variable_types"))
             .is_empty()
     );
-    let f =
-        Fixture::parse("void f() {\n  var o = {1: 2};\n  Map<int,int> m = {...o, 1: 2};\n}\n");
+    let f = Fixture::parse("void f() {\n  var o = {1: 2};\n  Map<int,int> m = {...o, 1: 2};\n}\n");
     assert_eq!(
         f.run(&one_rule("omit_obvious_local_variable_types")).len(),
         1
@@ -5980,8 +5967,9 @@ fn prefer_final_locals_case_patterns() {
     let start = utf16_at(&f, tok(&f.source, &f.tokens, "int", 0));
     assert_eq!(lints[0].range, start..start + 5, "{lints:?}");
 
-    let f =
-        Fixture::parse("void f(Object o) {\n  switch (o) {\n    case (int a, int b):\n      a; b;\n  }\n}\n");
+    let f = Fixture::parse(
+        "void f(Object o) {\n  switch (o) {\n    case (int a, int b):\n      a; b;\n  }\n}\n",
+    );
     let lints = f.run(&one_rule("prefer_final_locals"));
     assert_eq!(lints.len(), 2, "{lints:?}");
     let first = utf16_at(&f, tok(&f.source, &f.tokens, "int", 0));
@@ -6023,7 +6011,10 @@ fn prefer_final_locals_pattern_variable_declarations() {
     let lints = f.run(&one_rule("prefer_final_locals"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let keyword = tok(&f.source, &f.tokens, "var", 0);
-    assert_eq!(lints[0].range, utf16_at(&f, keyword)..utf16_at(&f, keyword) + 3);
+    assert_eq!(
+        lints[0].range,
+        utf16_at(&f, keyword)..utf16_at(&f, keyword) + 3
+    );
 
     let f = Fixture::parse("void f() {\n  var [a] = [1];\n  a = 2;\n}\n");
     assert!(f.run(&one_rule("prefer_final_locals")).is_empty());
@@ -6063,9 +6054,8 @@ fn specify_nonobvious_local_variable_types_gate() {
 /// a literal-initialized one passes.
 #[test]
 fn specify_nonobvious_property_types_gate() {
-    let f = Fixture::parse(
-        "class C {\n  static var h = bar('x');\n}\nString bar(String s) => '';\n",
-    );
+    let f =
+        Fixture::parse("class C {\n  static var h = bar('x');\n}\nString bar(String s) => '';\n");
     let lints = f.run(&one_rule("specify_nonobvious_property_types"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
@@ -6383,9 +6373,8 @@ fn use_enums_constructor_gates() {
         "class A { static const A a = A(1); static const A b = A(2); final int i; const A(this.i); }\n",
     );
     assert!(f.run(&one_rule("use_enums")).is_empty());
-    let f = Fixture::parse(
-        "class _A { static const _A a = _A(); static const _A b = _A(); _A(); }\n",
-    );
+    let f =
+        Fixture::parse("class _A { static const _A a = _A(); static const _A b = _A(); _A(); }\n");
     assert!(f.run(&one_rule("use_enums")).is_empty());
 }
 

@@ -242,7 +242,10 @@ fn non_generic_super_keeps_the_plain_comparison() {
         overrides.len(),
         1,
         "only Bad's mismatch may report: {:?}",
-        rep.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        rep.diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -489,6 +492,9 @@ fn bare_head_position_control_keeps_substituting() {
         overrides.len(),
         1,
         "only Bad's mismatch may report: {:?}",
-        rep.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        rep.diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
     );
 }

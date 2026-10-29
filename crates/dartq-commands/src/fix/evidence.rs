@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The engine sources' check pass: one throwaway engine over the
 /// discovered targets (`sdk` assembles it; `None` falls back to the
 /// `DART_SDK` environment), one discover + analyze run — no lint stage,
@@ -338,7 +337,10 @@ pub(crate) fn evidence_rows(
 /// (the container-keyed arms) sorts first, two names order by spelling,
 /// then shape, then qualification — the comparator's last leg, reachable
 /// only for rows identical on code, span, and insertion facts.
-pub(crate) fn name_order(a: &Option<EvidenceName>, b: &Option<EvidenceName>) -> core::cmp::Ordering {
+pub(crate) fn name_order(
+    a: &Option<EvidenceName>,
+    b: &Option<EvidenceName>,
+) -> core::cmp::Ordering {
     match (a, b) {
         (None, None) => core::cmp::Ordering::Equal,
         (None, Some(_)) => core::cmp::Ordering::Less,

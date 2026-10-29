@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The UTF-16 length of a string slice (the edits' currency).
 pub(crate) fn utf16_count(slice: &str) -> u32 {
     u32::try_from(slice.chars().map(char::len_utf16).sum::<usize>()).unwrap_or(u32::MAX)
@@ -80,7 +79,10 @@ pub(crate) fn cut_line(text: &str, line_start: usize, line_end: usize) -> (u32, 
 /// tokens count — the scanner-recovery tail (the phantom bracket pair
 /// behind the `[]` index token, `Eof`) is zero-width and unsorted, so a
 /// binary search over the stream cannot close the window.
-pub(crate) fn hit_tokens(tokens: &TokenTable, range: &core::ops::Range<u32>) -> Option<(usize, usize)> {
+pub(crate) fn hit_tokens(
+    tokens: &TokenTable,
+    range: &core::ops::Range<u32>,
+) -> Option<(usize, usize)> {
     let mut first = None;
     let mut last = None;
     for index in 0..tokens.as_slice().len() {
@@ -100,7 +102,12 @@ pub(crate) fn hit_tokens(tokens: &TokenTable, range: &core::ops::Range<u32>) -> 
 }
 
 /// The UTF-16 `[offset, length)` covering tokens `first..=last`.
-pub(crate) fn span_over(text: &str, tokens: &TokenTable, first: usize, last: usize) -> Option<(u32, u32)> {
+pub(crate) fn span_over(
+    text: &str,
+    tokens: &TokenTable,
+    first: usize,
+    last: usize,
+) -> Option<(u32, u32)> {
     let start = tokens.get(first)?.utf16_offset;
     let end = tokens.get(last)?.utf16_offset
         + u32::try_from(tokens.lexeme(text, last).encode_utf16().count()).ok()?;
@@ -214,7 +221,11 @@ pub(crate) fn paren_removable(kind: TokenKind) -> bool {
 
 /// The trimmed source text of a token range (an empty range is the empty
 /// string).
-pub(crate) fn token_text(tokens: &TokenTable, text: &str, range: core::ops::Range<usize>) -> Option<String> {
+pub(crate) fn token_text(
+    tokens: &TokenTable,
+    text: &str,
+    range: core::ops::Range<usize>,
+) -> Option<String> {
     if range.is_empty() {
         return Some(String::new());
     }
@@ -537,7 +548,12 @@ pub(crate) fn wordish(tokens: &TokenTable, text: &str, index: usize) -> bool {
 /// more than one token (type + name), or a function-typed suffix the
 /// official `_allParametersHaveTypes` exempts. A single bare word refuses
 /// (the old-form name-only parameter the conversion cannot express).
-pub(crate) fn parameter_typed(tokens: &TokenTable, text: &str, start: usize, end: usize) -> Option<bool> {
+pub(crate) fn parameter_typed(
+    tokens: &TokenTable,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<bool> {
     if start >= end {
         return None;
     }
@@ -801,7 +817,12 @@ pub(crate) fn line_of(text: &str, byte: usize) -> usize {
 /// starting on `line` between `from_byte` and `to_byte` carry forward past
 /// their end; the first comment on a later line stops the walk. Returns the
 /// carried byte end.
-pub(crate) fn ride_line_comments(text: &str, from_byte: usize, to_byte: usize, line: usize) -> usize {
+pub(crate) fn ride_line_comments(
+    text: &str,
+    from_byte: usize,
+    to_byte: usize,
+    line: usize,
+) -> usize {
     let bytes = text.as_bytes();
     let mut at = from_byte;
     let mut carried = from_byte;

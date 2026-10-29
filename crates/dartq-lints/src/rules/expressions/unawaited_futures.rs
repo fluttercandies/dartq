@@ -13,11 +13,8 @@ use super::{Check, NodeKind, RuleSpec, unused_futures};
 /// are the shared walk's (see `discarded_futures`). Message:
 /// `diagnostic.g.dart` `unawaitedFutures` (the `FutureOr` shape
 /// reports the paired `unawaited_future_or` texts).
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unawaited_futures",
-    &[NodeKind::ExpressionStatement],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("unawaited_futures", &[NodeKind::ExpressionStatement], check,);
 
 fn check(c: &mut Check<'_>) {
     unused_futures::check(c, true);

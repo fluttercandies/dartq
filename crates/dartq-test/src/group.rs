@@ -127,7 +127,10 @@ pub fn compile(
     timeout: Duration,
 ) -> io::Result<Compiled> {
     let packages = crate::cache::package_config_path(root);
-    let none = |excluded| Compiled { runner: None, excluded };
+    let none = |excluded| Compiled {
+        runner: None,
+        excluded,
+    };
     if !packages.is_file() || suites.is_empty() {
         return Ok(none(Vec::new()));
     }
@@ -146,7 +149,11 @@ pub fn compile(
         }
         let _ = std::fs::remove_file(&staged);
         let mut result = match &server {
-            Some(server) => run(server.incremental(&packages, &entry, &staged, &kernel), root, deadline)?,
+            Some(server) => run(
+                server.incremental(&packages, &entry, &staged, &kernel),
+                root,
+                deadline,
+            )?,
             None => Outcome::Failed,
         };
         if matches!(result, Outcome::Failed) {
@@ -196,7 +203,8 @@ pub(crate) fn broken_suites(root: &Path, hosted: &[PathBuf], output: &str) -> Op
             continue;
         };
         let mut parts = location.rsplitn(3, ':');
-        let (Some(column), Some(row), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(column), Some(row), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
             return None;
         };
         if column.parse::<u32>().is_err() || row.parse::<u32>().is_err() {
@@ -226,11 +234,24 @@ struct FrontendServer {
 fn frontend_server(dart: &Path) -> Option<FrontendServer> {
     let dart = dart.canonicalize().ok()?;
     let bin = dart.parent()?;
-    let candidates = [bin.parent()?.to_path_buf(), bin.join("cache").join("dart-sdk")];
+    let candidates = [
+        bin.parent()?.to_path_buf(),
+        bin.join("cache").join("dart-sdk"),
+    ];
     candidates.into_iter().find_map(|sdk| {
-        let runtime = sdk.join("bin").join(if cfg!(windows) { "dartaotruntime.exe" } else { "dartaotruntime" });
-        let snapshot = sdk.join("bin").join("snapshots").join("frontend_server_aot.dart.snapshot");
-        let platform = sdk.join("lib").join("_internal").join("vm_platform_strong.dill");
+        let runtime = sdk.join("bin").join(if cfg!(windows) {
+            "dartaotruntime.exe"
+        } else {
+            "dartaotruntime"
+        });
+        let snapshot = sdk
+            .join("bin")
+            .join("snapshots")
+            .join("frontend_server_aot.dart.snapshot");
+        let platform = sdk
+            .join("lib")
+            .join("_internal")
+            .join("vm_platform_strong.dill");
         (runtime.is_file() && snapshot.is_file() && platform.is_file()).then_some(FrontendServer {
             runtime,
             snapshot,
@@ -243,7 +264,13 @@ impl FrontendServer {
     /// One incremental compile of `entry` into `output`, initialized from
     /// `previous` when it exists. Asserts stay in the kernel (`dart test`
     /// compiles with them enabled; the VM runs them with `--enable-asserts`).
-    fn incremental(&self, packages: &Path, entry: &Path, output: &Path, previous: &Path) -> Command {
+    fn incremental(
+        &self,
+        packages: &Path,
+        entry: &Path,
+        output: &Path,
+        previous: &Path,
+    ) -> Command {
         let internal = self.sdk.join("lib").join("_internal");
         let mut cmd = Command::new(&self.runtime);
         cmd.arg(&self.snapshot)
@@ -251,7 +278,12 @@ impl FrontendServer {
             .arg(&internal)
             .arg("--platform")
             .arg(internal.join("vm_platform_strong.dill"))
-            .args(["--target", "vm", "--incremental", "--no-print-incremental-dependencies"])
+            .args([
+                "--target",
+                "vm",
+                "--incremental",
+                "--no-print-incremental-dependencies",
+            ])
             .arg(format!("--packages={}", packages.display()))
             .arg("--output-dill")
             .arg(output);
@@ -304,8 +336,18 @@ fn run(mut cmd: Command, root: &Path, deadline: Instant) -> io::Result<Outcome> 
             text
         })
     };
-    let stdout = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn io::Read + Send>));
-    let stderr = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn io::Read + Send>));
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn io::Read + Send>),
+    );
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -340,7 +382,8 @@ fn compile_errors(stdout: &str) -> usize {
         .rev()
         .find_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            (fields.len() == 3 && fields[1].ends_with(".dill")).then(|| fields[2].parse().unwrap_or(1))
+            (fields.len() == 3 && fields[1].ends_with(".dill"))
+                .then(|| fields[2].parse().unwrap_or(1))
         })
         .unwrap_or(0)
 }
@@ -355,11 +398,21 @@ pub fn entry_point(out_dir: &Path, suites: &[PathBuf]) -> String {
     let mut src = String::with_capacity(4096 + suites.len() * 160);
     src.push_str(PRELUDE);
     for (index, suite) in suites.iter().enumerate() {
-        let _ = writeln!(src, "import '{}' as s{index};", relative_uri(out_dir, suite));
+        let _ = writeln!(
+            src,
+            "import '{}' as s{index};",
+            relative_uri(out_dir, suite)
+        );
     }
-    src.push_str("\nfinal Map<String, Function Function()> _suites = <String, Function Function()>{\n");
+    src.push_str(
+        "\nfinal Map<String, Function Function()> _suites = <String, Function Function()>{\n",
+    );
     for (index, suite) in suites.iter().enumerate() {
-        let _ = writeln!(src, "  {}: () => s{index}.main,", dart_string(&suite.to_string_lossy()));
+        let _ = writeln!(
+            src,
+            "  {}: () => s{index}.main,",
+            dart_string(&suite.to_string_lossy())
+        );
     }
     src.push_str("};\n");
     src.push_str(PLATFORM);
@@ -525,7 +578,11 @@ fn encode_segment(segment: &str) -> String {
 /// processes: one isolate group per process keeps garbage collection (which
 /// pauses a whole group) from serializing every suite of the run.
 #[must_use]
-pub fn shard(suites: &[PathBuf], shards: usize, cost: impl Fn(&Path) -> Option<u64>) -> Vec<Vec<PathBuf>> {
+pub fn shard(
+    suites: &[PathBuf],
+    shards: usize,
+    cost: impl Fn(&Path) -> Option<u64>,
+) -> Vec<Vec<PathBuf>> {
     let shards = shards.clamp(1, suites.len().max(1));
     let known: Vec<u64> = suites.iter().filter_map(|suite| cost(suite)).collect();
     let fallback = if known.is_empty() {
@@ -533,8 +590,10 @@ pub fn shard(suites: &[PathBuf], shards: usize, cost: impl Fn(&Path) -> Option<u
     } else {
         (known.iter().sum::<u64>() / known.len() as u64).max(1)
     };
-    let mut weighted: Vec<(u64, &PathBuf)> =
-        suites.iter().map(|suite| (cost(suite).unwrap_or(fallback).max(1), suite)).collect();
+    let mut weighted: Vec<(u64, &PathBuf)> = suites
+        .iter()
+        .map(|suite| (cost(suite).unwrap_or(fallback).max(1), suite))
+        .collect();
     weighted.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     let mut bins: Vec<(u64, Vec<PathBuf>)> = vec![(0, Vec::new()); shards];
     for (weight, suite) in weighted {
@@ -545,7 +604,10 @@ pub fn shard(suites: &[PathBuf], shards: usize, cost: impl Fn(&Path) -> Option<u
         bin.0 += weight;
         bin.1.push(suite.clone());
     }
-    bins.into_iter().map(|(_, suites)| suites).filter(|suites| !suites.is_empty()).collect()
+    bins.into_iter()
+        .map(|(_, suites)| suites)
+        .filter(|suites| !suites.is_empty())
+        .collect()
 }
 
 /// Recorded run time per suite of one package, for balancing shards. A
@@ -558,7 +620,10 @@ pub struct Durations {
 
 impl Durations {
     fn path(root: &Path) -> PathBuf {
-        root.join(".dart_tool").join("dartq").join("test").join("durations.json")
+        root.join(".dart_tool")
+            .join("dartq")
+            .join("test")
+            .join("durations.json")
     }
 
     /// The durations recorded for the package at `root`; empty when none.
@@ -575,7 +640,9 @@ impl Durations {
     #[must_use]
     pub fn get(&self, root: &Path, suite: &Path) -> Option<u64> {
         let rel = suite.strip_prefix(root).ok()?;
-        self.millis.get(&rel.to_string_lossy().replace('\\', "/")).copied()
+        self.millis
+            .get(&rel.to_string_lossy().replace('\\', "/"))
+            .copied()
     }
 
     /// Record per-row durations (`(package-relative suite, ms)`), summed per
@@ -584,7 +651,9 @@ impl Durations {
     pub fn record(mut self, root: &Path, rows: &[(PathBuf, u64)]) {
         let mut sums: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
         for (file, ms) in rows {
-            *sums.entry(file.to_string_lossy().replace('\\', "/")).or_default() += ms;
+            *sums
+                .entry(file.to_string_lossy().replace('\\', "/"))
+                .or_default() += ms;
         }
         if sums.is_empty() {
             return;
@@ -603,7 +672,10 @@ mod tests {
     #[test]
     fn entry_point_maps_every_suite() {
         let out = Path::new("/ws/.dart_tool/dartq/group");
-        let suites = [PathBuf::from("/ws/test/a b_test.dart"), PathBuf::from("/ws/test/it's$_test.dart")];
+        let suites = [
+            PathBuf::from("/ws/test/a b_test.dart"),
+            PathBuf::from("/ws/test/it's$_test.dart"),
+        ];
         let src = entry_point(out, &suites);
         assert!(src.contains("import '../../../test/a%20b_test.dart' as s0;"));
         assert!(src.contains("import '../../../test/it%27s%24_test.dart' as s1;"));
@@ -617,35 +689,68 @@ mod tests {
     #[test]
     fn broken_suites_only_when_every_error_is_in_a_suite() {
         let root = Path::new("/ws");
-        let hosted = [PathBuf::from("/ws/test/a_test.dart"), PathBuf::from("/ws/test/b_test.dart")];
+        let hosted = [
+            PathBuf::from("/ws/test/a_test.dart"),
+            PathBuf::from("/ws/test/b_test.dart"),
+        ];
         let suite_error = "result k\n\
             test/a_test.dart:3:25: Error: A value of type 'String' can't be assigned.\n\
             void broken() { int x = \"s\"; }\n                        ^\n\
             test/a_test.dart:9:1: Error: Expected ';' after this.\n\
             k /ws/.dart_tool/dartq/group/group.next.dill 2\n";
-        assert_eq!(broken_suites(root, &hosted, suite_error), Some(vec![hosted[0].clone()]));
+        assert_eq!(
+            broken_suites(root, &hosted, suite_error),
+            Some(vec![hosted[0].clone()])
+        );
         let absolute = "/ws/test/b_test.dart:1:1: Error: Not found: 'missing.dart'\n";
-        assert_eq!(broken_suites(root, &hosted, absolute), Some(vec![hosted[1].clone()]));
-        let lib_error = format!("{suite_error}lib/src/x.dart:100:20: Error: A value of type 'String'.\n");
-        assert_eq!(broken_suites(root, &hosted, &lib_error), None, "a shared file breaks every suite");
+        assert_eq!(
+            broken_suites(root, &hosted, absolute),
+            Some(vec![hosted[1].clone()])
+        );
+        let lib_error =
+            format!("{suite_error}lib/src/x.dart:100:20: Error: A value of type 'String'.\n");
+        assert_eq!(
+            broken_suites(root, &hosted, &lib_error),
+            None,
+            "a shared file breaks every suite"
+        );
         assert_eq!(broken_suites(root, &hosted, "x: Error: oops\n"), None);
-        assert_eq!(broken_suites(root, &hosted, "k out.dill 1\n"), None, "no location at all");
+        assert_eq!(
+            broken_suites(root, &hosted, "k out.dill 1\n"),
+            None,
+            "no location at all"
+        );
     }
 
     #[test]
     fn frontend_server_result_lines() {
-        assert_eq!(compile_errors("+file:///a.dart\nabc-key /x/group.next.dill 0\n"), 0);
+        assert_eq!(
+            compile_errors("+file:///a.dart\nabc-key /x/group.next.dill 0\n"),
+            0
+        );
         assert_eq!(compile_errors("abc-key /x/group.next.dill 3\n"), 3);
         assert_eq!(compile_errors("abc-key /x/group.next.dill ?\n"), 1);
-        assert_eq!(compile_errors(""), 0, "dart compile kernel prints no result line");
+        assert_eq!(
+            compile_errors(""),
+            0,
+            "dart compile kernel prints no result line"
+        );
     }
 
     #[test]
     fn shards_balance_by_cost() {
-        let suites: Vec<PathBuf> = (0..6).map(|i| PathBuf::from(format!("/t/{i}_test.dart"))).collect();
+        let suites: Vec<PathBuf> = (0..6)
+            .map(|i| PathBuf::from(format!("/t/{i}_test.dart")))
+            .collect();
         let costs = [90u64, 10, 10, 10, 40, 40];
         let cost = |path: &Path| {
-            let index: usize = path.file_name()?.to_str()?.split('_').next()?.parse().ok()?;
+            let index: usize = path
+                .file_name()?
+                .to_str()?
+                .split('_')
+                .next()?
+                .parse()
+                .ok()?;
             costs.get(index).copied()
         };
         let parts = shard(&suites, 2, cost);
@@ -675,7 +780,11 @@ mod tests {
         assert_eq!(durations.get(&root, &a), Some(150));
         assert_eq!(durations.get(&root, &b), Some(200));
         assert_eq!(durations.get(&root, &root.join("test/c_test.dart")), None);
-        assert_eq!(durations.get(Path::new("/elsewhere"), &a), None, "outside the package");
+        assert_eq!(
+            durations.get(Path::new("/elsewhere"), &a),
+            None,
+            "outside the package"
+        );
         // A corrupt index starts empty, and recording no rows writes nothing.
         std::fs::write(Durations::path(&root), b"{").expect("write");
         Durations::load(&root).record(&root, &[]);
@@ -692,7 +801,11 @@ mod tests {
         };
         assert_eq!(
             runner.args(),
-            ["--enable-asserts", "--packages=/p/.dart_tool/package_config.json", "/k/group.dill"]
+            [
+                "--enable-asserts",
+                "--packages=/p/.dart_tool/package_config.json",
+                "/k/group.dill"
+            ]
         );
     }
 }

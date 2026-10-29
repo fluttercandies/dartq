@@ -192,9 +192,7 @@ impl<'a> Engine<'a> {
         member: StringId,
         skip_own: bool,
     ) -> Walk<'a> {
-        if skip_own
-            && let found @ Walk::Found(_) = self.walk_climb(container, member, true, true)
-        {
+        if skip_own && let found @ Walk::Found(_) = self.walk_climb(container, member, true, true) {
             return found;
         }
         self.walk_climb(container, member, skip_own, false)
@@ -276,9 +274,7 @@ impl<'a> Engine<'a> {
                     // DECLARING library's scope — the oracle walks the
                     // declaring scope, not the use site's. The re-anchor
                     // bypasses the seen gate once.
-                    if let Some((file, lib)) =
-                        self.unique_declared_elsewhere(name, scope_lib)
-                    {
+                    if let Some((file, lib)) = self.unique_declared_elsewhere(name, scope_lib) {
                         owner = file;
                         scope_lib = lib;
                         at_anchor = false;
@@ -357,8 +353,7 @@ impl<'a> Engine<'a> {
                     return Walk::ChainBroken;
                 }
                 let mixin_lib = owner_lib;
-                let mixin_resolved =
-                    self.resolve_clause_face(name, found_owner, mixin_lib, *mixin);
+                let mixin_resolved = self.resolve_clause_face(name, found_owner, mixin_lib, *mixin);
                 if let Some((mixin_container, mixin_owner)) = &mixin_resolved
                     && mixin_container.members.get(&member).is_none()
                 {
@@ -2285,9 +2280,8 @@ impl<'a> Engine<'a> {
         let (graph, namespaces, index, strings) =
             (self.graph, self.namespaces, self.index, self.strings);
         let element = (self.file, container);
-        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
-            self.alias_clause_hop(name, file, lib)
-        };
+        let alias_hop =
+            |name: StringId, file: FileId, lib: LibraryId| self.alias_clause_hop(name, file, lib);
         let hierarchy = FoldHierarchy {
             graph,
             namespaces,
@@ -2408,9 +2402,8 @@ impl<'a> Engine<'a> {
         let display = |name: StringId| self.strings.resolve(name).to_owned();
         let element = (self.file, container);
         let use_facts = self.library_facts(self.lib);
-        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
-            self.alias_clause_hop(name, file, lib)
-        };
+        let alias_hop =
+            |name: StringId, file: FileId, lib: LibraryId| self.alias_clause_hop(name, file, lib);
         let hierarchy = FoldHierarchy {
             graph: self.graph,
             namespaces: self.namespaces,
@@ -4441,15 +4434,20 @@ impl<'a> Engine<'a> {
     ) -> Option<(&'a Container, FileId, StringId)> {
         let (mut head, mut scope_lib, mut scope_file) = (name, lib, file);
         for _ in 0..8 {
-            let (owner, decl) =
-                match lookup_scoped(self.graph, self.namespaces, self.index, scope_lib, scope_file, head)
-                {
-                    ScopedHit::Local(decl) => (scope_file, decl),
-                    ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
-                        (owner, self.index.get(owner)?.decl(head)?)
-                    }
-                    _ => return None,
-                };
+            let (owner, decl) = match lookup_scoped(
+                self.graph,
+                self.namespaces,
+                self.index,
+                scope_lib,
+                scope_file,
+                head,
+            ) {
+                ScopedHit::Local(decl) => (scope_file, decl),
+                ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
+                    (owner, self.index.get(owner)?.decl(head)?)
+                }
+                _ => return None,
+            };
             if decl.kind != crate::model::MicroKind::TypeAlias || decl.var_ty == Ty::UNKNOWN {
                 return None;
             }
@@ -4457,9 +4455,14 @@ impl<'a> Engine<'a> {
                 return None;
             };
             let next_lib = self.owner_library_of(owner, head).unwrap_or(scope_lib);
-            if let Some((container, found)) =
-                resolve_container(self.graph, self.namespaces, self.index, next_lib, owner, next)
-            {
+            if let Some((container, found)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                next_lib,
+                owner,
+                next,
+            ) {
                 return Some((container, found, next));
             }
             (head, scope_lib, scope_file) = (next, next_lib, owner);

@@ -236,14 +236,7 @@ pub const CLAUSE_KINDS: &[&str] = &["extends", "with", "on", "implements"];
 
 /// The explain report's array sections, in `counts` order.
 pub const EXPLAIN_SECTIONS: &[&str] = &[
-    "bases",
-    "ifaces",
-    "ctors",
-    "methods",
-    "refs",
-    "deps",
-    "tests",
-    "others",
+    "bases", "ifaces", "ctors", "methods", "refs", "deps", "tests", "others",
 ];
 
 const EXPLAIN_TOP: &[&str] = &["v", "sym"];

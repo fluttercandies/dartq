@@ -150,9 +150,7 @@ impl<'src, 'tab> CaptureListener<'src, 'tab> {
         // guard `crate::bounds` applies. A foreign window (a preceding
         // generic function's, a typedef's) never adopts.
         let (params, param_bounds) = match self.pending.take() {
-            Some((names, bounds, window_end)) if token.range.offset < window_end => {
-                (names, bounds)
-            }
+            Some((names, bounds, window_end)) if token.range.offset < window_end => (names, bounds),
             _ => (Vec::new(), Vec::new()),
         };
         self.containers.entry(id).or_insert(Row {
@@ -271,10 +269,7 @@ impl ParserListener for CaptureListener<'_, '_> {
     fn end_function_type(&mut self, function: Token, question: Option<Token>) {
         let range = SourceRange {
             offset: function.range.offset,
-            length: question
-                .map_or(function.range, |q| q.range)
-                .end()
-                - function.range.offset,
+            length: question.map_or(function.range, |q| q.range).end() - function.range.offset,
         };
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.end_function(question.is_some(), range);
@@ -342,8 +337,7 @@ impl ParserListener for CaptureListener<'_, '_> {
         // capture's parameter order is the written one.
         let mut window = std::mem::take(&mut self.window);
         window.reverse();
-        let (names, bounds): (Vec<StringId>, Vec<Option<TypeTree>>) =
-            window.into_iter().unzip();
+        let (names, bounds): (Vec<StringId>, Vec<Option<TypeTree>>) = window.into_iter().unzip();
         self.pending = (!names.is_empty()).then_some((names, bounds, end.range.offset));
     }
 
@@ -562,9 +556,7 @@ pub fn capture_clause_trees(
         // supertype trees, or written parameter bounds (`class C<T
         // extends num>` has no supers to speak of — its bounds are the
         // payload).
-        if row.open
-            || (row.supers.is_empty() && row.param_bounds.iter().all(Option::is_none))
-        {
+        if row.open || (row.supers.is_empty() && row.param_bounds.iter().all(Option::is_none)) {
             continue;
         }
         into.insert(

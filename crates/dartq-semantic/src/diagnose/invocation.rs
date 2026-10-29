@@ -1,6 +1,6 @@
 use super::ffi::matching_close;
-use dartq_source::byte_offset_to_utf16;
 use super::*;
+use dartq_source::byte_offset_to_utf16;
 
 /// The chain-root static type behind a receiver classification: the
 /// declared type of a `Typed` receiver's head (`data` of `data.address`,
@@ -50,7 +50,7 @@ impl<'a> Engine<'a> {
         // `deferred_miss_rows` re-entry, resolved rows stay (the known
         // under-report boundary). Geometric matches take the original path
         // untouched; the latch is single-shot.
-        
+
         if let Some((index, send_end)) = self.last_send_callee.take() {
             let displaced = self.rows.get(index).is_some_and(|row| {
                 matches!(row.shape, RowShape::Member { .. })
@@ -960,7 +960,6 @@ impl<'a> Engine<'a> {
         if cascade_recv.is_some()
             && let Some(target_span) = self.cascade_target_spans.last().copied()
         {
-            
             recv_span = target_span;
         }
         if is_null_aware {
@@ -1121,10 +1120,11 @@ impl<'a> Engine<'a> {
             // (`readEnum(Tag.values)` binds `T := Tag` from exactly this
             // element face). A non-enum container (an SDK `Map.values`
             // instance read) never takes this arm.
-            self.boundary
-                .args
-                .borrow_mut()
-                .named(self.intern("List"), false, &[Ty::named(container)])
+            self.boundary.args.borrow_mut().named(
+                self.intern("List"),
+                false,
+                &[Ty::named(container)],
+            )
         } else {
             match &recv {
                 Receiver::This { container, .. } => {
@@ -1502,7 +1502,8 @@ impl<'a> Engine<'a> {
             } else if self.index_result_recvs.contains_key(&span.offset) {
                 self.recv_expression_ty(span)
             } else {
-                self.rebound_read_face(span).or_else(|| self.read_type_at(span))
+                self.rebound_read_face(span)
+                    .or_else(|| self.read_type_at(span))
             };
             let Some(face @ Ty::Named { name, .. }) = face else {
                 continue;
@@ -1996,7 +1997,11 @@ impl<'a> Engine<'a> {
     fn named_selector_head_before(&self, open: u32) -> Option<(StringId, SourceRange)> {
         let bytes = self.source.as_bytes();
         let mut end = self.byte_of(open);
-        while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_' || bytes[end - 1] == b'$') {
+        while end > 0
+            && (bytes[end - 1].is_ascii_alphanumeric()
+                || bytes[end - 1] == b'_'
+                || bytes[end - 1] == b'$')
+        {
             end -= 1;
         }
         let start = end;
@@ -2072,7 +2077,10 @@ impl<'a> Engine<'a> {
             }
         }
         let end = cursor;
-        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_' || bytes[cursor - 1] == b'$')
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric()
+                || bytes[cursor - 1] == b'_'
+                || bytes[cursor - 1] == b'$')
         {
             cursor -= 1;
         }
@@ -2104,7 +2112,10 @@ impl<'a> Engine<'a> {
                 continue;
             }
             // Whole word: no identifier character directly before.
-            if start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'$')
+            if start == 0
+                || !(bytes[start - 1].is_ascii_alphanumeric()
+                    || bytes[start - 1] == b'_'
+                    || bytes[start - 1] == b'$')
             {
                 return true;
             }
@@ -2164,7 +2175,10 @@ impl<'a> Engine<'a> {
             cursor -= 1;
         }
         let end = cursor;
-        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_' || bytes[cursor - 1] == b'$')
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric()
+                || bytes[cursor - 1] == b'_'
+                || bytes[cursor - 1] == b'$')
         {
             cursor -= 1;
         }
@@ -2188,7 +2202,9 @@ impl<'a> Engine<'a> {
         let name = if cursor > 0
             && bytes[cursor - 1] == b'.'
             && !(cursor >= 2 && (bytes[cursor - 2] == b'?' || bytes[cursor - 2] == b'.'))
-            && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' || bytes[cursor] == b'$')
+            && (bytes[cursor].is_ascii_alphabetic()
+                || bytes[cursor] == b'_'
+                || bytes[cursor] == b'$')
         {
             self.intern(&self.source[cursor..end])
         } else {
@@ -2397,10 +2413,7 @@ impl<'a> Engine<'a> {
             && let Some((class, kind)) = self.alias_class_head(row.name)
         {
             self.used_names.insert(row.name);
-            self.rows[index].shape = RowShape::Bare(BareInfo::Container {
-                name: class,
-                kind,
-            });
+            self.rows[index].shape = RowShape::Bare(BareInfo::Container { name: class, kind });
         }
         // The source-spelled fallback head: only when the row transport
         // dropped the callee outright. Strict adjacency (no trivia skip) —
@@ -2546,15 +2559,15 @@ impl<'a> Engine<'a> {
         if self.pending_send.is_none()
             && !enum_const
             && let Some((head, head_range)) = bare_head
+        {
+            if let Some((class, class_offset)) = self.creation_class_before(head_range)
+                && matches!(self.type_resolution(class).0, TypeResolution::Type)
             {
-                if let Some((class, class_offset)) = self.creation_class_before(head_range)
-                    && matches!(self.type_resolution(class).0, TypeResolution::Type)
-                {
-                    let open = self.creation_open_offset(head_range.end());
-                    let kept = self.rows.partition_point(|row| row.range.offset < open);
-                    for row in self.rows.drain(kept..) {
-                        self.deferred_miss_rows.push(row);
-                    }
+                let open = self.creation_open_offset(head_range.end());
+                let kept = self.rows.partition_point(|row| row.range.offset < open);
+                for row in self.rows.drain(kept..) {
+                    self.deferred_miss_rows.push(row);
+                }
                 let range = SourceRange {
                     offset: class_offset,
                     length: close.end().saturating_sub(class_offset),
@@ -2594,7 +2607,13 @@ impl<'a> Engine<'a> {
             } else if self.keyword_creation_head(head_range.offset)
                 && matches!(self.type_resolution(head).0, TypeResolution::Type)
             {
-                self.fold_unnamed_creation_row(head_range.offset, head_range, close.end(), head, ContainerKind::Class);
+                self.fold_unnamed_creation_row(
+                    head_range.offset,
+                    head_range,
+                    close.end(),
+                    head,
+                    ContainerKind::Class,
+                );
             }
             // The prefix-resolved creation (`const fb.Reader().vTableGet`,
             // the unprefixed-spelled `fb.Reader(...)`): the constructor
@@ -2605,11 +2624,24 @@ impl<'a> Engine<'a> {
             // under-report through the bare scope the same way the
             // non-keyword prefixed send already does (the class name sits
             // behind the prefix table).
-            else if let Some((prefix, prefix_offset)) = self.written_prefix_before(head_range.offset)
-                && let Some((resolved, _)) =
-                    prefixed_container(self.graph, self.namespaces, self.index, self.lib, prefix, head)
+            else if let Some((prefix, prefix_offset)) =
+                self.written_prefix_before(head_range.offset)
+                && let Some((resolved, _)) = prefixed_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    prefix,
+                    head,
+                )
             {
-                self.fold_unnamed_creation_row(prefix_offset, head_range, close.end(), head, resolved.kind);
+                self.fold_unnamed_creation_row(
+                    prefix_offset,
+                    head_range,
+                    close.end(),
+                    head,
+                    resolved.kind,
+                );
             }
         }
     }
@@ -2634,8 +2666,7 @@ impl<'a> Engine<'a> {
             && let Some(row) = self.rows.get(index)
             && (self.ffi_callee_spelling(row.name)
                 || self.decl_sites.iter().any(|site| {
-                    site.name == row.name
-                        && site.annotations.contains(&self.intern("Native"))
+                    site.name == row.name && site.annotations.contains(&self.intern("Native"))
                 }))
         {
             let mut recv_ty = Ty::UNKNOWN;
@@ -2890,10 +2921,8 @@ impl<'a> Engine<'a> {
                 b')' => depth_paren -= 1,
                 b'F' if depth_angle == 0 && depth_paren == 0 => {
                     let word_end = i + "Function".len();
-                    let word_before = i == 0
-                        || bytes
-                            .get(i - 1)
-                            .is_some_and(|b| b.is_ascii_whitespace());
+                    let word_before =
+                        i == 0 || bytes.get(i - 1).is_some_and(|b| b.is_ascii_whitespace());
                     if word_before
                         && text[i..].starts_with("Function")
                         && bytes.get(word_end) == Some(&b'(')
@@ -2921,9 +2950,7 @@ impl<'a> Engine<'a> {
                 let head: String = param
                     .trim()
                     .chars()
-                    .take_while(|c| {
-                        c.is_ascii_alphanumeric() || *c == '_' || *c == '$'
-                    })
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
                     .collect();
                 (!head.is_empty()).then(|| self.strings.intern(&head))
             })
@@ -2943,15 +2970,13 @@ impl<'a> Engine<'a> {
         // `(` sits just past the span's end) or the whole call; both read
         // as an invocation.
         let trimmed_end = text.trim_end();
-        let after = self.source[self.byte_of(range.end()).min(self.source.len())..]
-            .trim_start();
-        let invocation_shaped =
-            trimmed_end.ends_with(')') || after.starts_with('(');
-        let head: String =
-            text.trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
+        let after = self.source[self.byte_of(range.end()).min(self.source.len())..].trim_start();
+        let invocation_shaped = trimmed_end.ends_with(')') || after.starts_with('(');
+        let head: String = text
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
         let head = if head.is_empty() {
             StringId::NONE
         } else {
@@ -3201,16 +3226,13 @@ impl<'a> Engine<'a> {
                         // `Unknown` so the assignability face reads the same
                         // posture as before; the closure-schema face re-types
                         // the row on demand through the recorded range).
-                        let anchor = hi
-                            .checked_sub(1)
-                            .and_then(|i| self.rows.get(i))
-                            .map_or(
-                                SourceRange {
-                                    offset: 0,
-                                    length: 0,
-                                },
-                                |row| row.range,
-                            );
+                        let anchor = hi.checked_sub(1).and_then(|i| self.rows.get(i)).map_or(
+                            SourceRange {
+                                offset: 0,
+                                length: 0,
+                            },
+                            |row| row.range,
+                        );
                         Some((Ty::UNKNOWN, false, anchor, None))
                     }
                 },
@@ -3419,7 +3441,12 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|(name, ty)| Some((*name, self.subst_params(*ty, map)?)))
                     .collect::<Option<Vec<_>>>()?;
-                Some(self.boundary.args.borrow_mut().record(&positional, &named, nullable))
+                Some(
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .record(&positional, &named, nullable),
+                )
             }
             Ty::Function { shape, nullable } => {
                 // A function-typed member face (`FutureOr<T> Function(T)`
@@ -3600,7 +3627,8 @@ impl<'a> Engine<'a> {
                     return true;
                 }
                 let list = self.boundary.pool().get(args).to_vec();
-                list.iter().any(|&arg| self.formal_mentions_param(arg, param))
+                list.iter()
+                    .any(|&arg| self.formal_mentions_param(arg, param))
             }
             Ty::Function { shape, .. } => {
                 let pool_shape = {
@@ -3634,7 +3662,12 @@ impl<'a> Engine<'a> {
                 .get(f)
                 .is_some_and(|unit| unit.container(name).is_some())
         })?;
-        let names = self.index.get(file)?.container(name)?.type_param_names.to_vec();
+        let names = self
+            .index
+            .get(file)?
+            .container(name)?
+            .type_param_names
+            .to_vec();
         (!names.is_empty()).then_some(names)
     }
 
@@ -3659,8 +3692,11 @@ impl<'a> Engine<'a> {
                 {
                     return None;
                 }
-                let params: Vec<(StringId, Option<Ty>)> =
-                    entry.type_param_names.iter().map(|name| (*name, None)).collect();
+                let params: Vec<(StringId, Option<Ty>)> = entry
+                    .type_param_names
+                    .iter()
+                    .map(|name| (*name, None))
+                    .collect();
                 return Some((params.into_boxed_slice(), Vec::new()));
             }
             _ => return None,
@@ -3703,22 +3739,26 @@ impl<'a> Engine<'a> {
                 return false;
             };
             let pool = self.boundary.pool();
-            formals.positional.iter().chain(formals.named.iter()).any(|formal| {
-                // An unmodeled formal type (a function-typed formal) may
-                // spell the parameter anywhere.
-                if formal.ty == Ty::Unknown {
-                    return true;
-                }
-                let mut hit = false;
-                pool.visit_named(formal.ty, &mut |named| {
-                    if let Ty::Named { name, .. } = named
-                        && name == param
-                    {
-                        hit = true;
+            formals
+                .positional
+                .iter()
+                .chain(formals.named.iter())
+                .any(|formal| {
+                    // An unmodeled formal type (a function-typed formal) may
+                    // spell the parameter anywhere.
+                    if formal.ty == Ty::Unknown {
+                        return true;
                     }
-                });
-                hit
-            })
+                    let mut hit = false;
+                    pool.visit_named(formal.ty, &mut |named| {
+                        if let Ty::Named { name, .. } = named
+                            && name == param
+                        {
+                            hit = true;
+                        }
+                    });
+                    hit
+                })
         };
         let own_bound = |index: usize| {
             if !context_free || formal_mentions(entry.type_param_names[index]) {
@@ -3752,7 +3792,8 @@ impl<'a> Engine<'a> {
         // a solution the oracle never derives). With no seed the foreign
         // member's bare-parameter formal binds nothing (the formal spells
         // a name outside this param list, so `unify_upward` declines it).
-        let container_params: Vec<(StringId, Option<crate::bounds::TypeTree>, bool)> = if own_member {
+        let container_params: Vec<(StringId, Option<crate::bounds::TypeTree>, bool)> = if own_member
+        {
             match self.bounds.container_params(container) {
                 Some(params) if !params.is_empty() => params,
                 // The SDK's own containers (`Stream<T>` from a user unit)
@@ -4601,9 +4642,9 @@ impl<'a> Engine<'a> {
                             // own written arguments, so the positional
                             // pairing reads them out of the pool first.
                             let written: Vec<Ty> = match args.as_slice() {
-                                [Ty::Named {
-                                    args: arg_list, ..
-                                }] if *arg_list != crate::model::ArgListId::EMPTY => {
+                                [Ty::Named { args: arg_list, .. }]
+                                    if *arg_list != crate::model::ArgListId::EMPTY =>
+                                {
                                     self.boundary.args.borrow().get(*arg_list).to_vec()
                                 }
                                 many => many.to_vec(),
@@ -4920,15 +4961,14 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         ) {
-            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
-                self.index
-                    .get(file)
-                    .and_then(|els| els.decl(name))
-                    .and_then(|decl| {
-                        (decl.kind == MicroKind::TypeAlias)
-                            .then(|| self.foreign_alias_rhs_grounded(decl.var_ty))
-                    })
-            }
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => self
+                .index
+                .get(file)
+                .and_then(|els| els.decl(name))
+                .and_then(|decl| {
+                    (decl.kind == MicroKind::TypeAlias)
+                        .then(|| self.foreign_alias_rhs_grounded(decl.var_ty))
+                }),
             _ => None,
         }
     }
@@ -5278,7 +5318,11 @@ impl<'a> Engine<'a> {
             at -= 1;
         }
         let end = at;
-        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'$') {
+        while at > 0
+            && (bytes[at - 1].is_ascii_alphanumeric()
+                || bytes[at - 1] == b'_'
+                || bytes[at - 1] == b'$')
+        {
             at -= 1;
         }
         end - at == 5 && &bytes[at..end] == b"const"
@@ -5301,7 +5345,11 @@ impl<'a> Engine<'a> {
             at -= 1;
         }
         let end = at;
-        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'$') {
+        while at > 0
+            && (bytes[at - 1].is_ascii_alphanumeric()
+                || bytes[at - 1] == b'_'
+                || bytes[at - 1] == b'$')
+        {
             at -= 1;
         }
         if at == end {
@@ -5321,8 +5369,7 @@ impl<'a> Engine<'a> {
     /// `None` (the unprefixed walk handles it).
     fn prefixed_alias_head(&self, tree: &crate::capture::TypeTree) -> Option<(StringId, StringId)> {
         let bytes = self.source.as_bytes();
-        let mut at = self.byte_of(tree.range.offset)
-            + self.strings.resolve(tree.head).len();
+        let mut at = self.byte_of(tree.range.offset) + self.strings.resolve(tree.head).len();
         while at < bytes.len() && bytes[at].is_ascii_whitespace() {
             at += 1;
         }
@@ -5334,7 +5381,9 @@ impl<'a> Engine<'a> {
             at += 1;
         }
         let start = at;
-        while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] == b'$') {
+        while at < bytes.len()
+            && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] == b'$')
+        {
             at += 1;
         }
         if at == start {
@@ -5484,8 +5533,7 @@ impl<'a> Engine<'a> {
             self.lib,
             self.file,
             container,
-        )
-        else {
+        ) else {
             return false;
         };
         let Some(head) = face.superclass else {
@@ -5565,10 +5613,8 @@ impl<'a> Engine<'a> {
         // prefixed namespace) is a plain creation and keeps its existing
         // fold.
         {
-            let alias_head: Option<(StringId, SourceRange, bool)> = self
-                .rows
-                .get(callee)
-                .and_then(|row| {
+            let alias_head: Option<(StringId, SourceRange, bool)> =
+                self.rows.get(callee).and_then(|row| {
                     if row.qualified {
                         // `Alias.named(` — the selector callee: the class
                         // segment is the row directly below.
@@ -5592,12 +5638,15 @@ impl<'a> Engine<'a> {
                 let const_head = self.creation_head_is_const(head_range.offset);
                 let name_text = self.strings.resolve(name).to_string();
                 if const_head {
-                    self.emit(SemanticCode::CreationWithNonType, head_range, &name_text, "");
+                    self.emit(
+                        SemanticCode::CreationWithNonType,
+                        head_range,
+                        &name_text,
+                        "",
+                    );
                     return;
                 }
-                if !bare
-                    && let Some(selector) = self.rows.get(callee)
-                {
+                if !bare && let Some(selector) = self.rows.get(callee) {
                     let selector_text = self.strings.resolve(selector.name).to_string();
                     self.emit(
                         SemanticCode::UndefinedMethod,
@@ -5895,25 +5944,23 @@ impl<'a> Engine<'a> {
                     None if member_found => (!shadowed)
                         .then(|| self.container_context())
                         .flatten()
-                        .and_then(
-                            |(container, kind)| {
-                                match self.bare_member_walk(container, kind, row.name) {
-                                    Walk::Found(entry) if entry.kind == MemberKind::Field => {
-                                        match self.fold_alias_ty(entry.var_ty) {
-                                            Ty::Named { name, .. } => Some(name),
-                                            _ => None,
-                                        }
+                        .and_then(|(container, kind)| {
+                            match self.bare_member_walk(container, kind, row.name) {
+                                Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                                    match self.fold_alias_ty(entry.var_ty) {
+                                        Ty::Named { name, .. } => Some(name),
+                                        _ => None,
                                     }
-                                    Walk::Found(entry) if entry.kind == MemberKind::Getter => {
-                                        match self.fold_alias_ty(entry.return_ty) {
-                                            Ty::Named { name, .. } => Some(name),
-                                            _ => None,
-                                        }
-                                    }
-                                    _ => None,
                                 }
-                            },
-                        )
+                                Walk::Found(entry) if entry.kind == MemberKind::Getter => {
+                                    match self.fold_alias_ty(entry.return_ty) {
+                                        Ty::Named { name, .. } => Some(name),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        })
                         .and_then(|name| self.alias_fn_sig(name)),
                     None => None,
                 };
@@ -6619,12 +6666,12 @@ impl<'a> Engine<'a> {
             // chain whose nullability face this model under-seeds (the
             // `StreamTransformer.fromHandlers` cascade) — under-report
             // over a wrong binding.
-            let write_ctx = self.assignment_write_ctx(callee).filter(|_| level.closures.is_empty());
+            let write_ctx = self
+                .assignment_write_ctx(callee)
+                .filter(|_| level.closures.is_empty());
             if let Some(container) = creation_container
                 && let Some(Ty::Named {
-                    name: head,
-                    args,
-                    ..
+                    name: head, args, ..
                 }) = write_ctx
                 && head == container
                 && args != ArgListId::EMPTY
@@ -6708,17 +6755,19 @@ impl<'a> Engine<'a> {
                 .iter()
                 .zip(solutions.iter())
                 .enumerate()
-                .map(|(index, ((param, bound), solution))| match (solution, bound) {
-                    _ if disagreed.contains(&index) => Ty::UNKNOWN,
-                    (Some(ty), None) => *ty,
-                    (Some(ty), Some(bound))
-                        if self.assignable(*ty, *bound, false) != Some(false) =>
-                    {
-                        *ty
-                    }
-                    (_, Some(bound)) => *bound,
-                    (None, None) => Ty::named(*param),
-                })
+                .map(
+                    |(index, ((param, bound), solution))| match (solution, bound) {
+                        _ if disagreed.contains(&index) => Ty::UNKNOWN,
+                        (Some(ty), None) => *ty,
+                        (Some(ty), Some(bound))
+                            if self.assignable(*ty, *bound, false) != Some(false) =>
+                        {
+                            *ty
+                        }
+                        (_, Some(bound)) => *bound,
+                        (None, None) => Ty::named(*param),
+                    },
+                )
                 .collect(),
         };
 
@@ -6987,8 +7036,7 @@ impl<'a> Engine<'a> {
                     .iter()
                     .any(|(param, _)| self.formal_mentions_param(ty, *param))
             };
-            let unconstrainable = self
-                .declared_extends_unresolved(container)
+            let unconstrainable = self.declared_extends_unresolved(container)
                 && formals
                     .positional
                     .iter()
@@ -7065,9 +7113,8 @@ impl<'a> Engine<'a> {
                     // brace — a braceless closure (`() => f(this)`) opened
                     // in the body has no `body_brace` of its own, so the
                     // ctor-level `ctor_body_open` latch answers for it.
-                    let in_ctor_initializers = self.ctor_pending.is_some()
-                        && body_brace.is_none()
-                        && !self.ctor_body_open;
+                    let in_ctor_initializers =
+                        self.ctor_pending.is_some() && body_brace.is_none() && !self.ctor_body_open;
                     dq_probe!(
                         "[kw-recv] is_super={} instance={} body_brace={:?} ctor_body_open={} -> in_init={}",
                         is_super,
@@ -7196,7 +7243,12 @@ impl<'a> Engine<'a> {
                     self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
                     return;
                 }
-                let Ty::Named { name, nullable: ty_nullable, .. } = ty else {
+                let Ty::Named {
+                    name,
+                    nullable: ty_nullable,
+                    ..
+                } = ty
+                else {
                     // A record-typed callee reports both ways the record
                     // face answers upstream: a `call`-named field resolves
                     // through the `recordField != null` arm and a record
@@ -7446,8 +7498,7 @@ impl<'a> Engine<'a> {
     /// gate.
     pub(crate) fn extension_call_member(&mut self, name: StringId, nullable: bool) -> bool {
         let call = self.intern("call");
-        let pairs: Vec<(&ExtensionFace, FileId)> =
-            self.accessible_extension_faces().to_vec();
+        let pairs: Vec<(&ExtensionFace, FileId)> = self.accessible_extension_faces().to_vec();
         pairs.iter().any(|(face, _)| {
             face.on_type == Some(name)
                 && (!nullable || face.on_type_nullable)
@@ -7561,7 +7612,10 @@ impl<'a> Engine<'a> {
         // implicit-call arm above instead.
         if let Some(row) = self.rows.get(callee)
             && !row.qualified
-            && let Some(Ty::Function { shape, nullable: false }) = self.read_type_at(row.range)
+            && let Some(Ty::Function {
+                shape,
+                nullable: false,
+            }) = self.read_type_at(row.range)
             && matches!(self.fold_alias_ty(row.ty), Ty::Function { .. })
         {
             self.rows[callee].ty = self.boundary.pool().function_shape(shape).return_ty;
@@ -7572,10 +7626,7 @@ impl<'a> Engine<'a> {
         // alias or the raw function type) — never the whole function type
         // the declared row carries. A nullable callee keeps its face (the
         // unchecked-use verdict owns the value then).
-        let callee_ty = self
-            .rows
-            .get(callee)
-            .map(|row| self.fold_alias_ty(row.ty));
+        let callee_ty = self.rows.get(callee).map(|row| self.fold_alias_ty(row.ty));
         if let Some(Ty::Function {
             shape,
             nullable: false,

@@ -1,6 +1,6 @@
 use std::path::Component;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, get_set_token, narrow_u32, type_before};
+use super::{Check, NodeKind, PayloadField, RuleSpec, get_set_token, narrow_u32, type_before};
 
 /// Official: `pkg/linter/lib/src/rules/always_declare_return_types.dart:38-85`
 /// — a function, method, getter, or old-form `typedef` written without a
@@ -78,9 +78,8 @@ fn check(c: &mut Check<'_>) {
             // `test_*` / `solo_test_*` methods inside a test directory
             // skip (:76-81).
             if in_test_directory(c)
-                && name_lexeme.is_some_and(|name| {
-                    name.starts_with("test_") || name.starts_with("solo_test_")
-                })
+                && name_lexeme
+                    .is_some_and(|name| name.starts_with("test_") || name.starts_with("solo_test_"))
             {
                 return;
             }
@@ -162,10 +161,7 @@ fn report_untyped_operator(c: &mut Check<'_>, node: u32, op_row: u32) {
         .any(|kid| {
             matches!(
                 c.kind(kid),
-                NodeKind::Type
-                    | NodeKind::VoidType
-                    | NodeKind::FunctionType
-                    | NodeKind::RecordType
+                NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType | NodeKind::RecordType
             )
         });
     if typed {

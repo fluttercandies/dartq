@@ -1,4 +1,3 @@
-
 use super::Receiver;
 use crate::collector::collect;
 use crate::diagnose::{Engine, FileReport, StrictModes, Walk, diagnose_with};

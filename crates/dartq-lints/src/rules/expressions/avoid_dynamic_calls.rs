@@ -1,6 +1,9 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces, value_run_end};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces as faces,
+    value_run_end,
+};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,

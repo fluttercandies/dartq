@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, PayloadField, query_site, slice, static_type_faces as faces};
 use crate::rules::{NONE_TOKEN, same_file_declaration, utf16_token_span};
 
 // The official message templates (`diagnostic.g.dart`): the Future
@@ -64,8 +64,7 @@ pub(super) fn check(c: &mut Check<'_>, want_async: bool) {
         return;
     };
     let written = analysis.strings().resolve(name);
-    if (written != "Future" && written != "FutureOr")
-        || same_file_declaration(c, written).is_some()
+    if (written != "Future" && written != "FutureOr") || same_file_declaration(c, written).is_some()
     {
         return;
     }
@@ -79,11 +78,15 @@ pub(super) fn check(c: &mut Check<'_>, want_async: bool) {
 /// absent word stored as [`NONE_TOKEN`]), and `sync*` is a
 /// synchronous body.
 fn enclosing_body_is_async(c: &Check<'_>) -> Option<bool> {
-    let body =
-        c.path.iter().rev().copied().find(|&row| {
-            matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody)
-        })?;
-    let kw = c.field(body, PayloadField::AsyncKeyword).unwrap_or(NONE_TOKEN);
+    let body = c
+        .path
+        .iter()
+        .rev()
+        .copied()
+        .find(|&row| matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody))?;
+    let kw = c
+        .field(body, PayloadField::AsyncKeyword)
+        .unwrap_or(NONE_TOKEN);
     Some(kw != NONE_TOKEN && c.lexeme(kw) == "async")
 }
 

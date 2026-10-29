@@ -122,7 +122,10 @@ fn split_list(text: &str) -> Option<Vec<String>> {
 
 /// The trace text after the logger's `[ +N ms] ` prefix.
 fn trace_body(line: &str) -> &str {
-    match line.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+    match line
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+    {
         Some((_, body)) => body,
         None => line,
     }
@@ -164,20 +167,35 @@ impl Recipe {
         let mut environment = None;
         for line in trace.lines() {
             if let Some(event) = crate::event::parse(line) {
-                if let Some(text) = event.str_at(&["message"]).and_then(|message| message.strip_prefix(ENVIRONMENT)) {
-                    environment = Some(serde_json::from_str::<std::collections::BTreeMap<String, String>>(text).ok()?);
+                if let Some(text) = event
+                    .str_at(&["message"])
+                    .and_then(|message| message.strip_prefix(ENVIRONMENT))
+                {
+                    environment = Some(
+                        serde_json::from_str::<std::collections::BTreeMap<String, String>>(text)
+                            .ok()?,
+                    );
                 }
                 continue;
             }
             let body = trace_body(line);
-            if compiler.is_none() && body.contains("frontend_server") && body.contains(" --sdk-root ") {
+            if compiler.is_none()
+                && body.contains("frontend_server")
+                && body.contains(" --sdk-root ")
+            {
                 compiler = Some(split_trace(body)?);
-            } else if let Some(rest) = body.strip_prefix("test 0: Starting flutter_tester process with command=") {
+            } else if let Some(rest) =
+                body.strip_prefix("test 0: Starting flutter_tester process with command=")
+            {
                 let (command, _) = rest.split_once("], environment=")?;
                 let command = split_list(&format!("{command}]"))?;
                 // Every argument after the binary is a flag, but the last
                 // (the kernel): anything else means the split was ambiguous.
-                if command.len() < 2 || command[1..command.len() - 1].iter().any(|arg| !arg.starts_with("--")) {
+                if command.len() < 2
+                    || command[1..command.len() - 1]
+                        .iter()
+                        .any(|arg| !arg.starts_with("--"))
+                {
                     return None;
                 }
                 tester = Some(command);
@@ -206,12 +224,20 @@ impl Recipe {
             .collect();
         // The tool deletes its fonts configuration on exit; the contents are
         // fixed (`FontConfigManager`): the SDK's artifact cache directory.
-        let artifacts = Path::new(kept.first()?).ancestors().find(|dir| dir.ends_with("bin/cache"))?.join("artifacts");
+        let artifacts = Path::new(kept.first()?)
+            .ancestors()
+            .find(|dir| dir.ends_with("bin/cache"))?
+            .join("artifacts");
         let fonts = format!(
             "<fontconfig>\n  <dir>{}</dir>\n  <cachedir>/var/cache/fontconfig</cachedir>\n</fontconfig>\n",
             artifacts.display()
         );
-        Some(Self { compiler: kept, tester: command, environment, fonts })
+        Some(Self {
+            compiler: kept,
+            tester: command,
+            environment,
+            fonts,
+        })
     }
 }
 
@@ -254,10 +280,19 @@ pub fn chunk_entry(index: usize, suites: &[(usize, &Hosted)]) -> String {
     let mut configs: Vec<&Path> = Vec::new();
     let mut header = String::new();
     for &(i, suite) in suites {
-        let _ = writeln!(header, "import {} as s{i};", crate::group::dart_string(&file_uri(&suite.path)));
+        let _ = writeln!(
+            header,
+            "import {} as s{i};",
+            crate::group::dart_string(&file_uri(&suite.path))
+        );
         if let Some(config) = &suite.config {
             if !configs.contains(&config.as_path()) {
-                let _ = writeln!(header, "import {} as c{};", crate::group::dart_string(&file_uri(config)), configs.len());
+                let _ = writeln!(
+                    header,
+                    "import {} as c{};",
+                    crate::group::dart_string(&file_uri(config)),
+                    configs.len()
+                );
                 configs.push(config);
             }
         }
@@ -268,12 +303,18 @@ pub fn chunk_entry(index: usize, suites: &[(usize, &Hosted)]) -> String {
         let url = crate::group::dart_string(&file_uri(&suite.path));
         let main = match &suite.config {
             Some(config) => {
-                let c = configs.iter().position(|seen| *seen == config.as_path()).expect("imported above");
+                let c = configs
+                    .iter()
+                    .position(|seen| *seen == config.as_path())
+                    .expect("imported above");
                 format!("() => () => c{c}.testExecutable(() async {{ await Future(s{i}.main); }})")
             }
             None => format!("() => () async {{ await Future(s{i}.main); }}"),
         };
-        let _ = writeln!(src, "\n@pragma('vm:entry-point')\nvoid _s{i}() => _connect({i}, {url}, {main});");
+        let _ = writeln!(
+            src,
+            "\n@pragma('vm:entry-point')\nvoid _s{i}() => _connect({i}, {url}, {main});"
+        );
     }
     src
 }
@@ -309,7 +350,12 @@ fn file_uri(path: &Path) -> String {
 ///
 /// `hosted` is the local-index subset actually compiled (a failed suite is
 /// retried out, so the key follows the reduced set, not the original).
-fn chunk_key(plan: &Plan<'_>, index: usize, hosted: &[usize], member_of: impl Fn(usize) -> usize) -> String {
+fn chunk_key(
+    plan: &Plan<'_>,
+    index: usize,
+    hosted: &[usize],
+    member_of: impl Fn(usize) -> usize,
+) -> String {
     let suites: Vec<(usize, &Hosted)> = hosted
         .iter()
         .map(|&local| (local, &plan.suites[member_of(local)]))
@@ -376,7 +422,10 @@ enum Compiled {
 
 impl Compiler {
     fn start(recipe: &Recipe, packages: &Path, output: &Path, root: &Path) -> io::Result<Self> {
-        let (program, args) = recipe.compiler.split_first().ok_or_else(|| io::Error::other("empty compiler command"))?;
+        let (program, args) = recipe
+            .compiler
+            .split_first()
+            .ok_or_else(|| io::Error::other("empty compiler command"))?;
         let mut child = Command::new(program)
             .args(args)
             .arg("--incremental")
@@ -391,7 +440,13 @@ impl Compiler {
             .spawn()?;
         let stdin = child.stdin.take().expect("piped");
         let stdout = BufReader::new(child.stdout.take().expect("piped"));
-        Ok(Self { child, stdin, stdout, output: output.to_path_buf(), first: true })
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            output: output.to_path_buf(),
+            first: true,
+        })
     }
 
     /// Compile `entry` (a file path) into the output path.
@@ -427,7 +482,11 @@ impl Compiler {
                             // The opening boundary (sources follow).
                             continue;
                         }
-                        let errors: usize = rest.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                        let errors: usize = rest
+                            .rsplit(' ')
+                            .next()
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(1);
                         writeln!(self.stdin, "accept\nreset")?;
                         self.stdin.flush()?;
                         return Ok(if errors == 0 && self.output.is_file() {
@@ -481,7 +540,10 @@ pub fn runner_kernel(vm: &Path, tool_packages: &Path, scratch: &Path) -> io::Res
     hasher.update(vm.to_string_lossy().as_bytes());
     hasher.update(&std::fs::read(tool_packages)?);
     let key = hasher.finalize().to_hex();
-    let dir = crate::host::cache_dir().map_or_else(|| scratch.to_path_buf(), |dir| dir.join("test").join("flutter"));
+    let dir = crate::host::cache_dir().map_or_else(
+        || scratch.to_path_buf(),
+        |dir| dir.join("test").join("flutter"),
+    );
     let kernel = dir.join(format!("runner-{}.dill", &key[..32]));
     if kernel.is_file() {
         return Ok(kernel);
@@ -568,7 +630,10 @@ fn shard_spelling(path: &Path, shard: u32) -> String {
     for _ in 0..shard {
         out.push_str("./");
     }
-    out.push_str(&path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned()));
+    out.push_str(&path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    ));
     out
 }
 
@@ -602,8 +667,14 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
             rows.push(Row { suite, shard });
         }
     }
-    let chunks: Vec<Vec<usize>> = (0..rows.len()).collect::<Vec<usize>>().chunks(CHUNK).map(<[usize]>::to_vec).collect();
-    let kernels: Vec<PathBuf> = (0..chunks.len()).map(|index| dir.join(format!("chunk{index}.dill"))).collect();
+    let chunks: Vec<Vec<usize>> = (0..rows.len())
+        .collect::<Vec<usize>>()
+        .chunks(CHUNK)
+        .map(<[usize]>::to_vec)
+        .collect();
+    let kernels: Vec<PathBuf> = (0..chunks.len())
+        .map(|index| dir.join(format!("chunk{index}.dill")))
+        .collect();
     // Chunk kernels persist across runs, keyed on the content they were
     // compiled from: a run whose chunk source is unchanged adopts the
     // previous run's kernel and skips the ~5 s framework-load compile
@@ -623,19 +694,33 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
             let locals: Vec<usize> = (0..chunks[index].len()).collect();
             crate::stamp::write_atomic(
                 &kernel.with_extension("dill.json"),
-                serde_json::to_string(&locals).map_err(io::Error::other)?.as_bytes(),
+                serde_json::to_string(&locals)
+                    .map_err(io::Error::other)?
+                    .as_bytes(),
             )?;
             continue;
         }
-        for stale in [kernel.clone(), kernel.with_extension("dill.failed"), kernel.with_extension("dill.json"), kernel.with_extension("dill.key")] {
+        for stale in [
+            kernel.clone(),
+            kernel.with_extension("dill.failed"),
+            kernel.with_extension("dill.json"),
+            kernel.with_extension("dill.key"),
+        ] {
             let _ = std::fs::remove_file(stale);
         }
     }
     let fonts = dir.join("fonts.conf");
     crate::stamp::write_atomic(&fonts, plan.recipe.fonts.as_bytes())?;
-    let mut environment: serde_json::Map<String, serde_json::Value> =
-        plan.recipe.environment.iter().map(|(key, value)| (key.clone(), value.clone().into())).collect();
-    environment.insert("FONTCONFIG_FILE".to_owned(), fonts.display().to_string().into());
+    let mut environment: serde_json::Map<String, serde_json::Value> = plan
+        .recipe
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone().into()))
+        .collect();
+    environment.insert(
+        "FONTCONFIG_FILE".to_owned(),
+        fonts.display().to_string().into(),
+    );
     let mut run_rows = Vec::with_capacity(rows.len());
     for (chunk, members) in chunks.iter().enumerate() {
         for (local, &row) in members.iter().enumerate() {
@@ -684,7 +769,8 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     let excluded = std::sync::Mutex::new(Vec::new());
     let stop = std::sync::atomic::AtomicBool::new(false);
     let result = std::thread::scope(|scope| {
-        let compiling = scope.spawn(|| compile_chunks(plan, &rows, &dir, &chunks, &kernels, &excluded, &stop));
+        let compiling =
+            scope.spawn(|| compile_chunks(plan, &rows, &dir, &chunks, &kernels, &excluded, &stop));
         let mut cmd = Command::new(plan.vm);
         cmd.arg("--disable-dart-dev")
             .arg(&runner)
@@ -694,12 +780,17 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
             .stderr(Stdio::piped());
         let ran = crate::exec::run_command_for(cmd, cfg);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let compiled = compiling.join().unwrap_or_else(|_| Err(io::Error::other("the chunk compiler panicked")));
+        let compiled = compiling
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the chunk compiler panicked")));
         (ran, compiled)
     });
     let (ran, compiled) = result;
     compiled?;
-    Ok(Outcome { execution: ran?, excluded: excluded.into_inner().unwrap_or_default() })
+    Ok(Outcome {
+        execution: ran?,
+        excluded: excluded.into_inner().unwrap_or_default(),
+    })
 }
 
 /// Compile every chunk in order through one resident compiler, writing
@@ -732,11 +823,19 @@ fn compile_chunks(
         let mut hosted: Vec<usize> = (0..members.len()).collect();
         let mut retried = false;
         loop {
-            let suites: Vec<(usize, &Hosted)> = hosted.iter().map(|&local| (local, &plan.suites[suite_of(local, members)])).collect();
+            let suites: Vec<(usize, &Hosted)> = hosted
+                .iter()
+                .map(|&local| (local, &plan.suites[suite_of(local, members)]))
+                .collect();
             let entry = dir.join(format!("chunk{index}.dart"));
             crate::stamp::write_atomic(&entry, chunk_entry(index, &suites).as_bytes())?;
             if compiler.is_none() {
-                compiler = Some(Compiler::start(plan.recipe, plan.packages, &output, plan.root)?);
+                compiler = Some(Compiler::start(
+                    plan.recipe,
+                    plan.packages,
+                    &output,
+                    plan.root,
+                )?);
             }
             let _ = std::fs::remove_file(&output);
             let result = match compiler.as_mut().expect("started").compile(&entry) {
@@ -758,27 +857,46 @@ fn compile_chunks(
                     // retried chunk's reduced set, so a later run wanting
                     // the full set re-keys and recompiles instead of
                     // adopting a kernel missing the excluded suite.
-                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.key"), chunk_key(plan, index, &hosted, |local| suite_of(local, members)).as_bytes())?;
-                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.json"), serde_json::to_string(&hosted)?.as_bytes())?;
+                    crate::stamp::write_atomic(
+                        &kernels[index].with_extension("dill.key"),
+                        chunk_key(plan, index, &hosted, |local| suite_of(local, members))
+                            .as_bytes(),
+                    )?;
+                    crate::stamp::write_atomic(
+                        &kernels[index].with_extension("dill.json"),
+                        serde_json::to_string(&hosted)?.as_bytes(),
+                    )?;
                     break;
                 }
                 Compiled::Errors(text) if !retried => {
-                    let paths: Vec<PathBuf> = hosted.iter().map(|&local| plan.suites[suite_of(local, members)].path.clone()).collect();
+                    let paths: Vec<PathBuf> = hosted
+                        .iter()
+                        .map(|&local| plan.suites[suite_of(local, members)].path.clone())
+                        .collect();
                     let broken = crate::group::broken_suites(plan.root, &paths, &text);
                     match broken.filter(|broken| broken.len() < paths.len()) {
                         Some(broken) => {
-                            hosted.retain(|&local| !broken.contains(&plan.suites[suite_of(local, members)].path));
-                            excluded.lock().map_err(|_| io::Error::other("poisoned"))?.extend(broken);
+                            hosted.retain(|&local| {
+                                !broken.contains(&plan.suites[suite_of(local, members)].path)
+                            });
+                            excluded
+                                .lock()
+                                .map_err(|_| io::Error::other("poisoned"))?
+                                .extend(broken);
                             retried = true;
                         }
                         None => {
-                            fail_chunk(plan, &hosted, &kernels[index], excluded, |local| suite_of(local, members))?;
+                            fail_chunk(plan, &hosted, &kernels[index], excluded, |local| {
+                                suite_of(local, members)
+                            })?;
                             break;
                         }
                     }
                 }
                 Compiled::Errors(_) => {
-                    fail_chunk(plan, &hosted, &kernels[index], excluded, |local| suite_of(local, members))?;
+                    fail_chunk(plan, &hosted, &kernels[index], excluded, |local| {
+                        suite_of(local, members)
+                    })?;
                     break;
                 }
             }
@@ -797,7 +915,11 @@ fn fail_chunk(
     excluded
         .lock()
         .map_err(|_| io::Error::other("poisoned"))?
-        .extend(hosted.iter().map(|&local| plan.suites[suite_of(local)].path.clone()));
+        .extend(
+            hosted
+                .iter()
+                .map(|&local| plan.suites[suite_of(local)].path.clone()),
+        );
     crate::stamp::write_atomic(&kernel.with_extension("dill.failed"), b"")
 }
 
@@ -856,15 +978,21 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Hosting>> {
     let Ok(packages) = config.resolve(dart_tool) else {
         return Ok(stock());
     };
-    let lib_dirs: FxHashMap<&str, &Path> =
-        packages.iter().map(|package| (package.name.as_str(), package.lib_dir.as_path())).collect();
+    let lib_dirs: FxHashMap<&str, &Path> = packages
+        .iter()
+        .map(|package| (package.name.as_str(), package.lib_dir.as_path()))
+        .collect();
     let framework: Option<PathBuf> = config
         .additional_properties
         .get("flutterRoot")
         .and_then(serde_json::Value::as_str)
         .and_then(|uri| uri.strip_prefix("file://"))
         .map(PathBuf::from);
-    let in_framework = |path: &Path| framework.as_deref().is_some_and(|sdk| path.starts_with(sdk));
+    let in_framework = |path: &Path| {
+        framework
+            .as_deref()
+            .is_some_and(|sdk| path.starts_with(sdk))
+    };
 
     // Breadth-first over the closure, one frontier read in parallel.
     #[derive(Default)]
@@ -880,13 +1008,19 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Hosting>> {
     let mut frontier: Vec<PathBuf> = Vec::new();
     for suite in suites {
         if !ids.contains_key(suite) {
-            ids.insert(suite.clone(), u32::try_from(nodes.len()).unwrap_or(u32::MAX));
+            ids.insert(
+                suite.clone(),
+                u32::try_from(nodes.len()).unwrap_or(u32::MAX),
+            );
             nodes.push(Node::default());
             frontier.push(suite.clone());
         }
     }
     while !frontier.is_empty() {
-        let read: Vec<(PathBuf, Option<(crate::deps::FileFacts, Option<Vec<PathBuf>>)>)> = frontier
+        let read: Vec<(
+            PathBuf,
+            Option<(crate::deps::FileFacts, Option<Vec<PathBuf>>)>,
+        )> = frontier
             .par_drain(..)
             .map(|path| {
                 let Ok(bytes) = std::fs::read(&path) else {
@@ -899,7 +1033,12 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Hosting>> {
                     .iter()
                     .map(|uri| crate::cache::resolve_uri(&path, uri, &lib_dirs))
                     .collect::<Option<Vec<Option<PathBuf>>>>()
-                    .map(|deps| deps.into_iter().flatten().filter(|dep| !in_framework(dep)).collect());
+                    .map(|deps| {
+                        deps.into_iter()
+                            .flatten()
+                            .filter(|dep| !in_framework(dep))
+                            .collect()
+                    });
                 (path, Some((facts, deps)))
             })
             .collect();
@@ -969,7 +1108,10 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Hosting>> {
             } else {
                 Placement::Shared
             };
-            Hosting { placement, shardable }
+            Hosting {
+                placement,
+                shardable,
+            }
         })
         .collect())
 }
@@ -996,15 +1138,21 @@ pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Ve
     let config = dartq_pub::PackageConfig::parse(&text).ok()?;
     let dart_tool = config_path.parent()?;
     let packages = config.resolve(dart_tool).ok()?;
-    let lib_dirs: FxHashMap<&str, &Path> =
-        packages.iter().map(|package| (package.name.as_str(), package.lib_dir.as_path())).collect();
+    let lib_dirs: FxHashMap<&str, &Path> = packages
+        .iter()
+        .map(|package| (package.name.as_str(), package.lib_dir.as_path()))
+        .collect();
     let framework: Option<PathBuf> = config
         .additional_properties
         .get("flutterRoot")
         .and_then(serde_json::Value::as_str)
         .and_then(|uri| uri.strip_prefix("file://"))
         .map(PathBuf::from);
-    let in_framework = |path: &Path| framework.as_deref().is_some_and(|sdk| path.starts_with(sdk));
+    let in_framework = |path: &Path| {
+        framework
+            .as_deref()
+            .is_some_and(|sdk| path.starts_with(sdk))
+    };
 
     // Breadth-first over the union closure, one frontier read in parallel.
     // Framework files are the toolchain every suite runs on and are covered
@@ -1025,14 +1173,21 @@ pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Ve
         let read: Vec<(PathBuf, Option<Vec<PathBuf>>)> = frontier
             .par_drain(..)
             .map(|path| {
-                let Ok(bytes) = std::fs::read(&path) else { return (path, None) };
+                let Ok(bytes) = std::fs::read(&path) else {
+                    return (path, None);
+                };
                 let facts = crate::deps::facts(&bytes);
                 let deps = facts
                     .uris
                     .iter()
                     .map(|uri| crate::cache::resolve_uri(&path, uri, &lib_dirs))
                     .collect::<Option<Vec<Option<PathBuf>>>>()
-                    .map(|deps| deps.into_iter().flatten().filter(|dep| !in_framework(dep)).collect());
+                    .map(|deps| {
+                        deps.into_iter()
+                            .flatten()
+                            .filter(|dep| !in_framework(dep))
+                            .collect()
+                    });
                 (path, deps)
             })
             .collect();
@@ -1082,7 +1237,11 @@ pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Ve
     // files `Recipe::load` reads), so an upgrade re-keys every chunk even
     // with argv and package_config unchanged.
     let mut stamps = blake3::Hasher::new();
-    for stamp in ["bin/cache/flutter.version.json", "bin/cache/engine.stamp", "bin/cache/dart-sdk/version"] {
+    for stamp in [
+        "bin/cache/flutter.version.json",
+        "bin/cache/engine.stamp",
+        "bin/cache/dart-sdk/version",
+    ] {
         stamps.update(&std::fs::read(sdk.join(stamp)).unwrap_or_default());
     }
     let stamps: [u8; 32] = *stamps.finalize().as_bytes();
@@ -1127,8 +1286,17 @@ impl Recipe {
     /// I/O failures reading the toolchain stamps or running the probe.
     pub fn load(flutter: &Path, root: &Path, args: &[String]) -> io::Result<Option<Self>> {
         let mut hasher = blake3::Hasher::new();
-        let sdk = flutter.canonicalize()?.parent().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
-        for stamp in ["bin/cache/flutter.version.json", "bin/cache/engine.stamp", "bin/cache/dart-sdk/version"] {
+        let sdk = flutter
+            .canonicalize()?
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        for stamp in [
+            "bin/cache/flutter.version.json",
+            "bin/cache/engine.stamp",
+            "bin/cache/dart-sdk/version",
+        ] {
             hasher.update(stamp.as_bytes());
             hasher.update(&std::fs::read(sdk.join(stamp)).unwrap_or_default());
         }
@@ -1162,7 +1330,11 @@ impl Recipe {
         // it, not len+mtime — the tool touches it on every one of its own
         // runs without changing contents, and mtime would re-probe forever.
         let bundle = root.join("build").join("unit_test_assets");
-        for name in ["AssetManifest.bin", "FontManifest.json", "NativeAssetsManifest.json"] {
+        for name in [
+            "AssetManifest.bin",
+            "FontManifest.json",
+            "NativeAssetsManifest.json",
+        ] {
             hasher.update(name.as_bytes());
             hasher.update(&std::fs::read(bundle.join(name)).unwrap_or_default());
         }
@@ -1173,7 +1345,10 @@ impl Recipe {
             key: String,
             recipe: Recipe,
         }
-        if let Some(stored) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok()) {
+        if let Some(stored) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok())
+        {
             if stored.key == key {
                 return Ok(Some(stored.recipe));
             }
@@ -1181,7 +1356,11 @@ impl Recipe {
         let Some(recipe) = Self::probe(flutter, root, args)? else {
             return Ok(None);
         };
-        let bytes = serde_json::to_vec(&Stored { key, recipe: recipe.clone() }).map_err(io::Error::other)?;
+        let bytes = serde_json::to_vec(&Stored {
+            key,
+            recipe: recipe.clone(),
+        })
+        .map_err(io::Error::other)?;
         crate::stamp::write_atomic(&path, &bytes)?;
         Ok(Some(recipe))
     }
@@ -1191,11 +1370,21 @@ impl Recipe {
 /// native-asset build before every run.
 fn has_build_hooks(root: &Path) -> bool {
     let config_path = crate::cache::package_config_path(root);
-    let Ok(text) = std::fs::read_to_string(&config_path) else { return true };
-    let Ok(config) = dartq_pub::PackageConfig::parse(&text) else { return true };
-    let Some(dart_tool) = config_path.parent() else { return true };
-    let Ok(packages) = config.resolve(dart_tool) else { return true };
-    packages.iter().any(|package| package.root.join("hook").join("build.dart").is_file())
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return true;
+    };
+    let Ok(config) = dartq_pub::PackageConfig::parse(&text) else {
+        return true;
+    };
+    let Some(dart_tool) = config_path.parent() else {
+        return true;
+    };
+    let Ok(packages) = config.resolve(dart_tool) else {
+        return true;
+    };
+    packages
+        .iter()
+        .any(|package| package.root.join("hook").join("build.dart").is_file())
 }
 
 #[cfg(test)]
@@ -1211,20 +1400,42 @@ mod tests {
     #[test]
     fn recipe_follows_the_tools_trace() {
         let recipe = Recipe::parse(TRACE).expect("recipe");
-        assert_eq!(recipe.compiler[0], "/sdk/bin/cache/dart-sdk/bin/dartaotruntime");
+        assert_eq!(
+            recipe.compiler[0],
+            "/sdk/bin/cache/dart-sdk/bin/dartaotruntime"
+        );
         // Per-run arguments are dartq's; everything else is the tool's.
-        for dropped in ["--incremental", "--output-dill", "/t/output.dill", "--packages", "--initialize-from-dill", "/p/build/x.dill"] {
-            assert!(!recipe.compiler.iter().any(|arg| arg == dropped), "{dropped}");
+        for dropped in [
+            "--incremental",
+            "--output-dill",
+            "/t/output.dill",
+            "--packages",
+            "--initialize-from-dill",
+            "/p/build/x.dill",
+        ] {
+            assert!(
+                !recipe.compiler.iter().any(|arg| arg == dropped),
+                "{dropped}"
+            );
         }
-        for kept in ["--target=flutter", "-DFLUTTER_VERSION=3.47.1", "--track-widget-creation", "--enable-experiment=alternative-invalidation-strategy"] {
+        for kept in [
+            "--target=flutter",
+            "-DFLUTTER_VERSION=3.47.1",
+            "--track-widget-creation",
+            "--enable-experiment=alternative-invalidation-strategy",
+        ] {
             assert!(recipe.compiler.iter().any(|arg| arg == kept), "{kept}");
         }
-        assert_eq!(recipe.tester.last().map(String::as_str), Some("--flutter-assets-dir=/p/build/unit_test_assets"));
+        assert_eq!(
+            recipe.tester.last().map(String::as_str),
+            Some("--flutter-assets-dir=/p/build/unit_test_assets")
+        );
         // The tester environment is what the probe observed, minus the
         // runner port and the fonts file dartq writes itself.
         assert_eq!(
             recipe.environment,
-            [("APP_NAME", "p"), ("FLUTTER_TEST", "true"), ("HOME", "/h")].map(|(k, v)| (k.to_owned(), v.to_owned()))
+            [("APP_NAME", "p"), ("FLUTTER_TEST", "true"), ("HOME", "/h")]
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
         );
         assert!(recipe.fonts.contains("<dir>/sdk/bin/cache/artifacts</dir>"));
         // A tester argument the trace cannot split back is refused.
@@ -1234,7 +1445,13 @@ mod tests {
 
     #[test]
     fn chunk_entries_wire_each_suite_like_the_stock_bootstrap() {
-        let plain = Hosted { path: PathBuf::from("/p/test/a b_test.dart"), config: None, fresh: false, digest: None, shard_total: 1 };
+        let plain = Hosted {
+            path: PathBuf::from("/p/test/a b_test.dart"),
+            config: None,
+            fresh: false,
+            digest: None,
+            shard_total: 1,
+        };
         let wrapped = Hosted {
             path: PathBuf::from("/p/test/w/x_test.dart"),
             config: Some(PathBuf::from("/p/test/flutter_test_config.dart")),
@@ -1269,17 +1486,37 @@ mod tests {
         );
         write("lib/fonts.dart", "void load() { FontLoader('x'); }");
         write("lib/via.dart", "import 'fonts.dart';\nvoid f() {}");
-        write("lib/script.dart", "import 'dart:io';\nvar s = Platform.script;");
-        let plain = write("test/a_test.dart", "import 'package:p/missing.dart';\nvoid main() {}");
-        let fresh = write("test/b_test.dart", "import 'package:p/via.dart';\nvoid main() {}");
-        let stock = write("test/c_test.dart", "import '../lib/script.dart';\nvoid main() {}");
+        write(
+            "lib/script.dart",
+            "import 'dart:io';\nvar s = Platform.script;",
+        );
+        let plain = write(
+            "test/a_test.dart",
+            "import 'package:p/missing.dart';\nvoid main() {}",
+        );
+        let fresh = write(
+            "test/b_test.dart",
+            "import 'package:p/via.dart';\nvoid main() {}",
+        );
+        let stock = write(
+            "test/c_test.dart",
+            "import '../lib/script.dart';\nvoid main() {}",
+        );
         let opaque = write("test/d_test.dart", "import 'x$y.dart';\nvoid main() {}");
         let placements: Vec<Placement> = place(&root, &[plain, fresh, stock, opaque])
             .expect("placed")
             .iter()
             .map(|hosting| hosting.placement)
             .collect();
-        assert_eq!(placements, [Placement::Shared, Placement::Fresh, Placement::Stock, Placement::Stock]);
+        assert_eq!(
+            placements,
+            [
+                Placement::Shared,
+                Placement::Fresh,
+                Placement::Stock,
+                Placement::Stock
+            ]
+        );
     }
 
     /// `shardable` is read from the suite's own file only: a marker in a
@@ -1300,12 +1537,21 @@ mod tests {
             r#"{"configVersion":2,"packages":[{"name":"p","rootUri":"../","packageUri":"lib/"}]}"#,
         );
         write("lib/marked.dart", "// dartq: shardable\nvoid f() {}");
-        let marked = write("test/marked_test.dart", "// dartq: shardable both halves are independent\nvoid main() {}");
-        let via_helper = write("test/helper_test.dart", "import 'package:p/marked.dart';\nvoid main() {}");
+        let marked = write(
+            "test/marked_test.dart",
+            "// dartq: shardable both halves are independent\nvoid main() {}",
+        );
+        let via_helper = write(
+            "test/helper_test.dart",
+            "import 'package:p/marked.dart';\nvoid main() {}",
+        );
         let plain = write("test/plain_test.dart", "void main() {}");
         let hostings = place(&root, &[marked, via_helper, plain]).expect("placed");
         assert_eq!(
-            hostings.iter().map(|hosting| hosting.shardable).collect::<Vec<_>>(),
+            hostings
+                .iter()
+                .map(|hosting| hosting.shardable)
+                .collect::<Vec<_>>(),
             [true, false, false]
         );
     }
@@ -1315,7 +1561,11 @@ mod tests {
     #[test]
     fn recipe_parse_refuses_ambiguous_or_incomplete_traces() {
         let drop_line = |needle: &str| {
-            TRACE.lines().filter(|line| !line.contains(needle)).collect::<Vec<_>>().join("\n")
+            TRACE
+                .lines()
+                .filter(|line| !line.contains(needle))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         // The compiler line, the tester line and the environment event are
         // all required.
@@ -1341,7 +1591,13 @@ mod tests {
         assert!(Recipe::parse(&swapped).is_none());
         // The fonts configuration is derived from the compiler's SDK cache;
         // a compiler outside one yields no recipe.
-        assert!(Recipe::parse(&TRACE.replace("/sdk/bin/cache/dart-sdk/bin/dartaotruntime", "/opt/dart/dartaotruntime")).is_none());
+        assert!(
+            Recipe::parse(&TRACE.replace(
+                "/sdk/bin/cache/dart-sdk/bin/dartaotruntime",
+                "/opt/dart/dartaotruntime"
+            ))
+            .is_none()
+        );
     }
 
     /// Suites wrapped by the same `flutter_test_config.dart` share its
@@ -1366,7 +1622,9 @@ mod tests {
         assert!(src.contains("const int _chunk = 1;"));
         for (suite, config) in [("s0", "c0"), ("s2", "c0"), ("s3", "c1")] {
             assert!(
-                src.contains(&format!("{config}.testExecutable(() async {{ await Future({suite}.main); }})")),
+                src.contains(&format!(
+                    "{config}.testExecutable(() async {{ await Future({suite}.main); }})"
+                )),
                 "{suite}"
             );
         }
@@ -1388,7 +1646,11 @@ mod tests {
         // Outside the package, spelled as canonically as the resolved
         // imports will be (the framework prefix check compares paths).
         let sdk = root.parent().expect("tmp parent").join("sdk");
-        write(&sdk, "packages/fw/lib/launch.dart", "import 'dart:io';\nvar s = Platform.script;\n");
+        write(
+            &sdk,
+            "packages/fw/lib/launch.dart",
+            "import 'dart:io';\nvar s = Platform.script;\n",
+        );
         let config = format!(
             concat!(
                 r#"{{"configVersion":2,"packages":["#,
@@ -1400,15 +1662,30 @@ mod tests {
         );
         std::fs::create_dir_all(root.join(".dart_tool")).expect("dir");
         std::fs::write(root.join(".dart_tool/package_config.json"), config).expect("write");
-        let own = write(&root, "test/own_test.dart", "void main() { FontLoader('x'); }");
-        let unknown = write(&root, "test/unknown_test.dart", "import 'package:nosuch/x.dart';\nvoid main() {}");
-        let framework = write(&root, "test/fw_test.dart", "import 'package:fw/launch.dart';\nvoid main() {}");
+        let own = write(
+            &root,
+            "test/own_test.dart",
+            "void main() { FontLoader('x'); }",
+        );
+        let unknown = write(
+            &root,
+            "test/unknown_test.dart",
+            "import 'package:nosuch/x.dart';\nvoid main() {}",
+        );
+        let framework = write(
+            &root,
+            "test/fw_test.dart",
+            "import 'package:fw/launch.dart';\nvoid main() {}",
+        );
         let placements: Vec<Placement> = place(&root, &[own, unknown, framework])
             .expect("placed")
             .iter()
             .map(|hosting| hosting.placement)
             .collect();
-        assert_eq!(placements, [Placement::Fresh, Placement::Stock, Placement::Shared]);
+        assert_eq!(
+            placements,
+            [Placement::Fresh, Placement::Stock, Placement::Shared]
+        );
     }
 
     /// The chunk key is a content identity: identical inputs produce the
@@ -1457,29 +1734,69 @@ mod tests {
         let members = vec![0usize, 1usize];
         let locals = vec![0usize, 1usize];
         let key = chunk_key(&plan, 0, &locals, |local| members[local]);
-        assert_eq!(key, chunk_key(&plan, 0, &locals, |local| members[local]), "same inputs same key");
+        assert_eq!(
+            key,
+            chunk_key(&plan, 0, &locals, |local| members[local]),
+            "same inputs same key"
+        );
         // The resolution bytes are an input.
-        std::fs::write(&packages, br#"{"configVersion":2,"packages":[{"name":"x","rootUri":"../","packageUri":"lib/"}]}"#).expect("write");
-        assert_ne!(key, chunk_key(&plan, 0, &locals, |local| members[local]), "resolution change re-keys");
+        std::fs::write(
+            &packages,
+            br#"{"configVersion":2,"packages":[{"name":"x","rootUri":"../","packageUri":"lib/"}]}"#,
+        )
+        .expect("write");
+        assert_ne!(
+            key,
+            chunk_key(&plan, 0, &locals, |local| members[local]),
+            "resolution change re-keys"
+        );
         std::fs::write(&packages, br#"{"configVersion":2,"packages":[]}"#).expect("write");
         // A different member set re-keys (and a retried subset differs from
         // the full set it was reduced from).
         let subset = vec![0usize];
-        assert_ne!(key, chunk_key(&plan, 0, &subset, |local| members[local]), "member set re-keys");
+        assert_ne!(
+            key,
+            chunk_key(&plan, 0, &subset, |local| members[local]),
+            "member set re-keys"
+        );
         // A different chunk index re-keys (the entry's `_chunk` differs).
-        assert_ne!(key, chunk_key(&plan, 1, &locals, |local| members[local]), "chunk index re-keys");
+        assert_ne!(
+            key,
+            chunk_key(&plan, 1, &locals, |local| members[local]),
+            "chunk index re-keys"
+        );
         // A different compiler command re-keys.
-        let other_recipe = Recipe { compiler: vec!["fe".to_owned(), "--target=flutter2".to_owned()], ..recipe.clone() };
-        let other_plan = Plan { recipe: &other_recipe, ..plan };
-        assert_ne!(key, chunk_key(&other_plan, 0, &locals, |local| members[local]), "compiler command re-keys");
+        let other_recipe = Recipe {
+            compiler: vec!["fe".to_owned(), "--target=flutter2".to_owned()],
+            ..recipe.clone()
+        };
+        let other_plan = Plan {
+            recipe: &other_recipe,
+            ..plan
+        };
+        assert_ne!(
+            key,
+            chunk_key(&other_plan, 0, &locals, |local| members[local]),
+            "compiler command re-keys"
+        );
         // A changed run-cache key re-keys (that key is what carries a
         // source/lib/dependency/config byte change into the chunk).
         let moved = [
-            Hosted { digest: Some("cachekey-a2".to_owned()), ..suites[0].clone() },
+            Hosted {
+                digest: Some("cachekey-a2".to_owned()),
+                ..suites[0].clone()
+            },
             suites[1].clone(),
         ];
-        let moved_plan = Plan { suites: &moved, ..plan };
-        assert_ne!(key, chunk_key(&moved_plan, 0, &locals, |local| members[local]), "suite cache-key change re-keys");
+        let moved_plan = Plan {
+            suites: &moved,
+            ..plan
+        };
+        assert_ne!(
+            key,
+            chunk_key(&moved_plan, 0, &locals, |local| members[local]),
+            "suite cache-key change re-keys"
+        );
     }
 
     /// A byte flip inside a suite's import closure — not an entry input —
@@ -1500,7 +1817,13 @@ mod tests {
             fonts: String::new(),
         };
         // No run-cache key: the file bytes are the chunk key's floor.
-        let no_key = [Hosted { path: suite_file.clone(), config: None, fresh: false, digest: None, shard_total: 1 }];
+        let no_key = [Hosted {
+            path: suite_file.clone(),
+            config: None,
+            fresh: false,
+            digest: None,
+            shard_total: 1,
+        }];
         let plan = Plan {
             root: tmp.path(),
             vm: Path::new("/vm"),
@@ -1515,15 +1838,35 @@ mod tests {
         let locals = vec![0usize];
         let before = chunk_key(&plan, 0, &locals, |local| members[local]);
         std::fs::write(&suite_file, b"void main() {}\n").expect("write");
-        assert_ne!(before, chunk_key(&plan, 0, &locals, |local| members[local]), "a source byte re-keys");
+        assert_ne!(
+            before,
+            chunk_key(&plan, 0, &locals, |local| members[local]),
+            "a source byte re-keys"
+        );
         // With a run-cache key the file bytes are no longer hashed — the key
         // is. A changed cache key re-keys even when file bytes are identical.
-        let with_key = [Hosted { digest: Some("closure-digest-v1".to_owned()), ..no_key[0].clone() }];
-        let plan = Plan { suites: &with_key, ..plan };
+        let with_key = [Hosted {
+            digest: Some("closure-digest-v1".to_owned()),
+            ..no_key[0].clone()
+        }];
+        let plan = Plan {
+            suites: &with_key,
+            ..plan
+        };
         let k1 = chunk_key(&plan, 0, &locals, |local| members[local]);
-        let with_key2 = [Hosted { digest: Some("closure-digest-v2".to_owned()), ..no_key[0].clone() }];
-        let plan = Plan { suites: &with_key2, ..plan };
-        assert_ne!(k1, chunk_key(&plan, 0, &locals, |local| members[local]), "a closure digest change re-keys");
+        let with_key2 = [Hosted {
+            digest: Some("closure-digest-v2".to_owned()),
+            ..no_key[0].clone()
+        }];
+        let plan = Plan {
+            suites: &with_key2,
+            ..plan
+        };
+        assert_ne!(
+            k1,
+            chunk_key(&plan, 0, &locals, |local| members[local]),
+            "a closure digest change re-keys"
+        );
     }
 
     /// A `flutter_test_config.dart` is read as bytes when the suite has no
@@ -1538,8 +1881,19 @@ mod tests {
         let config_file = tmp.path().join("flutter_test_config.dart");
         std::fs::write(&suite_file, b"void main() {}").expect("write");
         std::fs::write(&config_file, b"// config v1").expect("write");
-        let recipe = Recipe { compiler: vec!["fe".to_owned()], tester: vec![], environment: vec![], fonts: String::new() };
-        let suites = [Hosted { path: suite_file, config: Some(config_file.clone()), fresh: false, digest: None, shard_total: 1 }];
+        let recipe = Recipe {
+            compiler: vec!["fe".to_owned()],
+            tester: vec![],
+            environment: vec![],
+            fonts: String::new(),
+        };
+        let suites = [Hosted {
+            path: suite_file,
+            config: Some(config_file.clone()),
+            fresh: false,
+            digest: None,
+            shard_total: 1,
+        }];
         let plan = Plan {
             root: tmp.path(),
             vm: Path::new("/vm"),
@@ -1554,7 +1908,11 @@ mod tests {
         let locals = vec![0usize];
         let before = chunk_key(&plan, 0, &locals, |local| members[local]);
         std::fs::write(&config_file, b"// config v2").expect("write");
-        assert_ne!(before, chunk_key(&plan, 0, &locals, |local| members[local]), "a config byte re-keys");
+        assert_ne!(
+            before,
+            chunk_key(&plan, 0, &locals, |local| members[local]),
+            "a config byte re-keys"
+        );
     }
 
     /// `closure_digests` digests every file a suite's imports reach: a byte
@@ -1577,23 +1935,30 @@ mod tests {
             r#"{"configVersion":2,"packages":[{"name":"p","rootUri":"../","packageUri":"lib/"}]}"#,
         );
         let dep = write("lib/helper.dart", "int answer() => 41;");
-        let suite = write("test/a_test.dart", "import 'package:p/helper.dart';\nvoid main() {}");
+        let suite = write(
+            "test/a_test.dart",
+            "import 'package:p/helper.dart';\nvoid main() {}",
+        );
         let sdk = root.join("sdk");
         std::fs::create_dir_all(sdk.join("bin/cache/dart-sdk")).expect("sdk dirs");
         std::fs::write(sdk.join("bin/cache/dart-sdk/version"), b"3.13.1").expect("version");
 
-        let first = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        let first =
+            closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
         // Same tree, same digest — deterministic across calls.
-        let again = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        let again =
+            closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
         assert_eq!(first, again, "an unchanged tree digests identically");
         // One byte in a transitively-imported lib file re-keys the suite.
         std::fs::write(&dep, "int answer() => 42;").expect("write");
-        let changed = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        let changed =
+            closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
         assert_ne!(first, changed, "a lib byte flip re-keys the suite");
         // And the toolchain stamp is an input: a version bump re-keys even
         // with argv and package_config untouched.
         std::fs::write(sdk.join("bin/cache/dart-sdk/version"), b"3.13.2").expect("version");
-        let upgraded = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        let upgraded =
+            closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
         assert_ne!(changed, upgraded, "a toolchain stamp bump re-keys");
     }
 }

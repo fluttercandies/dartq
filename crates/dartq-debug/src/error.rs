@@ -40,7 +40,9 @@ pub enum Error {
     /// The peer's protocol major version differs from the one this
     /// client implements (major bumps are, by spec, potentially
     /// incompatible changes).
-    #[error("incompatible protocol version {found_major}.{found_minor}; expected major {expected_major}")]
+    #[error(
+        "incompatible protocol version {found_major}.{found_minor}; expected major {expected_major}"
+    )]
     VersionIncompatible {
         /// The major version this client speaks.
         expected_major: u64,

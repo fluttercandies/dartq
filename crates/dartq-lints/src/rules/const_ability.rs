@@ -1756,12 +1756,21 @@ mod w3_const_pins {
         let vendored = Fixture::parse(VENDORED);
         let named = Fixture::parse(NAMED);
         // The fallback (the plain-run posture).
-        assert!(!spells_meta_library(&unit(&vendored), None), "vendored meta");
+        assert!(
+            !spells_meta_library(&unit(&vendored), None),
+            "vendored meta"
+        );
         assert!(spells_meta_library(&unit(&named), None), "named meta");
         // The mounted fold, the graph's declared name fed as the engine
         // feeds it.
-        assert!(!mounted_gate(&vendored, None), "vendored meta, unnamed graph");
-        assert!(mounted_gate(&named, Some("meta")), "named meta, named graph");
+        assert!(
+            !mounted_gate(&vendored, None),
+            "vendored meta, unnamed graph"
+        );
+        assert!(
+            mounted_gate(&named, Some("meta")),
+            "named meta, named graph"
+        );
     }
 
     /// The gate over a semantics-mounted run: the source folded as the sole
@@ -1787,8 +1796,7 @@ mod w3_const_pins {
         }
         let mut index = dartq_semantic::ElementIndex::default();
         index.insert(file, elements);
-        let graph: &'static dartq_resolution::LibraryGraph =
-            Box::leak(Box::new(builder.finish()));
+        let graph: &'static dartq_resolution::LibraryGraph = Box::leak(Box::new(builder.finish()));
         let namespaces: &'static dartq_resolution::Namespaces =
             Box::leak(Box::new(dartq_resolution::Namespaces::build(graph)));
         let index: &'static dartq_semantic::ElementIndex = Box::leak(Box::new(index));

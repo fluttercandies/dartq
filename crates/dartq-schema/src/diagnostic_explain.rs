@@ -42,8 +42,8 @@ use serde_json::{Value, json};
 
 use crate::diagnostics::{DIAGNOSTIC_TYPES, SEVERITIES};
 use crate::support::{
-    absent, array, enum_spelling, exact_fields, field, join, non_negative, object,
-    pinned_version, string,
+    absent, array, enum_spelling, exact_fields, field, join, non_negative, object, pinned_version,
+    string,
 };
 use crate::{SchemaViolation, Verbosity};
 
@@ -158,8 +158,7 @@ static DIAGNOSTIC_EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 /// The lint-registry group spellings (`dartq-lints`' `Group` —
 /// core/recommended member, the diagnostic mirror, the SDK-removed
 /// registrations, and the options-driven standalone rest).
-pub const RULE_GROUPS: &[&str] =
-    &["core", "recommended", "diagnostic", "removed", "standalone"];
+pub const RULE_GROUPS: &[&str] = &["core", "recommended", "diagnostic", "removed", "standalone"];
 
 const TOP: &[&str] = &["v", "diagnostic"];
 const TOP_OPTIONAL: &[&str] = &["why", "doc", "related", "fixes"];
@@ -379,10 +378,8 @@ mod tests {
     /// not carry `fixes` or `related.lines`; `full` carries them.
     #[test]
     fn tiers_enforce_the_field_floor() {
-        let violation =
-            validate_diagnostic_explain_at_tier(&full_report(), Verbosity::Minimal).expect_err(
-                "minimal must not carry the registry/related/fix sections",
-            );
+        let violation = validate_diagnostic_explain_at_tier(&full_report(), Verbosity::Minimal)
+            .expect_err("minimal must not carry the registry/related/fix sections");
         assert_eq!(violation.path, "why");
         assert_eq!(violation.expected, "omitted at the minimal tier");
 
@@ -414,14 +411,12 @@ mod tests {
     fn violations_name_the_first_bad_field() {
         let mut bad = full_report();
         bad["diagnostic"]["sev"] = json!("BLOCKER");
-        let violation =
-            validate_diagnostic_explain(&bad).expect_err("unknown severity spelling");
+        let violation = validate_diagnostic_explain(&bad).expect_err("unknown severity spelling");
         assert_eq!(violation.path, "diagnostic.sev");
 
         let mut bad = full_report();
         bad["why"]["trigger_kind"] = json!("magic");
-        let violation =
-            validate_diagnostic_explain(&bad).expect_err("unknown trigger kind");
+        let violation = validate_diagnostic_explain(&bad).expect_err("unknown trigger kind");
         assert_eq!(violation.path, "why.trigger_kind");
 
         let mut bad = full_report();

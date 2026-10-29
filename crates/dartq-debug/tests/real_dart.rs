@@ -19,15 +19,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dartq_debug::{
-    BreakpointLocationSpec, BreakpointSpec, DebugSession, LaunchConfig, SessionConfig,
-    StepOption, StoppedReason, VmObject,
+    BreakpointLocationSpec, BreakpointSpec, DebugSession, LaunchConfig, SessionConfig, StepOption,
+    StoppedReason, VmObject,
 };
 
 #[test]
 #[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART_BIN)"]
 fn live_debug_session() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/hello.dart");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.dart");
     assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
 
     let settings = SessionConfig {
@@ -35,11 +34,8 @@ fn live_debug_session() {
         rpc_timeout: Duration::from_secs(10),
         ..SessionConfig::default()
     };
-    let mut session = DebugSession::launch_with(
-        LaunchConfig::new(&fixture),
-        settings,
-    )
-    .unwrap_or_else(|error| panic!("launch failed (is `dart` installed?): {error}"));
+    let mut session = DebugSession::launch_with(LaunchConfig::new(&fixture), settings)
+        .unwrap_or_else(|error| panic!("launch failed (is `dart` installed?): {error}"));
 
     assert!(session.main_isolate().is_some(), "no main isolate");
 
@@ -86,7 +82,10 @@ fn live_debug_session() {
             }
         }
     }
-    assert_eq!(snapshot.location.script_uri.as_deref(), Some(script_uri.as_str()));
+    assert_eq!(
+        snapshot.location.script_uri.as_deref(),
+        Some(script_uri.as_str())
+    );
     assert_eq!(snapshot.location.line, Some(6));
     // The spec marks `Frame.vars` as optional — the VM may omit locals
     // for a paused frame. When it does enumerate them, `counter` must
@@ -125,16 +124,25 @@ fn live_debug_session() {
         .expect("step over");
     // The VM reports a completed step as a breakpoint-less
     // `PauseBreakpoint`, which the session surfaces as `Step`.
-    assert_eq!(stepped.reason, StoppedReason::Step, "step over landed on {stepped:?}");
+    assert_eq!(
+        stepped.reason,
+        StoppedReason::Step,
+        "step over landed on {stepped:?}"
+    );
     assert_eq!(stepped.location.line, Some(7), "step over from line 6");
 
-    session.remove_breakpoint(None, &handle.id).expect("remove breakpoint");
+    session
+        .remove_breakpoint(None, &handle.id)
+        .expect("remove breakpoint");
 
     // The remaining program output shows up in the stdout ring.
     session.resume(None).expect("final resume");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut output = Vec::new();
-    while !output.windows(b"counter=1".len()).any(|window| window == b"counter=1") {
+    while !output
+        .windows(b"counter=1".len())
+        .any(|window| window == b"counter=1")
+    {
         session.poll_events().expect("poll output");
         let batch = session.stdout_since(0, usize::MAX);
         output = batch.bytes;

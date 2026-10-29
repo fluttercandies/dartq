@@ -115,18 +115,17 @@ fn default_missing_kind_is_the_symbol_answer() {
     assert_eq!(absent["sym"], "Foo");
     let decls = absent["decls"].as_array().expect("decls");
     assert_eq!(decls.len(), 1);
-    assert_eq!(decls[0]["file"], "lib/a.dart", "the unified locator's root-relative spelling");
+    assert_eq!(
+        decls[0]["file"], "lib/a.dart",
+        "the unified locator's root-relative spelling"
+    );
     assert_eq!(decls[0]["kind"], "class");
     assert_eq!(decls[0]["name"], "Foo");
     assert_eq!(decls[0]["line"], 1);
     assert_eq!(decls[0]["col"], 7);
     assert_eq!(decls[0]["len"], 3);
     let refs = absent["refs"].as_array().expect("refs");
-    assert_eq!(
-        refs.len(),
-        2,
-        "the annotation use plus the invocation"
-    );
+    assert_eq!(refs.len(), 2, "the annotation use plus the invocation");
     assert_eq!(refs[0]["kind"], "reference");
     assert_eq!(refs[0]["off"], 33);
     assert_eq!(refs[1]["kind"], "invoked");
@@ -158,10 +157,16 @@ fn minimal_tier_keeps_the_package_form_labels() {
     let result = answer_result(&h, 2);
     let decls = result["decls"].as_array().expect("decls");
     assert_eq!(decls.len(), 1);
-    assert_eq!(decls[0]["file"], "lib/a.dart", "the unified locator's root-relative spelling");
+    assert_eq!(
+        decls[0]["file"], "lib/a.dart",
+        "the unified locator's root-relative spelling"
+    );
     let refs = result["refs"].as_array().expect("refs");
     assert_eq!(refs.len(), 2);
-    assert_eq!(refs[0]["target"], "lib/a.dart", "the unified locator's root-relative spelling");
+    assert_eq!(
+        refs[0]["target"], "lib/a.dart",
+        "the unified locator's root-relative spelling"
+    );
     assert!(
         refs[0].get("file").is_none(),
         "the minimal red line keeps the target locator only: {row}",
@@ -243,11 +248,7 @@ fn callers_kind_keeps_the_invocation_rows() {
     let decls = result["decls"].as_array().expect("decls");
     assert_eq!(decls.len(), 1, "the declaration rows stay");
     let refs = result["refs"].as_array().expect("refs");
-    assert_eq!(
-        refs.len(),
-        1,
-        "only the invocation survives: {refs:?}"
-    );
+    assert_eq!(refs.len(), 1, "only the invocation survives: {refs:?}");
     assert_eq!(refs[0]["kind"], "invoked");
     assert_eq!(refs[0]["off"], 42);
     refs.iter().for_each(assert_reference_row_shape);

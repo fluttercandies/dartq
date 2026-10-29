@@ -146,12 +146,15 @@ impl Engine<'_> {
                 // only stands for a receiver that is not itself a member
                 // link (`ce.fragments.firstWhere` must not re-type
                 // `fragments`' result with `ce`'s face).
-                self.local_decl_at_read.get(&span.offset).copied().or_else(|| {
-                    self.chain_node_read(span, true)
-                        .is_none()
-                        .then(|| self.local_decl_at_member.get(&member_offset).copied())
-                        .flatten()
-                })
+                self.local_decl_at_read
+                    .get(&span.offset)
+                    .copied()
+                    .or_else(|| {
+                        self.chain_node_read(span, true)
+                            .is_none()
+                            .then(|| self.local_decl_at_member.get(&member_offset).copied())
+                            .flatten()
+                    })
             })?;
         let &(parse_ty, corrected) = self.rebound_locals.get(&decl)?;
         let recv_span = self

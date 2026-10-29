@@ -42,11 +42,8 @@ const CORRECTION: &str = "Try removing the catch or catching an 'Exception' inst
 /// without implementing `Error` (pinned by test). Message:
 /// `diagnostic.g.dart` `avoidCatchingErrorsClass` /
 /// `avoidCatchingErrorsSubclass`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_catching_errors",
-    &[NodeKind::CatchClause],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("avoid_catching_errors", &[NodeKind::CatchClause], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -163,8 +160,7 @@ mod tests {
     /// allowlist is name-level).
     #[test]
     fn user_same_name_still_reports() {
-        let source =
-            "class StateError {}\n\nvoid f() {\n  try {} on StateError catch (_) {}\n}\n";
+        let source = "class StateError {}\n\nvoid f() {\n  try {} on StateError catch (_) {}\n}\n";
         assert_eq!(run(source).len(), 1);
     }
 
@@ -172,7 +168,8 @@ mod tests {
     /// outside the allowlist stays silent.
     #[test]
     fn unknown_error_subtype_under_reports() {
-        let source = "class MyError extends Error {}\n\nvoid f() {\n  try {} on MyError catch (_) {}\n}\n";
+        let source =
+            "class MyError extends Error {}\n\nvoid f() {\n  try {} on MyError catch (_) {}\n}\n";
         assert!(run(source).is_empty());
     }
 

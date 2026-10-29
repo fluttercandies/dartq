@@ -116,9 +116,7 @@ fn peel_step(c: &Check<'_>, run: &[u32]) -> Option<Vec<u32>> {
                 end = prev;
             }
             match run.get(end.checked_sub(1)?).map(|&row| c.kind(row)) {
-                Some(NodeKind::DotAccess | NodeKind::Qualified) => {
-                    Some(run[..end - 1].to_vec())
-                }
+                Some(NodeKind::DotAccess | NodeKind::Qualified) => Some(run[..end - 1].to_vec()),
                 _ => None,
             }
         }

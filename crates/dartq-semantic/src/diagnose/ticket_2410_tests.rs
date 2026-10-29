@@ -67,7 +67,9 @@ fn report_ops(source: &str) -> FileReport {
     builder.seed_implicit_core(
         lib,
         core_file,
-        &["Object", "String", "int", "bool", "double", "num", "List", "Map"],
+        &[
+            "Object", "String", "int", "bool", "double", "num", "List", "Map",
+        ],
     );
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
@@ -179,11 +181,7 @@ fn report_two_file(main_source: &str, lib_source: &str) -> FileReport {
 }
 
 fn code_names(report: &FileReport) -> Vec<&'static str> {
-    report
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect()
+    report.diagnostics.iter().map(|d| d.code.name).collect()
 }
 
 /// The chase evidence row: the inner `x is <direct spelling>` inside the

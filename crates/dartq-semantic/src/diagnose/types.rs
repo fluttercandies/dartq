@@ -1946,10 +1946,7 @@ pub(crate) struct Engine<'a> {
     /// and the leaf segment's name plus span. The completion arms the
     /// LEAF's name (`p.C` keeps `C`); the prefix's own lexeme would name
     /// no container anywhere downstream.
-    pub(crate) pending_prefixed: Option<(
-        SourceRange,
-        Option<(StringId, SourceRange)>,
-    )>,
+    pub(crate) pending_prefixed: Option<(SourceRange, Option<(StringId, SourceRange)>)>,
     /// Suppression depth inside `is`/`as` type operands.
     pub(crate) non_type_pos: u32,
     /// Suppression depth inside `is` type operands only (the usage
@@ -5342,12 +5339,24 @@ mod boundary_projection {
         );
         assert_eq!(named, Ty::Dynamic, "a stale named face reads unknown");
         assert_eq!(
-            boundary.ty(foreign, Ty::Record { shape: record, nullable: false }),
+            boundary.ty(
+                foreign,
+                Ty::Record {
+                    shape: record,
+                    nullable: false
+                }
+            ),
             Ty::Dynamic,
             "a stale record face reads unknown"
         );
         assert_eq!(
-            boundary.ty(foreign, Ty::Function { shape: function, nullable: false }),
+            boundary.ty(
+                foreign,
+                Ty::Function {
+                    shape: function,
+                    nullable: false
+                }
+            ),
             Ty::Dynamic,
             "a stale function face reads unknown"
         );

@@ -147,7 +147,8 @@ fn stream_empty_const_factory_is_a_valid_constant() {
         ],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the upstream const factory redirect answers the implicit-const \
          question — the declaration stays silent"
     );
@@ -230,7 +231,8 @@ fn const_creation_argument_checks_the_creation_not_the_inner_literal() {
     let fold = unit_fold(CONST_CREATION_ARGUMENT, &strings);
     let got = code_offsets(&fold.report, &["argument_type_not_assignable"]);
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the oracle's downward inference instantiates `Expression<bool>` \
          from the context, so the `null` fits `bool?` — no argument face \
          against the outer parameter leaks from the inner literal"
@@ -259,7 +261,8 @@ fn const_creation_argument_silent_under_the_class_type_variable_context() {
     let fold = unit_fold(CONST_GENERIC_METHOD_CONTEXT, &strings);
     let got = code_offsets(&fold.report, &["argument_type_not_assignable"]);
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the drift corpus shape: `Expression<D>`'s context leaves the \
          creation's own `null` argument to the creation's faces — the \
          outer call stays silent"
@@ -324,7 +327,8 @@ fn implicit_call_yields_the_call_methods_return_type() {
     let fold = unit_fold(IMPLICIT_CALL_RETURN_TYPE, &strings);
     let got = code_offsets(&fold.report, &["return_of_invalid_type"]);
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the invocation's static type is `XPathSequence` (the call \
          method's return), so the return check passes — the receiver's \
          own type must not leak into the return face"

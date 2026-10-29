@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{PayloadField, Check, NONE_TOKEN, RuleSpec, last_child};
+use super::{Check, NONE_TOKEN, PayloadField, RuleSpec, last_child};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -27,11 +27,8 @@ use crate::rules::utf16_token_span;
 /// is `Type`, not the enum. Over-reports: none — a binding's written
 /// type is its static type. Message: `diagnostic.g.dart`
 /// `noDefaultCases`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_default_cases",
-    &[NodeKind::SwitchStatement],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("no_default_cases", &[NodeKind::SwitchStatement], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -57,8 +54,7 @@ fn check(c: &mut Check<'_>) {
     // A `case` clause in the switch head is not the lint's face (the
     // container's `CaseKeyword` word carries the `case` token when
     // present).
-    if c
-        .field(container, PayloadField::CaseKeyword)
+    if c.field(container, PayloadField::CaseKeyword)
         .is_some_and(|case| case != NONE_TOKEN)
     {
         return;
@@ -78,8 +74,7 @@ fn check(c: &mut Check<'_>) {
     let name = c.lexeme(c.head_token(*root));
     // The binding's written type names the scrutinee's static type at
     // the syntax level; untyped (`var`, dynamic) bails.
-    let Some(type_name) = crate::rules::expressions::same_file::written_type(c, *root, name)
-    else {
+    let Some(type_name) = crate::rules::expressions::same_file::written_type(c, *root, name) else {
         return;
     };
     let Some(declaration) = crate::rules::same_file_declaration(c, type_name) else {
@@ -91,8 +86,7 @@ fn check(c: &mut Check<'_>) {
     // The members ride the `SwitchBlock` child; the first `default`
     // member reports (payload word 0 is the `default` keyword, NONE
     // for a `case` — the official `member is SwitchDefault` face).
-    let Some(block) =
-        last_child(c, node).filter(|&block| c.kind(block) == NodeKind::SwitchBlock)
+    let Some(block) = last_child(c, node).filter(|&block| c.kind(block) == NodeKind::SwitchBlock)
     else {
         return;
     };
@@ -101,8 +95,7 @@ fn check(c: &mut Check<'_>) {
         .into_iter()
         .find(|&member| {
             c.kind(member) == NodeKind::SwitchCase
-                && c
-                    .field(member, PayloadField::DefaultKeyword)
+                && c.field(member, PayloadField::DefaultKeyword)
                     .is_some_and(|kw| kw != NONE_TOKEN)
         })
         .and_then(|member| c.field(member, PayloadField::DefaultKeyword))
@@ -184,7 +177,8 @@ mod tests {
     /// An untyped binding (dynamic) stays silent.
     #[test]
     fn untyped_binding_is_silent() {
-        let source = "enum E { a, b }\n\nvoid f(e) {\n  switch (e) {\n    default:\n      break;\n  }\n}\n";
+        let source =
+            "enum E { a, b }\n\nvoid f(e) {\n  switch (e) {\n    default:\n      break;\n  }\n}\n";
         assert!(run(source).is_empty());
     }
 
@@ -200,7 +194,8 @@ mod tests {
     /// official, a type literal's static type is `Type`.
     #[test]
     fn bare_enum_name_scrutinee_is_silent() {
-        let source = "enum E { a, b }\n\nvoid f() {\n  switch (E) {\n    default:\n      break;\n  }\n}\n";
+        let source =
+            "enum E { a, b }\n\nvoid f() {\n  switch (E) {\n    default:\n      break;\n  }\n}\n";
         assert!(run(source).is_empty());
     }
 }

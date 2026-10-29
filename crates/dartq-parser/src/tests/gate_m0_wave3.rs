@@ -636,10 +636,7 @@ fn stack_overflow_fuse_triple() {
     let mut collector = Collector::default();
     let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
-    assert!(
-        !p.is_bailed(),
-        "the fuse must not latch a terminal bailout"
-    );
+    assert!(!p.is_bailed(), "the fuse must not latch a terminal bailout");
     assert_eq!(
         p.listener.error_codes(),
         vec!["stack_overflow".to_owned()],

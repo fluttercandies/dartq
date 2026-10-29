@@ -291,9 +291,7 @@ impl<'a> Engine<'a> {
                         || {
                             let foreign = !self.is_scope_param(container)
                                 && self.type_resolution(container).0 == TypeResolution::Missing;
-                            if foreign {
-                                
-                            }
+                            if foreign {}
                             foreign
                         }
                 }
@@ -552,7 +550,10 @@ impl<'a> Engine<'a> {
         let mut face_keys: FxHashMap<StringId, Vec<u32>> = FxHashMap::default();
         for (index, face) in faces.iter().enumerate() {
             if let Ok(index) = u32::try_from(index) {
-                face_keys.entry(face.name.unwrap_or(empty)).or_default().push(index);
+                face_keys
+                    .entry(face.name.unwrap_or(empty))
+                    .or_default()
+                    .push(index);
             }
         }
         let mut derived: FxHashSet<(FileId, u32, StringId)> = FxHashSet::default();
@@ -578,7 +579,11 @@ impl<'a> Engine<'a> {
         let type_param_heads: FxHashSet<StringId> = elements
             .containers()
             .flat_map(|(_, c)| c.type_param_names.iter().copied())
-            .chain(faces.iter().flat_map(|f| f.type_param_names.iter().copied()))
+            .chain(
+                faces
+                    .iter()
+                    .flat_map(|f| f.type_param_names.iter().copied()),
+            )
             .chain(
                 self.exec_bounds
                     .values()
@@ -613,7 +618,10 @@ impl<'a> Engine<'a> {
             let bytes = self.source.as_bytes();
             let mut end = self.byte_of(offset).min(bytes.len());
             loop {
-                let start = bytes[..end].iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1);
+                let start = bytes[..end]
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map_or(0, |p| p + 1);
                 let line = &self.source[start..end];
                 // A top-level declaration header starts in column 0.
                 if !line.is_empty() && !line.starts_with([' ', '\t', '}', '/', '*', ')']) {
@@ -623,11 +631,18 @@ impl<'a> Engine<'a> {
                             .iter()
                             .position(|w| *w == "on")
                             .and_then(|at| words.get(at + 1))
-                            .map(|w| w.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')))
+                            .map(|w| {
+                                w.trim_end_matches(|c: char| {
+                                    !(c.is_alphanumeric() || c == '_' || c == '$')
+                                })
+                            })
                             .map(|w| w.split(['<', '?']).next().unwrap_or(w));
                         return Some(head.unwrap_or(""));
                     }
-                    if words.iter().any(|w| matches!(*w, "class" | "mixin" | "enum")) {
+                    if words
+                        .iter()
+                        .any(|w| matches!(*w, "class" | "mixin" | "enum"))
+                    {
                         return None;
                     }
                 }
@@ -657,7 +672,7 @@ impl<'a> Engine<'a> {
                 }
                 _ => false,
             };
-            
+
             foreign
         };
         for unit_ref in &self.refs {
@@ -665,7 +680,6 @@ impl<'a> Engine<'a> {
                 && let Some(index) = unique_face(unit_ref.name)
                 && !in_extension_body(unit_ref.range.offset, index)
             {
-                
                 derived.insert((self.file, index, unit_ref.name));
             }
         }
@@ -674,7 +688,6 @@ impl<'a> Engine<'a> {
                 && type_param_heads.contains(&type_name)
                 && let Some(index) = unique_face(read.name)
             {
-                
                 derived.insert((self.file, index, read.name));
             }
         }
@@ -723,12 +736,10 @@ impl<'a> Engine<'a> {
             reads.sort_unstable();
             reads.dedup_by(|a, b| a.0 == b.0);
             for (read_offset, read_name) in reads {
-                
                 let Some((start, end)) = self.ident_span_before_dot(read_offset) else {
                     continue;
                 };
-                let span_bytes =
-                    &self.source.as_bytes()[self.byte_of(start)..self.byte_of(end)];
+                let span_bytes = &self.source.as_bytes()[self.byte_of(start)..self.byte_of(end)];
                 let rooted_at_formal = self
                     .closure_formal_names
                     .iter()
@@ -822,8 +833,9 @@ impl<'a> Engine<'a> {
             if !receiver_valid || declarers.get(&read.name).copied() != Some(1) {
                 continue;
             }
-            let Some(&(face, face_file)) =
-                faces.iter().find(|(face, _)| face.members.contains_key(&read.name))
+            let Some(&(face, face_file)) = faces
+                .iter()
+                .find(|(face, _)| face.members.contains_key(&read.name))
             else {
                 continue;
             };
@@ -1000,7 +1012,6 @@ impl<'a> Engine<'a> {
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
                         && !element_used.contains(&bare)
                     {
-
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
                     }
                 }
@@ -1133,7 +1144,6 @@ impl<'a> Engine<'a> {
                         || member_used
                         || matches!(self.walk_super(container, site.name), Walk::Found(_));
                     if !spared {
-
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
                     }
                 }
@@ -1810,14 +1820,12 @@ impl<'a> Engine<'a> {
                     let hit = used.iter().find(|&&n| {
                         edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
                     });
-                    if let Some(n) = hit {
-                    }
+                    if let Some(n) = hit {}
                     let credited = self.import_credits_extension_member(edge, target, &credit);
                     hit.is_some() || credited
                 }
             };
             if !is_used {
-                
                 self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
                 continue;
             }
@@ -2117,10 +2125,10 @@ impl<'a> Engine<'a> {
         }
         let asserts = std::mem::take(&mut self.null_assert_staged);
         for (read, bang, nullable_params) in asserts {
-            let promoted = promotions.promoted(read).filter(|ty| {
-                !matches!(ty, Ty::Named { name, .. } if nullable_params.contains(name))
-            });
-            
+            let promoted = promotions.promoted(read).filter(
+                |ty| !matches!(ty, Ty::Named { name, .. } if nullable_params.contains(name)),
+            );
+
             if promoted.is_some_and(Ty::is_strictly_non_nullable) {
                 self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, bang, "");
             }

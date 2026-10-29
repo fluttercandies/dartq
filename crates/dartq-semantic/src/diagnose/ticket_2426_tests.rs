@@ -98,8 +98,16 @@ fn invalid_receiver_head_keeps_the_closure_formal_dynamic() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// A provable receiver head keeps the stand-in: `List<Und>`'s first written

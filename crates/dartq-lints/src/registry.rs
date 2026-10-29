@@ -564,7 +564,11 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
         names: impl Iterator<Item = &'static str>,
     ) -> Vec<&'static str> {
         names
-            .filter(|name| !rules.iter().any(|spec| spec.name.eq_ignore_ascii_case(name)))
+            .filter(|name| {
+                !rules
+                    .iter()
+                    .any(|spec| spec.name.eq_ignore_ascii_case(name))
+            })
             .collect()
     }
 
@@ -582,10 +586,16 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
     }
     let incompatible_keys = unresolved(rules, INCOMPATIBLE_RULES.iter().map(|(name, _)| *name));
     if !incompatible_keys.is_empty() {
-        drift.push(format!("INCOMPATIBLE_RULES unregistered keys {incompatible_keys:?}"));
+        drift.push(format!(
+            "INCOMPATIBLE_RULES unregistered keys {incompatible_keys:?}"
+        ));
     }
-    let incompatible_peers =
-        unresolved(rules, INCOMPATIBLE_RULES.iter().flat_map(|(_, peers)| peers.iter().copied()));
+    let incompatible_peers = unresolved(
+        rules,
+        INCOMPATIBLE_RULES
+            .iter()
+            .flat_map(|(_, peers)| peers.iter().copied()),
+    );
     if !incompatible_peers.is_empty() {
         drift.push(format!(
             "INCOMPATIBLE_RULES unregistered peer names {incompatible_peers:?}"
@@ -593,11 +603,15 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
     }
     let pubspec_seam = unresolved(rules, PUBSPEC_PASS_SEAM.iter().copied());
     if !pubspec_seam.is_empty() {
-        drift.push(format!("PUBSPEC_PASS_SEAM unregistered names {pubspec_seam:?}"));
+        drift.push(format!(
+            "PUBSPEC_PASS_SEAM unregistered names {pubspec_seam:?}"
+        ));
     }
     let epilogue_seam = unresolved(rules, RUN_EPILOGUE_SEAM.iter().copied());
     if !epilogue_seam.is_empty() {
-        drift.push(format!("RUN_EPILOGUE_SEAM unregistered names {epilogue_seam:?}"));
+        drift.push(format!(
+            "RUN_EPILOGUE_SEAM unregistered names {epilogue_seam:?}"
+        ));
     }
     let late_join = unresolved(rules, LATE_JOIN_RULES.iter().copied());
     if !late_join.is_empty() {
@@ -949,11 +963,7 @@ pub enum Gate {
 
 impl Gate {
     /// Whether a unit carrying `features` and `version` admits this gate.
-    fn admits(
-        self,
-        features: &crate::engine::Features,
-        version: Option<LanguageVersion>,
-    ) -> bool {
+    fn admits(self, features: &crate::engine::Features, version: Option<LanguageVersion>) -> bool {
         match self {
             Self::Feature(feature) => features.is_enabled(feature),
             Self::NotFeature(feature) => !features.is_enabled(feature),
@@ -986,42 +996,96 @@ pub(crate) static REGISTRATION_GATES: &[(&str, Gate)] = &[
     // pattern-era rules register only with it; the legacy-case rules only
     // without it.
     ("switch_on_type", Gate::Feature(Feature::Patterns)), // registration bail (:34)
-    ("simplify_variable_pattern", Gate::Feature(Feature::Patterns)), // registration bail (:32)
+    (
+        "simplify_variable_pattern",
+        Gate::Feature(Feature::Patterns),
+    ), // registration bail (:32)
     ("unnecessary_breaks", Gate::Feature(Feature::Patterns)), // registers only with patterns on
-    ("no_duplicate_case_values", Gate::NotFeature(Feature::Patterns)), // `member is SwitchCase` gate (:41)
+    (
+        "no_duplicate_case_values",
+        Gate::NotFeature(Feature::Patterns),
+    ), // `member is SwitchCase` gate (:41)
     ("invalid_case_patterns", Gate::NotFeature(Feature::Patterns)), // registration bail (:41)
     // `wildcard_variables` (shipped 3.7): the multi-underscore face
     // registers only with it; the lone-use rule only without it.
-    ("no_wildcard_variable_uses", Gate::NotFeature(Feature::WildcardVariables)), // (:36-38)
-    ("unnecessary_underscores", Gate::Feature(Feature::WildcardVariables)), // registration bail (:33)
+    (
+        "no_wildcard_variable_uses",
+        Gate::NotFeature(Feature::WildcardVariables),
+    ), // (:36-38)
+    (
+        "unnecessary_underscores",
+        Gate::Feature(Feature::WildcardVariables),
+    ), // registration bail (:33)
     // `primary_constructors` (shipped 3.13, `enabledIn: 3.13.0`): the
     // primary-form family registers only with it; the superseded
     // parameter rules only without it. (`unnecessary_final` is NOT here:
     // only its parameter-visitor faces skip under the feature
     // (unnecessary_final.dart:66-68) — an in-rule body check, not a
     // registration bail; the rule registers unconditionally.)
-    ("use_primary_constructors", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
-    ("use_declaring_parameters", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
-    ("initialize_in_field_declaration", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
-    ("empty_container_bodies", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
-    ("unnecessary_const_in_enum_constructor", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:36-40)
-    ("unnecessary_type_name_in_constructor", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:36-38)
-    ("avoid_final_parameters", Gate::NotFeature(Feature::PrimaryConstructors)), // inverted bail (:56-59)
-    ("prefer_final_parameters", Gate::NotFeature(Feature::PrimaryConstructors)), // inverted bail (:48-52)
-    ("var_with_no_type_annotation", Gate::NotFeature(Feature::PrimaryConstructors)), // inverted bail (:34-36)
+    (
+        "use_primary_constructors",
+        Gate::Feature(Feature::PrimaryConstructors),
+    ), // registration bail (:35)
+    (
+        "use_declaring_parameters",
+        Gate::Feature(Feature::PrimaryConstructors),
+    ), // registration bail (:35)
+    (
+        "initialize_in_field_declaration",
+        Gate::Feature(Feature::PrimaryConstructors),
+    ), // registration bail (:35)
+    (
+        "empty_container_bodies",
+        Gate::Feature(Feature::PrimaryConstructors),
+    ), // registration bail (:35)
+    (
+        "unnecessary_const_in_enum_constructor",
+        Gate::Feature(Feature::PrimaryConstructors),
+    ), // registration bail (:36-40)
+    (
+        "unnecessary_type_name_in_constructor",
+        Gate::Feature(Feature::PrimaryConstructors),
+    ), // registration bail (:36-38)
+    (
+        "avoid_final_parameters",
+        Gate::NotFeature(Feature::PrimaryConstructors),
+    ), // inverted bail (:56-59)
+    (
+        "prefer_final_parameters",
+        Gate::NotFeature(Feature::PrimaryConstructors),
+    ), // inverted bail (:48-52)
+    (
+        "var_with_no_type_annotation",
+        Gate::NotFeature(Feature::PrimaryConstructors),
+    ), // inverted bail (:34-36)
     // `unnamed_libraries` (shipped 2.19, `experimental_features.yaml:397-400`).
-    ("unnecessary_library_name", Gate::Feature(Feature::UnnamedLibraries)), // registration bail (:32-34)
+    (
+        "unnecessary_library_name",
+        Gate::Feature(Feature::UnnamedLibraries),
+    ), // registration bail (:32-34)
     // `enhanced_parts` (experimental — no `enabledIn`,
     // `tools/experimental_features.yaml:150-152`).
-    ("use_string_in_part_of_directives", Gate::NotFeature(Feature::EnhancedParts)), // registration bail (:32-34)
+    (
+        "use_string_in_part_of_directives",
+        Gate::NotFeature(Feature::EnhancedParts),
+    ), // registration bail (:32-34)
     // `super_parameters` (shipped 2.17, `enabledIn: 2.17.0`).
-    ("use_super_parameters", Gate::Feature(Feature::SuperParameters)), // registration bail (:43)
+    (
+        "use_super_parameters",
+        Gate::Feature(Feature::SuperParameters),
+    ), // registration bail (:43)
     // `null_aware_elements` (shipped 3.8, `enabledIn: 3.8.0`).
-    ("use_null_aware_elements", Gate::Feature(Feature::NullAwareElements)), // registration bail (:35)
+    (
+        "use_null_aware_elements",
+        Gate::Feature(Feature::NullAwareElements),
+    ), // registration bail (:35)
     // The settled-version face: `require_trailing_commas` registers below
     // 3.7 and stays silent from 3.7, where `dart format` enforces the
     // commas itself (require_trailing_commas.dart:52-56).
-    ("require_trailing_commas", Gate::Version(VersionGate::Below(LanguageVersion::new(3, 7)))),
+    (
+        "require_trailing_commas",
+        Gate::Version(VersionGate::Below(LanguageVersion::new(3, 7))),
+    ),
 ];
 
 /// Doc-link anchor for the frozen `rules/flow/require_trailing_commas.rs`
@@ -1123,9 +1187,8 @@ pub static SEMANTIC_RULES: &[&str] = &[
 /// impossible past [`assert_startup_consistency`] (which holds every
 /// [`SEMANTIC_RULES`] name against the registry, in release too, at the
 /// earlier [`RULES`] init this lock depends on).
-static SEMANTIC_SET: LazyLock<EnableSet> = LazyLock::new(|| {
-    EnableSet::resolve(SEMANTIC_RULES.iter().copied()).0
-});
+static SEMANTIC_SET: LazyLock<EnableSet> =
+    LazyLock::new(|| EnableSet::resolve(SEMANTIC_RULES.iter().copied()).0);
 
 /// Whether `set` enables any fold-consuming rule — the predicate behind the
 /// per-file semantic-fold mount (the driver's `Analysis` build) and the memo
@@ -1215,9 +1278,8 @@ mod gate_tests {
     #[test]
     fn registration_gated_filters_by_polarity() {
         let all = EnableSet::resolve(REGISTRATION_GATES.iter().map(|(name, _)| *name)).0;
-        let enabled = |set: &EnableSet, name: &str| {
-            rule_by_name(name).is_some_and(|id| set.is_enabled(id))
-        };
+        let enabled =
+            |set: &EnableSet, name: &str| rule_by_name(name).is_some_and(|id| set.is_enabled(id));
 
         let latest = registration_gated(&all, &Features::default(), None);
         assert!(enabled(&latest, "use_primary_constructors"));
@@ -1227,11 +1289,8 @@ mod gate_tests {
         // No settled version face: the version gate admits (the official
         // latest-default posture); a settled 3.7 face clears it.
         assert!(enabled(&latest, "require_trailing_commas"));
-        let gated_37 = registration_gated(
-            &all,
-            &Features::default(),
-            Some(LanguageVersion::new(3, 7)),
-        );
+        let gated_37 =
+            registration_gated(&all, &Features::default(), Some(LanguageVersion::new(3, 7)));
         assert!(!enabled(&gated_37, "require_trailing_commas"));
 
         // The 2.12 floor predates every shipped milestone among the seven

@@ -252,8 +252,7 @@ impl Interp<'_> {
                             // covers every typed pattern, and an `is`-test
                             // on the local it feeds always succeeds).
                             if !promoted
-                                && let Some(this_ty) =
-                                    self.staged_this.get(&token.range.offset)
+                                && let Some(this_ty) = self.staged_this.get(&token.range.offset)
                                 && self.ops.is_invalid_typed(
                                     *this_ty,
                                     crate::ty::EMPTY_ARGS,
@@ -410,9 +409,7 @@ impl Interp<'_> {
                     // faces are the same ones the property null check uses:
                     // a captured receiver or slot leaves the slot alone.
                     let receiver = self.props[slot as usize].0;
-                    if !self.prop_target_captured(receiver)
-                        && !self.current.prop(slot).captured()
-                    {
+                    if !self.prop_target_captured(receiver) && !self.current.prop(slot).captured() {
                         self.current = self.current.clone().promote_prop_non_null(
                             self.ops,
                             &mut self.lists,
@@ -675,9 +672,7 @@ impl Interp<'_> {
                         }) => (Some(*op_span), *rhs_dead_entry),
                         _ => (None, false),
                     };
-                    if rhs_dead_entry
-                        && let Some(op_span) = op_span
-                    {
+                    if rhs_dead_entry && let Some(op_span) = op_span {
                         // The `??` face of the same official re-anchor
                         // (`parent is IfNull` → offset = operator,
                         // dead_code_verifier.dart:316-318).
@@ -866,8 +861,10 @@ impl Interp<'_> {
                     // (`tryPromoteForTypeCheck`'s `ifFalseIsUnreachable`,
                     // :4156-4160), already
                     // [`Interp::branch_type_test`]'s face.
-                    let declared =
-                        self.vars.get(var as usize).map_or(Ty::UNKNOWN, |meta| meta.ty);
+                    let declared = self
+                        .vars
+                        .get(var as usize)
+                        .map_or(Ty::UNKNOWN, |meta| meta.ty);
                     // The fail fold's nullability disjointness is a
                     // name-level question — the official's 0c arm
                     // suppresses it the moment either spelling maps to the
@@ -881,7 +878,12 @@ impl Interp<'_> {
                         self.ops.is_invalid_typed(ty, args, self.args, self.names)
                     };
                     if self.is_test_guaranteed_fail(declared, tested)
-                        && !invalid_face(declared, self.vars.get(var as usize).map_or(crate::ty::EMPTY_ARGS, |meta| meta.args))
+                        && !invalid_face(
+                            declared,
+                            self.vars
+                                .get(var as usize)
+                                .map_or(crate::ty::EMPTY_ARGS, |meta| meta.args),
+                        )
                         && !invalid_face(tested, tested_args)
                     {
                         let cur = self.current.clone();
@@ -903,12 +905,9 @@ impl Interp<'_> {
                         // Dart 3.13.1: int/dynamic/invalid operands all
                         // carry the dead-arm row alongside the
                         // TYPE_TEST_WITH_UNDEFINED_NAME spelling row).
-                        let invalid_tested = self.ops.is_invalid_typed(
-                            tested,
-                            tested_args,
-                            self.args,
-                            self.names,
-                        );
+                        let invalid_tested =
+                            self.ops
+                                .is_invalid_typed(tested, tested_args, self.args, self.names);
                         let promoted = if invalid_tested {
                             None
                         } else {
@@ -998,7 +997,7 @@ impl Interp<'_> {
                     // type, which neither folds nor factors to bottom.
                     else if (operand_invalid && !operand.ref_chain)
                         || !operand_invalid
-                        && (self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
+                            && (self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
                             // The invalid-tested face: an unresolved spelling
                             // is the official's `InvalidType` on the checked
                             // side, and `subtype.dart:274` makes any relation
@@ -1125,7 +1124,8 @@ impl Interp<'_> {
                 // `ifNullExpression_rightBegin`'s split, flattened): the
                 // RHS runs inline below, so the live pre-RHS state is
                 // parked here for the exiting-RHS restore at the write.
-                self.if_null_skips.push((op.range.end(), self.current.clone()));
+                self.if_null_skips
+                    .push((op.range.end(), self.current.clone()));
             }
             Ev::Assign {
                 plain,
@@ -1688,10 +1688,7 @@ impl Interp<'_> {
                 {
                     // Interior death — the skip path rejoins at the chain's
                     // boundary and carries the continuation's reachability.
-                } else if !self
-                    .exit_at
-                    .is_some_and(|at| at >= member.range.offset)
-                {
+                } else if !self.exit_at.is_some_and(|at| at >= member.range.offset) {
                     // A `?.` whose access path was dead at open (a
                     // null-or-equivalent receiver) anchors at the member
                     // name — the official polls the property/method name
@@ -1897,11 +1894,7 @@ impl Interp<'_> {
                 // access build around it (chain bases, branches, the
                 // receiver pop) is exactly what the post-send position
                 // owes the chain.
-                if post_send_tile
-                    && !matches!(
-                        member_value.ty,
-                        Ty::UNKNOWN | Ty::UNKNOWN_NULLABLE
-                    )
+                if post_send_tile && !matches!(member_value.ty, Ty::UNKNOWN | Ty::UNKNOWN_NULLABLE)
                 {
                     expr.ty = member_value.ty;
                     expr.args = member_value.args;
@@ -1923,9 +1916,7 @@ impl Interp<'_> {
                     expr.args = recv.args;
                     expr.non_reference_invalid = true;
                 }
-                if !post_send_tile
-                    && let Some(recv) = self.exprs.last()
-                {
+                if !post_send_tile && let Some(recv) = self.exprs.last() {
                     expr.ref_chain = recv.ref_chain
                         || recv.prop_receiver().is_some()
                         || (recv.prop.is_some() && !recv.non_reference_invalid);
@@ -2273,10 +2264,7 @@ impl Interp<'_> {
                 // over the target builds here from the head value's own
                 // name and read anchor — a later section's same-named head
                 // then reads the slot a `!` or null test promoted.
-                let head_face = self
-                    .exprs
-                    .last()
-                    .and_then(|e| e.name.zip(e.read_span));
+                let head_face = self.exprs.last().and_then(|e| e.name.zip(e.read_span));
                 let target_recv = exprs_base
                     .checked_sub(1)
                     .and_then(|idx| self.exprs.get(idx))
@@ -2460,7 +2448,10 @@ impl Interp<'_> {
                     after_then: None,
                 });
             }
-            Ev::ElseControlFlow { then_end, else_start } => {
+            Ev::ElseControlFlow {
+                then_end,
+                else_start,
+            } => {
                 // The then-element is consumed: its exit state is saved
                 // (official `ifStatement_elseBegin`'s
                 // `context._afterThen = _current`, flow_analysis.dart:7111-
@@ -2715,10 +2706,8 @@ impl Interp<'_> {
     /// face on either side is never a dead-branch producer (the
     /// name-level lattice's optimism must not certify the mark).
     fn is_test_guaranteed_fail(&self, operand_ty: Ty, tested: Ty) -> bool {
-        if matches!(
-            operand_ty.base,
-            Base::Unknown | Base::Dynamic | Base::Void
-        ) || matches!(tested.base, Base::Unknown | Base::Dynamic | Base::Void)
+        if matches!(operand_ty.base, Base::Unknown | Base::Dynamic | Base::Void)
+            || matches!(tested.base, Base::Unknown | Base::Dynamic | Base::Void)
         {
             return false;
         }
@@ -2744,10 +2733,8 @@ impl Interp<'_> {
         tested: Ty,
         tested_args: u32,
     ) -> bool {
-        if matches!(
-            operand_ty.base,
-            Base::Unknown | Base::Dynamic | Base::Void
-        ) || matches!(tested.base, Base::Unknown | Base::Dynamic | Base::Void)
+        if matches!(operand_ty.base, Base::Unknown | Base::Dynamic | Base::Void)
+            || matches!(tested.base, Base::Unknown | Base::Dynamic | Base::Void)
         {
             return false;
         }
@@ -2796,9 +2783,7 @@ impl Interp<'_> {
             nullable: false,
         } = tested
         {
-            let unresolved = self
-                .ops
-                .call_head_unresolved(name, self.names);
+            let unresolved = self.ops.call_head_unresolved(name, self.names);
             if unresolved {
                 // Promotion only: the oracle's flow keeps BOTH arms live
                 // over an invalid tested type (no dead_code rows — the
@@ -2970,8 +2955,7 @@ impl Interp<'_> {
                 // The marker step lives in [`Interp::promote_to_non_null`]
                 // (the opaque-declared face's non-null form is the plain
                 // unknown, #2243/#2241).
-                let (promoted, promoted_args) =
-                    self.promote_to_non_null(operand.ty, operand.args);
+                let (promoted, promoted_args) = self.promote_to_non_null(operand.ty, operand.args);
                 if promoted == operand.ty {
                     // Official `tryMarkNonNullable` bails on
                     // `isSameType` (flow_analysis.dart:4059-4068): the

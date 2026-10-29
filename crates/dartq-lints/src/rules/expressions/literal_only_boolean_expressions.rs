@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, query_site};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec, query_site};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/literal_only_boolean_expressions.dart`
 /// — a `do`/`for`/`if`/`while` condition (or a `when` guard) composed
@@ -64,8 +64,7 @@ fn check(c: &mut Check<'_>) {
             }
             // The case-clause skip (:86): `if (e case p)` carries the
             // clause keyword in the condition row's `CaseKeyword` word.
-            if c
-                .field(node, PayloadField::CaseKeyword)
+            if c.field(node, PayloadField::CaseKeyword)
                 .is_some_and(|kw| kw != NONE_TOKEN)
             {
                 return;
@@ -259,11 +258,7 @@ fn string_valued(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, literal
 /// (:36 — `element is TypeParameterElement` bails): the semantic
 /// container face first (same-file and imported classes, enums, mixins,
 /// extensions), then the unshadowed core names and the same-file types.
-fn is_type_resolves(
-    c: &Check<'_>,
-    analysis: &dartq_semantic::Analysis<'_>,
-    type_row: u32,
-) -> bool {
+fn is_type_resolves(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, type_row: u32) -> bool {
     if analysis
         .resolve_constructor(query_site(c, type_row), None)
         .is_some()

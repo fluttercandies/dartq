@@ -174,7 +174,8 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
         decls.retain(|decl| decl.container == Some(container));
         let members: FxHashSet<FileId> = decls.iter().map(|decl| decl.file).collect();
         refs.retain(|reference| {
-            reference.target_container == Some(container) && members.contains(&reference.target_file)
+            reference.target_container == Some(container)
+                && members.contains(&reference.target_file)
         });
     }
     let layout = EngineLayout::over(
@@ -728,8 +729,7 @@ pub fn to_json_at_tier(
             .expect("declaration rows serialize");
     }
     if !run.dependencies.is_empty() {
-        json["deps"] =
-            serde_json::to_value(&run.dependencies).expect("dependency rows serialize");
+        json["deps"] = serde_json::to_value(&run.dependencies).expect("dependency rows serialize");
     }
     json
 }
@@ -1307,8 +1307,7 @@ mod tests {
     /// The dependency declares `Widget`; the app's use site references it.
     /// Returns the app root; the dependency sits at `<parent>/dep`.
     fn foreign_package_fixture(tag: &str) -> PathBuf {
-        let parent =
-            std::env::temp_dir().join(format!("dq_cmd_{tag}_pair_{}", std::process::id()));
+        let parent = std::env::temp_dir().join(format!("dq_cmd_{tag}_pair_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&parent);
         let write = |dir: &std::path::Path, relative: &str, content: &str| {
             let path = dir.join(relative);
@@ -1349,11 +1348,7 @@ mod tests {
             "lib/use.dart",
             "import 'package:dep/decl.dart';\nvoid use() {\n  var w = Widget();\n}\n",
         );
-        write(
-            &parent.join("dep"),
-            "lib/decl.dart",
-            "class Widget {}\n",
-        );
+        write(&parent.join("dep"), "lib/decl.dart", "class Widget {}\n");
         app
     }
 
@@ -1569,7 +1564,10 @@ mod tests {
     );
 
     fn member_fixture(tag: &str) -> PathBuf {
-        workspace(tag, &[("lib/a.dart", MEMBER_A), ("lib/main.dart", MEMBER_USE)])
+        workspace(
+            tag,
+            &[("lib/a.dart", MEMBER_A), ("lib/main.dart", MEMBER_USE)],
+        )
     }
 
     /// The name token's offset (ASCII sources, so byte = UTF-16).
@@ -1649,11 +1647,8 @@ mod tests {
             (run.decls[0].name, run.decls[0].container),
             ("m", Some("B"))
         );
-        let rows: Vec<(ReferenceKind, u32)> = run
-            .refs
-            .iter()
-            .map(|r| (r.kind, r.range.offset))
-            .collect();
+        let rows: Vec<(ReferenceKind, u32)> =
+            run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
         assert_eq!(
             rows,
             vec![(ReferenceKind::Invoked, at(MEMBER_USE, "b.m();") + 2)],
@@ -1870,10 +1865,7 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![
-                ("lib/a.dart", Some("Unused")),
-                ("lib/b.dart", None),
-            ],
+            vec![("lib/a.dart", Some("Unused")), ("lib/b.dart", None),],
             "the consumed symbol rides its library, the bare edge stands alone"
         );
         let json = to_json(&run, "C");
@@ -2179,7 +2171,10 @@ mod tests {
         assert_eq!(exact.decls.len(), 1);
         assert_eq!(exact.decls[0].name, "FooBar");
         let discovery = symbol_fuzzy_after_analysis(&engine, "FooBar");
-        assert_eq!(discovery.decls[0].name, "FooBar", "the exact name ranks first");
+        assert_eq!(
+            discovery.decls[0].name, "FooBar",
+            "the exact name ranks first"
+        );
 
         fs_remove(&root);
     }

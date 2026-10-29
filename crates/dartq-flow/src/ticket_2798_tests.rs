@@ -66,7 +66,8 @@ fn dead_of(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -104,10 +105,7 @@ fn promoted_prop_at(source: &str, snippet: &str) -> bool {
 fn tspan(offset: u32) -> TokenSpan {
     TokenSpan {
         id: offset,
-        range: dartq_source::SourceRange {
-            offset,
-            length: 1,
-        },
+        range: dartq_source::SourceRange { offset, length: 1 },
     }
 }
 
@@ -124,10 +122,7 @@ fn a3_never_operand_is_check_anchors_dead_row_at_tested_type() {
     // engine resolves a call's type to Never, so the parser pipeline
     // alone cannot build this buffer.
     let events: Vec<Ev> = [
-        vec![
-            Ev::ExecBegin { is_closure: false },
-            Ev::BlockBodyBegin,
-        ],
+        vec![Ev::ExecBegin { is_closure: false }, Ev::BlockBodyBegin],
         vec![
             // `neverFn()` — its type resolves to Never, the engine
             // records the exit at the call's end (offset 19).
@@ -219,7 +214,10 @@ fn b3_null_aware_cascade_target_promotion_ends_with_the_cascade() {
     // The post-cascade read of `c` (the last row) is nullable.
     let post = reads.last().expect("the post-cascade read carries a row");
     assert_eq!(post.0, "c", "{reads:?}");
-    assert!(post.1, "the ?.. shortcut join demotes the target: {reads:?}");
+    assert!(
+        post.1,
+        "the ?.. shortcut join demotes the target: {reads:?}"
+    );
 }
 
 /// Field promotions on the cascade target persist into later sections
@@ -266,7 +264,10 @@ fn b3_section_null_aware_join_resets_inner_variable_promotion() {
 fn b4_for_in_iterable_read_carries_its_flow_type() {
     let source = "void f() { List? x; for (var y in x) {} }";
     let (reads, _) = read_tys(source);
-    let x_row = reads.iter().find(|(s, _)| *s == "x").expect("iterable read row");
+    let x_row = reads
+        .iter()
+        .find(|(s, _)| *s == "x")
+        .expect("iterable read row");
     assert!(x_row.1, "the nullable iterable stays nullable: {reads:?}");
 
     let guarded = "void f() { List? x; if (x != null) { for (var y in x) {} } }";
@@ -291,7 +292,10 @@ fn b4_spread_operand_read_carries_its_flow_type() {
         .iter()
         .find(|(s, _)| *s == "list")
         .expect("spread read row");
-    assert!(row.1, "the nullable spread operand stays nullable: {reads:?}");
+    assert!(
+        row.1,
+        "the nullable spread operand stays nullable: {reads:?}"
+    );
 }
 
 /// The condition-operand row (official `checkForNonBoolCondition`'s flow

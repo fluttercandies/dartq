@@ -312,7 +312,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             type_arg = TypeParamOrArg::None;
         }
 
-        let end = self.precedence_loop(precedence, allow_cascades, type_arg, left, false, lhs_begin);
+        let end =
+            self.precedence_loop(precedence, allow_cascades, type_arg, left, false, lhs_begin);
         self.leave_depth();
         end
     }
@@ -551,10 +552,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         // missing_identifier row on the assignment — no
                         // selector rows). The last real token is the `]`, so
                         // the shape flag must carry the assignability.
-                        lhs_ends_index = matches!(
-                            operand_kind,
-                            TokenKind::OpenSquare | TokenKind::Index
-                        );
+                        lhs_ends_index =
+                            matches!(operand_kind, TokenKind::OpenSquare | TokenKind::Index);
                         if is_dot_shorthand {
                             self.listener.handle_dot_shorthand_head(dot);
                             self.report_dot_shorthands_gate(dot);
@@ -787,7 +786,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             // parse left the cursor at the group head. Degrade to the peek
             // id (the group's own head) instead of panicking: the follower
             // probe reads a neighboring token and the parse stays forward.
-            self.cursor.last_consumed_id().unwrap_or_else(|| self.peek_id())
+            self.cursor
+                .last_consumed_id()
+                .unwrap_or_else(|| self.peek_id())
         };
         // `computeMethodTypeArguments` (type_info.dart:485-491) keeps the
         // group only while the scan never recovered: a recovered scan is a

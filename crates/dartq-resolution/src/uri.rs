@@ -2980,7 +2980,10 @@ mod tests {
             "app/.dart_tool/package_config.json",
             r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "packageUri": "lib/"}, {"name": "dep", "rootUri": "../../dep", "packageUri": "lib/"}], "generator": "pub"}"#,
         );
-        write("dep/pubspec.yaml", "name: dep\nenvironment:\n  sdk: ^3.2.0\n");
+        write(
+            "dep/pubspec.yaml",
+            "name: dep\nenvironment:\n  sdk: ^3.2.0\n",
+        );
         write("dep/lib/d.dart", "// fixture\n");
         // The dep's own leftover config: parseable but empty — its own
         // universe would resolve nothing.
@@ -3009,8 +3012,7 @@ mod tests {
         // the empty leftover config never governs them.
         let own = resolver.resolve(dep, Some("package:dep/d.dart"), DirectiveKind::ImportExport);
         assert_eq!(
-            own.code,
-            None,
+            own.code, None,
             "a dependency outside the context root resolves through the root universe"
         );
         let ResolvedUri::Package { package, file, .. } = own.uri.clone() else {

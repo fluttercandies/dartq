@@ -758,8 +758,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.cursor.reset(before_probe);
             }
         } else if self.peek_kind() == TokenKind::OpenParen
-            || (is_identifier(self.peek_kind())
-                && self.cursor.look_kind(1) == TokenKind::OpenParen)
+            || (is_identifier(self.peek_kind()) && self.cursor.look_kind(1) == TokenKind::OpenParen)
         {
             // Function-typed field formal `String this.field(int value)`:
             // the official OPEN_PAREN arm consumes the suffix with the

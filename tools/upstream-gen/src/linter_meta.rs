@@ -203,7 +203,9 @@ pub fn validate_names(entries: &[ConstEntry], lint_names_src: &str) -> Result<()
         let Some(rest) = line.trim().strip_prefix("static const String ") else {
             continue;
         };
-        let Some(name) = rest.split(' ').next() else { continue };
+        let Some(name) = rest.split(' ').next() else {
+            continue;
+        };
         if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             official.push(name);
         }
@@ -519,8 +521,9 @@ pub fn fold(
         let selected = if let Some((_, const_name)) =
             SELECTION_OVERRIDES.iter().find(|(rule, _)| rule == name)
         {
-            pick(const_name)
-                .ok_or_else(|| format!("{name}: selection override names unknown const {const_name}"))?
+            pick(const_name).ok_or_else(|| {
+                format!("{name}: selection override names unknown const {const_name}")
+            })?
         } else {
             let base: String = {
                 let mut chars = name.chars();
@@ -635,9 +638,11 @@ fn resolve_since(
     match arg {
         None => Ok(None),
         Some(SinceArg::Version(text)) => Ok(Some(text.clone())),
-        Some(SinceArg::Const(ident)) => versions.get(ident).cloned().map(Some).ok_or_else(|| {
-            format!("{name}: since constant {ident} missing from rule_state.dart")
-        }),
+        Some(SinceArg::Const(ident)) => {
+            versions.get(ident).cloned().map(Some).ok_or_else(|| {
+                format!("{name}: since constant {ident} missing from rule_state.dart")
+            })
+        }
     }
 }
 
@@ -655,7 +660,9 @@ fn convert_refs(text: &str, params: &[String], name: &str) -> Result<String, Str
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
         let Some(slot) = params.iter().position(|param| *param == ident) else {
-            return Err(format!("{name}: message references #{ident} outside its parameters"));
+            return Err(format!(
+                "{name}: message references #{ident} outside its parameters"
+            ));
         };
         let _ = write!(out, "{{{slot}}}");
         rest = &tail[ident.len()..];
@@ -680,13 +687,21 @@ fn group_camel(group: &str) -> &'static str {
 /// regeneration is byte-reproducible for identical inputs. `pin_line` is
 /// the `SDK pin: <revision> (<checkout stamp>)` line `--check` verifies.
 #[must_use]
-pub fn render_rule_meta(rows: &[RuleRow], const_count: usize, pin_line: &str, checkout_stamp: &str) -> String {
+pub fn render_rule_meta(
+    rows: &[RuleRow],
+    const_count: usize,
+    pin_line: &str,
+    checkout_stamp: &str,
+) -> String {
     const REGEN: &str = "DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen";
     let mut out = String::with_capacity(4096 + rows.len() * 192);
     out.push_str("//! GENERATED lint rule metadata — DO NOT EDIT.\n");
     out.push_str("//! Regenerate with:\n");
     let _ = writeln!(out, "//!   {REGEN}");
-    let _ = writeln!(out, "//! {pin_line} — conformance/pin.toml (verified by --check).");
+    let _ = writeln!(
+        out,
+        "//! {pin_line} — conformance/pin.toml (verified by --check)."
+    );
     let _ = writeln!(
         out,
         "//! Source: pkg/linter/messages.yaml of the pinned SDK checkout ({checkout_stamp}),"
@@ -840,9 +855,15 @@ pub fn render_lint_docs_rows(rows: &[RuleRow], pin_line: &str, checkout_stamp: &
     out.push_str("// GENERATED lint documentation rows — DO NOT EDIT.\n");
     out.push_str("// Regenerate with:\n");
     out.push_str("//   DARTQ_SDK_SRC=<dart-sdk-tree> DART_LINTS_SRC=<lints-tree> cargo run -p upstream-gen --bin linter-meta-gen\n");
-    let _ = writeln!(out, "// {pin_line} — conformance/pin.toml (verified by --check).");
+    let _ = writeln!(
+        out,
+        "// {pin_line} — conformance/pin.toml (verified by --check)."
+    );
     out.push_str("// Source: hasPublishedDocs of pkg/linter/messages.yaml (the pinned\n");
-    let _ = writeln!(out, "// SDK checkout, {checkout_stamp}), one row per first-party linter rule name.");
+    let _ = writeln!(
+        out,
+        "// SDK checkout, {checkout_stamp}), one row per first-party linter rule name."
+    );
     out.push_str("&[\n");
     for row in rows {
         let _ = writeln!(out, "    (\"{}\", {}),", row.name, row.published);
@@ -881,7 +902,10 @@ mod tests {
             parse_version_ctor("Version(3, 11, 0)").as_deref(),
             Some("3.11.0")
         );
-        assert_eq!(parse_version_ctor(".new(3, 13, 0)").as_deref(), Some("3.13.0"));
+        assert_eq!(
+            parse_version_ctor(".new(3, 13, 0)").as_deref(),
+            Some("3.13.0")
+        );
         assert_eq!(parse_version_ctor("dart3_3"), None);
         let consts = version_consts(concat!(
             "final Version dart2_12 = Version(2, 12, 0);\n",
@@ -953,7 +977,10 @@ mod tests {
         .expect("parses");
         assert_eq!(
             names,
-            ["avoid_empty_else", "curly_braces_in_flow_control_structures"]
+            [
+                "avoid_empty_else",
+                "curly_braces_in_flow_control_structures"
+            ]
         );
         assert!(lints_set_names("linter:\n  rules:\n    avoid_print: true\n").is_err());
     }
@@ -1014,8 +1041,7 @@ mod tests {
         let facts = scan_rule_files(&files);
         let versions = version_consts("final Version dart2_12 = Version(2, 12, 0);\n");
         let core = ["empty_catches".to_owned()];
-        let rows =
-            fold(&entries, &facts, &versions, &core, &[]).expect("fold succeeds");
+        let rows = fold(&entries, &facts, &versions, &core, &[]).expect("fold succeeds");
         assert_eq!(rows.len(), 3);
         // Name-sorted: avoid_as, empty_catches, prefer_is_empty.
         assert_eq!(rows[0].name, "avoid_as");
@@ -1037,8 +1063,7 @@ mod tests {
         let err = convert_refs("uses #nope", &["p0".to_owned()], "some_rule");
         assert!(err.is_err());
         assert_eq!(
-            convert_refs("uses #p0 and #p0", &["p0".to_owned()], "r")
-                .expect("resolves"),
+            convert_refs("uses #p0 and #p0", &["p0".to_owned()], "r").expect("resolves"),
             "uses {0} and {0}"
         );
     }
@@ -1066,9 +1091,9 @@ mod tests {
         );
         assert!(doc.contains("pub(crate) const fn meta_group"));
         assert!(doc.contains("1 consts fold to 1 name rows"));
-        assert!(
-            doc.contains("//! SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)")
-        );
+        assert!(doc.contains(
+            "//! SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)"
+        ));
         let docs = render_lint_docs_rows(
             &rows,
             "SDK pin: 416e33b0ffaef062a60ec966bb8c82ed2b83f128 (dart 3.13.7, stable)",
@@ -1078,5 +1103,3 @@ mod tests {
         assert!(docs.starts_with("// GENERATED"));
     }
 }
-
-

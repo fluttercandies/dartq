@@ -14,8 +14,8 @@
 use dartq_scanner::ScanConfig;
 
 use super::collector::{Collector, latest_features};
-use crate::parser::Parser;
 use crate::ParserFeatures;
+use crate::parser::Parser;
 
 /// Parses `source` and returns the scanner+parser rows as
 /// `(code, start, end)` sorted by offset (gate_bi_name_faces harness shape).

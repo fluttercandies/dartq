@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ---------------------------------------------------------------------------
 // Semantic source: the F6 written-surface family
 //
@@ -1208,7 +1207,10 @@ pub(crate) fn equality_null_operand(input: &FixInput<'_>) -> Option<(u32, u32, S
 /// the hit span is one operand of an `&&`/`||` chain — a non-last
 /// operand cuts `startStart(node, nextOperand)`, the last operand cuts
 /// `endEnd(prevOperand, node)`.
-pub(crate) fn chain_operand_drop(input: &FixInput<'_>, chain_op: TokenKind) -> Option<(u32, u32, String)> {
+pub(crate) fn chain_operand_drop(
+    input: &FixInput<'_>,
+    chain_op: TokenKind,
+) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
     let (first, last) = hit_tokens(tokens, &input.range)?;
@@ -1285,7 +1287,11 @@ pub(crate) fn scan_chain(tokens: &TokenTable, first: usize, last: usize) -> Chai
 }
 
 /// The `Option`-shaped body of [`scan_chain`]: `None` is not-a-chain.
-pub(crate) fn scan_chain_inner(tokens: &TokenTable, first: usize, last: usize) -> Option<ChainScan> {
+pub(crate) fn scan_chain_inner(
+    tokens: &TokenTable,
+    first: usize,
+    last: usize,
+) -> Option<ChainScan> {
     // The chain head: an identifier, a literal, one balanced group, or
     // one of the keywords that may stand as an expression's head
     // (`await`, `switch`, `const`, `throw` sit below postfix precedence
@@ -1357,7 +1363,11 @@ pub(crate) fn expect_member_name(tokens: &TokenTable, index: usize) -> Option<()
 /// The replace face: the chain's null-aware operator goes to its `!` form
 /// (the official `!${lexeme.substring(1)}` rewrite — `?.` → `!.`,
 /// `?..` → `!..`, `?[` → `![`).
-pub(crate) fn replace_null_aware(tokens: &TokenTable, text: &str, op: usize) -> Option<(u32, u32, String)> {
+pub(crate) fn replace_null_aware(
+    tokens: &TokenTable,
+    text: &str,
+    op: usize,
+) -> Option<(u32, u32, String)> {
     let token = tokens.get(op)?;
     let replacement = match token.kind {
         TokenKind::QuestionPeriod | TokenKind::QuestionPeriodPeriod => {
@@ -1377,7 +1387,11 @@ pub(crate) fn replace_null_aware(tokens: &TokenTable, text: &str, op: usize) -> 
 /// precedence sits below postfix (anything but one member chain or one
 /// balanced group) wraps in parentheses — the official producer's two
 /// insertions folded into one whole-run replacement.
-pub(crate) fn append_bang(input: &FixInput<'_>, first: usize, last: usize) -> Option<(u32, u32, String)> {
+pub(crate) fn append_bang(
+    input: &FixInput<'_>,
+    first: usize,
+    last: usize,
+) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
     let (start16, length16) = span_over(text, tokens, first, last)?;

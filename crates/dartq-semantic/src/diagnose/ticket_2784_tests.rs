@@ -12,14 +12,13 @@ fn aug_rows(report: &FileReport) -> Vec<String> {
     report
         .diagnostics
         .iter()
-        .filter(|d| d.code.name.starts_with("augmentation_") || d.code.name == "typedef_augmentation")
+        .filter(|d| {
+            d.code.name.starts_with("augmentation_") || d.code.name == "typedef_augmentation"
+        })
         .map(|d| {
             format!(
                 "{} @{}:{} {}",
-                d.code.name,
-                d.range.offset,
-                d.range.length,
-                d.message
+                d.code.name, d.range.offset, d.range.length, d.message
             )
         })
         .collect()
@@ -55,9 +54,7 @@ fn assert_aug_row(report: &FileReport, name: &str, offset: usize, len: u32, mess
         .diagnostics
         .iter()
         .filter(|d| {
-            d.code.name == name
-                && d.range.offset as usize == offset
-                && d.range.length == len
+            d.code.name == name && d.range.offset as usize == offset && d.range.length == len
         })
         .collect();
     assert_eq!(
@@ -347,7 +344,12 @@ augment class C {
 }
 "#;
     let report = report_ops(src);
-    let member_augment = at_abs(src, "augment", "augment class C", at(src, "augment class C", 0));
+    let member_augment = at_abs(
+        src,
+        "augment",
+        "augment class C",
+        at(src, "augment class C", 0),
+    );
     assert_eq!(aug_rows(&report).len(), 1, "{:#?}", aug_rows(&report));
     assert_aug_row(
         &report,

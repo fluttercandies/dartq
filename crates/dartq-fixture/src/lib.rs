@@ -47,7 +47,7 @@ pub mod port;
 pub mod runner;
 
 pub use fixture::{
-    AnalyzedFile, Case, Expectation, FileBlock, FixtureDoc, ParseError, parse, DEFAULT_FILE,
+    AnalyzedFile, Case, DEFAULT_FILE, Expectation, FileBlock, FixtureDoc, ParseError, parse,
 };
 pub use port::{Outcome, PortedCase, merge_divergences, port_file, render};
 pub use runner::{assert_case, assert_doc, run_case};

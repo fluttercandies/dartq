@@ -1721,9 +1721,7 @@ impl SemanticCode {
             Self::UndefinedIdentifierAwait => {
                 ("undefined_identifier_await", "UNDEFINED_IDENTIFIER_AWAIT")
             }
-            Self::AwaitInWrongContext => {
-                ("await_in_wrong_context", "AWAIT_IN_WRONG_CONTEXT")
-            }
+            Self::AwaitInWrongContext => ("await_in_wrong_context", "AWAIT_IN_WRONG_CONTEXT"),
             Self::UndefinedMethod => ("undefined_method", "UNDEFINED_METHOD"),
             Self::UndefinedNamedParameter => {
                 ("undefined_named_parameter", "UNDEFINED_NAMED_PARAMETER")
@@ -2044,9 +2042,10 @@ impl SemanticCode {
             // subtype codes share the registry's `subtypeOfStructClass`
             // sharedName — like the super-member family, the uniqueName
             // differs and the analyzerCode folds.
-            Self::AbiSpecificIntegerInvalid => {
-                ("abi_specific_integer_invalid", "ABI_SPECIFIC_INTEGER_INVALID")
-            }
+            Self::AbiSpecificIntegerInvalid => (
+                "abi_specific_integer_invalid",
+                "ABI_SPECIFIC_INTEGER_INVALID",
+            ),
             Self::AbiSpecificIntegerMappingExtra => (
                 "abi_specific_integer_mapping_extra",
                 "ABI_SPECIFIC_INTEGER_MAPPING_EXTRA",
@@ -2079,9 +2078,7 @@ impl SemanticCode {
                 "field_must_be_external_in_struct",
                 "FIELD_MUST_BE_EXTERNAL_IN_STRUCT",
             ),
-            Self::GenericStructSubclass => {
-                ("generic_struct_subclass", "GENERIC_STRUCT_SUBCLASS")
-            }
+            Self::GenericStructSubclass => ("generic_struct_subclass", "GENERIC_STRUCT_SUBCLASS"),
             Self::InvalidFieldTypeInStruct => (
                 "invalid_field_type_in_struct",
                 "INVALID_FIELD_TYPE_IN_STRUCT",
@@ -2102,30 +2099,25 @@ impl SemanticCode {
                 "missing_size_annotation_carray",
                 "MISSING_SIZE_ANNOTATION_CARRAY",
             ),
-            Self::NegativeVariableDimension => (
-                "negative_variable_dimension",
-                "NEGATIVE_VARIABLE_DIMENSION",
-            ),
+            Self::NegativeVariableDimension => {
+                ("negative_variable_dimension", "NEGATIVE_VARIABLE_DIMENSION")
+            }
             Self::NonPositiveArrayDimension => (
                 "non_positive_array_dimension",
                 "NON_POSITIVE_ARRAY_DIMENSION",
             ),
-            Self::NonSizedTypeArgument => {
-                ("non_sized_type_argument", "NON_SIZED_TYPE_ARGUMENT")
-            }
+            Self::NonSizedTypeArgument => ("non_sized_type_argument", "NON_SIZED_TYPE_ARGUMENT"),
             Self::PackedAnnotation => ("packed_annotation", "PACKED_ANNOTATION"),
-            Self::PackedAnnotationAlignment => (
-                "packed_annotation_alignment",
-                "PACKED_ANNOTATION_ALIGNMENT",
-            ),
+            Self::PackedAnnotationAlignment => {
+                ("packed_annotation_alignment", "PACKED_ANNOTATION_ALIGNMENT")
+            }
             Self::VariableLengthArrayNotLast => (
                 "variable_length_array_not_last",
                 "VARIABLE_LENGTH_ARRAY_NOT_LAST",
             ),
-            Self::SizeAnnotationDimensions => (
-                "size_annotation_dimensions",
-                "SIZE_ANNOTATION_DIMENSIONS",
-            ),
+            Self::SizeAnnotationDimensions => {
+                ("size_annotation_dimensions", "SIZE_ANNOTATION_DIMENSIONS")
+            }
             Self::SubtypeOfStructClassInExtends
             | Self::SubtypeOfStructClassInImplements
             | Self::SubtypeOfStructClassInWith => {
@@ -2133,17 +2125,13 @@ impl SemanticCode {
             }
             Self::AddressPosition => ("address_position", "ADDRESS_POSITION"),
             Self::AddressReceiver => ("address_receiver", "ADDRESS_RECEIVER"),
-            Self::ArgumentMustBeAConstant => (
-                "argument_must_be_a_constant",
-                "ARGUMENT_MUST_BE_A_CONSTANT",
-            ),
-            Self::ArgumentMustBeNative => {
-                ("argument_must_be_native", "ARGUMENT_MUST_BE_NATIVE")
+            Self::ArgumentMustBeAConstant => {
+                ("argument_must_be_a_constant", "ARGUMENT_MUST_BE_A_CONSTANT")
             }
-            Self::CreationOfStructOrUnion => (
-                "creation_of_struct_or_union",
-                "CREATION_OF_STRUCT_OR_UNION",
-            ),
+            Self::ArgumentMustBeNative => ("argument_must_be_native", "ARGUMENT_MUST_BE_NATIVE"),
+            Self::CreationOfStructOrUnion => {
+                ("creation_of_struct_or_union", "CREATION_OF_STRUCT_OR_UNION")
+            }
             Self::FfiNativeInvalidDuplicateDefaultAsset => (
                 "ffi_native_invalid_duplicate_default_asset",
                 "FFI_NATIVE_INVALID_DUPLICATE_DEFAULT_ASSET",
@@ -2167,9 +2155,7 @@ impl SemanticCode {
                 "ffi_native_unexpected_number_of_parameters_with_receiver",
                 "FFI_NATIVE_UNEXPECTED_NUMBER_OF_PARAMETERS_WITH_RECEIVER",
             ),
-            Self::InvalidExceptionValue => {
-                ("invalid_exception_value", "INVALID_EXCEPTION_VALUE")
-            }
+            Self::InvalidExceptionValue => ("invalid_exception_value", "INVALID_EXCEPTION_VALUE"),
             Self::LeafCallMustNotReturnHandle => (
                 "leaf_call_must_not_return_handle",
                 "LEAF_CALL_MUST_NOT_RETURN_HANDLE",
@@ -2178,9 +2164,7 @@ impl SemanticCode {
                 "leaf_call_must_not_take_handle",
                 "LEAF_CALL_MUST_NOT_TAKE_HANDLE",
             ),
-            Self::MissingExceptionValue => {
-                ("missing_exception_value", "MISSING_EXCEPTION_VALUE")
-            }
+            Self::MissingExceptionValue => ("missing_exception_value", "MISSING_EXCEPTION_VALUE"),
             Self::MustBeANativeFunctionType => (
                 "must_be_a_native_function_type",
                 "MUST_BE_A_NATIVE_FUNCTION_TYPE",
@@ -2193,17 +2177,14 @@ impl SemanticCode {
             Self::NativeFieldMissingType => {
                 ("native_field_missing_type", "NATIVE_FIELD_MISSING_TYPE")
             }
-            Self::NativeFieldNotStatic => {
-                ("native_field_not_static", "NATIVE_FIELD_NOT_STATIC")
-            }
+            Self::NativeFieldNotStatic => ("native_field_not_static", "NATIVE_FIELD_NOT_STATIC"),
             Self::NativeFunctionMissingType => (
                 "native_function_missing_type",
                 "NATIVE_FUNCTION_MISSING_TYPE",
             ),
-            Self::NonConstantTypeArgument => (
-                "non_constant_type_argument",
-                "NON_CONSTANT_TYPE_ARGUMENT",
-            ),
+            Self::NonConstantTypeArgument => {
+                ("non_constant_type_argument", "NON_CONSTANT_TYPE_ARGUMENT")
+            }
             Self::NonNativeFunctionTypeArgumentToPointer => (
                 "non_native_function_type_argument_to_pointer",
                 "NON_NATIVE_FUNCTION_TYPE_ARGUMENT_TO_POINTER",
@@ -2332,10 +2313,9 @@ impl SemanticCode {
             Self::EqualKeysInMap => ("equal_keys_in_map", "EQUAL_KEYS_IN_MAP"),
             // The #2261 const twins (`messages.yaml` :5870/:5905 — both
             // `type: compileTimeError`).
-            Self::EqualElementsInConstSet => (
-                "equal_elements_in_const_set",
-                "EQUAL_ELEMENTS_IN_CONST_SET",
-            ),
+            Self::EqualElementsInConstSet => {
+                ("equal_elements_in_const_set", "EQUAL_ELEMENTS_IN_CONST_SET")
+            }
             Self::EqualKeysInConstMap => ("equal_keys_in_const_map", "EQUAL_KEYS_IN_CONST_MAP"),
             // The #748 W5 pair (diagnostic.g.dart :13184-13191 and
             // :17517-17523 — both `hasPublishedDocs: true`).
@@ -2373,10 +2353,9 @@ impl SemanticCode {
                 "not_enough_positional_arguments",
                 "NOT_ENOUGH_POSITIONAL_ARGUMENTS",
             ),
-            Self::MissingRequiredArgument => (
-                "missing_required_argument",
-                "MISSING_REQUIRED_ARGUMENT",
-            ),
+            Self::MissingRequiredArgument => {
+                ("missing_required_argument", "MISSING_REQUIRED_ARGUMENT")
+            }
             // The #1314 FAM7 cluster: the positional face shares the named
             // one's registry name (the `sharedName` split, messages.yaml
             // :11379/:11434).
@@ -2479,10 +2458,9 @@ impl SemanticCode {
                 "invocation_of_non_function_expression",
                 "INVOCATION_OF_NON_FUNCTION_EXPRESSION",
             ),
-            Self::InvocationOfNonFunction => (
-                "invocation_of_non_function",
-                "INVOCATION_OF_NON_FUNCTION",
-            ),
+            Self::InvocationOfNonFunction => {
+                ("invocation_of_non_function", "INVOCATION_OF_NON_FUNCTION")
+            }
             Self::InvalidReferenceToThis => {
                 ("invalid_reference_to_this", "INVALID_REFERENCE_TO_THIS")
             }
@@ -2536,10 +2514,9 @@ impl SemanticCode {
             // The registry's nullability twins share the name and the
             // machine form (the `uniqueName` split) — the base variant
             // covers both report faces.
-            Self::MapKeyTypeNotAssignable => (
-                "map_key_type_not_assignable",
-                "MAP_KEY_TYPE_NOT_ASSIGNABLE",
-            ),
+            Self::MapKeyTypeNotAssignable => {
+                ("map_key_type_not_assignable", "MAP_KEY_TYPE_NOT_ASSIGNABLE")
+            }
             Self::MapValueTypeNotAssignable => (
                 "map_value_type_not_assignable",
                 "MAP_VALUE_TYPE_NOT_ASSIGNABLE",
@@ -2547,10 +2524,9 @@ impl SemanticCode {
             // The `yield*` row's registry `name` is `yield_of_invalid_type`
             // (diagnostic.g.dart:18854 — the `uniqueName` split); both
             // generator faces print the shared code.
-            Self::YieldOfInvalidType | Self::YieldEachOfInvalidType => (
-                "yield_of_invalid_type",
-                "YIELD_OF_INVALID_TYPE",
-            ),
+            Self::YieldOfInvalidType | Self::YieldEachOfInvalidType => {
+                ("yield_of_invalid_type", "YIELD_OF_INVALID_TYPE")
+            }
             Self::AmbiguousSetOrMapLiteralEither => (
                 "ambiguous_set_or_map_literal_either",
                 "AMBIGUOUS_SET_OR_MAP_LITERAL_EITHER",
@@ -2722,9 +2698,13 @@ impl SemanticCode {
     #[must_use]
     pub fn unchecked_nullable_message(is_method: bool, name: &str) -> String {
         if is_method {
-            format!("The method '{name}' can't be unconditionally invoked because the receiver can be 'null'.")
+            format!(
+                "The method '{name}' can't be unconditionally invoked because the receiver can be 'null'."
+            )
         } else {
-            format!("The property '{name}' can't be unconditionally accessed because the receiver can be 'null'.")
+            format!(
+                "The property '{name}' can't be unconditionally accessed because the receiver can be 'null'."
+            )
         }
     }
 

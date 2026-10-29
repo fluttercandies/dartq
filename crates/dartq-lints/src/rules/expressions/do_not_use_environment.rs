@@ -17,11 +17,8 @@ use super::{Check, NodeKind, RuleSpec, same_file, slice};
 /// `fromEnvironment` constructor under-report; the dot-shorthand form
 /// (`.fromEnvironment`) under-report. Message: `diagnostic.g.dart`
 /// `doNotUseEnvironment`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "do_not_use_environment",
-    &[NodeKind::Send],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("do_not_use_environment", &[NodeKind::Send], check,);
 
 fn check(c: &mut Check<'_>) {
     let Some((kids, pos)) = slice::owner_slice(c) else {

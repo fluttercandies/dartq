@@ -6,11 +6,8 @@ use super::{Check, NodeKind, RuleSpec};
 /// (`NewExpression` is a width-0 kind: the derivable word is eliminated
 /// into `header.first_token`).
 /// Message: `diagnostic.g.dart` `unnecessaryNew`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_new",
-    &[NodeKind::NewExpression],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("unnecessary_new", &[NodeKind::NewExpression], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

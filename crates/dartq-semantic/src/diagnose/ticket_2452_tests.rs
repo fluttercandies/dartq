@@ -142,8 +142,7 @@ void h() {
     );
     let at = source_m.find("Alias()").unwrap() as u32;
     assert!(
-        rows(&report)
-            .contains(&("invocation_of_non_function", at)),
+        rows(&report).contains(&("invocation_of_non_function", at)),
         "{:?}",
         rows(&report)
     );
@@ -190,10 +189,7 @@ void i() {
     let report = report_prefixed(source_m, "class Other {}");
     let at = source_m.find("Alias.named").unwrap() as u32;
     let spans = rows(&report);
-    assert!(
-        spans.contains(&("creation_with_non_type", at)),
-        "{spans:?}"
-    );
+    assert!(spans.contains(&("creation_with_non_type", at)), "{spans:?}");
     assert!(
         !spans.iter().any(|(c, _)| *c == "undefined_method"),
         "{spans:?}"
@@ -216,10 +212,7 @@ void m() {
     let report = report_prefixed(source_m, "class Other {}");
     let at = source_m.find("Gen<int>").unwrap() as u32;
     let spans = rows(&report);
-    assert!(
-        spans.contains(&("creation_with_non_type", at)),
-        "{spans:?}"
-    );
+    assert!(spans.contains(&("creation_with_non_type", at)), "{spans:?}");
 }
 
 /// A grounded chain stays silent: `typedef L = io.File;` resolves
@@ -266,8 +259,5 @@ void h() {
 ";
     let report = report_prefixed(source_m, "class Other {}");
     let names = code_names(&report);
-    assert!(
-        names.contains(&"invocation_of_non_function"),
-        "{names:?}"
-    );
+    assert!(names.contains(&"invocation_of_non_function"), "{names:?}");
 }

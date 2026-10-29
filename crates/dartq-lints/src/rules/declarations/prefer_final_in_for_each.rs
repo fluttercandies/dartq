@@ -29,9 +29,7 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     // `loopVariable.isFinal` (:46).
-    if variables_declaration_keyword(c, node)
-        .is_some_and(|keyword| c.lexeme(keyword) == "final")
-    {
+    if variables_declaration_keyword(c, node).is_some_and(|keyword| c.lexeme(keyword) == "final") {
         return;
     }
     let Some(var_row) = c
@@ -50,9 +48,7 @@ fn check(c: &mut Check<'_>) {
     let window = c.unit.ast.token_range(parent);
     let decl = c.unit.ast.token_range(node);
     let closures = closure_windows(c, parent);
-    if name_written_in_window(c, decl.end..window.end, name)
-        || name_captured(c, &closures, name)
-    {
+    if name_written_in_window(c, decl.end..window.end, name) || name_captured(c, &closures, name) {
         return;
     }
     c.report(utf16_token_span(c, name_token), &[name]);

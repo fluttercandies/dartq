@@ -73,7 +73,8 @@ pub(crate) fn prefixed_dart_core_name(c: &Check<'_>, prefix: &str, name: &str) -
         // The `DeferredKeyword` word carries the `deferred` keyword token
         // (`TOKEN_NONE` when the import is not deferred) — a deferred
         // import's constants never load.
-        if c.field(row, PayloadField::DeferredKeyword).unwrap_or(crate::rules::NONE_TOKEN)
+        if c.field(row, PayloadField::DeferredKeyword)
+            .unwrap_or(crate::rules::NONE_TOKEN)
             != crate::rules::NONE_TOKEN
         {
             continue;
@@ -120,9 +121,7 @@ fn metadata_name_face(c: &Check<'_>, meta: u32) -> Option<(Option<u32>, u32)> {
         .collect();
     match names.as_slice() {
         [name] => Some((None, *name)),
-        [prefix, name]
-            if c.field(meta, PayloadField::PeriodBeforeName).unwrap_or(0) != 0 =>
-        {
+        [prefix, name] if c.field(meta, PayloadField::PeriodBeforeName).unwrap_or(0) != 0 => {
             Some((Some(*prefix), *name))
         }
         _ => None,
@@ -276,11 +275,8 @@ pub(crate) mod avoid_relative_lib_imports {
     /// URI. `isRelativeLibImport` (:24-35): `Uri.tryParse(uri.stringValue)`,
     /// scheme empty, `uri.path.contains('/lib/')`. Message:
     /// `diagnostic.g.dart` `avoidRelativeLibImports`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_relative_lib_imports",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("avoid_relative_lib_imports", &[NodeKind::Import], check,);
 
     /// The scheme prefix length (`letter (letter | digit | + - .)* ':'`, the
     /// `Uri` scheme grammar) — non-empty schemes disqualify (:28-32).
@@ -340,11 +336,8 @@ pub(crate) mod library_annotations {
     /// `isPragmaLateTrust` branch (:84-95) pins the dart:core `pragma`
     /// constructor; the dartq face reads the written name bare or
     /// import-qualified through a same-file prefix.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "library_annotations",
-    &[NodeKind::Metadata],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("library_annotations", &[NodeKind::Metadata], check,);
 
     fn check(c: &mut Check<'_>) {
         // Top-level annotations only: the official visits unit directives
@@ -557,11 +550,8 @@ pub(crate) mod library_prefixes {
     /// `^\$?_*[a-z][_a-z\d]*$`), the `_` wildcard exempt when
     /// `wildcard_variables` is on (:36-39). Message: `diagnostic.g.dart`
     /// `libraryPrefixes`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "library_prefixes",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("library_prefixes", &[NodeKind::Import], check,);
 
     /// `utils.dart:58` — optional `$`, then underscores, then a lowercase
     /// letter, then `[_a-z\d]*`.
@@ -611,10 +601,10 @@ pub(crate) mod no_leading_underscores_for_library_prefixes {
     /// problem/correction texts, so this spec renders both verbatim; the
     /// uniqueName split is unobservable at this face.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_leading_underscores_for_library_prefixes",
-    &[NodeKind::Import],
-    check,
-);
+        "no_leading_underscores_for_library_prefixes",
+        &[NodeKind::Import],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let Some(prefix) = super::import_prefix(c, c.node()) else {
@@ -644,10 +634,10 @@ pub(crate) mod unnecessary_library_directive {
     /// `//`/`/* */` comments do not. Message: `diagnostic.g.dart`
     /// `unnecessaryLibraryDirective`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_library_directive",
-    &[NodeKind::LibraryName],
-    check,
-);
+        "unnecessary_library_directive",
+        &[NodeKind::LibraryName],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -775,7 +765,7 @@ pub(crate) mod unnecessary_library_directive {
 }
 
 pub(crate) mod unnecessary_library_name {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_library_name.dart:28-44`
     /// — a named `library` directive reports at the name. The rule registers
@@ -784,11 +774,8 @@ pub(crate) mod unnecessary_library_name {
     /// presence is the `LibraryName.has_name` payload (the
     /// `end_library_name` back-fill). Message: `diagnostic.g.dart`
     /// `unnecessaryLibraryName`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_library_name",
-    &[NodeKind::LibraryName],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("unnecessary_library_name", &[NodeKind::LibraryName], check,);
 
     fn check(c: &mut Check<'_>) {
         if !c.unit.features.unnamed_libraries {
@@ -807,7 +794,7 @@ pub(crate) mod unnecessary_library_name {
 }
 
 pub(crate) mod use_string_in_part_of_directives {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/use_string_in_part_of_directives.dart:29-47`
     /// — a `part of` in the dotted-name form reports at the directive. The
@@ -817,10 +804,10 @@ pub(crate) mod use_string_in_part_of_directives {
     /// `PartOf.has_name` payload (the `end_part_of` back-fill).
     /// Message: `diagnostic.g.dart` `useStringInPartOfDirectives`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_string_in_part_of_directives",
-    &[NodeKind::PartOf],
-    check,
-);
+        "use_string_in_part_of_directives",
+        &[NodeKind::PartOf],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         if c.unit.features.enhanced_parts {
@@ -858,11 +845,8 @@ pub(crate) mod directives_ordering {
     /// `directivesOrderingPackageBeforeRelative`,
     /// `directivesOrderingExports`, `directivesOrderingAlphabetical` (the
     /// nominal spec face; every report carries its own texts).
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "directives_ordering",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("directives_ordering", &[NodeKind::CompilationUnit], check,);
 
     const DART_PROBLEM: &str = "Place 'dart:' {0} before other {0}.";
     const PACKAGE_PROBLEM: &str = "Place 'package:' {0} before relative {0}.";
@@ -1064,7 +1048,7 @@ pub(crate) mod directives_ordering {
 }
 
 pub(crate) mod library_names {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/library_names.dart:28-46` — a
     /// named `library` directive whose name is not
@@ -1073,11 +1057,8 @@ pub(crate) mod library_names {
     /// official corpus). The validator is `utils.dart:35`
     /// `_lowerCaseUnderScoreWithDots`: `^_?[_a-z\d]*(?:\.[a-z][_a-z\d]*)*$`.
     /// Message: `diagnostic.g.dart` `libraryNames`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "library_names",
-    &[NodeKind::LibraryName],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("library_names", &[NodeKind::LibraryName], check,);
 
     fn check(c: &mut Check<'_>) {
         if c.field(c.node(), PayloadField::HasName).unwrap_or(0) == 0 {
@@ -1149,10 +1130,10 @@ pub(crate) mod package_prefixed_library_names {
     /// (`diagnostic.g.dart` `packagePrefixedLibraryNames`) for the listing
     /// face.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "package_prefixed_library_names",
-    &[NodeKind::LibraryName],
-    check,
-);
+        "package_prefixed_library_names",
+        &[NodeKind::LibraryName],
+        check,
+    );
 
     fn check(_c: &mut Check<'_>) {}
 }
@@ -1174,11 +1155,8 @@ pub(crate) mod provide_deprecation_message {
     /// class annotation is always `no_annotation_constructor_arguments`), a
     /// face unreachable on valid code. Message:
     /// `diagnostic.g.dart` `provideDeprecationMessage`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "provide_deprecation_message",
-    &[NodeKind::Metadata],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("provide_deprecation_message", &[NodeKind::Metadata], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1238,11 +1216,8 @@ pub(crate) mod implementation_imports {
 
     use super::{Check, NodeKind, RuleSpec, written_uri};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "implementation_imports",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("implementation_imports", &[NodeKind::Import], check,);
 
     fn check(c: &mut Check<'_>) {
         let Some(facts) = c.unit.workspace else {
@@ -1406,10 +1381,10 @@ pub(crate) mod combinators_ordering {
     /// case-sensitive code-unit order (`String.compareTo`). Message:
     /// `diagnostic.g.dart` `combinatorsOrdering`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "combinators_ordering",
-    &[NodeKind::Show, NodeKind::Hide],
-    check,
-);
+        "combinators_ordering",
+        &[NodeKind::Show, NodeKind::Hide],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1436,11 +1411,8 @@ pub(crate) mod migrate_design_widgets {
     /// `package:flutter/cupertino.dart`) reports at the URI with the
     /// library spelled in the message. Message: `diagnostic.g.dart`
     /// `migrateDesignWidgets`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "migrate_design_widgets",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("migrate_design_widgets", &[NodeKind::Import], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1471,11 +1443,8 @@ pub(crate) mod always_use_package_imports {
 
     use super::{Check, NodeKind, RuleSpec, written_uri};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "always_use_package_imports",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("always_use_package_imports", &[NodeKind::Import], check,);
 
     fn check(c: &mut Check<'_>) {
         let Some(facts) = c.unit.workspace else {
@@ -1523,11 +1492,8 @@ pub(crate) mod prefer_relative_imports {
 
     use super::{Check, NodeKind, RuleSpec, written_uri};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_relative_imports",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("prefer_relative_imports", &[NodeKind::Import], check,);
 
     fn check(c: &mut Check<'_>) {
         let Some(facts) = c.unit.workspace else {
@@ -1582,16 +1548,16 @@ pub(crate) mod simple_directive_paths {
     use super::{Check, NodeKind, RuleSpec, candidate_uri, written_uri};
 
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "simple_directive_paths",
-    &[
+        "simple_directive_paths",
+        &[
             NodeKind::Import,
             NodeKind::Export,
             NodeKind::Part,
             NodeKind::PartOf,
             NodeKind::ConditionalUri,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         // The directive's primary URI; on a conditional-uri clause the
@@ -2079,11 +2045,8 @@ pub(crate) mod avoid_web_libraries_in_flutter {
 
     use super::{Check, NodeKind, RuleSpec, written_uri};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_web_libraries_in_flutter",
-    &[NodeKind::Import],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("avoid_web_libraries_in_flutter", &[NodeKind::Import], check,);
 
     fn check(c: &mut Check<'_>) {
         // `context.package?.root` (rule_context gate): outside any known
@@ -2132,10 +2095,10 @@ pub(crate) mod conditional_uri_does_not_exist {
     use super::{Check, NodeKind, RuleSpec, candidate_uri};
 
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "conditional_uri_does_not_exist",
-    &[NodeKind::ConditionalUri],
-    check,
-);
+        "conditional_uri_does_not_exist",
+        &[NodeKind::ConditionalUri],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let Some((range, candidate)) = candidate_uri(c, c.node()) else {

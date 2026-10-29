@@ -99,9 +99,7 @@ fn perf_event_throughput() {
     }
     let elapsed = start.elapsed();
     let per_sec = TOTAL as f64 / elapsed.as_secs_f64();
-    println!(
-        "perf_event_throughput: {TOTAL} events in {elapsed:?} -> {per_sec:.0} events/s"
-    );
+    println!("perf_event_throughput: {TOTAL} events in {elapsed:?} -> {per_sec:.0} events/s");
     assert!(
         per_sec > 10_000.0,
         "throughput floor missed: {per_sec:.0} events/s"

@@ -217,8 +217,7 @@ int f(E e) {
         report
             .diagnostics
             .iter()
-            .any(|d| d.code.name == "dead_code"
-                && d.range.offset == at(source, "return 2")),
+            .any(|d| d.code.name == "dead_code" && d.range.offset == at(source, "return 2")),
         "{:?}",
         report.diagnostics
     );

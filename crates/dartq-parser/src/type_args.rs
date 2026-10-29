@@ -810,8 +810,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     n += len;
                 }
                 if self.kind_at(offset + n) == TokenKind::OpenParen {
-                    let Some(end) = self.cursor.table_matching_end(self.real_id(offset + n))
-                    else {
+                    let Some(end) = self.cursor.table_matching_end(self.real_id(offset + n)) else {
                         return 0;
                     };
                     n = self.offset_of(end) - offset + 1;

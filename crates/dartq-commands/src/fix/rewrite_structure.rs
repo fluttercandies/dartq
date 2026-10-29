@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// `unawaited_futures`: `await ` lands at the reported expression
 /// statement's head — the official `AddAwait.unawaited` arm (`await ` at
 /// the expression's offset, refused inside a cascade). The lint's own
@@ -512,7 +511,11 @@ pub(crate) fn is_constructor_body(tokens: &TokenTable, text: &str, brace: usize)
 /// The name of the `class`/`enum`/`mixin`/`extension`/`extension type`
 /// declaration whose body encloses token `at` — found by walking the
 /// brace pairs out to the container's `{` and its header's name.
-pub(crate) fn enclosing_container_name<'s>(tokens: &TokenTable, text: &'s str, at: usize) -> Option<&'s str> {
+pub(crate) fn enclosing_container_name<'s>(
+    tokens: &TokenTable,
+    text: &'s str,
+    at: usize,
+) -> Option<&'s str> {
     // The enclosing `{`: the innermost begin-group opened before `at` and
     // closed after it.
     let mut depth = 0u32;
@@ -1108,7 +1111,11 @@ pub(crate) fn is_constructor_member(
 /// Whether the member range is an unnamed (`Name(`/`Name.new(`)
 /// constructor — the official `name == null || name.lexeme == 'new'`
 /// read.
-pub(crate) fn is_unnamed_constructor(tokens: &TokenTable, text: &str, member: (usize, usize)) -> bool {
+pub(crate) fn is_unnamed_constructor(
+    tokens: &TokenTable,
+    text: &str,
+    member: (usize, usize),
+) -> bool {
     let (s, e) = member;
     let mut i = s;
     // Skip leading keywords (`const`, `factory`, `external`).
@@ -1276,7 +1283,11 @@ pub(crate) fn member_has_keyword(tokens: &TokenTable, member: (usize, usize), kw
 /// The declared name a `get`/`set`/method member carries — the identifier
 /// immediately before its `(` parameter list or its `=>`/`{`/`;`
 /// terminator.
-pub(crate) fn member_name<'s>(tokens: &TokenTable, text: &'s str, member: (usize, usize)) -> Option<&'s str> {
+pub(crate) fn member_name<'s>(
+    tokens: &TokenTable,
+    text: &'s str,
+    member: (usize, usize),
+) -> Option<&'s str> {
     let (s, e) = member;
     for i in s..e {
         match kind_of(tokens, i) {
@@ -1975,7 +1986,11 @@ pub(crate) fn typedef_signature(
 
 /// The parameter-list interior text — verbatim except a trailing comma,
 /// which the official parameter-by-parameter rebuild drops.
-pub(crate) fn params_text(tokens: &TokenTable, text: &str, range: core::ops::Range<usize>) -> Option<String> {
+pub(crate) fn params_text(
+    tokens: &TokenTable,
+    text: &str,
+    range: core::ops::Range<usize>,
+) -> Option<String> {
     let mut end = range.end;
     if end > range.start && kind_of(tokens, end - 1)? == TokenKind::Comma {
         end -= 1;
@@ -2011,7 +2026,11 @@ pub(crate) fn add_static_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, St
             _ => break,
         }
     }
-    Some(vec![(tokens.get(head)?.utf16_offset, 0, "static ".to_owned())])
+    Some(vec![(
+        tokens.get(head)?.utf16_offset,
+        0,
+        "static ".to_owned(),
+    )])
 }
 
 /// The head of the variable declaration list owning the reported name —
@@ -2043,9 +2062,7 @@ pub(crate) fn variable_list_head(
             break;
         };
         match kind_of(tokens, prev)? {
-            TokenKind::Keyword(
-                Keyword::Var | Keyword::Final | Keyword::Const | Keyword::Late,
-            ) => {
+            TokenKind::Keyword(Keyword::Var | Keyword::Final | Keyword::Const | Keyword::Late) => {
                 keyword = Some(prev);
                 list_head = prev;
             }
@@ -2290,11 +2307,7 @@ pub(crate) fn add_const_pattern_entry(input: &FixInput<'_>) -> Option<Vec<(u32, 
                 | TokenKind::Hexadecimal
                 | TokenKind::String
                 | TokenKind::Keyword(
-                    Keyword::Null
-                        | Keyword::True
-                        | Keyword::False
-                        | Keyword::This
-                        | Keyword::Super
+                    Keyword::Null | Keyword::True | Keyword::False | Keyword::This | Keyword::Super
                 )
         )
     } else {
@@ -2371,8 +2384,7 @@ pub(crate) fn add_async_await_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u3
     // `addInsertion(body.offset, …)` — a ` ` lead when the body opener
     // fuses with the previous token (`f()=>` writes ` async `).
     let at = tokens.get(body_head)?.utf16_offset;
-    let fused =
-        body_head > 0 && utf16_end(tokens, input.text, body_head - 1)? == at;
+    let fused = body_head > 0 && utf16_end(tokens, input.text, body_head - 1)? == at;
     let text = if fused { " async " } else { "async " };
     Some(vec![(at, 0, text.to_owned())])
 }
@@ -2416,7 +2428,11 @@ pub(crate) fn formal_spans(tokens: &TokenTable, list: usize) -> Option<Vec<(usiz
 /// last identifier before an optional `:`/`=` default tail (the named
 /// parameter's `required`, type, and `covariant` lead it; the `this.` /
 /// `super.` receiver's own name side is still the parameter name).
-pub(crate) fn formal_name_token(tokens: &TokenTable, text: &str, span: (usize, usize)) -> Option<usize> {
+pub(crate) fn formal_name_token(
+    tokens: &TokenTable,
+    text: &str,
+    span: (usize, usize),
+) -> Option<usize> {
     let mut end = span.1;
     // The default tail (`= expr` / `: expr`) is not part of the
     // declaration shape — walk it off at depth 0 of the span.
@@ -2610,9 +2626,7 @@ pub(crate) fn comma_entries(
 /// its list (`nodeInList`) and ` = expr` lands at the field declaration's
 /// end (the field must declare `x` without an initializer). The report
 /// anchors the initializer's field name.
-pub(crate) fn move_init_to_field_entry(
-    input: &FixInput<'_>,
-) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn move_init_to_field_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
     let tokens = input.tokens?;
     let text = input.text;
     let (first, _) = hit_tokens(tokens, &input.range)?;
@@ -2627,9 +2641,7 @@ pub(crate) fn move_init_to_field_entry(
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
                     cursor = matching_begin(tokens, cursor)?;
                 }
-                TokenKind::Semicolon
-                | TokenKind::OpenCurly
-                | TokenKind::Eof => return None,
+                TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::Eof => return None,
                 _ => {}
             }
         }
@@ -2648,13 +2660,18 @@ pub(crate) fn move_init_to_field_entry(
     let mut depth = 0u32;
     let entry_end = loop {
         match kind_of(tokens, expr_end)? {
-            TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon | TokenKind::Eof
+            TokenKind::OpenCurly
+            | TokenKind::Function
+            | TokenKind::Semicolon
+            | TokenKind::Eof
             | TokenKind::Comma
                 if depth == 0 =>
             {
                 break expr_end;
             }
-            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
             | TokenKind::StringInterpolationExpression => depth += 1,
             TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
                 depth = depth.checked_sub(1)?;
@@ -2672,7 +2689,9 @@ pub(crate) fn move_init_to_field_entry(
             {
                 break;
             }
-            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
             | TokenKind::StringInterpolationExpression => depth += 1,
             TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
                 depth = depth.checked_sub(1)?;
@@ -2745,7 +2764,9 @@ pub(crate) fn convert_to_init_formal_entry(
     // The `=` inside the report: the field name precedes it (a `this.x`
     // prefix rides the body-assignment face), the parameter's identifier
     // follows it.
-    let eq = depth0_find(tokens, text, first, last + 1, |kind, _| kind == TokenKind::Eq)?;
+    let eq = depth0_find(tokens, text, first, last + 1, |kind, _| {
+        kind == TokenKind::Eq
+    })?;
     let field_tok = {
         let mut cursor = eq;
         loop {
@@ -2828,9 +2849,7 @@ pub(crate) fn convert_to_init_formal_entry(
         }
         _ => false,
     };
-    if same_type
-        && let Some((ps, _)) = param_type
-    {
+    if same_type && let Some((ps, _)) = param_type {
         // `int v` → `this.x` — the type through the name goes in one
         // span (the type deletion plus the `this.`-insert plus the
         // rename compose to the same replacement).
@@ -2872,12 +2891,12 @@ pub(crate) fn convert_to_init_formal_entry(
         let mut depth = 0u32;
         let list_end = loop {
             match kind_of(tokens, end)? {
-                TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon
-                    if depth == 0 =>
-                {
+                TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon if depth == 0 => {
                     break end;
                 }
-                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+                TokenKind::OpenParen
+                | TokenKind::OpenSquare
+                | TokenKind::OpenCurly
                 | TokenKind::StringInterpolationExpression => depth += 1,
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
                     depth = depth.checked_sub(1)?;
@@ -3018,9 +3037,7 @@ pub(crate) fn convert_to_declaring_param_entry(
     // The field: same name, or the `_x`-under-`x` pair the lint's
     // `names_match` allows.
     let (field_member, field_name_tok) = field_member_named(tokens, text, &members, name)
-        .or_else(|| {
-            field_member_named(tokens, text, &members, &format!("_{name}"))
-        })?;
+        .or_else(|| field_member_named(tokens, text, &members, &format!("_{name}")))?;
     // The field declaration's `final`/`var`/absent keyword — the
     // storage keyword the declaring parameter spells (`var` for the
     // mutable faces).
@@ -3121,15 +3138,17 @@ pub(crate) fn convert_to_declaring_param_entry(
             let end = utf16_end(tokens, text, first)?;
             edits.push((start, end - start, field_name.to_owned()));
         }
-        let required_tok = first.checked_sub(1).filter(|&t| {
-            kind_of(tokens, t) == Some(TokenKind::Keyword(Keyword::Required))
-        });
+        let required_tok = first
+            .checked_sub(1)
+            .filter(|&t| kind_of(tokens, t) == Some(TokenKind::Keyword(Keyword::Required)));
         // The parameter's lead: back to its `(`/`,` boundary, then its
         // written type is what the modifier lead leaves before the name.
         let mut boundary = first;
         while let Some(prev) = boundary.checked_sub(1) {
             match kind_of(tokens, prev)? {
-                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+                TokenKind::OpenParen
+                | TokenKind::OpenSquare
+                | TokenKind::OpenCurly
                 | TokenKind::Comma => break,
                 _ => boundary = prev,
             }
@@ -3151,9 +3170,7 @@ pub(crate) fn convert_to_declaring_param_entry(
         // the two at the same offset; one edit keeps the composition
         // order explicit).
         let mut inserted = format!("{keyword} ");
-        if !has_type
-            && let Some((fs, fe)) = field_type
-        {
+        if !has_type && let Some((fs, fe)) = field_type {
             let (o, l) = span_over(text, tokens, fs, fe - 1)?;
             inserted.push_str(slice16(text, &(o..o + l))?.trim());
             inserted.push(' ');
@@ -3181,9 +3198,8 @@ pub(crate) fn convert_to_declaring_param_entry(
             .find(|&(s, _)| kind_of(tokens, s) == Some(TokenKind::Keyword(Keyword::This)));
         if let Some((ctor_start, ctor_end)) = ctor {
             // `:` heading the initializer list inside this member.
-            let colon = (ctor_start..ctor_end).find(|&i| {
-                kind_of(tokens, i) == Some(TokenKind::Colon)
-            });
+            let colon =
+                (ctor_start..ctor_end).find(|&i| kind_of(tokens, i) == Some(TokenKind::Colon));
             // The body token after the initializer list: `{` (block) or
             // `;` (empty body).
             let body_tok = colon.and_then(|colon| {
@@ -3351,9 +3367,7 @@ pub(crate) fn compare_directive_uri(a: &str, b: &str) -> core::cmp::Ordering {
 /// directive or non-directive content inside the block bounds the face
 /// and drops the fix; a rebuild that changes nothing drops it too (the
 /// official `organize()` returns no edits then).
-pub(crate) fn organize_directives_entry(
-    input: &FixInput<'_>,
-) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn organize_directives_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
     let tokens = input.tokens?;
     let text = input.text;
     let line_starts = byte_line_starts(text);
@@ -3486,9 +3500,7 @@ pub(crate) fn organize_directives_entry(
     // group attaches; `///`/`/**` docs, `@` annotations, and
     // blank-separated groups stay at the top (upstream's
     // pseudo-library-directive face).
-    let line_of = |byte: usize| -> usize {
-        line_starts.partition_point(|&s| s <= byte) - 1
-    };
+    let line_of = |byte: usize| -> usize { line_starts.partition_point(|&s| s <= byte) - 1 };
     let line_start_byte = |line: usize| -> usize { line_starts[line] };
     let line_end_byte = |line: usize| -> usize {
         if line + 1 < line_starts.len() {
@@ -3503,7 +3515,9 @@ pub(crate) fn organize_directives_entry(
     // trivia, which stops at the library's tokens).
     let library_floor = library_kw
         .and_then(|lib| {
-            depth0_find(tokens, text, lib + 1, len, |kind, _| kind == TokenKind::Semicolon)
+            depth0_find(tokens, text, lib + 1, len, |kind, _| {
+                kind == TokenKind::Semicolon
+            })
         })
         .and_then(|semi| tokens.get(semi).map(|t| line_of(t.byte_offset as usize)));
     let mut prev_trailing_line = None::<usize>;
@@ -3616,9 +3630,7 @@ pub(crate) fn organize_directives_entry(
         // directive's `;` (`hide` ends the run) whose own offset a row
         // sits on.
         let mut flagged_shown = Vec::new();
-        if !unused_shown.is_empty()
-            && kind_of(tokens, kw)? == TokenKind::Keyword(Keyword::Import)
-        {
+        if !unused_shown.is_empty() && kind_of(tokens, kw)? == TokenKind::Keyword(Keyword::Import) {
             let mut in_show = false;
             for i in kw + 1..semi {
                 match kind_of(tokens, i)? {
@@ -3667,9 +3679,7 @@ pub(crate) fn organize_directives_entry(
     let mut current = None::<u8>;
     let mut previous_text = String::new();
     for piece in &sorted {
-        if !unresolved_gate
-            && (unused_uris.contains(&piece.uri16) || previous_text == piece.text)
-        {
+        if !unresolved_gate && (unused_uris.contains(&piece.uri16) || previous_text == piece.text) {
             continue;
         }
         let mut written = piece.text.clone();
@@ -3719,8 +3729,8 @@ pub(crate) fn organize_directives_entry(
     // The doc-import leg: the library directive's doc comment sorts its
     // `@docImport` lines (upstream `_organizeDocImports`, run before the
     // directive write loop and independent of it).
-    let doc_edit = library_kw
-        .and_then(|lib| organize_doc_imports(tokens, text, lib, &line_starts, eol));
+    let doc_edit =
+        library_kw.and_then(|lib| organize_doc_imports(tokens, text, lib, &line_starts, eol));
     match (doc_edit, block_edit) {
         (None, None) => None,
         (doc, block) => {
@@ -3916,11 +3926,7 @@ pub(crate) fn organize_doc_imports(
         ""
     } else {
         let marker = doc_imports[0].3;
-        if marker.starts_with('*') {
-            "*"
-        } else {
-            "///"
-        }
+        if marker.starts_with('*') { "*" } else { "///" }
     };
     let mut sorted_texts: Vec<&str> = Vec::new();
     let mut previous_priority = None;
@@ -3938,10 +3944,7 @@ pub(crate) fn organize_doc_imports(
     let is_blank_between = |index: usize| -> bool {
         index > first_doc
             && index < last_doc
-            && matches!(
-                text[lines[index].0..lines[index].1].trim(),
-                "///" | "*"
-            )
+            && matches!(text[lines[index].0..lines[index].1].trim(), "///" | "*")
     };
     let mut others: Vec<&str> = Vec::new();
     for index in 0..line_count {

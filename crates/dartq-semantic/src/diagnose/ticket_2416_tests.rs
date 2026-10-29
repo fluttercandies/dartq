@@ -152,10 +152,7 @@ fn const_named_record_duplicates_still_report() {
     let source = "void f() {\n\
                   \x20 const { (a: 1, b: 'x'), (a: 1, b: 'x') };\n\
                   }\n";
-    assert_eq!(
-        code_names(&report(source)),
-        ["equal_elements_in_const_set"]
-    );
+    assert_eq!(code_names(&report(source)), ["equal_elements_in_const_set"]);
 }
 
 /// A nested record literal keeps its own label list — the outer literal's

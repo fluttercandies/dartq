@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
 use crate::rules::in_const_context;
 
 const USE_IS_EMPTY_PROBLEM: &str =
@@ -31,11 +31,8 @@ const ALWAYS_TRUE_PROBLEM: &str =
 /// const-constructor initializer face. Messages: `diagnostic.g.dart`
 /// `preferIsEmptyUseIsEmpty`/`preferIsEmptyUseIsNotEmpty`/
 /// `preferIsEmptyAlwaysFalse`/`preferIsEmptyAlwaysTrue`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_is_empty",
-    &[NodeKind::BinaryExpression],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("prefer_is_empty", &[NodeKind::BinaryExpression], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

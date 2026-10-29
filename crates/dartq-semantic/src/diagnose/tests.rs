@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -8520,18 +8519,16 @@ fn invalid_override_hits_the_implements_and_mixin_paths() {
         code_names(&applied)
     );
     assert!(
-        applied
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("'M.f' ('void Function(int)') isn't a valid override of 'A.f'")),
+        applied.diagnostics.iter().any(|d| d
+            .message
+            .contains("'M.f' ('void Function(int)') isn't a valid override of 'A.f'")),
         "{:?}",
         applied.diagnostics
     );
     assert!(
-        applied
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("'C.f' ('void Function()') isn't a valid override of 'M.f'")),
+        applied.diagnostics.iter().any(|d| d
+            .message
+            .contains("'C.f' ('void Function()') isn't a valid override of 'M.f'")),
         "{:?}",
         applied.diagnostics
     );
@@ -11300,7 +11297,12 @@ fn dead_rhs_bare_send_ends_at_operand() {
         .filter(|d| d.code.name == "dead_code")
         .map(|d| (d.range.offset, d.range.length))
         .collect();
-    assert_eq!(rows, [(offset_of(source, "|| b"), 4)], "{:?}", code_names(&report));
+    assert_eq!(
+        rows,
+        [(offset_of(source, "|| b"), 4)],
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// Labels declare through the labeled-statement scope chain: a
@@ -16873,7 +16875,6 @@ fn non_constant_map_pattern_key_reports_at_the_key() {
     assert_eq!(rows[0].severity, Severity::Error);
 }
 
-
 /// The receiver-expression walk must terminate on recovery-staged
 /// degenerate records: `x.(null)` folds a member read whose `recv_span`
 /// names its own member token, and the chain hop cycled on the same span
@@ -16939,18 +16940,15 @@ fn const_shared_substructure_stays_bounded() {
 /// precomputed streak index make the pass input-bounded.
 #[test]
 fn long_cascade_resolves_linearly() {
-    let mut src =
-        String::from("class int {} class List<T> { void add(T x) {} } void main() { var xs = <int>[]");
+    let mut src = String::from(
+        "class int {} class List<T> { void add(T x) {} } void main() { var xs = <int>[]",
+    );
     for i in 0..10_000 {
         src.push_str(&format!("..add({i})"));
     }
     src.push_str("; xs; }");
     let r = report(&src);
-    assert!(
-        code_names(&r).len() < 20,
-        "{:?}",
-        code_names(&r)
-    );
+    assert!(code_names(&r).len() < 20, "{:?}", code_names(&r));
 }
 
 /// The `RECV_WALK_DEPTH_CAP` firing pin. The canonical promoted-receiver
@@ -16986,12 +16984,7 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
     };
     // 900 hops: the walk resolves the promoted face and the formal solves.
     let r = report(&fixture(900));
-    assert_eq!(
-        code_names(&r),
-        ["undefined_getter"],
-        "{:?}",
-        code_names(&r)
-    );
+    assert_eq!(code_names(&r), ["undefined_getter"], "{:?}", code_names(&r));
     assert_eq!(
         r.diagnostics[0].message,
         "The getter 'miss' isn't defined for the type 'Idx'."

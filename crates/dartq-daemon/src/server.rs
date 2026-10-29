@@ -1968,8 +1968,14 @@ mod tests {
             baseline_gets > PARTS,
             "the baseline read enough contents for a mid-fold flip: {baseline_gets}"
         );
-        assert!(baseline["result"]["diags"].is_array(), "answered: {baseline}");
-        assert!(!flag.load(Ordering::Relaxed), "nobody flipped the baseline's cell");
+        assert!(
+            baseline["result"]["diags"].is_array(),
+            "answered: {baseline}"
+        );
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "nobody flipped the baseline's cell"
+        );
         drop(client);
         let baseline_code = server
             .join()
@@ -1986,12 +1992,7 @@ mod tests {
         // the serve loop's SIGTERM landing mid-turn.
         let workspace = part_workspace(PARTS);
         let flag = Arc::new(AtomicBool::new(false));
-        let (session, gets) = flip_session(
-            "quit-wire-flipped",
-            &workspace,
-            flag.clone(),
-            Some(4),
-        );
+        let (session, gets) = flip_session("quit-wire-flipped", &workspace, flag.clone(), Some(4));
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();

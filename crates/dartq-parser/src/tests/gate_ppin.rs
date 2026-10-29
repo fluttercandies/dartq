@@ -300,8 +300,7 @@ fn ppin_6716c102_library_directive_unterminated_recovery() {
 /// (length 4): row span 182..186, exactly the frozen oracle capture.
 #[test]
 fn ppin_76dd104c_interpolation_recovery_rows_and_texts() {
-    let source =
-        corpus_source("../curly/typing_string_interpolation_2.dart");
+    let source = corpus_source("../curly/typing_string_interpolation_2.dart");
     let scanner_rows: Vec<_> = scan_with_diagnostics(source).1;
     assert_eq!(
         scanner_rows,

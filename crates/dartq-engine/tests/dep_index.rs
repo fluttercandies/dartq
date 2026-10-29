@@ -102,19 +102,15 @@ fn corpus_engine(tag: &str) -> (Engine, PathBuf) {
     let config_dir = ws.join(".dart_tool");
     let config = Arc::new(
         PackageConfig::parse(
-            &std::fs::read_to_string(config_dir.join("package_config.json"))
-                .expect("config"),
+            &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
         )
         .expect("valid config"),
     );
-    let lock = LockFile::parse(
-        &std::fs::read_to_string(ws.join("pubspec.lock")).expect("lock"),
-    )
-    .expect("valid lock");
-    let pubspec = Pubspec::parse(
-        &std::fs::read_to_string(ws.join("pubspec.yaml")).expect("pubspec"),
-    )
-    .expect("valid pubspec");
+    let lock = LockFile::parse(&std::fs::read_to_string(ws.join("pubspec.lock")).expect("lock"))
+        .expect("valid lock");
+    let pubspec =
+        Pubspec::parse(&std::fs::read_to_string(ws.join("pubspec.yaml")).expect("pubspec"))
+            .expect("valid pubspec");
     let graph = build_graph(
         &config,
         &lock,

@@ -81,7 +81,10 @@ fn sdk_packages(sdk_src: &Path) -> Vec<(String, Vec<MockFile>)> {
                     "lib/static_type_helper.dart",
                     SdkFile::Verbatim("static_type_helper.dart"),
                 ),
-                ("lib/async_helper.dart", SdkFile::Verbatim("async_helper.dart")),
+                (
+                    "lib/async_helper.dart",
+                    SdkFile::Verbatim("async_helper.dart"),
+                ),
                 ("lib/variations.dart", SdkFile::Verbatim("variations.dart")),
                 ("lib/config.dart", SdkFile::Shaped(EXPECT_CONFIG_STUB)),
                 (
@@ -115,7 +118,10 @@ fn sdk_packages(sdk_src: &Path) -> Vec<(String, Vec<MockFile>)> {
         (
             "collection".to_string(),
             "pkg/collection/lib",
-            vec![("lib/equality.dart", SdkFile::Shaped(COLLECTION_EQUALITY_STUB))],
+            vec![(
+                "lib/equality.dart",
+                SdkFile::Shaped(COLLECTION_EQUALITY_STUB),
+            )],
         ),
     ];
     let mut out = Vec::new();
@@ -431,9 +437,16 @@ mod tests {
             .expect("expect.dart");
         // The signatures the analyzed snippets call, verbatim from the
         // upstream setUp literal.
-        assert!(expect.content.contains("void expect(dynamic actual, dynamic matcher) {}"));
+        assert!(
+            expect
+                .content
+                .contains("void expect(dynamic actual, dynamic matcher) {}")
+        );
         assert!(expect.content.contains("Never fail(String message) {}"));
-        let export = files.iter().find(|f| f.path == "lib/test_api.dart").expect("test_api.dart");
+        let export = files
+            .iter()
+            .find(|f| f.path == "lib/test_api.dart")
+            .expect("test_api.dart");
         assert_eq!(export.content, "\nexport 'src/frontend/expect.dart';\n");
     }
 
@@ -464,8 +477,11 @@ mod tests {
         std::fs::create_dir_all(sdk.join("pkg/async_helper/lib")).expect("creates");
         std::fs::write(sdk.join("pkg/expect/lib/expect.dart"), "class Expect {}\n")
             .expect("writes");
-        std::fs::write(sdk.join("pkg/expect/lib/static_type_helper.dart"), "var h = 1;\n")
-            .expect("writes");
+        std::fs::write(
+            sdk.join("pkg/expect/lib/static_type_helper.dart"),
+            "var h = 1;\n",
+        )
+        .expect("writes");
         std::fs::write(sdk.join("pkg/expect/lib/async_helper.dart"), "var a = 1;\n")
             .expect("writes");
         std::fs::write(sdk.join("pkg/expect/lib/variations.dart"), "const v = 1;\n")
@@ -480,8 +496,11 @@ mod tests {
             "export 'package:expect/async_helper.dart';\n",
         )
         .expect("writes");
-        std::fs::write(sdk.join("pkg/async_helper/lib/async_minitest.dart"), "export 'x';\n")
-            .expect("writes");
+        std::fs::write(
+            sdk.join("pkg/async_helper/lib/async_minitest.dart"),
+            "export 'x';\n",
+        )
+        .expect("writes");
         let packages = sdk_packages(&sdk);
         let by_name = |name: &str| {
             packages
@@ -498,7 +517,10 @@ mod tests {
                 .any(|f| f.path == "lib/expect.dart" && f.content == "class Expect {}\n")
         );
         // The smith-dependent file keeps its real public names.
-        let config = expect.iter().find(|f| f.path == "lib/config.dart").expect("config");
+        let config = expect
+            .iter()
+            .find(|f| f.path == "lib/config.dart")
+            .expect("config");
         assert!(config.content.contains("isVmConfiguration"));
         assert!(!config.content.contains("import 'package:smith"));
         // The async_helper package re-exports the expect package, which every
@@ -510,7 +532,11 @@ mod tests {
                 .any(|f| f.content.contains("package:expect/async_helper.dart"))
         );
         let dart_internal = by_name("dart_internal");
-        assert!(dart_internal[0].content.contains("extractIterableTypeArgument"));
+        assert!(
+            dart_internal[0]
+                .content
+                .contains("extractIterableTypeArgument")
+        );
         let collection = by_name("collection");
         assert!(collection[0].content.contains("UnorderedIterableEquality"));
         let _ = std::fs::remove_dir_all(&sdk);

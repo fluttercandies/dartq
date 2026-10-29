@@ -99,7 +99,12 @@ void f(int error) {
 "#,
     );
     let rows = invocation_rows(&report);
-    assert_eq!(rows, ["invocation_of_non_function_expression"], "{:?}", report.diagnostics);
+    assert_eq!(
+        rows,
+        ["invocation_of_non_function_expression"],
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// The oracle `FunctionExpressionInvocationTest/

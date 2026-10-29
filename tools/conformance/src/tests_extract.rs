@@ -42,10 +42,7 @@ const TARGET_CALLS: [&str; 5] = [
 /// (`resolveTestFile`) or deliberately ignore diagnostics
 /// (`parseTestCodeIgnoringDiagnostics`). Recorded as named skips so the
 /// coverage hole stays visible in the skip inventory.
-const UNMODELED_TARGET_CALLS: [&str; 2] = [
-    "resolveTestFile",
-    "parseTestCodeIgnoringDiagnostics",
-];
+const UNMODELED_TARGET_CALLS: [&str; 2] = ["resolveTestFile", "parseTestCodeIgnoringDiagnostics"];
 
 /// Package/workspace registration helpers whose effects the single
 /// package-root case model cannot express. A test calling them wires its
@@ -877,7 +874,10 @@ fn assigned_ident(prefix: &str) -> Option<String> {
     if callee_start == tail.len() {
         return None;
     }
-    let head = tail[..callee_start].trim_end().strip_suffix('=')?.trim_end();
+    let head = tail[..callee_start]
+        .trim_end()
+        .strip_suffix('=')?
+        .trim_end();
     let start = head
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .map_or(0, |i| i + 1);
@@ -1390,10 +1390,7 @@ fn extract_method(
                         files,
                     });
                 }
-                Err(reason) => out.skips.push(Skip {
-                    id,
-                    reason,
-                }),
+                Err(reason) => out.skips.push(Skip { id, reason }),
             }
             continue;
         }
@@ -1402,7 +1399,9 @@ fn extract_method(
         // `experimentsForTests`; an explicit override is a different
         // environment than the modeled one.
         if name == "parseTestCodeWithDiagnostics"
-            && args.iter().any(|a| a.label.as_deref() == Some("featureSet"))
+            && args
+                .iter()
+                .any(|a| a.label.as_deref() == Some("featureSet"))
         {
             out.skips.push(Skip {
                 id,
@@ -1528,7 +1527,8 @@ pub fn extract_front_end_parser(root: &Path) -> DirExtraction {
             }
         };
         let experiments = folder_experiments(root, rel);
-        let options = setup::analysis_options_content(&experiments, &[], false, false, false, &[], &[]);
+        let options =
+            setup::analysis_options_content(&experiments, &[], false, false, false, &[], &[]);
         out.cases.push(Case {
             id: format!("parser-fe/{id}"),
             source: format!("pkg/front_end/parser_testcases/{rel}"),
@@ -2115,7 +2115,10 @@ class ParserDiagnosticsTest {}
 "#;
         let out = extract_file("generated/error_parser_test.dart", src);
         assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
-        assert_eq!(out.cases[0].id, "parser/generated/error_parser/ErrorParserTest/test_x#0");
+        assert_eq!(
+            out.cases[0].id,
+            "parser/generated/error_parser/ErrorParserTest/test_x#0"
+        );
         assert_eq!(out.cases[0].packages, Vec::<String>::new());
 
         let diag = extract_file("src/diagnostics/extraneous_modifier_test.dart", src);
@@ -2165,7 +2168,10 @@ class T extends PubPackageResolutionTest {
         let out = extract_file("src/dart/micro/u_test.dart", src);
         assert!(out.cases.is_empty(), "{:?}", out.cases);
         let reasons: Vec<&str> = out.skips.iter().map(|s| s.reason.as_str()).collect();
-        assert!(reasons.contains(&"unmodeled_target_call:resolveTestFile"), "{reasons:?}");
+        assert!(
+            reasons.contains(&"unmodeled_target_call:resolveTestFile"),
+            "{reasons:?}"
+        );
         assert!(
             reasons.contains(&"unmodeled_target_call:parseTestCodeIgnoringDiagnostics"),
             "{reasons:?}"
@@ -2266,10 +2272,19 @@ part of 'a.dart';
             ],
             "{ids:?}"
         );
-        let top = out.cases.iter().find(|c| c.id == "parser-fe/top").expect("top");
+        let top = out
+            .cases
+            .iter()
+            .find(|c| c.id == "parser-fe/top")
+            .expect("top");
         assert_eq!(top.files[0].0, "parser-fe/top.dart");
         assert_eq!(top.files[0].1, "void f() {}\n");
-        assert!(top.options.as_ref().expect("options").contains("augmentations"));
+        assert!(
+            top.options
+                .as_ref()
+                .expect("options")
+                .contains("augmentations")
+        );
         let decl = out
             .cases
             .iter()

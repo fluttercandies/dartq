@@ -126,13 +126,13 @@ class Holder<E> {
         .expect("the write-context parameter mismatch reports");
     assert!(
         row.message.contains("'Ctrl<dynamic>'"),
-            "the creation fill lands: {}",
-            row.message
+        "the creation fill lands: {}",
+        row.message
     );
     assert!(
         row.message.contains("'Ctrl<E>'"),
-            "the write context solved the factory parameter: {}",
-            row.message
+        "the write context solved the factory parameter: {}",
+        row.message
     );
 }
 

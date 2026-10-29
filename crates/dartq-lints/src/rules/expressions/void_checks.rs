@@ -1,6 +1,9 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, value_run_end};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, same_file, slice, static_type_faces,
+    value_run_end,
+};
 use crate::rules::{TypeFace, type_face, type_face_of_field};
 /// Official: `pkg/linter/lib/src/rules/void_checks.dart` — a value
 /// written where `void` (or `FutureOr<void>`) is expected reports
@@ -51,9 +54,7 @@ fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {
         NodeKind::Assignment => assignment_face(c),
         NodeKind::ReturnStatement => return_face(c),
-        NodeKind::Send | NodeKind::NewExpression | NodeKind::ImplicitCreation => {
-            argument_face(c)
-        }
+        NodeKind::Send | NodeKind::NewExpression | NodeKind::ImplicitCreation => argument_face(c),
         _ => {}
     }
 }
@@ -180,8 +181,8 @@ fn return_face(c: &mut Check<'_>) {
     // The value's static type; `return;` carries none and stays
     // silent (`node.expression?.staticType` is null).
     let rows = c.collect_direct(node);
-    let Some(ty) = literal_ty(c, analysis, &rows)
-        .or_else(|| static_type_faces::expr_type(c, analysis, &rows))
+    let Some(ty) =
+        literal_ty(c, analysis, &rows).or_else(|| static_type_faces::expr_type(c, analysis, &rows))
     else {
         return;
     };
@@ -251,8 +252,7 @@ fn argument_face(c: &mut Check<'_>) {
             }) else {
                 return;
             };
-            let Some(binding) = analysis.resolve_constructor(query_site(c, callee), None)
-            else {
+            let Some(binding) = analysis.resolve_constructor(query_site(c, callee), None) else {
                 return;
             };
             let Some(formals) = binding.formals else {
@@ -356,11 +356,7 @@ pub(crate) fn written_return_face<'a>(c: &'a Check<'_>, function: u32) -> Option
 
 /// The value type the literal faces answer: `null` and the scalar
 /// literals (the `right_scalar_face` shape, as a [`Ty`]).
-fn literal_ty(
-    c: &Check<'_>,
-    analysis: &dartq_semantic::Analysis<'_>,
-    rows: &[u32],
-) -> Option<Ty> {
+fn literal_ty(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, rows: &[u32]) -> Option<Ty> {
     let run = slice::access_run(c, rows);
     let [root] = run.as_slice() else {
         return None;

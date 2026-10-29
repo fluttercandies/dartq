@@ -105,10 +105,7 @@ fn null_aware_initializer_reports_invalid_assignment() {
                   \x20 int x = a?.b;\n\
                   \x20 sink(x);\n\
                   }\n";
-    assert_eq!(
-        code_names(&report(source)),
-        ["invalid_assignment"]
-    );
+    assert_eq!(code_names(&report(source)), ["invalid_assignment"]);
 }
 
 /// The plain-assignment twin: `x = a?.b` stages the `int?` result against
@@ -122,10 +119,7 @@ fn null_aware_assignment_rhs_reports_invalid_assignment() {
                   \x20 x = a?.b;\n\
                   \x20 sink(x);\n\
                   }\n";
-    assert_eq!(
-        code_names(&report(source)),
-        ["invalid_assignment"]
-    );
+    assert_eq!(code_names(&report(source)), ["invalid_assignment"]);
 }
 
 /// The return face: `return a?.b` reads the `int?` result against the
@@ -139,10 +133,7 @@ fn null_aware_return_reports_return_of_invalid_type() {
                   }\n";
     let names = code_names(&report(source));
     assert_eq!(names.len(), 1, "{names:?}");
-    assert!(
-        names[0].starts_with("return_of_invalid_type"),
-        "{names:?}"
-    );
+    assert!(names[0].starts_with("return_of_invalid_type"), "{names:?}");
 }
 
 /// The argument face (U1): `g(a?.b)` offers `int?` where the formal reads
@@ -189,10 +180,7 @@ fn null_aware_chain_initializer_reports_invalid_assignment() {
                   \x20 int x = a?.b.c;\n\
                   \x20 sink(x);\n\
                   }\n";
-    assert_eq!(
-        code_names(&report(source)),
-        ["invalid_assignment"]
-    );
+    assert_eq!(code_names(&report(source)), ["invalid_assignment"]);
 }
 
 /// The receiver-side control (the latch must not leak INTO the

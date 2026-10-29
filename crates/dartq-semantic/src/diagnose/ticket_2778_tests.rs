@@ -20,7 +20,7 @@
 //!   verdict reads the enclosing container's `this` face and anchors at
 //!   the keyword.
 
-use super::test_rig::{report_ops, CORE_PRELUDE};
+use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
 
 /// The exact `(offset, length)` rows of one code, source-ordered.
@@ -206,7 +206,8 @@ fn this_operand_folds_and_anchors_at_the_keyword() {
 /// keyword's flow stage adopts.
 #[test]
 fn extension_this_reads_the_on_type() {
-    let fixture = "extension E on int {\n  void f() {\n    if (this is int) {\n      1;\n    }\n  }\n}\n";
+    let fixture =
+        "extension E on int {\n  void f() {\n    if (this is int) {\n      1;\n    }\n  }\n}\n";
     let source = fixture;
     let report = report_ops(&source);
     assert_eq!(

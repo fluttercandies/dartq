@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/type_literal_in_constant_pattern.dart:40-63`
 /// — a constant pattern whose expression's static type is the `Type`
@@ -285,10 +285,8 @@ fn enclosing_static_declares(c: &Check<'_>, name: &str) -> bool {
                             NodeKind::Method if static_member => {
                                 // The name row's head token — `member_name`
                                 // answers a ROW id, never a token index.
-                                if crate::rules::declarations::member_declaration_name(
-                                    c, member,
-                                )
-                                .is_some_and(|row| c.lexeme(c.head_token(row)) == name)
+                                if crate::rules::declarations::member_declaration_name(c, member)
+                                    .is_some_and(|row| c.lexeme(c.head_token(row)) == name)
                                 {
                                     return true;
                                 }

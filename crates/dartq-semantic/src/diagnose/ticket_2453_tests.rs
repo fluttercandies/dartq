@@ -405,4 +405,3 @@ class C {
     let report = unit_report(source);
     assert_eq!(codes(&report), ["undefined_method"], "{:?}", codes(&report));
 }
-

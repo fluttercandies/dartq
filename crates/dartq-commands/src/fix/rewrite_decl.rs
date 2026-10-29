@@ -1,7 +1,9 @@
 use super::*;
 
-
-pub(crate) fn add_member_annotation(input: &FixInput<'_>, name: &str) -> Option<(u32, u32, String)> {
+pub(crate) fn add_member_annotation(
+    input: &FixInput<'_>,
+    name: &str,
+) -> Option<(u32, u32, String)> {
     let text = input.text;
     let start = utf16_offset_to_byte(text, input.range.start);
     // The annotation rides the member's own line: the official
@@ -145,10 +147,7 @@ fn parameter_type_run(slice: &str) -> Option<usize> {
             bytes.get(end + ws + 8),
             Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$'
         )
-        && matches!(
-            bytes.get(end + ws + 8),
-            Some(b'(' | b'<' | b'?')
-        )
+        && matches!(bytes.get(end + ws + 8), Some(b'(' | b'<' | b'?'))
     {
         end += ws + 8;
         if bytes.get(end) == Some(&b'<') {
@@ -181,7 +180,9 @@ fn parameter_type_run(slice: &str) -> Option<usize> {
     dotted
         .is_some_and(|name| {
             !name.is_empty()
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
         })
         .then_some(end)
 }
@@ -245,8 +246,8 @@ pub(crate) fn omit_type_with_var(input: &FixInput<'_>) -> Option<(u32, u32, Stri
     }
     let after_name = after_ws[name_len..].trim_start_matches([' ', '\t']);
     let carries_gap = slice.len() != trimmed.len();
-    let type_len16 = input.range.end - input.range.start
-        - u32::try_from(slice.len() - trimmed.len()).ok()?;
+    let type_len16 =
+        input.range.end - input.range.start - u32::try_from(slice.len() - trimmed.len()).ok()?;
     if after_name.starts_with('=') {
         let initializer = after_name[1..].trim_start_matches([' ', '\t']);
         if initializer.starts_with('{') {
@@ -325,10 +326,7 @@ pub(crate) fn make_declaration_final(input: &FixInput<'_>) -> Option<(u32, u32, 
         }
         return Some((input.range.start, 3, "final".to_owned()));
     }
-    if !slice.is_empty()
-        && !slice.contains('=')
-        && slice.chars().next()?.is_ascii_alphabetic()
-    {
+    if !slice.is_empty() && !slice.contains('=') && slice.chars().next()?.is_ascii_alphabetic() {
         // The type face: `final ` lands at the head. The single-variable
         // gate reads the declarators the slice already carries when the
         // report is the whole list, the text past the span's end when it
@@ -371,7 +369,10 @@ pub(crate) fn make_declaration_final(input: &FixInput<'_>) -> Option<(u32, u32, 
             let at = utf16_end(tokens, text, prev)?;
             Some((at, 0, " final".to_owned()))
         }
-        TokenKind::Identifier | TokenKind::Keyword(_) | TokenKind::Gt | TokenKind::GtGt
+        TokenKind::Identifier
+        | TokenKind::Keyword(_)
+        | TokenKind::Gt
+        | TokenKind::GtGt
         | TokenKind::GtGtGt => {
             let head = field_declaration_head(tokens, prev)?;
             let start = tokens.get(head)?.utf16_offset;
@@ -768,30 +769,36 @@ pub(crate) fn remove_ignore_comment(input: &FixInput<'_>) -> Option<(u32, u32, S
     let text = input.text;
     let start = utf16_offset_to_byte(text, input.range.start);
     let end = utf16_offset_to_byte(text, input.range.end);
-    let (comment_start, comment_end, has_trailing) =
-        if text[start..].starts_with("//") {
-            // The comment itself is the report: its own bounds, to the
-            // line's end.
-            let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i);
-            text[start..line_end]
-                .contains("ignore")
-                .then_some((start, line_end, false))?
-        } else if text[start..].starts_with("/*") {
-            let close = start + text[start..].find("*/").map_or(text.len() - start, |i| i + 2);
-            text[start..close]
-                .contains("ignore")
-                .then_some((start, close, trailing_code_on_line(text, close)))?
-        } else {
-            // The name-token citation: the enclosing comment, scanned in
-            // the hit's trivia window (block comments nest, a line
-            // comment ends at its newline).
-            let tokens = input.tokens?;
-            let window = trivia_window(tokens, text, input.range.start)?;
-            let (open, close) = enclosing_comment(text, window, start)?;
-            text[open..close]
-                .contains("ignore")
-                .then_some((open, close, trailing_code_on_line(text, close)))?
-        };
+    let (comment_start, comment_end, has_trailing) = if text[start..].starts_with("//") {
+        // The comment itself is the report: its own bounds, to the
+        // line's end.
+        let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i);
+        text[start..line_end]
+            .contains("ignore")
+            .then_some((start, line_end, false))?
+    } else if text[start..].starts_with("/*") {
+        let close = start
+            + text[start..]
+                .find("*/")
+                .map_or(text.len() - start, |i| i + 2);
+        text[start..close].contains("ignore").then_some((
+            start,
+            close,
+            trailing_code_on_line(text, close),
+        ))?
+    } else {
+        // The name-token citation: the enclosing comment, scanned in
+        // the hit's trivia window (block comments nest, a line
+        // comment ends at its newline).
+        let tokens = input.tokens?;
+        let window = trivia_window(tokens, text, input.range.start)?;
+        let (open, close) = enclosing_comment(text, window, start)?;
+        text[open..close].contains("ignore").then_some((
+            open,
+            close,
+            trailing_code_on_line(text, close),
+        ))?
+    };
     if has_trailing {
         // The official's trailing-content case: the cut starts at the
         // comment's own offset — the indent before stays — and its end
@@ -822,11 +829,7 @@ pub(crate) fn remove_ignore_comment(input: &FixInput<'_>) -> Option<(u32, u32, S
 /// trails every token). Comments and whitespace are all a window holds:
 /// the scanner emits no comment tokens, and any `//`/`/*` inside a
 /// string literal sits inside that string's own token.
-fn trivia_window(
-    tokens: &TokenTable,
-    text: &str,
-    hit16: u32,
-) -> Option<(usize, usize)> {
+fn trivia_window(tokens: &TokenTable, text: &str, hit16: u32) -> Option<(usize, usize)> {
     let mut start = 0usize;
     let mut end = text.len();
     for token in tokens.as_slice() {
@@ -843,11 +846,7 @@ fn trivia_window(
 /// byte offset `hit`: the window's comments in order — a `//` comment
 /// to its newline, a `/* … */` comment to its matching closer (block
 /// comments nest) — the first whose interval covers the hit.
-fn enclosing_comment(
-    text: &str,
-    window: (usize, usize),
-    hit: usize,
-) -> Option<(usize, usize)> {
+fn enclosing_comment(text: &str, window: (usize, usize), hit: usize) -> Option<(usize, usize)> {
     let (from, to) = window;
     let bytes = text.as_bytes();
     let mut at = from;
@@ -892,9 +891,7 @@ fn enclosing_comment(
 
 /// Whether non-whitespace code follows `at` on its line.
 fn trailing_code_on_line(text: &str, at: usize) -> bool {
-    let to_eol = text[at..]
-        .find('\n')
-        .map_or(text.len(), |i| at + i);
+    let to_eol = text[at..].find('\n').map_or(text.len(), |i| at + i);
     !text[at..to_eol]
         .bytes()
         .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
@@ -1488,7 +1485,11 @@ pub(crate) fn if_null_bools(input: &FixInput<'_>) -> Option<(u32, u32, String)> 
 }
 
 /// Whether the token range is exactly one `true`/`false` literal.
-pub(crate) fn is_bool_literal_pair(tokens: &TokenTable, text: &str, range: core::ops::Range<usize>) -> bool {
+pub(crate) fn is_bool_literal_pair(
+    tokens: &TokenTable,
+    text: &str,
+    range: core::ops::Range<usize>,
+) -> bool {
     range.len() == 1 && bool_literal(tokens, text, range.start).is_some()
 }
 
@@ -1709,7 +1710,11 @@ pub(crate) fn binary_precedence(kind: TokenKind) -> Option<u8> {
 /// Whether the token range carries a depth-0 operator binding at `max`
 /// precedence or tighter — the official `needsParens(operator)` read
 /// (`Precedence.forTokenType`).
-pub(crate) fn binds_at_or_below(tokens: &TokenTable, range: core::ops::Range<usize>, max: u8) -> bool {
+pub(crate) fn binds_at_or_below(
+    tokens: &TokenTable,
+    range: core::ops::Range<usize>,
+    max: u8,
+) -> bool {
     let mut depth = 0u32;
     for index in range {
         let Some(kind) = kind_of(tokens, index) else {
@@ -1999,9 +2004,7 @@ pub(crate) fn conditional_to_if_element(input: &FixInput<'_>) -> Option<(u32, u3
     // official replaces `nodeToReplace` — the conditional with its
     // wrapping parens.
     let mut wrapper_close = None;
-    let boundary = cond_start
-        .checked_sub(1)
-        .and_then(|i| kind_of(tokens, i));
+    let boundary = cond_start.checked_sub(1).and_then(|i| kind_of(tokens, i));
     match boundary {
         Some(TokenKind::Comma | TokenKind::OpenSquare | TokenKind::OpenCurly) => {}
         Some(TokenKind::OpenParen) => {
@@ -2015,8 +2018,7 @@ pub(crate) fn conditional_to_if_element(input: &FixInput<'_>) -> Option<(u32, u3
                 return None;
             }
         }
-        Some(TokenKind::CloseParen)
-            if is_control_head_close(tokens, cond_start - 1) => {}
+        Some(TokenKind::CloseParen) if is_control_head_close(tokens, cond_start - 1) => {}
         Some(TokenKind::Keyword(Keyword::Else)) => {}
         _ => return None,
     }
@@ -2187,7 +2189,10 @@ fn else_expression_end(tokens: &TokenTable, colon: usize, last: usize) -> Option
                 depth -= 1;
             }
             TokenKind::Comma | TokenKind::Semicolon | TokenKind::Keyword(Keyword::Else)
-                if depth == 0 => break,
+                if depth == 0 =>
+            {
+                break;
+            }
             _ => {}
         }
         end = Some(index);
@@ -2642,7 +2647,10 @@ pub(crate) enum ItemMode {
 /// in a `[…]`/`{…}` group takes the delimiters with it when it is also the
 /// last (an optional `this.x` field formal additionally folds its default
 /// into a fresh initializer when the constructor has none).
-pub(crate) fn remove_listed_item(input: &FixInput<'_>, mode: ItemMode) -> Option<(u32, u32, String)> {
+pub(crate) fn remove_listed_item(
+    input: &FixInput<'_>,
+    mode: ItemMode,
+) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
     let (mut first, last) = hit_tokens(tokens, &input.range)?;

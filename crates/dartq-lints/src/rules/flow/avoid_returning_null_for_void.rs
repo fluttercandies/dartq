@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{NONE_TOKEN, byte_span_of_token, first_child, last_child};
 
 const PROBLEM: &str = "Don't return 'null' from a function with a return type of 'void'.";
@@ -104,8 +104,7 @@ fn report(c: &mut Check<'_>, node: u32, function: u32, type_row: Option<u32>, pr
         NodeKind::Type => {
             is_async
                 && c.lexeme(c.head_token(type_row)) == "Future"
-                && c.byte_span(type_row).end
-                    == byte_span_of_token(c, c.head_token(type_row)).end
+                && c.byte_span(type_row).end == byte_span_of_token(c, c.head_token(type_row)).end
                 && first_type_argument_is_void(c, type_row)
         }
         _ => false,
@@ -143,9 +142,7 @@ fn body_is_async(c: &Check<'_>, function: u32) -> bool {
         return false;
     };
     let async_kw = match c.kind(body) {
-        NodeKind::ExpressionBody | NodeKind::BlockBody => {
-            c.field(body, PayloadField::AsyncKeyword)
-        }
+        NodeKind::ExpressionBody | NodeKind::BlockBody => c.field(body, PayloadField::AsyncKeyword),
         _ => Some(NONE_TOKEN),
     }
     .unwrap_or(NONE_TOKEN);

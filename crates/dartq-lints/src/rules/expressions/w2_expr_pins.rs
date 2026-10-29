@@ -414,9 +414,8 @@ fn prefer_const_constructors_faces() {
     // meta never recognizes the annotation and the creation reports —
     // the live oracle's own face over a differential corpus's vendored
     // meta — while a `library meta;` unit resolves it and bails.
-    let lints =
-        Fixture::parse("class C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n")
-            .run(&one_rule("prefer_const_constructors"));
+    let lints = Fixture::parse("class C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n")
+        .run(&one_rule("prefer_const_constructors"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let fixture = Fixture::parse(
         "library meta;\nclass C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n",
@@ -755,9 +754,8 @@ fn avoid_redundant_argument_values_faces() {
 
     // The optional-positional face and the break after it: only the
     // last argument reports (`g(1, 2)` — `2` at 52..53).
-    let lints =
-        Fixture::parse("void g([int a = 1, int b = 2]) {}\nvoid f() {\n  g(1, 2);\n}\n")
-            .run(&one_rule("avoid_redundant_argument_values"));
+    let lints = Fixture::parse("void g([int a = 1, int b = 2]) {}\nvoid f() {\n  g(1, 2);\n}\n")
+        .run(&one_rule("avoid_redundant_argument_values"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(lints[0].range, 52..53);
 
@@ -841,8 +839,7 @@ fn avoid_redundant_argument_values_evaluated_equality() {
 /// silent.
 #[test]
 fn avoid_slow_async_io_faces() {
-    let instance =
-        "import 'dart:io';\nvoid f(Directory dir) async {\n  await dir.exists();\n}\n";
+    let instance = "import 'dart:io';\nvoid f(Directory dir) async {\n  await dir.exists();\n}\n";
     let fixture = Fixture::parse(instance);
     assert!(fixture.run(&one_rule("avoid_slow_async_io")).is_empty());
     let lints = run_semantic(instance, "avoid_slow_async_io");
@@ -948,8 +945,7 @@ fn future_sync_value_faces() {
     // The 3.9 gate keeps the rule off; 3.10 turns it on.
     let source = "Future<int> f() => Future.value(1);";
     assert!(
-        run_semantic_version(source, "future_sync_value", LanguageVersion::new(3, 9))
-            .is_empty()
+        run_semantic_version(source, "future_sync_value", LanguageVersion::new(3, 9)).is_empty()
     );
     assert_eq!(
         run_semantic_version(source, "future_sync_value", LanguageVersion::new(3, 10)).len(),
@@ -963,8 +959,7 @@ fn future_sync_value_faces() {
 /// exemptions, and the 3.13/3.15 gate.
 #[test]
 fn unnecessary_this_alias_faces() {
-    let is_face =
-        "class C {\n  void m() {\n    var self = this;\n    if (self is C) {}\n  }\n}\n";
+    let is_face = "class C {\n  void m() {\n    var self = this;\n    if (self is C) {}\n  }\n}\n";
     let fixture = Fixture::parse(is_face);
     assert!(fixture.run(&one_rule("unnecessary_this_alias")).is_empty());
     let lints = run_semantic(is_face, "unnecessary_this_alias");

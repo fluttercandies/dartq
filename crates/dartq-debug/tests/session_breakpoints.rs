@@ -54,12 +54,14 @@ fn attach_performs_version_streams_then_vm() {
     let mut methods = Vec::new();
     let mut streams = Vec::new();
     for _ in 0..8 {
-        let request = vm
-            .requests
-            .recv_timeout(WAIT)
-            .expect("handshake request");
+        let request = vm.requests.recv_timeout(WAIT).expect("handshake request");
         if request.method == "streamListen" {
-            streams.push(request.params["streamId"].as_str().unwrap_or_default().to_owned());
+            streams.push(
+                request.params["streamId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
         }
         methods.push(request.method);
     }
@@ -193,7 +195,10 @@ fn add_breakpoint_rpc_error_102_is_structured() {
     let error = session
         .add_breakpoint(line_spec(7))
         .expect_err("102 must surface");
-    assert!(matches!(error, Error::Rpc { code: 102, .. }), "got {error:?}");
+    assert!(
+        matches!(error, Error::Rpc { code: 102, .. }),
+        "got {error:?}"
+    );
     assert_eq!(session.breakpoints().count(), 0);
 }
 
@@ -223,7 +228,9 @@ fn breakpoint_resolved_event_updates_handle() {
         _ => default_reply(request),
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    let handle = session.add_breakpoint(line_spec(7)).expect("add breakpoint");
+    let handle = session
+        .add_breakpoint(line_spec(7))
+        .expect("add breakpoint");
     assert!(!handle.resolved);
 
     session.stack(None, 1).expect("barrier rpc");
@@ -255,7 +262,9 @@ fn breakpoint_removed_event_forgets_handle() {
         _ => default_reply(request),
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    session.add_breakpoint(line_spec(7)).expect("add breakpoint");
+    session
+        .add_breakpoint(line_spec(7))
+        .expect("add breakpoint");
     session.stack(None, 1).expect("barrier rpc");
     session.poll_events().expect("poll events");
     assert_eq!(session.breakpoints().count(), 0);
@@ -268,7 +277,9 @@ fn remove_breakpoint_sends_rpc_and_forgets_handle() {
         _ => default_reply(request),
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    let handle = session.add_breakpoint(line_spec(7)).expect("add breakpoint");
+    let handle = session
+        .add_breakpoint(line_spec(7))
+        .expect("add breakpoint");
     session
         .remove_breakpoint(None, &handle.id)
         .expect("remove breakpoint");
@@ -328,7 +339,10 @@ fn stack_returns_frames() {
     let stack = session.stack(None, 20).expect("getStack");
     assert_eq!(stack.frames.len(), 1);
     let frame = &stack.frames[0];
-    assert_eq!(frame.function.as_ref().and_then(|f| f.name.as_deref()), Some("main"));
+    assert_eq!(
+        frame.function.as_ref().and_then(|f| f.name.as_deref()),
+        Some("main")
+    );
     let location = frame.location.as_ref().expect("location");
     assert_eq!(location.line, Some(7));
     assert_eq!(location.column, Some(3));
@@ -388,8 +402,7 @@ fn isolate_exit_reelects_main_and_clears_tracking() {
         })),
         "getStack" => {
             // First barrier: main exits; second: worker exits.
-            static CALLS: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let exiting = if call == 0 {
                 ("isolates/1", "1", "main")

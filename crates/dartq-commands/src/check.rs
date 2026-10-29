@@ -764,7 +764,10 @@ pub(crate) fn scan_file_at(
         // to the (0,0) anchor rather than crash the check face.
         let span = result
             .language_version_override_span
-            .unwrap_or(SourceRange { offset: 0, length: 0 });
+            .unwrap_or(SourceRange {
+                offset: 0,
+                length: 0,
+            });
         if override_version.is_above_latest() {
             let code = CodeRegistry::builtin()
                 .get("invalid_language_version_override")
@@ -1456,7 +1459,12 @@ mod tests {
         let bare = analyze_files(&files).expect("check core");
         assert_eq!(
             bare.output().files.analysis_root(),
-            Some(root.canonicalize().expect("canonical").join("lib").as_path()),
+            Some(
+                root.canonicalize()
+                    .expect("canonical")
+                    .join("lib")
+                    .as_path()
+            ),
             "no targets: the deepest covering directory of the files"
         );
 

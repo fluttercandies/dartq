@@ -131,18 +131,30 @@ class C implements G<B> {}
 /// answer — the under-report posture).
 #[test]
 fn satisfied_and_in_scope_bounded_clause_arguments_stay_silent() {
-    let satisfied = report_ops(r#"
+    let satisfied = report_ops(
+        r#"
 class A {}
 class G<E extends A> {}
 class C extends G<A> {}
-"#);
-    assert!(bounds_rows(&satisfied).is_empty(), "{:?}", satisfied.diagnostics);
-    let in_scope = report_ops(r#"
+"#,
+    );
+    assert!(
+        bounds_rows(&satisfied).is_empty(),
+        "{:?}",
+        satisfied.diagnostics
+    );
+    let in_scope = report_ops(
+        r#"
 class A {}
 class G<E extends A> {}
 class C<T extends A> extends G<T> {}
-"#);
-    assert!(bounds_rows(&in_scope).is_empty(), "{:?}", in_scope.diagnostics);
+"#,
+    );
+    assert!(
+        bounds_rows(&in_scope).is_empty(),
+        "{:?}",
+        in_scope.diagnostics
+    );
 }
 
 /// The `??=` face (assignment_static_test_05 family): the plain
@@ -174,12 +186,14 @@ void f(B? b, A a) {
 /// The control: a conforming `??=` value stays silent.
 #[test]
 fn if_null_assignment_with_conforming_rhs_stays_silent() {
-    let report = report_ops(r#"
+    let report = report_ops(
+        r#"
 class B {}
 void f(B? b, B c) {
   b ??= c;
 }
-"#);
+"#,
+    );
     assert!(
         assignment_rows(&report).is_empty(),
         "{:?}",
@@ -246,12 +260,14 @@ void f(y) {
 /// silent (`dynamic` is assignable to everything).
 #[test]
 fn unpromoted_dynamic_rhs_stays_silent() {
-    let report = report_ops(r#"
+    let report = report_ops(
+        r#"
 void f(y) {
   int x = y;
   print(x);
 }
-"#);
+"#,
+    );
     assert!(
         assignment_rows(&report).is_empty(),
         "{:?}",

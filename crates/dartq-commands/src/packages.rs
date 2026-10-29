@@ -98,9 +98,7 @@ pub fn inventory(from: &Path) -> Result<PackageInventory, PackagesError> {
                 .map(|pattern| dartq_pub::glob::Glob::new(pattern))
                 .collect::<Result<_, _>>()
                 .map_err(|error| {
-                    PackagesError::Usage(format!(
-                        "dartq.yaml packages.include: bad glob: {error}"
-                    ))
+                    PackagesError::Usage(format!("dartq.yaml packages.include: bad glob: {error}"))
                 })?,
             exclude: policy
                 .exclude
@@ -108,15 +106,17 @@ pub fn inventory(from: &Path) -> Result<PackageInventory, PackagesError> {
                 .map(|pattern| dartq_pub::glob::Glob::new(pattern))
                 .collect::<Result<_, _>>()
                 .map_err(|error| {
-                    PackagesError::Usage(format!(
-                        "dartq.yaml packages.exclude: bad glob: {error}"
-                    ))
+                    PackagesError::Usage(format!("dartq.yaml packages.exclude: bad glob: {error}"))
                 })?,
         },
         None => ScanOptions::default(),
     };
     let report = scan(&universe.root, &options);
-    Ok(PackageInventory { universe, report, config })
+    Ok(PackageInventory {
+        universe,
+        report,
+        config,
+    })
 }
 
 /// The default package set for bare multi-package invocations: the
@@ -134,6 +134,11 @@ pub fn default_set(inventory: &PackageInventory) -> Vec<PathBuf> {
             .iter()
             .map(|relative| dartq_pub::normalize(&inventory.universe.root.join(relative)))
             .collect(),
-        _ => inventory.report.packages.iter().map(|entry| entry.dir.clone()).collect(),
+        _ => inventory
+            .report
+            .packages
+            .iter()
+            .map(|entry| entry.dir.clone())
+            .collect(),
     }
 }

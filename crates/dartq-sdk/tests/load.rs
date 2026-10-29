@@ -476,7 +476,8 @@ fn embedder_table_replaces_every_resolution_face() {
     assert_eq!(ui, sky_engine_lib(&tree).join("ui/ui.dart"));
     // Part files join the embedder library's directory.
     assert_eq!(
-        sdk.uri_to_path("vm", "dart:ui/painting.dart").expect("part"),
+        sdk.uri_to_path("vm", "dart:ui/painting.dart")
+            .expect("part"),
         sky_engine_lib(&tree).join("ui/painting.dart")
     );
     // The flat existence face answers from the replacement table too —
@@ -547,7 +548,10 @@ fn embedder_snapshots_fork_identity() {
 fn embedder_yaml_load_errors_are_distinct() {
     // Unparsable yaml.
     let tree = TempTree::new(&embedder_files());
-    tree.rewrite("sky_engine/lib/_embedder.yaml", "embedded_libs: [unclosed\n");
+    tree.rewrite(
+        "sky_engine/lib/_embedder.yaml",
+        "embedded_libs: [unclosed\n",
+    );
     assert!(matches!(
         load_embedder_result(&tree),
         Err(SdkError::InvalidEmbedderYaml { .. })

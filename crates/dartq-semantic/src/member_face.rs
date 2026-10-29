@@ -297,17 +297,18 @@ pub(crate) fn core_member_return(head: &str, member: &str) -> Option<CoreRet> {
 pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
     (
         "Object",
+        &["hashCode", "runtimeType", "noSuchMethod", "toString", "=="],
+    ),
+    (
+        "Iterator",
         &[
+            "current",
+            "moveNext",
             "hashCode",
             "runtimeType",
             "noSuchMethod",
             "toString",
-            "==",
         ],
-    ),
-    (
-        "Iterator",
-        &["current", "moveNext", "hashCode", "runtimeType", "noSuchMethod", "toString"],
     ),
     (
         "int",
@@ -978,14 +979,7 @@ pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 26] = [
     (
         "StreamSubscription",
         &[
-            "cancel",
-            "onData",
-            "onError",
-            "onDone",
-            "pause",
-            "resume",
-            "isPaused",
-            "asFuture",
+            "cancel", "onData", "onError", "onDone", "pause", "resume", "isPaused", "asFuture",
         ],
     ),
     // `sdk/lib/async/stream.dart:2705` — `StreamIterator`'s declared face.
@@ -1037,7 +1031,10 @@ pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 26] = [
     ),
     // `sdk/lib/io/socket.dart:1398` — `SocketException implements
     // IOException` (`IOException` is a marker interface, no members).
-    ("SocketException", &["message", "osError", "address", "port"]),
+    (
+        "SocketException",
+        &["message", "osError", "address", "port"],
+    ),
     // `sdk/lib/io/io_sink.dart:26` — `IOSink implements
     // StreamSink<List<int>>, StringSink`: the union of both faces plus
     // `flush` and the abstract `encoding` field (which induces the getter
@@ -1073,13 +1070,7 @@ pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 26] = [
     // `startChunkedConversion`.
     (
         "Converter",
-        &[
-            "convert",
-            "fuse",
-            "startChunkedConversion",
-            "bind",
-            "cast",
-        ],
+        &["convert", "fuse", "startChunkedConversion", "bind", "cast"],
     ),
     // `sdk/lib/convert/chunked_conversion.dart:13` —
     // `ChunkedConversionSink implements Sink`: the same `add`/`close` face,
@@ -1218,7 +1209,18 @@ pub(crate) const COLLECTION_INTERFACE_ALIASES: [(&str, &[&str]); 36] = [
 /// absent here falls through to the indexed-container walk unchanged.
 pub(crate) const CORE_CONST_CTOR: [(&str, &[&str]); 16] = [
     ("bool", &["fromEnvironment", "hasEnvironment"]),
-    ("Deprecated", &["", "extend", "implement", "instantiate", "mixin", "optional", "subclass"]),
+    (
+        "Deprecated",
+        &[
+            "",
+            "extend",
+            "implement",
+            "instantiate",
+            "mixin",
+            "optional",
+            "subclass",
+        ],
+    ),
     ("Duration", &[""]),
     ("FormatException", &[""]),
     ("int", &["fromEnvironment"]),
@@ -1271,7 +1273,8 @@ pub(crate) struct MemberFace {
     /// set only at a `Single`/`UnsafeSingle` conclusion (cleared at
     /// entry), read by the verdict sites that own the use row.
     /// Single-slot: the resolution that reads it always just concluded.
-    pub(crate) ext_ref: std::cell::Cell<Option<(FileId, StringId, StringId, crate::model::MemberKind)>>,
+    pub(crate) ext_ref:
+        std::cell::Cell<Option<(FileId, StringId, StringId, crate::model::MemberKind)>>,
 }
 
 /// The #748 `==` operator-parameter latch: the operator's name-token anchor

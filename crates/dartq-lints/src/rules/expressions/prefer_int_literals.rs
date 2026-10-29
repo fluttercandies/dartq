@@ -1,6 +1,8 @@
 use dartq_semantic::{BindingKind, model::Ty};
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces as faces,
+};
 use crate::rules::{body_members, type_face};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_int_literals.dart`
@@ -34,11 +36,8 @@ use crate::rules::{body_members, type_face};
 /// (`void g<T>(T x)` — the written `T` is not `double`) resolve to
 /// nothing and stay silent. Message: `diagnostic.g.dart`
 /// `preferIntLiterals`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_int_literals",
-    &[NodeKind::LiteralDouble],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("prefer_int_literals", &[NodeKind::LiteralDouble], check,);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent
@@ -253,11 +252,7 @@ fn same_file_callable(c: &Check<'_>, name: &str) -> Option<u32> {
 
 /// Whether the queried formal of the same-file callable is written
 /// `double` (the row-walk face behind the bare-callee argument query).
-fn same_file_formal_is_double(
-    c: &Check<'_>,
-    name: &str,
-    query: FormalQuery<'_>,
-) -> Option<bool> {
+fn same_file_formal_is_double(c: &Check<'_>, name: &str, query: FormalQuery<'_>) -> Option<bool> {
     let decl = same_file_callable(c, name)?;
     let params = c
         .collect_direct(decl)

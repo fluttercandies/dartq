@@ -143,11 +143,7 @@ impl Expected {
     pub fn render(&self) -> String {
         match self {
             Expected::Rows(rows) if rows.is_empty() => "-".to_string(),
-            Expected::Rows(rows) => rows
-                .iter()
-                .map(Row::text)
-                .collect::<Vec<_>>()
-                .join("\t"),
+            Expected::Rows(rows) => rows.iter().map(Row::text).collect::<Vec<_>>().join("\t"),
             Expected::Crash => "oracle_crash".to_string(),
         }
     }
@@ -192,7 +188,15 @@ mod tests {
 
     #[test]
     fn row_text_roundtrip() {
-        let r = row("ERROR", "undefined_identifier", "lib/test.dart", 3, 9, 10, "Undefined name 'x'.");
+        let r = row(
+            "ERROR",
+            "undefined_identifier",
+            "lib/test.dart",
+            3,
+            9,
+            10,
+            "Undefined name 'x'.",
+        );
         assert_eq!(Row::parse_text(&r.text()), Some(r.clone()));
         assert_eq!(
             r.text(),
@@ -228,7 +232,10 @@ mod tests {
     fn expected_cell_vocabulary() {
         assert_eq!(Expected::Rows(Vec::new()).render(), "-");
         assert_eq!(Expected::Crash.render(), "oracle_crash");
-        let rows = vec![row("ERROR", "a", "f.dart", 1, 1, 1, "m"), row("INFO", "b", "g.dart", 2, 3, 4, "n")];
+        let rows = vec![
+            row("ERROR", "a", "f.dart", 1, 1, 1, "m"),
+            row("INFO", "b", "g.dart", 2, 3, 4, "n"),
+        ];
         let text = Expected::Rows(rows.clone()).render();
         let parsed = Expected::parse(&text).expect("parses");
         assert_eq!(parsed.rows(), rows.as_slice());

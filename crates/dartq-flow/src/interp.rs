@@ -613,41 +613,41 @@ pub(crate) const STEP_BUDGET_PER_EVENT: u64 = 128;
 /// One open null-shorting context (official `_NullAwareAccessContext`,
 /// flow_analysis.dart:9664): the skip path captured at the `?.`/`?[`/`?..`
 /// and the access-path state the condition face can still read back.
-    pub(crate) struct NullShort {
-        /// The receiver-was-null path (upstream `shortcutControlPath` —
-        /// `flow_analysis.dart:9206`): the pre-split state, made unreachable
-        /// when the receiver type can never be null (:9217-9221).
-        pub shortcut: State,
-        /// The receiver-was-non-null path (upstream's promoted `_current` at
-        /// the access): the consumer-visible branch pair's non-null half, kept
-        /// so the expression's `branches` still splits a condition on it.
-        pub matched: Option<State>,
-        /// The chain's own end face seen so far (a send's `)`, an index's
-        /// `]`, a member's identifier): recorded even while no dead window
-        /// exists yet — the send fires before the member poll opens the
-        /// window (the stream is post-order) — and applied at the close.
-        pub face_end: u32,
-        /// `exprs` depth when the context opened: the `?` belongs to the
-        /// expression whose operand region began at this depth, so a consumer
-        /// closing a deeper operand (`throw e`, `f(e)`, `x[e]`) leaves it open
-        /// — the official `nullShortingDepth` bound (`finishNullShorting`'s
-        /// `targetDepth`, type_analyzer.dart:804-827).
-        pub exprs_depth: usize,
-        /// Whether the access path was already dead when the context opened —
-        /// the pre-split state was unreachable, or a never-null/Null-typed
-        /// receiver classified it dead (:9214-9221). The member-level dead-node
-        /// poll (`checkUnreachableNode`, type_analyzer.dart:2082) reads the
-        /// state as the member STARTED — a `throw`/Never inside the member's own
-        /// tail (`x?.m(throw _)`) dies after the poll, so it must not anchor the
-        /// access row; a dead-at-open path is the genuine dead member.
-        pub dead_at_open: bool,
-        /// The receiver read's own offset: the chain-region bound the
-        /// completion row uses (`handleNullShortingFinished`'s
-        /// `flowEnd(expression)` — dead_code_verifier.dart:408-414 — fires
-        /// only when the first dead node sits INSIDE the chain, never for an
-        /// interval opened before the receiver).
-        pub recv_offset: u32,
-    }
+pub(crate) struct NullShort {
+    /// The receiver-was-null path (upstream `shortcutControlPath` —
+    /// `flow_analysis.dart:9206`): the pre-split state, made unreachable
+    /// when the receiver type can never be null (:9217-9221).
+    pub shortcut: State,
+    /// The receiver-was-non-null path (upstream's promoted `_current` at
+    /// the access): the consumer-visible branch pair's non-null half, kept
+    /// so the expression's `branches` still splits a condition on it.
+    pub matched: Option<State>,
+    /// The chain's own end face seen so far (a send's `)`, an index's
+    /// `]`, a member's identifier): recorded even while no dead window
+    /// exists yet — the send fires before the member poll opens the
+    /// window (the stream is post-order) — and applied at the close.
+    pub face_end: u32,
+    /// `exprs` depth when the context opened: the `?` belongs to the
+    /// expression whose operand region began at this depth, so a consumer
+    /// closing a deeper operand (`throw e`, `f(e)`, `x[e]`) leaves it open
+    /// — the official `nullShortingDepth` bound (`finishNullShorting`'s
+    /// `targetDepth`, type_analyzer.dart:804-827).
+    pub exprs_depth: usize,
+    /// Whether the access path was already dead when the context opened —
+    /// the pre-split state was unreachable, or a never-null/Null-typed
+    /// receiver classified it dead (:9214-9221). The member-level dead-node
+    /// poll (`checkUnreachableNode`, type_analyzer.dart:2082) reads the
+    /// state as the member STARTED — a `throw`/Never inside the member's own
+    /// tail (`x?.m(throw _)`) dies after the poll, so it must not anchor the
+    /// access row; a dead-at-open path is the genuine dead member.
+    pub dead_at_open: bool,
+    /// The receiver read's own offset: the chain-region bound the
+    /// completion row uses (`handleNullShortingFinished`'s
+    /// `flowEnd(expression)` — dead_code_verifier.dart:408-414 — fires
+    /// only when the first dead node sits INSIDE the chain, never for an
+    /// interval opened before the receiver).
+    pub recv_offset: u32,
+}
 
 /// The receiver-invalidation sweep over one state's property slots: the
 /// state-level half of [`Interp::join_state_with_sweep`], also driven
@@ -860,7 +860,10 @@ impl DeadWindow {
     /// interior anchored moves with it.
     pub(crate) fn reanchor_to(&mut self, span: TokenSpan) {
         self.anchor = span;
-        if self.split_start.is_some_and(|start| start >= span.range.offset) {
+        if self
+            .split_start
+            .is_some_and(|start| start >= span.range.offset)
+        {
             self.split_start = Some(span.range.offset);
         }
     }
@@ -1633,7 +1636,8 @@ impl<'o> Interp<'o> {
         promote_to_interest: bool,
         write_span: Option<SourceRange>,
         literal_rhs: bool,
-    ) {        // A stale id (a collect rollback can strand effect-set entries and
+    ) {
+        // A stale id (a collect rollback can strand effect-set entries and
         // scope bindings past their variable) degrades to the unknown
         // declared type; the state write itself is model-bounds-safe.
         let (declared, declared_args) = match self.vars.get(var as usize) {
@@ -1884,12 +1888,9 @@ impl<'o> Interp<'o> {
     pub(crate) fn null_short_end(&mut self) -> Option<NullShort> {
         let short = self.null_shorts.pop()?;
         let close = short.dead_at_open
-            && self
-                .dead
-                .as_ref()
-                .is_some_and(|window| {
-                    !window.suppressed && window.anchor.range.offset >= short.recv_offset
-                });
+            && self.dead.as_ref().is_some_and(|window| {
+                !window.suppressed && window.anchor.range.offset >= short.recv_offset
+            });
         if close {
             let window = self.dead.take().expect("close gate checked the window");
             let offset = window.anchor.range.offset;
@@ -2075,12 +2076,12 @@ impl<'o> Interp<'o> {
         // semantic layer's staged type to fill. Keeping the invalid name
         // instead typed every `?? `-joined inferred local with the
         // invalid face and deaded switch arms the oracle keeps live.
-        let a_invalid =
-            self.ops
-                .is_invalid_typed(a, crate::ty::EMPTY_ARGS, self.args, self.names);
-        let b_invalid =
-            self.ops
-                .is_invalid_typed(b, crate::ty::EMPTY_ARGS, self.args, self.names);
+        let a_invalid = self
+            .ops
+            .is_invalid_typed(a, crate::ty::EMPTY_ARGS, self.args, self.names);
+        let b_invalid = self
+            .ops
+            .is_invalid_typed(b, crate::ty::EMPTY_ARGS, self.args, self.names);
         if a_invalid && !b_invalid {
             return b;
         }
@@ -2126,13 +2127,11 @@ impl<'o> Interp<'o> {
     /// implicit-creation face (`x = C()`) keys on it, since a lowercase
     /// head is a function/getter call whose return this layer cannot spell.
     pub(crate) fn is_class_head(&self, name: u32) -> bool {
-        self.names
-            .get(name as usize)
-            .is_some_and(|spelling| {
-                spelling
-                    .trim_start_matches('_')
-                    .starts_with(|c: char| c.is_ascii_uppercase())
-            })
+        self.names.get(name as usize).is_some_and(|spelling| {
+            spelling
+                .trim_start_matches('_')
+                .starts_with(|c: char| c.is_ascii_uppercase())
+        })
     }
 
     /// Whether the send about to consume its two arguments is a bare
@@ -3150,9 +3149,9 @@ impl Interp<'_> {
         // inside its body (the inner `ForParts` matches, and the replay
         // slices the inner header over the outer tail — the for-in's post
         // code runs as loop body and every break/continue folds wrong).
-        let Some(parts) = (i + 1..end).find(|&j| {
-            matches!(events[j], Ev::ForParts { .. } | Ev::ForInParts)
-        }) else {
+        let Some(parts) =
+            (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. } | Ev::ForInParts))
+        else {
             return Control::Continue;
         };
         let Ev::ForParts {
@@ -3447,9 +3446,9 @@ impl Interp<'_> {
         let base = self.exprs.len();
         // The header's own first marker decides the kind (the statement
         // form's `for_begin` documents the nested-marker hijack).
-        if let Some(parts) = (i + 1..end).find(|&j| {
-            matches!(events[j], Ev::ForParts { .. } | Ev::ForInParts)
-        }) && matches!(events[parts], Ev::ForParts { .. })
+        if let Some(parts) =
+            (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. } | Ev::ForInParts))
+            && matches!(events[parts], Ev::ForParts { .. })
         {
             let Ev::ForParts {
                 left_sep,
@@ -3552,7 +3551,15 @@ impl Interp<'_> {
                 self.args
                     .get(iterable.args as usize)
                     .and_then(|args| args.first())
-                    .map(|arg| (Ty { base: arg.base, nullable: arg.nullable }, arg.args))
+                    .map(|arg| {
+                        (
+                            Ty {
+                                base: arg.base,
+                                nullable: arg.nullable,
+                            },
+                            arg.args,
+                        )
+                    })
             })
             .unwrap_or((Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
         let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));

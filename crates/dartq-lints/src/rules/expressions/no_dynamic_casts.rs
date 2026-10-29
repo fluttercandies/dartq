@@ -60,11 +60,7 @@ fn target_admits(name: &str, nullable: bool) -> bool {
 
 /// The dynamic-source verdict for a piece run: the static type is
 /// `dynamic` and the expression is not an explicit cast (:255-262).
-fn source_is_dynamic(
-    c: &Check<'_>,
-    analysis: &dartq_semantic::Analysis<'_>,
-    run: &[u32],
-) -> bool {
+fn source_is_dynamic(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) -> bool {
     !faces::is_explicit_cast(c, run) && faces::expr_type(c, analysis, run) == Some(Ty::Dynamic)
 }
 
@@ -142,8 +138,7 @@ fn assignment_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     if c.kind(lhs) != NodeKind::Identifier {
         return;
     }
-    let Some((_, Some(type_row))) = same_file::binding(c, node, c.lexeme(c.head_token(lhs)))
-    else {
+    let Some((_, Some(type_row))) = same_file::binding(c, node, c.lexeme(c.head_token(lhs))) else {
         return;
     };
     let face = type_face(c, type_row);
@@ -170,9 +165,7 @@ fn return_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     }
     for &row in c.path.iter().rev().skip(1) {
         match c.kind(row) {
-            NodeKind::Method
-            | NodeKind::TopLevelMethod
-            | NodeKind::LocalFunctionDeclaration => {
+            NodeKind::Method | NodeKind::TopLevelMethod | NodeKind::LocalFunctionDeclaration => {
                 // A local function's name nests under `FunctionName` —
                 // `member_declaration_name` covers all three kinds.
                 let written = crate::rules::declarations::member_declaration_name(c, row)

@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces};
 use crate::rules::utf16_token_span;
 
 /// Official: `pkg/linter/lib/src/rules/await_only_futures.dart:38-56` —
@@ -21,11 +21,8 @@ use crate::rules::utf16_token_span;
 /// type with explicit type arguments, a chain beyond the first hop, and
 /// the extension-type exemption (:46) under-report. Message:
 /// `diagnostic.g.dart` `awaitOnlyFutures`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "await_only_futures",
-    &[NodeKind::AwaitExpression],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("await_only_futures", &[NodeKind::AwaitExpression], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

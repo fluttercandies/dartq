@@ -1,6 +1,9 @@
-use super::{Check, NodeKind, RuleSpec, local_written_type, name_written_in_window, utf16_token_run_span};
+use super::{
+    Check, NodeKind, RuleSpec, local_written_type, name_written_in_window, utf16_token_run_span,
+};
 use crate::rules::{
-    NONE_TOKEN, initialized_identifier_name, last_child, utf16_token_span, variables_declaration_keyword,
+    NONE_TOKEN, initialized_identifier_name, last_child, utf16_token_span,
+    variables_declaration_keyword,
 };
 use dartq_ast::PayloadField;
 
@@ -207,17 +210,22 @@ fn declared_pattern(c: &mut Check<'_>) {
     // `PatternVarDeclStatement` covering the variable token (a
     // switch-expression initializer inside the statement is covered by
     // the :90-92 bail either way).
-    let Some(container) = c.path[..c.path.len() - 1].iter().rev().copied().find(|&row| {
-        matches!(
-            c.kind(row),
-            NodeKind::Block
-                | NodeKind::BlockBody
-                | NodeKind::SwitchCase
-                | NodeKind::IfStatement
-                | NodeKind::ForIn
-                | NodeKind::ForStatement
-        )
-    }) else {
+    let Some(container) = c.path[..c.path.len() - 1]
+        .iter()
+        .rev()
+        .copied()
+        .find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::Block
+                    | NodeKind::BlockBody
+                    | NodeKind::SwitchCase
+                    | NodeKind::IfStatement
+                    | NodeKind::ForIn
+                    | NodeKind::ForStatement
+            )
+        })
+    else {
         return;
     };
     if (c.children(container).start..=container).any(|row| {
@@ -255,8 +263,7 @@ fn declared_pattern(c: &mut Check<'_>) {
         PatternContext::Case(clause) => {
             let joined_earlier = (c.children(clause).start..node).any(|row| {
                 c.kind(row) == NodeKind::DeclaredVariablePattern
-                    && c
-                        .field(row, PayloadField::Variable)
+                    && c.field(row, PayloadField::Variable)
                         .is_some_and(|token| token != NONE_TOKEN && c.lexeme(token) == name)
             });
             if !joined_earlier && !name_written_in_window(c, decl.end..window.end, name) {
@@ -268,16 +275,10 @@ fn declared_pattern(c: &mut Check<'_>) {
         PatternContext::ForEach(forin) => {
             let mutated = c.collect_direct(forin).into_iter().any(|row| {
                 c.kind(row) == NodeKind::DeclaredVariablePattern
-                    && c
-                        .field(row, PayloadField::Variable)
-                        .is_some_and(|token| {
-                            token != NONE_TOKEN
-                                && name_written_in_window(
-                                    c,
-                                    decl.end..window.end,
-                                    c.lexeme(token),
-                                )
-                        })
+                    && c.field(row, PayloadField::Variable).is_some_and(|token| {
+                        token != NONE_TOKEN
+                            && name_written_in_window(c, decl.end..window.end, c.lexeme(token))
+                    })
             });
             if !mutated {
                 report_pattern(c, node, head, variable);

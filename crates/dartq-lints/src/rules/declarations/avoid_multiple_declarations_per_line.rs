@@ -18,9 +18,9 @@ fn check(c: &mut Check<'_>) {
     // wrapper parents the for initializer's declaration list straight
     // to the `ForStatement` row (probe), the hand-built shape uses a
     // `ForParts` row — both owner faces skip.
-    if c.ancestor(1).is_some_and(|parent| {
-        matches!(c.kind(parent), NodeKind::ForStatement | NodeKind::ForParts)
-    }) {
+    if c.ancestor(1)
+        .is_some_and(|parent| matches!(c.kind(parent), NodeKind::ForStatement | NodeKind::ForParts))
+    {
         return;
     }
     let second = c

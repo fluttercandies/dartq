@@ -152,12 +152,11 @@ pub(crate) fn binary_operands_at(c: &Check<'_>, node: u32) -> Option<(Vec<u32>, 
     // fragments sit behind the separating `;`/`in` token. Other owners keep
     // the standard bounds ([`flow_body_run`] + [`statement_run`]).
     let bounded = statement_run(c, flow_body_run(c, raw));
-    let below: Vec<u32> =
-        if matches!(c.kind(parent), NodeKind::ForStatement | NodeKind::ForIn) {
-            contiguous_tail(c, &bounded, op_token).to_vec()
-        } else {
-            bounded
-        };
+    let below: Vec<u32> = if matches!(c.kind(parent), NodeKind::ForStatement | NodeKind::ForIn) {
+        contiguous_tail(c, &bounded, op_token).to_vec()
+    } else {
+        bounded
+    };
     let mut rows: Vec<u32> = below
         .into_iter()
         .filter(|&kid| kid < window.start)
@@ -659,7 +658,7 @@ pub(crate) fn arguments(c: &Check<'_>, pieces: &[u32]) -> Vec<core::ops::Range<u
 }
 
 pub(crate) mod no_self_assignments {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/no_self_assignments.dart`
     /// — an `=` assignment whose both sides are identifiers with the same
@@ -681,16 +680,12 @@ pub(crate) mod no_self_assignments {
     /// the production tiling does materialize under the
     /// [`NodeKind::FieldInitializer`] wrapper bail on the ancestor — the
     /// official's node-kind gate.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_self_assignments",
-    &[NodeKind::Assignment],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("no_self_assignments", &[NodeKind::Assignment], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        if c
-            .field(node, PayloadField::Operator)
+        if c.field(node, PayloadField::Operator)
             .is_none_or(|op| c.lexeme(op) != "=")
         {
             return;
@@ -773,8 +768,9 @@ pub(crate) mod no_self_assignments {
             let rhs = tok(&f.source, &f.tokens, "i", 2);
             assert_eq!(lints[0].range.end, utf16_at(&f, rhs) + 1);
 
-            let f =
-                Fixture::parse("void f(int i, bool b) {\n  for (i = 0; b; i = i) {\n    i = 2;\n  }\n}");
+            let f = Fixture::parse(
+                "void f(int i, bool b) {\n  for (i = 0; b; i = i) {\n    i = 2;\n  }\n}",
+            );
             let lints = f.run(&one_rule("no_self_assignments"));
             assert_eq!(lints.len(), 1, "{lints:?}");
             let write = tok(&f.source, &f.tokens, "i", 2);
@@ -848,7 +844,7 @@ pub(crate) mod no_self_assignments {
 }
 
 pub(crate) mod parameter_assignments {
-    use super::{PayloadField, Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
     use crate::rules::{NONE_TOKEN, initialized_identifier_name};
     use dartq_scanner::TokenKind;
 
@@ -896,16 +892,16 @@ pub(crate) mod parameter_assignments {
     /// The leaf's token face answers the bare-identifier `=` write — the
     /// shapes the row covers never double-report.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "parameter_assignments",
-    &[
+        "parameter_assignments",
+        &[
             NodeKind::Assignment,
             NodeKind::PatternAssignment,
             NodeKind::UnaryPrefix,
             NodeKind::UnaryPostfix,
             NodeKind::ExpressionStatement,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -1144,9 +1140,7 @@ pub(crate) mod parameter_assignments {
             // token before the `=` (the record-pattern row's span ends at
             // its last child under flat tiling, one closer short).
             let head = c.head_token(pattern_row);
-            if let Some(range) =
-                crate::rules::declarations::utf16_token_run_span(c, head..equals)
-            {
+            if let Some(range) = crate::rules::declarations::utf16_token_run_span(c, head..equals) {
                 c.report(range, &[name]);
             }
         }
@@ -1358,8 +1352,7 @@ pub(crate) mod parameter_assignments {
     /// `InitializerStart`/`InitializerEnd` words).
     fn has_default_clause(c: &Check<'_>, parameter: u32) -> bool {
         c.kind(parameter) == NodeKind::FormalParameter
-            && c
-                .field(parameter, PayloadField::InitializerStart)
+            && c.field(parameter, PayloadField::InitializerStart)
                 .is_some_and(|token| token != NONE_TOKEN)
     }
 

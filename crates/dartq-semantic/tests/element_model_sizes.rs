@@ -21,7 +21,11 @@ fn element_model_row_structs_stay_at_their_pinned_sizes() {
     // `Option<Box<Formals>>`(8) = 35 bytes, rounded to the 8-byte alignment
     // of the boxed formals — 40 is exact, no padding lever without boxing a
     // `Ty`.
-    assert_eq!(size_of::<TopDecl>(), 40, "TopDecl budget: 8 + 12 + 12 + 4+4");
+    assert_eq!(
+        size_of::<TopDecl>(),
+        40,
+        "TopDecl budget: 8 + 12 + 12 + 4+4"
+    );
 
     // `MemberEntry`: payload = two boxed columns(32) + `Option<Box<Formals>>`
     // (8) + two `Ty`(24) + `SourceRange`(8) + kind(1) + four modifier bools

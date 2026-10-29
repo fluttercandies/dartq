@@ -104,7 +104,11 @@ pub fn port_file(text: &str) -> Result<Outcome, String> {
             Err(reason) => skipped.push((name, reason)),
         }
     }
-    Ok(Outcome { rule, ported, skipped })
+    Ok(Outcome {
+        rule,
+        ported,
+        skipped,
+    })
 }
 
 /// The `lintRule => …;` value: `LintNames.<name>`, `'<name>'`, or
@@ -296,7 +300,11 @@ fn next_line(text: &str, from: usize) -> usize {
 
 /// The first line of a snippet, for reject messages.
 fn first_line(text: &str) -> String {
-    text.split('\n').next().unwrap_or_default().trim().to_owned()
+    text.split('\n')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 /// One raw-string argument (`r'''…'''` / `r"""…"""`): the verbatim
@@ -406,7 +414,9 @@ pub fn merge_divergences(rendered: &str, previous: &str) -> (String, Vec<String>
     let mut merged = String::with_capacity(rendered.len());
     for line in rendered.split_inclusive('\n') {
         merged.push_str(line);
-        if let Some(name) = line.strip_prefix("//- case: ").and_then(|n| n.strip_suffix('\n'))
+        if let Some(name) = line
+            .strip_prefix("//- case: ")
+            .and_then(|n| n.strip_suffix('\n'))
             && let Some((_, reason)) = quarantines.iter().find(|(cased, _)| cased == name)
         {
             merged.push_str(&format!("//- diverge: {reason}\n"));
@@ -508,9 +518,9 @@ mod tests {
         assert!(rendered.starts_with("// Ported by port_upstream"));
         assert!(rendered.contains("//- lint: some_rule\n"));
         assert!(rendered.contains("//- case: test_reports\n"));
-        assert!(rendered.contains(
-            "//- file: /lib/test.dart\n\nvoid f() { if (c) ; else [!;!] }\n"
-        ));
+        assert!(
+            rendered.contains("//- file: /lib/test.dart\n\nvoid f() { if (c) ; else [!;!] }\n")
+        );
         assert!(rendered.contains("//- file: /lib/a.dart\n\nclass A {}\n"));
         // And the rendered text parses back through the DSL.
         let doc = crate::parse(&rendered).expect("round-trips");
@@ -527,9 +537,11 @@ mod tests {
         );
         let pinned = "class T extends LanguageVersion219Mixin on LintRuleTest {\n\
                       String get lintRule => 'x';\n}";
-        assert!(port_file(pinned)
-            .unwrap_err()
-            .contains("language-version-pinned"));
+        assert!(
+            port_file(pinned)
+                .unwrap_err()
+                .contains("language-version-pinned")
+        );
     }
 
     /// The quoted-`lintRule` spelling and the `code:` override skip.
@@ -548,7 +560,11 @@ mod tests {
         let out = port_file(source).expect("ports");
         assert_eq!(out.rule, "quoted_rule");
         assert_eq!(out.tally(), (0, 1));
-        assert!(out.skipped[0].1.contains("`code:` override `somethingElse`"));
+        assert!(
+            out.skipped[0]
+                .1
+                .contains("`code:` override `somethingElse`")
+        );
     }
 
     /// An unrecognized statement rejects the case, never silently.

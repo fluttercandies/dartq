@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use dartq_parser::MemberKind;
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_late.dart:36-55` —
@@ -8,11 +8,8 @@ use dartq_parser::MemberKind;
 /// `late` keyword is the declaration's span head when present
 /// (`VariablesDeclaration` head-when-present contract). Message:
 /// `diagnostic.g.dart` `unnecessaryLate`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_late",
-    &[NodeKind::VariablesDeclaration],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("unnecessary_late", &[NodeKind::VariablesDeclaration], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

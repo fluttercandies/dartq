@@ -95,13 +95,11 @@ pub fn load_cases(dir: &Path) -> Result<Vec<LoadedCase>, String> {
     let mut cases: Vec<LoadedCase> = Vec::with_capacity(files.len());
     let mut by_id: BTreeMap<String, PathBuf> = BTreeMap::new();
     for path in files {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            format!("{} is not UTF-8", path.display())
-        })?;
-        let parsed = case::read(&text)
-            .map_err(|e| format!("{}: {:?}", path.display(), e))?;
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+        let parsed = case::read(&text).map_err(|e| format!("{}: {:?}", path.display(), e))?;
         if let Some(first) = by_id.insert(parsed.id.clone(), path.clone()) {
             return Err(format!(
                 "duplicate case id `{}` in {} and {}",
@@ -138,10 +136,7 @@ fn collect_case_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// extracted case wins and the manual file is reported. A missing manual
 /// directory is reported and skipped: the manual corpus is an optional
 /// addition, unlike the extracted corpus whose absence is fatal.
-pub fn load_corpus(
-    cases_dir: &Path,
-    manual_dir: Option<&Path>,
-) -> Result<Vec<LoadedCase>, String> {
+pub fn load_corpus(cases_dir: &Path, manual_dir: Option<&Path>) -> Result<Vec<LoadedCase>, String> {
     let mut cases = load_cases(cases_dir)?;
     let Some(manual_dir) = manual_dir else {
         return Ok(cases);
@@ -168,7 +163,10 @@ pub fn load_corpus(
         manual += 1;
     }
     if manual > 0 {
-        let _ = writeln!(std::io::stderr().lock(), "manual corpus: {manual} cases loaded");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "manual corpus: {manual} cases loaded"
+        );
     }
     cases.sort_by(|a, b| a.case.id.cmp(&b.case.id));
     Ok(cases)
@@ -269,7 +267,10 @@ fn materialize_one(
         }
         let package_root = mocks_abs.join(name);
         if !package_root.is_dir() {
-            return Err(format!("mock package `{name}` not found under {}", mocks_abs.display()));
+            return Err(format!(
+                "mock package `{name}` not found under {}",
+                mocks_abs.display()
+            ));
         }
         mock_names.insert(name);
     }
@@ -312,8 +313,11 @@ fn materialize_one(
         )
         .map_err(|e| format!("cannot write analysis_options.yaml: {e}"))?;
     }
-    std::fs::write(root.join(".dart_tool").join("package_config.json"), config.to_string())
-        .map_err(|e| format!("cannot write package_config.json: {e}"))?;
+    std::fs::write(
+        root.join(".dart_tool").join("package_config.json"),
+        config.to_string(),
+    )
+    .map_err(|e| format!("cannot write package_config.json: {e}"))?;
     Ok(())
 }
 
@@ -348,7 +352,11 @@ fn normalize_section_path(path: &str) -> Result<String, String> {
     for part in trimmed.split('/') {
         match part {
             "" | "." => {}
-            ".." => return Err(format!("file section path `{path}` escapes the package root")),
+            ".." => {
+                return Err(format!(
+                    "file section path `{path}` escapes the package root"
+                ));
+            }
             _ => parts.push(part),
         }
     }
@@ -362,7 +370,8 @@ pub fn mocks_tree_hash(mocks_root: &Path) -> Result<String, String> {
     files.sort();
     let mut hasher = Hasher::new();
     for (rel, path) in &files {
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         hasher.update(rel.as_bytes());
         hasher.update(&[0]);
         hasher.update(&bytes);
@@ -417,8 +426,7 @@ pub fn pin_value(pin_text: &str, key: &str) -> Option<String> {
 pub fn sdk_revision(pin_path: &Path) -> Result<String, String> {
     let text =
         std::fs::read_to_string(pin_path).map_err(|e| format!("cannot read pin.toml: {e}"))?;
-    pin_value(&text, "sdk_revision")
-        .ok_or_else(|| "pin.toml has no `sdk_revision`".to_string())
+    pin_value(&text, "sdk_revision").ok_or_else(|| "pin.toml has no `sdk_revision`".to_string())
 }
 
 #[cfg(test)]
@@ -446,9 +454,18 @@ mod tests {
 
     #[test]
     fn section_paths_normalize_and_reject_escapes() {
-        assert_eq!(normalize_section_path("lib/test.dart").as_deref(), Ok("lib/test.dart"));
-        assert_eq!(normalize_section_path("/lib/test.dart").as_deref(), Ok("lib/test.dart"));
-        assert_eq!(normalize_section_path("pubspec.yaml").as_deref(), Ok("pubspec.yaml"));
+        assert_eq!(
+            normalize_section_path("lib/test.dart").as_deref(),
+            Ok("lib/test.dart")
+        );
+        assert_eq!(
+            normalize_section_path("/lib/test.dart").as_deref(),
+            Ok("lib/test.dart")
+        );
+        assert_eq!(
+            normalize_section_path("pubspec.yaml").as_deref(),
+            Ok("pubspec.yaml")
+        );
         assert!(normalize_section_path("../x.dart").is_err());
         assert!(normalize_section_path("/").is_err());
     }
@@ -456,7 +473,11 @@ mod tests {
     #[test]
     fn cache_key_changes_with_every_input() {
         let base = cache_key("case", "mocks", "rev");
-        assert_eq!(base, cache_key("case", "mocks", "rev"), "stable for equal inputs");
+        assert_eq!(
+            base,
+            cache_key("case", "mocks", "rev"),
+            "stable for equal inputs"
+        );
         assert_ne!(base, cache_key("case2", "mocks", "rev"));
         assert_ne!(base, cache_key("case", "mocks2", "rev"));
         assert_ne!(base, cache_key("case", "mocks", "rev2"));
@@ -481,7 +502,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creates");
         let pin = dir.join("pin.toml");
-        std::fs::write(&pin, "# comment\nsdk_version = \"3.13.7\"\nsdk_revision = \"416e33b0\"\n").expect("writes");
+        std::fs::write(
+            &pin,
+            "# comment\nsdk_version = \"3.13.7\"\nsdk_revision = \"416e33b0\"\n",
+        )
+        .expect("writes");
         assert_eq!(sdk_revision(&pin).as_deref(), Ok("416e33b0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -550,7 +575,10 @@ mod tests {
         let mut case = loaded(
             "diagnostics/x/t#aux",
             &[
-                ("lib/test.dart", "import 'package:aaa/a.dart';\nvar x = f;\n"),
+                (
+                    "lib/test.dart",
+                    "import 'package:aaa/a.dart';\nvar x = f;\n",
+                ),
                 ("package:aaa/lib/a.dart", "@deprecated\nlibrary a;\n"),
                 ("package:p/p.dart", "var p = 1;\n"),
             ],
@@ -596,7 +624,10 @@ mod tests {
         let mut case = loaded(
             "diagnostics/x/t#rel",
             &[
-                ("lib/test.dart", "import 'package:aaa/a.dart';\nvar x = f;\n"),
+                (
+                    "lib/test.dart",
+                    "import 'package:aaa/a.dart';\nvar x = f;\n",
+                ),
                 ("package:aaa/lib/a.dart", "var a = 1;\n"),
             ],
         );
@@ -614,8 +645,9 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let config = std::fs::read_to_string(rel.join("0/.dart_tool/package_config.json"))
             .expect("reads config");
-        let aux_root =
-            std::fs::canonicalize(&rel).expect("canonical chunk").join("0/.aux/aaa");
+        let aux_root = std::fs::canonicalize(&rel)
+            .expect("canonical chunk")
+            .join("0/.aux/aaa");
         assert!(
             config.contains(&format!("\"rootUri\":\"{}\"", path_to_file_uri(&aux_root))),
             "{config}"
@@ -630,7 +662,10 @@ mod tests {
             path_to_file_uri(Path::new("/home/analyst/x y")),
             "file:///home/analyst/x%20y"
         );
-        assert_eq!(path_to_file_uri(Path::new("/a.b-c_d~e")), "file:///a.b-c_d~e");
+        assert_eq!(
+            path_to_file_uri(Path::new("/a.b-c_d~e")),
+            "file:///a.b-c_d~e"
+        );
     }
 
     #[test]
@@ -683,7 +718,12 @@ mod tests {
         // manual directory is reported and skipped, not fatal.
         assert_eq!(load_corpus(&extracted, None).expect("loads").len(), 1);
         let missing = extracted.parent().expect("tmp").join("no-such-manual");
-        assert_eq!(load_corpus(&extracted, Some(&missing)).expect("loads").len(), 1);
+        assert_eq!(
+            load_corpus(&extracted, Some(&missing))
+                .expect("loads")
+                .len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&extracted);
         let _ = std::fs::remove_dir_all(&manual);
     }
@@ -692,12 +732,18 @@ mod tests {
     fn supplied_pubspec_wins_generated_otherwise_and_never_blocks() {
         let supplied = loaded(
             "manual/diagnostic/missing_name/1",
-            &[("lib/test.dart", "void f() {}\n"), ("pubspec.yaml", "version: 1.0.0\n")],
+            &[
+                ("lib/test.dart", "void f() {}\n"),
+                ("pubspec.yaml", "version: 1.0.0\n"),
+            ],
         );
         let generated = loaded("diagnostics/x/t", &[("lib/test.dart", "var x = 1;\n")]);
         let invalid = loaded(
             "manual/diagnostic/invalid_pubspec/1",
-            &[("lib/test.dart", "void f() {}\n"), ("pubspec.yaml", "- a\n- b\n")],
+            &[
+                ("lib/test.dart", "void f() {}\n"),
+                ("pubspec.yaml", "- a\n- b\n"),
+            ],
         );
         let cases = vec![supplied, generated, invalid];
         let mocks = std::env::temp_dir().join(format!("conf-pubspec-{}", std::process::id()));
@@ -730,13 +776,22 @@ mod tests {
     fn analysis_options_section_honored_directive_wins() {
         let section_only = loaded(
             "manual/diagnostic/x/1",
-            &[("lib/test.dart", "void f() {}\n"), ("analysis_options.yaml", "linter:\n  rules:\n    - avoid_print\n")],
+            &[
+                ("lib/test.dart", "void f() {}\n"),
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - avoid_print\n",
+                ),
+            ],
         );
         let mut both = loaded(
             "manual/diagnostic/x/2",
             &[
                 ("lib/test.dart", "void f() {}\n"),
-                ("analysis_options.yaml", "linter:\n  rules:\n    - avoid_print\n"),
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - avoid_print\n",
+                ),
             ],
         );
         both.case.options = Some("analyzer:\n  errors:\n    dead_code: ignore\n".into());
@@ -767,13 +822,16 @@ mod tests {
         assert!(dir.is_dir(), "{} should exist", dir.display());
         let mut files = Vec::new();
         collect_case_files(&dir, &mut files);
-        assert!(files.len() > 100, "manual corpus unexpectedly small: {files:?}");
+        assert!(
+            files.len() > 100,
+            "manual corpus unexpectedly small: {files:?}"
+        );
         let mut checked = 0usize;
         for path in files {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let parsed = case::read(&text)
-                .unwrap_or_else(|e| panic!("{}: {:?}", path.display(), e));
+            let parsed =
+                case::read(&text).unwrap_or_else(|e| panic!("{}: {:?}", path.display(), e));
             assert_eq!(
                 case::write(&parsed),
                 text,

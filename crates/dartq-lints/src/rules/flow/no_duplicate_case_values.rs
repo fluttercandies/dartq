@@ -92,8 +92,8 @@ fn check(c: &mut Check<'_>) {
             if let Some((_, original)) = seen.iter().find(|(seen, _)| *seen == value) {
                 let dup = token_slice(c, range.clone()).to_owned();
                 let orig = token_slice(c, original.clone()).to_owned();
-                let span = utf16_token_span(c, range.start).start
-                    ..utf16_token_span(c, range.end - 1).end;
+                let span =
+                    utf16_token_span(c, range.start).start..utf16_token_span(c, range.end - 1).end;
                 c.report(span, &[&dup, &orig]);
             } else {
                 seen.push((value, range));
@@ -258,18 +258,12 @@ impl<'b> Folder<'_, 'b> {
 /// known constant.
 fn fold_binary(operator: &str, left: ConstValue, right: ConstValue) -> Option<ConstValue> {
     match (operator, left, right) {
-        ("+", ConstValue::Int(a), ConstValue::Int(b)) => {
-            Some(ConstValue::Int(a.wrapping_add(b)))
-        }
+        ("+", ConstValue::Int(a), ConstValue::Int(b)) => Some(ConstValue::Int(a.wrapping_add(b))),
         ("+", ConstValue::Str(a), ConstValue::Str(b)) => {
             Some(ConstValue::Str(format!("{a}{b}").into()))
         }
-        ("-", ConstValue::Int(a), ConstValue::Int(b)) => {
-            Some(ConstValue::Int(a.wrapping_sub(b)))
-        }
-        ("*", ConstValue::Int(a), ConstValue::Int(b)) => {
-            Some(ConstValue::Int(a.wrapping_mul(b)))
-        }
+        ("-", ConstValue::Int(a), ConstValue::Int(b)) => Some(ConstValue::Int(a.wrapping_sub(b))),
+        ("*", ConstValue::Int(a), ConstValue::Int(b)) => Some(ConstValue::Int(a.wrapping_mul(b))),
         ("~/", ConstValue::Int(a), ConstValue::Int(b)) if b != 0 => {
             Some(ConstValue::Int(a.wrapping_div(b)))
         }

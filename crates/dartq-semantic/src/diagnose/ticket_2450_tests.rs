@@ -143,7 +143,8 @@ void f() {
     let dead = rows(&report, "dead_code");
     let second_case = source.find("case Data").unwrap() as u32;
     assert!(
-        dead.iter().any(|&(offset, len)| offset == second_case && len == 4),
+        dead.iter()
+            .any(|&(offset, len)| offset == second_case && len == 4),
         "the clause after the absorber reports at its `case` keyword: {:?}",
         report.diagnostics
     );
@@ -193,7 +194,8 @@ void f() {
     );
     let qualified_case = source.find("case Qualified()").unwrap() as u32;
     assert!(
-        dead.iter().any(|&(offset, len)| offset == qualified_case && len == 4),
+        dead.iter()
+            .any(|&(offset, len)| offset == qualified_case && len == 4),
         "the clause after the absorber reports at its `case` keyword: {:?}",
         report.diagnostics
     );

@@ -188,7 +188,8 @@ fn type_parameter_on_operator_span_matches_oracle_row() {
 /// again.
 #[test]
 fn factory_with_initializers_rows_match_the_oracle() {
-    let source = "class C {\n  int x = 0;\n  factory C() : x = 1 {\n    return C._();\n  }\n  C._();\n}\n";
+    let source =
+        "class C {\n  int x = 0;\n  factory C() : x = 1 {\n    return C._();\n  }\n  C._();\n}\n";
     let rows = rows(source);
     let (_, cm_start, cm_end) = rows
         .iter()
@@ -211,13 +212,16 @@ fn factory_with_initializers_rows_match_the_oracle() {
 /// factory_with_initializers/1 pairs and the expected-string pair).
 #[test]
 fn registry_templates_carry_no_but_got_suffix() {
-    let source = "class C {\n  int x = 0;\n  factory C() : x = 1 {\n    return C._();\n  }\n  C._();\n}\n";
+    let source =
+        "class C {\n  int x = 0;\n  factory C() : x = 1 {\n    return C._();\n  }\n  C._();\n}\n";
     let (table, text) = scan_ok(source);
     let mut collector = Collector::default();
     let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     assert!(
-        p.listener.texts.contains(&"Expected a class member.".to_string()),
+        p.listener
+            .texts
+            .contains(&"Expected a class member.".to_string()),
         "{:?}",
         p.listener.texts
     );

@@ -1,5 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, fields_written_type, obvious_spelling};
-use crate::rules::{MemberQuery, last_child, member_matches, same_file_ancestors, same_file_declaration, supertypes};
+use super::{Check, NodeKind, PayloadField, RuleSpec, fields_written_type, obvious_spelling};
+use crate::rules::{
+    MemberQuery, last_child, member_matches, same_file_ancestors, same_file_declaration, supertypes,
+};
 
 /// Official: `pkg/linter/lib/src/rules/specify_nonobvious_property_types.dart:47-120`
 /// — a top-level or field variable list (:43-44) with no written type

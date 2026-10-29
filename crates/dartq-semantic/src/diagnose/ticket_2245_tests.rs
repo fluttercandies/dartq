@@ -1,4 +1,3 @@
-
 //! The #2245 pins: the composite-argument-window faces verified
 //! end-to-end through the single-file rig.
 //!

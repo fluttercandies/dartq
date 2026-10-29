@@ -214,7 +214,9 @@ fn batched(
     while start < files.len() || merged.is_none() {
         let mut end = start;
         let mut bytes = 0;
-        while end < files.len() && (end == start || bytes + files[end].as_os_str().len() + 1 <= ARGV_BUDGET) {
+        while end < files.len()
+            && (end == start || bytes + files[end].as_os_str().len() + 1 <= ARGV_BUDGET)
+        {
             bytes += files[end].as_os_str().len() + 1;
             end += 1;
         }
@@ -258,7 +260,11 @@ fn run_command(mut cmd: Command, cfg: &ExecConfig) -> Result<Execution, ExecErro
     let activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let seen = std::sync::Arc::clone(&activity);
     let reader = std::thread::spawn(move || {
-        let lines = Activity { inner: stdout, seen, spawned };
+        let lines = Activity {
+            inner: stdout,
+            seen,
+            spawned,
+        };
         parse_stream(BufReader::new(lines), sink.as_ref(), ready, spawned)
     });
     let errors = std::thread::spawn(move || {
@@ -281,7 +287,8 @@ fn run_command(mut cmd: Command, cfg: &ExecConfig) -> Result<Execution, ExecErro
             peak_rss = peak_rss.max(tree);
             peak_tester_rss = peak_tester_rss.max(tester);
         }
-        let idle_since = spawned + Duration::from_millis(activity.load(std::sync::atomic::Ordering::Relaxed));
+        let idle_since =
+            spawned + Duration::from_millis(activity.load(std::sync::atomic::Ordering::Relaxed));
         if idle_since.elapsed() > timeout {
             kill_group(&mut child);
             // Reap the runner; the reader sees EOF once the group is gone.
@@ -357,12 +364,18 @@ fn group_rss(pgid: u32) -> (u64, u64) {
         // `comm` is a path that may hold spaces: everything after the
         // pgid and rss fields belongs to it.
         let rest = line.trim_start();
-        let Some((group, rest)) = rest.split_once(' ') else { continue };
+        let Some((group, rest)) = rest.split_once(' ') else {
+            continue;
+        };
         if group.parse().ok() != Some(pgid) {
             continue;
         }
-        let Some((kib, command)) = rest.trim_start().split_once(' ') else { continue };
-        let Some(kib) = kib.parse::<u64>().ok() else { continue };
+        let Some((kib, command)) = rest.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Some(kib) = kib.parse::<u64>().ok() else {
+            continue;
+        };
         let bytes = kib * 1024;
         tree += bytes;
         if command.ends_with(TESTER_PROCESS) {
@@ -470,7 +483,10 @@ fn parse_stream(
                 if let Some(&index) = raw.str_at(&["path"]).and_then(|path| block_at.get(path)) {
                     if let Some(block) = blocks[index].as_mut() {
                         block.closed = true;
-                        block.clean = raw.get("clean").and_then(crate::event::Json::as_bool).unwrap_or(false);
+                        block.clean = raw
+                            .get("clean")
+                            .and_then(crate::event::Json::as_bool)
+                            .unwrap_or(false);
                     }
                     if let Some(sink) = sink {
                         if let Some(block) = blocks[index].take() {
@@ -490,7 +506,12 @@ fn parse_stream(
                 block_of.insert(id, blocks.len());
                 block_at.insert(path.clone(), blocks.len());
                 streaming = Some(blocks.len());
-                blocks.push(Some(SuiteBlock { path, events: vec![raw], closed: false, clean: false }));
+                blocks.push(Some(SuiteBlock {
+                    path,
+                    events: vec![raw],
+                    closed: false,
+                    clean: false,
+                }));
             }
             _ => {
                 if let Some(test) = raw.u64_at(&["test", "id"]) {
@@ -498,8 +519,10 @@ fn parse_stream(
                         suite_of_test.insert(test, suite);
                     }
                 }
-                let suite = crate::event::suite_of(&raw)
-                    .or_else(|| raw.u64_at(&["testID"]).and_then(|test| suite_of_test.get(&test).copied()));
+                let suite = crate::event::suite_of(&raw).or_else(|| {
+                    raw.u64_at(&["testID"])
+                        .and_then(|test| suite_of_test.get(&test).copied())
+                });
                 let placed = suite.and_then(|suite| block_of.get(&suite)).copied();
                 if let Some(index) = placed
                     && let Some(block) = blocks[index].as_mut()
@@ -585,7 +608,9 @@ raw from b\n\
         let streamed: Vec<Streamed> = receiver.into_iter().collect();
         // The runner banner (before any suite event) streams on its own.
         assert!(matches!(&streamed[0], Streamed::Line(line) if line == "runner banner"));
-        let Streamed::Settled(Settled { block: a, .. }) = &streamed[1] else { panic!("settled") };
+        let Streamed::Settled(Settled { block: a, .. }) = &streamed[1] else {
+            panic!("settled")
+        };
         assert_eq!(a.events.len(), 5);
         assert_eq!(a.events[1].kind(), crate::event::SHELL);
         assert_eq!(a.events[1].str_at(&["message"]), Some("raw from a"));
@@ -593,7 +618,9 @@ raw from b\n\
         // last: it renders with that suite, never after the run.
         assert_eq!(a.events[4].kind(), crate::event::SHELL);
         assert_eq!(a.events[4].str_at(&["message"]), Some("between suites"));
-        let Streamed::Settled(Settled { block: b, .. }) = &streamed[2] else { panic!("settled") };
+        let Streamed::Settled(Settled { block: b, .. }) = &streamed[2] else {
+            panic!("settled")
+        };
         // `raw from b` sits between b's testStart and its testDone.
         assert_eq!(b.events[2].kind(), crate::event::SHELL);
         assert_eq!(b.events[3].kind(), "testDone");
@@ -606,7 +633,12 @@ raw from b\n\
             Instant::now(),
         )
         .expect("parse");
-        assert!(parsed.blocks[0].events.iter().any(|event| event.kind() == crate::event::SHELL));
+        assert!(
+            parsed.blocks[0]
+                .events
+                .iter()
+                .any(|event| event.kind() == crate::event::SHELL)
+        );
         assert!(matches!(&parsed.loose[0], Loose::Line(line) if line == "runner banner"));
     }
 
@@ -615,7 +647,9 @@ raw from b\n\
     #[test]
     fn oversized_selections_run_in_batches() {
         let long = "x".repeat(300);
-        let files: Vec<PathBuf> = (0..2000).map(|i| PathBuf::from(format!("/ws/{long}/{i}_test.dart"))).collect();
+        let files: Vec<PathBuf> = (0..2000)
+            .map(|i| PathBuf::from(format!("/ws/{long}/{i}_test.dart")))
+            .collect();
         let mut calls = Vec::new();
         let merged = batched(&files, |batch| {
             let bytes: usize = batch.iter().map(|p| p.as_os_str().len() + 1).sum();
@@ -672,10 +706,14 @@ raw from b\n\
         drop(sender);
         assert!(parsed.blocks.is_empty(), "every block reached the sink");
         let streamed: Vec<Streamed> = receiver.into_iter().collect();
-        let Streamed::Settled(Settled { block: a, .. }) = &streamed[0] else { panic!("settled") };
+        let Streamed::Settled(Settled { block: a, .. }) = &streamed[0] else {
+            panic!("settled")
+        };
         assert!(a.closed && a.clean, "the marker closed the suite clean");
         assert_eq!(a.events.len(), 3, "the marker itself joins no block");
-        let Streamed::Settled(Settled { block: b, .. }) = &streamed[1] else { panic!("settled") };
+        let Streamed::Settled(Settled { block: b, .. }) = &streamed[1] else {
+            panic!("settled")
+        };
         assert!(b.closed, "`done` closes the suites still held");
         assert!(!b.clean);
 

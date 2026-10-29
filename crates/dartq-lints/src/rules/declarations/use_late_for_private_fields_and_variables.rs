@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, ctor_header_has_const, fields_written_type, is_identifier_token, range_has_const};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, container_members, ctor_header_has_const,
+    fields_written_type, is_identifier_token, range_has_const,
+};
 use crate::rules::{initialized_identifier_name, utf16_token_span};
 
 const STATIC_FIELD: u32 = dartq_parser::MemberKind::StaticField as u32;

@@ -32,10 +32,7 @@ fn rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
 }
 
 fn type_check_rows(report: &FileReport) -> Vec<(u32, u32)> {
-    rows(
-        report,
-        "unnecessary_type_check",
-    )
+    rows(report, "unnecessary_type_check")
 }
 
 /// —— A1: the covariant argument leg is the strict ask ——
@@ -64,7 +61,12 @@ fn list_of_null_is_not_list_of_object() {
 fn list_of_null_is_list_of_null_reports() {
     let src = "void f() {\n  if (const <Null>[] is List<Null>) {}\n}\n";
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// `List<int> is List<num>`: the unmarked parameter's covariant default
@@ -73,16 +75,29 @@ fn list_of_null_is_list_of_null_reports() {
 /// #2462 `Box<int>`/`Box<num>` probe's List spelling).
 #[test]
 fn covariant_argument_fit_reports() {
-    let src = concat!("void f(List<int> l) {\n", "  if (l is List<num>) {}\n", "}\n",);
+    let src = concat!(
+        "void f(List<int> l) {\n",
+        "  if (l is List<num>) {}\n",
+        "}\n",
+    );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// The misfit direction stays live: `List<num> is List<int>` asks
 /// `num <: int` — no declared edge walks upward, the oracle is silent.
 #[test]
 fn covariant_argument_misfit_stays_live() {
-    let src = concat!("void f(List<num> l) {\n", "  if (l is List<int>) {}\n", "}\n",);
+    let src = concat!(
+        "void f(List<num> l) {\n",
+        "  if (l is List<int>) {}\n",
+        "}\n",
+    );
     let report = report_ops(src);
     assert!(
         type_check_rows(&report).is_empty(),
@@ -98,7 +113,12 @@ fn covariant_argument_misfit_stays_live() {
 fn list_int_is_raw_list_reports() {
     let src = concat!("void f(List<int> l) {\n", "  if (l is List) {}\n", "}\n",);
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// A raw-typed operand against the raw head (`Set c1; c1 is Set`) is
@@ -112,7 +132,12 @@ fn raw_set_operand_is_raw_set_reports() {
         "}\n",
     );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// —— A1: the top-type edges ——
@@ -138,24 +163,21 @@ fn dynamic_operand_is_type_parameter_stays_live() {
 /// constant-true; the negated spelling maps to the 'false' row.
 #[test]
 fn type_parameter_is_object_question_reports() {
-    let src = concat!(
-        "void f<T>(T a) {\n",
-        "  if (a is Object?) {}\n",
-        "}\n",
-    );
+    let src = concat!("void f<T>(T a) {\n", "  if (a is Object?) {}\n", "}\n",);
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// `num? a; a is int?` stays live: Left Nullable needs `num <: int`
 /// (`int <: num` is the declared edge, never the reverse).
 #[test]
 fn nullable_num_is_not_nullable_int() {
-    let src = concat!(
-        "void f(num? a) {\n",
-        "  if (a is int?) {}\n",
-        "}\n",
-    );
+    let src = concat!("void f(num? a) {\n", "  if (a is int?) {}\n", "}\n",);
     let report = report_ops(src);
     assert!(
         type_check_rows(&report).is_empty(),
@@ -180,7 +202,12 @@ fn top_level_tearoff_is_own_alias_reports() {
         "}\n",
     );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 2, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        2,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// An instance method tear-off inside the class: `m0`'s static type is
@@ -199,7 +226,12 @@ fn member_tearoff_is_own_alias_reports() {
         "}\n",
     );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 2, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        2,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// A generic member tear-off stays untyped (the instantiate-to-bounds
@@ -234,7 +266,12 @@ fn alias_typed_local_is_own_alias_reports() {
         "}\n",
     );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// An invocation operand keeps its call-result face — `confuse(f0)`
@@ -265,15 +302,19 @@ fn invocation_operand_stays_live() {
 /// message (`the result is always 'false'.`).
 #[test]
 fn negated_constant_true_reports_the_false_row() {
-    let src = concat!(
-        "void f<T>(T a) {\n",
-        "  if (a is! Object?) {}\n",
-        "}\n",
-    );
+    let src = concat!("void f<T>(T a) {\n", "  if (a is! Object?) {}\n", "}\n",);
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
     assert!(
-        report.diagnostics.iter().any(|d| d.message.contains("always 'false'")),
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("always 'false'")),
         "{:?}",
         report.diagnostics
     );
@@ -290,7 +331,12 @@ fn field_operand_is_own_declared_type_reports() {
         "}\n",
     );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// A supertype-edge question keeps the declared-edge walk:
@@ -304,5 +350,10 @@ fn supertype_edge_reports() {
         "}\n",
     );
     let report = report_ops(src);
-    assert_eq!(type_check_rows(&report).len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
+        "{:?}",
+        report.diagnostics
+    );
 }

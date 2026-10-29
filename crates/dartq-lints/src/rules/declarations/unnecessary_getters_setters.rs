@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, get_set_token, is_identifier_token, parameter_name, parameters_bind};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, get_set_token, is_identifier_token, parameter_name,
+    parameters_bind,
+};
 use crate::rules::expressions::static_type_faces as faces;
 use dartq_semantic::model::Ty;
 
@@ -352,10 +355,7 @@ fn is_simple_setter(
 /// callee or member return type). The shapes neither source types
 /// (collection and record literals, chains, unknowns) answer `None`
 /// and the agreement bails — the under-report direction.
-fn inferred_field_type<'a>(
-    c: &'a Check<'_>,
-    initializer: Option<u32>,
-) -> Option<(&'a str, bool)> {
+fn inferred_field_type<'a>(c: &'a Check<'_>, initializer: Option<u32>) -> Option<(&'a str, bool)> {
     let Some(initializer) = initializer else {
         return Some(("dynamic", false));
     };
@@ -380,9 +380,7 @@ fn inferred_field_type<'a>(
     }
     let analysis = c.semantics()?;
     let ty = match c.kind(root) {
-        NodeKind::Identifier => {
-            analysis.type_of(crate::rules::expressions::query_site(c, root))
-        }
+        NodeKind::Identifier => analysis.type_of(crate::rules::expressions::query_site(c, root)),
         NodeKind::ImplicitCreation | NodeKind::NewExpression => {
             super::constructed_type(c, analysis, root)
         }

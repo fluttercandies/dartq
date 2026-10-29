@@ -1,4 +1,3 @@
-
 //! The dead/unused-family differential pins: the corpus `dart analyze`
 //! `(severity, code, file, line:col)` burn-down, rooted in four oracle
 //! mechanisms each fixture reproduces end-to-end.
@@ -786,7 +785,11 @@ fn always_true_conditional_rows_the_else_operand_whole() {
 fn member_operand_is_test_keeps_both_arms() {
     let source = "class C {}\nvoid f(Und x) {\n  if (x.foo is C) {\n    print(1);\n  } else {\n    print(2);\n  }\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// The `is!` polarity of the same non-reference face: the then arm stays
@@ -795,7 +798,11 @@ fn member_operand_is_test_keeps_both_arms() {
 fn member_operand_is_not_test_keeps_then_arm() {
     let source = "void f(Und x) {\n  if (x.foo is! String) {\n    print(1);\n  }\n  print(2);\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// A null comparison on an invalid-typed operand is open: the official
@@ -805,7 +812,11 @@ fn member_operand_is_not_test_keeps_then_arm() {
 fn null_comparison_on_invalid_operand_is_open() {
     let source = "void f(Und x) {\n  if (x == null) {\n    print(1);\n  }\n  print(2);\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
     assert!(
         rows(&report, "unnecessary_null_comparison").is_empty(),
         "{:?}",
@@ -820,7 +831,11 @@ fn null_comparison_on_invalid_operand_is_open() {
 fn null_comparison_chain_on_invalid_is_open() {
     let source = "void f(Und x) {\n  if (x != null) {\n    if (x == null) {\n      print(1);\n    }\n    print(2);\n  }\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
     assert!(
         rows(&report, "unnecessary_null_comparison").is_empty(),
         "{:?}",
@@ -838,7 +853,11 @@ fn null_comparison_chain_on_invalid_is_open() {
 fn invalid_written_value_keeps_null_question_open() {
     let source = "void f() {\n  String? s;\n  s = xfoo();\n  if (s == null) {\n    print(1);\n  }\n  print(2);\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// The ast_builder shape: the invalid written value rides a member read
@@ -864,7 +883,11 @@ fn invalid_member_write_keeps_null_question_open() {
 fn object_pattern_property_invalid_keeps_default_live() {
     let source = "abstract class C1 {\n  MissingTok get name;\n}\nvoid f(Und node) {\n  switch (node) {\n    case C1(:var name):\n      print(1);\n    default:\n      print(2);\n  }\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// A for-in (record-pattern bind) whose body carries an inner switch must
@@ -875,5 +898,9 @@ fn object_pattern_property_invalid_keeps_default_live() {
 fn for_in_inner_switch_keeps_outer_default_live() {
     let source = "class Keys {\n  static const String a = 'a';\n}\nvoid report(Object? x) {}\nvoid f(YamlNode? x) {\n  switch (x) {\n    case null:\n      break;\n    case YamlMap():\n      for (var (:keyNode, :valueNode) in x.entries) {\n        switch (keyNode.value) {\n          case Keys.a:\n            break;\n          default:\n            report(keyNode);\n        }\n      }\n    default:\n      report(3);\n  }\n}\n";
     let report = report_ops(source);
-    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "dead_code").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }

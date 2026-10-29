@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
+use super::{Check, NodeKind, PayloadField, RuleSpec, member_declaration_name, operator_name};
 
 /// Official: `pkg/linter/lib/src/rules/hash_and_equals.dart:45-80` — a
 /// class defining exactly one of `==` / `hashCode` reports at the
@@ -9,11 +9,8 @@ use super::{PayloadField, Check, NodeKind, RuleSpec, member_declaration_name, op
 /// (`node.hasMethod('==')` etc.) collapse into the same scan — the blind
 /// spot is members the syntax shape misclassifies (none today). Message:
 /// `diagnostic.g.dart` `hashAndEquals`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "hash_and_equals",
-    &[NodeKind::ClassDeclaration],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("hash_and_equals", &[NodeKind::ClassDeclaration], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -61,11 +58,10 @@ fn check(c: &mut Check<'_>) {
 /// ([`operator_name`]).
 fn is_equals(c: &Check<'_>, member: u32) -> bool {
     c.kind(member) == NodeKind::Method
-        && operator_name(c, member)
-            .is_some_and(|name| {
-                c.field_token(name, PayloadField::Name)
-                    .is_none_or(|t| c.lexeme(t) == "==")
-            })
+        && operator_name(c, member).is_some_and(|name| {
+            c.field_token(name, PayloadField::Name)
+                .is_none_or(|t| c.lexeme(t) == "==")
+        })
 }
 
 /// `isHashCode` (`ast.dart`): a `Method` named `hashCode` or a `Fields`

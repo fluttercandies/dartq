@@ -549,8 +549,11 @@ impl<'a> Bounds<'a> {
         let Some(name) = name else {
             return;
         };
-        let capture = self.index.containers.entry(name).or_insert_with(|| {
-            ContainerCapture {
+        let capture = self
+            .index
+            .containers
+            .entry(name)
+            .or_insert_with(|| ContainerCapture {
                 params: Vec::new(),
                 bounds: Vec::new(),
                 supers: Vec::new(),
@@ -558,8 +561,7 @@ impl<'a> Bounds<'a> {
                 open: false,
                 is_extension_type,
                 is_enum,
-            }
-        });
+            });
         // The kind flags were stated at the header open (keep-first: a
         // same-named duplicate's second header never re-registers).
         capture.params = window.iter().map(|(n, _, _)| *n).collect();
@@ -572,12 +574,7 @@ impl<'a> Bounds<'a> {
     /// variables, the common `class C extends G<B> {}` shape) never
     /// reaches [`Self::note_container`], whose window latch is its
     /// precondition, and its clause trees would drop.
-    pub(crate) fn open_header(
-        &mut self,
-        name: StringId,
-        is_extension_type: bool,
-        is_enum: bool,
-    ) {
+    pub(crate) fn open_header(&mut self, name: StringId, is_extension_type: bool, is_enum: bool) {
         self.index
             .containers
             .entry(name)
@@ -1403,7 +1400,9 @@ impl<'a> Bounds<'a> {
             return Vec::new();
         }
         let ext_faces = std::mem::take(&mut self.index.ext_faces);
-        let invalid_heads = ["dynamic", "void", "Never", "Null", "FutureOr", "Function", "Record"];
+        let invalid_heads = [
+            "dynamic", "void", "Never", "Null", "FutureOr", "Function", "Record",
+        ];
         // Plan with the capture index borrowed, decide with the snapshot:
         // each row carries the tree pair the snapshot may map.
         let mut plan: Vec<(ExtFaceRow, Option<(&TypeTree, &TypeTree)>)> = Vec::new();
@@ -1473,7 +1472,10 @@ impl<'a> Bounds<'a> {
                     && let (Some(rep_ty), Some(face_ty)) =
                         (ctx.map_tree(rep, &empty), ctx.map_tree(face, &empty))
                     && snapshot.type_is_safe(rep_ty)
-                    && matches!(snapshot.table.get(face_ty).kind(), TypeKind::Interface { .. })
+                    && matches!(
+                        snapshot.table.get(face_ty).kind(),
+                        TypeKind::Interface { .. }
+                    )
                 {
                     row.verdict = Some(snapshot.system().is_subtype(rep_ty, face_ty));
                     row.displays = Some((snapshot.display(face_ty), snapshot.display(rep_ty)));

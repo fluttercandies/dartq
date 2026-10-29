@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{const_ability, utf16_token_span, variables_declaration_keyword};
 use dartq_parser::MemberKind;
 
@@ -124,9 +124,7 @@ fn const_as_written(c: &Check<'_>, expr: u32) -> bool {
         | NodeKind::SetOrMapLiteral
         | NodeKind::NewExpression
         | NodeKind::ImplicitCreation => false,
-        NodeKind::Send => {
-            !send_invocation(c, expr) && const_ability::is_const_able(c.unit, expr)
-        }
+        NodeKind::Send => !send_invocation(c, expr) && const_ability::is_const_able(c.unit, expr),
         _ => const_ability::is_const_able(c.unit, expr),
     }
 }

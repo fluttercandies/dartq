@@ -239,13 +239,18 @@ impl DebugManager {
     /// The manager keeping `live` in sync with its registry — the
     /// session holds the other handle of the same counter.
     pub(crate) fn sharing(live: Arc<AtomicUsize>) -> Self {
-        Self { sessions: FxHashMap::default(), next_id: 0, live }
+        Self {
+            sessions: FxHashMap::default(),
+            next_id: 0,
+            live,
+        }
     }
 
     /// Registers a live session under the next monotonic id.
     fn register(&mut self, origin: Origin, session: DebugSession) -> u32 {
         self.next_id += 1;
-        self.sessions.insert(self.next_id, ManagedSession { origin, session });
+        self.sessions
+            .insert(self.next_id, ManagedSession { origin, session });
         self.live.fetch_add(1, Ordering::Relaxed);
         self.next_id
     }
@@ -262,7 +267,9 @@ impl DebugManager {
 
     /// The named session, or the machine-coded miss.
     fn get(&mut self, id: u32) -> Result<&mut ManagedSession, DebugError> {
-        self.sessions.get_mut(&id).ok_or(DebugError::NoSuchSession(id))
+        self.sessions
+            .get_mut(&id)
+            .ok_or(DebugError::NoSuchSession(id))
     }
 }
 
@@ -416,7 +423,11 @@ fn sole_or_ambiguous(ids: &[u32], line: impl Fn(u32) -> String) -> Result<u32, D
         [] => Err(DebugError::NoSessions),
         [only] => Ok(*only),
         several => Err(DebugError::AmbiguousSession(
-            several.iter().map(|&id| line(id)).collect::<Vec<_>>().join("; "),
+            several
+                .iter()
+                .map(|&id| line(id))
+                .collect::<Vec<_>>()
+                .join("; "),
         )),
     }
 }
@@ -481,7 +492,10 @@ impl DebugDispatch {
                 }
             })
             .expect("the debug worker thread spawns");
-        Self { requests, completions }
+        Self {
+            requests,
+            completions,
+        }
     }
 
     /// Queues one request. `Some` is the intake-time answer for a
@@ -502,7 +516,8 @@ impl DebugDispatch {
             Err(TrySendError::Disconnected(DebugJob { id, .. })) => Some(Response::error(
                 Some(id),
                 codes::DEBUG_SESSION,
-                "DARTQ/DEBUG/WORKER_GONE: the debug worker terminated; retry the request".to_owned(),
+                "DARTQ/DEBUG/WORKER_GONE: the debug worker terminated; retry the request"
+                    .to_owned(),
             )),
         }
     }
@@ -827,7 +842,9 @@ pub(crate) fn handle(
             let decoded =
                 serde_json::from_value::<AttachParams>(params.clone()).map_err(invalid)?;
             if decoded.ws_uri.is_empty() {
-                return Err(DebugError::InvalidParams("ws_uri must be a non-empty string".into()));
+                return Err(DebugError::InvalidParams(
+                    "ws_uri must be a non-empty string".into(),
+                ));
             }
             let session = DebugSession::attach(&decoded.ws_uri).map_err(DebugError::Vm)?;
             let id = manager.register(Origin::Attach(decoded.ws_uri), session);
@@ -896,9 +913,8 @@ pub(crate) fn handle(
                 Some(id) => {
                     let managed = manager.get(id)?;
                     let mut row = status_row(id, managed);
-                    row["breakpoints"] = Value::Array(
-                        managed.session.breakpoints().map(breakpoint_row).collect(),
-                    );
+                    row["breakpoints"] =
+                        Value::Array(managed.session.breakpoints().map(breakpoint_row).collect());
                     Ok(json!({ "v": 1, "sessions": [row], "orphans": orphans }))
                 }
             }
@@ -943,8 +959,8 @@ pub(crate) fn handle(
             Ok(breakpoint_row(&handle))
         }
         DEBUG_BREAKPOINT_REMOVE => {
-            let decoded =
-                serde_json::from_value::<BreakpointRemoveParams>(params.clone()).map_err(invalid)?;
+            let decoded = serde_json::from_value::<BreakpointRemoveParams>(params.clone())
+                .map_err(invalid)?;
             let id = select_session(manager, decoded.session_id)?;
             let managed = manager.get(id)?;
             managed
@@ -1011,8 +1027,9 @@ pub(crate) fn handle(
             // compile error in the edited sources; dartq-debug's reload
             // contract).
             let started = Instant::now();
-            let outcome =
-                managed.session.reload_sources(decoded.isolate.as_deref(), decoded.force);
+            let outcome = managed
+                .session
+                .reload_sources(decoded.isolate.as_deref(), decoded.force);
             Ok(reload_row(started, outcome))
         }
         DEBUG_RESTART => {
@@ -1039,7 +1056,10 @@ pub(crate) fn handle(
             // its generic compile-error text, so the session's tracked
             // pause answers the real condition before any round trip.
             if let Some(frame_index) = decoded.frame_index
-                && managed.session.paused_frame_exists(decoded.isolate.as_deref()) == Some(false)
+                && managed
+                    .session
+                    .paused_frame_exists(decoded.isolate.as_deref())
+                    == Some(false)
             {
                 return Err(DebugError::NoFrame(frame_index));
             }
@@ -1096,9 +1116,13 @@ pub(crate) fn handle(
             let managed = manager.get(id)?;
             managed.session.poll_events().map_err(DebugError::Vm)?;
             let batch = if stderr {
-                managed.session.stderr_since(decoded.cursor, decoded.max_bytes)
+                managed
+                    .session
+                    .stderr_since(decoded.cursor, decoded.max_bytes)
             } else {
-                managed.session.stdout_since(decoded.cursor, decoded.max_bytes)
+                managed
+                    .session
+                    .stdout_since(decoded.cursor, decoded.max_bytes)
             };
             Ok(output_row(&batch))
         }
@@ -1471,7 +1495,10 @@ mod tests {
             "condition": "x > 3"
         }))
         .expect("decodes");
-        assert_eq!(line.location.script.as_deref(), Some("package:app/main.dart"));
+        assert_eq!(
+            line.location.script.as_deref(),
+            Some("package:app/main.dart")
+        );
         assert_eq!(line.location.line, Some(12));
         assert_eq!(line.location.column, Some(5));
         assert_eq!(line.condition.as_deref(), Some("x > 3"));
@@ -1482,7 +1509,10 @@ mod tests {
             "location": { "function_id": "functions/42" }
         }))
         .expect("decodes");
-        assert_eq!(function.location.function_id.as_deref(), Some("functions/42"));
+        assert_eq!(
+            function.location.function_id.as_deref(),
+            Some("functions/42")
+        );
         assert!(function.location.script.is_none());
         assert_eq!(function.location.line, None);
 
@@ -1504,14 +1534,23 @@ mod tests {
         assert!(matches!(parse_step_option("into"), Some(StepOption::Into)));
         assert!(matches!(parse_step_option("over"), Some(StepOption::Over)));
         assert!(matches!(parse_step_option("out"), Some(StepOption::Out)));
-        assert!(parse_step_option("Into").is_none(), "the wire words are lowercase");
+        assert!(
+            parse_step_option("Into").is_none(),
+            "the wire words are lowercase"
+        );
 
         assert!(matches!(
             parse_pause_mode("uncaught"),
             Some(ExceptionPauseMode::Unhandled)
         ));
-        assert!(matches!(parse_pause_mode("all"), Some(ExceptionPauseMode::All)));
-        assert!(matches!(parse_pause_mode("none"), Some(ExceptionPauseMode::None)));
+        assert!(matches!(
+            parse_pause_mode("all"),
+            Some(ExceptionPauseMode::All)
+        ));
+        assert!(matches!(
+            parse_pause_mode("none"),
+            Some(ExceptionPauseMode::None)
+        ));
         assert!(parse_pause_mode("All").is_none());
 
         let events: EventsParams =
@@ -1635,7 +1674,10 @@ mod tests {
             value: "null".into(),
             handle: None,
         });
-        assert_eq!(leaf, json!({ "name": "flag", "value": "null", "handle": null }));
+        assert_eq!(
+            leaf,
+            json!({ "name": "flag", "value": "null", "handle": null })
+        );
 
         let handle = breakpoint_row(&BreakpointHandle {
             id: "breakpoints/3".into(),
@@ -1690,8 +1732,9 @@ mod tests {
         });
         assert_eq!(error["kind"], "error");
         assert_eq!(error["message"], "undefined name");
-        assert!(vm_object_row(&VmObject::Other(json!({ "type": "Script" })))["raw"]["type"]
-            == "Script");
+        assert!(
+            vm_object_row(&VmObject::Other(json!({ "type": "Script" })))["raw"]["type"] == "Script"
+        );
     }
 
     /// One recorded event answers its kind tag, cursor, and stream, embeds
@@ -1757,7 +1800,10 @@ mod tests {
             (DEBUG_RELOAD, json!({})),
             (DEBUG_RESTART, json!({})),
             (DEBUG_EXCEPTION_PAUSE, json!({"mode": "all"})),
-            (DEBUG_BREAKPOINT_REMOVE, json!({"breakpoint_id": "breakpoints/1"})),
+            (
+                DEBUG_BREAKPOINT_REMOVE,
+                json!({"breakpoint_id": "breakpoints/1"}),
+            ),
             (
                 DEBUG_BREAKPOINT_ADD,
                 json!({"location": {"script": "package:app/main.dart", "line": 1}}),
@@ -1802,7 +1848,8 @@ mod tests {
             3 => origin_line(&launch, id),
             other => panic!("unexpected candidate id {other}"),
         };
-        let error = sole_or_ambiguous(&[2, 3], line).expect_err("several live sessions refuse to guess");
+        let error =
+            sole_or_ambiguous(&[2, 3], line).expect_err("several live sessions refuse to guess");
         let DebugError::AmbiguousSession(candidates) = error else {
             panic!("the several case is the ambiguity listing, not {error:?}");
         };
@@ -1836,16 +1883,31 @@ mod tests {
             (DEBUG_DETACH, json!({ "session_id": 1 })),
             (DEBUG_STOP, json!({ "session_id": 1 })),
             (DEBUG_RESUME, json!({ "session_id": 1 })),
-            (DEBUG_PAUSE, json!({ "session_id": 1, "isolate": "isolates/1" })),
-            (DEBUG_SNAPSHOT, json!({ "session_id": 1, "isolate": "isolates/1" })),
+            (
+                DEBUG_PAUSE,
+                json!({ "session_id": 1, "isolate": "isolates/1" }),
+            ),
+            (
+                DEBUG_SNAPSHOT,
+                json!({ "session_id": 1, "isolate": "isolates/1" }),
+            ),
             (DEBUG_EVENTS, json!({ "session_id": 1 })),
             (DEBUG_OUTPUT, json!({ "session_id": 1, "stream": "stdout" })),
-            (DEBUG_BREAKPOINT_REMOVE, json!({ "session_id": 1, "breakpoint_id": "breakpoints/1" })),
-            (DEBUG_EXCEPTION_PAUSE, json!({ "session_id": 1, "mode": "none" })),
+            (
+                DEBUG_BREAKPOINT_REMOVE,
+                json!({ "session_id": 1, "breakpoint_id": "breakpoints/1" }),
+            ),
+            (
+                DEBUG_EXCEPTION_PAUSE,
+                json!({ "session_id": 1, "mode": "none" }),
+            ),
             (DEBUG_STEP, json!({ "session_id": 1, "option": "into" })),
             (DEBUG_RELOAD, json!({ "session_id": 1 })),
             (DEBUG_RESTART, json!({ "session_id": 1 })),
-            (DEBUG_EVALUATE, json!({ "session_id": 1, "expression": "1 + 1" })),
+            (
+                DEBUG_EVALUATE,
+                json!({ "session_id": 1, "expression": "1 + 1" }),
+            ),
         ] {
             let error = handle(&mut manager, method, &params, root)
                 .err()
@@ -1864,7 +1926,10 @@ mod tests {
         // without a line names no position).
         for (method, params) in [
             (DEBUG_LAUNCH, json!({})),
-            (DEBUG_LAUNCH, json!({ "script": "lib/main.dart", "kind": "swift" })),
+            (
+                DEBUG_LAUNCH,
+                json!({ "script": "lib/main.dart", "kind": "swift" }),
+            ),
             (
                 DEBUG_LAUNCH,
                 json!({ "script": "lib/main.dart", "kind": "flutter", "dart_defines": ["NOVALUE"] }),
@@ -1872,7 +1937,10 @@ mod tests {
             (DEBUG_STEP, json!({ "session_id": 1, "option": "sideways" })),
             (DEBUG_OUTPUT, json!({ "session_id": 1, "stream": "stdin" })),
             (DEBUG_ATTACH, json!({ "ws_uri": "" })),
-            (DEBUG_EXCEPTION_PAUSE, json!({ "session_id": 1, "mode": "sometimes" })),
+            (
+                DEBUG_EXCEPTION_PAUSE,
+                json!({ "session_id": 1, "mode": "sometimes" }),
+            ),
             (DEBUG_EVALUATE, json!({ "session_id": 1, "expression": "" })),
             (
                 DEBUG_BREAKPOINT_ADD,
@@ -1893,13 +1961,20 @@ mod tests {
     /// family both refuse it — and an empty registry releases zero.
     #[test]
     fn the_internal_shutdown_face_is_not_wire_reachable_and_releases_zero_when_empty() {
-        assert!(!is_request(DEBUG_SHUTDOWN), "the shutdown face is serve-loop only");
+        assert!(
+            !is_request(DEBUG_SHUTDOWN),
+            "the shutdown face is serve-loop only"
+        );
         assert!(!DEBUG_REQUESTS.contains(&DEBUG_SHUTDOWN));
         let live = Arc::new(AtomicUsize::new(0));
         let mut manager = DebugManager::sharing(Arc::clone(&live));
-        let answer =
-            handle(&mut manager, DEBUG_SHUTDOWN, &json!({}), Path::new("/workspace"))
-                .expect("shutdown answers");
+        let answer = handle(
+            &mut manager,
+            DEBUG_SHUTDOWN,
+            &json!({}),
+            Path::new("/workspace"),
+        )
+        .expect("shutdown answers");
         assert_eq!(answer, json!({"released": 0}));
         assert_eq!(live.load(Ordering::Relaxed), 0, "the counter stays in step");
     }
@@ -1911,7 +1986,8 @@ mod tests {
     /// manifest is marked released.
     #[test]
     fn shutdown_releases_zero_and_never_touches_orphan_manifests() {
-        let root = std::env::temp_dir().join(format!("dqd-shutdown-orphans-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("dqd-shutdown-orphans-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = manifests_dir(&root);
         write_manifest(
@@ -1928,10 +2004,17 @@ mod tests {
         let mut manager = DebugManager::sharing(Arc::new(AtomicUsize::new(0)));
         let answer =
             handle(&mut manager, DEBUG_SHUTDOWN, &json!({}), &root).expect("shutdown answers");
-        assert_eq!(answer, json!({"released": 0}), "no live session, nothing released");
+        assert_eq!(
+            answer,
+            json!({"released": 0}),
+            "no live session, nothing released"
+        );
         let trail = load_manifests(&dir);
         assert_eq!(trail.len(), 1, "the orphan trail stays");
-        assert_eq!(trail[0].1.released, None, "an untouched manifest is never marked released");
+        assert_eq!(
+            trail[0].1.released, None,
+            "an untouched manifest is never marked released"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1944,7 +2027,8 @@ mod tests {
         let (code, message) = DebugError::NoFrame(0).wire();
         assert_eq!(code, codes::DEBUG_SESSION);
         assert!(
-            message.starts_with("DARTQ/DEBUG/NO_FRAME: the paused isolate has no frame at index 0;"),
+            message
+                .starts_with("DARTQ/DEBUG/NO_FRAME: the paused isolate has no frame at index 0;"),
             "{message}"
         );
         assert!(
@@ -1962,8 +2046,14 @@ mod tests {
         let success = reload_row(Instant::now(), Ok(true));
         assert_eq!(success["ok"], json!(true));
         assert_eq!(success["isolates_reloaded"], json!(1));
-        assert!(success["ms"].as_u64().is_some(), "the wall cost rides: {success}");
-        assert!(success.get("err").is_none(), "no failure, no err: {success}");
+        assert!(
+            success["ms"].as_u64().is_some(),
+            "the wall cost rides: {success}"
+        );
+        assert!(
+            success.get("err").is_none(),
+            "no failure, no err: {success}"
+        );
 
         let reported = reload_row(Instant::now(), Ok(false));
         assert_eq!(reported["ok"], json!(false));
@@ -2018,7 +2108,10 @@ mod tests {
         let launched = std::fs::read_to_string(dir.join("1.json")).expect("manifest");
         assert!(launched.contains("\"pid\":4242"), "{launched}");
         let attached = std::fs::read_to_string(dir.join("2.json")).expect("manifest");
-        assert!(!attached.contains("pid") && !attached.contains("released"), "{attached}");
+        assert!(
+            !attached.contains("pid") && !attached.contains("released"),
+            "{attached}"
+        );
 
         // The graceful-shutdown rewrite: released true, the rest intact.
         mark_released(&dir, 1);
@@ -2032,7 +2125,11 @@ mod tests {
         write_manifest(&dir, 7, &manifest("ws://a", None));
         consume_matching(&dir, "ws://a", 7);
         let ids: Vec<u32> = load_manifests(&dir).into_iter().map(|(id, _)| id).collect();
-        assert_eq!(ids, [2, 7], "only the unrelated trail and the fresh one remain");
+        assert_eq!(
+            ids,
+            [2, 7],
+            "only the unrelated trail and the fresh one remain"
+        );
 
         // The client-requested end deletes with the session.
         delete_manifest(&dir, 7);

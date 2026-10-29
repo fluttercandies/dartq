@@ -108,8 +108,7 @@ fn report_two_file(main_source: &str, lib_source: &str) -> FileReport {
         lib_main,
         core_file,
         &[
-            "Object", "String", "int", "bool", "double", "num", "List", "Map",
-            "Iterable", "void",
+            "Object", "String", "int", "bool", "double", "num", "List", "Map", "Iterable", "void",
         ],
     );
     let graph = builder.finish();

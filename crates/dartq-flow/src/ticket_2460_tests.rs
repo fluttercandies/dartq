@@ -48,9 +48,7 @@ fn promoted_read_rows(
     let rows = facts
         .into_iter()
         .filter_map(|fact| match fact {
-            FlowFact::PromotedRead {
-                span, ty, args, ..
-            } => Some((span.range.offset, ty, args)),
+            FlowFact::PromotedRead { span, ty, args, .. } => Some((span.range.offset, ty, args)),
             _ => None,
         })
         .collect();
@@ -100,8 +98,7 @@ fn async_generator_body_keeps_promotion_across_yield() {
 /// promotion stands inside the branch and across the yield.
 #[test]
 fn sync_generator_guard_promotion_survives_yield() {
-    let source =
-        "class Foo {}\nvoid f(Foo? x) sync* {\n  if (x != null) {\n    yield x;\n  }\n}";
+    let source = "class Foo {}\nvoid f(Foo? x) sync* {\n  if (x != null) {\n    yield x;\n  }\n}";
     let (flow, rows) = promoted_read_rows(source);
     let yield_read = source.rfind('x').unwrap() as u32;
     assert_eq!(

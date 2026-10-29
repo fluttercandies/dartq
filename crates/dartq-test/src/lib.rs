@@ -31,6 +31,9 @@ pub mod select;
 pub mod stamp;
 
 pub use cache::{Cache, Refusal, Runner};
-pub use exec::{ExecConfig, ExecError, Execution, Loose, Settled, Streamed, SuiteBlock, execute, execute_flutter, execute_grouped};
+pub use exec::{
+    ExecConfig, ExecError, Execution, Loose, Settled, Streamed, SuiteBlock, execute,
+    execute_flutter, execute_grouped,
+};
 pub use group::GroupRunner;
 pub use host::{Lease, Profile, cache_dir, lease, lease_processes, lease_run, split};

@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_constructor_name.dart`
 /// — a written `.new` constructor name reports at the name token. Faces
@@ -174,8 +174,7 @@ fn check_creation(c: &mut Check<'_>) {
     let Some(_) = args else {
         return;
     };
-    if c.kind(kids[head]) != NodeKind::Identifier || c.lexeme(c.head_token(kids[head])) != "new"
-    {
+    if c.kind(kids[head]) != NodeKind::Identifier || c.lexeme(c.head_token(kids[head])) != "new" {
         return;
     }
     // The bare receiver: `Foo.new(…)`.

@@ -325,7 +325,10 @@ fn generic_argument_type_args_stay_anchored_at_list_head() {
     let bta = c.log.iter().position(|l| *l == ("begin", "type_arguments"));
     let eta = c.log.iter().position(|l| *l == ("end", "type_arguments"));
     let (Some(bta), Some(eta)) = (bta, eta) else {
-        panic!("the `<String>` group must fire type-argument events: {:?}", c.log);
+        panic!(
+            "the `<String>` group must fire type-argument events: {:?}",
+            c.log
+        );
     };
     // The ident's log index is the position the NEXT log entry takes, so
     // the group opening right after the `List` ident lands AT list_idx.

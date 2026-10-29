@@ -118,7 +118,10 @@ const ROOT_URI_MARK: &str = "\u{0}dartq:root-uri\u{0}/";
 /// when the member's pointer is unreadable.
 #[must_use]
 pub fn workspace_root(root: &Path) -> Option<PathBuf> {
-    let reference = root.join(".dart_tool").join("pub").join("workspace_ref.json");
+    let reference = root
+        .join(".dart_tool")
+        .join("pub")
+        .join("workspace_ref.json");
     let Ok(text) = std::fs::read_to_string(&reference) else {
         return Some(root.to_path_buf());
     };
@@ -131,7 +134,10 @@ pub fn workspace_root(root: &Path) -> Option<PathBuf> {
 /// The package configuration resolving the package at `root`.
 #[must_use]
 pub fn package_config_path(root: &Path) -> PathBuf {
-    workspace_root(root).unwrap_or_else(|| root.to_path_buf()).join(".dart_tool").join("package_config.json")
+    workspace_root(root)
+        .unwrap_or_else(|| root.to_path_buf())
+        .join(".dart_tool")
+        .join("package_config.json")
 }
 
 /// One path segment as `Uri.file` writes it: unreserved characters and
@@ -238,7 +244,9 @@ pub(crate) fn flutter_assets(root: &Path) -> Vec<PathBuf> {
     let mut named: Vec<String> = Vec::new();
     if let Some(serde_yaml::Value::Sequence(assets)) = flutter.get("assets") {
         for asset in assets {
-            let path = asset.as_str().or_else(|| asset.get("path").and_then(serde_yaml::Value::as_str));
+            let path = asset
+                .as_str()
+                .or_else(|| asset.get("path").and_then(serde_yaml::Value::as_str));
             if let Some(path) = path {
                 named.push(path.to_owned());
             }
@@ -264,7 +272,9 @@ pub(crate) fn flutter_assets(root: &Path) -> Vec<PathBuf> {
             // whole subtree is covered.
             let mut stack = vec![path];
             while let Some(dir) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
@@ -321,8 +331,10 @@ impl Cache {
     #[must_use]
     pub fn open(root: &Path) -> Self {
         let dir = root.join(".dart_tool").join("dartq").join("test");
-        let store = crate::host::cache_dir()
-            .map_or_else(|| dir.join("results"), |shared| shared.join("test").join("results"));
+        let store = crate::host::cache_dir().map_or_else(
+            || dir.join("results"),
+            |shared| shared.join("test").join("results"),
+        );
         Self::with_store(root, store)
     }
 
@@ -348,7 +360,11 @@ impl Cache {
     /// # Errors
     ///
     /// I/O failures reading the package tree.
-    pub fn keys(&mut self, suites: &[PathBuf], runner: Runner<'_>) -> io::Result<Vec<Option<String>>> {
+    pub fn keys(
+        &mut self,
+        suites: &[PathBuf],
+        runner: Runner<'_>,
+    ) -> io::Result<Vec<Option<String>>> {
         // A resolution-level failure refuses every suite at once, with the
         // same reason recorded for each.
         let none = |cache: &mut Self| {
@@ -394,8 +410,14 @@ impl Cache {
             .into_iter()
             .collect();
         if runner.flutter {
-            let bin = runner.bin.canonicalize().unwrap_or_else(|_| runner.bin.to_path_buf());
-            if let Some(packages) = bin.parent().and_then(Path::parent).map(|sdk| sdk.join("packages"))
+            let bin = runner
+                .bin
+                .canonicalize()
+                .unwrap_or_else(|_| runner.bin.to_path_buf());
+            if let Some(packages) = bin
+                .parent()
+                .and_then(Path::parent)
+                .map(|sdk| sdk.join("packages"))
                 && !toolchain.contains(&packages)
             {
                 toolchain.push(packages);
@@ -436,13 +458,24 @@ impl Cache {
         // `flutter test` wraps each suite in its `flutter_test_config.dart`:
         // the configs' closures join the graph.
         let wrappers: Vec<(Vec<PathBuf>, Vec<PathBuf>)> = if runner.flutter {
-            suites.iter().map(|suite| flutter_inputs(&self.root, suite)).collect()
+            suites
+                .iter()
+                .map(|suite| flutter_inputs(&self.root, suite))
+                .collect()
         } else {
             Vec::new()
         };
-        let assets = if runner.flutter { flutter_assets(&self.root) } else { Vec::new() };
+        let assets = if runner.flutter {
+            flutter_assets(&self.root)
+        } else {
+            Vec::new()
+        };
         let mut roots: Vec<PathBuf> = suites.to_vec();
-        roots.extend(wrappers.iter().flat_map(|(configs, _)| configs.iter().cloned()));
+        roots.extend(
+            wrappers
+                .iter()
+                .flat_map(|(configs, _)| configs.iter().cloned()),
+        );
         let graph = self.import_graph(&roots, &lib_dirs, &immutable)?;
         let package = package_files(&self.root)?;
         let index = PathIndex::new(&self.root, &package);
@@ -458,14 +491,30 @@ impl Cache {
             .iter()
             .enumerate()
             .map(|(index_in_run, suite)| {
-                let mut inputs = dense.suite_inputs(&self.root, suite, &package_ids, &index, &mut paths, &mut memo)?;
+                let mut inputs = dense.suite_inputs(
+                    &self.root,
+                    suite,
+                    &package_ids,
+                    &index,
+                    &mut paths,
+                    &mut memo,
+                )?;
                 if let Some((configs, absent)) = wrappers.get(index_in_run) {
                     for config in configs {
-                        let wrapped = dense.suite_inputs(&self.root, config, &package_ids, &index, &mut paths, &mut memo)?;
+                        let wrapped = dense.suite_inputs(
+                            &self.root,
+                            config,
+                            &package_ids,
+                            &index,
+                            &mut paths,
+                            &mut memo,
+                        )?;
                         inputs.ids.extend(wrapped.ids);
                         inputs.pinned |= wrapped.pinned;
                     }
-                    inputs.ids.extend(absent.iter().map(|path| paths.intern(path)));
+                    inputs
+                        .ids
+                        .extend(absent.iter().map(|path| paths.intern(path)));
                     inputs.ids.extend_from_slice(&asset_ids);
                 }
                 Ok(inputs)
@@ -665,7 +714,10 @@ impl Cache {
         let mut hasher = blake3::Hasher::new();
         hasher.update(FORMAT.as_bytes());
         hasher.update(&[u8::from(runner.flutter)]);
-        let bin = runner.bin.canonicalize().unwrap_or_else(|_| runner.bin.to_path_buf());
+        let bin = runner
+            .bin
+            .canonicalize()
+            .unwrap_or_else(|_| runner.bin.to_path_buf());
         let mut identity = toolchain_identity(&bin);
         identity.insert(0, bin);
         self.stamps.stamp(identity.clone())?;
@@ -691,7 +743,8 @@ impl Cache {
         let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
             .filter(|(name, _)| {
                 let name = name.to_string_lossy();
-                (name.starts_with("DART_") || name.starts_with("FLUTTER_")) && !env_ignored(name.as_ref(), &ignored)
+                (name.starts_with("DART_") || name.starts_with("FLUTTER_"))
+                    && !env_ignored(name.as_ref(), &ignored)
             })
             .collect();
         env.sort_unstable();
@@ -722,10 +775,12 @@ fn env_ignore_patterns() -> Vec<String> {
 /// `IGNORE_ENV_VAR` (a trailing `*` matches a prefix).
 fn env_ignored(name: &str, ignored: &[String]) -> bool {
     VOLATILE_ENV.contains(&name)
-        || ignored.iter().any(|pattern| match pattern.strip_suffix('*') {
-            Some(prefix) => name.starts_with(prefix),
-            None => name == *pattern,
-        })
+        || ignored
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == *pattern,
+            })
 }
 
 /// The environment digest shared across a `keys` call, computed on first
@@ -805,7 +860,12 @@ impl Cache {
         let manifests: FxHashSet<u32> = PACKAGE_INPUTS
             .iter()
             .map(|rel| self.root.join(rel))
-            .chain(self.root.ancestors().skip(1).map(|dir| dir.join("analysis_options.yaml")))
+            .chain(
+                self.root
+                    .ancestors()
+                    .skip(1)
+                    .map(|dir| dir.join("analysis_options.yaml")),
+            )
             .map(|path| paths.intern(&path))
             .collect();
         let mut named_by: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -813,7 +873,11 @@ impl Cache {
         // (grown as new candidates are interned), so a closure walk never
         // hashes a path.
         let mut mark: Vec<u32> = Vec::new();
-        for (generation, suite) in inputs.iter_mut().filter_map(|inputs| inputs.as_mut().ok()).enumerate() {
+        for (generation, suite) in inputs
+            .iter_mut()
+            .filter_map(|inputs| inputs.as_mut().ok())
+            .enumerate()
+        {
             let generation = u32::try_from(generation + 1).expect("suite count fits u32");
             mark.resize(paths.paths.len(), 0);
             let mut frontier: Vec<u32> = Vec::with_capacity(suite.ids.len());
@@ -829,11 +893,15 @@ impl Cache {
                 let mut next = Vec::new();
                 for id in frontier {
                     if !named_by.contains_key(&id) {
-                        let refs = self.stamps.get(&paths.paths[id as usize]).and_then(|entry| entry.refs.clone());
+                        let refs = self
+                            .stamps
+                            .get(&paths.paths[id as usize])
+                            .and_then(|entry| entry.refs.clone());
                         let mut named = Vec::new();
                         for literal in refs.iter().flat_map(|refs| refs.iter()) {
                             if !memo.contains_key(literal) {
-                                let ids = literal_inputs(&self.root, literal, package, index, paths);
+                                let ids =
+                                    literal_inputs(&self.root, literal, package, index, paths);
                                 memo.insert(literal.clone(), ids);
                             }
                             named.extend_from_slice(&memo[literal]);
@@ -902,12 +970,18 @@ impl Cache {
                                         next.push(dep.clone());
                                     }
                                 }
-                                Node::File { deps, facts: Some(facts.clone()) }
+                                Node::File {
+                                    deps,
+                                    facts: Some(facts.clone()),
+                                }
                             }
                             None => Node::Untrusted,
                         }
                     }
-                    None => Node::File { deps: Vec::new(), facts: None },
+                    None => Node::File {
+                        deps: Vec::new(),
+                        facts: None,
+                    },
                 };
                 graph.insert(path, node);
             }
@@ -951,7 +1025,11 @@ fn toolchain_identity(bin: &Path) -> Vec<PathBuf> {
 /// Resolve one directive URI of `from`: `Ok(None)` for `dart:` libraries
 /// (the toolchain key covers the SDK), `None` (outer) when the URI is
 /// outside what the cache can map.
-pub(crate) fn resolve_uri(from: &Path, uri: &str, lib_dirs: &FxHashMap<&str, &Path>) -> Option<Option<PathBuf>> {
+pub(crate) fn resolve_uri(
+    from: &Path,
+    uri: &str,
+    lib_dirs: &FxHashMap<&str, &Path>,
+) -> Option<Option<PathBuf>> {
     if uri.starts_with("dart:") {
         return Some(None);
     }
@@ -1098,7 +1176,11 @@ impl Dense {
             node_of[id as usize] = u32::try_from(node).expect("graph size fits u32");
         }
         let node_id = |path: &Path, paths: &Interner| {
-            paths.ids.get(path).and_then(|&id| node_of.get(id as usize).copied()).filter(|&n| n != u32::MAX)
+            paths
+                .ids
+                .get(path)
+                .and_then(|&id| node_of.get(id as usize).copied())
+                .filter(|&n| n != u32::MAX)
         };
         let mut deps = Vec::with_capacity(ordered.len());
         let mut facts = Vec::with_capacity(ordered.len());
@@ -1117,7 +1199,10 @@ impl Dense {
                 Tier::Dependency
             });
             match node {
-                Node::File { deps: edges, facts: file_facts } => {
+                Node::File {
+                    deps: edges,
+                    facts: file_facts,
+                } => {
                     // Every edge target was queued into the graph.
                     deps.push(edges.iter().filter_map(|dep| node_id(dep, paths)).collect());
                     facts.push(file_facts.clone());
@@ -1130,13 +1215,20 @@ impl Dense {
                 }
             }
         }
-        let mut base_inputs: Vec<u32> = PACKAGE_INPUTS.iter().map(|rel| paths.intern(&root.join(rel))).collect();
+        let mut base_inputs: Vec<u32> = PACKAGE_INPUTS
+            .iter()
+            .map(|rel| paths.intern(&root.join(rel)))
+            .collect();
         // A pub workspace member resolves through the workspace root's
         // configuration and lock.
         let workspace = workspace_root(root);
         if workspace.as_deref() != Some(root) {
             if let Some(workspace) = &workspace {
-                for rel in ["pubspec.yaml", "pubspec.lock", ".dart_tool/package_config.json"] {
+                for rel in [
+                    "pubspec.yaml",
+                    "pubspec.lock",
+                    ".dart_tool/package_config.json",
+                ] {
                     base_inputs.push(paths.intern(&workspace.join(rel)));
                 }
             }
@@ -1163,8 +1255,14 @@ impl Dense {
     /// were read (`None` for package inputs, absent candidates, and
     /// untrusted headers).
     fn env_facts(&self, id: u32) -> Option<(&FileFacts, Tier)> {
-        let node = self.node_of.get(id as usize).copied().filter(|&n| n != u32::MAX)?;
-        self.facts[node as usize].as_deref().map(|facts| (facts, self.tier[node as usize]))
+        let node = self
+            .node_of
+            .get(id as usize)
+            .copied()
+            .filter(|&n| n != u32::MAX)?;
+        self.facts[node as usize]
+            .as_deref()
+            .map(|facts| (facts, self.tier[node as usize]))
     }
 
     /// The inputs of one suite, or the [`Refusal`] its import closure met
@@ -1179,7 +1277,9 @@ impl Dense {
         paths: &mut Interner,
         memo: &mut FxHashMap<String, Vec<u32>>,
     ) -> Result<SuiteInputs, Refusal> {
-        let start = *self.node_of.get(*paths.ids.get(suite).ok_or(Refusal::SuiteUnknown)? as usize)
+        let start = *self
+            .node_of
+            .get(*paths.ids.get(suite).ok_or(Refusal::SuiteUnknown)? as usize)
             .ok_or(Refusal::SuiteUnknown)?;
         if start == u32::MAX {
             return Err(Refusal::SuiteUnknown);
@@ -1198,7 +1298,12 @@ impl Dense {
                 return Err(Refusal::Untrusted);
             }
             inputs.push(self.path_of[node]);
-            stack.extend(self.deps[node].iter().copied().filter(|&dep| !seen[dep as usize]));
+            stack.extend(
+                self.deps[node]
+                    .iter()
+                    .copied()
+                    .filter(|&dep| !seen[dep as usize]),
+            );
             let Some(facts) = &self.facts[node] else {
                 continue;
             };
@@ -1244,7 +1349,10 @@ impl Dense {
         if whole_package {
             inputs.extend_from_slice(package);
         }
-        Ok(SuiteInputs { ids: inputs, pinned })
+        Ok(SuiteInputs {
+            ids: inputs,
+            pinned,
+        })
     }
 }
 
@@ -1286,7 +1394,11 @@ impl Cache {
     /// # Errors
     ///
     /// I/O failures reading the package tree.
-    pub fn rekey(&mut self, suites: &[PathBuf], runner: Runner<'_>) -> io::Result<Vec<Option<String>>> {
+    pub fn rekey(
+        &mut self,
+        suites: &[PathBuf],
+        runner: Runner<'_>,
+    ) -> io::Result<Vec<Option<String>>> {
         self.stamps.refresh();
         self.keys(suites, runner)
     }
@@ -1316,7 +1428,13 @@ impl Cache {
     /// `file:` URI.
     fn spellings(&self) -> (String, String) {
         let root = self.root.to_string_lossy().into_owned();
-        let uri = format!("file://{}/", root.split('/').map(encode_uri_segment).collect::<Vec<_>>().join("/"));
+        let uri = format!(
+            "file://{}/",
+            root.split('/')
+                .map(encode_uri_segment)
+                .collect::<Vec<_>>()
+                .join("/")
+        );
         (format!("{root}/"), uri)
     }
 
@@ -1346,7 +1464,11 @@ impl Cache {
                 event
             })
             .collect();
-        let bytes = serde_json::to_vec(&Staged { format: FORMAT, events: &events }).map_err(io::Error::other)?;
+        let bytes = serde_json::to_vec(&Staged {
+            format: FORMAT,
+            events: &events,
+        })
+        .map_err(io::Error::other)?;
         write_atomic(&self.staging.join(format!("{key}.json")), &bytes)?;
         self.staged.insert(key.to_owned());
         Ok(())
@@ -1445,7 +1567,9 @@ fn prune(store: &Path, bound: usize) -> io::Result<()> {
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for shard in std::fs::read_dir(store)? {
         let shard = shard?.path();
-        let hidden = shard.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'));
+        let hidden = shard
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'));
         if hidden || !shard.is_dir() {
             continue;
         }
@@ -1492,10 +1616,19 @@ mod tests {
         write("lib/a.dart", "import 'b.dart';\nint a() => b();\n");
         write("lib/b.dart", "int b() => 1;\n");
         write("lib/other.dart", "int other() => 2;\n");
-        write("test/a_test.dart", "import 'package:fx/a.dart';\nvoid main() {}\n");
-        write("test/data_test.dart", "void main() { read('test/data'); }\n");
+        write(
+            "test/a_test.dart",
+            "import 'package:fx/a.dart';\nvoid main() {}\n",
+        );
+        write(
+            "test/data_test.dart",
+            "void main() { read('test/data'); }\n",
+        );
         write("test/data/input.txt", "one\n");
-        write("test/bad_test.dart", "import 'x${y}.dart';\nvoid main() {}\n");
+        write(
+            "test/bad_test.dart",
+            "import 'x${y}.dart';\nvoid main() {}\n",
+        );
         (tmp, root)
     }
 
@@ -1512,14 +1645,22 @@ mod tests {
         let (tmp, root) = fixture();
         let store = tmp.path().join("store");
         let bin = root.join("pubspec.yaml");
-        let suites = ["test/a_test.dart", "test/data_test.dart", "test/bad_test.dart"]
-            .map(|rel| root.join(rel))
-            .to_vec();
+        let suites = [
+            "test/a_test.dart",
+            "test/data_test.dart",
+            "test/bad_test.dart",
+        ]
+        .map(|rel| root.join(rel))
+        .to_vec();
         let mut cache = Cache::with_store(&root, store.clone());
         let first = cache.keys(&suites, runner(&bin)).expect("keys");
         assert!(first[0].is_some() && first[1].is_some());
         assert!(first[2].is_none(), "an interpolated URI is untrusted");
-        assert_eq!(cache.rekey(&suites, runner(&bin)).expect("keys"), first, "stable");
+        assert_eq!(
+            cache.rekey(&suites, runner(&bin)).expect("keys"),
+            first,
+            "stable"
+        );
 
         // A file outside every closure changes nothing.
         std::fs::write(root.join("lib/other.dart"), "int other() => 3;\n").expect("write");
@@ -1547,7 +1688,10 @@ mod tests {
         let verified: FxHashSet<String> = [old.clone(), key.clone()].into_iter().collect();
         cache.commit(&verified).expect("commit");
         cache.save().expect("save");
-        assert!(cache.lookup("unverified").is_none(), "an unverified entry is never published");
+        assert!(
+            cache.lookup("unverified").is_none(),
+            "an unverified entry is never published"
+        );
         let reopened = Cache::with_store(&root, store);
         assert!(reopened.lookup(&key).is_some());
         assert!(reopened.lookup(&old).is_some(), "a reverted edit replays");
@@ -1576,14 +1720,19 @@ mod tests {
         let bin = shared.path().join("dart");
         std::fs::write(&bin, "bin").expect("bin");
         let suites = |root: &Path| {
-            ["test/a_test.dart", "test/where_test.dart"].map(|rel| root.join(rel)).to_vec()
+            ["test/a_test.dart", "test/where_test.dart"]
+                .map(|rel| root.join(rel))
+                .to_vec()
         };
         let mut a = Cache::with_store(&root_a, store.clone());
         let keys_a = a.keys(&suites(&root_a), runner(&bin)).expect("keys");
         let mut b = Cache::with_store(&root_b, store.clone());
         let keys_b = b.keys(&suites(&root_b), runner(&bin)).expect("keys");
         assert_eq!(keys_a[0], keys_b[0], "same content, same key");
-        assert_ne!(keys_a[1], keys_b[1], "a location observer is pinned to its checkout");
+        assert_ne!(
+            keys_a[1], keys_b[1],
+            "a location observer is pinned to its checkout"
+        );
 
         // A `// dartq: portable` attestation lifts the pin.
         for root in [&root_a, &root_b] {
@@ -1595,14 +1744,21 @@ mod tests {
         }
         let attested_a = a.rekey(&suites(&root_a), runner(&bin)).expect("keys");
         let attested_b = b.rekey(&suites(&root_b), runner(&bin)).expect("keys");
-        assert_eq!(attested_a[1], attested_b[1], "attested portable suites share");
+        assert_eq!(
+            attested_a[1], attested_b[1],
+            "attested portable suites share"
+        );
 
         let shared_key = keys_a[0].clone().expect("key");
         a.stage(&shared_key, &[]).expect("stage");
         assert!(b.lookup(&shared_key).is_none(), "a staged entry is private");
-        a.commit(&[shared_key].into_iter().collect()).expect("commit");
+        a.commit(&[shared_key].into_iter().collect())
+            .expect("commit");
         a.save().expect("save");
-        assert!(b.lookup(keys_b[0].as_deref().expect("key")).is_some(), "shared store hit");
+        assert!(
+            b.lookup(keys_b[0].as_deref().expect("key")).is_some(),
+            "shared store hit"
+        );
 
         // Diverging content diverges the key.
         std::fs::write(root_b.join("lib/b.dart"), "int b() => 9;\n").expect("write");
@@ -1625,17 +1781,38 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
             std::fs::write(path, body).expect("write");
         };
-        write("test/manifest_test.dart", "void main() { read('test/manifest.yaml'); }\n");
+        write(
+            "test/manifest_test.dart",
+            "void main() { read('test/manifest.yaml'); }\n",
+        );
         write("test/manifest.yaml", "fixtures:\n  - test/named/a.txt\n");
         write("test/named/a.txt", "a\n");
         write("test/clock_test.dart", "void main() { DateTime.now(); }\n");
-        write("test/clock_attested_test.dart", "// dartq: deterministic\nvoid main() { DateTime.now(); }\n");
-        write("test/marked_test.dart", "import 'helper.dart';\nvoid main() {}\n");
-        write("test/helper.dart", "// dartq: no-cache shared server\nvoid help() {}\n");
+        write(
+            "test/clock_attested_test.dart",
+            "// dartq: deterministic\nvoid main() { DateTime.now(); }\n",
+        );
+        write(
+            "test/marked_test.dart",
+            "import 'helper.dart';\nvoid main() {}\n",
+        );
+        write(
+            "test/helper.dart",
+            "// dartq: no-cache shared server\nvoid help() {}\n",
+        );
         let outside = tmp.path().join("outside.txt");
         std::fs::write(&outside, "v1\n").expect("write");
-        write("test/etc_test.dart", &format!("void main() {{ File('{}'); File('/dartq/mock/path.dart'); }}\n", outside.display()));
-        write("test/dir_test.dart", &format!("void main() {{ Directory('{}'); }}\n", tmp.path().display()));
+        write(
+            "test/etc_test.dart",
+            &format!(
+                "void main() {{ File('{}'); File('/dartq/mock/path.dart'); }}\n",
+                outside.display()
+            ),
+        );
+        write(
+            "test/dir_test.dart",
+            &format!("void main() {{ Directory('{}'); }}\n", tmp.path().display()),
+        );
         let suites: Vec<PathBuf> = [
             "test/data_test.dart",
             "test/manifest_test.dart",
@@ -1652,9 +1829,18 @@ mod tests {
         let first = cache.keys(&suites, runner(&bin)).expect("keys");
         assert!(first[0].is_some() && first[1].is_some() && first[3].is_some());
         assert_eq!(first[2], None, "a wall-clock read is never cached");
-        assert_eq!(first[4], None, "a no-cache marker anywhere in the closure refuses");
-        assert!(first[5].is_some(), "absolute file paths and mock paths are inputs");
-        assert_eq!(first[6], None, "an absolute directory's listing is not keyed");
+        assert_eq!(
+            first[4], None,
+            "a no-cache marker anywhere in the closure refuses"
+        );
+        assert!(
+            first[5].is_some(),
+            "absolute file paths and mock paths are inputs"
+        );
+        assert_eq!(
+            first[6], None,
+            "an absolute directory's listing is not keyed"
+        );
 
         // Deleting the fixture changes the reader's key, not the others'.
         std::fs::remove_file(root.join("test/data/input.txt")).expect("rm");
@@ -1678,7 +1864,11 @@ mod tests {
         let named = rekey(&mut cache);
         assert_ne!(named[1], first[1]);
         std::fs::remove_file(root.join("test/named/a.txt")).expect("rm");
-        assert_ne!(rekey(&mut cache)[1], named[1], "deleting a named file invalidates");
+        assert_ne!(
+            rekey(&mut cache)[1],
+            named[1],
+            "deleting a named file invalidates"
+        );
     }
 
     /// The prune pass keeps the most recently used entries.
@@ -1692,7 +1882,8 @@ mod tests {
         for (index, age) in [30u64, 10, 20].into_iter().enumerate() {
             let path = shard.join(format!("ab{index}.json"));
             let file = std::fs::File::create(&path).expect("create");
-            file.set_modified(now - std::time::Duration::from_secs(age)).expect("mtime");
+            file.set_modified(now - std::time::Duration::from_secs(age))
+                .expect("mtime");
         }
         prune(&store, 2).expect("prune");
         assert!(!shard.join("ab0.json").exists(), "the oldest is evicted");
@@ -1706,9 +1897,18 @@ mod tests {
     #[test]
     fn portable_paths_are_root_relative() {
         let root = Path::new("/ws/pkg");
-        assert_eq!(portable(root, Path::new("/ws/pkg/test/a.dart")), Path::new("test/a.dart"));
-        assert_eq!(portable(root, Path::new("/ws/other/b.dart")), Path::new("../other/b.dart"));
-        assert_eq!(portable(root, Path::new("/ws/analysis_options.yaml")), Path::new("../analysis_options.yaml"));
+        assert_eq!(
+            portable(root, Path::new("/ws/pkg/test/a.dart")),
+            Path::new("test/a.dart")
+        );
+        assert_eq!(
+            portable(root, Path::new("/ws/other/b.dart")),
+            Path::new("../other/b.dart")
+        );
+        assert_eq!(
+            portable(root, Path::new("/ws/analysis_options.yaml")),
+            Path::new("../analysis_options.yaml")
+        );
     }
 
     #[test]
@@ -1753,16 +1953,28 @@ mod tests {
         let verified: FxHashSet<String> = [key.clone()].into_iter().collect();
         a.commit(&verified).expect("commit");
 
-        let from_b = Cache::with_store(&root_b, store.clone()).lookup(&key).expect("hit");
-        let text = from_b.iter().map(|event| event.to_line()).collect::<String>();
+        let from_b = Cache::with_store(&root_b, store.clone())
+            .lookup(&key)
+            .expect("hit");
+        let text = from_b
+            .iter()
+            .map(|event| event.to_line())
+            .collect::<String>();
         assert!(text.contains(&format!("{}/test/a_test.dart", root_b.display())));
         assert!(text.contains(&format!("file://{}/test/a_test.dart", root_b.display())));
         let staged_root = root_a.to_string_lossy();
-        assert!(!text.contains(staged_root.as_ref()), "the staging root never leaks");
+        assert!(
+            !text.contains(staged_root.as_ref()),
+            "the staging root never leaks"
+        );
 
         let from_a = Cache::with_store(&root_a, store).lookup(&key).expect("hit");
         let own = format!("{}/test/a_test.dart", root_a.display());
-        assert!(from_a.iter().any(|event| event.str_at(&["suite", "path"]) == Some(own.as_str())));
+        assert!(
+            from_a
+                .iter()
+                .any(|event| event.str_at(&["suite", "path"]) == Some(own.as_str()))
+        );
         drop((tmp_a, tmp_b));
     }
 
@@ -1778,21 +1990,33 @@ mod tests {
         };
         write("ws/.dart_tool/package_config.json", "{}");
         // The pointer resolves from its `.dart_tool/pub` directory.
-        write("ws/pkg/a/.dart_tool/pub/workspace_ref.json", r#"{"workspaceRoot": "../../../.."}"#);
+        write(
+            "ws/pkg/a/.dart_tool/pub/workspace_ref.json",
+            r#"{"workspaceRoot": "../../../.."}"#,
+        );
         let member = tmp.path().join("ws/pkg/a");
         assert_eq!(workspace_root(&member), Some(tmp.path().join("ws")));
-        assert_eq!(package_config_path(&member), tmp.path().join("ws/.dart_tool/package_config.json"));
+        assert_eq!(
+            package_config_path(&member),
+            tmp.path().join("ws/.dart_tool/package_config.json")
+        );
         // A package without a pointer is its own workspace.
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).expect("dir");
         assert_eq!(workspace_root(&plain), Some(plain.clone()));
-        assert_eq!(package_config_path(&plain), plain.join(".dart_tool/package_config.json"));
+        assert_eq!(
+            package_config_path(&plain),
+            plain.join(".dart_tool/package_config.json")
+        );
         // An unreadable pointer names nothing; the member's own
         // configuration is the fallback.
         write("ws/pkg/b/.dart_tool/pub/workspace_ref.json", "not json");
         let broken = tmp.path().join("ws/pkg/b");
         assert_eq!(workspace_root(&broken), None);
-        assert_eq!(package_config_path(&broken), broken.join(".dart_tool/package_config.json"));
+        assert_eq!(
+            package_config_path(&broken),
+            broken.join(".dart_tool/package_config.json")
+        );
     }
 
     /// `flutter test` wraps the nearest `flutter_test_config.dart` (every
@@ -1861,9 +2085,25 @@ mod tests {
         let mut cache = Cache::with_store(&root, tmp.path().join("store"));
         let plain = cache.keys(&suites, runner(&bin)).expect("keys");
         let named = cache
-            .keys(&suites, Runner { bin: &bin, args: &["--name=x".to_owned()], flutter: false })
+            .keys(
+                &suites,
+                Runner {
+                    bin: &bin,
+                    args: &["--name=x".to_owned()],
+                    flutter: false,
+                },
+            )
             .expect("keys");
-        let flutter = cache.keys(&suites, Runner { bin: &bin, args: &[], flutter: true }).expect("keys");
+        let flutter = cache
+            .keys(
+                &suites,
+                Runner {
+                    bin: &bin,
+                    args: &[],
+                    flutter: true,
+                },
+            )
+            .expect("keys");
         assert_ne!(plain[0], named[0], "arguments are inputs");
         assert_ne!(plain[0], flutter[0], "the tool is an input");
     }
@@ -1878,10 +2118,21 @@ mod tests {
         cache.stage("deadbeef", &[]).expect("stage");
         assert!(cache.staging.is_dir());
         drop(cache);
-        assert!(!store.join(format!(".staging-{}", std::process::id())).is_dir());
+        assert!(
+            !store
+                .join(format!(".staging-{}", std::process::id()))
+                .is_dir()
+        );
         std::fs::create_dir_all(store.join("ab")).expect("dir");
-        std::fs::write(store.join("ab/abcd.json"), br#"{"format":"dartq-test-cache-v0","events":[]}"#).expect("write");
-        assert!(Cache::with_store(&root, store).lookup("abcd").is_none(), "a foreign format never replays");
+        std::fs::write(
+            store.join("ab/abcd.json"),
+            br#"{"format":"dartq-test-cache-v0","events":[]}"#,
+        )
+        .expect("write");
+        assert!(
+            Cache::with_store(&root, store).lookup("abcd").is_none(),
+            "a foreign format never replays"
+        );
     }
 
     /// The environment enters a key only through the names the suite's
@@ -1905,9 +2156,13 @@ mod tests {
             "void main() { for (final e in Platform.environment.entries) {} }\n",
         )
         .expect("write");
-        let suites = ["test/a_test.dart", "test/env_test.dart", "test/opaque_test.dart"]
-            .map(|rel| root.join(rel))
-            .to_vec();
+        let suites = [
+            "test/a_test.dart",
+            "test/env_test.dart",
+            "test/opaque_test.dart",
+        ]
+        .map(|rel| root.join(rel))
+        .to_vec();
         let mut cache = Cache::with_store(&root, store);
         unsafe {
             std::env::set_var("dartq_probe_read", "one");
@@ -1915,21 +2170,35 @@ mod tests {
         }
         let first = cache.keys(&suites, runner(&bin)).expect("keys");
         assert!(first[0].is_some() && first[1].is_some());
-        assert!(first[2].is_none(), "an unnamable environment read is never cached");
+        assert!(
+            first[2].is_none(),
+            "an unnamable environment read is never cached"
+        );
 
         // An ambient variable no closure reads changes nothing.
-        unsafe { std::env::set_var("dartq_probe_ambient", "y"); }
+        unsafe {
+            std::env::set_var("dartq_probe_ambient", "y");
+        }
         assert_eq!(cache.rekey(&suites, runner(&bin)).expect("keys"), first);
 
         // The read variable's flip re-keys only its reader.
-        unsafe { std::env::set_var("dartq_probe_read", "two"); }
+        unsafe {
+            std::env::set_var("dartq_probe_read", "two");
+        }
         let second = cache.rekey(&suites, runner(&bin)).expect("keys");
         assert_eq!(second[0], first[0], "a suite without the read is untouched");
         assert_ne!(second[1], first[1], "the reader re-keys");
         // Removing the variable re-keys again: presence is part of the key.
-        unsafe { std::env::remove_var("dartq_probe_read"); }
-        assert_ne!(cache.rekey(&suites, runner(&bin)).expect("keys")[1], second[1]);
-        unsafe { std::env::remove_var("dartq_probe_ambient"); }
+        unsafe {
+            std::env::remove_var("dartq_probe_read");
+        }
+        assert_ne!(
+            cache.rekey(&suites, runner(&bin)).expect("keys")[1],
+            second[1]
+        );
+        unsafe {
+            std::env::remove_var("dartq_probe_ambient");
+        }
     }
 
     /// A dependency package's unnamable environment read no longer refuses:
@@ -1968,8 +2237,14 @@ mod tests {
             &dep.join("lib/dep.dart"),
             "import 'dart:io';\nMap<String, String> env() => Platform.environment;\n",
         );
-        write(&root.join("lib/helper.dart"), "import 'dart:io';\nString? probe() => Platform.environment['dartq_probe_dep'];\n");
-        write(&root.join("test/dep_test.dart"), "import 'package:dep/dep.dart';\nvoid main() {}\n");
+        write(
+            &root.join("lib/helper.dart"),
+            "import 'dart:io';\nString? probe() => Platform.environment['dartq_probe_dep'];\n",
+        );
+        write(
+            &root.join("test/dep_test.dart"),
+            "import 'package:dep/dep.dart';\nvoid main() {}\n",
+        );
         write(
             &root.join("test/mixed_test.dart"),
             "import 'package:dep/dep.dart';\nimport 'package:fx/helper.dart';\nvoid main() {}\n",
@@ -1978,26 +2253,39 @@ mod tests {
             &root.join("test/own_test.dart"),
             "import 'dart:io';\nvoid main() { final e = Platform.environment; }\n",
         );
-        let suites = ["test/dep_test.dart", "test/mixed_test.dart", "test/own_test.dart"]
-            .map(|rel| root.join(rel))
-            .to_vec();
+        let suites = [
+            "test/dep_test.dart",
+            "test/mixed_test.dart",
+            "test/own_test.dart",
+        ]
+        .map(|rel| root.join(rel))
+        .to_vec();
         let bin = root.join("pubspec.yaml");
         let mut cache = Cache::with_store(&root, tmp.path().join("store"));
-        unsafe { std::env::set_var("dartq_probe_dep", "one"); }
+        unsafe {
+            std::env::set_var("dartq_probe_dep", "one");
+        }
         let first = cache.keys(&suites, runner(&bin)).expect("keys");
         assert!(first[0].is_some(), "a dependency's whole-map read keys");
         assert!(first[1].is_some(), "a mixed own/dependency closure keys");
-        assert!(first[2].is_none(), "the suite's own whole-map read still refuses");
+        assert!(
+            first[2].is_none(),
+            "the suite's own whole-map read still refuses"
+        );
 
         // A changed variable re-keys — the dependency's read can observe
         // it, so the suite runs again. (No "identical environment replays"
         // assertion: sibling tests mutate the process environment in
         // parallel, and the digest covers it all.)
-        unsafe { std::env::set_var("dartq_probe_dep", "two"); }
+        unsafe {
+            std::env::set_var("dartq_probe_dep", "two");
+        }
         let second = cache.rekey(&suites, runner(&bin)).expect("keys");
         assert_ne!(second[0], first[0], "the digest tracks the environment");
         assert_ne!(second[1], first[1], "the mixed suite re-keys too");
-        unsafe { std::env::remove_var("dartq_probe_dep"); }
+        unsafe {
+            std::env::remove_var("dartq_probe_dep");
+        }
     }
 
     /// The base key's environment half is the toolchain's alone: IDE and
@@ -2086,7 +2374,11 @@ mod tests {
         let suites = ["test/a_test.dart", "test/local_test.dart"]
             .map(|rel| root.join(rel))
             .to_vec();
-        let runner = Runner { bin: &bin, args: &[], flutter: true };
+        let runner = Runner {
+            bin: &bin,
+            args: &[],
+            flutter: true,
+        };
         let store = tmp.path().join("store");
         let mut cache = Cache::with_store(&root, store.clone());
         let keys = cache.keys(&suites, runner).expect("keys");
@@ -2104,7 +2396,11 @@ mod tests {
         let key = keys[0].clone().expect("key");
         cache.stage(&key, &[]).expect("stage");
         let after = cache.rekey(&suites, runner).expect("rekey");
-        assert_eq!(after[0].as_deref(), Some(key.as_str()), "stable across a run");
+        assert_eq!(
+            after[0].as_deref(),
+            Some(key.as_str()),
+            "stable across a run"
+        );
         let verified: FxHashSet<String> = [key.clone()].into_iter().collect();
         cache.commit(&verified).expect("commit");
         cache.save().expect("save");

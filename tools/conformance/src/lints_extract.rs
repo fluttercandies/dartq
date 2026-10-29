@@ -13,12 +13,10 @@
 //! same way the official `TestCode.parse` produces the analyzed text.
 
 use crate::case::Case;
-use crate::dart::{
-    find_call, is_ident_start, match_paren, parse_args, parse_string_expression,
-};
+use crate::dart::{find_call, is_ident_start, match_paren, parse_args, parse_string_expression};
 use crate::markers::camel_to_snake;
 use crate::setup;
-use crate::structure::{scan_declarations, Declaration};
+use crate::structure::{Declaration, scan_declarations};
 
 /// The official test package layout (upstream `workspaceRootPath` etc.).
 const WORKSPACE_ROOT: &str = "/home";
@@ -164,10 +162,7 @@ fn base_path_env() -> Vec<(String, String)> {
             "testPackagePubspecPath".to_string(),
             format!("{TEST_ROOT}/pubspec.yaml"),
         ),
-        (
-            "testFilePath".to_string(),
-            format!("{TEST_LIB}/test.dart"),
-        ),
+        ("testFilePath".to_string(), format!("{TEST_LIB}/test.dart")),
     ]
 }
 
@@ -189,7 +184,9 @@ fn class_env(content: &str, decl: &Declaration) -> Env {
             "experiments" if experiments.is_none() => {
                 experiments = setup::string_list(expr);
             }
-            "addMetaPackageDep" | "addFlutterPackageDep" | "addFixnumPackageDep"
+            "addMetaPackageDep"
+            | "addFlutterPackageDep"
+            | "addFixnumPackageDep"
             | "addTestReflectiveLoaderPackageDep"
                 if expr == "true" =>
             {
@@ -247,21 +244,33 @@ fn class_env(content: &str, decl: &Declaration) -> Env {
 }
 
 fn options_for(env: &Env, rule: &str) -> String {
-    setup::analysis_options_content(&env.experiments, &[rule.to_string()], false, false, false, &[], &[])
+    setup::analysis_options_content(
+        &env.experiments,
+        &[rule.to_string()],
+        false,
+        false,
+        false,
+        &[],
+        &[],
+    )
 }
 
-fn extract_declaration(rule: &str, rel: &str, content: &str, decl: &Declaration, out: &mut LintExtraction) {
+fn extract_declaration(
+    rule: &str,
+    rel: &str,
+    content: &str,
+    decl: &Declaration,
+    out: &mut LintExtraction,
+) {
     let mut env = class_env(content, decl);
     if let Some(set_up) = decl.members.iter().find(|m| m.name == "setUp") {
         if let Some((start, end)) = set_up.body {
-            interpret_calls(
-                &content[start..end],
-                &mut env,
-                &mut |reason| out.skips.push(Skip {
+            interpret_calls(&content[start..end], &mut env, &mut |reason| {
+                out.skips.push(Skip {
                     id: format!("lints/{rule}/{}", decl.name),
                     reason,
-                }),
-            );
+                })
+            });
         }
     }
     for member in &decl.members {
@@ -271,7 +280,15 @@ fn extract_declaration(rule: &str, rel: &str, content: &str, decl: &Declaration,
         if member.name == "setUp" {
             continue;
         }
-        extract_method(rule, rel, &decl.name, &member.name, &content[start..end], &env, out);
+        extract_method(
+            rule,
+            rel,
+            &decl.name,
+            &member.name,
+            &content[start..end],
+            &env,
+            out,
+        );
     }
 }
 
@@ -396,9 +413,7 @@ fn interpret_calls(body: &str, env: &mut Env, note: &mut dyn FnMut(String)) {
         };
         let args = parse_args(&body[open + 1..close]);
         match name.as_str() {
-            "newFile" | "newPubspecYamlFile" => {
-                interpret_new_file(&body[..open], env, &args, note)
-            }
+            "newFile" | "newPubspecYamlFile" => interpret_new_file(&body[..open], env, &args, note),
             "newPackage" => interpret_new_package(body, open, close, env, note),
             "add" => interpret_config_add(&body[..open], env, &args),
             "writeTestPackageConfig" => {
@@ -437,11 +452,13 @@ fn same_as_default(arg: &crate::dart::Arg) -> bool {
         return false;
     };
     inner[close..].trim().is_empty()
-        && parse_args(&inner[..close]).into_iter().all(|a| match a.label.as_deref() {
-            Some("rules") => matches!(a.expr.trim(), "lintRule" | "rule" | "analysisRule"),
-            Some("experiments") => a.expr.trim() == "experiments",
-            _ => false,
-        })
+        && parse_args(&inner[..close])
+            .into_iter()
+            .all(|a| match a.label.as_deref() {
+                Some("rules") => matches!(a.expr.trim(), "lintRule" | "rule" | "analysisRule"),
+                Some("experiments") => a.expr.trim() == "experiments",
+                _ => false,
+            })
 }
 
 /// `<builder>.add(name: <pkg>, rootFolder: ...)` on a
@@ -531,8 +548,7 @@ fn interpret_new_package(
         match (args.first(), content) {
             (Some(local), Some(content)) => {
                 if let Some(local) = literal_arg(&local.expr) {
-                    env.files
-                        .push((format!("package:{name}/{local}"), content));
+                    env.files.push((format!("package:{name}/{local}"), content));
                 } else {
                     note("companion_path".into());
                 }
@@ -611,7 +627,11 @@ fn extract_method(
                 }
                 Sink::HookName | Sink::LibName => {
                     let name = args.first().and_then(|a| literal_arg(&a.expr))?;
-                    let prefix = if sink == Sink::HookName { "hook" } else { "lib" };
+                    let prefix = if sink == Sink::HookName {
+                        "hook"
+                    } else {
+                        "lib"
+                    };
                     Some((format!("{prefix}/{name}"), String::new(), Vec::new()))
                 }
                 Sink::FromPath => {
@@ -764,7 +784,9 @@ fn scan_numbered(rest: &str, open: &str, close: &str) -> Option<usize> {
         return None;
     }
     let after_digits = &after_open[digits..];
-    after_digits.starts_with(close).then(|| open.len() + digits + close.len())
+    after_digits
+        .starts_with(close)
+        .then(|| open.len() + digits + close.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -814,12 +836,17 @@ fn parse_rule_entries(yaml: &str) -> Vec<RuleEntry> {
                 break;
             }
             if fi == 4 {
-                let (name, value) = field.trim_start().split_once(':').unwrap_or((field.trim_start(), ""));
+                let (name, value) = field
+                    .trim_start()
+                    .split_once(':')
+                    .unwrap_or((field.trim_start(), ""));
                 let value = value.trim();
                 match name {
                     "sharedName" => entry.shared_name = Some(unquote(value)),
                     "removedIn" => entry.removed_in = Some(unquote(value)),
-                    "documentation" | "deprecatedDetails" if value == "|-" || value == "|" || value == "|+" => {
+                    "documentation" | "deprecatedDetails"
+                        if value == "|-" || value == "|" || value == "|+" =>
+                    {
                         let (block, next) = read_block(&lines, i + 1, 4);
                         if name == "documentation" {
                             entry.documentation = Some(block);
@@ -842,7 +869,9 @@ fn parse_rule_entries(yaml: &str) -> Vec<RuleEntry> {
 fn unquote(value: &str) -> String {
     let value = value.trim();
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        value[1..value.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+        value[1..value.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
     } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
         value[1..value.len() - 1].replace("''", "'")
     } else {
@@ -1209,16 +1238,17 @@ void f() {
         let out = extract_file("use_test_throws_matchers_test.dart", TEST_API_FILE);
         assert_eq!(out.cases.len(), 1, "{:?}", out.skips);
         let case = &out.cases[0];
-        assert_eq!(case.id, "lints/use_test_throws_matchers/UseTestThrowsMatchersTest/test_failInTry#0");
+        assert_eq!(
+            case.id,
+            "lints/use_test_throws_matchers/UseTestThrowsMatchersTest/test_failInTry#0"
+        );
         assert_eq!(case.aux_packages, vec!["test_api"]);
         // The fixture files come from the mocks tree; the unmodeled companion
         // paths record advisory skips and produce no sections.
         assert_eq!(case.files.len(), 1);
         assert_eq!(case.files[0].0, "lib/test.dart");
         assert!(
-            out.skips
-                .iter()
-                .all(|s| s.reason == "companion_path"),
+            out.skips.iter().all(|s| s.reason == "companion_path"),
             "{:?}",
             out.skips
         );
@@ -1235,7 +1265,7 @@ void f() {
         // Numbers above 9 and multi-digit.
         assert_eq!(strip_markup("/*[12*/xy/*12]*/"), "xy");
         // The scan does not respect strings (official behavior).
-        assert_eq!(strip_markup("var s = '^';"), "var s = '';") ;
+        assert_eq!(strip_markup("var s = '^';"), "var s = '';");
     }
 
     #[test]
@@ -1271,17 +1301,22 @@ void f() {}
         let out = extract_file("avoid_print_test.dart", src);
         assert_eq!(out.cases.len(), 2, "{:?}", out.skips);
         let first = &out.cases[0];
-        assert_eq!(first.id, "lints/avoid_print/AvoidPrintTest/test_directCall#0");
+        assert_eq!(
+            first.id,
+            "lints/avoid_print/AvoidPrintTest/test_directCall#0"
+        );
         assert_eq!(first.language.as_deref(), Some("2.19"));
         assert_eq!(first.packages, vec!["flutter"]);
         assert_eq!(first.files[0].0, "lib/test.dart");
         // The raw-string literal keeps its leading newline, as analyzed.
         assert_eq!(first.files[0].1, "\nvoid f() {\n  print('ha');\n}\n");
-        assert!(first
-            .options
-            .as_ref()
-            .expect("options")
-            .contains("    - avoid_print\n"));
+        assert!(
+            first
+                .options
+                .as_ref()
+                .expect("options")
+                .contains("    - avoid_print\n")
+        );
 
         let second = &out.cases[1];
         assert_eq!(second.files.len(), 2);
@@ -1377,18 +1412,31 @@ void main() { [!print!]('x'); }
         assert_eq!(out.cases.len(), 4, "{:?}", out.skips);
         // All BAD snippets first (documentation, then deprecatedDetails),
         // then all GOOD snippets in the same order.
-        assert_eq!(out.cases[0].id, "lints/always_declare_return_types/doc_bad_0");
+        assert_eq!(
+            out.cases[0].id,
+            "lints/always_declare_return_types/doc_bad_0"
+        );
         assert_eq!(out.cases[0].files[0].1, "f() {}\n");
-        assert_eq!(out.cases[1].id, "lints/always_declare_return_types/doc_bad_1");
+        assert_eq!(
+            out.cases[1].id,
+            "lints/always_declare_return_types/doc_bad_1"
+        );
         assert_eq!(out.cases[1].files[0].1, "main() { }\n");
-        assert_eq!(out.cases[2].id, "lints/always_declare_return_types/doc_good_0");
-        assert_eq!(out.cases[3].id, "lints/always_declare_return_types/doc_good_1");
+        assert_eq!(
+            out.cases[2].id,
+            "lints/always_declare_return_types/doc_good_0"
+        );
+        assert_eq!(
+            out.cases[3].id,
+            "lints/always_declare_return_types/doc_good_1"
+        );
         for case in &out.cases {
-            assert!(case
-                .options
-                .as_ref()
-                .expect("options")
-                .contains("    - always_declare_return_types\n"));
+            assert!(
+                case.options
+                    .as_ref()
+                    .expect("options")
+                    .contains("    - always_declare_return_types\n")
+            );
         }
     }
 

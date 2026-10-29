@@ -6,7 +6,7 @@
 
 use crate::materialize::{self, LoadedCase};
 use crate::registry::Registry;
-use crate::rows::{diff_sorted, Expected, Row};
+use crate::rows::{Expected, Row, diff_sorted};
 use crate::runner::{self, Runner};
 use crate::status::{self, Comparison};
 use std::collections::{BTreeMap, BTreeSet};
@@ -79,7 +79,12 @@ pub fn run_command(args: &RunArgs) -> i32 {
     let runnable: Vec<usize> = selected
         .iter()
         .copied()
-        .filter(|i| !matches!(expected.get(&all_cases[*i].case.id), Some(Expected::Crash) | None))
+        .filter(|i| {
+            !matches!(
+                expected.get(&all_cases[*i].case.id),
+                Some(Expected::Crash) | None
+            )
+        })
         .collect();
     let runner = Runner {
         cases: &all_cases,
@@ -89,7 +94,8 @@ pub fn run_command(args: &RunArgs) -> i32 {
         mocks_root: args.mocks_root.clone(),
         timeout: crate::watchdog::CHUNK_TIMEOUT,
     };
-    let build = |chunk_dir: &Path| runner::dartq_command(&args.dartq_bin, args.sdk.as_deref(), chunk_dir);
+    let build =
+        |chunk_dir: &Path| runner::dartq_command(&args.dartq_bin, args.sdk.as_deref(), chunk_dir);
     let analysis = runner.analyze(&runnable, &build);
 
     let mut actual: BTreeMap<String, Vec<Row>> = BTreeMap::new();
@@ -123,9 +129,9 @@ pub fn run_command(args: &RunArgs) -> i32 {
             eprintln!("error: cannot write {}: {e}", args.status_path.display());
             return 2;
         }
-        let (pass, fail, crash): (u32, u32, u32) = stats
-            .iter()
-            .fold((0, 0, 0), |(p, f, c), s| (p + s.pass, f + s.fail, c + s.crash));
+        let (pass, fail, crash): (u32, u32, u32) = stats.iter().fold((0, 0, 0), |(p, f, c), s| {
+            (p + s.pass, f + s.fail, c + s.crash)
+        });
         let greens = stats.iter().filter(|s| s.state == "green").count();
         let covered = stats.iter().filter(|s| s.state != "uncovered").count();
         let _ = writeln!(
@@ -175,7 +181,7 @@ fn verdict_for(
                 missing: "<no expected rows>".to_string(),
                 extra: String::new(),
                 key_match: false,
-            }
+            };
         }
     };
     let act_rows = actual.get(id).map(Vec::as_slice).unwrap_or(&[]);
@@ -191,8 +197,16 @@ fn verdict_for(
     let key_match = key_set(exp_rows) == key_set(act_rows);
     CaseVerdict {
         verdict: "fail",
-        missing: missing.iter().map(|r| r.text()).collect::<Vec<_>>().join(";;"),
-        extra: extra.iter().map(|r| r.text()).collect::<Vec<_>>().join(";;"),
+        missing: missing
+            .iter()
+            .map(|r| r.text())
+            .collect::<Vec<_>>()
+            .join(";;"),
+        extra: extra
+            .iter()
+            .map(|r| r.text())
+            .collect::<Vec<_>>()
+            .join(";;"),
         key_match,
     }
 }

@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT};
 
 /// Official: `pkg/linter/lib/src/rules/var_with_no_type_annotation.dart`
 /// — a parameter whose storage keyword is `var` with no type reports at
@@ -47,8 +47,7 @@ fn check(c: &mut Check<'_>) {
         if receiver != NONE_TOKEN && c.lexeme(receiver) == "super" {
             continue;
         }
-        let Some(keyword) = storage_keyword(c, param).filter(|kw| c.lexeme(*kw) == "var")
-        else {
+        let Some(keyword) = storage_keyword(c, param).filter(|kw| c.lexeme(*kw) == "var") else {
             continue;
         };
         if c.collect_direct(param).into_iter().any(|kid| {

@@ -1,7 +1,7 @@
 use crate::rules::last_child;
 
 use super::same_file::{BindingScope, binding};
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_double_and_int_checks.dart:28-59`
 /// — an else-if chain whose branches test the same simple identifier —
@@ -198,8 +198,7 @@ fn prefix_admits(c: &Check<'_>, prefix: &str, name: &str) -> bool {
                 continue;
             };
             let span = c.byte_span(uri);
-            let text =
-                c.unit.source[span.start..span.end].trim_matches(|q| q == '\'' || q == '"');
+            let text = c.unit.source[span.start..span.end].trim_matches(|q| q == '\'' || q == '"');
             if text != "dart:core" {
                 continue;
             }

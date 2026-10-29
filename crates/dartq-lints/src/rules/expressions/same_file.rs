@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, query_site, slice};
+use super::{Check, NodeKind, PayloadField, query_site, slice};
 
 /// `ModSet` member family: static is bit 3 (`mod_bits` in
 /// the bridge; [`dartq_ast::mod_flags`] reads the header bits back).
@@ -501,8 +501,7 @@ pub(crate) fn declares_type(c: &Check<'_>, name: &str) -> bool {
 /// (`(List<int>)`) from a same-file generic tear-off (`(fn<int>)`).
 #[must_use]
 pub(crate) fn declares_value(c: &Check<'_>, use_node: u32, name: &str) -> bool {
-    binding(c, use_node, name).is_some()
-        || scan(c).values.iter().any(|&tok| c.lexeme(tok) == name)
+    binding(c, use_node, name).is_some() || scan(c).values.iter().any(|&tok| c.lexeme(tok) == name)
 }
 
 /// The resolve-then-judge verdict for the paren's trailing accessor
@@ -684,12 +683,7 @@ fn body_declares_member(c: &Check<'_>, row: u32, member: &str) -> bool {
                   present-untyped vs present-typed; callers branch on the \
                   outer layer first"
 )]
-fn block_binding(
-    c: &Check<'_>,
-    block: u32,
-    use_start: usize,
-    name: &str,
-) -> Option<Option<u32>> {
+fn block_binding(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Option<Option<u32>> {
     let ctx = dartq_parser::IdentifierContext::LocalVariableDeclaration as u32;
     let mut written: Option<u32> = None;
     for kid in c.collect_direct(block) {
@@ -872,21 +866,26 @@ fn class_decl(c: &Check<'_>, top: u32, inner: u32) -> Option<ClassDecl> {
             c.field(inner, PayloadField::ExtendsKeyword).unwrap_or(none),
             (
                 c.field(inner, PayloadField::WithKeyword).unwrap_or(none),
-                c.field(inner, PayloadField::ImplementsKeyword).unwrap_or(none),
+                c.field(inner, PayloadField::ImplementsKeyword)
+                    .unwrap_or(none),
             ),
         ),
         NodeKind::NamedMixinApplication => (
             c.field(inner, PayloadField::Equals).unwrap_or(none),
             (
                 c.field(inner, PayloadField::WithKeyword).unwrap_or(none),
-                c.field(inner, PayloadField::ImplementsKeyword).unwrap_or(none),
+                c.field(inner, PayloadField::ImplementsKeyword)
+                    .unwrap_or(none),
             ),
         ),
         // `mixin M on A with B`: the on-clause is a superclass
         // constraint; the with-clause an interface face.
         NodeKind::MixinDeclaration => (
             c.field(inner, PayloadField::OnKeyword).unwrap_or(none),
-            (c.field(inner, PayloadField::WithKeyword).unwrap_or(none), none),
+            (
+                c.field(inner, PayloadField::WithKeyword).unwrap_or(none),
+                none,
+            ),
         ),
         _ => return None,
     };

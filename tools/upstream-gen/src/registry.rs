@@ -301,7 +301,12 @@ pub fn fold(entries: &[Entry], classes: &BTreeMap<String, String>) -> Result<Vec
 /// the `SDK pin: <revision> (<checkout stamp>)` line `--check` verifies;
 /// `checkout_stamp` spells the checkout identity in the source prose.
 #[must_use]
-pub fn render_tsv(rows: &[Row], registry_entries: usize, pin_line: &str, checkout_stamp: &str) -> String {
+pub fn render_tsv(
+    rows: &[Row],
+    registry_entries: usize,
+    pin_line: &str,
+    checkout_stamp: &str,
+) -> String {
     let mut out = String::with_capacity(4096 + rows.len() * 128);
     let _ = writeln!(
         out,
@@ -312,9 +317,15 @@ pub fn render_tsv(rows: &[Row], registry_entries: usize, pin_line: &str, checkou
         "#   DARTQ_SDK_SRC=<dart-sdk-tree> cargo run -p upstream-gen --bin analyzer-codes-gen\n",
     );
     out.push_str("# Content pin: crates/dartq-diagnostics/tests/analyzer_codes_tsv.rs (blake3).\n");
-    let _ = writeln!(out, "# {pin_line} — conformance/pin.toml (verified by --check).");
+    let _ = writeln!(
+        out,
+        "# {pin_line} — conformance/pin.toml (verified by --check)."
+    );
     out.push_str("# Source: pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart of the pinned\n");
-    let _ = writeln!(out, "#   SDK checkout ({checkout_stamp}), generated upstream from");
+    let _ = writeln!(
+        out,
+        "#   SDK checkout ({checkout_stamp}), generated upstream from"
+    );
     out.push_str("#   pkg/analyzer/messages.yaml (class groups) plus\n");
     out.push_str("#   pkg/_fe_analyzer_shared/messages.yaml (shared parser codes; their\n");
     out.push_str("#   class column spells `_fe_analyzer_shared`).\n");

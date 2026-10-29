@@ -2,7 +2,7 @@ use core::ops::Range;
 
 use dartq_ast::NodeKind;
 
-use super::{PayloadField, Check, RuleSpec};
+use super::{Check, PayloadField, RuleSpec};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/invalid_case_patterns.dart` — a legacy
@@ -27,11 +27,8 @@ use super::{PayloadField, Check, RuleSpec};
 /// implicit-const constructor-call face (`C()` where the constructor
 /// is const, :78-81) needs constructor resolution and under-reports.
 /// Message: `diagnostic.g.dart` `invalidCasePatterns`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "invalid_case_patterns",
-    &[NodeKind::SwitchCase],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("invalid_case_patterns", &[NodeKind::SwitchCase], check,);
 
 fn check(c: &mut Check<'_>) {
     // The registration bail (:41).
@@ -232,8 +229,7 @@ mod tests {
             1
         );
         assert_eq!(
-            legacy("void f(Object o) {\n  switch (o) {\n    case true ? 1 : 2:\n  }\n}\n")
-                .len(),
+            legacy("void f(Object o) {\n  switch (o) {\n    case true ? 1 : 2:\n  }\n}\n").len(),
             1
         );
         assert_eq!(
@@ -251,8 +247,7 @@ mod tests {
             1
         );
         assert_eq!(
-            legacy("void f(Object o) {\n  switch (o) {\n    case const [1, 2]:\n  }\n}\n")
-                .len(),
+            legacy("void f(Object o) {\n  switch (o) {\n    case const [1, 2]:\n  }\n}\n").len(),
             0
         );
         assert_eq!(
@@ -341,8 +336,7 @@ mod tests {
     #[test]
     fn identical_and_length_faces_report() {
         assert_eq!(
-            legacy("void f(Object o) {\n  switch (o) {\n    case identical(1, 2):\n  }\n}\n")
-                .len(),
+            legacy("void f(Object o) {\n  switch (o) {\n    case identical(1, 2):\n  }\n}\n").len(),
             1
         );
         assert_eq!(
@@ -374,7 +368,10 @@ mod tests {
     #[test]
     fn constructor_call_is_the_documented_under_report() {
         assert_eq!(
-            legacy("class C {\n  const C();\n}\n\nf(C c) {\n  switch (c) {\n    case C():\n  }\n}\n").len(),
+            legacy(
+                "class C {\n  const C();\n}\n\nf(C c) {\n  switch (c) {\n    case C():\n  }\n}\n"
+            )
+            .len(),
             0
         );
     }

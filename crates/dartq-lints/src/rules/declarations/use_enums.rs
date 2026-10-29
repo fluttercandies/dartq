@@ -1,5 +1,11 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, constructor_name_part, container_members, container_name_node, initializer_expression, modifier_keyword, parameter_name, parameter_rows};
-use crate::rules::{NONE_TOKEN, SupertypeClause, initialized_identifier_name, supertypes, utf16_token_span, variables_declaration_keyword};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, constructor_name_part, container_members,
+    container_name_node, initializer_expression, modifier_keyword, parameter_name, parameter_rows,
+};
+use crate::rules::{
+    NONE_TOKEN, SupertypeClause, initialized_identifier_name, supertypes, utf16_token_span,
+    variables_declaration_keyword,
+};
 use dartq_ast::mod_flags;
 use dartq_language::LanguageVersion;
 use dartq_parser::{IdentifierContext, MemberKind};
@@ -34,11 +40,7 @@ const ABSTRACT_BIT: u16 = 1 << 2;
 /// (upstream `isFeatureEnabled` at registration; the per-dispatch
 /// consult is observationally identical). Message: `diagnostic.g.dart`
 /// `useEnums`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_enums",
-    &[NodeKind::ClassDeclaration],
-    check,
-);
+pub(crate) static SPEC: RuleSpec = crate::spec!("use_enums", &[NodeKind::ClassDeclaration], check,);
 
 fn check(c: &mut Check<'_>) {
     // `context.isFeatureEnabled(Feature.enhanced_enums)` (:32).
@@ -109,11 +111,17 @@ fn check(c: &mut Check<'_>) {
 /// public-class naming gate (:158-161 — the name must be written and
 /// private), and no `hashCode`/`index`/`values` parameter (:162-167).
 fn primary_ok(c: &Check<'_>, primary: u32, public: bool) -> bool {
-    if c.field(primary, PayloadField::ConstKeyword).unwrap_or(NONE_TOKEN) == NONE_TOKEN {
+    if c.field(primary, PayloadField::ConstKeyword)
+        .unwrap_or(NONE_TOKEN)
+        == NONE_TOKEN
+    {
         return false;
     }
     if public {
-        let named = c.field(primary, PayloadField::HasConstructorName).unwrap_or(0) != 0;
+        let named = c
+            .field(primary, PayloadField::HasConstructorName)
+            .unwrap_or(0)
+            != 0;
         let name = c.collect_direct(primary).into_iter().find(|&kid| {
             c.kind(kid) == NodeKind::Identifier
                 && c.field(kid, PayloadField::Context)
@@ -222,7 +230,8 @@ fn method_disqualifies(c: &Check<'_>, member: u32) -> bool {
     let ctx = IdentifierContext::MethodDeclaration as u32;
     let is_name = |kid: u32| {
         c.kind(kid) == NodeKind::OperatorName
-            || (c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
+            || (c.kind(kid) == NodeKind::Identifier
+                && c.field(kid, PayloadField::Context) == Some(ctx))
     };
     let name = c
         .collect_direct(member)
@@ -252,8 +261,7 @@ fn method_disqualifies(c: &Check<'_>, member: u32) -> bool {
 /// The public-class naming gate (:159, :206): the constructor must be
 /// named and private (`name == null || !name.isPrivateName` bails).
 fn private_named(c: &Check<'_>, ctor: u32) -> bool {
-    constructor_name_part(c, ctor)
-        .is_some_and(|part| c.lexeme(c.head_token(part)).starts_with('_'))
+    constructor_name_part(c, ctor).is_some_and(|part| c.lexeme(c.head_token(part)).starts_with('_'))
 }
 
 /// The candidate collection (:185-200): each `static const`
@@ -325,9 +333,7 @@ fn generative_ctor_names<'a>(
     }
     for member in members {
         if c.kind(*member) == NodeKind::Constructor {
-            names.push(
-                constructor_name_part(c, *member).map(|part| c.lexeme(c.head_token(part))),
-            );
+            names.push(constructor_name_part(c, *member).map(|part| c.lexeme(c.head_token(part))));
         }
     }
     names
@@ -354,9 +360,9 @@ fn creation_invokes(
 ) -> bool {
     match c.kind(creation) {
         NodeKind::Send => send_creation(c, class_name, ctors, creation),
-        NodeKind::NewExpression
-        | NodeKind::ImplicitCreation
-        | NodeKind::ConstructorReference => structured_creation(c, class_name, ctors, creation),
+        NodeKind::NewExpression | NodeKind::ImplicitCreation | NodeKind::ConstructorReference => {
+            structured_creation(c, class_name, ctors, creation)
+        }
         // A written-`const` creation spells no send — its callee is
         // the `ConstructorReference` row inside the wrapper.
         NodeKind::ConstExpression | NodeKind::ConstLiteral => c
@@ -472,7 +478,9 @@ fn structured_creation(
 /// The name an access marker spells (the dot rides the row's `Operator`
 /// word; the name follows it — the `const_ability::selector_name` read).
 fn selector_lexeme<'a>(c: &'a Check<'a>, marker: u32) -> &'a str {
-    let dot = c.field(marker, PayloadField::Operator).unwrap_or(NONE_TOKEN);
+    let dot = c
+        .field(marker, PayloadField::Operator)
+        .unwrap_or(NONE_TOKEN);
     if dot == NONE_TOKEN {
         ""
     } else {
@@ -565,12 +573,7 @@ fn class_scan_bails(
 /// declaration uses the name as a supertype (extends, with or
 /// implements; the mixin application's superclass `Type` rows join
 /// through the same read).
-fn outside_clean(
-    c: &Check<'_>,
-    class_row: u32,
-    class_name: &str,
-    ctors: &[Option<&str>],
-) -> bool {
+fn outside_clean(c: &Check<'_>, class_row: u32, class_name: &str, ctors: &[Option<&str>]) -> bool {
     let Some(root) = c.unit.ast.root() else {
         return true;
     };

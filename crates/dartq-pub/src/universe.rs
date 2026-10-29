@@ -83,13 +83,21 @@ pub fn enclosing_universe(from: &Path) -> Result<Universe, PubError> {
     // The fast path: `from` is a package root whose resolved state names
     // its workspace. Verified membership: the ref must point at a real
     // root whose layout covers `from`.
-    let reference = from.join(".dart_tool").join("pub").join("workspace_ref.json");
+    let reference = from
+        .join(".dart_tool")
+        .join("pub")
+        .join("workspace_ref.json");
     if let Ok(text) = fs::read_to_string(&reference)
         && let Some(relative) = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|value| value.get("workspaceRoot")?.as_str().map(str::to_owned))
     {
-        let candidate = normalize(&reference.parent().expect("file has a parent").join(&relative));
+        let candidate = normalize(
+            &reference
+                .parent()
+                .expect("file has a parent")
+                .join(&relative),
+        );
         if candidate.join("pubspec.yaml").is_file()
             && let Ok(layout) = find_workspace_root(&candidate)
             && normalize(&layout.root) == candidate
@@ -97,7 +105,10 @@ pub fn enclosing_universe(from: &Path) -> Result<Universe, PubError> {
                 .chain(layout.members.iter())
                 .any(|dir| from.starts_with(dir))
         {
-            return Ok(Universe { root: absolute(&candidate), layout: Some(layout) });
+            return Ok(Universe {
+                root: absolute(&candidate),
+                layout: Some(layout),
+            });
         }
     }
     let mut dir = from;
@@ -105,10 +116,16 @@ pub fn enclosing_universe(from: &Path) -> Result<Universe, PubError> {
         if dir.join("pubspec.yaml").is_file() {
             let layout = find_workspace_root(dir)?;
             let root = absolute(&layout.root);
-            return Ok(Universe { root, layout: Some(layout) });
+            return Ok(Universe {
+                root,
+                layout: Some(layout),
+            });
         }
         if dir.join(".git").exists() {
-            return Ok(Universe { root: absolute(dir), layout: None });
+            return Ok(Universe {
+                root: absolute(dir),
+                layout: None,
+            });
         }
         dir = dir.parent().ok_or_else(|| {
             PubError::NoRoot(format!(
@@ -271,8 +288,7 @@ pub fn scan(root: &Path, options: &ScanOptions) -> ScanReport {
     let mut boundaries: Vec<BoundaryEntry> = Vec::new();
     let mut found: Vec<Found> = Vec::new();
     let mut registered: FxHashSet<PathBuf> = FxHashSet::default();
-    let mut visited: FxHashSet<PathBuf> =
-        FxHashSet::from_iter(std::iter::once(root.clone()));
+    let mut visited: FxHashSet<PathBuf> = FxHashSet::from_iter(std::iter::once(root.clone()));
 
     // The root itself is classified like any directory (a pubspec at the
     // scan root is the common entry), but never pruned for carrying .git.
@@ -315,7 +331,10 @@ pub fn scan(root: &Path, options: &ScanOptions) -> ScanReport {
     let deps = path_dependencies(&found, &mut registered);
     found.extend(deps);
     mark_resolved(&mut found);
-    let mut report = ScanReport { root: root.clone(), ..ScanReport::default() };
+    let mut report = ScanReport {
+        root: root.clone(),
+        ..ScanReport::default()
+    };
     if !options.include.is_empty() {
         found.retain(|one| {
             relative_posix(&root, &one.entry.dir)
@@ -359,9 +378,16 @@ fn classify(dir: &Path) -> std::io::Result<Vec<Found>> {
             // the path-dependency pass; the display fields come from the
             // member's own pubspec via `package_entry`.
             for (member, spec) in layout.members.iter().zip(&layout.member_pubspecs) {
-                let entry =
-                    package_entry(member, &PackageKind::WorkspaceMember { root: normalize(&layout.root) });
-                dirs.push(Found { entry, pubspec: Some(spec.clone()) });
+                let entry = package_entry(
+                    member,
+                    &PackageKind::WorkspaceMember {
+                        root: normalize(&layout.root),
+                    },
+                );
+                dirs.push(Found {
+                    entry,
+                    pubspec: Some(spec.clone()),
+                });
             }
             // A layout without members is one independent package
             // (pub's single-package workspace) — the inventory's
@@ -382,7 +408,10 @@ fn classify(dir: &Path) -> std::io::Result<Vec<Found>> {
             // an independent unit with the refusal as its note.
             let mut entry = package_entry(dir, &PackageKind::Independent);
             entry.note = Some(error.to_string());
-            dirs.push(Found { entry, pubspec: parsed.ok() });
+            dirs.push(Found {
+                entry,
+                pubspec: parsed.ok(),
+            });
         }
     }
     Ok(dirs)
@@ -393,7 +422,14 @@ fn classify(dir: &Path) -> std::io::Result<Vec<Found>> {
 fn package_entry(dir: &Path, kind: &PackageKind) -> PackageEntry {
     let dir = normalize(dir);
     let (name, sdk) = display_fields(&dir);
-    PackageEntry { dir, name, kind: kind.clone(), sdk, resolved: false, note: None }
+    PackageEntry {
+        dir,
+        name,
+        kind: kind.clone(),
+        sdk,
+        resolved: false,
+        note: None,
+    }
 }
 
 /// The workspace root's pubspec for the path-dependency pass (the layout
@@ -412,7 +448,10 @@ fn display_fields(dir: &Path) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
         return (None, None);
     };
-    let name = value.get("name").and_then(serde_yaml::Value::as_str).map(str::to_owned);
+    let name = value
+        .get("name")
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_owned);
     let sdk = value
         .get("environment")
         .and_then(|env| env.get("sdk"))
@@ -424,7 +463,12 @@ fn display_fields(dir: &Path) -> (Option<String>, Option<String>) {
 /// The descentable child directories of `dir`, one boundary entry per
 /// pruned tree (only when something package-like was hidden — a probe
 /// bounded by [`PROBE_DEPTH`] and [`PROBE_DIRS`] looks for a pubspec).
-fn child_dirs(dir: &Path, root: &Path, options: &ScanOptions, boundaries: &mut Vec<BoundaryEntry>) -> Vec<PathBuf> {
+fn child_dirs(
+    dir: &Path,
+    root: &Path,
+    options: &ScanOptions,
+    boundaries: &mut Vec<BoundaryEntry>,
+) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         boundaries.push(BoundaryEntry {
             dir: normalize(dir),
@@ -523,7 +567,11 @@ fn probe_pubspec(dir: &Path) -> Option<PathBuf> {
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries {
                 let path = entry.path();
-                if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                {
                     continue;
                 }
                 if path.join("pubspec.yaml").is_file() {
@@ -557,7 +605,9 @@ fn stale_gitdir(git_file: &Path) -> Option<String> {
     if Path::new(target).exists() {
         Some(format!("gitdir: {target}"))
     } else {
-        Some(format!("gitdir: {target} (missing — stale worktree file, safe to delete)"))
+        Some(format!(
+            "gitdir: {target} (missing — stale worktree file, safe to delete)"
+        ))
     }
 }
 
@@ -593,14 +643,21 @@ fn path_dependencies(found: &[Found], registered: &mut FxHashSet<PathBuf>) -> Ve
                 if !target.join("pubspec.yaml").is_file() || !registered.insert(target.clone()) {
                     continue;
                 }
-                let mut entry =
-                    package_entry(&target, &PackageKind::PathDependency { consumer: one.entry.dir.clone() });
+                let mut entry = package_entry(
+                    &target,
+                    &PackageKind::PathDependency {
+                        consumer: one.entry.dir.clone(),
+                    },
+                );
                 if let Ok(text) = fs::read_to_string(target.join("pubspec.yaml"))
                     && let Ok(dep_spec) = Pubspec::parse(&text)
                 {
                     entry.name = Some(dep_spec.name);
                 }
-                out.push(Found { entry, pubspec: None });
+                out.push(Found {
+                    entry,
+                    pubspec: None,
+                });
             }
         }
     }
@@ -618,14 +675,20 @@ fn mark_resolved(found: &mut [Found]) {
             PackageKind::PathDependency { consumer } => found
                 .iter()
                 .find(|other| &other.entry.dir == consumer)
-                .map_or_else(|| consumer.clone(), |other| match &other.entry.kind {
-                    PackageKind::WorkspaceMember { root } => root.clone(),
-                    _ => other.entry.dir.clone(),
-                }),
+                .map_or_else(
+                    || consumer.clone(),
+                    |other| match &other.entry.kind {
+                        PackageKind::WorkspaceMember { root } => root.clone(),
+                        _ => other.entry.dir.clone(),
+                    },
+                ),
             _ => one.entry.dir.clone(),
         }
     }
-    let mut roots: Vec<PathBuf> = found.iter().map(|one| resolution_root(one, found)).collect();
+    let mut roots: Vec<PathBuf> = found
+        .iter()
+        .map(|one| resolution_root(one, found))
+        .collect();
     roots.sort();
     roots.dedup();
     let configs: FxHashMap<&Path, Option<PackageConfig>> = roots
@@ -637,7 +700,10 @@ fn mark_resolved(found: &mut [Found]) {
             (root.as_path(), config)
         })
         .collect();
-    let roots: Vec<PathBuf> = found.iter().map(|one| resolution_root(one, found)).collect();
+    let roots: Vec<PathBuf> = found
+        .iter()
+        .map(|one| resolution_root(one, found))
+        .collect();
     for (one, root) in found.iter_mut().zip(&roots) {
         let Some(config) = configs.get(root.as_path()).and_then(Option::as_ref) else {
             continue;
@@ -659,7 +725,8 @@ mod tests {
 
     /// A fresh temp directory per test invocation.
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dartq-universe-{}-{}", label, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dartq-universe-{}-{}", label, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
@@ -686,7 +753,10 @@ mod tests {
             .collect();
         write(
             &root.join(".dart_tool").join("package_config.json"),
-            &format!(r#"{{"configVersion":2,"packages":[{}],"generator":"pub"}}"#, entries.join(",")),
+            &format!(
+                r#"{{"configVersion":2,"packages":[{}],"generator":"pub"}}"#,
+                entries.join(",")
+            ),
         );
     }
 
@@ -697,14 +767,21 @@ mod tests {
         let to: Vec<_> = to.components().collect();
         let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
         let mut parts: Vec<String> = vec!["..".into(); from.len() - common];
-        parts.extend(to[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+        parts.extend(
+            to[common..]
+                .iter()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+        );
         parts.join("/")
     }
 
     fn options(exclude: &[&str]) -> ScanOptions {
         ScanOptions {
             include: Vec::new(),
-            exclude: exclude.iter().map(|p| Glob::new(p).expect("glob")).collect(),
+            exclude: exclude
+                .iter()
+                .map(|p| Glob::new(p).expect("glob"))
+                .collect(),
         }
     }
 
@@ -737,14 +814,20 @@ mod tests {
         let canonical = root.canonicalize().expect("canonical");
         // The resolved-state fast path: a ref naming the true root.
         write(
-            &from.join(".dart_tool").join("pub").join("workspace_ref.json"),
+            &from
+                .join(".dart_tool")
+                .join("pub")
+                .join("workspace_ref.json"),
             r#"{"workspaceRoot":"../.."}"#,
         );
         assert_eq!(enclosing_universe(&from).expect("universe").root, canonical);
 
         // A ref naming anywhere else is ignored — pubspecs decide.
         write(
-            &from.join(".dart_tool").join("pub").join("workspace_ref.json"),
+            &from
+                .join(".dart_tool")
+                .join("pub")
+                .join("workspace_ref.json"),
             r#"{"workspaceRoot":"../../pkg_a"}"#,
         );
         assert_eq!(enclosing_universe(&from).expect("universe").root, canonical);
@@ -755,14 +838,20 @@ mod tests {
     #[test]
     fn ladder_stops_at_the_git_foreign_tree() {
         let root = temp_dir("foreign");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let inner = root.join("vendor").join("inner");
         std::fs::create_dir_all(inner.join("lib")).expect("mkdir");
         std::fs::create_dir_all(inner.join(".git")).expect("mkdir");
 
         let universe = enclosing_universe(&inner.join("lib")).expect("capped universe");
         assert_eq!(universe.root, inner.canonicalize().expect("canonical"));
-        assert!(universe.layout.is_none(), "no pubspec inside the foreign tree");
+        assert!(
+            universe.layout.is_none(),
+            "no pubspec inside the foreign tree"
+        );
     }
 
     /// Neither pubspec nor `.git` anywhere: the navigation error.
@@ -796,7 +885,11 @@ mod tests {
             "name: mid\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
         );
         write(
-            &root.join("examples").join("mid").join("cockpit").join("pubspec.yaml"),
+            &root
+                .join("examples")
+                .join("mid")
+                .join("cockpit")
+                .join("pubspec.yaml"),
             "name: nested\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
         );
         let here = std::env::current_dir().expect("cwd");
@@ -811,7 +904,9 @@ mod tests {
             std::fs::canonicalize(&root).expect("canonical root"),
             "the root is the workspace root"
         );
-        let layout = universe.layout.expect("a pubspec universe carries its layout");
+        let layout = universe
+            .layout
+            .expect("a pubspec universe carries its layout");
         assert_eq!(layout.root, universe.root);
         assert_eq!(
             layout.members,
@@ -825,7 +920,10 @@ mod tests {
     #[test]
     fn relative_invocation_roots_absolutely() {
         let root = temp_dir("relative");
-        write(&root.join("pubspec.yaml"), "name: solo\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: solo\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let here = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("chdir");
         let universe = enclosing_universe(Path::new("."));
@@ -849,7 +947,10 @@ mod tests {
             report.boundaries
         );
         assert!(
-            report.packages.iter().any(|entry| entry.dir == universe.root),
+            report
+                .packages
+                .iter()
+                .any(|entry| entry.dir == universe.root),
             "the package still registers: {:?}",
             report.packages
         );
@@ -883,7 +984,9 @@ mod tests {
         let member = package(&report, &root.join("pkgs").join("a"));
         assert_eq!(
             member.kind,
-            PackageKind::WorkspaceMember { root: normalize(&root) }
+            PackageKind::WorkspaceMember {
+                root: normalize(&root)
+            }
         );
         assert!(!member.resolved);
         let solo = package(&report, &root.join("vendor").join("solo"));
@@ -903,23 +1006,42 @@ mod tests {
     #[test]
     fn scan_registers_nested_checkout_boundaries() {
         let root = temp_dir("checkouts");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let clone = root.join("vendor").join("clone");
-        write(&clone.join("pubspec.yaml"), "name: clone\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &clone.join("pubspec.yaml"),
+            "name: clone\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         std::fs::create_dir_all(clone.join(".git")).expect("mkdir");
 
         let worktree = root.join("vendor").join("linked");
-        write(&worktree.join("pubspec.yaml"), "name: linked\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &worktree.join("pubspec.yaml"),
+            "name: linked\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let live_git = temp_dir("main-git");
         std::fs::create_dir_all(&live_git).expect("mkdir");
-        write(&worktree.join(".git"), &format!("gitdir: {}\n", live_git.display()));
+        write(
+            &worktree.join(".git"),
+            &format!("gitdir: {}\n", live_git.display()),
+        );
 
         let stale = root.join("vendor").join("stale");
-        write(&stale.join("pubspec.yaml"), "name: stale\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &stale.join("pubspec.yaml"),
+            "name: stale\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         write(&stale.join(".git"), "gitdir: /gone/.git/worktrees/x\n");
 
         let report = scan(&root, &ScanOptions::default());
-        assert_eq!(report.packages.len(), 1, "foreign trees are not work points");
+        assert_eq!(
+            report.packages.len(),
+            1,
+            "foreign trees are not work points"
+        );
         let boundary = |dir: &Path| {
             report
                 .boundaries
@@ -938,17 +1060,26 @@ mod tests {
     #[test]
     fn scan_lists_plain_copies_and_tarball_extractions() {
         let root = temp_dir("copies");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         write(
             &root.join("vendor").join("copy").join("pubspec.yaml"),
             "name: copy\nenvironment:\n  sdk: ^3.5.0\n",
         );
         write(
-            &root.join("vendor").join("some_pkg-1.2.3").join("pubspec.yaml"),
+            &root
+                .join("vendor")
+                .join("some_pkg-1.2.3")
+                .join("pubspec.yaml"),
             "name: some_pkg\nenvironment:\n  sdk: ^3.5.0\n",
         );
         let report = scan(&root, &ScanOptions::default());
-        assert_eq!(package(&report, &root.join("vendor").join("copy")).kind, PackageKind::Independent);
+        assert_eq!(
+            package(&report, &root.join("vendor").join("copy")).kind,
+            PackageKind::Independent
+        );
         assert_eq!(
             package(&report, &root.join("vendor").join("some_pkg-1.2.3")).kind,
             PackageKind::Independent
@@ -960,7 +1091,10 @@ mod tests {
     #[test]
     fn scan_handles_gitless_nesting() {
         let root = temp_dir("gitless");
-        write(&root.join("a").join("pubspec.yaml"), "name: a\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         write(
             &root.join("a").join("b").join("pubspec.yaml"),
             "name: b\nenvironment:\n  sdk: ^3.5.0\n",
@@ -973,8 +1107,14 @@ mod tests {
         );
         let report = scan(&root, &ScanOptions::default());
         assert_eq!(report.packages.len(), 2);
-        assert_eq!(package(&report, &root.join("a")).kind, PackageKind::Independent);
-        assert_eq!(package(&report, &root.join("a").join("b")).kind, PackageKind::Independent);
+        assert_eq!(
+            package(&report, &root.join("a")).kind,
+            PackageKind::Independent
+        );
+        assert_eq!(
+            package(&report, &root.join("a").join("b")).kind,
+            PackageKind::Independent
+        );
     }
 
     /// A `path:` dependency crossing the scan root's boundary is a work
@@ -984,14 +1124,21 @@ mod tests {
         let home = temp_dir("pathdep");
         let root = home.join("repo");
         let outside = home.join("sibling");
-        write(&root.join("pubspec.yaml"),
-            "name: repo\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  shared:\n    path: ../sibling\n");
-        write(&outside.join("pubspec.yaml"), "name: shared\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: repo\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  shared:\n    path: ../sibling\n",
+        );
+        write(
+            &outside.join("pubspec.yaml"),
+            "name: shared\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let report = scan(&root, &ScanOptions::default());
         let dep = package(&report, &outside);
         assert_eq!(
             dep.kind,
-            PackageKind::PathDependency { consumer: normalize(&root) }
+            PackageKind::PathDependency {
+                consumer: normalize(&root)
+            }
         );
         assert_eq!(dep.name.as_deref(), Some("shared"));
     }
@@ -1002,11 +1149,26 @@ mod tests {
     #[test]
     fn scan_registers_pruned_trees_that_hide_pubspecs() {
         let root = temp_dir("pruned");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
-        write(&root.join(".dot").join("pkg").join("pubspec.yaml"), "name: dot\nenvironment:\n  sdk: ^3.5.0\n");
-        write(&root.join("test").join("fixtures").join("pkg").join("pubspec.yaml"),
-            "name: fixture\nenvironment:\n  sdk: ^3.5.0\n");
-        write(&root.join("build").join("pkg").join("pubspec.yaml"), "name: built\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &root.join(".dot").join("pkg").join("pubspec.yaml"),
+            "name: dot\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &root
+                .join("test")
+                .join("fixtures")
+                .join("pkg")
+                .join("pubspec.yaml"),
+            "name: fixture\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &root.join("build").join("pkg").join("pubspec.yaml"),
+            "name: built\nenvironment:\n  sdk: ^3.5.0\n",
+        );
 
         let report = scan(&root, &options(&["test/fixtures"]));
         let reason = |dir: &Path| {
@@ -1017,15 +1179,25 @@ mod tests {
                 .map(|entry| entry.reason)
         };
         assert_eq!(reason(&root.join(".dot")), Some(BoundaryReason::HiddenTree));
-        assert_eq!(reason(&root.join("test").join("fixtures")), Some(BoundaryReason::ExcludedTree));
+        assert_eq!(
+            reason(&root.join("test").join("fixtures")),
+            Some(BoundaryReason::ExcludedTree)
+        );
         assert_eq!(reason(&root.join("build")), Some(BoundaryReason::BuildTree));
-        assert_eq!(report.packages.len(), 1, "the pruned trees' pubspecs are not work points");
+        assert_eq!(
+            report.packages.len(),
+            1,
+            "the pruned trees' pubspecs are not work points"
+        );
 
         // A hidden tree with nothing package-like stays silent — no noise.
         std::fs::create_dir_all(root.join(".cache").join("deep")).expect("mkdir");
         let report = scan(&root, &ScanOptions::default());
         assert!(
-            !report.boundaries.iter().any(|entry| entry.dir == normalize(&root.join(".cache"))),
+            !report
+                .boundaries
+                .iter()
+                .any(|entry| entry.dir == normalize(&root.join(".cache"))),
             "empty hidden trees are not registered"
         );
     }
@@ -1039,8 +1211,10 @@ mod tests {
             &root.join("pubspec.yaml"),
             "name: ws\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkgs/a\n",
         );
-        write(&root.join("pkgs").join("a").join("pubspec.yaml"),
-            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n");
+        write(
+            &root.join("pkgs").join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
         let scan_options = ScanOptions {
             include: vec![Glob::new("pkgs/**").expect("glob")],
             exclude: Vec::new(),
@@ -1055,12 +1229,20 @@ mod tests {
     #[test]
     fn orphan_member_keeps_its_refusal_note() {
         let root = temp_dir("orphan");
-        write(&root.join("pkg").join("pubspec.yaml"),
-            "name: pkg\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n");
+        write(
+            &root.join("pkg").join("pubspec.yaml"),
+            "name: pkg\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
         let report = scan(&root, &ScanOptions::default());
         let pkg = package(&report, &root.join("pkg"));
         assert_eq!(pkg.kind, PackageKind::Independent);
-        assert!(pkg.note.as_deref().unwrap_or_default().contains("no workspace root"), "{pkg:?}");
+        assert!(
+            pkg.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no workspace root"),
+            "{pkg:?}"
+        );
     }
 
     /// A symlinked package directory is never descended (cycle safety)
@@ -1069,8 +1251,14 @@ mod tests {
     #[test]
     fn symlinked_package_dirs_register_as_boundaries() {
         let root = temp_dir("symlink");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
-        write(&root.join("real").join("pubspec.yaml"), "name: real\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &root.join("real").join("pubspec.yaml"),
+            "name: real\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         std::os::unix::fs::symlink(root.join("real"), root.join("alias")).expect("symlink");
         let report = scan(&root, &ScanOptions::default());
         assert!(
@@ -1082,7 +1270,11 @@ mod tests {
             "symlink boundary: {:?}",
             report.boundaries
         );
-        assert_eq!(report.packages.len(), 2, "the real dir registers, the alias does not");
+        assert_eq!(
+            report.packages.len(),
+            2,
+            "the real dir registers, the alias does not"
+        );
     }
 
     /// The other half of the symlink rule: a symlinked directory carrying
@@ -1092,7 +1284,10 @@ mod tests {
     #[test]
     fn symlinked_dirs_without_a_pubspec_stay_silent() {
         let root = temp_dir("symlink-bare");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         std::fs::create_dir_all(root.join("plain")).expect("mkdir");
         std::os::unix::fs::symlink(root.join("plain"), root.join("alias")).expect("symlink");
         let report = scan(&root, &ScanOptions::default());
@@ -1113,10 +1308,20 @@ mod tests {
     #[test]
     fn probe_depth_bounds_boundary_registration() {
         let root = temp_dir("probe-depth");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         // Three levels below the hidden root: inside the budget.
-        write(&root.join(".dot").join("a").join("b").join("c").join("pubspec.yaml"),
-            "name: deep\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root
+                .join(".dot")
+                .join("a")
+                .join("b")
+                .join("c")
+                .join("pubspec.yaml"),
+            "name: deep\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let report = scan(&root, &ScanOptions::default());
         let boundary = report
             .boundaries
@@ -1125,16 +1330,31 @@ mod tests {
             .expect("the shallow-hidden pubspec is registered");
         assert_eq!(boundary.reason, BoundaryReason::HiddenTree);
         assert!(
-            boundary.detail.as_deref().unwrap_or_default().contains("pubspec.yaml"),
+            boundary
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pubspec.yaml"),
             "the detail names the hidden pubspec: {:?}",
             boundary.detail
         );
 
         // Four levels below: beyond the budget, silently pruned.
         let deep = temp_dir("probe-deeper");
-        write(&deep.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
-        write(&deep.join(".dot").join("a").join("b").join("c").join("d").join("pubspec.yaml"),
-            "name: deeper\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &deep.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &deep
+                .join(".dot")
+                .join("a")
+                .join("b")
+                .join("c")
+                .join("d")
+                .join("pubspec.yaml"),
+            "name: deeper\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let report = scan(&deep, &ScanOptions::default());
         assert!(
             !report
@@ -1153,7 +1373,10 @@ mod tests {
     #[test]
     fn probe_width_budget_bounds_the_search() {
         let root = temp_dir("probe-wide");
-        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let hidden = root.join(".dot");
         for index in 0..70 {
             std::fs::create_dir_all(hidden.join(format!("d{index:02}"))).expect("mkdir");
@@ -1169,12 +1392,18 @@ mod tests {
         );
 
         let wide = temp_dir("probe-wide-ok");
-        write(&wide.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &wide.join("pubspec.yaml"),
+            "name: outer\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let hidden = wide.join(".dot");
         for index in 0..60 {
             std::fs::create_dir_all(hidden.join(format!("d{index:02}"))).expect("mkdir");
         }
-        write(&hidden.join("zz").join("pubspec.yaml"), "name: z\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &hidden.join("zz").join("pubspec.yaml"),
+            "name: z\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let report = scan(&wide, &ScanOptions::default());
         assert!(
             report
@@ -1196,14 +1425,25 @@ mod tests {
             &root.join("pubspec.yaml"),
             "name: ws\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkgs/a\n",
         );
-        write(&root.join("pkgs").join("a").join("pubspec.yaml"),
-            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n");
+        write(
+            &root.join("pkgs").join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
         // One level inside the pruned tree — the boundary probe searches
         // the pruned dir's children, matching the other prune fixtures.
-        write(&root.join("vendor").join("fixture").join("pkg").join("pubspec.yaml"),
-            "name: fixture\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root
+                .join("vendor")
+                .join("fixture")
+                .join("pkg")
+                .join("pubspec.yaml"),
+            "name: fixture\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let scan_options = ScanOptions {
-            include: vec![Glob::new("pkgs/**").expect("glob"), Glob::new("vendor/fixture").expect("glob")],
+            include: vec![
+                Glob::new("pkgs/**").expect("glob"),
+                Glob::new("vendor/fixture").expect("glob"),
+            ],
             exclude: vec![Glob::new("vendor/fixture").expect("glob")],
         };
         let report = scan(&root, &scan_options);
@@ -1217,12 +1457,10 @@ mod tests {
             "the excluded tree never lists, include cannot resurrect it"
         );
         assert!(
-            report
-                .boundaries
-                .iter()
-                .any(|entry| entry.dir == normalize(&root.join("vendor").join("fixture"))
-                    && entry.reason == BoundaryReason::ExcludedTree
-                    && entry.detail.is_some()),
+            report.boundaries.iter().any(|entry| entry.dir
+                == normalize(&root.join("vendor").join("fixture"))
+                && entry.reason == BoundaryReason::ExcludedTree
+                && entry.detail.is_some()),
             "the pruned pubspec is a boundary with its detail: {:?}",
             report.boundaries
         );
@@ -1235,8 +1473,10 @@ mod tests {
     #[test]
     fn orphan_member_universe_is_the_refusal() {
         let root = temp_dir("orphan-ladder");
-        write(&root.join("pkg").join("pubspec.yaml"),
-            "name: pkg\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n");
+        write(
+            &root.join("pkg").join("pubspec.yaml"),
+            "name: pkg\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
         for from in [root.join("pkg"), root.join("pkg").join("lib")] {
             assert!(
                 matches!(enclosing_universe(&from), Err(PubError::OrphanMember(_))),
@@ -1263,9 +1503,16 @@ mod tests {
         );
         let from = root.join("pkg_a");
         let expected = enclosing_universe(&from).expect("universe").root;
-        let reference = from.join(".dart_tool").join("pub").join("workspace_ref.json");
+        let reference = from
+            .join(".dart_tool")
+            .join("pub")
+            .join("workspace_ref.json");
         write(&reference, "{}");
-        assert_eq!(enclosing_universe(&from).expect("universe").root, expected, "no key: ignored");
+        assert_eq!(
+            enclosing_universe(&from).expect("universe").root,
+            expected,
+            "no key: ignored"
+        );
         write(&reference, r#"{"workspaceRoot":"../../empty"}"#);
         assert_eq!(
             enclosing_universe(&from).expect("universe").root,
@@ -1280,15 +1527,23 @@ mod tests {
     #[test]
     fn bare_scan_root_lists_child_packages() {
         let root = temp_dir("bare-root");
-        write(&root.join("app").join("pubspec.yaml"), "name: app\nenvironment:\n  sdk: ^3.5.0\n");
-        write(&root.join(".dot").join("pkg").join("pubspec.yaml"),
-            "name: dot\nenvironment:\n  sdk: ^3.5.0\n");
+        write(
+            &root.join("app").join("pubspec.yaml"),
+            "name: app\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &root.join(".dot").join("pkg").join("pubspec.yaml"),
+            "name: dot\nenvironment:\n  sdk: ^3.5.0\n",
+        );
         let report = scan(&root, &ScanOptions::default());
         assert_eq!(report.root, normalize(&root));
         assert_eq!(report.packages.len(), 1);
         assert_eq!(report.packages[0].name.as_deref(), Some("app"));
         assert!(
-            !report.packages.iter().any(|entry| entry.dir == normalize(&root)),
+            !report
+                .packages
+                .iter()
+                .any(|entry| entry.dir == normalize(&root)),
             "the bare root is not a package"
         );
         assert!(

@@ -1,5 +1,10 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, annotation_names, container_members, fields_declare, member_declaration_name};
-use crate::rules::{MemberQuery, member_annotations, member_matches, same_file_ancestors, utf16_token_span};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, annotation_names, container_members, fields_declare,
+    member_declaration_name,
+};
+use crate::rules::{
+    MemberQuery, member_annotations, member_matches, same_file_ancestors, utf16_token_span,
+};
 
 const STATIC_BIT: u16 = 1 << 3;
 
@@ -22,11 +27,7 @@ const OBJECT_MEMBERS: [&str; 5] = ["==", "hashCode", "noSuchMethod", "runtimeTyp
 /// in the interface and never answers, matching the resolved face).
 /// A supertype name that leaves the file under-reports. Message:
 /// `diagnostic.g.dart` `annotateRedeclares`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "annotate_redeclares",
-    &[NodeKind::Method],
-    check,
-);
+pub(crate) static SPEC: RuleSpec = crate::spec!("annotate_redeclares", &[NodeKind::Method], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

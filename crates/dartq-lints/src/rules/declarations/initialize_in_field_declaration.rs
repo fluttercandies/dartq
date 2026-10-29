@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// The `late` `ModSet` bit (bridge `mod_bits`, member family).
 const LATE_BIT: u16 = 1 << 5;
@@ -119,9 +119,7 @@ fn same_class_field_is_late(c: &Check<'_>, class_row: u32, name: &str) -> Option
                         .is_some_and(|tok| c.lexeme(tok) == name)
                 {
                     let flags = dartq_ast::mod_flags(c.unit.ast, member);
-                    return Some(
-                        flags & LATE_BIT != 0 || c.lexeme(c.head_token(member)) == "late",
-                    );
+                    return Some(flags & LATE_BIT != 0 || c.lexeme(c.head_token(member)) == "late");
                 }
             }
         }

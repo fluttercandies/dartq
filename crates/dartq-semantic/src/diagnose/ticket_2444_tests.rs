@@ -229,12 +229,7 @@ int f() {
         "{:?}",
         report.diagnostics
     );
-    one_at(
-        &report,
-        "dead_code",
-        at(source, "return 1"),
-        source,
-    );
+    one_at(&report, "dead_code", at(source, "return 1"), source);
 }
 
 // —— the world arithmetic behind the Null faces ———————————————————————

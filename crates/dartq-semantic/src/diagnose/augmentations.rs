@@ -139,9 +139,7 @@ impl Face<'_> {
         match self {
             Face::Container(c) => (&c.type_param_names, &c.type_param_bounds),
             Face::Member(m) => (&m.type_param_names, &m.type_param_bounds),
-            Face::TopFn { decl, .. } | Face::TopVar { decl, .. } => {
-                (&decl.type_param_names, &[])
-            }
+            Face::TopFn { decl, .. } | Face::TopVar { decl, .. } => (&decl.type_param_names, &[]),
             Face::Ctor { .. } => (&[], &[]),
         }
     }
@@ -150,9 +148,14 @@ impl Face<'_> {
     /// abstract, base, final, interface, sealed, mixin-class.
     fn header_modifiers(&self) -> [bool; 6] {
         match self {
-            Face::Container(c) => {
-                [c.is_abstract, c.is_base, c.is_final, c.is_interface, c.sealed, c.is_mixin_class]
-            }
+            Face::Container(c) => [
+                c.is_abstract,
+                c.is_base,
+                c.is_final,
+                c.is_interface,
+                c.sealed,
+                c.is_mixin_class,
+            ],
             _ => [false; 6],
         }
     }
@@ -215,7 +218,8 @@ pub(super) fn augmentation_diagnostics(
     if own.augmentations().is_empty() {
         return Vec::new();
     }
-    let mut table: FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>> = FxHashMap::default();
+    let mut table: FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>> =
+        FxHashMap::default();
     for &unit in graph.unit_files(lib) {
         if let Some(elements) = index.get(unit) {
             populate(&mut table, unit, elements);
@@ -336,16 +340,28 @@ fn check_header(
             AugKind::Class => {
                 let i = &intro_aug.modifiers;
                 vec![
-                    ("abstract", aug.modifiers.abstract_kw, i.abstract_kw.is_some()),
+                    (
+                        "abstract",
+                        aug.modifiers.abstract_kw,
+                        i.abstract_kw.is_some(),
+                    ),
                     ("base", aug.modifiers.base_kw, i.base_kw.is_some()),
                     ("final", aug.modifiers.final_kw, i.final_kw.is_some()),
-                    ("interface", aug.modifiers.interface_kw, i.interface_kw.is_some()),
+                    (
+                        "interface",
+                        aug.modifiers.interface_kw,
+                        i.interface_kw.is_some(),
+                    ),
                     ("sealed", aug.modifiers.sealed_kw, i.sealed_kw.is_some()),
                     ("mixin", aug.modifiers.mixin_kw, i.mixin_kw.is_some()),
                 ]
             }
             AugKind::Mixin => {
-                vec![("base", aug.modifiers.base_kw, intro_aug.modifiers.base_kw.is_some())]
+                vec![(
+                    "base",
+                    aug.modifiers.base_kw,
+                    intro_aug.modifiers.base_kw.is_some(),
+                )]
             }
             _ => Vec::new(),
         };
@@ -425,7 +441,17 @@ fn check_member_shape(
                 intro_bounds,
             );
             if let Some(span) = aug.return_ty_range {
-                check_return(out, file, own, intro_elements, strings, aug, &face, false, span);
+                check_return(
+                    out,
+                    file,
+                    own,
+                    intro_elements,
+                    strings,
+                    aug,
+                    &face,
+                    false,
+                    span,
+                );
             }
             check_formals(out, file, own, intro_elements, strings, aug, face.formals());
         }
@@ -637,9 +663,7 @@ fn without_declaration(
             out.push(row(file, anchor, code, message));
         }
         None => {
-            let code = SemanticCode::AugmentationWithoutDeclaration(
-                WithoutDeclarationShape::Plain,
-            );
+            let code = SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Plain);
             out.push(row(file, anchor, code, code.message("", "")));
         }
     }
@@ -794,12 +818,21 @@ fn check_induced_accessors(
     // absent — the check skips). The getter variant of the upstream row is
     // unreachable here: a preceding variable always induces a getter.
     if !aug.is_final && face.is_final_variable() {
-        let code =
-            SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Setter);
+        let code = SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Setter);
         let message = code.message(strings.resolve(aug.display_name), "");
         out.push(row(file, aug.name_range, code, message));
     }
-    check_return(out, file, own, intro_unit, strings, aug, face, true, aug.name_range);
+    check_return(
+        out,
+        file,
+        own,
+        intro_unit,
+        strings,
+        aug,
+        face,
+        true,
+        aug.name_range,
+    );
 }
 
 /// The formal-parameter pass (upstream
@@ -831,7 +864,10 @@ fn check_formals(
         .iter()
         .filter(|f| f.required_positional || f.optional_positional)
         .collect();
-    let cur_required = cur_positional.iter().filter(|f| f.required_positional).count();
+    let cur_required = cur_positional
+        .iter()
+        .filter(|f| f.required_positional)
+        .count();
     let cur_optional = cur_positional.len() - cur_required;
     let first_required = first.positional.iter().filter(|f| f.required).count();
     let first_optional = first.positional.len() - first_required;
@@ -1031,12 +1067,10 @@ fn intro_face<'e>(
                 .get(&aug.name)
                 .map(Face::Member)
         }
-        AugKind::TopLevelVar => elements
-            .decl(aug.name)
-            .map(|decl| Face::TopVar {
-                decl,
-                is_final: intro.is_final,
-            }),
+        AugKind::TopLevelVar => elements.decl(aug.name).map(|decl| Face::TopVar {
+            decl,
+            is_final: intro.is_final,
+        }),
         _ => elements.decl(aug.name).map(|decl| Face::TopFn {
             decl,
             is_setter: intro.kind == AugKind::Setter,
@@ -1055,5 +1089,12 @@ fn render(ty: Ty, unit: &FileElements, strings: &StringTable) -> String {
 }
 
 fn row(file: FileId, range: SourceRange, code: SemanticCode, message: String) -> Diagnostic {
-    Diagnostic::new(Severity::Error, code.code_info(), message, file, range, None)
+    Diagnostic::new(
+        Severity::Error,
+        code.code_info(),
+        message,
+        file,
+        range,
+        None,
+    )
 }

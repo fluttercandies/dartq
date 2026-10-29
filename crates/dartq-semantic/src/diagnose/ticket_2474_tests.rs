@@ -141,10 +141,7 @@ extension E<S> on Stream<S> {
 }
 ";
     let names = code_names(&report(source));
-    assert!(
-        names.contains(&"undefined_method"),
-        "{names:?}"
-    );
+    assert!(names.contains(&"undefined_method"), "{names:?}");
 }
 
 /// The local `Stream` `Found` path: `listen` resolves through the
@@ -182,4 +179,3 @@ extension E<T> on List<T> {
     let names = code_names(&report(source));
     assert!(!names.contains(&"undefined_method"), "{names:?}");
 }
-

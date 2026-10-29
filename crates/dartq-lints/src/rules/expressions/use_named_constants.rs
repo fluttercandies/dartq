@@ -56,8 +56,7 @@ fn check(c: &mut Check<'_>) {
         if c.lexeme(c.head_token(node)) != "const" {
             return;
         }
-        let Some((type_name, extent)) =
-            crate::rules::const_ability::pattern_creation(c.unit, node)
+        let Some((type_name, extent)) = crate::rules::const_ability::pattern_creation(c.unit, node)
         else {
             return;
         };

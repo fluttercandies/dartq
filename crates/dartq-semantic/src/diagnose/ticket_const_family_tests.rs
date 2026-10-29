@@ -350,10 +350,7 @@ fn annotation_set_element_reports_at_unresolved_prefix() {
     // annotation_space_before_parenthesis/1 measures `@metadata (x, y)` at
     // 1:1|16 — `@` through the arguments' closing paren).
     assert!(
-        rows.contains(&(
-            "undefined_annotation",
-            "@Target({TargetKind.classType})"
-        )),
+        rows.contains(&("undefined_annotation", "@Target({TargetKind.classType})")),
         "{rows:?}"
     );
     assert!(
@@ -748,7 +745,6 @@ fn valid_annotation_arguments_stay_silent() {
     }
 }
 
-
 /// The const-creation face captures the declaring model's facts: head
 /// container and the written named arguments' verbatim texts (the
 /// cross-library instance-equality substrate, `ConstCreationFace`).
@@ -761,29 +757,20 @@ fn const_creation_face_captures_head_and_named_texts() {
     let (scanned, features, _) = scan(source, file);
     let elements = collect(source, &scanned.tokens, features, &strings);
     let face = |name: &str| {
-        elements
-            .const_creation(strings.intern(name))
-            .map(|f| {
-                (
-                    strings.resolve(f.container).to_owned(),
-                    f.named
-                        .iter()
-                        .map(|(l, v)| (strings.resolve(*l), strings.resolve(*v)))
-                        .collect::<Vec<_>>(),
-                )
-            })
+        elements.const_creation(strings.intern(name)).map(|f| {
+            (
+                strings.resolve(f.container).to_owned(),
+                f.named
+                    .iter()
+                    .map(|(l, v)| (strings.resolve(*l), strings.resolve(*v)))
+                    .collect::<Vec<_>>(),
+            )
+        })
     };
-    assert_eq!(
-        face("a"),
-        Some(("Impl".to_owned(), vec![("name", "'a'")]))
-    );
-    assert_eq!(
-        face("b"),
-        Some(("Impl".to_owned(), vec![("name", "'b'")]))
-    );
+    assert_eq!(face("a"), Some(("Impl".to_owned(), vec![("name", "'a'")])));
+    assert_eq!(face("b"), Some(("Impl".to_owned(), vec![("name", "'b'")])));
     assert_eq!(face("missing"), None);
 }
-
 
 /// [`report`] with the unit registered into the graph
 /// (`LibraryGraphBuilder::unit`): the faces that read
@@ -838,15 +825,21 @@ fn super_formal_evaporation_reports_equal_const_instances() {
     let chain = "class Base extends Missing {\n  const Base({required super.name});\n}\nclass Impl extends Base {\n  const Impl({required super.name, this.tag = 't'});\n}\n";
     // name (a super formal) evaporates; both instances' surviving maps are
     // empty — equal instances, one row at the later element.
-    let source = format!("{chain}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'x');\nvar s = {{a, b}};");
+    let source = format!(
+        "{chain}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'x');\nvar s = {{a, b}};"
+    );
     let rep = report_registered(&source);
     assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 1);
     // A differing surviving `this` field text (tag) keeps the pair silent.
-    let source = format!("{chain}const Impl a = Impl(name: 'x', tag: '1');\nconst Impl b = Impl(name: 'x', tag: '2');\nvar s = {{a, b}};");
+    let source = format!(
+        "{chain}const Impl a = Impl(name: 'x', tag: '1');\nconst Impl b = Impl(name: 'x', tag: '2');\nvar s = {{a, b}};"
+    );
     let rep = report_registered(&source);
     assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 0);
     // An equal surviving `this` field text still reports.
-    let source = format!("{chain}const Impl a = Impl(name: 'x', tag: 'k');\nconst Impl b = Impl(name: 'y', tag: 'k');\nvar s = {{a, b}};");
+    let source = format!(
+        "{chain}const Impl a = Impl(name: 'x', tag: 'k');\nconst Impl b = Impl(name: 'y', tag: 'k');\nvar s = {{a, b}};"
+    );
     let rep = report_registered(&source);
     assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 1);
     // Direct creations in a NON-const literal never compare (the
@@ -870,7 +863,9 @@ fn super_formal_evaporation_reports_equal_const_instances() {
         0
     );
     // The ERROR-tier const literal reports the same face.
-    let source = format!("{chain}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'x');\nconst s = {{a, b}};");
+    let source = format!(
+        "{chain}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'x');\nconst s = {{a, b}};"
+    );
     let rep = report_registered(&source);
     assert_eq!(
         count(&rows(&rep, &source), "equal_elements_in_const_set"),
@@ -880,7 +875,9 @@ fn super_formal_evaporation_reports_equal_const_instances() {
     // const constructor) forwards the super-formal value down; two
     // differing forwarded texts keep the instances distinct.
     let resolvable = "class Base {\n  const Base({required this.name});\n}\nclass Impl extends Base {\n  const Impl({required super.name});\n}\n";
-    let source = format!("{resolvable}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'y');\nvar s = {{a, b}};");
+    let source = format!(
+        "{resolvable}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'y');\nvar s = {{a, b}};"
+    );
     let rep = report_registered(&source);
     assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 0);
 }

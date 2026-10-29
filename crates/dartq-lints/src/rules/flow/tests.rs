@@ -1434,8 +1434,7 @@ fn rethrow_non_simple_and_shadowed_faces_stay_silent_on_real_parse() {
     let f = Fixture::parse("void f() {\n  try {} catch (e) {\n    throw (e);\n  }\n}\n");
     assert!(f.run(&one_rule_set).is_empty());
     // A member invocation is not the parameter reference.
-    let f =
-        Fixture::parse("void f() {\n  try {} catch (e) {\n    throw e.toString();\n  }\n}\n");
+    let f = Fixture::parse("void f() {\n  try {} catch (e) {\n    throw e.toString();\n  }\n}\n");
     assert!(f.run(&one_rule_set).is_empty());
     // A different name.
     let f = Fixture::parse("void f() {\n  try {} catch (e) {\n    throw x;\n  }\n}\n");
@@ -1445,9 +1444,8 @@ fn rethrow_non_simple_and_shadowed_faces_stay_silent_on_real_parse() {
     assert!(f.run(&one_rule_set).is_empty());
     // A shadowing local binds the throw (`e` the local, not the
     // parameter).
-    let f = Fixture::parse(
-        "void f() {\n  try {} catch (e) {\n    var e = 1;\n    throw e;\n  }\n}\n",
-    );
+    let f =
+        Fixture::parse("void f() {\n  try {} catch (e) {\n    var e = 1;\n    throw e;\n  }\n}\n");
     assert!(f.run(&one_rule_set).is_empty());
     // A shadowing for-in loop variable binds the throw the same way.
     let f = Fixture::parse(
@@ -2360,9 +2358,8 @@ fn catch_without_on_reports_a_bare_catch() {
 /// `on`-clause forms skip — with or without a catch clause.
 #[test]
 fn catch_without_on_on_forms_pass() {
-    let f = Fixture::parse(
-        "void f() { try {} on int catch (e) {} }\nvoid g() { try {} on int {} }",
-    );
+    let f =
+        Fixture::parse("void f() { try {} on int catch (e) {} }\nvoid g() { try {} on int {} }");
     assert!(
         f.run(&one_rule("avoid_catches_without_on_clauses"))
             .is_empty()
@@ -2749,9 +2746,8 @@ fn extension_type_parameters_skip() {
 /// when its own argument parens share a line (:149-157).
 #[test]
 fn anonymous_function_call_last_argument_passes() {
-    let f = Fixture::parse(
-        "void f() {\n  assert(\n    () {\n      return true;\n    }()\n  );\n}\n",
-    );
+    let f =
+        Fixture::parse("void f() {\n  assert(\n    () {\n      return true;\n    }()\n  );\n}\n");
     assert!(f.run(&one_rule("require_trailing_commas")).is_empty());
 }
 

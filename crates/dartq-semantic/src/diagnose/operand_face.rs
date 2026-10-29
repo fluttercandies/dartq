@@ -88,7 +88,6 @@ impl<'a> Engine<'a> {
                     .get(&row.range.offset)
                     .is_some_and(|decl| self.invalid_init_locals.borrow().contains(decl)) =>
             {
-                
                 OperandFace::Invalid
             }
             _ => OperandFace::Gap,

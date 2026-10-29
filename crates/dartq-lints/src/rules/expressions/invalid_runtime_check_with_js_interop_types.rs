@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, slice};
 
 const DART_IS_JS_PROBLEM: &str = "Runtime check between '{0}' and '{1}' checks whether a Dart value is a JS interop type, which might not be platform-consistent.";
 const DART_IS_JS_CORRECTION: &str =
@@ -58,40 +58,39 @@ fn check(c: &mut Check<'_>) {
     // inside the condition's token range that close before the
     // operator. The arrow-body return-type window (`preceding`)
     // exists only in the member-window shape.
-    let (left, preceding): (Vec<u32>, Vec<u32>) =
-        if c.kind(parent) == NodeKind::ParenthesizedCondition {
-            let Some(stmt) = c.ancestor(2) else {
-                return;
-            };
-            let cond = c.unit.ast.token_range(parent);
-            let node_start = c.unit.ast.token_range(node).start;
-            let run: Vec<u32> = c
-                .collect_direct(stmt)
-                .into_iter()
-                .filter(|&row| {
-                    let span = c.unit.ast.token_range(row);
-                    span.start >= cond.start
-                        && span.end <= node_start
-                        && !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified)
-                })
-                .collect();
-            (run, Vec::new())
-        } else {
-            let kids = c.collect_direct(parent);
-            let Some(pos) = kids.iter().position(|&kid| kid == node) else {
-                return;
-            };
-            (
-                kids[..pos]
-                    .iter()
-                    .copied()
-                    .filter(|&row| {
-                        !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified)
-                    })
-                    .collect(),
-                kids[..pos].to_vec(),
-            )
+    let (left, preceding): (Vec<u32>, Vec<u32>) = if c.kind(parent)
+        == NodeKind::ParenthesizedCondition
+    {
+        let Some(stmt) = c.ancestor(2) else {
+            return;
         };
+        let cond = c.unit.ast.token_range(parent);
+        let node_start = c.unit.ast.token_range(node).start;
+        let run: Vec<u32> = c
+            .collect_direct(stmt)
+            .into_iter()
+            .filter(|&row| {
+                let span = c.unit.ast.token_range(row);
+                span.start >= cond.start
+                    && span.end <= node_start
+                    && !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified)
+            })
+            .collect();
+        (run, Vec::new())
+    } else {
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        (
+            kids[..pos]
+                .iter()
+                .copied()
+                .filter(|&row| !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified))
+                .collect(),
+            kids[..pos].to_vec(),
+        )
+    };
     let Some(&root) = left.last() else {
         return;
     };
@@ -158,8 +157,8 @@ fn check(c: &mut Check<'_>) {
     // row — `token_range().start` is the operator token); the official
     // `reportAtNode` opens at the operand. `head_token` on the operand
     // row answers that start.
-    let range = crate::rules::utf16_token_span(c, c.head_token(operand_row)).start
-        ..c.utf16_span(node).end;
+    let range =
+        crate::rules::utf16_token_span(c, c.head_token(operand_row)).start..c.utf16_span(node).end;
     if is_check {
         c.report_texts(
             range,
@@ -277,8 +276,7 @@ fn same_file_js_class(c: &Check<'_>, name: &str) -> bool {
             c.kind(kid) == NodeKind::Identifier
                 && c.field(kid, PayloadField::Context)
                     == Some(
-                        dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
-                            as u32,
+                        dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration as u32,
                     )
                 && c.lexeme(c.head_token(kid)) == name
         });

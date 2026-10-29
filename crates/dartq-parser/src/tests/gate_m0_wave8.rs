@@ -608,8 +608,9 @@ fn unclosed_type_args_in_block_read_as_expressions() {
         assert!(got.contains(&want), "missing {want:?}: {got:?}");
     }
     assert!(
-        !got.iter().any(|(code, _, _)| code == "missing_function_body"
-            || code == "missing_function_parameters"),
+        !got.iter()
+            .any(|(code, _, _)| code == "missing_function_body"
+                || code == "missing_function_parameters"),
         "no declaration-shaped rows: {got:?}"
     );
 }

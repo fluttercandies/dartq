@@ -56,7 +56,9 @@ fn rpc_error_is_structured() {
 #[test]
 fn rpc_error_details_are_captured() {
     let vm = MockVm::start(|request| match request.method.as_str() {
-        "evaluateInFrame" => err_with_details(113, "Expression compilation error", "undefined name 'x'"),
+        "evaluateInFrame" => {
+            err_with_details(113, "Expression compilation error", "undefined name 'x'")
+        }
         _ => default_reply(request),
     });
     let client = VmClient::connect(&vm.ws_uri).expect("connect to mock");
@@ -83,7 +85,10 @@ fn rpc_timeout_is_reported_and_connection_survives() {
         .call("hang", json!({}), Duration::from_millis(150))
         .expect_err("silent peer must time out");
     assert!(matches!(error, Error::Timeout(_)), "got {error:?}");
-    assert_eq!(client.get_version().expect("connection still alive").major, 4);
+    assert_eq!(
+        client.get_version().expect("connection still alive").major,
+        4
+    );
 }
 
 #[test]
@@ -126,8 +131,7 @@ fn stray_response_id_is_discarded() {
     let client = VmClient::connect(&vm.ws_uri).expect("connect to mock");
     vm.control()
         .send(Control::Raw(
-            json!({ "jsonrpc": "2.0", "id": "99999", "result": { "type": "Version" } })
-                .to_string(),
+            json!({ "jsonrpc": "2.0", "id": "99999", "result": { "type": "Version" } }).to_string(),
         ))
         .expect("send stray response");
     assert_eq!(client.get_version().expect("connection survives").major, 4);
@@ -222,10 +226,11 @@ fn stream_listen_reports_duplicate_subscription() {
         _ => default_reply(request),
     });
     let client = VmClient::connect(&vm.ws_uri).expect("connect to mock");
-    let error = client
-        .stream_listen("Debug")
-        .expect_err("103 must surface");
-    assert!(matches!(error, Error::Rpc { code: 103, .. }), "got {error:?}");
+    let error = client.stream_listen("Debug").expect_err("103 must surface");
+    assert!(
+        matches!(error, Error::Rpc { code: 103, .. }),
+        "got {error:?}"
+    );
 }
 
 #[test]
@@ -270,7 +275,10 @@ fn last_client_drop_closes_the_connection() {
     // requests drain) proves teardown ran.
     let deadline = std::time::Instant::now() + WAIT;
     loop {
-        match vm.requests.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        match vm
+            .requests
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout)
                 if std::time::Instant::now() < deadline => {}
@@ -304,7 +312,10 @@ fn dropped_events_counts_feed_overruns() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(client.dropped_events(), 2);
-    assert_eq!(client.drain_events().len(), dartq_debug::EVENT_BUFFER_CAPACITY);
+    assert_eq!(
+        client.drain_events().len(),
+        dartq_debug::EVENT_BUFFER_CAPACITY
+    );
 }
 
 #[test]
@@ -373,10 +384,9 @@ fn attach_fails_within_the_handshake_budget_when_rpcs_stall() {
         ..SessionConfig::default()
     };
     let started = std::time::Instant::now();
-    let error =
-        DebugSession::attach_with(&vm.ws_uri, settings)
-            .err()
-            .expect("a silent vm must fail");
+    let error = DebugSession::attach_with(&vm.ws_uri, settings)
+        .err()
+        .expect("a silent vm must fail");
     assert!(
         matches!(error, Error::Timeout(ref message) if message.contains("getVersion")),
         "the structured timeout names the stalled rpc: {error:?}"

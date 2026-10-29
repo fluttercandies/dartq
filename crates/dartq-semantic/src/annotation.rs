@@ -253,7 +253,9 @@ fn imports_meta(
 ) -> bool {
     graph.import_edges(lib).iter().any(|edge| {
         edge.prefix == prefix
-            && edge.target.is_some_and(|target| is_meta_library(graph, target))
+            && edge
+                .target
+                .is_some_and(|target| is_meta_library(graph, target))
             && edge.combinators.allows(getter_id)
     })
 }
@@ -557,7 +559,10 @@ mod tests {
     /// annotation resolves locally, never to meta.
     #[test]
     fn local_shadow_suppresses_bare_recognition() {
-        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &["sealed"]);
+        let rig = Rig::new(
+            &[Import::named("package:meta/meta.dart", "meta")],
+            &["sealed"],
+        );
         assert!(!rig.recognizes("sealed", "sealed"));
     }
 
@@ -567,7 +572,14 @@ mod tests {
     /// unresolved.
     #[test]
     fn prefixed_import_recognizes_by_prefix() {
-        let rig = Rig::new(&[Import::prefixed_named("package:meta/meta.dart", "meta", "meta")], &[]);
+        let rig = Rig::new(
+            &[Import::prefixed_named(
+                "package:meta/meta.dart",
+                "meta",
+                "meta",
+            )],
+            &[],
+        );
         assert!(rig.recognizes("meta.sealed", "sealed"));
         assert!(!rig.recognizes("sealed", "sealed"));
         assert!(!rig.recognizes("p.sealed", "sealed"));
@@ -608,7 +620,14 @@ mod tests {
     /// prefixed import, and a wrong prefix stays unresolved.
     #[test]
     fn prefixed_literal_recognizes_by_prefix() {
-        let rig = Rig::new(&[Import::prefixed_named("package:meta/meta.dart", "meta", "meta")], &[]);
+        let rig = Rig::new(
+            &[Import::prefixed_named(
+                "package:meta/meta.dart",
+                "meta",
+                "meta",
+            )],
+            &[],
+        );
         assert!(rig.meta_literal("meta.literal"));
         assert!(!rig.meta_literal("literal"));
         assert!(!rig.meta_literal("p.literal"));
@@ -692,7 +711,14 @@ mod tests {
     /// Prefixed: `@meta.UseResult.unless` through `import ... as meta;`.
     #[test]
     fn prefixed_unless_resolves_parameter_defined_span() {
-        let rig = Rig::new(&[Import::prefixed_named("package:meta/meta.dart", "meta", "meta")], &[]);
+        let rig = Rig::new(
+            &[Import::prefixed_named(
+                "package:meta/meta.dart",
+                "meta",
+                "meta",
+            )],
+            &[],
+        );
         assert_eq!(
             rig.unless_span(
                 "meta.UseResult.unless",

@@ -69,10 +69,7 @@ fn missing_pattern(diagnostic: &Diagnostic) -> Option<&str> {
 /// still carries. The diagnostic anchors the `switch` keyword;
 /// upstream's producer walks `SwitchStatement`/`SwitchExpression` node
 /// fields, which this face mirrors over the paired token groups.
-fn switch_frame(
-    tokens: &TokenTable,
-    offset: u32,
-) -> Option<(usize, usize, usize, usize)> {
+fn switch_frame(tokens: &TokenTable, offset: u32) -> Option<(usize, usize, usize, usize)> {
     let keyword = token_starting_at(tokens, offset)?;
     if kind_of(tokens, keyword)? != TokenKind::Keyword(Keyword::Switch) {
         return None;
@@ -195,8 +192,7 @@ pub(crate) fn from_switch_cases(
         let Some(frame) = switch_frame(tokens, diagnostic.range.offset) else {
             continue;
         };
-        let Some((offset, length, replacement)) =
-            insertion(text, tokens, face, pattern, frame)
+        let Some((offset, length, replacement)) = insertion(text, tokens, face, pattern, frame)
         else {
             continue;
         };

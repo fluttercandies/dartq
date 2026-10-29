@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_is_not_operator.dart:33-55`
 /// — `!(x is T)` (the `is` expression wrapped in parentheses under a
@@ -19,11 +19,8 @@ use super::{PayloadField, Check, NodeKind, RuleSpec};
 /// (paren directly under the prefix) is the official shape, so a
 /// double paren `!((x is int))` stays silent, as does a postfix
 /// operand (`x!.m`).
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_is_not_operator",
-    &[NodeKind::IsExpression],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("prefer_is_not_operator", &[NodeKind::IsExpression], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

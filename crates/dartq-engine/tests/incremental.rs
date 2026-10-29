@@ -433,8 +433,7 @@ fn depth2_part_chain_joins_through_the_attached_middle() {
     // includer, so the leaf never reports the defining-library mismatch.
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(
-        diagnostics[0].code.name,
-        "non_part_of_directive_in_part",
+        diagnostics[0].code.name, "non_part_of_directive_in_part",
         "{diagnostics:?}"
     );
 }

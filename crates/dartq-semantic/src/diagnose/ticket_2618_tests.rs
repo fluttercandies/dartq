@@ -95,7 +95,11 @@ fn assert_resolved(report: &FileReport) {
 /// offset-ascending — the deterministic projection the pins compare. The
 /// row span is the MEMBER name token, so every expectation's offset lands
 /// exactly on its spelling (asserted here, not trusted).
-fn rows(source: &str, report: &FileReport, strings: &StringTable) -> Vec<(usize, &'static str, String)> {
+fn rows(
+    source: &str,
+    report: &FileReport,
+    strings: &StringTable,
+) -> Vec<(usize, &'static str, String)> {
     let mut rows: Vec<_> = report
         .member_refs
         .iter()
@@ -128,7 +132,10 @@ fn rows(source: &str, report: &FileReport, strings: &StringTable) -> Vec<(usize,
 /// spelling's length — the needle leads at the receiver, the row at the
 /// member).
 fn at(source: &str, needle: &str, skip: usize) -> usize {
-    source.find(needle).unwrap_or_else(|| panic!("`{needle}` missing")) + skip
+    source
+        .find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` missing"))
+        + skip
 }
 
 /// The send-shape sweep: every qualified and implicit-this member access
@@ -185,7 +192,11 @@ fn member_refs_cover_the_send_shapes() {
         .iter()
         .map(|&(needle, skip, kind, target)| (at(source, needle, skip), kind, target.to_owned()))
         .collect();
-    assert_eq!(rows(source, &report, &strings), wanted, "one edge per resolved member send");
+    assert_eq!(
+        rows(source, &report, &strings),
+        wanted,
+        "one edge per resolved member send"
+    );
 }
 
 /// `super.m` resolves onto the superclass declaration; a nullable
@@ -283,7 +294,11 @@ fn interface_typed_receivers_target_the_interface_declaration() {
                   }\n";
     let (report, strings) = report(source);
     assert_resolved(&report);
-    let expected = vec![(at(source, "r.createTask()", 2), "invoked", "createTask".to_owned())];
+    let expected = vec![(
+        at(source, "r.createTask()", 2),
+        "invoked",
+        "createTask".to_owned(),
+    )];
     assert_eq!(rows(source, &report, &strings), expected);
 }
 

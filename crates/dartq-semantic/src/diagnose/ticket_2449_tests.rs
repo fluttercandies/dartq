@@ -89,11 +89,7 @@ fn count_code(report: &FileReport, name: &str) -> usize {
 }
 
 fn codes(report: &FileReport) -> Vec<&str> {
-    report
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect()
+    report.diagnostics.iter().map(|d| d.code.name).collect()
 }
 
 /// The plain-dot face on a non-nullable getter receiver: the getter's
@@ -317,4 +313,3 @@ void test() {
         codes(&report)
     );
 }
-

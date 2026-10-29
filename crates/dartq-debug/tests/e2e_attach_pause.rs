@@ -101,7 +101,10 @@ fn attach_pause_step_rewind() {
     // Attach to the paused-at-start isolate.
     let mut session = DebugSession::attach_with(&ws_uri, config())
         .unwrap_or_else(|e| panic!("attach failed: {e}"));
-    assert!(session.main_isolate().is_some(), "no main isolate on attach");
+    assert!(
+        session.main_isolate().is_some(),
+        "no main isolate on attach"
+    );
 
     // The isolate is paused at entry — arm a breakpoint mid-program
     // (L57: plenty of execution left after it) and resume.
@@ -138,10 +141,10 @@ fn attach_pause_step_rewind() {
         "no events recorded after attach session"
     );
     assert!(
-        batch
-            .events
-            .iter()
-            .any(|e| matches!(e.event.kind, EventKind::PauseBreakpoint | EventKind::PauseInterrupted)),
+        batch.events.iter().any(|e| matches!(
+            e.event.kind,
+            EventKind::PauseBreakpoint | EventKind::PauseInterrupted
+        )),
         "no pause event in ring"
     );
 

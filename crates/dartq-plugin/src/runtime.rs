@@ -2733,10 +2733,9 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let (batch, pending_queries) =
-            pending
-                .wait_for_output(start + Duration::from_secs(5))
-                .expect("the push woke the wait");
+        let (batch, pending_queries) = pending
+            .wait_for_output(start + Duration::from_secs(5))
+            .expect("the push woke the wait");
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "woke on the push signal, long before the deadline"
@@ -2755,10 +2754,9 @@ mod tests {
         // A non-empty queue skips the first-row wait and only settles the
         // burst; the settle window (5 ms) bounds this far below the old
         // full-deadline shape.
-        let (batch, pending_queries) =
-            pending
-                .wait_for_output(start + Duration::from_millis(50))
-                .expect("the queued row skips the park");
+        let (batch, pending_queries) = pending
+            .wait_for_output(start + Duration::from_millis(50))
+            .expect("the queued row skips the park");
         assert!(start.elapsed() < Duration::from_millis(50));
         assert_eq!(batch.len(), 1);
         assert_eq!(pending_queries, 0);
@@ -2823,10 +2821,9 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let (batch, pending_queries) =
-            pending
-                .wait_for_output(start + Duration::from_secs(5))
-                .expect("the query woke the wait");
+        let (batch, pending_queries) = pending
+            .wait_for_output(start + Duration::from_secs(5))
+            .expect("the query woke the wait");
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "the query woke the wait immediately"

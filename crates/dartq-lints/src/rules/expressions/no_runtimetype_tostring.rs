@@ -32,11 +32,8 @@ const CLASS_ABSTRACT_BIT: u16 = 1 << 2;
 /// reads the same-file declarations only, so core and cross-file
 /// `on` types skip. Message: `diagnostic.g.dart`
 /// `noRuntimetypeTostring`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_runtimetype_tostring",
-    &[NodeKind::Send],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("no_runtimetype_tostring", &[NodeKind::Send], check,);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent
@@ -168,9 +165,7 @@ fn on_concrete_class(c: &Check<'_>, extension: u32) -> bool {
     let Some(on_type) = c
         .collect_direct(extension)
         .into_iter()
-        .take_while(|&kid| {
-            !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
-        })
+        .take_while(|&kid| !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody))
         .find(|&kid| c.kind(kid) == NodeKind::Type)
     else {
         return false;

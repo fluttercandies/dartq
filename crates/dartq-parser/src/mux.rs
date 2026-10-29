@@ -328,10 +328,8 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
     }
 
     fn end_formal_parameter_default_value_expression(&mut self, token: Token) {
-        self.a
-            .end_formal_parameter_default_value_expression(token);
-        self.b
-            .end_formal_parameter_default_value_expression(token);
+        self.a.end_formal_parameter_default_value_expression(token);
+        self.b.end_formal_parameter_default_value_expression(token);
     }
 
     fn begin_top_level_method(
@@ -571,22 +569,10 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
         has_constructor_name: bool,
         name: Option<Token>,
     ) {
-        self.a.end_primary_constructor(
-            kind,
-            begin,
-            end,
-            const_keyword,
-            has_constructor_name,
-            name,
-        );
-        self.b.end_primary_constructor(
-            kind,
-            begin,
-            end,
-            const_keyword,
-            has_constructor_name,
-            name,
-        );
+        self.a
+            .end_primary_constructor(kind, begin, end, const_keyword, has_constructor_name, name);
+        self.b
+            .end_primary_constructor(kind, begin, end, const_keyword, has_constructor_name, name);
     }
 
     fn begin_method(

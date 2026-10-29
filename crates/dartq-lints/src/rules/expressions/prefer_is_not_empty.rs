@@ -13,11 +13,8 @@ use super::{Check, NodeKind, RuleSpec, query_site, slice};
 /// the operand run at the argument boundaries — a later argument's
 /// access no longer leaks into the run (the documented false-fire
 /// face). Message: `diagnostic.g.dart` `preferIsNotEmpty`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_is_not_empty",
-    &[NodeKind::UnaryPrefix],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("prefer_is_not_empty", &[NodeKind::UnaryPrefix], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

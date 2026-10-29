@@ -432,12 +432,20 @@ mod tests {
     #[test]
     fn resolve_is_exact_across_bucket_boundaries() {
         let table = StringTable::new();
-        let ids: Vec<StringId> = (0..5000_u32).map(|i| table.intern(&format!("s{i}"))).collect();
+        let ids: Vec<StringId> = (0..5000_u32)
+            .map(|i| table.intern(&format!("s{i}")))
+            .collect();
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(id.index() as usize, i, "dense first-intern order");
             assert_eq!(table.resolve(*id), format!("s{i}"));
         }
-        for (index, (bucket, offset)) in [(0, (0, 0)), (31, (0, 31)), (32, (1, 0)), (95, (1, 63)), (96, (2, 0))] {
+        for (index, (bucket, offset)) in [
+            (0, (0, 0)),
+            (31, (0, 31)),
+            (32, (1, 0)),
+            (95, (1, 63)),
+            (96, (2, 0)),
+        ] {
             assert_eq!(slot_of(index), (bucket, offset), "slot of {index}");
         }
     }

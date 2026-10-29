@@ -469,7 +469,9 @@ void keepsAssertFace(Sdk? sourceFactory) {
     let family = cs
         .iter()
         .filter(|c| {
-            **c == "undefined_getter" || **c == "unchecked_use_of_nullable_value" || **c == "dead_code"
+            **c == "undefined_getter"
+                || **c == "unchecked_use_of_nullable_value"
+                || **c == "dead_code"
         })
         .collect::<Vec<_>>();
     // The pass-2 initializer derivation types `b` as `DNum.marker`'s

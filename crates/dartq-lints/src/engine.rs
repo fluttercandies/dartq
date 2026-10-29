@@ -2651,11 +2651,14 @@ void f(int x) {
         }
         // The default is the latest-version fold, and the horizon clamp
         // keeps everything past the vendored data at the latest posture.
-        assert_eq!(Features::default(), Features::from_feature_set(FeatureSet::latest()));
         assert_eq!(
-            Features::from_feature_set(FeatureSet::for_language_version(
-                LanguageVersion::new(3, 15)
-            )),
+            Features::default(),
+            Features::from_feature_set(FeatureSet::latest())
+        );
+        assert_eq!(
+            Features::from_feature_set(FeatureSet::for_language_version(LanguageVersion::new(
+                3, 15
+            ))),
             Features::default(),
         );
     }

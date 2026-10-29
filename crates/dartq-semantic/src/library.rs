@@ -488,12 +488,8 @@ pub(crate) fn member_lookup_defining<'a>(
     // `extends`/`with`/`implements`, a nested extension type its
     // `implements` — the same face set `walk_face_list` climbs for the
     // receiver-side walk).
-    let mut queue: VecDeque<(StringId, FileId)> = pending_faces
-        .iter()
-        .rev()
-        .flatten()
-        .copied()
-        .collect();
+    let mut queue: VecDeque<(StringId, FileId)> =
+        pending_faces.iter().rev().flatten().copied().collect();
     let mut scope_lib = owner_lib;
     while let Some((face, face_owner)) = queue.pop_front() {
         if !seen.insert(face) {
@@ -703,10 +699,7 @@ pub(crate) fn supertype_hop_dead(
     file: FileId,
     name: StringId,
 ) -> bool {
-    if index
-        .get(file)
-        .is_some_and(|f| f.container(name).is_some())
-    {
+    if index.get(file).is_some_and(|f| f.container(name).is_some()) {
         return false;
     }
     match namespaces.lookup(graph, lib, name) {
@@ -754,9 +747,7 @@ pub(crate) fn implements_interface(
     // bound, never the graph) is the oracle's InvalidType target: the
     // assignability faces stay silent. A core ask keeps the core-face
     // answer.
-    if entity_ask
-        && resolve_container(graph, namespaces, index, lib, file, interface).is_none()
-    {
+    if entity_ask && resolve_container(graph, namespaces, index, lib, file, interface).is_none() {
         return None;
     }
     let Some((container, owner)) =
@@ -808,14 +799,8 @@ pub(crate) fn implements_interface(
                     if core_implements(&core, edge, interface) {
                         return Some(true);
                     }
-                    if !supertype_hop_dead(
-                        graph,
-                        namespaces,
-                        index,
-                        owner_lib,
-                        current_owner,
-                        edge,
-                    ) {
+                    if !supertype_hop_dead(graph, namespaces, index, owner_lib, current_owner, edge)
+                    {
                         answer = None;
                     }
                 }

@@ -448,7 +448,8 @@ fn missing_selector_defers_to_the_existence_face() {
         ],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "a resolved class without the selector reports \
          undefined_constructor_in_initializer only — the oracle pairs no \
          arguments against it"
@@ -511,7 +512,8 @@ fn selector_over_dead_superclass_stays_silent_on_argument_faces() {
         ],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "a written selector over a dead superclass resolves against the \
          implicit Object and misses it — undefined_constructor_in_initializer \
          reports alone, with no argument faces (probed)"
@@ -538,7 +540,8 @@ fn selector_with_no_extends_stays_silent_on_argument_faces() {
         ],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the same Object-miss shape applies to the no-extends face"
     );
 }
@@ -556,10 +559,14 @@ fn empty_table_counts_only_attributed_positional_windows() {
     let got = code_lines(
         &fold.report,
         EMPTY_TABLE_COMPOUND_NAMED_VALUE,
-        &["extra_positional_arguments", "extra_positional_arguments_could_be_named"],
+        &[
+            "extra_positional_arguments",
+            "extra_positional_arguments_could_be_named",
+        ],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "a compound named-argument value leaves an unattributed window — \
          no phantom surplus against the empty table (the oracle sees one \
          named argument)"
@@ -617,7 +624,8 @@ fn unnamed_super_over_undefined_superclass_stays_silent() {
         &["undefined_constructor_in_initializer"],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the implicit super() face is satisfied by Object's unnamed \
          constructor — no report"
     );
@@ -643,7 +651,8 @@ fn named_super_selector_over_resolved_superclass_stays_silent() {
         &["undefined_constructor_in_initializer"],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "the fallback arm only covers unresolvable superclasses — a resolved \
          named constructor is the ordinary satisfied path"
     );
@@ -766,7 +775,8 @@ fn named_super_selector_over_prefixed_but_reachable_superclass_stays_silent() {
         &["undefined_constructor_in_initializer"],
     );
     assert_eq!(
-        got, vec![],
+        got,
+        vec![],
         "a superclass reachable through a prefixed import resolves for the \
          oracle — the Object fallback must not report through the bare \
          continuation edge"

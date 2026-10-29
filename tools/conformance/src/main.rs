@@ -485,7 +485,10 @@ fn extract_command(
             feature_extraction.skips.extend(co19_extraction.skips);
         }
         Some(dir) => {
-            *stats.feature_skips.entry("co19_missing".to_string()).or_insert(0) += 1;
+            *stats
+                .feature_skips
+                .entry("co19_missing".to_string())
+                .or_insert(0) += 1;
             eprintln!("warn: no LanguageFeatures under {}", dir.display());
         }
         None => {
@@ -510,7 +513,11 @@ fn extract_command(
     stats.parserfe_files_scanned = front_end_extraction.scanned;
     for skip in &front_end_extraction.skips {
         *stats.parserfe_skips.entry(skip.reason.clone()).or_insert(0) += 1;
-        skip_triples.insert(("parser-fe".to_string(), skip.reason.clone(), skip.id.clone()));
+        skip_triples.insert((
+            "parser-fe".to_string(),
+            skip.reason.clone(),
+            skip.id.clone(),
+        ));
     }
     for c in &front_end_extraction.cases {
         write_case(out, c, &mut rows, check, &mut stats.case_writes_skipped);
@@ -557,7 +564,10 @@ fn extract_command(
             eprintln!("error: cannot write {}: {e}", manifest_path.display());
             return 2;
         }
-        write_skip_inventory(manifest_path.parent().unwrap_or(Path::new(".")), &skip_triples);
+        write_skip_inventory(
+            manifest_path.parent().unwrap_or(Path::new(".")),
+            &skip_triples,
+        );
     }
 
     stats.print(started);
@@ -645,10 +655,7 @@ fn write_skip_inventory(
         ids.dedup();
         let count = ids.len();
         ids.truncate(3);
-        out.push_str(&format!(
-            "{face}\t{reason}\t{count}\t{}\n",
-            ids.join(", ")
-        ));
+        out.push_str(&format!("{face}\t{reason}\t{count}\t{}\n", ids.join(", ")));
     }
     let path = dir.join("skips.tsv");
     if let Err(e) = std::fs::write(&path, out) {
@@ -938,8 +945,11 @@ mod tests {
     fn read_git_head_resolves_detached_loose_and_packed() {
         let dir = std::env::temp_dir().join("dartq-conf-head-detached");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        std::fs::write(dir.join(".git/HEAD"), "8c17c2fa3d018098494422557d195ad396a0daf8\n")
-            .unwrap();
+        std::fs::write(
+            dir.join(".git/HEAD"),
+            "8c17c2fa3d018098494422557d195ad396a0daf8\n",
+        )
+        .unwrap();
         assert_eq!(
             read_git_head(&dir).as_deref(),
             Some("8c17c2fa3d018098494422557d195ad396a0daf8")
@@ -1051,7 +1061,11 @@ mod tests {
         let checkout = work.join("co19");
         fake_checkout(&checkout, "8c17c2fa3d018098494422557d195ad396a0daf8");
         let pin = work.join("pin.toml");
-        std::fs::write(&pin, "sdk_version = \"3.13.7\"\nco19_revision = \"a83e2182\"\n").unwrap();
+        std::fs::write(
+            &pin,
+            "sdk_version = \"3.13.7\"\nco19_revision = \"a83e2182\"\n",
+        )
+        .unwrap();
 
         let warnings = co19_pin_warnings(&checkout, &pin);
         assert_eq!(warnings.len(), 1);

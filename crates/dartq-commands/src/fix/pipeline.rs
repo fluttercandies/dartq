@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The fix source stage: validates the targets through discovery, then
 /// parses each file once through the lints layer's production entry and
 /// runs its governing-options lint set; every hit the mechanical
@@ -192,7 +191,13 @@ pub fn collect_set_with_evidence(
         if fuse.tripped() {
             break 'files;
         }
-        applied.extend(from_semantic(semantic_rows, &text, &parsed.lines, path, &fuse));
+        applied.extend(from_semantic(
+            semantic_rows,
+            &text,
+            &parsed.lines,
+            path,
+            &fuse,
+        ));
         applied.extend(from_imports(
             semantic_rows,
             import_contexts.get(path),
@@ -201,7 +206,13 @@ pub fn collect_set_with_evidence(
             &parsed.lines,
             &fuse,
         ));
-        applied.extend(from_parser(semantic_rows, &text, &parsed.lines, path, &fuse));
+        applied.extend(from_parser(
+            semantic_rows,
+            &text,
+            &parsed.lines,
+            path,
+            &fuse,
+        ));
         applied.extend(from_switch_cases(
             semantic_rows,
             &text,

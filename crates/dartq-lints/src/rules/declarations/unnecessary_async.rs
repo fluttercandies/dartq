@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, async_words, member_declaration_name, override_annotation};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, async_words, member_declaration_name,
+    override_annotation,
+};
 use crate::rules::{NONE_TOKEN, is_statement_row, last_child, type_before, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_async.dart:100-203`
@@ -121,13 +124,8 @@ fn absent_face(c: &Check<'_>, node: u32) -> Face {
                 .iter()
                 .any(|&a| {
                     super::container_members(c, a).1.iter().any(|&m| {
-                        !crate::rules::member_matches(
-                            c,
-                            m,
-                            crate::rules::MemberQuery::Method,
-                            name,
-                        )
-                        .is_empty()
+                        !crate::rules::member_matches(c, m, crate::rules::MemberQuery::Method, name)
+                            .is_empty()
                     })
                 })
         });
@@ -171,7 +169,8 @@ fn scan_body(c: &Check<'_>, owner: u32) -> BodyScan {
                     .into_iter()
                     .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
                     .is_some_and(|parts| {
-                        c.field(parts, PayloadField::AwaitKeyword).unwrap_or(NONE_TOKEN)
+                        c.field(parts, PayloadField::AwaitKeyword)
+                            .unwrap_or(NONE_TOKEN)
                             != NONE_TOKEN
                     })
                 {

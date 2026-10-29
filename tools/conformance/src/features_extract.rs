@@ -267,7 +267,15 @@ fn extract_one(
 
     // Companion files carried for relative imports (section path, content).
     let mut companions: Vec<(String, String)> = Vec::new();
-    carry_imports(root, prefix, rel, &content, &mut companions, &mut Vec::new(), out);
+    carry_imports(
+        root,
+        prefix,
+        rel,
+        &content,
+        &mut companions,
+        &mut Vec::new(),
+        out,
+    );
 
     // Package declarations: the suite config's always-present packages plus
     // every SDK-internal package any file of the case imports. A directive
@@ -346,14 +354,12 @@ pub fn header_options(content: &str) -> (Option<String>, Vec<String>) {
                 let rest = rest.trim_start();
                 if let Some(rest) = rest.strip_prefix('=') {
                     let version = rest.trim();
-                    let valid = version
-                        .split_once('.')
-                        .is_some_and(|(a, b)| {
-                            !a.is_empty()
-                                && a.bytes().all(|b| b.is_ascii_digit())
-                                && !b.is_empty()
-                                && b.bytes().all(|b| b.is_ascii_digit())
-                        });
+                    let valid = version.split_once('.').is_some_and(|(a, b)| {
+                        !a.is_empty()
+                            && a.bytes().all(|b| b.is_ascii_digit())
+                            && !b.is_empty()
+                            && b.bytes().all(|b| b.is_ascii_digit())
+                    });
                     if valid {
                         language = Some(version.to_string());
                     }
@@ -606,7 +612,10 @@ mod tests {
 
     #[test]
     fn flag_tables_cover_obvious_dirs() {
-        assert_eq!(language_flag("dot_shorthands/x_test.dart"), "dot-shorthands");
+        assert_eq!(
+            language_flag("dot_shorthands/x_test.dart"),
+            "dot-shorthands"
+        );
         assert_eq!(language_flag("records/a_test.dart"), "records");
         assert_eq!(language_flag("extension_type/a_test.dart"), "inline-class");
         assert_eq!(language_flag("nnbd/a_test.dart"), "non-nullable");
@@ -617,7 +626,10 @@ mod tests {
             "dot-shorthands"
         );
         assert_eq!(co19_flag("Extension-types/a_t01.dart"), "inline-class");
-        assert_eq!(co19_flag("Super-mixins/a_t01.dart"), "_core/co19/Super-mixins");
+        assert_eq!(
+            co19_flag("Super-mixins/a_t01.dart"),
+            "_core/co19/Super-mixins"
+        );
         assert_eq!(co19_flag("regression/x_t01.dart"), "_core/co19/regression");
     }
 
@@ -638,7 +650,12 @@ mod tests {
         let src = "aaa\nbbb //# 02: runtime error\nccc //# 02: continued\nddd //# 07: static type warning\neee //# 10: ok\nfff\n";
         let (sections, multitest) = split_multitest(src, "x_test.dart");
         assert!(multitest);
-        let get = |k: &str| sections.iter().find(|(key, _)| key == k).map(|(_, t)| t.clone());
+        let get = |k: &str| {
+            sections
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, t)| t.clone())
+        };
         assert_eq!(sections.len(), 4);
         // Four tagged lines leave four blank lines in the `none` section.
         assert_eq!(
@@ -682,7 +699,12 @@ mod tests {
         // directives do not match.
         assert_eq!(
             imports,
-            vec!["helper.dart", "annotated.dart", "parts.dart", "../upper.dart"]
+            vec![
+                "helper.dart",
+                "annotated.dart",
+                "parts.dart",
+                "../upper.dart"
+            ]
         );
     }
 
@@ -800,10 +822,12 @@ mod tests {
             .find(|c| c.id.ends_with("multi_test_none"))
             .expect("multitest");
         assert_eq!(multi.files[0].0, "language/feat/multi_test_none.dart");
-        assert!(multi
-            .files
-            .iter()
-            .any(|(p, _)| p == "language/feat/part.dart"));
+        assert!(
+            multi
+                .files
+                .iter()
+                .any(|(p, _)| p == "language/feat/part.dart")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

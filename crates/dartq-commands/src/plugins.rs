@@ -572,7 +572,10 @@ pub struct PluginBatch {
 /// context's own `pluginConfigurations` (`_getConfigurationsForFile`'s
 /// null arm, plugin_server.dart:719-735); the caller supplies the root
 /// entry as that fallback.
-fn governing_for<'a>(path: &Path, governing: &'a [&'a AnalysisOptions]) -> Option<&'a AnalysisOptions> {
+fn governing_for<'a>(
+    path: &Path,
+    governing: &'a [&'a AnalysisOptions],
+) -> Option<&'a AnalysisOptions> {
     governing
         .iter()
         .copied()

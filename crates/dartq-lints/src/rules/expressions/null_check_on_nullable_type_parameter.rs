@@ -1,6 +1,9 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, switch_scrutinee_read, written_type_sibling};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, slice, switch_scrutinee_read,
+    written_type_sibling,
+};
 use crate::rules::utf16_token_span;
 
 /// Official: `pkg/linter/lib/src/rules/null_check_on_nullable_type_parameter.dart`
@@ -91,8 +94,7 @@ fn check(c: &mut Check<'_>) {
     // name falls back to the same-class field face. The head must be an
     // in-scope type parameter (`isNullableTypeParameterType`).
     let operand = if this_prefixed {
-        crate::rules::type_face_of_field(c, name)
-            .and_then(|face| Some((face.name?, face.nullable)))
+        crate::rules::type_face_of_field(c, name).and_then(|face| Some((face.name?, face.nullable)))
     } else {
         written_target_type(c, node, name)
     };
@@ -238,9 +240,7 @@ fn in_scope_type_parameter_names<'a>(c: &'a Check<'_>) -> Vec<&'a str> {
     let mut names = Vec::new();
     for &ancestor in c.path.iter() {
         match c.kind(ancestor) {
-            NodeKind::ClassDeclaration
-            | NodeKind::MixinDeclaration
-            | NodeKind::EnumDeclaration => {
+            NodeKind::ClassDeclaration | NodeKind::MixinDeclaration | NodeKind::EnumDeclaration => {
                 names.extend(class_type_parameter_names(c, ancestor));
             }
             NodeKind::TopLevelMethod | NodeKind::Method => {
@@ -295,8 +295,7 @@ fn class_type_parameter_names<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<&'a s
         .collect_direct(variables)
         .into_iter()
         .filter(|&kid| {
-            c.kind(kid) == NodeKind::Identifier
-                && c.field(kid, PayloadField::Context) == Some(ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         })
         .map(|name| c.lexeme(c.head_token(name)))
         .collect();
@@ -332,10 +331,7 @@ fn context_expects_same_nullable(c: &Check<'_>, expected: &str, operand: (&str, 
 /// type is `T?` (the official `writeType` face), or an argument whose
 /// callee's formal table (the bridge signature face) declares `T?`.
 /// A body boundary first bails.
-fn expected_type_type_parameter<'a>(
-    c: &'a Check<'_>,
-    operand: (&str, bool),
-) -> Option<&'a str> {
+fn expected_type_type_parameter<'a>(c: &'a Check<'_>, operand: (&str, bool)) -> Option<&'a str> {
     for &ancestor in c.path.iter().rev().skip(1) {
         match c.kind(ancestor) {
             NodeKind::VariableInitializer => {
@@ -401,11 +397,7 @@ fn assignment_target_name<'a>(c: &'a Check<'_>, assignment: u32) -> Option<(&'a 
 /// The written `(name, nullable)` of the assignment target: the
 /// shadow-correct same-file binding first, then the same-class field
 /// face.
-fn written_target_type<'a>(
-    c: &'a Check<'_>,
-    use_node: u32,
-    name: &str,
-) -> Option<(&'a str, bool)> {
+fn written_target_type<'a>(c: &'a Check<'_>, use_node: u32, name: &str) -> Option<(&'a str, bool)> {
     if let Some((_, Some(row))) = super::same_file::binding(c, use_node, name)
         && c.kind(row) == NodeKind::Type
     {
@@ -531,7 +523,6 @@ fn written_return_type<'a>(c: &'a Check<'_>, function: u32) -> Option<(&'a str, 
         return None;
     }
     let name_token = c.head_token(type_row);
-    let nullable =
-        c.byte_span(type_row).end > crate::rules::byte_span_of_token(c, name_token).end;
+    let nullable = c.byte_span(type_row).end > crate::rules::byte_span_of_token(c, name_token).end;
     Some((c.lexeme(name_token), nullable))
 }

@@ -4,11 +4,8 @@ use super::{Check, NodeKind, RuleSpec};
 /// — an integer literal whose value does not survive the f64 round
 /// trip (`value.toDouble().toInt() != value`, :29) reports at the
 /// literal. Hexadecimal literals wrap modulo 2^64 (the VM face).
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_js_rounded_ints",
-    &[NodeKind::LiteralInt],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("avoid_js_rounded_ints", &[NodeKind::LiteralInt], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

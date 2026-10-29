@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, formal_parameter_rows, operator_name};
+use super::{Check, NodeKind, PayloadField, RuleSpec, formal_parameter_rows, operator_name};
 use crate::rules::class_declaration_name;
 
 /// Official: `pkg/linter/lib/src/rules/test_types_in_equals.dart:35-48`
@@ -8,11 +8,8 @@ use crate::rules::class_declaration_name;
 /// extension's `on` type source, or `unknown`). The enclosing face is
 /// `MethodDeclaration` — top-level functions never qualify. Message:
 /// `diagnostic.g.dart` `testTypesInEquals`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "test_types_in_equals",
-    &[NodeKind::AsExpression],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("test_types_in_equals", &[NodeKind::AsExpression], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -97,9 +94,7 @@ fn owner_type_name(c: &Check<'_>, method: u32) -> String {
     let mut current = method;
     while let Some(parent) = c.unit.ast.parent(current) {
         match c.kind(parent) {
-            NodeKind::ClassDeclaration
-            | NodeKind::EnumDeclaration
-            | NodeKind::MixinDeclaration => {
+            NodeKind::ClassDeclaration | NodeKind::EnumDeclaration | NodeKind::MixinDeclaration => {
                 return class_declaration_name(c, parent)
                     .unwrap_or("unknown")
                     .to_owned();

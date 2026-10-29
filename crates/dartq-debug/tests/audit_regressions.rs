@@ -90,7 +90,11 @@ fn same_breakpoint_id_in_two_isolates_is_tracked_separately() {
     session
         .add_breakpoint(line_spec("isolates/2", Some("ready")))
         .expect("bp on isolate 2");
-    assert_eq!(session.breakpoints().count(), 2, "ids collide across isolates");
+    assert_eq!(
+        session.breakpoints().count(),
+        2,
+        "ids collide across isolates"
+    );
 
     session
         .remove_breakpoint(Some("isolates/2"), "breakpoints/1")
@@ -119,7 +123,10 @@ fn failed_remove_keeps_the_handle() {
     let error = session
         .remove_breakpoint(None, "breakpoints/1")
         .expect_err("VM rejects the removal");
-    assert!(matches!(error, Error::Rpc { code: -32602, .. }), "got {error:?}");
+    assert!(
+        matches!(error, Error::Rpc { code: -32602, .. }),
+        "got {error:?}"
+    );
     assert_eq!(session.breakpoints().count(), 1);
 }
 
@@ -146,11 +153,18 @@ fn isolate_exit_drops_its_breakpoints() {
         _ => default_reply(request),
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    session.add_breakpoint(line_spec("isolates/1", None)).expect("bp 1");
-    session.add_breakpoint(line_spec("isolates/2", None)).expect("bp 2");
+    session
+        .add_breakpoint(line_spec("isolates/1", None))
+        .expect("bp 1");
+    session
+        .add_breakpoint(line_spec("isolates/2", None))
+        .expect("bp 2");
     session.stack(Some("isolates/1"), 1).expect("barrier");
     session.poll_events().expect("poll");
-    let remaining: Vec<_> = session.breakpoints().map(|bp| bp.isolate.as_str()).collect();
+    let remaining: Vec<_> = session
+        .breakpoints()
+        .map(|bp| bp.isolate.as_str())
+        .collect();
     assert_eq!(remaining, ["isolates/1"]);
     assert_eq!(session.isolates().count(), 1);
 }
@@ -213,7 +227,9 @@ fn stale_pause_before_resume_is_not_reported() {
         _ => default_reply(request),
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    session.stack(None, 1).expect("barrier queues the stale pause");
+    session
+        .stack(None, 1)
+        .expect("barrier queues the stale pause");
     let snapshot = session.step_and_package(None, None).expect("resume");
     assert_eq!(
         snapshot.reason,
@@ -252,8 +268,15 @@ fn wait_for_pause_fails_fast_when_the_isolate_exits() {
     let error = session
         .step_and_package(None, None)
         .expect_err("exited isolate cannot pause");
-    assert!(matches!(error, Error::IsolateExited(ref id) if id == "isolates/1"), "got {error:?}");
-    assert!(started.elapsed() < Duration::from_secs(5), "waited {:?}", started.elapsed());
+    assert!(
+        matches!(error, Error::IsolateExited(ref id) if id == "isolates/1"),
+        "got {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?}",
+        started.elapsed()
+    );
 }
 
 /// The spec's single-step pause is a `PauseBreakpoint` with no
@@ -390,7 +413,10 @@ fn event_gaps_sit_at_the_wire_position_and_pages_compose() {
             assert_eq!(tail.dropped, 0);
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "late event never arrived");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late event never arrived"
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -486,7 +512,9 @@ fn expand_graph_breaks_cycles_and_honors_the_node_budget() {
         let fields: Vec<Value> = (0..10)
             .map(|n| json!({ "name": format!("f{n}"), "value": instance_ref("objects/x", "Int", "1") }))
             .collect();
-        ok(json!({ "type": "Instance", "id": "objects/r", "kind": "PlainInstance", "fields": fields }))
+        ok(
+            json!({ "type": "Instance", "id": "objects/r", "kind": "PlainInstance", "fields": fields }),
+        )
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, tight).expect("attach");
     let graph = session.expand_graph(None, "objects/r").expect("graph");
@@ -525,9 +553,7 @@ fn expand_page_requests_a_bounded_slice() {
         ..fast_config()
     };
     let mut session = DebugSession::attach_with(&vm.ws_uri, settings).expect("attach");
-    let page = session
-        .expand_page(None, "objects/list", 10)
-        .expect("page");
+    let page = session.expand_page(None, "objects/list", 10).expect("page");
     let names: Vec<&str> = page.iter().map(|v| v.name.as_str()).collect();
     assert_eq!(names, ["[10]", "[11]", "[12]", "[...]"]);
     assert_eq!(page[3].value, "999987 more (next offset 13)");
@@ -555,8 +581,7 @@ fn rpc_timeout_unregisters_and_late_answers_are_discarded() {
     let late = vm.expect_request("hang");
     vm.control()
         .send(Control::Raw(
-            json!({ "jsonrpc": "2.0", "id": late.id, "result": { "type": "Success" } })
-                .to_string(),
+            json!({ "jsonrpc": "2.0", "id": late.id, "result": { "type": "Success" } }).to_string(),
         ))
         .expect("late answer");
     assert_eq!(client.get_version().expect("still alive").major, 4);
@@ -567,7 +592,8 @@ fn rpc_timeout_unregisters_and_late_answers_are_discarded() {
 /// of our pending calls. Malformed frames are counted, not silent.
 #[test]
 fn forwarded_requests_never_answer_pending_calls_and_malformed_frames_count() {
-    let vm = MockVm::start(|request| match request.method.as_str() {
+    let vm = MockVm::start(|request| {
+        match request.method.as_str() {
         "getVersion" => Reply::Prefixed {
             prelude: vec![
                 Control::Raw(
@@ -580,6 +606,7 @@ fn forwarded_requests_never_answer_pending_calls_and_malformed_frames_count() {
             result: json!({ "type": "Version", "major": 4, "minor": 23 }),
         },
         _ => default_reply(request),
+    }
     });
     let client = VmClient::connect(&vm.ws_uri).expect("connect");
     let version = client.get_version().expect("the real response wins");
@@ -608,7 +635,9 @@ fn auto_resume_ceiling_still_applies() {
         _ => default_reply(request),
     });
     let settings = SessionConfig {
-        conditional_resume_limit: ConditionalResumeLimit { max_auto_resumes: 2 },
+        conditional_resume_limit: ConditionalResumeLimit {
+            max_auto_resumes: 2,
+        },
         ..fast_config()
     };
     let mut session = DebugSession::attach_with(&vm.ws_uri, settings).expect("attach");

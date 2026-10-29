@@ -40,7 +40,10 @@ fn assert_code_fires(source: &'static str, code: &str) {
 /// `parser_impl.dart:4556-4558`, the `DeclarationKind.Extension` arm).
 #[test]
 fn local_pin_abstract_extension_field() {
-    assert_code_fires("extension E on int { abstract int x; }\n", "abstract_extension_field");
+    assert_code_fires(
+        "extension E on int { abstract int x; }\n",
+        "abstract_extension_field",
+    );
 }
 
 /// `augment` heading a typedef (official `parseTypedef`'s augmentToken
@@ -77,5 +80,8 @@ fn local_pin_new_constructor_new_name() {
 /// qualified names").
 #[test]
 fn local_pin_new_constructor_qualified_name() {
-    assert_code_fires("class C { new a.b() {} }\n", "new_constructor_qualified_name");
+    assert_code_fires(
+        "class C { new a.b() {} }\n",
+        "new_constructor_qualified_name",
+    );
 }

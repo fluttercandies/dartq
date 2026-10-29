@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces};
 use crate::rules::{same_file_declaration, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -30,11 +30,7 @@ use crate::rules::{same_file_declaration, utf16_token_span};
 /// `this`/`super` receivers, extension-type receivers implementing the
 /// interface, and cross-file shadowing classes resolve to nothing
 /// here. Message: `diagnostic.g.dart` `avoidSlowAsyncIo`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_slow_async_io",
-    &[NodeKind::Send],
-    check,
-);
+pub(crate) static SPEC: RuleSpec = crate::spec!("avoid_slow_async_io", &[NodeKind::Send], check,);
 
 /// The slow `FileSystemEntity` statics: `exists` is instance-only.
 const STATIC_SLOW: [&str; 5] = ["stat", "type", "isDirectory", "isFile", "isLink"];
@@ -77,8 +73,7 @@ fn check(c: &mut Check<'_>) {
     // The static face: the receiver spells `FileSystemEntity` and
     // binds to nothing same-file (the element library gate).
     if c.lexeme(c.head_token(receiver)) == "FileSystemEntity"
-        && crate::rules::expressions::same_file::binding(c, receiver, "FileSystemEntity")
-            .is_none()
+        && crate::rules::expressions::same_file::binding(c, receiver, "FileSystemEntity").is_none()
         && STATIC_SLOW.contains(&name)
     {
         report_invocation(c, receiver, arguments);

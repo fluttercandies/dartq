@@ -46,7 +46,10 @@ pub fn assert_doc(doc: &FixtureDoc) {
         }
         run += 1;
         let lint = case.lint(&doc.lint);
-        let expected = case.analyzed(&doc.lint).expect("parse re-validated").expectations;
+        let expected = case
+            .analyzed(&doc.lint)
+            .expect("parse re-validated")
+            .expectations;
         let emitted = run_case(case, &doc.lint);
         if let Err((missing, extra)) = match_rows(&expected, &emitted) {
             failures.push(render_failure(case, lint, missing, extra));
@@ -71,7 +74,10 @@ pub fn assert_doc(doc: &FixtureDoc) {
 /// [`one_rule`]).
 pub fn assert_case(case: &Case, doc_lint: &str) {
     let lint = case.lint(doc_lint);
-    let expected = case.analyzed(doc_lint).expect("parse re-validated").expectations;
+    let expected = case
+        .analyzed(doc_lint)
+        .expect("parse re-validated")
+        .expectations;
     let emitted = run_case(case, doc_lint);
     match match_rows(&expected, &emitted) {
         Ok(()) => {}
@@ -104,12 +110,7 @@ fn expected_source(case: &Case) -> String {
 
 /// The failure report: case, lint, both row sets (the missing expectations
 /// and the unexpected lints), and the analyzed source.
-fn render_failure(
-    case: &Case,
-    lint: &str,
-    missing: Vec<Expectation>,
-    extra: Vec<Lint>,
-) -> String {
+fn render_failure(case: &Case, lint: &str, missing: Vec<Expectation>, extra: Vec<Lint>) -> String {
     format!(
         "case `{}` (lint `{lint}`) diverged\nmissing expectations:\n{}\nunexpected lints:\n{}\nanalyzed file {}:\n{}",
         case.name,
@@ -135,7 +136,8 @@ fn match_rows(
                 && rules()[lint.rule.0 as usize].name == expectation.code
                 && lint.range.start == expectation.range.start
                 && lint.range.end == expectation.range.end
-                && (expectation.message.is_none() || Some(lint.message.as_str()) == expectation.message.as_deref())
+                && (expectation.message.is_none()
+                    || Some(lint.message.as_str()) == expectation.message.as_deref())
         });
         match hit {
             Some((i, _)) => taken[i] = true,
@@ -166,8 +168,14 @@ fn rows(items: &[Expectation], source: &str) -> String {
         .iter()
         .map(|e| {
             let (line, col) = lines.line_col_utf16(source, e.range.start);
-            let message = e.message.as_deref().map_or(String::new(), |m| format!(": {m}"));
-            format!("  {line}:{col} {} [{}..{}]{message}", e.code, e.range.start, e.range.end)
+            let message = e
+                .message
+                .as_deref()
+                .map_or(String::new(), |m| format!(": {m}"));
+            format!(
+                "  {line}:{col} {} [{}..{}]{message}",
+                e.code, e.range.start, e.range.end
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")

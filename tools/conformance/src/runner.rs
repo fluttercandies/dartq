@@ -71,7 +71,10 @@ impl Runner<'_> {
                     analysis.rows.extend(rows);
                     for (i, error) in &materialize_errors {
                         analysis.crashed.insert(*i);
-                        warn(&format!("case {} unanalyzable: {error}", self.cases[*i].case.id));
+                        warn(&format!(
+                            "case {} unanalyzable: {error}",
+                            self.cases[*i].case.id
+                        ));
                     }
                     let _ = writeln!(
                         std::io::stderr().lock(),
@@ -123,11 +126,17 @@ impl Runner<'_> {
         let mid = indices.len() / 2;
         for half in [&indices[..mid], &indices[mid..]] {
             match self.run_chunk(half, build, &mut analysis.peak_rss_kb) {
-                ChunkOutcome::Done { rows, materialize_errors } => {
+                ChunkOutcome::Done {
+                    rows,
+                    materialize_errors,
+                } => {
                     analysis.rows.extend(rows);
                     for (i, error) in &materialize_errors {
                         analysis.crashed.insert(*i);
-                        warn(&format!("case {} unanalyzable: {error}", self.cases[*i].case.id));
+                        warn(&format!(
+                            "case {} unanalyzable: {error}",
+                            self.cases[*i].case.id
+                        ));
                     }
                 }
                 ChunkOutcome::Crashed { .. } => self.bisect(half, build, analysis),
@@ -156,15 +165,18 @@ impl Runner<'_> {
         }
         // The analyzers report absolute paths; canonicalize once and use
         // the same prefix for attribution.
-        let abs_dir = std::fs::canonicalize(&chunk_dir)
-            .unwrap_or_else(|_| std::fs::canonicalize(&self.work_root).expect("work root exists").join(self.label));
+        let abs_dir = std::fs::canonicalize(&chunk_dir).unwrap_or_else(|_| {
+            std::fs::canonicalize(&self.work_root)
+                .expect("work root exists")
+                .join(self.label)
+        });
         let mut command = build(&abs_dir);
         let result = match watchdog::run(&mut command, self.timeout, watchdog::RSS_LIMIT_KB) {
             Ok(result) => result,
             Err(e) => {
                 return ChunkOutcome::Crashed {
                     detail: format!("cannot spawn analyzer: {e}"),
-                }
+                };
             }
         };
         *peak_rss_kb = (*peak_rss_kb).max(result.peak_rss_kb);
@@ -205,7 +217,11 @@ fn envelope_seen(stdout: &str) -> bool {
 /// reporting including-file paths) lose the machine-local prefix — both the
 /// oracle and the dartq run get `<chunk>`, so the row is stable across chunk
 /// dirs and comparable between the sides.
-fn attribute(diags: &[analyze_json::Diag], chunk_dir: &Path, indices: &[usize]) -> BTreeMap<usize, Vec<Row>> {
+fn attribute(
+    diags: &[analyze_json::Diag],
+    chunk_dir: &Path,
+    indices: &[usize],
+) -> BTreeMap<usize, Vec<Row>> {
     let chunk_prefix = chunk_dir.to_string_lossy();
     let mut rows: BTreeMap<usize, Vec<Row>> = indices.iter().map(|i| (*i, Vec::new())).collect();
     let mut outside = 0usize;
@@ -243,7 +259,9 @@ fn attribute(diags: &[analyze_json::Diag], chunk_dir: &Path, indices: &[usize]) 
         });
     }
     if outside > 0 {
-        warn(&format!("{outside} diagnostics outside the chunk package roots were dropped"));
+        warn(&format!(
+            "{outside} diagnostics outside the chunk package roots were dropped"
+        ));
     }
     for batch in rows.values_mut() {
         crate::rows::sort_rows(batch);
@@ -258,10 +276,7 @@ fn warn(message: &str) {
 /// The oracle command: `<sdk>/bin/dart analyze --format=json <chunk>`.
 pub fn oracle_command(sdk_bin: &Path, chunk_dir: &Path) -> Command {
     let mut command = Command::new(sdk_bin);
-    command
-        .arg("analyze")
-        .arg("--format=json")
-        .arg(chunk_dir);
+    command.arg("analyze").arg("--format=json").arg(chunk_dir);
     command
 }
 
@@ -298,7 +313,8 @@ mod tests {
         Runner {
             cases,
             chunk_size: 2,
-            work_root: std::env::temp_dir().join(format!("conf-runner-{label}-{}", std::process::id())),
+            work_root: std::env::temp_dir()
+                .join(format!("conf-runner-{label}-{}", std::process::id())),
             label,
             mocks_root: std::env::temp_dir().join("conf-runner-mocks-missing"),
             timeout: Duration::from_secs(60),
@@ -382,8 +398,14 @@ mod tests {
     #[test]
     fn commands_carry_the_documented_flags() {
         let sdk = PathBuf::from("/sdk");
-        let debug = format!("{:?}", oracle_command(&sdk.join("bin/dart"), Path::new("/chunk")));
-        assert_eq!(debug, r#""/sdk/bin/dart" "analyze" "--format=json" "/chunk""#);
+        let debug = format!(
+            "{:?}",
+            oracle_command(&sdk.join("bin/dart"), Path::new("/chunk"))
+        );
+        assert_eq!(
+            debug,
+            r#""/sdk/bin/dart" "analyze" "--format=json" "/chunk""#
+        );
         let debug = format!(
             "{:?}",
             dartq_command(Path::new("/bin/dartq"), Some(&sdk), Path::new("/chunk"))
@@ -392,7 +414,10 @@ mod tests {
             debug,
             r#""/bin/dartq" "analyze" "--cold" "--format=json" "--sdk-path=/sdk" "/chunk""#
         );
-        let debug = format!("{:?}", dartq_command(Path::new("/bin/dartq"), None, Path::new("/chunk")));
+        let debug = format!(
+            "{:?}",
+            dartq_command(Path::new("/bin/dartq"), None, Path::new("/chunk"))
+        );
         assert!(!debug.contains("sdk-path"), "{debug}");
     }
 }

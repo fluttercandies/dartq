@@ -12,15 +12,12 @@ impl Engine<'_> {
     /// A pattern variable is about to bind `name`: remember the frame's
     /// current type for the spelling (the shadowed declaration, if any).
     pub(crate) fn note_pattern_shadow(&mut self, name: StringId) {
-        let (prev, was_local) = self
-            .frames
-            .last()
-            .map_or((None, false), |frame| {
-                (
-                    frame.var_types.get(&name).copied(),
-                    frame.locals.contains(&name),
-                )
-            });
+        let (prev, was_local) = self.frames.last().map_or((None, false), |frame| {
+            (
+                frame.var_types.get(&name).copied(),
+                frame.locals.contains(&name),
+            )
+        });
         self.pattern_shadows.push((name, prev, was_local));
         // An open switch member records the same pair in its own scope:
         // the binder shadows only inside its member. A member whose head

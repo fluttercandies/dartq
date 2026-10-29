@@ -97,10 +97,18 @@ fn parse_features(text: &str) -> Result<Vec<String>, String> {
         let rest = line.trim_start();
         if line.len() - rest.len() == 2 {
             // Flag lines may carry a trailing comment (`  flag: # note`).
-            let rest = rest.split_once(" #").map_or(rest, |(prefix, _)| prefix).trim_end();
+            let rest = rest
+                .split_once(" #")
+                .map_or(rest, |(prefix, _)| prefix)
+                .trim_end();
             match rest.strip_suffix(':') {
                 Some(flag) if !flag.is_empty() => flags.push(flag.to_string()),
-                _ => return Err(format!("experimental_features.yaml line {}: expected `  <flag>:`", no + 1)),
+                _ => {
+                    return Err(format!(
+                        "experimental_features.yaml line {}: expected `  <flag>:`",
+                        no + 1
+                    ));
+                }
             }
         }
     }
@@ -118,7 +126,10 @@ mod tests {
     fn codes_tsv_skips_comments_and_takes_column_two() {
         let text = "# header\nFfiCode\tabi_specific_integer_invalid\tABI_SPECIFIC_INTEGER_INVALID\tCOMPILE_TIME_ERROR\tERROR\ttrue\tmsg\tfix\n\nCompileTimeErrorCode\tabstract_field_initializer\tX\tY\tZ\ttrue\tm\tf\n";
         let ids: Vec<String> = parse_codes(text).collect();
-        assert_eq!(ids, vec!["abi_specific_integer_invalid", "abstract_field_initializer"]);
+        assert_eq!(
+            ids,
+            vec!["abi_specific_integer_invalid", "abstract_field_initializer"]
+        );
     }
 
     #[test]
@@ -136,7 +147,10 @@ mod tests {
             vec!["variance", "enhanced-parts"]
         );
         let commented = "features:\n  inference-update-3: # see the language repo\n    help: h\n";
-        assert_eq!(parse_features(commented).expect("parses"), vec!["inference-update-3"]);
+        assert_eq!(
+            parse_features(commented).expect("parses"),
+            vec!["inference-update-3"]
+        );
         assert!(parse_features("no features here").is_err());
     }
 
@@ -148,10 +162,18 @@ mod tests {
             "features:\n  mm_feature:\n    help: h\n",
         )
         .expect("loads");
-        let keys: Vec<_> = reg.entries.keys().map(|(k, id)| (k.name(), id.as_str())).collect();
+        let keys: Vec<_> = reg
+            .entries
+            .keys()
+            .map(|(k, id)| (k.name(), id.as_str()))
+            .collect();
         assert_eq!(
             keys,
-            vec![("diagnostic", "zz_code"), ("lint", "aa_lint"), ("feature", "mm_feature")]
+            vec![
+                ("diagnostic", "zz_code"),
+                ("lint", "aa_lint"),
+                ("feature", "mm_feature")
+            ]
         );
     }
 }

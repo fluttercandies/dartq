@@ -402,8 +402,7 @@ fn fold(graph: &LibraryGraph, hits: impl Iterator<Item = NamespaceEntry>) -> Loo
             Some(existing) if existing == hit => {}
             Some(existing) => {
                 if rest.is_empty() {
-                    let (existing_sdk, hit_sdk) =
-                        (is_sdk(graph, &existing), is_sdk(graph, &hit));
+                    let (existing_sdk, hit_sdk) = (is_sdk(graph, &existing), is_sdk(graph, &hit));
                     if existing_sdk && !hit_sdk {
                         first = Some(hit);
                         continue;

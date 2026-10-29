@@ -1,4 +1,7 @@
-use super::{Check, NodeKind, RuleSpec, angle_arguments, expanded_lexemes, is_identifier_token, local_written_type, type_arguments_open};
+use super::{
+    Check, NodeKind, RuleSpec, angle_arguments, expanded_lexemes, is_identifier_token,
+    local_written_type, type_arguments_open,
+};
 use crate::rules::last_child;
 
 /// Official: `pkg/linter/lib/src/rules/omit_local_variable_types.dart:43-97`

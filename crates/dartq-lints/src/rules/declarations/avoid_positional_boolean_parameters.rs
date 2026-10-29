@@ -1,6 +1,12 @@
 use super::constructor_name_part;
-use super::{PayloadField, AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, formal_parameter_rows, member_declaration_name, same_class_field_type};
-use crate::rules::{MemberQuery, NONE_TOKEN, body_members, get_set_token, member_matches, member_name, same_file_ancestors};
+use super::{
+    AUGMENT_MEMBER_BIT, Check, NodeKind, PayloadField, RuleSpec, formal_parameter_rows,
+    member_declaration_name, same_class_field_type,
+};
+use crate::rules::{
+    MemberQuery, NONE_TOKEN, body_members, get_set_token, member_matches, member_name,
+    same_file_ancestors,
+};
 use dartq_ast::mod_flags;
 
 /// Official:

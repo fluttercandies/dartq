@@ -69,67 +69,181 @@ const DATA_DIR: &str = "tests/data/fix_examples";
 /// - `multi-file`: the report needs a file the single example pair
 ///   cannot carry.
 const NO_EXAMPLE_YET: &[(&str, &str)] = &[
-    ("abstract_static_method", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
+    (
+        "abstract_static_method",
+        "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire",
+    ),
     ("annotate_overrides", "fold"),
-    ("const_eval_method_invocation", "silent: the const-eval method-invocation trigger produces no diagnostic rows through the engine pass (probe-verified)"),
-    ("const_with_non_const", "silent: non-const class + `const C(arg)` produces `const_initialized_with_non_constant_value` only, never this code (probe-verified)"),
-    ("extension_augmentation_has_on_clause", "silent: augmentation declarations parse to `expected_token` today; this code never emits (probe-verified)"),
-    ("extension_type_declares_member_of_object", "silent: the Object-member extension-type trigger produces no diagnostic rows through the engine pass (probe-verified)"),
-    ("getter_constructor", "silent: `int get C => 1;` parses without any diagnostic through the engine pass (probe-verified)"),
+    (
+        "const_eval_method_invocation",
+        "silent: the const-eval method-invocation trigger produces no diagnostic rows through the engine pass (probe-verified)",
+    ),
+    (
+        "const_with_non_const",
+        "silent: non-const class + `const C(arg)` produces `const_initialized_with_non_constant_value` only, never this code (probe-verified)",
+    ),
+    (
+        "extension_augmentation_has_on_clause",
+        "silent: augmentation declarations parse to `expected_token` today; this code never emits (probe-verified)",
+    ),
+    (
+        "extension_type_declares_member_of_object",
+        "silent: the Object-member extension-type trigger produces no diagnostic rows through the engine pass (probe-verified)",
+    ),
+    (
+        "getter_constructor",
+        "silent: `int get C => 1;` parses without any diagnostic through the engine pass (probe-verified)",
+    ),
     ("avoid_bool_literals_in_conditional_expressions", "fold"),
-    ("avoid_final_parameters", "posture: registers only without primary constructors; the fix face parses every file at its package posture"),
+    (
+        "avoid_final_parameters",
+        "posture: registers only without primary constructors; the fix face parses every file at its package posture",
+    ),
     ("avoid_print", "fold"),
-    ("avoid_private_typedef_functions", "silent: canonical old-style private typedef does not fire through the engine-free stage"),
-    ("avoid_returning_null_for_void", "drops: lint fires on `return null;` in a void function but the rewrite never materializes"),
+    (
+        "avoid_private_typedef_functions",
+        "silent: canonical old-style private typedef does not fire through the engine-free stage",
+    ),
+    (
+        "avoid_returning_null_for_void",
+        "drops: lint fires on `return null;` in a void function but the rewrite never materializes",
+    ),
     ("avoid_types_on_closure_parameters", "fold"),
     ("await_only_futures", "fold"),
     ("cast_nullable_to_non_nullable", "fold"),
-    ("future_sync_value", "posture: the rule name is outside the options-known lint universe, so no options file can enable it"),
-    ("final_constructor", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
-    ("final_method", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
+    (
+        "future_sync_value",
+        "posture: the rule name is outside the options-known lint universe, so no options file can enable it",
+    ),
+    (
+        "final_constructor",
+        "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire",
+    ),
+    (
+        "final_method",
+        "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire",
+    ),
     ("implicit_call_tearoffs", "fold"),
-    ("invalid_constant", "silent: const-list non-constant-element triggers emit `non_constant_list_element` instead; no shape found producing this code (probe-verified)"),
-    ("leading_newlines_in_multiline_strings", "silent: the upstream-verbatim trigger does not fire through the fix face's parse posture"),
-    ("library_annotations", "silent: `@pragma` shapes do not fire through the engine-free stage"),
-    ("import_of_non_library", "multi-file: the report needs a part file distinct from the importing library, one example file per pair today"),
-    ("non_const_call_to_literal_constructor", "silent: `new Map()` emits `unused_local_variable` only; the literal-constructor code never fires (probe-verified)"),
-    ("non_constant_map_element", "silent: const-map non-constant-value triggers produce no diagnostic rows (probe-verified)"),
-    ("no_duplicate_case_values", "silent: typed duplicate-case distinctness is invisible to the engine-free stage"),
+    (
+        "invalid_constant",
+        "silent: const-list non-constant-element triggers emit `non_constant_list_element` instead; no shape found producing this code (probe-verified)",
+    ),
+    (
+        "leading_newlines_in_multiline_strings",
+        "silent: the upstream-verbatim trigger does not fire through the fix face's parse posture",
+    ),
+    (
+        "library_annotations",
+        "silent: `@pragma` shapes do not fire through the engine-free stage",
+    ),
+    (
+        "import_of_non_library",
+        "multi-file: the report needs a part file distinct from the importing library, one example file per pair today",
+    ),
+    (
+        "non_const_call_to_literal_constructor",
+        "silent: `new Map()` emits `unused_local_variable` only; the literal-constructor code never fires (probe-verified)",
+    ),
+    (
+        "non_constant_map_element",
+        "silent: const-map non-constant-value triggers produce no diagnostic rows (probe-verified)",
+    ),
+    (
+        "no_duplicate_case_values",
+        "silent: typed duplicate-case distinctness is invisible to the engine-free stage",
+    ),
     ("noop_primitive_operations", "fold"),
     ("prefer_collection_literals", "fold"),
-    ("prefer_const_literals_to_create_immutables", "silent: `@immutable`-annotated typed list does not fire through the engine-free stage"),
+    (
+        "prefer_const_literals_to_create_immutables",
+        "silent: `@immutable`-annotated typed list does not fire through the engine-free stage",
+    ),
     ("prefer_contains", "fold"),
-    ("prefer_final_parameters", "posture: alias of `avoid_final_parameters`, which registers only without primary constructors; the fix face parses every file at its package posture"),
+    (
+        "prefer_final_parameters",
+        "posture: alias of `avoid_final_parameters`, which registers only without primary constructors; the fix face parses every file at its package posture",
+    ),
     ("prefer_for_elements_to_map_fromiterable", "fold"),
     ("prefer_initializing_formals", "fold"),
     ("prefer_int_literals", "fold"),
-    ("representation_field_trailing_comma", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
-    ("setter_constructor", "silent: `set C(int v)` parses without any diagnostic through the engine pass (probe-verified)"),
+    (
+        "representation_field_trailing_comma",
+        "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire",
+    ),
+    (
+        "setter_constructor",
+        "silent: `set C(int v)` parses without any diagnostic through the engine pass (probe-verified)",
+    ),
     ("prefer_is_empty", "fold"),
     ("prefer_iterable_wheretype", "fold"),
     ("sized_box_for_whitespace", "fold"),
-    ("static_getter_without_body", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
-    ("static_setter_without_body", "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire"),
-    ("type_check_with_null", "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `UseEqEqNull` rewrite"),
-    ("unawaited_futures", "silent: async-context typing is invisible to the engine-free stage"),
-    ("unchecked_use_of_nullable_value", "drops: the null-check family's primary insert never materializes through the engine pass (probe-verified)"),
-    ("unnecessary_await_in_return", "silent: written-Future shapes do not fire through the engine-free stage"),
+    (
+        "static_getter_without_body",
+        "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire",
+    ),
+    (
+        "static_setter_without_body",
+        "registry-only: the parser never emits this code today (the table's own pin notes it), so no example can fire",
+    ),
+    (
+        "type_check_with_null",
+        "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `UseEqEqNull` rewrite",
+    ),
+    (
+        "unawaited_futures",
+        "silent: async-context typing is invisible to the engine-free stage",
+    ),
+    (
+        "unchecked_use_of_nullable_value",
+        "drops: the null-check family's primary insert never materializes through the engine pass (probe-verified)",
+    ),
+    (
+        "unnecessary_await_in_return",
+        "silent: written-Future shapes do not fire through the engine-free stage",
+    ),
     ("unnecessary_lambdas", "fold"),
-    ("unnecessary_nan_comparison", "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `RemoveComparison` rewrite"),
-    ("unnecessary_null_aware_operator_on_extension_on_nullable", "fold"),
+    (
+        "unnecessary_nan_comparison",
+        "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `RemoveComparison` rewrite",
+    ),
+    (
+        "unnecessary_null_aware_operator_on_extension_on_nullable",
+        "fold",
+    ),
     ("unnecessary_null_checks", "fold"),
-    ("unnecessary_null_comparison", "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `RemoveComparison` rewrite"),
-    ("unnecessary_type_check", "silent: `is`-check-comparison shapes emit no rows through the engine pass (probe-verified)"),
+    (
+        "unnecessary_null_comparison",
+        "no-emitter: the semantic diagnose face carries no report site for the code (its name-collapse entries exist, nothing reports them) — no diagnostic row can reach the `RemoveComparison` rewrite",
+    ),
+    (
+        "unnecessary_type_check",
+        "silent: `is`-check-comparison shapes emit no rows through the engine pass (probe-verified)",
+    ),
     ("unnecessary_string_interpolations", "fold"),
     ("unnecessary_unawaited", "fold"),
     ("unrelated_type_equality_checks", "fold"),
-    ("unreachable_switch_case", "silent: case-after-default emits `dead_code` instead; no shape found producing this code (probe-verified)"),
+    (
+        "unreachable_switch_case",
+        "silent: case-after-default emits `dead_code` instead; no shape found producing this code (probe-verified)",
+    ),
     ("use_colored_box", "fold"),
     ("use_truncating_division", "fold"),
-    ("unused_catch_clause", "silent: an unused catch variable produces no diagnostic rows through the engine pass (probe-verified)"),
-    ("unused_element_parameter", "silent: the unused callback-parameter trigger produces no diagnostic rows (probe-verified)"),
-    ("var_and_type", "drops: probe-verified that no primary materializes through the engine pass, though the commands wiring reads clean (the parser fires the code, `is_engine_fix_code` passes it, `RemoveLexeme` anchors at the span start) — the drop sits in the engine pass's row set; needs an SDK-run attribution"),
-    ("var_with_no_type_annotation", "posture: registers only without primary constructors; the fix face parses every file at its package posture"),
+    (
+        "unused_catch_clause",
+        "silent: an unused catch variable produces no diagnostic rows through the engine pass (probe-verified)",
+    ),
+    (
+        "unused_element_parameter",
+        "silent: the unused callback-parameter trigger produces no diagnostic rows (probe-verified)",
+    ),
+    (
+        "var_and_type",
+        "drops: probe-verified that no primary materializes through the engine pass, though the commands wiring reads clean (the parser fires the code, `is_engine_fix_code` passes it, `RemoveLexeme` anchors at the span start) — the drop sits in the engine pass's row set; needs an SDK-run attribution",
+    ),
+    (
+        "var_with_no_type_annotation",
+        "posture: registers only without primary constructors; the fix face parses every file at its package posture",
+    ),
 ];
 
 /// One corpus entry: the workspace file's stem (`code` or
@@ -224,10 +338,8 @@ fn fix_examples_round_trip() {
         .collect();
     let sets = fix::collect_set(&paths, &mut fix::PluginHosts::empty(), None)
         .expect("the fix face's discovery and walk succeed");
-    let by_path: BTreeMap<&str, &fix::FileFixSet> = sets
-        .iter()
-        .map(|set| (set.path.as_str(), set))
-        .collect();
+    let by_path: BTreeMap<&str, &fix::FileFixSet> =
+        sets.iter().map(|set| (set.path.as_str(), set)).collect();
 
     // The engine pass behind the semantic and parser rows needs an SDK
     // root; without one those tiers cannot fire — the production face's
@@ -239,8 +351,7 @@ fn fix_examples_round_trip() {
     for example in &examples {
         let spec = fix_table::spec_for(&example.code)
             .unwrap_or_else(|| panic!("example `{}` names no fix-table row", example.stem));
-        let is_engine_row =
-            matches!(spec.source, FixSource::Semantic | FixSource::Parser);
+        let is_engine_row = matches!(spec.source, FixSource::Semantic | FixSource::Parser);
         if is_engine_row && !engine_tier {
             skipped_engine += 1;
             continue;
@@ -287,9 +398,7 @@ fn fix_examples_round_trip() {
                 continue;
             }
             let fix = created[0];
-            if Path::new(fix.target.as_deref().expect("created row names its target"))
-                .exists()
-            {
+            if Path::new(fix.target.as_deref().expect("created row names its target")).exists() {
                 failures.push(format!(
                     "`{}`: create-file target already exists ({})",
                     example.stem,

@@ -1,6 +1,9 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, switch_scrutinee_read};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, same_file, slice, static_type_faces,
+    switch_scrutinee_read,
+};
 use crate::rules::utf16_token_span;
 
 /// The pattern-face problem text (`unrelatedTypeEqualityChecksInPattern`,
@@ -288,14 +291,14 @@ fn operand_type<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
                         | NodeKind::ExtensionDeclaration
                 )
             })?;
-            let name = c
-                .collect_direct(*class_row)
-                .into_iter()
-                .find(|&kid| {
-                    c.kind(kid) == NodeKind::Identifier
-                        && c.field(kid, PayloadField::Context)
-                            == Some(dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration as u32)
-                })?;
+            let name = c.collect_direct(*class_row).into_iter().find(|&kid| {
+                c.kind(kid) == NodeKind::Identifier
+                    && c.field(kid, PayloadField::Context)
+                        == Some(
+                            dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
+                                as u32,
+                        )
+            })?;
             Some(c.lexeme(c.head_token(name)))
         }
         NodeKind::Identifier => {

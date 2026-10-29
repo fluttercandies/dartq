@@ -62,10 +62,10 @@ pub(crate) mod unnecessary_brace_in_string_interps {
     /// interpolation. Message: `diagnostic.g.dart`
     /// `unnecessaryBraceInStringInterps`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_brace_in_string_interps",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "unnecessary_brace_in_string_interps",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -162,10 +162,10 @@ pub(crate) mod unnecessary_string_escapes {
     /// only where unescaping would merge the closing quotes. Message:
     /// `diagnostic.g.dart` `unnecessaryStringEscapes`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_string_escapes",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "unnecessary_string_escapes",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -239,8 +239,7 @@ pub(crate) mod unnecessary_string_escapes {
         // A scanner lexeme is always UTF-8, so a decode failure is a
         // program bug — degrade to the official empty-contents face (no
         // candidates, `visitLexeme` :44-91) instead of panicking.
-        let Some(contents) =
-            core::str::from_utf8(&bytes[leading..bytes.len() - trailing]).ok()
+        let Some(contents) = core::str::from_utf8(&bytes[leading..bytes.len() - trailing]).ok()
         else {
             return;
         };
@@ -370,10 +369,10 @@ pub(crate) mod unnecessary_string_interpolations {
     /// exactly where the official reads the `AdjacentStrings` parent.
     /// Message: `diagnostic.g.dart` `unnecessaryStringInterpolations`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_string_interpolations",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "unnecessary_string_interpolations",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -650,10 +649,10 @@ pub(crate) mod avoid_escaping_inner_quotes {
     /// before the quote scan (identity, `\xHH`, `\uHHHH`, `\u{H+}`), `$id`
     /// markers contribute nothing, `${...}` groups hold their own literals.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_escaping_inner_quotes",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "avoid_escaping_inner_quotes",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -921,10 +920,10 @@ pub(crate) mod leading_newlines_in_multiline_strings {
     /// first segment (:54-59 — the opening `'''…` token). Message:
     /// `diagnostic.g.dart` `leadingNewlinesInMultilineStrings`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "leading_newlines_in_multiline_strings",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "leading_newlines_in_multiline_strings",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -990,10 +989,10 @@ pub(crate) mod missing_whitespace_between_adjacent_strings {
     /// (:43-53). Message: `diagnostic.g.dart`
     /// `missingWhitespaceBetweenAdjacentStrings`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "missing_whitespace_between_adjacent_strings",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "missing_whitespace_between_adjacent_strings",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1202,10 +1201,10 @@ pub(crate) mod no_adjacent_strings_in_list {
     /// pattern's constant elements (:73-81) reports at the whole group.
     /// Message: `diagnostic.g.dart` `noAdjacentStringsInList`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "no_adjacent_strings_in_list",
-    &[NodeKind::StringLiteral],
-    check,
-);
+        "no_adjacent_strings_in_list",
+        &[NodeKind::StringLiteral],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1513,11 +1512,8 @@ pub(crate) mod eol_at_end_of_file {
     /// pairs are carried verbatim (`diagnostic.g.dart`
     /// `eolAtEndOfFileMissing` / `eolAtEndOfFileTooMany`), so
     /// [`Check::report_texts`] selects per shape.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "eol_at_end_of_file",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("eol_at_end_of_file", &[NodeKind::CompilationUnit], check,);
 
     const TOO_MANY_PROBLEM: &str = "Too many newlines at the end of the file.";
     const TOO_MANY_CORRECTION: &str = "Try removing the extra newlines at the end of the file.";
@@ -1591,10 +1587,10 @@ pub(crate) mod lines_longer_than_80_chars {
     /// `/` or `\` (a `// ignore:` comment's own line is always covered,
     /// :33-40). Message: `diagnostic.g.dart` `linesLongerThan80Chars`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "lines_longer_than_80_chars",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+        "lines_longer_than_80_chars",
+        &[NodeKind::CompilationUnit],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let lines = LineTable::new(c.unit.source);
@@ -1879,11 +1875,8 @@ pub(crate) mod prefer_double_quotes {
     /// is itself nested inside an interpolation (`isNestedString`,
     /// :48-50/:60/:83). Double-quoted literals never report. Message:
     /// `diagnostic.g.dart` `preferDoubleQuotes`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_double_quotes",
-    &[NodeKind::StringLiteral],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("prefer_double_quotes", &[NodeKind::StringLiteral], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -2018,11 +2011,8 @@ pub(crate) mod prefer_single_quotes {
     /// never report; the `prefer_double_quotes` counterpart shares these
     /// three guards with this rule through the module-level helpers.
     /// Message: `diagnostic.g.dart` `preferSingleQuotes`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_single_quotes",
-    &[NodeKind::StringLiteral],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("prefer_single_quotes", &[NodeKind::StringLiteral], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -2062,11 +2052,8 @@ pub(crate) mod unnecessary_raw_strings {
     /// raw head lexeme is the whole literal — an interpolated literal's
     /// middle segment can still open with an `r` (`"${x}rest"`) and must
     /// stay silent. Message: `diagnostic.g.dart` `unnecessaryRawStrings`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_raw_strings",
-    &[NodeKind::StringLiteral],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("unnecessary_raw_strings", &[NodeKind::StringLiteral], check,);
 
     fn check(c: &mut Check<'_>) {
         let extent = super::literal_token_extent(c, c.node());
@@ -2092,11 +2079,8 @@ pub(crate) mod use_raw_strings {
     /// the literal (those are exactly the escapes a raw string preserves;
     /// any other escape bails). Interpolated literals are not simple and
     /// never enter. Message: `diagnostic.g.dart` `useRawStrings`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_raw_strings",
-    &[NodeKind::StringLiteral],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("use_raw_strings", &[NodeKind::StringLiteral], check,);
 
     fn check(c: &mut Check<'_>) {
         let extent = super::literal_token_extent(c, c.node());
@@ -2136,7 +2120,7 @@ pub(crate) mod use_raw_strings {
 }
 
 pub(crate) mod use_string_buffers {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, TokenKind};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, TokenKind};
     use crate::rules::slice::parameter_assignments::{parameter_name, parameter_rows};
     use crate::rules::{NONE_TOKEN, initialized_identifier_name, type_face, type_face_of_field};
 
@@ -2172,11 +2156,8 @@ pub(crate) mod use_string_buffers {
     /// `if`/`switch`/`try` arms inside a loop body stay silent. The `+=`
     /// face reports at the assignment, the `=` face at the target
     /// identifier (the official reports the left-hand side).
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_string_buffers",
-    &[NodeKind::Assignment],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("use_string_buffers", &[NodeKind::Assignment], check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();

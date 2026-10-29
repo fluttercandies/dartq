@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{PayloadField, Check, RuleSpec};
+use super::{Check, PayloadField, RuleSpec};
 use core::ops::Range;
 
 /// Official: `upstream Dart SDK source,
@@ -213,9 +213,7 @@ fn equal(c: &Check<'_>, left: &Range<usize>, right: Option<&Range<usize>>) -> bo
             .get(span.clone())
             .is_some_and(|spelling| is_identifier_chain(spelling))
     };
-    is_chain(left)
-        && is_chain(right)
-        && c.unit.source[left.clone()] == c.unit.source[right.clone()]
+    is_chain(left) && is_chain(right) && c.unit.source[left.clone()] == c.unit.source[right.clone()]
 }
 
 /// UTF-16 min/max over a row run — the engine's external coordinates.
@@ -303,8 +301,7 @@ mod tests {
     /// `test_class_field_propertyAccess` / `..._nested` — chains join.
     #[test]
     fn property_access_chains_report() {
-        let source =
-            "class A {\n  int f = 0;\n}\n\nint f(A a) {\n  a.f = 0;\n  return a.f;\n}\n";
+        let source = "class A {\n  int f = 0;\n}\n\nint f(A a) {\n  a.f = 0;\n  return a.f;\n}\n";
         assert_eq!(run(source).len(), 1);
         let source = "class A {\n  int f = 0;\n}\n\nclass B {\n  A a = A();\n}\n\nint f(B b) {\n  b.a.f = 0;\n  return b.a.f;\n}\n";
         assert_eq!(run(source).len(), 1);
@@ -321,7 +318,8 @@ mod tests {
     /// `..._nested_notSame` — different chains stay silent.
     #[test]
     fn different_targets_are_silent() {
-        let source = "class A {\n  int f = 0;\n}\n\nint f(A a1, A a2) {\n  a1.f = 0;\n  return a2.f;\n}\n";
+        let source =
+            "class A {\n  int f = 0;\n}\n\nint f(A a1, A a2) {\n  a1.f = 0;\n  return a2.f;\n}\n";
         assert!(run(source).is_empty());
         let source = "class A {\n  int f = 0;\n}\n\nclass B {\n  A a = A();\n}\n\nint f(B b1, B b2) {\n  b1.a.f = 0;\n  return b2.a.f;\n}\n";
         assert!(run(source).is_empty());
@@ -340,9 +338,7 @@ mod tests {
     #[test]
     fn pattern_shapes_are_silent() {
         assert!(run("int f(int a, int b) {\n  (a, b) = (0, 1);\n  return a;\n}\n").is_empty());
-        assert!(
-            run("int f(int a, int b) {\n  var (a, b) = (0, 1);\n  return a;\n}\n").is_empty()
-        );
+        assert!(run("int f(int a, int b) {\n  var (a, b) = (0, 1);\n  return a;\n}\n").is_empty());
     }
 
     /// A bare `return;` has no expression (:60-66); a non-return last

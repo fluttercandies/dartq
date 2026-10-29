@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, formal_parameter_rows};
+use super::{Check, NodeKind, PayloadField, RuleSpec, formal_parameter_rows};
 use crate::rules::{MemberQuery, has_override_annotation, member_matches, same_file_ancestors};
 
 /// Official: `pkg/linter/lib/src/rules/annotate_overrides.dart` — an
@@ -167,9 +167,10 @@ fn check_primary(c: &mut Check<'_>) {
             continue;
         }
         let name = c.lexeme(name_token);
-        let overridden = ancestors.iter().any(|&ancestor| {
-            inherited_member(c, ancestor, MemberQuery::Getter, name).is_some()
-        }) || bridge_overrides(c, owner, MemberQuery::Getter, name)
+        let overridden = ancestors
+            .iter()
+            .any(|&ancestor| inherited_member(c, ancestor, MemberQuery::Getter, name).is_some())
+            || bridge_overrides(c, owner, MemberQuery::Getter, name)
             || core_object_declares(MemberQuery::Getter, name);
         if overridden {
             let range = crate::rules::utf16_token_span(c, name_token);
@@ -231,12 +232,7 @@ fn field_keyword(c: &Check<'_>, param: u32, name_token: u32) -> Option<u32> {
 }
 
 /// The first member of `ancestor`'s body matching `query` by `name`.
-fn inherited_member(
-    c: &Check<'_>,
-    ancestor: u32,
-    query: MemberQuery,
-    name: &str,
-) -> Option<u32> {
+fn inherited_member(c: &Check<'_>, ancestor: u32, query: MemberQuery, name: &str) -> Option<u32> {
     crate::rules::body_members(c, ancestor)
         .into_iter()
         .find(|&member| {

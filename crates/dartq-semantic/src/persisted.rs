@@ -719,7 +719,11 @@ impl<'a> Slice<'a> {
             is_final: entry.is_final,
             type_params: entry.type_params,
             type_param_names: self.ids(&entry.type_param_names),
-            type_param_bounds: entry.type_param_bounds.iter().map(|bound| self.ty(bound)).collect(),
+            type_param_bounds: entry
+                .type_param_bounds
+                .iter()
+                .map(|bound| self.ty(bound))
+                .collect(),
             var_ty: self.ty(&entry.var_ty),
             return_ty: self.ty(&entry.return_ty),
             formals: entry
@@ -1020,7 +1024,10 @@ impl PersistedElements {
                         })
                         .collect(),
                     type_params_close: aug.type_params_close.map(PersistedRange::source_range),
-                    return_ty: aug.return_ty.clone().map(|ty| into_ty(ty, &ids, &mut type_args)),
+                    return_ty: aug
+                        .return_ty
+                        .clone()
+                        .map(|ty| into_ty(ty, &ids, &mut type_args)),
                     return_ty_range: aug.return_ty_range.map(PersistedRange::source_range),
                     formals: aug
                         .formals
@@ -1040,9 +1047,7 @@ impl PersistedElements {
                         .collect(),
                     parens: aug
                         .parens
-                        .map(|(open, close)| {
-                            (open.source_range(), close.source_range())
-                        }),
+                        .map(|(open, close)| (open.source_range(), close.source_range())),
                     group_open: aug.group_open.map(PersistedRange::source_range),
                     const_kw: aug.const_kw.map(PersistedRange::source_range),
                     factory_kw: aug.factory_kw.map(PersistedRange::source_range),

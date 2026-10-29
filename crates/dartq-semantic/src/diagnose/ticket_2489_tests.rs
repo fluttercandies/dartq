@@ -183,8 +183,7 @@ fn future_or_operand_is_plain_head_stays_live() {
     );
     let report = report_ops(source);
     assert!(
-        rows(&report, "unnecessary_type_check").is_empty()
-            && rows(&report, "dead_code").is_empty(),
+        rows(&report, "unnecessary_type_check").is_empty() && rows(&report, "dead_code").is_empty(),
         "the conjunctive miss keeps both arms live: {:?}",
         report.diagnostics
     );
@@ -283,8 +282,7 @@ fn well_typed_operand_against_future_undef_stays_live() {
     );
     let report = report_ops(source);
     assert!(
-        rows(&report, "unnecessary_type_check").is_empty()
-            && rows(&report, "dead_code").is_empty(),
+        rows(&report, "unnecessary_type_check").is_empty() && rows(&report, "dead_code").is_empty(),
         "the interface miss keeps both arms live: {:?}",
         report.diagnostics
     );
@@ -307,8 +305,7 @@ fn dynamic_operand_against_future_undef_stays_live() {
     );
     let report = report_ops(source);
     assert!(
-        rows(&report, "unnecessary_type_check").is_empty()
-            && rows(&report, "dead_code").is_empty(),
+        rows(&report, "unnecessary_type_check").is_empty() && rows(&report, "dead_code").is_empty(),
         "the dynamic operand's test stays live: {:?}",
         report.diagnostics
     );

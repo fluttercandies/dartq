@@ -1,5 +1,12 @@
-use super::{Check, NodeKind, RuleSpec, balanced_angle, constructor_name_part, container_members, is_identifier_token, member_declaration_name, name_row_token, override_annotation, parameter_rows, sole_statement_tokens};
-use crate::rules::{get_set_token, is_upper_camel_case, same_file_ancestors, same_file_declaration, type_before, utf16_token_span};
+use super::{
+    Check, NodeKind, RuleSpec, balanced_angle, constructor_name_part, container_members,
+    is_identifier_token, member_declaration_name, name_row_token, override_annotation,
+    parameter_rows, sole_statement_tokens,
+};
+use crate::rules::{
+    get_set_token, is_upper_camel_case, same_file_ancestors, same_file_declaration, type_before,
+    utf16_token_span,
+};
 
 /// Official: `pkg/linter/lib/src/rules/use_to_and_as_if_applicable.dart:45-78`
 /// — a method (:45) that is not a getter (:49), takes no parameters
@@ -20,11 +27,8 @@ use crate::rules::{get_set_token, is_upper_camel_case, same_file_ancestors, same
 /// face over-reports only for an un-annotated override of a
 /// cross-file member. Message: `diagnostic.g.dart`
 /// `useToAndAsIfApplicable`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "use_to_and_as_if_applicable",
-    &[NodeKind::Method],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("use_to_and_as_if_applicable", &[NodeKind::Method], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -108,8 +112,7 @@ fn ancestor_method(c: &Check<'_>, name: &str) -> bool {
     };
     same_file_ancestors(c, container, false).iter().any(|&a| {
         container_members(c, a).1.iter().any(|&m| {
-            !crate::rules::member_matches(c, m, crate::rules::MemberQuery::Method, name)
-                .is_empty()
+            !crate::rules::member_matches(c, m, crate::rules::MemberQuery::Method, name).is_empty()
         })
     })
 }

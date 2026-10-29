@@ -146,7 +146,9 @@ impl<U: Copy + Ord> Postings<U> {
     /// rank by a total order before any output, so the order never
     /// reaches an answer).
     pub fn names(&self) -> impl Iterator<Item = (StringId, &[U])> + '_ {
-        self.dir.iter().map(|(&name, units)| (name, units.as_slice()))
+        self.dir
+            .iter()
+            .map(|(&name, units)| (name, units.as_slice()))
     }
 
     /// Whether nothing is listed — the update law's no-dead-entries
@@ -536,7 +538,11 @@ mod tests {
         let names: Vec<StringId> = ["x", "y", "z"].iter().map(|n| strings.intern(n)).collect();
         // Standing listings first (both forms start from the same state),
         // then a descending, duplicated arrival over a shared name.
-        let standing = [(names[0], units[3]), (names[0], units[9]), (names[1], units[5])];
+        let standing = [
+            (names[0], units[3]),
+            (names[0], units[9]),
+            (names[1], units[5]),
+        ];
         let arrivals: Vec<(StringId, FileId)> = (0..12)
             .rev()
             .flat_map(|i| [(names[0], units[i]), (names[2], units[i % 4])])

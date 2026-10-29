@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{NONE_TOKEN, same_file_declaration};
 use dartq_ast::mod_flags;
 use dartq_parser::IdentifierContext;

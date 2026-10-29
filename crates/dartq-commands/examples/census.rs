@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use dartq_commands::analyze::Target;
-use dartq_commands::workspace::{engine_config_with_overrides, AnalyzeOverrides};
-use dartq_diagnostics::{write_machine, AnalysisOutput};
+use dartq_commands::workspace::{AnalyzeOverrides, engine_config_with_overrides};
+use dartq_diagnostics::{AnalysisOutput, write_machine};
 
 fn main() {
     let Some(target) = std::env::args().nth(1) else {
@@ -24,18 +24,20 @@ fn main() {
 
 fn run(target: &Path) -> i32 {
     let Ok(dir) = target.canonicalize() else {
-        eprintln!("error: Directory or file doesn't exist: {}", target.display());
+        eprintln!(
+            "error: Directory or file doesn't exist: {}",
+            target.display()
+        );
         return 2;
     };
     let overrides = AnalyzeOverrides::default();
-    let (config, root, _advisory) =
-        match engine_config_with_overrides(&dir, None, &overrides) {
-            Ok(faces) => faces,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return 2;
-            }
-        };
+    let (config, root, _advisory) = match engine_config_with_overrides(&dir, None, &overrides) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 2;
+        }
+    };
     let mut plugins =
         dartq_commands::plugins::PluginSet::launch(&root, &config.pub_config, &config.config_dir);
     let mut engine = match dartq_engine::Engine::new(config) {
@@ -46,7 +48,11 @@ fn run(target: &Path) -> i32 {
             return 2;
         }
     };
-    let plugin_ref = if plugins.is_empty() { None } else { Some(&mut plugins) };
+    let plugin_ref = if plugins.is_empty() {
+        None
+    } else {
+        Some(&mut plugins)
+    };
     let run = match dartq_commands::analyze::run_targets(
         &mut engine,
         &[],

@@ -77,7 +77,10 @@ pub struct Candidate {
 /// non-ASCII query byte can never match).
 #[must_use]
 pub fn fold_query(query: &str) -> Vec<u8> {
-    query.bytes().map(|byte| byte.to_ascii_lowercase()).collect()
+    query
+        .bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect()
 }
 
 /// Classifies `name` against the folded `query`: [`None`] when the name
@@ -195,7 +198,10 @@ mod tests {
         assert_eq!(classify(&mixed, "FB"), Some(MatchClass::ExactPrefix));
         // No `z` anywhere: not a candidate under any class.
         assert_eq!(classify(&fold_query("fz"), "FooBar"), None);
-        assert_eq!(classify(&fold_query("fz"), "FZ"), Some(MatchClass::ExactPrefix));
+        assert_eq!(
+            classify(&fold_query("fz"), "FZ"),
+            Some(MatchClass::ExactPrefix)
+        );
     }
 
     /// Within one class, shorter names win, then byte order — the total
@@ -263,7 +269,10 @@ mod tests {
         assert_eq!(classify(&query, "foo_bar"), Some(MatchClass::WordBoundary));
         assert_eq!(classify(&query, "FooBaz"), Some(MatchClass::WordBoundary));
         // `HttpServer`: the `S` hump after a lowercase is a word start.
-        assert_eq!(classify(&fold_query("hs"), "HttpServer"), Some(MatchClass::WordBoundary));
+        assert_eq!(
+            classify(&fold_query("hs"), "HttpServer"),
+            Some(MatchClass::WordBoundary)
+        );
         // `f` then `b` around a mid-word hop: neither match position
         // after the first is a word start, and the pair is not contiguous
         // — the sparse class.
@@ -298,7 +307,10 @@ mod tests {
 
         let hits = index.search_fuzzy(strings, "fb");
         assert_eq!(hits.len(), RESULT_CAP, "the cap applies");
-        let names: Vec<&str> = hits.iter().map(|hit| strings.resolve(hit.decl.name)).collect();
+        let names: Vec<&str> = hits
+            .iter()
+            .map(|hit| strings.resolve(hit.decl.name))
+            .collect();
         let expected: Vec<String> = ["fb", "FooBar", "foo_bar", "xfbx"]
             .iter()
             .map(|name| (*name).to_owned())

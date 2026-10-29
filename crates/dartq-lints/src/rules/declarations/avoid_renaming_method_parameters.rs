@@ -1,5 +1,8 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
-use crate::rules::{MemberQuery, class_declaration_name, has_doc_comment, member_is_concrete, member_matches, same_file_ancestors, utf16_token_span};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
+use crate::rules::{
+    MemberQuery, class_declaration_name, has_doc_comment, member_is_concrete, member_matches,
+    same_file_ancestors, utf16_token_span,
+};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_renaming_method_parameters.dart`
 /// — an overriding method whose positional parameter names differ from

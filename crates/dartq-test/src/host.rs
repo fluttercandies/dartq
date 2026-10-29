@@ -45,7 +45,11 @@ const RETRY: Duration = Duration::from_millis(250);
 /// environment names no home at all.
 #[must_use]
 pub fn cache_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
     if let Some(dir) = var("DARTQ_CACHE_DIR") {
         return Some(dir);
     }
@@ -85,7 +89,9 @@ pub fn total_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find_map(|line| line.strip_prefix("MemTotal:"))?;
+        let line = text
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))?;
         let kib: u64 = line.trim().trim_end_matches("kB").trim().parse().ok()?;
         Some(kib * 1024)
     }
@@ -130,12 +136,18 @@ impl Profile {
     /// package is compiled), plus one `flutter_tester` per concurrent suite
     /// (~0.2 GB each). Measured: one process at `--concurrency=5` 1.85 GB
     /// peak; three at two each 3.1 GB.
-    pub const FLUTTER: Self = Self { base: 2, per_worker: 1 };
+    pub const FLUTTER: Self = Self {
+        base: 2,
+        per_worker: 1,
+    };
 
     /// One grouped shard process: the shared program and heap (2.9 GB
     /// peak at seven concurrent suites, 3.5 GB at ten, on the same
     /// package), with no compiler resident while suites run.
-    pub const GROUPED: Self = Self { base: 2, per_worker: 1 };
+    pub const GROUPED: Self = Self {
+        base: 2,
+        per_worker: 1,
+    };
 
     /// The grouped Flutter pass: one runner VM and one resident
     /// `frontend_server` (1.0–1.4 GB together at the base-side peak), plus
@@ -143,7 +155,10 @@ impl Profile {
     /// depends on its suite (0.3–0.65 GB measured across packages), and
     /// workers are reused across suites, so the per-worker share covers the
     /// heaviest measured tester, not the average: two units.
-    pub const FLUTTER_GROUPED: Self = Self { base: 3, per_worker: 2 };
+    pub const FLUTTER_GROUPED: Self = Self {
+        base: 3,
+        per_worker: 2,
+    };
 
     /// `self` with the per-worker share raised to any larger value recorded
     /// for `kind` by earlier runs on this host ([`Self::observe`]); the
@@ -157,7 +172,9 @@ impl Profile {
     #[must_use]
     pub fn calibrated(self, kind: &str) -> Self {
         let recorded = cache_dir()
-            .and_then(|dir| std::fs::read_to_string(dir.join("test").join(format!("profile-{kind}"))).ok())
+            .and_then(|dir| {
+                std::fs::read_to_string(dir.join("test").join(format!("profile-{kind}"))).ok()
+            })
             .and_then(|text| text.trim().parse::<usize>().ok());
         self.refine(recorded)
     }
@@ -180,7 +197,14 @@ impl Profile {
     /// no tester exists and the measurement falls back to the trees' peak
     /// above every process's base, spread across the workers. Nothing is
     /// recorded when neither was sampled.
-    pub fn observe(self, kind: &str, peak: u64, tester_peak: u64, workers: usize, processes: usize) {
+    pub fn observe(
+        self,
+        kind: &str,
+        peak: u64,
+        tester_peak: u64,
+        workers: usize,
+        processes: usize,
+    ) {
         let Some(dir) = cache_dir() else {
             return;
         };
@@ -197,15 +221,30 @@ impl Profile {
     /// One run's per-worker measurement in [`UNIT`]s, `None` when the run
     /// sampled nothing ([`Self::observe`]'s no-op).
     #[must_use]
-    fn measurement(self, peak: u64, tester_peak: u64, workers: usize, processes: usize) -> Option<usize> {
+    fn measurement(
+        self,
+        peak: u64,
+        tester_peak: u64,
+        workers: usize,
+        processes: usize,
+    ) -> Option<usize> {
         if tester_peak > 0 {
-            return Some(usize::try_from(tester_peak.div_ceil(UNIT)).unwrap_or(usize::MAX).max(1));
+            return Some(
+                usize::try_from(tester_peak.div_ceil(UNIT))
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+            );
         }
         if peak == 0 {
             return None;
         }
         let units = usize::try_from(peak.div_ceil(UNIT)).unwrap_or(usize::MAX);
-        Some(units.saturating_sub(self.base * processes.max(1)).div_ceil(workers.max(1)).max(1))
+        Some(
+            units
+                .saturating_sub(self.base * processes.max(1))
+                .div_ceil(workers.max(1))
+                .max(1),
+        )
     }
 
     /// The run fold: a measurement above the current share books in full —
@@ -215,7 +254,9 @@ impl Profile {
     #[must_use]
     fn absorb(self, measured: usize) -> Self {
         Self {
-            per_worker: measured.max((self.per_worker + measured).div_ceil(2)).max(1),
+            per_worker: measured
+                .max((self.per_worker + measured).div_ceil(2))
+                .max(1),
             ..self
         }
     }
@@ -244,7 +285,11 @@ pub fn lease_run(workers: usize, deadline: Instant) -> io::Result<Option<(Option
 /// # Errors
 ///
 /// I/O failures on the slot files.
-pub fn lease(profile: Profile, workers: usize, deadline: Instant) -> io::Result<Option<(Option<Lease>, usize)>> {
+pub fn lease(
+    profile: Profile,
+    workers: usize,
+    deadline: Instant,
+) -> io::Result<Option<(Option<Lease>, usize)>> {
     lease_processes(profile, workers, 1, deadline)
 }
 
@@ -269,15 +314,21 @@ pub fn lease_processes(
     };
     let free = free_memory_bytes().map(|free| usize::try_from(free / UNIT).unwrap_or(usize::MAX));
     let fit = free
-        .map_or(workers, |units| units.saturating_sub(profile.base) / profile.per_worker)
+        .map_or(workers, |units| {
+            units.saturating_sub(profile.base) / profile.per_worker
+        })
         .clamp(1, workers);
-    let want = (profile.base * processes + fit * profile.per_worker)
-        .min(free.unwrap_or(usize::MAX).max(profile.base + profile.per_worker));
+    let want = (profile.base * processes + fit * profile.per_worker).min(
+        free.unwrap_or(usize::MAX)
+            .max(profile.base + profile.per_worker),
+    );
     let min = profile.base + profile.per_worker;
-    Ok(Lease::acquire(&dir.join("test"), want, min, capacity_units(), deadline)?.map(|lease| {
-        let (_, granted) = split(profile, lease.units(), workers, processes);
-        (Some(lease), granted)
-    }))
+    Ok(
+        Lease::acquire(&dir.join("test"), want, min, capacity_units(), deadline)?.map(|lease| {
+            let (_, granted) = split(profile, lease.units(), workers, processes);
+            (Some(lease), granted)
+        }),
+    )
 }
 
 /// How `units` lease units divide into processes and concurrent suites
@@ -291,7 +342,8 @@ pub fn split(profile: Profile, units: usize, workers: usize, processes: usize) -
     while shards > 1 && units < shards * (profile.base + profile.per_worker) {
         shards -= 1;
     }
-    let suites = (units.saturating_sub(shards * profile.base) / profile.per_worker).clamp(shards, workers);
+    let suites =
+        (units.saturating_sub(shards * profile.base) / profile.per_worker).clamp(shards, workers);
     (shards, suites)
 }
 
@@ -352,7 +404,10 @@ impl Lease {
                 drop(gate);
                 if slots.len() >= min {
                     let units = slots.len();
-                    return Ok(Some(Self { _slots: slots, units }));
+                    return Ok(Some(Self {
+                        _slots: slots,
+                        units,
+                    }));
                 }
                 drop(slots);
                 if Instant::now() + RETRY > deadline {
@@ -371,7 +426,11 @@ impl Lease {
 
 #[cfg(unix)]
 fn open_lock(path: &Path) -> io::Result<File> {
-    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
 }
 
 /// `flock(LOCK_EX)`; with `try_only`, `Ok(false)` when another process
@@ -403,11 +462,20 @@ fn lock(file: &File, try_only: bool) -> io::Result<bool> {
 pub fn find(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let names: &[String] = &if cfg!(windows) {
-        vec![format!("{name}.exe"), format!("{name}.bat"), format!("{name}.cmd")]
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.bat"),
+            format!("{name}.cmd"),
+        ]
     } else {
         vec![name.to_owned()]
     };
-    std::env::split_paths(&path).find_map(|dir| names.iter().map(|name| dir.join(name)).find(|candidate| candidate.is_file()))
+    std::env::split_paths(&path).find_map(|dir| {
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// Memory the host can hand out now: available memory on Linux
@@ -418,13 +486,18 @@ pub fn free_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))?;
+        let line = text
+            .lines()
+            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
         let kib: u64 = line.trim().trim_end_matches("kB").trim().parse().ok()?;
         Some(kib * 1024)
     }
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("vm_stat").stderr(std::process::Stdio::null()).output().ok()?;
+        let out = std::process::Command::new("vm_stat")
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         let page: u64 = text
             .lines()
@@ -441,7 +514,8 @@ pub fn free_memory_bytes() -> Option<u64> {
                 .and_then(|count| count.trim().trim_end_matches('.').parse().ok())
                 .unwrap_or(0)
         };
-        let bytes = (pages("Pages free:") + pages("Pages inactive:") + pages("Pages speculative:")) * page;
+        let bytes =
+            (pages("Pages free:") + pages("Pages inactive:") + pages("Pages speculative:")) * page;
         (bytes > 0).then_some(bytes)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -556,16 +630,26 @@ mod tests {
     fn lease_pool_is_shared_and_bounded() {
         let tmp = tempfile::tempdir().expect("tmp");
         let far = Instant::now() + Duration::from_secs(5);
-        let first = Lease::acquire(tmp.path(), 6, 2, 8, far).expect("io").expect("granted");
+        let first = Lease::acquire(tmp.path(), 6, 2, 8, far)
+            .expect("io")
+            .expect("granted");
         assert_eq!(first.units(), 6);
         // Two slots left: granted at the minimum, not the request.
-        let second = Lease::acquire(tmp.path(), 6, 2, 8, far).expect("io").expect("granted");
+        let second = Lease::acquire(tmp.path(), 6, 2, 8, far)
+            .expect("io")
+            .expect("granted");
         assert_eq!(second.units(), 2);
         // Pool empty: waits, then gives up at the deadline.
         let soon = Instant::now() + Duration::from_millis(300);
-        assert!(Lease::acquire(tmp.path(), 1, 1, 8, soon).expect("io").is_none());
+        assert!(
+            Lease::acquire(tmp.path(), 1, 1, 8, soon)
+                .expect("io")
+                .is_none()
+        );
         drop(first);
-        let third = Lease::acquire(tmp.path(), 6, 1, 8, far).expect("io").expect("granted");
+        let third = Lease::acquire(tmp.path(), 6, 1, 8, far)
+            .expect("io")
+            .expect("granted");
         assert_eq!(third.units(), 6, "released slots return to the pool");
         drop(second);
     }
@@ -594,9 +678,15 @@ mod tests {
         assert_eq!(grouped.refine(Some(1)).per_worker, grouped.per_worker);
         assert_eq!(grouped.refine(Some(4)).per_worker, 4);
         // Every profile keeps its own seed as the floor.
-        assert_eq!(Profile::STOCK.refine(Some(1)).per_worker, Profile::STOCK.per_worker);
+        assert_eq!(
+            Profile::STOCK.refine(Some(1)).per_worker,
+            Profile::STOCK.per_worker
+        );
         assert_eq!(Profile::FLUTTER.refine(Some(3)).per_worker, 3);
-        assert_eq!(Profile::GROUPED.refine(Some(1)).per_worker, Profile::GROUPED.per_worker);
+        assert_eq!(
+            Profile::GROUPED.refine(Some(1)).per_worker,
+            Profile::GROUPED.per_worker
+        );
     }
 
     /// The run fold converges in one run: a run whose heaviest worker
@@ -611,7 +701,10 @@ mod tests {
         assert_eq!(grouped.absorb(4).per_worker, 4);
         // Decay from above stays halfway: 5 recorded, a 2-unit run moves
         // the share to 4, not to 2.
-        let heavy = Profile { per_worker: 5, ..grouped };
+        let heavy = Profile {
+            per_worker: 5,
+            ..grouped
+        };
         assert_eq!(heavy.absorb(2).per_worker, 4);
         // A measurement at the seed holds it.
         assert_eq!(grouped.absorb(2).per_worker, grouped.per_worker);
@@ -627,7 +720,10 @@ mod tests {
         let unit = UNIT;
         // One heavy tester (2 units) among four workers: recorded as 2,
         // where the tree average would dilute it below the seed.
-        assert_eq!(grouped.measurement(6 * unit, 3 * unit / 2 + 1, 4, 1), Some(2));
+        assert_eq!(
+            grouped.measurement(6 * unit, 3 * unit / 2 + 1, 4, 1),
+            Some(2)
+        );
         // No testers (dart isolates): the round-2 tree division.
         assert_eq!(grouped.measurement(6 * unit, 0, 4, 1), Some(1));
         // Seven workers over two shard processes, twelve units of tree:

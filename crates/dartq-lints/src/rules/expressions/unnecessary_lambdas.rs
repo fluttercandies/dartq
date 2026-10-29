@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, slice};
 use crate::rules::{NONE_TOKEN, get_set_token, variables_declaration_keyword};
 use dartq_semantic::model::{ArgListId, Formal, Formals, Ty};
 use dartq_semantic::{Analysis, FnSig};
@@ -300,10 +300,9 @@ fn check_invocation(
     }
     // `containsNullAwareInvocationInChain` bail (:282): any null-aware
     // marker in the run's chain.
-    if run
-        .iter()
-        .any(|&row| c.kind(row) == NodeKind::DotAccess && c.field(row, PayloadField::IsNullAware) == Some(1))
-    {
+    if run.iter().any(|&row| {
+        c.kind(row) == NodeKind::DotAccess && c.field(row, PayloadField::IsNullAware) == Some(1)
+    }) {
         return;
     }
     // `argumentsMatchParameters` (:232-239).
@@ -624,8 +623,7 @@ fn arguments_match_parameters(
             }
             named += 1;
         } else {
-            if positional >= positional_params.len()
-                || positional_params[positional] != value_name
+            if positional >= positional_params.len() || positional_params[positional] != value_name
             {
                 return false;
             }
@@ -881,8 +879,7 @@ fn block_binds(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Optio
                     && c.byte_span(row).start < use_start
             })
         });
-        binds
-            .then(|| variables_declaration_keyword(c, kid).unwrap_or_else(|| c.head_token(kid)))
+        binds.then(|| variables_declaration_keyword(c, kid).unwrap_or_else(|| c.head_token(kid)))
     })
 }
 

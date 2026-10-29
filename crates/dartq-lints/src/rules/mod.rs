@@ -267,7 +267,8 @@ pub(crate) fn initialized_identifier_name(c: &Check<'_>, var: u32) -> Option<u32
 /// boundaries; hand-built tables may carry the keyword itself in that word.
 pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u32> {
     let stored = if c.kind(row) == NodeKind::VariablesDeclaration {
-        c.field(row, PayloadField::LateKeyword).unwrap_or(NONE_TOKEN)
+        c.field(row, PayloadField::LateKeyword)
+            .unwrap_or(NONE_TOKEN)
     } else {
         NONE_TOKEN
     };
@@ -981,18 +982,14 @@ pub(crate) fn member_matches(
                 match c.kind(kid) {
                     NodeKind::Identifier
                         if c.field(kid, PayloadField::Context)
-                            == Some(
-                                dartq_parser::IdentifierContext::MethodDeclaration as u32,
-                            ) =>
+                            == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32) =>
                     {
                         if c.lexeme(c.head_token(kid)) == name {
                             hits.push(kid);
                         }
                     }
                     NodeKind::OperatorName if query == MemberQuery::Method => {
-                        let op = c
-                            .field(kid, PayloadField::Name)
-                            .unwrap_or(u32::MAX);
+                        let op = c.field(kid, PayloadField::Name).unwrap_or(u32::MAX);
                         if c.lexeme(op) == name {
                             hits.push(kid);
                         }

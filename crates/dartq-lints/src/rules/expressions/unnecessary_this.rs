@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, same_file};
+use super::{Check, NodeKind, PayloadField, RuleSpec, same_file};
 use crate::rules::{NONE_TOKEN, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_this.dart` — a `this.`
@@ -167,12 +167,10 @@ fn member_shadows(c: &Check<'_>, use_node: u32, name: &str) -> bool {
                 // The function name binds from its declaration on; the
                 // parameters scope the whole body. The name nests under
                 // `FunctionName` — `member_declaration_name` reaches it.
-                let names_decl =
-                    crate::rules::declarations::member_declaration_name(c, ancestor)
-                        .is_some_and(|decl| {
-                            c.lexeme(c.head_token(decl)) == name
-                                && c.byte_span(decl).start < use_start
-                        });
+                let names_decl = crate::rules::declarations::member_declaration_name(c, ancestor)
+                    .is_some_and(|decl| {
+                        c.lexeme(c.head_token(decl)) == name && c.byte_span(decl).start < use_start
+                    });
                 if names_decl || collect_member_parameters(c, ancestor).contains(&name) {
                     return true;
                 }

@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dartq_diagnostics::{
-    CodeInfo, DARTQ_PACKAGE_CONFIG_MISSING, DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
-};
+use dartq_diagnostics::{CodeInfo, DARTQ_PACKAGE_CONFIG_MISSING, DARTQ_PACKAGE_CONFIG_OUT_OF_DATE};
 use dartq_engine::semdiag;
 use dartq_engine::{Engine, EngineConfig};
 use dartq_package::PackageTable;
@@ -297,7 +295,15 @@ pub fn engine_config_with_overrides_phased(
     dir: &Path,
     sdk: Option<&Path>,
     overrides: &AnalyzeOverrides,
-) -> Result<(EngineConfig, PathBuf, Option<WorkspaceAdvisory>, AssemblyPhases), WorkspaceError> {
+) -> Result<
+    (
+        EngineConfig,
+        PathBuf,
+        Option<WorkspaceAdvisory>,
+        AssemblyPhases,
+    ),
+    WorkspaceError,
+> {
     validate_experiments(&overrides.experiments)?;
     let sdk_root = sdk
         .map(Path::to_path_buf)
@@ -334,8 +340,7 @@ pub fn engine_config_with_overrides_phased(
     let sdk_snapshot = match embedder_lib_dir(&config, &config_dir) {
         Some(lib_dir) => {
             let embedder_at = Instant::now();
-            let reloaded =
-                SdkSnapshot::load(&sdk_root, Some(&lib_dir)).unwrap_or(sdk_snapshot);
+            let reloaded = SdkSnapshot::load(&sdk_root, Some(&lib_dir)).unwrap_or(sdk_snapshot);
             phases.sdk += embedder_at.elapsed();
             reloaded
         }
@@ -401,10 +406,9 @@ pub fn embedder_lib_dir(config: &PackageConfig, config_dir: &Path) -> Option<Pat
         };
         let source_root = root.join(entry.package_uri.as_deref().unwrap_or(""));
         if source_root.join("_embedder.yaml").is_file() {
-            let canonical =
-                source_root
-                    .canonicalize()
-                    .unwrap_or_else(|_| normalize(&source_root));
+            let canonical = source_root
+                .canonicalize()
+                .unwrap_or_else(|_| normalize(&source_root));
             if entry.name == "sky_engine" {
                 return Some(canonical);
             }
@@ -1836,7 +1840,11 @@ mod tests {
             engine_config(&root, Some(&root.join("sdk"))).expect("orphan member assembles");
         let root = root.canonicalize().expect("root");
         assert_eq!(dir, root, "the pointed-at dir");
-        assert_eq!(config.config_dir, root.join(".dart_tool"), "its own artifacts");
+        assert_eq!(
+            config.config_dir,
+            root.join(".dart_tool"),
+            "its own artifacts"
+        );
     }
 
     #[test]
@@ -1954,7 +1962,10 @@ mod tests {
         // The lowercase registry row, pinned against drift (#2388) — the
         // machine form above does not catch a `name` rename.
         assert_eq!(advisory.code().name, "dartq/package_config_missing");
-        assert_eq!(advisory.code().dtype, dartq_diagnostics::DiagnosticType::Tool);
+        assert_eq!(
+            advisory.code().dtype,
+            dartq_diagnostics::DiagnosticType::Tool
+        );
         assert!(advisory.message().contains("run `dart pub get`"));
 
         fs::remove_dir_all(&root).ok();
@@ -2028,7 +2039,8 @@ mod tests {
                 mocks.display(),
                 mock
             )
-        };        for (index, mock) in [("0", "ffi"), ("1", "meta")] {
+        };
+        for (index, mock) in [("0", "ffi"), ("1", "meta")] {
             let root = chunk.join(index);
             fs::create_dir_all(root.join("lib")).expect("case lib");
             fs::create_dir_all(root.join(".dart_tool")).expect("case dart_tool");
@@ -2044,9 +2056,8 @@ mod tests {
             .expect("case config");
         }
 
-        let (config, dir, advisory) =
-            engine_config_with_advisory(&chunk, Some(&chunk.join("sdk")))
-                .expect("the bare floor still assembles");
+        let (config, dir, advisory) = engine_config_with_advisory(&chunk, Some(&chunk.join("sdk")))
+            .expect("the bare floor still assembles");
         assert_eq!(dir, chunk);
         assert!(
             matches!(advisory, Some(WorkspaceAdvisory::MissingConfig(_))),
@@ -2262,8 +2273,8 @@ mod tests {
             fs::write(root.join(".dart_tool/package_config.json"), variant)
                 .expect("corrupt config");
             let root = root.canonicalize().expect("root");
-            let (config, _, advisory) =
-                engine_config_with_advisory(&root, Some(&root.join("sdk"))).expect(
+            let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+                .expect(
                     "a corrupt config degrades, never refuses (the oracle analyzes with \
                      Packages.empty)",
                 );
@@ -2271,7 +2282,11 @@ mod tests {
                 config.pub_config.packages.is_empty(),
                 "variant {index}: the Packages.empty floor"
             );
-            assert_eq!(config.packages.len(), 1, "variant {index}: the self package stays");
+            assert_eq!(
+                config.packages.len(),
+                1,
+                "variant {index}: the self package stays"
+            );
             assert!(config.packages.get("fixture").is_some());
             assert!(
                 advisory.is_none(),
@@ -2486,12 +2501,22 @@ mod tests {
             .sdk
             .flat_library_to_path("ui", "")
             .expect("dart:ui resolves through the embedder");
-        assert_eq!(ui, root.join("sky_engine").join("lib").join("ui").join("ui.dart"));
+        assert_eq!(
+            ui,
+            root.join("sky_engine")
+                .join("lib")
+                .join("ui")
+                .join("ui.dart")
+        );
         // Full replacement: core comes from the embedder file, not the
         // dart-sdk table's sdk/lib/core/core.dart.
         assert_eq!(
             config.sdk.flat_library_to_path("core", ""),
-            Some(root.join("sky_engine").join("lib").join("embedder_core.dart"))
+            Some(
+                root.join("sky_engine")
+                    .join("lib")
+                    .join("embedder_core.dart")
+            )
         );
         // A name only the plain table lists is gone under replacement.
         assert_eq!(config.sdk.flat_library_to_path("io", ""), None);
@@ -2585,7 +2610,11 @@ mod tests {
             .expect("the assembly loads");
         assert_eq!(
             config.sdk.flat_library_to_path("core", ""),
-            Some(root.join("sky_engine").join("lib").join("embedder_core.dart")),
+            Some(
+                root.join("sky_engine")
+                    .join("lib")
+                    .join("embedder_core.dart")
+            ),
             "sky_engine wins wherever it sits in the config"
         );
 
@@ -2606,8 +2635,7 @@ mod tests {
             "library dart.core;",
         )
         .expect("embedder core");
-        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
-            .expect("embedder ui");
+        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;").expect("embedder ui");
     }
 
     /// The fixture config plus one sky_engine entry (config-relative

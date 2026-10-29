@@ -64,13 +64,7 @@ static INDEX_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-const INDEX_TOP: &[&str] = &[
-    "v",
-    "files",
-    "libraries",
-    "symbols",
-    "refs",
-];
+const INDEX_TOP: &[&str] = &["v", "files", "libraries", "symbols", "refs"];
 
 pub(crate) fn validate_index(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;

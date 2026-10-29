@@ -482,8 +482,8 @@ struct RawEmbedderYaml {
 fn load_embedder(lib_dir: &Path) -> Result<EmbedderLibraries, SdkError> {
     let yaml_path = lib_dir.join("_embedder.yaml");
     let yaml_text = read_required(&yaml_path)?;
-    let libraries = parse_embedder_yaml(&yaml_text)
-        .map_err(|message| SdkError::InvalidEmbedderYaml {
+    let libraries =
+        parse_embedder_yaml(&yaml_text).map_err(|message| SdkError::InvalidEmbedderYaml {
             path: yaml_path,
             message,
         })?;
@@ -522,7 +522,9 @@ pub(crate) fn parse_embedder_yaml(text: &str) -> Result<BTreeMap<String, SdkLibr
             continue;
         };
         if name.is_empty() {
-            return Err(format!("library key `{dart_uri}` names no library after `dart:`"));
+            return Err(format!(
+                "library key `{dart_uri}` names no library after `dart:`"
+            ));
         }
         check_library_uri(&dart_uri, &path)?;
         libraries.insert(

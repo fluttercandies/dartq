@@ -452,7 +452,6 @@ fn nullable_formal_absorbs_arg_nullability() {
     );
 }
 
-
 /// A bare `this` argument carries the enclosing extension's on-type —
 /// `extension on M2?` contributes `M2?`, whose nullability the formal's
 /// `?` absorbs, so the callback formal stays silent on member uses
@@ -732,7 +731,11 @@ fn for_in_element_nullable_receiver_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The read face of the same inferred-slot receiver (`e.length` on the
@@ -749,7 +752,11 @@ fn for_in_element_read_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The write face (`e.x = 1` through the nullable element): the unchecked
@@ -765,7 +772,11 @@ fn for_in_element_write_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_setter"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_setter"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The non-nullable boundary of the inferred-slot face: an element of
@@ -802,7 +813,11 @@ fn record_destructure_nullable_slot_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The non-nullable record slot: `(C, int)`'s `c` is `C` — the member
@@ -817,7 +832,11 @@ fn record_destructure_non_null_stays_silent() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The if-case pattern variable under a nullable scrutinee (`Object? o`
@@ -834,7 +853,11 @@ fn if_case_pattern_nullable_scrutinee_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The switch-case pattern binding under a nullable scrutinee: the bound
@@ -849,7 +872,11 @@ fn switch_case_pattern_nullable_scrutinee_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The dynamic-dispatch boundary of the inferred-slot face: an untyped
@@ -865,7 +892,11 @@ fn inferred_slot_dynamic_face_keeps_the_silent_dispatch() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 // —— #2347: the closure-formal schema's receiver-element substitution ———————
@@ -989,5 +1020,9 @@ fn for_in_field_implicit_call_chain_reads_call_return() {
                       } \
                     } }";
     let rep = report(source);
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
 }

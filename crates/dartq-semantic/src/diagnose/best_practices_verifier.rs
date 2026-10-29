@@ -128,7 +128,9 @@ fn is_angular_meta_getter(
     let resolves = |prefix: Option<StringId>| {
         graph.import_edges(lib).iter().any(|edge| {
             edge.prefix == prefix
-                && edge.target.is_some_and(|target| graph.name(target) == "angular.meta")
+                && edge
+                    .target
+                    .is_some_and(|target| graph.name(target) == "angular.meta")
                 && edge.combinators.allows(getter_id)
         })
     };

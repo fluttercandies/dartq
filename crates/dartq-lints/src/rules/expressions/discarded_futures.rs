@@ -26,11 +26,8 @@ use super::{Check, NodeKind, RuleSpec, unused_futures};
 /// declared-return face and never reports. Message:
 /// `diagnostic.g.dart` `discardedFutures` (the `FutureOr` shape
 /// reports the paired `discarded_future_or` texts).
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "discarded_futures",
-    &[NodeKind::ExpressionStatement],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("discarded_futures", &[NodeKind::ExpressionStatement], check,);
 
 fn check(c: &mut Check<'_>) {
     unused_futures::check(c, false);

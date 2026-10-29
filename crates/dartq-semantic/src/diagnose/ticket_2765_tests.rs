@@ -57,9 +57,7 @@ fn rows(full: &str, rep: &FileReport) -> Vec<String> {
             };
             format!(
                 "{severity}|{}|{line}:{col}|{}|{}",
-                d.code.name,
-                d.range.length,
-                d.message
+                d.code.name, d.range.length, d.message
             )
         })
         .collect()
@@ -96,7 +94,9 @@ void f(C c) {
     let rep = report_ops(fixture);
     assert_eq!(
         rows(&full, &rep),
-        ["ERROR|unchecked_use_of_nullable_value|14:8|6|The property 'isEven' can't be unconditionally accessed because the receiver can be 'null'."],
+        [
+            "ERROR|unchecked_use_of_nullable_value|14:8|6|The property 'isEven' can't be unconditionally accessed because the receiver can be 'null'."
+        ],
         "{:?}",
         rep.diagnostics
     );

@@ -59,8 +59,7 @@ fn avoid_null_checks_in_equality_operator_faces() {
     let start = tok(&f.source, &f.tokens, "null", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, start));
 
-    let f =
-        Fixture::parse("class C {\n  bool operator ==(Object? other) => other?.foo();\n}\n");
+    let f = Fixture::parse("class C {\n  bool operator ==(Object? other) => other?.foo();\n}\n");
     let lints = f.run(&one_rule("avoid_null_checks_in_equality_operators"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let start = tok(&f.source, &f.tokens, "other", 1);

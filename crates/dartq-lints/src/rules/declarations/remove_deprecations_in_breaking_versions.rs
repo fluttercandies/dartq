@@ -74,11 +74,7 @@ fn parse(version: &str) -> Option<(u64, u64, u64, bool)> {
 /// the declaration rows' metadata with the version gate applied first
 /// (:36-48). `None` stays silent.
 #[must_use]
-pub fn check_annotation(
-    c: &Check<'_>,
-    version: &str,
-    meta: u32,
-) -> Option<core::ops::Range<u32>> {
+pub fn check_annotation(c: &Check<'_>, version: &str, meta: u32) -> Option<core::ops::Range<u32>> {
     if !is_breaking_version(version) {
         return None;
     }

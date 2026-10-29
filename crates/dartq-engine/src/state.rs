@@ -3046,17 +3046,18 @@ mod tests {
             "analyzer:\n  enable-experiment:\n    - augmentations\n",
         )
         .expect("options file");
-        let config =
-            dartq_pub::PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
-                .expect("empty config");
-        let options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>> =
-            [(case_dir.clone(), Arc::new(crate::analysis_options::AnalysisOptions::load(
+        let config = dartq_pub::PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+            .expect("empty config");
+        let options: FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>> = [(
+            case_dir.clone(),
+            Arc::new(crate::analysis_options::AnalysisOptions::load(
                 &case_dir.join("analysis_options.yaml"),
                 &config,
                 &case_dir,
-            )))]
-            .into_iter()
-            .collect();
+            )),
+        )]
+        .into_iter()
+        .collect();
         let grants = FeatureGrants::new(&sdk, "vm", &packages, &options, &[]);
         let mut files = FileTable::new();
         let file = files.intern(&case_dir.join("lib/test.dart"));

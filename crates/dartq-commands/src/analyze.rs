@@ -3463,7 +3463,8 @@ mod tests {
     #[test]
     fn run_overlaid_reports_text_direction_rows_on_their_own_files() {
         let bidi = '\u{202E}';
-        let flipped = format!("// The text direction is silently flipped here {bidi}\nvoid f() {{\n}}\n");
+        let flipped =
+            format!("// The text direction is silently flipped here {bidi}\nvoid f() {{\n}}\n");
         let root = workspace(
             "analyze_text_direction_rows",
             &[
@@ -3518,7 +3519,8 @@ mod tests {
         let line_ignored = flipped("// ignore: text_direction_code_point_in_comment\n");
         let same_line_ignored =
             format!("var s = 'a{bidi}b'; // ignore: text_direction_code_point_in_literal\n");
-        let for_file_ignored = flipped("// ignore_for_file: text_direction_code_point_in_comment\n");
+        let for_file_ignored =
+            flipped("// ignore_for_file: text_direction_code_point_in_comment\n");
         let wrong_code_file = flipped("// ignore: some_other_code\n");
         let root = workspace(
             "analyze_text_direction_ignores",
@@ -3587,14 +3589,20 @@ mod tests {
             rows
         };
         // The file-wide citation names the row's code: silent.
-        assert!(mount(
-            "analyze_inner_plugins_ignored",
-            "# ignore_for_file: plugins_in_inner_options\n"
-        )
-        .is_empty());
+        assert!(
+            mount(
+                "analyze_inner_plugins_ignored",
+                "# ignore_for_file: plugins_in_inner_options\n"
+            )
+            .is_empty()
+        );
         // A wrong-code citation names nothing: the row reports.
         assert_eq!(
-            mount("analyze_inner_plugins_kept", "# ignore_for_file: some_other_code\n").len(),
+            mount(
+                "analyze_inner_plugins_kept",
+                "# ignore_for_file: some_other_code\n"
+            )
+            .len(),
             1
         );
     }
@@ -3607,7 +3615,10 @@ mod tests {
     /// reaches the row.
     #[test]
     fn run_overlaid_reports_plugins_in_inner_options_on_inner_files_only() {
-        let root = workspace("analyze_inner_plugins", &[("lib/test.dart", "void f() {}\n")]);
+        let root = workspace(
+            "analyze_inner_plugins",
+            &[("lib/test.dart", "void f() {}\n")],
+        );
         let root = root.canonicalize().expect("canonical root");
         let inner_options = "plugins:\n  custom_lint:\n    path: .\n";
         std::fs::write(root.join("lib/analysis_options.yaml"), inner_options)
@@ -3661,8 +3672,11 @@ mod tests {
             &[("lib/test.dart", "void f() {}\n")],
         );
         let root = root.canonicalize().expect("canonical root");
-        std::fs::write(root.join("lib/analysis_options.yaml"), "plugins: custom_lint\n")
-            .expect("inner options");
+        std::fs::write(
+            root.join("lib/analysis_options.yaml"),
+            "plugins: custom_lint\n",
+        )
+        .expect("inner options");
         let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
         let mut engine = Engine::new(config).expect("engine");
         let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");

@@ -119,9 +119,11 @@ mod server;
 
 pub use commands::METHODS;
 pub use debug::DEBUG_REQUESTS;
-pub use test::TEST_REQUESTS;
-pub use server::{EXIT_CLEAN, EXIT_PROTOCOL, INTAKE_REQUESTS, SERVED_NOTIFICATIONS, run, run_with_signal};
+pub use server::{
+    EXIT_CLEAN, EXIT_PROTOCOL, INTAKE_REQUESTS, SERVED_NOTIFICATIONS, run, run_with_signal,
+};
 pub use session::{Publish, Session, SessionError, SessionRuntime, Turn};
+pub use test::TEST_REQUESTS;
 pub use watch::WatchOptions;
 
 /// Test-only observability for the daemon's hot-path allocation discipline

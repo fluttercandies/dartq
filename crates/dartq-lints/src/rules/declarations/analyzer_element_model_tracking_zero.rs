@@ -6,8 +6,5 @@ use crate::rules::not_dispatched;
 /// silent by design (same SDK-only annotation face as
 /// [`analyzer_element_model_tracking_bad`]). Message:
 /// `diagnostic.g.dart:170-176`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "analyzer_element_model_tracking_zero",
-    &[],
-    not_dispatched,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("analyzer_element_model_tracking_zero", &[], not_dispatched,);

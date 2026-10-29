@@ -1,5 +1,8 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, same_file, slice};
-use crate::rules::{byte_span_of_token, initialized_identifier_name, is_statement_row, variables_declaration_keyword};
+use super::{Check, NodeKind, PayloadField, RuleSpec, same_file, slice};
+use crate::rules::{
+    byte_span_of_token, initialized_identifier_name, is_statement_row,
+    variables_declaration_keyword,
+};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/cascade_invocations.dart`
 /// — consecutive statements on one cascadable reference report at the
@@ -358,8 +361,7 @@ fn assignment_box<'a>(c: &Check<'a>, assign: u32) -> CascadeBox<'a> {
     // The setter face: the plain-dot prefix must bind to a same-file
     // value (the upstream non-static variable gate). The marker's
     // `Operator` word is the access-operator token.
-    if c
-        .field(marker, PayloadField::Operator)
+    if c.field(marker, PayloadField::Operator)
         .is_none_or(|dot| c.lexeme(dot) != ".")
     {
         return CascadeBox::null();
@@ -406,8 +408,7 @@ fn invocation_box<'a>(c: &Check<'a>, stmt: u32, kids: &[u32], pos: usize) -> Cas
         .iter()
         .copied()
         .find(|&row| c.kind(row) == NodeKind::DotAccess)
-        && c
-            .field(marker, PayloadField::Operator)
+        && c.field(marker, PayloadField::Operator)
             .is_some_and(|dot| c.lexeme(dot) != ".")
     {
         return CascadeBox::null();
@@ -472,8 +473,7 @@ fn property_box<'a>(c: &Check<'a>, kids: &[u32]) -> CascadeBox<'a> {
     else {
         return CascadeBox::null();
     };
-    if c
-        .field(marker, PayloadField::Operator)
+    if c.field(marker, PayloadField::Operator)
         .is_none_or(|dot| c.lexeme(dot) != ".")
     {
         return CascadeBox::null();
@@ -547,8 +547,7 @@ mod tests {
         let source = "class A {\n  void m1() {}\n  void m2() {}\n}\nvoid f(A a) {\n  a.m1();\n  a.m2();\n}\n";
         assert_eq!(run(source).len(), 1);
 
-        let source =
-            "class A {\n  void m1() {}\n}\nvoid f(A a, A b) {\n  a.m1();\n  b.m1();\n}\n";
+        let source = "class A {\n  void m1() {}\n}\nvoid f(A a, A b) {\n  a.m1();\n  b.m1();\n}\n";
         assert!(run(source).is_empty());
     }
 
@@ -560,8 +559,7 @@ mod tests {
         let source = "class A {\n  int y = 0;\n  int z = 0;\n}\nbool probe(A a) => true;\nvoid f() {\n  var x = A();\n  x.y = probe(x);\n  x.z = 1;\n}\n";
         assert!(run(source).is_empty());
 
-        let source =
-            "class A {\n  int y = 0;\n}\nvoid f() {\n  const x = A();\n  x.y = 1;\n}\n";
+        let source = "class A {\n  int y = 0;\n}\nvoid f() {\n  const x = A();\n  x.y = 1;\n}\n";
         assert!(run(source).is_empty());
     }
 }

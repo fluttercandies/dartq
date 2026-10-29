@@ -71,7 +71,10 @@ impl TestError {
     pub(crate) fn wire(self) -> (i64, String) {
         match self {
             Self::InvalidParams(m) => (codes::INVALID_PARAMS, m),
-            Self::NoSuchRun(id) => (codes::TEST_RUN, format!("DARTQ/TEST/NO_SUCH_RUN: run {id} is not known")),
+            Self::NoSuchRun(id) => (
+                codes::TEST_RUN,
+                format!("DARTQ/TEST/NO_SUCH_RUN: run {id} is not known"),
+            ),
             Self::Domain(m) => (codes::TEST_RUN, format!("DARTQ/TEST: {m}")),
         }
     }
@@ -109,7 +112,9 @@ struct Tally {
 
 impl Tally {
     fn event(&mut self, event: &Value) {
-        let Some(id) = event.get("testID").and_then(Value::as_u64) else { return };
+        let Some(id) = event.get("testID").and_then(Value::as_u64) else {
+            return;
+        };
         match event.get("type").and_then(Value::as_str) {
             Some("error") => match self.state.insert(id, State::Failed) {
                 Some(State::Failed) => {}
@@ -194,18 +199,33 @@ struct CancelParams {
 struct ProbeParams {}
 
 fn decode<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, TestError> {
-    let params = if params.is_null() { json!({}) } else { params.clone() };
+    let params = if params.is_null() {
+        json!({})
+    } else {
+        params.clone()
+    };
     serde_json::from_value(params).map_err(|error| TestError::InvalidParams(error.to_string()))
 }
 
 /// Answer one `dartq/test/*` request.
-pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, root: &Path) -> Result<Value, TestError> {
+pub(crate) fn handle(
+    manager: &mut TestManager,
+    method: &str,
+    params: &Value,
+    root: &Path,
+) -> Result<Value, TestError> {
     match method {
         TEST_RUN => {
             let params: RunParams = decode(params)?;
-            let cwd = params.cwd.as_ref().map_or_else(|| root.to_path_buf(), |dir| root.join(dir));
+            let cwd = params
+                .cwd
+                .as_ref()
+                .map_or_else(|| root.to_path_buf(), |dir| root.join(dir));
             if !cwd.is_dir() {
-                return Err(TestError::InvalidParams(format!("cwd {} is not a directory", cwd.display())));
+                return Err(TestError::InvalidParams(format!(
+                    "cwd {} is not a directory",
+                    cwd.display()
+                )));
             }
             let id = manager.start(&params.args, &cwd)?;
             Ok(json!({ "run_id": id }))
@@ -217,18 +237,26 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
             }
             let mut ids: Vec<u64> = manager.runs.keys().copied().collect();
             ids.sort_unstable();
-            let runs = ids.into_iter().map(|id| manager.status(id)).collect::<Result<Vec<_>, _>>()?;
+            let runs = ids
+                .into_iter()
+                .map(|id| manager.status(id))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(json!({ "runs": runs }))
         }
         TEST_EVENTS => {
             let params: EventsParams = decode(params)?;
-            let run = manager.runs.get(&params.run_id).ok_or(TestError::NoSuchRun(params.run_id))?;
+            let run = manager
+                .runs
+                .get(&params.run_id)
+                .ok_or(TestError::NoSuchRun(params.run_id))?;
             let progress = run.progress.lock();
             let total = progress.events.len();
             let cursor = params.cursor.min(total);
             let end = (cursor + params.limit.unwrap_or(200).clamp(1, 2000)).min(total);
-            let page: Vec<Value> =
-                progress.events[cursor..end].iter().map(|line| serde_json::from_str(line).unwrap_or(Value::Null)).collect();
+            let page: Vec<Value> = progress.events[cursor..end]
+                .iter()
+                .map(|line| serde_json::from_str(line).unwrap_or(Value::Null))
+                .collect();
             Ok(json!({
                 "run_id": params.run_id,
                 "events": page,
@@ -238,7 +266,10 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
         }
         TEST_CANCEL => {
             let params: CancelParams = decode(params)?;
-            let run = manager.runs.get_mut(&params.run_id).ok_or(TestError::NoSuchRun(params.run_id))?;
+            let run = manager
+                .runs
+                .get_mut(&params.run_id)
+                .ok_or(TestError::NoSuchRun(params.run_id))?;
             let running = run.progress.lock().exit.is_none();
             if running {
                 run.cancelled = true;
@@ -253,13 +284,18 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
             let test = std::fs::read_to_string(root.join("pubspec.lock"))
                 .ok()
                 .and_then(|text| dartq_pub::LockFile::parse(&text).ok())
-                .and_then(|lock| lock.package("test").map(|package| package.version.to_string()));
+                .and_then(|lock| {
+                    lock.package("test")
+                        .map(|package| package.version.to_string())
+                });
             Ok(json!({
                 "dart": dartq_test::host::find("dart").map(|path| path.display().to_string()),
                 "test_package": test,
             }))
         }
-        _ => Err(TestError::InvalidParams(format!("unknown method: {method}"))),
+        _ => Err(TestError::InvalidParams(format!(
+            "unknown method: {method}"
+        ))),
     }
 }
 
@@ -268,7 +304,10 @@ impl TestManager {
         let bin = dartq_bin()?;
         // The run's own reporter goes after the caller's options (the last
         // one is in effect) and before any `--`.
-        let at = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+        let at = args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(args.len());
         let mut command = Command::new(&bin);
         command
             .arg("test")
@@ -283,8 +322,9 @@ impl TestManager {
         // daemon's, and a cancel reaches the child and its compiler.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let mut child =
-            command.spawn().map_err(|error| TestError::Domain(format!("cannot start {}: {error}", bin.display())))?;
+        let mut child = command.spawn().map_err(|error| {
+            TestError::Domain(format!("cannot start {}: {error}", bin.display()))
+        })?;
         let stdout = child.stdout.take().expect("stdout is piped");
         let mut stderr = child.stderr.take().expect("stderr is piped");
         let progress = Arc::new(parking_lot::Mutex::new(Progress::default()));
@@ -296,7 +336,9 @@ impl TestManager {
                 let mut buffer = [0u8; 8192];
                 while let Ok(read @ 1..) = stderr.read(&mut buffer) {
                     let mut progress = progress.lock();
-                    progress.stderr.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    progress
+                        .stderr
+                        .push_str(&String::from_utf8_lossy(&buffer[..read]));
                     if progress.stderr.len() > MAX_STDERR {
                         let mut cut = progress.stderr.len() - MAX_STDERR;
                         while !progress.stderr.is_char_boundary(cut) {
@@ -313,7 +355,9 @@ impl TestManager {
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
-                    let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+                    let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
                     let mut progress = progress.lock();
                     progress.tally.event(&event);
                     progress.events.push(line);
@@ -328,15 +372,26 @@ impl TestManager {
             });
         }
         self.next_id += 1;
-        self.runs.insert(self.next_id, ManagedRun { child, progress, cancelled: false });
+        self.runs.insert(
+            self.next_id,
+            ManagedRun {
+                child,
+                progress,
+                cancelled: false,
+            },
+        );
         self.evict();
         Ok(self.next_id)
     }
 
     /// Keep the newest [`MAX_FINISHED`] finished runs.
     fn evict(&mut self) {
-        let mut finished: Vec<u64> =
-            self.runs.iter().filter(|(_, run)| run.progress.lock().exit.is_some()).map(|(&id, _)| id).collect();
+        let mut finished: Vec<u64> = self
+            .runs
+            .iter()
+            .filter(|(_, run)| run.progress.lock().exit.is_some())
+            .map(|(&id, _)| id)
+            .collect();
         if finished.len() > MAX_FINISHED {
             finished.sort_unstable();
             for id in &finished[..finished.len() - MAX_FINISHED] {
@@ -395,11 +450,14 @@ fn dartq_bin() -> Result<PathBuf, TestError> {
     if let Some(bin) = std::env::var_os("DARTQ_BIN") {
         return Ok(PathBuf::from(bin));
     }
-    let exe = std::env::current_exe().map_err(|error| TestError::Domain(format!("cannot locate dartq: {error}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|error| TestError::Domain(format!("cannot locate dartq: {error}")))?;
     if exe.file_stem().and_then(|stem| stem.to_str()) == Some("dartq") {
         Ok(exe)
     } else {
-        Err(TestError::Domain("test runs need the dartq binary (set DARTQ_BIN)".to_owned()))
+        Err(TestError::Domain(
+            "test runs need the dartq binary (set DARTQ_BIN)".to_owned(),
+        ))
     }
 }
 
@@ -442,9 +500,18 @@ mod tests {
             (TEST_PROBE, json!({ "force": true })),
         ] {
             let error = handle(&mut manager, method, &params, &root).expect_err("rejected");
-            assert!(matches!(error, TestError::InvalidParams(_)), "{method}: {error:?}");
+            assert!(
+                matches!(error, TestError::InvalidParams(_)),
+                "{method}: {error:?}"
+            );
         }
-        assert!(matches!(handle(&mut manager, TEST_STATUS, &json!({ "run_id": 7 }), &root), Err(TestError::NoSuchRun(7))));
-        assert_eq!(handle(&mut manager, TEST_STATUS, &json!({}), &root).expect("status"), json!({ "runs": [] }));
+        assert!(matches!(
+            handle(&mut manager, TEST_STATUS, &json!({ "run_id": 7 }), &root),
+            Err(TestError::NoSuchRun(7))
+        ));
+        assert_eq!(
+            handle(&mut manager, TEST_STATUS, &json!({}), &root).expect("status"),
+            json!({ "runs": [] })
+        );
     }
 }

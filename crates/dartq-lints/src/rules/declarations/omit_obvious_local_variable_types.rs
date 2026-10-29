@@ -1,4 +1,7 @@
-use super::{Check, NodeKind, RuleSpec, every_initializer_obvious, for_each_iterable, local_written_type, obvious_spelling, utf16_token_run_span};
+use super::{
+    Check, NodeKind, RuleSpec, every_initializer_obvious, for_each_iterable, local_written_type,
+    obvious_spelling, utf16_token_run_span,
+};
 
 /// Official: `pkg/linter/lib/src/rules/omit_obvious_local_variable_types.dart:46-90`
 /// — a local variable declaration (statement or C-style for

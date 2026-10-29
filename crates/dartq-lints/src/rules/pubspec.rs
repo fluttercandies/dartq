@@ -990,11 +990,7 @@ pub(crate) mod secure_pubspec_urls {
 
     use super::{RuleSpec, not_dispatched};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "secure_pubspec_urls",
-    &[],
-    not_dispatched,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("secure_pubspec_urls", &[], not_dispatched,);
 
     /// One insecure URL: the value's byte range in the pubspec text and the
     /// offending (lowercase) scheme — the message's `{0}`.
@@ -1455,11 +1451,7 @@ pub(crate) mod package_names {
 
     use super::{RuleSpec, not_dispatched};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "package_names",
-    &[],
-    not_dispatched,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("package_names", &[], not_dispatched,);
 
     /// One invalid name: the value's byte range in the pubspec text and the
     /// name itself — the message's `{0}`.
@@ -1664,10 +1656,10 @@ pub(crate) mod depend_on_referenced_packages {
     use super::{NodeKind, RuleSpec};
 
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "depend_on_referenced_packages",
-    &[NodeKind::Import, NodeKind::Export],
-    check,
-);
+        "depend_on_referenced_packages",
+        &[NodeKind::Import, NodeKind::Export],
+        check,
+    );
 
     /// The virtual packages that never report (:68-72).
     const VIRTUAL_PACKAGES: [&str; 1] = ["flutter_gen"];
@@ -1833,11 +1825,7 @@ pub(crate) mod sort_pub_dependencies {
 
     use super::{RuleSpec, not_dispatched};
 
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "sort_pub_dependencies",
-    &[],
-    not_dispatched,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("sort_pub_dependencies", &[], not_dispatched,);
 
     /// The official `_visitDeps` (:41-65) over one section's named entries
     /// in document order — `(name span, name text)` pairs as the pubspec

@@ -53,9 +53,8 @@ fn no_fail_stays_silent() {
 /// exports the test `fail`, the bare name never reports.
 #[test]
 fn missing_test_import_stays_silent() {
-    let f = Fixture::parse(
-        "void f() {\n  try {\n    f();\n    fail('fail');\n  } catch (e) {}\n}\n",
-    );
+    let f =
+        Fixture::parse("void f() {\n  try {\n    f();\n    fail('fail');\n  } catch (e) {}\n}\n");
     assert!(f.run(&one_rule("use_test_throws_matchers")).is_empty());
 }
 

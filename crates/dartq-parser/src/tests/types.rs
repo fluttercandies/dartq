@@ -45,8 +45,16 @@ fn triple_nested_group_keeps_the_function_suffix_outside() {
     ] {
         let mut p = setup(source);
         let end = p.ensure_type_not_void_entry();
-        assert!(p.listener.errors.is_empty(), "{source}: {:?}", p.listener.errors);
-        assert_ne!(p.cursor.lexeme(end.id), ">", "{source}: the suffix belongs to the type");
+        assert!(
+            p.listener.errors.is_empty(),
+            "{source}: {:?}",
+            p.listener.errors
+        );
+        assert_ne!(
+            p.cursor.lexeme(end.id),
+            ">",
+            "{source}: the suffix belongs to the type"
+        );
     }
 }
 

@@ -171,8 +171,7 @@ fn entry_plus_expression_still_reports_both() {
 /// comparisons are a set → silent on the ambiguity face.
 #[test]
 fn comparison_operators_do_not_fold_into_angle_depth() {
-    let src =
-        "void f(bool x, bool y) { var s = {x ? 1 < 2 : 3, y ? 4 > 5 : 6}; }\n";
+    let src = "void f(bool x, bool y) { var s = {x ? 1 < 2 : 3, y ? 4 > 5 : 6}; }\n";
     let rep = lit_report(src);
     // No ambiguity face may fire; conditional expressions decide set.
     assert!(

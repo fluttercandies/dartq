@@ -356,16 +356,15 @@ pub(crate) fn restriction_disjoint_from(
         Restriction::Named(name, nullable) => {
             !world.can_be_subtype_of(&NameTy::Named(*name, *nullable), &matched)
         }
-        Restriction::NamedArgs(name, nullable, args) => !world
-            .can_be_subtype_of(
-                &NameTy::NamedArgs(*name, *nullable, *args),
-                &matched,
-            ),
+        Restriction::NamedArgs(name, nullable, args) => {
+            !world.can_be_subtype_of(&NameTy::NamedArgs(*name, *nullable, *args), &matched)
+        }
         Restriction::BoolValue(value) => {
             !world.can_be_subtype_of(&NameTy::BoolValue(*value), &matched)
         }
-        Restriction::EnumValue(enum_name, constant) => !world
-            .can_be_subtype_of(&NameTy::EnumValue(*enum_name, *constant), &matched),
+        Restriction::EnumValue(enum_name, constant) => {
+            !world.can_be_subtype_of(&NameTy::EnumValue(*enum_name, *constant), &matched)
+        }
     }
 }
 
@@ -851,13 +850,7 @@ impl Drop for FoldEngineGuard {
 
 /// The topmost window's engine, when one is open.
 fn fold_engine() -> Option<&'static Engine<'static>> {
-    FOLD_ENGINES.with(|stack| {
-        stack
-            .borrow()
-            .last()
-            .copied()
-            .map(|ptr| unsafe { &*ptr })
-    })
+    FOLD_ENGINES.with(|stack| stack.borrow().last().copied().map(|ptr| unsafe { &*ptr }))
 }
 
 impl ExhaustivenessWorld for NameWorld<'_> {
@@ -960,9 +953,10 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             // The restricted nullable inherits the value's type edges, but
             // only toward nullable targets (its `null` half never fits a
             // non-nullable type).
-            (NameTy::EnumValueOrNull(en, _), NameTy::Named(tn, true) | NameTy::NamedArgs(tn, true, _)) => {
-                self.is_subtype_of(&NameTy::Named(*en, false), &NameTy::Named(*tn, true))
-            }
+            (
+                NameTy::EnumValueOrNull(en, _),
+                NameTy::Named(tn, true) | NameTy::NamedArgs(tn, true, _),
+            ) => self.is_subtype_of(&NameTy::Named(*en, false), &NameTy::Named(*tn, true)),
             (NameTy::BoolOrNull(_), NameTy::Named(tn, true)) => self.is_subtype_of(
                 &NameTy::Named(self.bool_id, false),
                 &NameTy::Named(*tn, true),
@@ -1283,7 +1277,11 @@ impl<'a> NameWorld<'a> {
     /// clause names resolve in its declaring library, which the diagnosing
     /// library need not import). Several declaring libraries answer `None`
     /// — the name level cannot pick the one the declaring scope sees.
-    fn resolve_foreign(&self, scope: NameScope<'a>, name: StringId) -> Option<(&'a Container, FileId)> {
+    fn resolve_foreign(
+        &self,
+        scope: NameScope<'a>,
+        name: StringId,
+    ) -> Option<(&'a Container, FileId)> {
         if let Some(hit) = resolve_container(
             scope.graph,
             scope.namespaces,
@@ -1629,7 +1627,10 @@ impl<'a> NameWorld<'a> {
         if self.container(sup).is_none()
             && !self.primitive_ids.contains(&sup)
             && sup != self.object_id
-            && !self.core_supertypes.iter().any(|(_, parent)| *parent == sup)
+            && !self
+                .core_supertypes
+                .iter()
+                .any(|(_, parent)| *parent == sup)
         {
             return None;
         }

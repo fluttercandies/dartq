@@ -36,15 +36,15 @@
 use dartq_ast::{NodeKind, mod_flags};
 use dartq_scanner::{KeywordStyle, TokenKind};
 
-use super::{PayloadField, NONE_TOKEN, RuleSpec, first_child};
+use super::{NONE_TOKEN, PayloadField, RuleSpec, first_child};
 use crate::engine::Check;
-use crate::rules::{SupertypeClause, class_declaration_name, initialized_identifier_name, member_annotations, rows_with_parent, supertypes, utf16_token_span, variables_declaration_keyword};
+use crate::rules::{
+    SupertypeClause, class_declaration_name, initialized_identifier_name, member_annotations,
+    rows_with_parent, supertypes, utf16_token_span, variables_declaration_keyword,
+};
 
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "exhaustive_cases",
-    &[NodeKind::SwitchStatement],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("exhaustive_cases", &[NodeKind::SwitchStatement], check,);
 
 /// The class-family `abstract` modifier bit (bridge `mod_bits`; the
 /// parser lane owns the values).
@@ -93,8 +93,7 @@ fn check(c: &mut Check<'_>) {
     let constants = candidate_constants(c, &mut values, &field_faces, written);
     let candidate = EnumLikeCandidate {
         is_extension_type,
-        is_abstract: !is_extension_type
-            && mod_flags(c.unit.ast, candidate_row) & ABSTRACT_BIT != 0,
+        is_abstract: !is_extension_type && mod_flags(c.unit.ast, candidate_row) & ABSTRACT_BIT != 0,
         has_subclass_in_defining_unit: subclassed_in_file(c, candidate_row),
         constants: &constants,
         constructors: &constructors,
@@ -229,7 +228,10 @@ fn constructor_face(c: &Check<'_>, candidate_row: u32) -> Vec<(bool, bool)> {
         // A primary constructor names through `._` (private) or not at
         // all (the public type-named form).
         NodeKind::PrimaryConstructor => {
-            ctors.push((c.field(row, PayloadField::HasConstructorName) == Some(1), true));
+            ctors.push((
+                c.field(row, PayloadField::HasConstructorName) == Some(1),
+                true,
+            ));
         }
         _ => {}
     };
@@ -507,9 +509,8 @@ fn candidate_constants<'a>(
                 .and_then(|init| init_value(c, values, field_faces, init, &mut Vec::new(), 0));
             let of_this_type = match face.written {
                 Some(name) => name == candidate_name,
-                None => value.is_some_and(|id| {
-                    values.text(id).split(' ').next() == Some(candidate_name)
-                }),
+                None => value
+                    .is_some_and(|id| values.text(id).split(' ').next() == Some(candidate_name)),
             };
             ConstantField {
                 name: face.name,
@@ -579,8 +580,7 @@ pub(super) fn head_range(c: &Check<'_>, head: u32) -> Option<core::ops::Range<u3
         while c.kind(inner) == NodeKind::ParenthesizedPattern {
             inner = first_child(c, inner)?;
         }
-        return (c.kind(inner) == NodeKind::ConstantPattern)
-            .then(|| c.unit.ast.token_range(inner));
+        return (c.kind(inner) == NodeKind::ConstantPattern).then(|| c.unit.ast.token_range(inner));
     }
     let mut range = c.unit.ast.token_range(row);
     for &kid in &kids[..pos] {
@@ -612,10 +612,7 @@ fn head_face<'a>(c: &'a Check<'a>, range: core::ops::Range<u32>) -> Option<Alias
 /// The token range past a leading `const` introducer — `const` heads
 /// and initializers carry their constant through the same expression
 /// as the bare spelling.
-pub(super) fn strip_const(
-    c: &Check<'_>,
-    range: core::ops::Range<u32>,
-) -> core::ops::Range<u32> {
+pub(super) fn strip_const(c: &Check<'_>, range: core::ops::Range<u32>) -> core::ops::Range<u32> {
     if range.start < range.end && c.lexeme(range.start) == "const" {
         return range.start + 1..range.end;
     }

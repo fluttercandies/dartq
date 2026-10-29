@@ -54,8 +54,9 @@ pub(crate) fn import_arm(code: &str) -> Option<u8> {
         // The full bare-name legs: types, top-level callables/variables,
         // and named extensions (forTypeOrMember + forFunction +
         // forExtension registrations on these codes).
-        "undefined_function" | "undefined_identifier" | "undefined_method"
-        | "undefined_getter" => ARM_TYPE | ARM_CALLABLE | ARM_EXTENSION | ARM_SDK,
+        "undefined_function" | "undefined_identifier" | "undefined_method" | "undefined_getter" => {
+            ARM_TYPE | ARM_CALLABLE | ARM_EXTENSION | ARM_SDK
+        }
         _ => return None,
     };
     Some(mask)
@@ -549,10 +550,7 @@ pub(crate) fn import_edit(
         replacement.push('\n');
         return Some(insert_at(text, export.start, &replacement));
     }
-    if let Some(part) = spans
-        .iter()
-        .find(|span| span.kind == DirectiveClass::Part)
-    {
+    if let Some(part) = spans.iter().find(|span| span.kind == DirectiveClass::Part) {
         let mut replacement = line.clone();
         replacement.push('\n');
         return Some(insert_at(text, part.start, &replacement));

@@ -469,9 +469,7 @@ fn collect_npc(node: &Node, lookup: &dyn ConstLookup, out: &mut Vec<SourceRange>
                     IdentVerdict::NotConstant | IdentVerdict::Unresolved => {
                         out.push(node.span);
                     }
-                    IdentVerdict::Value(_)
-                    | IdentVerdict::Constant
-                    | IdentVerdict::InProgress => {}
+                    IdentVerdict::Value(_) | IdentVerdict::Constant | IdentVerdict::InProgress => {}
                 }
                 return;
             }
@@ -503,10 +501,7 @@ fn collect_npc(node: &Node, lookup: &dyn ConstLookup, out: &mut Vec<SourceRange>
                 collect_npc(part, lookup, out, depth);
             }
         }
-        Expr::Adjacent(parts)
-        | Expr::List(parts)
-        | Expr::Set(parts)
-        | Expr::Record(parts) => {
+        Expr::Adjacent(parts) | Expr::List(parts) | Expr::Set(parts) | Expr::Record(parts) => {
             for part in parts {
                 collect_npc(part, lookup, out, depth);
             }
@@ -587,12 +582,10 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 // A created num instance of unknown value (`const
                 // int.fromEnvironment(...)`): the assert passes, the
                 // result is a valid-but-unknown num.
-                Verdict::Value(ConstantValue::Created(c)) => {
-                    match lookup.created_state(c) {
-                        CreatedState::Int | CreatedState::Num => Verdict::Constant,
-                        _ => Verdict::Fault(ConstFault::TypeNum, node.span),
-                    }
-                }
+                Verdict::Value(ConstantValue::Created(c)) => match lookup.created_state(c) {
+                    CreatedState::Int | CreatedState::Num => Verdict::Constant,
+                    _ => Verdict::Fault(ConstFault::TypeNum, node.span),
+                },
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeNum, node.span),
                 other => other,
             },
@@ -606,12 +599,10 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 // A created bool instance of unknown value
                 // (`bool.fromEnvironment`): `assertBool` passes, the
                 // result is a valid-but-unknown bool.
-                Verdict::Value(ConstantValue::Created(c)) => {
-                    match lookup.created_state(c) {
-                        CreatedState::Bool => Verdict::Constant,
-                        _ => Verdict::Fault(ConstFault::TypeBool, node.span),
-                    }
-                }
+                Verdict::Value(ConstantValue::Created(c)) => match lookup.created_state(c) {
+                    CreatedState::Bool => Verdict::Constant,
+                    _ => Verdict::Fault(ConstFault::TypeBool, node.span),
+                },
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, node.span),
                 other => other,
             },
@@ -622,12 +613,10 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 Verdict::Value(ConstantValue::Null) => {
                     Verdict::Fault(ConstFault::ThrowsException, node.span)
                 }
-                Verdict::Value(ConstantValue::Created(c)) => {
-                    match lookup.created_state(c) {
-                        CreatedState::Int => Verdict::Constant,
-                        _ => Verdict::Fault(ConstFault::TypeInt, node.span),
-                    }
-                }
+                Verdict::Value(ConstantValue::Created(c)) => match lookup.created_state(c) {
+                    CreatedState::Int => Verdict::Constant,
+                    _ => Verdict::Fault(ConstFault::TypeInt, node.span),
+                },
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeInt, node.span),
                 other => other,
             },
@@ -710,13 +699,15 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 match (fold(k, lookup, depth), fold(v, lookup, depth)) {
                     (Verdict::Value(key), Verdict::Value(value)) => pairs.push((key, value)),
                     (
-                        other @ (Verdict::Fault(..) | Verdict::NotConstant(_)
+                        other @ (Verdict::Fault(..)
+                        | Verdict::NotConstant(_)
                         | Verdict::Unresolved(_)),
                         _,
                     )
                     | (
                         _,
-                        other @ (Verdict::Fault(..) | Verdict::NotConstant(_)
+                        other @ (Verdict::Fault(..)
+                        | Verdict::NotConstant(_)
                         | Verdict::Unresolved(_)),
                     ) => return other,
                     // One unknown-value side leaves the whole map's value
@@ -2691,7 +2682,11 @@ impl ConstCapture {
         }
         let has_ctl = self.windows.last().is_some_and(|w| w.ctl_elements > 0);
         let elements = self.pop_operands_at(count, floor);
-        let expr = if has_ctl { Expr::Other } else { build(elements) };
+        let expr = if has_ctl {
+            Expr::Other
+        } else {
+            build(elements)
+        };
         self.push(Node { expr, span }, true);
         true
     }
@@ -2716,12 +2711,15 @@ impl ConstCapture {
             return None;
         }
         self.apply_unaries_at(self.depth);
-        if self.fold_literal_ctor_element(count, span, |staged| {
-            match split_set_or_map(staged, has_set_entry) {
+        if self.fold_literal_ctor_element(
+            count,
+            span,
+            |staged| match split_set_or_map(staged, has_set_entry) {
                 SetOrMap::Set(elements) => Expr::Set(elements),
                 SetOrMap::Map(entries) => Expr::Map(entries),
-            }
-        }, self.base()) {
+            },
+            self.base(),
+        ) {
             return None;
         }
         let staged = self.pop_operands(count);
@@ -2746,7 +2744,9 @@ impl ConstCapture {
 
     /// Whether any annotation window is open.
     pub fn annotation_open(&self) -> bool {
-        self.windows.iter().any(|w| w.kind == WindowKind::Annotation)
+        self.windows
+            .iter()
+            .any(|w| w.kind == WindowKind::Annotation)
     }
 
     /// Takes every recorded leaf span, keeping only those inside
@@ -3214,12 +3214,10 @@ impl ConstCapture {
         // constant for the enclosing window (a redirect or super call can
         // never fold into a const value). It joins the operand stack as the
         // initializer window's own node so the root verdict still stands.
-        let span = level
-            .callee
-            .map_or(end, |callee| SourceRange {
-                offset: callee.span.offset,
-                length: end.end().saturating_sub(callee.span.offset),
-            });
+        let span = level.callee.map_or(end, |callee| SourceRange {
+            offset: callee.span.offset,
+            length: end.end().saturating_sub(callee.span.offset),
+        });
         self.push(
             Node {
                 expr: Expr::Other,
@@ -3390,7 +3388,13 @@ impl ConstCapture {
         } else {
             value
         };
-        self.push(Node { expr: Expr::Value(value), span }, true);
+        self.push(
+            Node {
+                expr: Expr::Value(value),
+                span,
+            },
+            true,
+        );
     }
 
     /// The implicit named creation `C.named(...)`: the capture keeps the
@@ -4377,7 +4381,9 @@ mod tests {
         assert_eq!(args.len(), 1);
         assert_eq!(
             eval(&args[0], &world),
-            Verdict::Value(ConstantValue::Set([ConstantValue::Int(1), ConstantValue::Int(2)].into())),
+            Verdict::Value(ConstantValue::Set(
+                [ConstantValue::Int(1), ConstantValue::Int(2)].into()
+            )),
             "a constant set stays const-feasible for the probe, by its element values"
         );
     }
@@ -4636,7 +4642,10 @@ mod equal_keys_2187 {
             },
             file,
         );
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
         let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
         let features = ParserFeatures::from_feature_set(set);
         let elements = collect(source, &scanned.tokens, features, &strings);
@@ -4674,12 +4683,7 @@ mod equal_keys_2187 {
         fold.report
             .diagnostics
             .iter()
-            .filter(|d| {
-                matches!(
-                    d.code.name,
-                    "equal_keys_in_map" | "equal_elements_in_set"
-                )
-            })
+            .filter(|d| matches!(d.code.name, "equal_keys_in_map" | "equal_elements_in_set"))
             .map(|d| (d.code.name, d.range.offset, d.range.end()))
             .collect()
     }
@@ -4855,9 +4859,7 @@ final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
     /// (the shift made junk payloads collide — the #2187 constants face).
     #[test]
     fn multibyte_neighbour_keeps_key_payloads_true() {
-        let rows = duplicate_rows(
-            "final a = '£';\nfinal m = {\n  \"AB\": 1,\n\"AB\": 2,\n};\n",
-        );
+        let rows = duplicate_rows("final a = '£';\nfinal m = {\n  \"AB\": 1,\n\"AB\": 2,\n};\n");
         assert_eq!(
             rows,
             [("equal_keys_in_map", String::from("\"AB\""))],

@@ -184,8 +184,7 @@ fn function_name_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
 fn pattern_binds(c: &Check<'_>, pattern: u32, name: &str) -> bool {
     c.children(pattern).any(|descendant| {
         c.kind(descendant) == NodeKind::DeclaredVariablePattern
-            && c
-                .field(descendant, PayloadField::Variable)
+            && c.field(descendant, PayloadField::Variable)
                 .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
     })
 }
@@ -273,8 +272,7 @@ fn path_shadowed(c: &Check<'_>, top_index: usize, name: &str) -> bool {
                     // Case patterns complete as flat direct children,
                     // so the variable is the child's own `Variable` word.
                     c.kind(kid) == NodeKind::DeclaredVariablePattern
-                        && c
-                            .field(kid, PayloadField::Variable)
+                        && c.field(kid, PayloadField::Variable)
                             .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
                 })
             }
@@ -362,8 +360,7 @@ fn scope_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
         NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
             c.collect_direct(node).into_iter().any(|kid| {
                 c.kind(kid) == NodeKind::DeclaredVariablePattern
-                    && c
-                        .field(kid, PayloadField::Variable)
+                    && c.field(kid, PayloadField::Variable)
                         .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name)
             })
         }
@@ -394,8 +391,7 @@ fn if_case_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
             // binder check reads the row's own `Variable` word, not only
             // its descendants.
             (c.kind(kid) == NodeKind::DeclaredVariablePattern
-                && c
-                    .field(kid, PayloadField::Variable)
+                && c.field(kid, PayloadField::Variable)
                     .is_some_and(|v| v != NONE_TOKEN && c.lexeme(v) == name))
                 || pattern_binds(c, kid, name)
         })
@@ -781,18 +777,18 @@ const VAR_FINAL_OR_CONST_MEMBER_BIT: u16 = 1 << 6;
 /// members.rs `ensure_identifier(IdentifierContext::MethodDeclaration)`).
 fn type_name_echo(c: &Check<'_>, ctor: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
-    c.collect_direct(ctor)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
+    c.collect_direct(ctor).into_iter().find(|&kid| {
+        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
+    })
 }
 
 /// The written constructor name part: the method-continuation context
 /// identifier child (the `.name` after the class-name echo).
 fn constructor_name_part(c: &Check<'_>, ctor: u32) -> Option<u32> {
     let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
-    c.collect_direct(ctor)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx))
+    c.collect_direct(ctor).into_iter().find(|&kid| {
+        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
+    })
 }
 
 /// A modifier keyword immediately before a constructor row's span head:
@@ -907,11 +903,13 @@ fn formal_parameter_rows(c: &Check<'_>, owner: u32) -> Vec<u32> {
 fn async_words(c: &Check<'_>, body: u32) -> (u32, u32) {
     match c.kind(body) {
         NodeKind::BlockBody => (
-            c.field(body, PayloadField::AsyncKeyword).unwrap_or(NONE_TOKEN),
+            c.field(body, PayloadField::AsyncKeyword)
+                .unwrap_or(NONE_TOKEN),
             c.field(body, PayloadField::Star).unwrap_or(NONE_TOKEN),
         ),
         NodeKind::ExpressionBody => (
-            c.field(body, PayloadField::AsyncKeyword).unwrap_or(NONE_TOKEN),
+            c.field(body, PayloadField::AsyncKeyword)
+                .unwrap_or(NONE_TOKEN),
             c.field(body, PayloadField::Star).unwrap_or(NONE_TOKEN),
         ),
         _ => (NONE_TOKEN, NONE_TOKEN),
@@ -2167,70 +2165,8 @@ fn header_supertype_flags(
 }
 
 // Per-rule modules (mechanical split 2026-10-19; registry paths unchanged).
-pub(crate) mod avoid_return_types_on_setters;
-pub(crate) mod unnecessary_late;
-pub(crate) mod use_function_type_syntax_for_parameters;
-pub(crate) mod prefer_typing_uninitialized_variables;
-pub(crate) mod prefer_generic_function_type_aliases;
-pub(crate) mod unnecessary_constructor_name;
-pub(crate) mod hash_and_equals;
-pub(crate) mod avoid_init_to_null;
-pub(crate) mod prefer_function_declarations_over_variables;
-pub(crate) mod type_init_formals;
-pub(crate) mod recursive_getters;
-pub(crate) mod unnecessary_getters_setters;
-pub(crate) mod unnecessary_nullable_for_final_variable_declarations;
-pub(crate) mod prefer_initializing_formals;
-pub(crate) mod annotate_overrides;
-pub(crate) mod avoid_renaming_method_parameters;
-pub(crate) mod overridden_fields;
-pub(crate) mod unnecessary_overrides;
 pub(crate) mod always_declare_return_types;
 pub(crate) mod always_put_required_named_parameters_first;
-pub(crate) mod avoid_final_parameters;
-pub(crate) mod avoid_classes_with_only_static_members;
-pub(crate) mod avoid_multiple_declarations_per_line;
-pub(crate) mod avoid_private_typedef_functions;
-pub(crate) mod avoid_returning_this;
-pub(crate) mod avoid_unused_constructor_parameters;
-pub(crate) mod avoid_types_on_closure_parameters;
-pub(crate) mod initialize_in_field_declaration;
-pub(crate) mod empty_container_bodies;
-pub(crate) mod unnecessary_const_in_enum_constructor;
-pub(crate) mod unnecessary_type_name_in_constructor;
-pub(crate) mod use_primary_constructors;
-pub(crate) mod var_with_no_type_annotation;
-pub(crate) mod prefer_final_parameters;
-pub(crate) mod avoid_void_async;
-pub(crate) mod async_return_with_no_await;
-pub(crate) mod unnecessary_primary_constructor_body;
-pub(crate) mod prefer_asserts_in_initializer_lists;
-pub(crate) mod test_types_in_equals;
-pub(crate) mod avoid_positional_boolean_parameters;
-pub(crate) mod avoid_field_initializers_in_const_classes;
-pub(crate) mod use_declaring_parameters;
-pub(crate) mod avoid_equals_and_hash_code_on_mutable_classes;
-pub(crate) mod avoid_setters_without_getters;
-pub(crate) mod use_setters_to_change_properties;
-pub(crate) mod use_to_and_as_if_applicable;
-pub(crate) mod deprecated_consistency;
-pub(crate) mod unnecessary_async;
-pub(crate) mod omit_local_variable_types;
-pub(crate) mod annotate_redeclares;
-pub(crate) mod avoid_implementing_value_types;
-pub(crate) mod omit_obvious_local_variable_types;
-pub(crate) mod omit_obvious_property_types;
-pub(crate) mod prefer_const_constructors_in_immutables;
-pub(crate) mod prefer_final_in_for_each;
-pub(crate) mod prefer_final_locals;
-pub(crate) mod specify_nonobvious_local_variable_types;
-pub(crate) mod specify_nonobvious_property_types;
-pub(crate) mod use_late_for_private_fields_and_variables;
-pub(crate) mod deprecated_member_use_from_same_package;
-pub(crate) mod remove_deprecations_in_breaking_versions;
-pub(crate) mod prefer_const_declarations;
-pub(crate) mod prefer_mixin;
-pub(crate) mod use_enums;
 pub(crate) mod analyzer_element_model_tracking_bad;
 pub(crate) mod analyzer_element_model_tracking_more_than_one;
 pub(crate) mod analyzer_element_model_tracking_zero;
@@ -2240,18 +2176,80 @@ pub(crate) mod analyzer_public_api_experimental_inconsistency;
 pub(crate) mod analyzer_public_api_exports_non_public_name;
 pub(crate) mod analyzer_public_api_impl_in_public_api;
 pub(crate) mod analyzer_to_be_deprecated_use;
+pub(crate) mod annotate_overrides;
+pub(crate) mod annotate_redeclares;
+pub(crate) mod async_return_with_no_await;
+pub(crate) mod avoid_classes_with_only_static_members;
+pub(crate) mod avoid_equals_and_hash_code_on_mutable_classes;
+pub(crate) mod avoid_field_initializers_in_const_classes;
+pub(crate) mod avoid_final_parameters;
+pub(crate) mod avoid_implementing_value_types;
+pub(crate) mod avoid_init_to_null;
+pub(crate) mod avoid_multiple_declarations_per_line;
+pub(crate) mod avoid_positional_boolean_parameters;
+pub(crate) mod avoid_private_typedef_functions;
+pub(crate) mod avoid_renaming_method_parameters;
+pub(crate) mod avoid_return_types_on_setters;
+pub(crate) mod avoid_returning_this;
+pub(crate) mod avoid_setters_without_getters;
+pub(crate) mod avoid_types_on_closure_parameters;
+pub(crate) mod avoid_unused_constructor_parameters;
+pub(crate) mod avoid_void_async;
 /// The class-family `ModSet` bits (bridge `mod_bits`) the
 /// rule reads. They live in `NodeHeader.flags` bits 1..=7; the member family
 /// shares positions on disjoint kinds.
 mod class_bits;
+pub(crate) mod deprecated_consistency;
+pub(crate) mod deprecated_member_use_from_same_package;
+pub(crate) mod empty_container_bodies;
+pub(crate) mod hash_and_equals;
 pub(crate) mod implicit_reopen;
 #[cfg(test)]
 mod implicit_reopen_tests;
+pub(crate) mod initialize_in_field_declaration;
+pub(crate) mod omit_local_variable_types;
+pub(crate) mod omit_obvious_local_variable_types;
+pub(crate) mod omit_obvious_property_types;
+pub(crate) mod overridden_fields;
+pub(crate) mod prefer_asserts_in_initializer_lists;
+pub(crate) mod prefer_const_constructors_in_immutables;
+pub(crate) mod prefer_const_declarations;
+pub(crate) mod prefer_final_in_for_each;
+pub(crate) mod prefer_final_locals;
+pub(crate) mod prefer_final_parameters;
+pub(crate) mod prefer_function_declarations_over_variables;
+pub(crate) mod prefer_generic_function_type_aliases;
+pub(crate) mod prefer_initializing_formals;
+pub(crate) mod prefer_mixin;
+pub(crate) mod prefer_typing_uninitialized_variables;
+pub(crate) mod recursive_getters;
+pub(crate) mod remove_deprecations_in_breaking_versions;
+pub(crate) mod specify_nonobvious_local_variable_types;
+pub(crate) mod specify_nonobvious_property_types;
+pub(crate) mod test_types_in_equals;
 #[cfg(test)]
 mod tests;
-/// The W5 (#1124) approximation pins over real parser trees.
-#[cfg(test)]
-mod w5_approx_pins;
+pub(crate) mod type_init_formals;
+pub(crate) mod unnecessary_async;
+pub(crate) mod unnecessary_const_in_enum_constructor;
+pub(crate) mod unnecessary_constructor_name;
+pub(crate) mod unnecessary_getters_setters;
+pub(crate) mod unnecessary_late;
+pub(crate) mod unnecessary_nullable_for_final_variable_declarations;
+pub(crate) mod unnecessary_overrides;
+pub(crate) mod unnecessary_primary_constructor_body;
+pub(crate) mod unnecessary_type_name_in_constructor;
 pub(crate) mod unreachable_from_main;
 #[cfg(test)]
 mod unreachable_from_main_tests;
+pub(crate) mod use_declaring_parameters;
+pub(crate) mod use_enums;
+pub(crate) mod use_function_type_syntax_for_parameters;
+pub(crate) mod use_late_for_private_fields_and_variables;
+pub(crate) mod use_primary_constructors;
+pub(crate) mod use_setters_to_change_properties;
+pub(crate) mod use_to_and_as_if_applicable;
+pub(crate) mod var_with_no_type_annotation;
+/// The W5 (#1124) approximation pins over real parser trees.
+#[cfg(test)]
+mod w5_approx_pins;

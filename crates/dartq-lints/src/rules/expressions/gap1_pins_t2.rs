@@ -229,8 +229,7 @@ fn unawaited_futures_async_faces() {
 /// silent.
 #[test]
 fn unnecessary_null_aware_extension_on_nullable_faces() {
-    let source =
-        "extension E on int? {\n  int get foo => 1;\n}\nvoid f(int? i) {\n  i?.foo;\n}\n";
+    let source = "extension E on int? {\n  int get foo => 1;\n}\nvoid f(int? i) {\n  i?.foo;\n}\n";
     let lints = run_semantic(
         source,
         "unnecessary_null_aware_operator_on_extension_on_nullable",

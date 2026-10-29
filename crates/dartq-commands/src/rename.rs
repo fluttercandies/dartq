@@ -601,7 +601,11 @@ mod tests {
         // interface's declaration file; the override rows stay out (they
         // are declarations, not invocations).
         let run = crate::query::callers(&mut engine, "createTask").expect("callers");
-        assert_eq!(run.decls.len(), 2, "the interface declaration and the override");
+        assert_eq!(
+            run.decls.len(),
+            2,
+            "the interface declaration and the override"
+        );
         assert_eq!(run.refs.len(), 1, "exactly the call site's invocation");
         let call = M.find("r.createTask()").expect("call site") + 2;
         let hit = &run.refs[0];
@@ -700,13 +704,13 @@ mod tests {
         // annotation, the receiver field — none spells the member, none is
         // an edit of it.
         assert!(!spells(&engine, svc_id, at("fetchTags("), "createTask"));
+        assert!(!spells(&engine, svc_id, at("C _repository"), "createTask"));
         assert!(!spells(
             &engine,
             svc_id,
-            at("C _repository"),
+            at("S(this._repository)"),
             "createTask"
         ));
-        assert!(!spells(&engine, svc_id, at("S(this._repository)"), "createTask"));
 
         // End to end: the plan over the interface declaration edits the
         // two family declarations and the one real call — the sibling
@@ -714,7 +718,10 @@ mod tests {
         let run = rename(
             &mut engine,
             &canonical(&root, "lib/repo.dart"),
-            Anchor::LineCol { line: 2, column: 17 },
+            Anchor::LineCol {
+                line: 2,
+                column: 17,
+            },
             "n",
         )
         .expect("rename");
@@ -848,14 +855,12 @@ mod tests {
 
         // The expected set: the four family declarations' name tokens
         // (Base, R, A, C in declaration order), then the four calls.
-        let m_sites: Vec<usize> = DIAMOND.match_indices("void m()").map(|(at, _)| at).collect();
+        let m_sites: Vec<usize> = DIAMOND
+            .match_indices("void m()")
+            .map(|(at, _)| at)
+            .collect();
         assert_eq!(m_sites.len(), 4, "Base, R, A, C");
-        let call = |receiver: &str| {
-            DIAMOND
-                .find(&format!("{receiver}.m()"))
-                .expect("call")
-                + 2
-        };
+        let call = |receiver: &str| DIAMOND.find(&format!("{receiver}.m()")).expect("call") + 2;
         let expected: Vec<usize> = m_sites
             .iter()
             .map(|at| at + 5)
@@ -967,8 +972,7 @@ mod tests {
         let byte = WIDE.find("fa").expect("declaration");
         let units = WIDE[..byte].encode_utf16().count();
         assert!(units < byte, "the fixture separates the spellings");
-        let run = rename(&mut engine, &a, Anchor::Utf16Offset(units as u64), "gb")
-            .expect("rename");
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(units as u64), "gb").expect("rename");
         let target = run.target.expect("the UTF-16 spelling resolves");
         assert_eq!(target.name, "fa");
         assert_eq!(
@@ -978,8 +982,7 @@ mod tests {
 
         // The byte count overshoots the token by the wide deficit — no
         // identifier there, the empty edit set answers.
-        let run = rename(&mut engine, &a, Anchor::Utf16Offset(byte as u64), "gb")
-            .expect("rename");
+        let run = rename(&mut engine, &a, Anchor::Utf16Offset(byte as u64), "gb").expect("rename");
         assert!(run.target.is_none(), "the byte spelling misses the token");
 
         // Between the two surrogates of '😀' is inside one character.
@@ -1072,7 +1075,13 @@ mod tests {
     /// refuse the write, name the reason).
     #[test]
     fn rename_finds_a_cross_package_declaration_outside_the_bound() {
-        let root = workspace("rename_cross_pkg", &[("lib/main.dart", "import 'package:dep/extra.dart';\n\nint main() => extra();\n")]);
+        let root = workspace(
+            "rename_cross_pkg",
+            &[(
+                "lib/main.dart",
+                "import 'package:dep/extra.dart';\n\nint main() => extra();\n",
+            )],
+        );
         // The out-of-tree path dependency: a sibling package the config
         // lists (the fvm/flutter and pub-cache shape), outside the
         // workspace bound discovery walks.
@@ -1110,7 +1119,10 @@ mod tests {
         let run = rename(
             &mut engine,
             &main,
-            Anchor::LineCol { line: 3, column: 15 },
+            Anchor::LineCol {
+                line: 3,
+                column: 15,
+            },
             "zulu",
         )
         .expect("rename");
@@ -1129,9 +1141,7 @@ mod tests {
         // The write gate names the dependency file — the refusal's reason.
         assert_eq!(
             outside_workspace(
-                run.edits
-                    .iter()
-                    .map(|edit| run.layout.file_path(edit.file)),
+                run.edits.iter().map(|edit| run.layout.file_path(edit.file)),
                 &bound
             ),
             Some(extra.as_path())

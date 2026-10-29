@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// A width-0 keyword hit (`new`, `late`): the rewrite drops the keyword
 /// plus its trailing horizontal whitespace (a newline stays — joining
 /// lines is a formatting decision, not a fix). The keyword is ASCII, so

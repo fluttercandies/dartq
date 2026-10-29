@@ -77,7 +77,6 @@ fn messages(report: &FileReport) -> Vec<String> {
         .collect()
 }
 
-
 /// The two-file rig: `main_src` imports `other_src` under the prefix
 /// `p` — the prefixed-callee seam (`p.f(x)` resolving through the
 /// import table into the other unit's element model).
@@ -95,7 +94,10 @@ fn report_prefixed(other_src: &str, main_src: &str) -> FileReport {
             },
             file,
         );
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {src:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {src:?}"
+        );
         scanned
     };
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
@@ -647,7 +649,12 @@ fn case_binder_scopes_to_its_member() {
          \x20 var after = element;\n\
          }",
     );
-    assert_eq!(count_code(&stmt, "undefined_getter"), 0, "{:?}", messages(&stmt));
+    assert_eq!(
+        count_code(&stmt, "undefined_getter"),
+        0,
+        "{:?}",
+        messages(&stmt)
+    );
     let expr = report(
         "class Element {} class Sub extends Element {}\n\
          class Pre extends Element { int get localId => 1; }\n\
@@ -657,7 +664,12 @@ fn case_binder_scopes_to_its_member() {
          \x20 _ => 0,\n\
          };",
     );
-    assert_eq!(count_code(&expr, "undefined_getter"), 0, "{:?}", messages(&expr));
+    assert_eq!(
+        count_code(&expr, "undefined_getter"),
+        0,
+        "{:?}",
+        messages(&expr)
+    );
 }
 
 /// `var x = p;` where `p`'s flow state carries a promotion infers the
@@ -692,7 +704,8 @@ fn tmp_cast_assign() {
         "  var a = x.sig;",
         "  var b = x.st;",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let r = report(&plain);
     assert_eq!(count_code(&r, "undefined_getter"), 0, "{:?}", messages(&r));
     let in_if_case = [
@@ -707,9 +720,15 @@ fn tmp_cast_assign() {
         "    var b = x.st;",
         "  }",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let r2 = report(&in_if_case);
-    assert_eq!(count_code(&r2, "undefined_getter"), 0, "{:?}", messages(&r2));
+    assert_eq!(
+        count_code(&r2, "undefined_getter"),
+        0,
+        "{:?}",
+        messages(&r2)
+    );
 }
 
 /// A top-level logical-or alternation joins its branches' promotions
@@ -733,7 +752,8 @@ fn or_alternation_joins_branch_promotions() {
         "    var a = x.sig;",
         "  }",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let r = report(&differing);
     assert_eq!(
         count_code(&r, "undefined_getter"),
@@ -749,7 +769,8 @@ fn or_alternation_joins_branch_promotions() {
         "    var a = x.sig;",
         "  }",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let r2 = report(&shared);
     assert_eq!(
         count_code(&r2, "undefined_getter"),
@@ -778,7 +799,8 @@ fn object_pattern_binder_takes_property_type() {
         "    var variable = element.isConst;",
         "  }",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let r = report(&src);
     let getters: Vec<&str> = r
         .diagnostics
@@ -811,7 +833,8 @@ fn callback_return_mismatch_still_reports() {
         "void f(C c, B Function(B) h) {",
         "  c.m(h);",
         "}",
-    ].join("\n");
+    ]
+    .join("\n");
     let r = report(&src);
     let args: Vec<&str> = r
         .diagnostics
@@ -821,7 +844,9 @@ fn callback_return_mismatch_still_reports() {
         .collect();
     assert_eq!(
         args,
-        ["The argument type 'B Function(B)' can't be assigned to the parameter type 'A Function(A)'. "],
+        [
+            "The argument type 'B Function(B)' can't be assigned to the parameter type 'A Function(A)'. "
+        ],
         "{:?}",
         messages(&r)
     );
@@ -916,7 +941,9 @@ fn yield_star_implied_type_is_raw_expression_type() {
         .collect();
     assert_eq!(
         yields,
-        ["The type 'String' implied by the 'yield*' expression must be assignable to 'Iterable<Item>'."],
+        [
+            "The type 'String' implied by the 'yield*' expression must be assignable to 'Iterable<Item>'."
+        ],
         "{:?}",
         messages(&r)
     );
@@ -939,7 +966,8 @@ fn cross_file_inferred_scrutinee_keeps_arms_live() {
         "  const Res(this.getter2);",
         "}",
         "Res resolve() => const Res(null);",
-    ].join("\n");
+    ]
+    .join("\n");
     let main = [
         "class MethodEl {}",
         "Object f() {",
@@ -950,19 +978,28 @@ fn cross_file_inferred_scrutinee_keeps_arms_live() {
         "    _ => 2,",
         "  };",
         "}",
-    ].join("\n");
-    let r = super::test_rig::report_ops_imports(&main, &[super::test_rig::RigImport {
-        uri: "package:t/other.dart",
-        prefix: Some("p"),
-        source: &other,
-    }]);
+    ]
+    .join("\n");
+    let r = super::test_rig::report_ops_imports(
+        &main,
+        &[super::test_rig::RigImport {
+            uri: "package:t/other.dart",
+            prefix: Some("p"),
+            source: &other,
+        }],
+    );
     let dead: Vec<&str> = r
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "dead_code")
         .map(|d| d.message.as_str())
         .collect();
-    assert!(dead.is_empty(), "arms died: {:?} ALL: {:?}", dead, messages(&r));
+    assert!(
+        dead.is_empty(),
+        "arms died: {:?} ALL: {:?}",
+        dead,
+        messages(&r)
+    );
 }
 
 /// A callback formal over a receiver whose element type is a FOREIGN
@@ -979,12 +1016,16 @@ fn foreign_element_type_callback_formal_is_not_nullable() {
         "void f(List<p.Ref> refs) {",
         "  refs.map((e) => e.uriString);",
         "}",
-    ].join("\n");
-    let r = super::test_rig::report_ops_imports(&main, &[super::test_rig::RigImport {
-        uri: "package:t/other.dart",
-        prefix: Some("p"),
-        source: &other,
-    }]);
+    ]
+    .join("\n");
+    let r = super::test_rig::report_ops_imports(
+        &main,
+        &[super::test_rig::RigImport {
+            uri: "package:t/other.dart",
+            prefix: Some("p"),
+            source: &other,
+        }],
+    );
     let unchecked: Vec<&str> = r
         .diagnostics
         .iter()
@@ -1190,7 +1231,6 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
 /// dereference — `x.match(...)` stays silent even though the class also
 /// declares an instance `match` (the unsafe instance read never runs).
 
-
 /// Explicit type arguments at a call to a generic top-level function
 /// declared in ANOTHER file fix its inference parameters outright — the
 /// upward face (here: `List<Object?>` arguments, which alone would solve
@@ -1214,11 +1254,7 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
 /// guarded read clean; format.dart:1479/1560/1585).
 #[test]
 fn demorgan_guard_promotes_prefixed_element_closure_formal() {
-    let idl = concat!(
-        "class K {\n",
-        "  final int index = 0;\n",
-        "}\n",
-    );
+    let idl = concat!("class K {\n", "  final int index = 0;\n", "}\n",);
     let main = concat!(
         "import 'idl.dart' as idl;\n",
         "class W {\n",
@@ -1232,11 +1268,14 @@ fn demorgan_guard_promotes_prefixed_element_closure_formal() {
         "  }\n",
         "}\n",
     );
-    let r = super::test_rig::report_ops_imports(main, &[super::test_rig::RigImport {
-        uri: "idl.dart",
-        prefix: Some("idl"),
-        source: idl,
-    }]);
+    let r = super::test_rig::report_ops_imports(
+        main,
+        &[super::test_rig::RigImport {
+            uri: "idl.dart",
+            prefix: Some("idl"),
+            source: idl,
+        }],
+    );
     // The rig's core stubs carry no `List.map`/`List.isEmpty` element
     // model, so those two rows report as unresolved getters — the pinned
     // faces are the guard's promotion (no unchecked nullable use) and
@@ -1315,11 +1354,14 @@ fn explicit_type_arguments_fix_foreign_callee_closure_formals() {
         "  }\n",
         "}\n",
     );
-    let r = super::test_rig::report_ops_imports(main, &[super::test_rig::RigImport {
-        uri: "helper.dart",
-        prefix: None,
-        source: helper,
-    }]);
+    let r = super::test_rig::report_ops_imports(
+        main,
+        &[super::test_rig::RigImport {
+            uri: "helper.dart",
+            prefix: None,
+            source: helper,
+        }],
+    );
     let unchecked: Vec<&str> = r
         .diagnostics
         .iter()
@@ -1344,11 +1386,7 @@ fn nullable_on_extension_wins_over_instance_member() {
         "  bool f() => x.match(null);\n",
         "}\n",
     ));
-    let miss: Vec<&str> = r
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect();
+    let miss: Vec<&str> = r.diagnostics.iter().map(|d| d.code.name).collect();
     assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
 }
 
@@ -1436,7 +1474,6 @@ fn record_short_field_chain_continuation_stays_clean() {
         );
     }
 }
-
 
 /// A cascade section's write no longer retracts the cascade target's own
 /// read facts: the first section's selector latches on the target's read

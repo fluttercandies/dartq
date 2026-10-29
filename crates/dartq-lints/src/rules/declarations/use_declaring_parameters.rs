@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows, same_class_field_type};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows,
+    same_class_field_type,
+};
 use crate::rules::{NONE_TOKEN, body_members, initialized_identifier_name};
 use dartq_ast::mod_flags;
 

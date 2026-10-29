@@ -158,11 +158,7 @@ fn mixin_parameter_spelling_never_reaches_the_member_face() {
                 }";
     let rep = report(main, MIX);
     for d in &rep.diagnostics {
-        assert!(
-            !d.message.contains("XmlNodeList<T>"),
-            "{:?}",
-            d.message
-        );
+        assert!(!d.message.contains("XmlNodeList<T>"), "{:?}", d.message);
     }
 }
 

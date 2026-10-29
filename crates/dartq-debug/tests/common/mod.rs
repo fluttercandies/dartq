@@ -405,8 +405,13 @@ fn serve<H>(
                         message,
                         details,
                     } => {
-                        if !write_error(&mut socket, &request.id, code, &message, details.as_deref())
-                        {
+                        if !write_error(
+                            &mut socket,
+                            &request.id,
+                            code,
+                            &message,
+                            details.as_deref(),
+                        ) {
                             return;
                         }
                     }
@@ -441,9 +446,7 @@ fn write_control(socket: &mut WebSocket<TcpStream>, frame: &Control) -> bool {
                 .send(Message::Text(envelope.to_string().into()))
                 .is_ok()
         }
-        Control::Raw(text) => socket
-            .send(Message::Text(text.clone().into()))
-            .is_ok(),
+        Control::Raw(text) => socket.send(Message::Text(text.clone().into())).is_ok(),
         Control::Close => {
             let _ = socket.close(None);
             false

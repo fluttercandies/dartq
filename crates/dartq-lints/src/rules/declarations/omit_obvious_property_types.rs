@@ -1,4 +1,6 @@
-use super::{Check, NodeKind, RuleSpec, every_initializer_obvious, fields_written_type, utf16_token_run_span};
+use super::{
+    Check, NodeKind, RuleSpec, every_initializer_obvious, fields_written_type, utf16_token_run_span,
+};
 
 /// Official: `pkg/linter/lib/src/rules/omit_obvious_property_types.dart:48-72`
 /// — a top-level or field variable list (:43-44) with a written type

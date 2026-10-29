@@ -7,8 +7,10 @@
 //! match exactly on both sides; a case whose id prefix names an entry counts
 //! for it even when neither side reports the code. Prefix families resolve
 //! case-insensitively (the SDK corpus spells some lint families in camelCase
-//! where the registry folds them to lowercase), and census-verified corpus
-//! grouping ids (`exclusions`) get no row by design and never warn.
+//! where the registry folds them to lowercase), and accounted exclusions
+//! (census-verified corpus grouping ids, plus pin-absent row codes the
+//! dartq engine emits that the pinned registry does not carry) get no row
+//! by design and never warn.
 
 use crate::materialize::LoadedCase;
 use crate::registry::{Entry, Kind, Registry};
@@ -81,8 +83,9 @@ pub fn compute(registry: &Registry, cases: &[LoadedCase], run: &Comparison) -> V
             let Some(entry) = resolve(&entries, key).and_then(|k| entries.get_mut(&k)) else {
                 // A code registered under neither the diagnostic nor the lint
                 // namespace has no status row; feature ids only ever arrive
-                // through case prefixes. Census-verified corpus grouping ids
-                // are accounted exclusions, not gaps.
+                // through case prefixes. Census-verified corpus grouping
+                // ids and pin-absent dartq-only row codes are accounted
+                // exclusions, not gaps.
                 if is_unregistered(&entries, key) {
                     unregistered.insert(key.1.clone());
                 }
@@ -149,15 +152,16 @@ fn prefix_entry(id: &str) -> Option<(Kind, String)> {
 
 /// Whether any registry kind carries this id.
 fn known_code(entries: &BTreeMap<(Kind, String), Entry>, code: &str) -> bool {
-    entries
-        .keys()
-        .any(|(_, id)| id == code)
+    entries.keys().any(|(_, id)| id == code)
 }
 
 /// The registry key an attributed key lands on: an exact hit, else a
 /// case-folded hit (the SDK corpus spells some lint families in camelCase
 /// where the registry folds them to lowercase).
-fn resolve(entries: &BTreeMap<(Kind, String), Entry>, key: &(Kind, String)) -> Option<(Kind, String)> {
+fn resolve(
+    entries: &BTreeMap<(Kind, String), Entry>,
+    key: &(Kind, String),
+) -> Option<(Kind, String)> {
     if entries.contains_key(key) {
         return Some(key.clone());
     }
@@ -185,17 +189,16 @@ fn rows_for<'a>(rows: &'a [Row], code: &str) -> Vec<&'a Row> {
 fn spec_drift(loaded: &LoadedCase, expected: &[Row]) -> bool {
     for (path, content) in &loaded.case.files {
         let file = path.trim_start_matches('/');
-        let markers: BTreeSet<(String, u32, u32)> =
-            crate::markers::extract_expectations(content)
-                .into_iter()
-                .map(|e| {
-                    (
-                        e.code,
-                        u32::try_from(e.line).unwrap_or(u32::MAX),
-                        e.column as u32,
-                    )
-                })
-                .collect();
+        let markers: BTreeSet<(String, u32, u32)> = crate::markers::extract_expectations(content)
+            .into_iter()
+            .map(|e| {
+                (
+                    e.code,
+                    u32::try_from(e.line).unwrap_or(u32::MAX),
+                    e.column as u32,
+                )
+            })
+            .collect();
         let oracle: BTreeSet<(String, u32, u32)> = expected
             .iter()
             .filter(|r| r.file == file)
@@ -258,7 +261,10 @@ pub fn parse(text: &str) -> Result<Vec<EntryStat>, String> {
         };
         let nums = fields[2..7]
             .iter()
-            .map(|f| f.parse::<u32>().map_err(|_| format!("status line {}: bad number `{f}`", no + 1)))
+            .map(|f| {
+                f.parse::<u32>()
+                    .map_err(|_| format!("status line {}: bad number `{f}`", no + 1))
+            })
             .collect::<Result<Vec<u32>, _>>()?;
         stats.push(EntryStat {
             kind,
@@ -302,7 +308,10 @@ pub fn lock(existing_text: &str, stats: &[EntryStat]) -> String {
             }
         }
     }
-    eprintln!("lock: {added} newly green entries added, {} already locked", locked.len() - added);
+    eprintln!(
+        "lock: {added} newly green entries added, {} already locked",
+        locked.len() - added
+    );
     let mut lines: Vec<String> = locked.into_iter().collect();
     lines.sort();
     let mut out = lines.join("\n");
@@ -316,10 +325,8 @@ pub fn lock(existing_text: &str, stats: &[EntryStat]) -> String {
 /// crashed. Returns the violation lines (empty = pass).
 pub fn gate(stats: &[EntryStat], locked_text: &str) -> Vec<String> {
     let mut violations = Vec::new();
-    let by_id: BTreeMap<String, &EntryStat> = stats
-        .iter()
-        .map(|stat| (locked_id(stat), stat))
-        .collect();
+    let by_id: BTreeMap<String, &EntryStat> =
+        stats.iter().map(|stat| (locked_id(stat), stat)).collect();
     for line in locked_text.lines().filter(|l| !l.trim().is_empty()) {
         match by_id.get(line.trim()) {
             Some(stat) if stat.state == "green" => {}
@@ -395,7 +402,10 @@ mod tests {
     fn attribution_prefix_counts_even_when_silent() {
         let cases = vec![loaded("diagnostics/code_a/silent", "var x = 1;\n")];
         let run = Comparison::new(
-            BTreeMap::from([("diagnostics/code_a/silent".to_string(), Expected::Rows(vec![]))]),
+            BTreeMap::from([(
+                "diagnostics/code_a/silent".to_string(),
+                Expected::Rows(vec![]),
+            )]),
             BTreeMap::from([("diagnostics/code_a/silent".to_string(), vec![])]),
             BTreeSet::new(),
         );
@@ -457,7 +467,10 @@ mod tests {
             ]
         };
         let run = Comparison::new(
-            BTreeMap::from([("diagnostics/code_a/t".to_string(), Expected::Rows(rows("code_a")))]),
+            BTreeMap::from([(
+                "diagnostics/code_a/t".to_string(),
+                Expected::Rows(rows("code_a")),
+            )]),
             BTreeMap::from([("diagnostics/code_a/t".to_string(), rows("code_a"))]),
             BTreeSet::new(),
         );
@@ -511,7 +524,10 @@ mod tests {
         // and its expectation line follows retained line 0.
         let matching = vec![row("ERROR", "code_a", "lib/test.dart", 0, 7, 3, "m")];
         let run = Comparison::new(
-            BTreeMap::from([("diagnostics/code_a/t".to_string(), Expected::Rows(matching.clone()))]),
+            BTreeMap::from([(
+                "diagnostics/code_a/t".to_string(),
+                Expected::Rows(matching.clone()),
+            )]),
             BTreeMap::from([("diagnostics/code_a/t".to_string(), matching)]),
             BTreeSet::new(),
         );
@@ -525,11 +541,27 @@ mod tests {
         let run = Comparison::new(
             BTreeMap::from([(
                 "diagnostics/code_a/t".to_string(),
-                Expected::Rows(vec![row("ERROR", "code_a", "lib/test.dart", 1, 1, 1, "oracle text")]),
+                Expected::Rows(vec![row(
+                    "ERROR",
+                    "code_a",
+                    "lib/test.dart",
+                    1,
+                    1,
+                    1,
+                    "oracle text",
+                )]),
             )]),
             BTreeMap::from([(
                 "diagnostics/code_a/t".to_string(),
-                vec![row("ERROR", "code_a", "lib/test.dart", 1, 1, 1, "dartq text")],
+                vec![row(
+                    "ERROR",
+                    "code_a",
+                    "lib/test.dart",
+                    1,
+                    1,
+                    1,
+                    "dartq text",
+                )],
             )]),
             BTreeSet::new(),
         );
@@ -604,12 +636,18 @@ mod tests {
         .expect("registry");
         let cases = vec![loaded("lints/prefer_iterable_whereType/t", "var x = 1;\n")];
         let run = Comparison::new(
-            BTreeMap::from([("lints/prefer_iterable_whereType/t".to_string(), Expected::Rows(vec![]))]),
+            BTreeMap::from([(
+                "lints/prefer_iterable_whereType/t".to_string(),
+                Expected::Rows(vec![]),
+            )]),
             BTreeMap::new(),
             BTreeSet::new(),
         );
         let map = stats_map(&compute(&reg, &cases, &run));
-        assert_eq!(map["lint/prefer_iterable_wheretype"], (1, 1, 0, 0, 0, "green"));
+        assert_eq!(
+            map["lint/prefer_iterable_wheretype"],
+            (1, 1, 0, 0, 0, "green")
+        );
         assert!(!map.contains_key("lint/prefer_iterable_whereType"));
     }
 
@@ -633,6 +671,29 @@ mod tests {
     }
 
     #[test]
+    fn dartq_only_row_code_is_excluded_not_warned() {
+        // `abstract_extension_field` is a pin-absent dartq emission: it
+        // arrives through actual rows, never through the oracle, so it is
+        // an accounted exclusion rather than an accounting gap.
+        assert!(crate::exclusions::is_excluded("abstract_extension_field"));
+        let reg = registry();
+        let entries = &reg.entries;
+        let key = (Kind::Diagnostic, "abstract_extension_field".to_string());
+        assert!(resolve(entries, &key).is_none());
+        assert!(!is_unregistered(entries, &key));
+        // The pinned registry's real near-miss stays a resolving hit, and
+        // an unknown near-miss stays a genuine gap.
+        let real = (Kind::Diagnostic, "code_a".to_string());
+        assert_eq!(resolve(entries, &real), Some(real.clone()));
+        let unknown = (
+            Kind::Diagnostic,
+            "extension_declares_instance_field".to_string(),
+        );
+        assert!(resolve(entries, &unknown).is_none());
+        assert!(is_unregistered(entries, &unknown));
+    }
+
+    #[test]
     fn case_folded_row_code_resolves() {
         let reg = Registry::load(
             "C\tcode_a\tX\tY\tZ\ttrue\tm\tf\n",
@@ -642,10 +703,16 @@ mod tests {
         .expect("registry");
         let entries = &reg.entries;
         let key = (Kind::Lint, "no_runtimeType_toString".to_string());
-        assert_eq!(resolve(entries, &key), Some((Kind::Lint, "no_runtimetype_tostring".to_string())));
+        assert_eq!(
+            resolve(entries, &key),
+            Some((Kind::Lint, "no_runtimetype_tostring".to_string()))
+        );
         // Exact hits win without folding.
         let exact = (Kind::Diagnostic, "code_a".to_string());
         assert_eq!(resolve(entries, &exact), Some(exact.clone()));
-        assert_eq!(resolve(entries, &(Kind::Diagnostic, "code_A".to_string())), Some(exact));
+        assert_eq!(
+            resolve(entries, &(Kind::Diagnostic, "code_A".to_string())),
+            Some(exact)
+        );
     }
 }

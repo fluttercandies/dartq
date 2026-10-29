@@ -1,4 +1,7 @@
-use super::{PayloadField, AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows};
+use super::{
+    AUGMENT_MEMBER_BIT, Check, NodeKind, PayloadField, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT,
+    formal_parameter_rows,
+};
 use crate::rules::{NONE_TOKEN, body_members, variables_declaration_keyword};
 use dartq_ast::mod_flags;
 
@@ -42,8 +45,7 @@ fn check_fields(c: &mut Check<'_>) {
     }
     // `node.isStatic` (:89) — the `Fields` row's `MemberKind` word is
     // the discriminant.
-    if c.field(node, PayloadField::MemberKind)
-        == Some(dartq_parser::MemberKind::StaticField as u32)
+    if c.field(node, PayloadField::MemberKind) == Some(dartq_parser::MemberKind::StaticField as u32)
     {
         return;
     }
@@ -201,8 +203,7 @@ fn initializer_references<S: AsRef<str>>(c: &Check<'_>, row: u32, params: &[S]) 
     let Some(eq) = range.clone().find(|&token| c.lexeme(token) == "=") else {
         return false;
     };
-    (eq + 1..range.end)
-        .any(|token| params.iter().any(|param| param.as_ref() == c.lexeme(token)))
+    (eq + 1..range.end).any(|token| params.iter().any(|param| param.as_ref() == c.lexeme(token)))
 }
 
 /// Whether the variable row carries a `VariableInitializer` child (the

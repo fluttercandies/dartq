@@ -111,7 +111,12 @@ fn run() -> Result<(), Failure> {
     if verbose {
         print_tally(&entries, &rows, &classes);
     }
-    let document = render_tsv(&rows, entries.len(), &pin.stamp(&checkout_stamp), &checkout_stamp);
+    let document = render_tsv(
+        &rows,
+        entries.len(),
+        &pin.stamp(&checkout_stamp),
+        &checkout_stamp,
+    );
 
     if check {
         let tracked = read(&out).map_err(|(message, _)| (format!("--check {message}"), 1))?;

@@ -163,17 +163,19 @@ impl VmClient {
     pub fn connect_bounded(ws_uri: &str, timeout: Duration) -> Result<Self> {
         use std::net::ToSocketAddrs as _;
 
-        let request = ws_uri
-            .into_client_request()
-            .map_err(Error::WebSocket)?;
+        let request = ws_uri.into_client_request().map_err(Error::WebSocket)?;
         let uri = request.uri().clone();
-        let host = uri.host().ok_or_else(|| {
-            Error::Protocol(format!("ws uri names no host: {ws_uri}"))
-        })?;
+        let host = uri
+            .host()
+            .ok_or_else(|| Error::Protocol(format!("ws uri names no host: {ws_uri}")))?;
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let port = uri
             .port_u16()
-            .unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+            .unwrap_or(if uri.scheme_str() == Some("wss") {
+                443
+            } else {
+                80
+            });
         let deadline = Instant::now() + timeout;
 
         // TCP connect, bounded per resolved address by the remainder.
@@ -227,10 +229,15 @@ impl VmClient {
         stream
             .set_read_timeout(Some(remaining.min(HANDSHAKE_TICK)))
             .map_err(Error::Io)?;
-        stream.set_write_timeout(Some(remaining)).map_err(Error::Io)?;
+        stream
+            .set_write_timeout(Some(remaining))
+            .map_err(Error::Io)?;
         let map_failure = |error: tungstenite::Error| match error {
             tungstenite::Error::Io(io)
-                if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                if matches!(
+                    io.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
             {
                 Error::Timeout(format!(
                     "connect to {ws_uri}: no websocket handshake within {timeout:?}"
@@ -238,16 +245,12 @@ impl VmClient {
             }
             other => Error::WebSocket(other),
         };
-        let mut handshake = match tungstenite::client_tls_with_config(
-            request,
-            stream,
-            Some(ws_config()),
-            None,
-        ) {
-            Ok((socket, _)) => return Self::from_socket(socket),
-            Err(tungstenite::HandshakeError::Failure(error)) => return Err(map_failure(error)),
-            Err(tungstenite::HandshakeError::Interrupted(mid)) => mid,
-        };
+        let mut handshake =
+            match tungstenite::client_tls_with_config(request, stream, Some(ws_config()), None) {
+                Ok((socket, _)) => return Self::from_socket(socket),
+                Err(tungstenite::HandshakeError::Failure(error)) => return Err(map_failure(error)),
+                Err(tungstenite::HandshakeError::Interrupted(mid)) => mid,
+            };
         loop {
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
                 return Err(Error::Timeout(format!(

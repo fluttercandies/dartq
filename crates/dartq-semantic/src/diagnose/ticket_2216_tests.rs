@@ -1,4 +1,3 @@
-
 //! The #2216-family pins: the S5 faces verified end-to-end through the
 //! single-file rig.
 //!

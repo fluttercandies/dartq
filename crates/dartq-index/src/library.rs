@@ -335,8 +335,7 @@ impl LibraryIndex {
     pub fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
         self.refs.len() * size_of::<RefRow>()
-            + (self.runs.len() + self.name_runs.len() + self.name_refs.len())
-                * size_of::<u32>()
+            + (self.runs.len() + self.name_runs.len() + self.name_refs.len()) * size_of::<u32>()
             + self.names.len() * size_of::<NameRow>()
             + self.names_overflow.capacity() * size_of::<NameRow>()
             + self.supers.len() * size_of::<SubtypeEdge>()
@@ -1364,10 +1363,12 @@ pub(crate) mod tests {
             .map(|row| row.range.offset)
             .collect();
         assert_eq!(rows, vec![10, 20]);
-        assert!(surface
-            .references_named(strings.intern("zz_absent"))
-            .next()
-            .is_none());
+        assert!(
+            surface
+                .references_named(strings.intern("zz_absent"))
+                .next()
+                .is_none()
+        );
     }
 
     /// Clause-typed supers through the fold: every clause kind resolves by

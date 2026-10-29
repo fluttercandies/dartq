@@ -1,4 +1,7 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, is_deprecated_metadata, narrow_u32, top_level_annotations};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, container_members, is_deprecated_metadata, narrow_u32,
+    top_level_annotations,
+};
 use crate::rules::initialized_identifier_name;
 use std::path::{Path, PathBuf};
 
@@ -441,9 +444,7 @@ fn scan_target_deprecations(source: &str, path: &Path) -> TargetDeprecations {
                         }
                     }
                     Some(dartq_scanner::TokenKind::Eof) => break,
-                    Some(dartq_scanner::TokenKind::String)
-                        if depth == 1 && message.is_none() =>
-                    {
+                    Some(dartq_scanner::TokenKind::String) if depth == 1 && message.is_none() => {
                         let token = tokens.get(close);
                         let raw = token.map(|token| {
                             &source[token.byte_offset as usize
@@ -704,9 +705,7 @@ fn push_decl<'a>(
             .filter(|&kid| {
                 c.kind(kid) == NodeKind::Identifier
                     && c.field(kid, PayloadField::Context)
-                        == Some(
-                            dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32,
-                        )
+                        == Some(dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32)
             })
             .map(|kid| c.lexeme(c.head_token(kid)))
             .collect(),
@@ -797,6 +796,5 @@ fn is_reference_context(context: u32) -> bool {
         || context == IdentifierContext::TypeReferenceContinuation as u32
         || context == IdentifierContext::ConstructorReference as u32
         || context == IdentifierContext::ConstructorReferenceContinuation as u32
-        || context
-            == IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments as u32
+        || context == IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments as u32
 }

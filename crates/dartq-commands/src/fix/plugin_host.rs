@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// One entry of the governing options file's `plugins:` section: the
 /// declared package name plus the source the value pins. Upstream
 /// `_parsePluginSource` (analysis_options_parse_model.dart:1639) resolves

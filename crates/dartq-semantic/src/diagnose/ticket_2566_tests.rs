@@ -76,4 +76,3 @@ fn messages(report: &FileReport) -> Vec<String> {
         .map(|d| format!("{}: {}", d.code.name, d.message))
         .collect()
 }
-

@@ -246,10 +246,9 @@ pub fn run_export(
         }
     }
     documents.sort_by(|&a, &b| {
-        crate::layout::path_key(engine.file_table().path(a).expect("analyzed member"))
-            .cmp(crate::layout::path_key(
-                engine.file_table().path(b).expect("analyzed member"),
-            ))
+        crate::layout::path_key(engine.file_table().path(a).expect("analyzed member")).cmp(
+            crate::layout::path_key(engine.file_table().path(b).expect("analyzed member")),
+        )
     });
 
     // The per-file row views over the library surfaces — grouped once per
@@ -302,8 +301,10 @@ pub fn run_export(
     let strings = engine.strings();
     let packages = engine.packages();
     for &file in &documents {
-        let label =
-            pkg_label(packages, engine.file_table().path(file).expect("analyzed member"));
+        let label = pkg_label(
+            packages,
+            engine.file_table().path(file).expect("analyzed member"),
+        );
         let capture = engine.file_capture(file).expect("analyzed member");
         let decls = capture.index.decls();
         let mut document = json!({
@@ -382,9 +383,8 @@ pub fn run_export(
                         entry
                     })
                     .collect();
-                let supers: Vec<serde_json::Value> = supertypes
-                    .get(&file)
-                    .map_or_else(Vec::new, |edges| {
+                let supers: Vec<serde_json::Value> =
+                    supertypes.get(&file).map_or_else(Vec::new, |edges| {
                         edges
                             .iter()
                             .map(|edge| {
@@ -655,8 +655,7 @@ mod tests {
                 )
                 .unwrap_or_else(|v| panic!("line failed {tier:?} validation: {v}\n{line}"));
             }
-            let header: serde_json::Value =
-                serde_json::from_str(lines[0]).expect("header parses");
+            let header: serde_json::Value = serde_json::from_str(lines[0]).expect("header parses");
             assert_eq!(header["documents"], 3);
             assert_eq!(header["declarations"], 6);
             match tier {
@@ -694,8 +693,7 @@ mod tests {
                 continue;
             }
             // Minimal documents are the red line only.
-            let doc: serde_json::Value =
-                serde_json::from_str(lines[1]).expect("document parses");
+            let doc: serde_json::Value = serde_json::from_str(lines[1]).expect("document parses");
             assert_eq!(doc["symbol_count"], 3);
             assert!(doc.get("symbols").is_none());
             assert!(doc.get("declarations").is_none());
@@ -731,10 +729,7 @@ mod tests {
     /// the canonical table's monotone growth.
     #[test]
     fn export_tiers_grow_monotonically() {
-        let root = workspace(
-            "index_export_tiers",
-            &[("lib/a.dart", "class Foo {}\n")],
-        );
+        let root = workspace("index_export_tiers", &[("lib/a.dart", "class Foo {}\n")]);
         let sdk = root.join("sdk");
         let keys = |tier: crate::Verbosity| -> Vec<String> {
             let mut out: Vec<u8> = Vec::new();
@@ -764,13 +759,11 @@ mod tests {
         );
         assert_eq!(minimal, ["path", "symbol_count", "v"]);
         assert!(
-            compact.contains(&"declarations".to_owned())
-                && compact.contains(&"symbols".to_owned()),
+            compact.contains(&"declarations".to_owned()) && compact.contains(&"symbols".to_owned()),
             "compact adds the table and decl rows"
         );
         assert!(
-            full.contains(&"occurrences".to_owned())
-                && full.contains(&"supertypes".to_owned()),
+            full.contains(&"occurrences".to_owned()) && full.contains(&"supertypes".to_owned()),
             "full adds the ref and super rows"
         );
         std::fs::remove_dir_all(&root).ok();

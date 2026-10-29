@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_function_literals_in_foreach_calls.dart:31-105`
 /// — `x.forEach((e) { … })` reports at the method name.
@@ -59,8 +59,7 @@ fn check(c: &mut Check<'_>) {
             NodeKind::NoTypeVariables | NodeKind::TypeVariables
         )
     });
-    let Some(closure) = closure.filter(|&root| c.kind(root) == NodeKind::FunctionExpression)
-    else {
+    let Some(closure) = closure.filter(|&root| c.kind(root) == NodeKind::FunctionExpression) else {
         return;
     };
     // The receiver run bounds at the statement body: the owner window of
@@ -128,9 +127,7 @@ fn receiver_is_iterable(c: &Check<'_>, receiver: &[u32]) -> bool {
 /// `containsNullAwareInvocationInChain` (:87): the invocation's own
 /// marker word, or any null-aware access over the receiver run.
 fn chain_has_null_aware(c: &Check<'_>, receiver: &[u32], marker: Option<u32>) -> bool {
-    if marker.is_some_and(|marker| {
-        c.field(marker, PayloadField::IsNullAware).unwrap_or(0) != 0
-    }) {
+    if marker.is_some_and(|marker| c.field(marker, PayloadField::IsNullAware).unwrap_or(0) != 0) {
         return true;
     }
     receiver.iter().any(|&piece| {

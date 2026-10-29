@@ -39,11 +39,7 @@ use crate::rules::utf16_token_span;
 /// face resolves package:flutter's foundation getter, which no
 /// imported model carries — so a shadowing `kDebugMode` value
 /// under-reports. Message: `diagnostic.g.dart` `avoidPrint`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_print",
-    &[NodeKind::Send],
-    check,
-);
+pub(crate) static SPEC: RuleSpec = crate::spec!("avoid_print", &[NodeKind::Send], check,);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice, token_seq_equal};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice, token_seq_equal};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_if_null_operators.dart:22-63`
 /// — `x == null ? a : x` (or the `!=`/then mirror) reports at the
@@ -16,11 +16,8 @@ use super::{PayloadField, Check, NodeKind, RuleSpec, slice, token_seq_equal};
 /// pieces below it — with the bare-name group's marker rows dropped
 /// for the comparison. Message: `diagnostic.g.dart`
 /// `preferIfNullOperators`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "prefer_if_null_operators",
-    &[NodeKind::Conditional],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("prefer_if_null_operators", &[NodeKind::Conditional], check,);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

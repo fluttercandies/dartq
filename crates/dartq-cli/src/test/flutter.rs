@@ -958,7 +958,12 @@ fn grouped_pass(
     // config's digest folds into each suite it wraps.
     let configs_of: Vec<Option<PathBuf>> = files
         .iter()
-        .map(|file| dartq_test::cache::flutter_inputs(root, file).0.into_iter().next())
+        .map(|file| {
+            dartq_test::cache::flutter_inputs(root, file)
+                .0
+                .into_iter()
+                .next()
+        })
         .collect();
     let mut seeds = files.clone();
     let mut config_ids: FxHashMap<PathBuf, usize> = FxHashMap::default();
@@ -999,10 +1004,12 @@ fn grouped_pass(
         // sound composite — no further hash needed.
         let suite_d = digests.get(pos).cloned();
         let digest = match (suite_d, &config) {
-            (Some(suite_d), Some(config)) => Some(match config_ids.get(config).and_then(|&ci| digests.get(ci)) {
-                Some(config_d) => format!("{suite_d}+{config_d}"),
-                None => suite_d,
-            }),
+            (Some(suite_d), Some(config)) => Some(
+                match config_ids.get(config).and_then(|&ci| digests.get(ci)) {
+                    Some(config_d) => format!("{suite_d}+{config_d}"),
+                    None => suite_d,
+                },
+            ),
             (suite_d, _) => suite_d,
         };
         // The 4 s floor keeps the per-shard engine-load tax (~0.4–0.6 s)
@@ -1048,7 +1055,10 @@ fn grouped_pass(
     // The lease target counts *rows*, not suites: a sharded suite occupies
     // two testers for its window, which is exactly what its two engines
     // cost.
-    let rows: usize = hosted.iter().map(|hosted| hosted.shard_total as usize).sum();
+    let rows: usize = hosted
+        .iter()
+        .map(|hosted| hosted.shard_total as usize)
+        .sum();
     let target = plan.workers.min(rows).max(1);
     let (lease, workers) = dartq_test::lease(profile, target, deadline)?.ok_or_else(|| {
         io::Error::other("timed out waiting for host memory held by other dartq runs")
@@ -1215,11 +1225,16 @@ fn purge_replayed_durations(root: &Path, replayed: &[PathBuf]) {
         return;
     }
     // The same path Durations::load resolves (private in dartq-test).
-    let path = root.join(".dart_tool").join("dartq").join("test").join("durations.json");
+    let path = root
+        .join(".dart_tool")
+        .join("dartq")
+        .join("test")
+        .join("durations.json");
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    let Ok(mut millis) = serde_json::from_slice::<std::collections::BTreeMap<String, u64>>(&bytes) else {
+    let Ok(mut millis) = serde_json::from_slice::<std::collections::BTreeMap<String, u64>>(&bytes)
+    else {
         return;
     };
     let before = millis.len();
@@ -1507,7 +1522,10 @@ mod tests {
         let millis: std::collections::BTreeMap<String, u64> =
             serde_json::from_slice(&fs::read(&durations).expect("read")).expect("json");
         assert_eq!(millis.len(), 1);
-        assert_eq!(millis["test/b_test.dart"], 120, "dispatched suite keeps its row");
+        assert_eq!(
+            millis["test/b_test.dart"], 120,
+            "dispatched suite keeps its row"
+        );
         // A suite outside the package cannot forge a key.
         purge_replayed_durations(&root, &[PathBuf::from("/elsewhere/d_test.dart")]);
         let millis: std::collections::BTreeMap<String, u64> =

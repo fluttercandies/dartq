@@ -203,10 +203,9 @@ void f(Token token) {
     );
     assert_eq!(code_names(&report), ["undefined_getter"]);
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("'missing' isn't defined for the type 'Token'")),
+        report.diagnostics.iter().any(|d| d
+            .message
+            .contains("'missing' isn't defined for the type 'Token'")),
         "{:?}",
         report
             .diagnostics

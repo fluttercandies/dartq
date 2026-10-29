@@ -322,9 +322,8 @@ impl StringScan<'_> {
     /// literal is here — no directive on the line.
     fn next_literal(&mut self) -> Option<Literal> {
         let bytes = self.text.as_bytes();
-        let raw =
-            matches!(bytes.get(self.pos), Some(b'r' | b'R'))
-                && matches!(bytes.get(self.pos + 1), Some(b'\'' | b'"'));
+        let raw = matches!(bytes.get(self.pos), Some(b'r' | b'R'))
+            && matches!(bytes.get(self.pos + 1), Some(b'\'' | b'"'));
         if raw {
             self.pos += 1;
         }
@@ -351,7 +350,10 @@ impl StringScan<'_> {
                 continue;
             }
             if byte == quote {
-                let run = bytes[self.pos..].iter().take_while(|&&b| b == quote).count();
+                let run = bytes[self.pos..]
+                    .iter()
+                    .take_while(|&&b| b == quote)
+                    .count();
                 if run >= width {
                     self.pos += width;
                     closed = true;
@@ -493,7 +495,10 @@ fn escape_code(text: &str, start: usize, letter: char) -> (Option<u32>, usize) {
     let mut value = 0u32;
     let mut width = 0;
     while width < max {
-        let Some(digit) = bytes.get(start + width).and_then(|&b| (b as char).to_digit(16)) else {
+        let Some(digit) = bytes
+            .get(start + width)
+            .and_then(|&b| (b as char).to_digit(16))
+        else {
             break;
         };
         value = value * 16 + digit;
@@ -569,8 +574,17 @@ mod tests {
             "library;",
         ]);
         assert_eq!(found.len(), 2);
-        assert_eq!(found[1].uri.as_deref(), Some("package:analyzer/src/error/codes.dart"));
-        assert_eq!(found[1].span, SourceRange { offset: 83, length: 39 });
+        assert_eq!(
+            found[1].uri.as_deref(),
+            Some("package:analyzer/src/error/codes.dart")
+        );
+        assert_eq!(
+            found[1].span,
+            SourceRange {
+                offset: 83,
+                length: 39
+            }
+        );
     }
 
     #[test]
@@ -626,7 +640,13 @@ mod tests {
         assert_eq!(found[0].uri.as_deref(), Some("a.dart"));
         // Span: lexeme offset 100, `\n * ` to the content start (7 bytes),
         // then `@docImport ` (11).
-        assert_eq!(found[0].span, SourceRange { offset: 118, length: 8 });
+        assert_eq!(
+            found[0].span,
+            SourceRange {
+                offset: 118,
+                length: 8
+            }
+        );
 
         // The block sequence strips leading whitespace itself, so plain
         // indentation never reaches the 4-space code-block test — but the
@@ -664,7 +684,10 @@ mod tests {
         // No directive at all: nothing string-like after the prefix, or
         // nothing after it.
         for line in ["@docImport ;", "@docImport", "@docImport as p;"] {
-            assert!(line_comment(&[&format!("/// {line}"), "library;"]).is_empty(), "{line}");
+            assert!(
+                line_comment(&[&format!("/// {line}"), "library;"]).is_empty(),
+                "{line}"
+            );
         }
 
         // Escapes decode into the value; the span stays raw (19 units:
@@ -677,7 +700,13 @@ mod tests {
         // synthesizes the close): `'open.dart` is 10 units.
         let found = line_comment(&["/// @docImport 'open.dart", "library;"]);
         assert_eq!(found[0].uri.as_deref(), Some("open.dart"));
-        assert_eq!(found[0].span, SourceRange { offset: 15, length: 10 });
+        assert_eq!(
+            found[0].span,
+            SourceRange {
+                offset: 15,
+                length: 10
+            }
+        );
 
         // `$` without an identifier character is literal text.
         let found = line_comment(&["/// @docImport 'a$.dart';", "library;"]);
@@ -691,7 +720,13 @@ mod tests {
         let found = line_comment(&["/// @docImport 'a🎉b.dart';", "library;"]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].uri.as_deref(), Some("a🎉b.dart"));
-        assert_eq!(found[0].span, SourceRange { offset: 15, length: 11 });
+        assert_eq!(
+            found[0].span,
+            SourceRange {
+                offset: 15,
+                length: 11
+            }
+        );
     }
 
     /// A throwaway workspace: `pkg_a` is the analyzed package, `app` holds
@@ -817,8 +852,11 @@ mod tests {
         }]))
         .into_iter()
         .map(|directive| {
-            let resolution =
-                resolver.resolve(container, directive.uri.as_deref(), DirectiveKind::DocImport);
+            let resolution = resolver.resolve(
+                container,
+                directive.uri.as_deref(),
+                DirectiveKind::DocImport,
+            );
             (resolution.code, directive.span)
         })
         .collect()
@@ -829,11 +867,20 @@ mod tests {
         // Relative hit through the package base, absolute package hit, and a
         // known dart: library: no row for any of them.
         let outcomes = resolve_doc_imports("/// @docImport 'a.dart';");
-        assert!(matches!(outcomes.as_slice(), &[(None, _)]), "relative: {outcomes:?}");
+        assert!(
+            matches!(outcomes.as_slice(), &[(None, _)]),
+            "relative: {outcomes:?}"
+        );
         let outcomes = resolve_doc_imports("/// @docImport 'package:pkg_a/a.dart';");
-        assert!(matches!(outcomes.as_slice(), &[(None, _)]), "package: {outcomes:?}");
+        assert!(
+            matches!(outcomes.as_slice(), &[(None, _)]),
+            "package: {outcomes:?}"
+        );
         let outcomes = resolve_doc_imports("/// @docImport 'dart:core';");
-        assert!(matches!(outcomes.as_slice(), &[(None, _)]), "dart:core: {outcomes:?}");
+        assert!(
+            matches!(outcomes.as_slice(), &[(None, _)]),
+            "dart:core: {outcomes:?}"
+        );
     }
 
     #[test]
@@ -848,7 +895,13 @@ mod tests {
             code.info().message.replace("{0}", "missing.dart"),
             "Target of URI doesn't exist: 'missing.dart'."
         );
-        assert_eq!(span, SourceRange { offset: 15, length: 14 });
+        assert_eq!(
+            span,
+            SourceRange {
+                offset: 15,
+                length: 14
+            }
+        );
     }
 
     #[test]
@@ -859,15 +912,19 @@ mod tests {
             let source = format!("/// @docImport '{uri}';");
             let outcomes = resolve_doc_imports(&source);
             assert!(
-                matches!(outcomes.as_slice(), &[(Some(ResolutionCode::UriDoesNotExistInDocImport), _)]),
+                matches!(
+                    outcomes.as_slice(),
+                    &[(Some(ResolutionCode::UriDoesNotExistInDocImport), _)]
+                ),
                 "{uri}"
             );
         }
         // An unknown dart: library takes the same face.
         let outcomes = resolve_doc_imports("/// @docImport 'dart:boom';");
-        assert!(
-            matches!(outcomes.as_slice(), &[(Some(ResolutionCode::UriDoesNotExistInDocImport), _)])
-        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            &[(Some(ResolutionCode::UriDoesNotExistInDocImport), _)]
+        ));
     }
 
     #[test]

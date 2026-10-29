@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
 use crate::rules::expressions::{query_site, static_type_faces as faces};
 use dartq_semantic::model::Ty;
 
@@ -97,8 +97,7 @@ fn context_is_function_type(c: &Check<'_>, closure: u32) -> bool {
                 let mut written: Option<u32> = None;
                 for kid in c.collect_direct(owner) {
                     if kid == ancestor {
-                        return written
-                            .is_some_and(|row| c.kind(row) == NodeKind::FunctionType);
+                        return written.is_some_and(|row| c.kind(row) == NodeKind::FunctionType);
                     }
                     if matches!(
                         c.kind(kid),
@@ -130,11 +129,7 @@ fn context_is_function_type(c: &Check<'_>, closure: u32) -> bool {
                 if !is_identifier_target {
                     return false;
                 }
-                match crate::rules::expressions::same_file::binding(
-                    c,
-                    closure,
-                    c.lexeme(eq - 1),
-                ) {
+                match crate::rules::expressions::same_file::binding(c, closure, c.lexeme(eq - 1)) {
                     Some((_, Some(type_row))) => {
                         return c.kind(type_row) == NodeKind::FunctionType;
                     }

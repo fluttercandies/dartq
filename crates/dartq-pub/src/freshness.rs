@@ -322,9 +322,7 @@ impl Freshness {
                 (_, None) => false,
                 (None, Some(_)) => true,
             };
-            if mismatch
-                && let Some(generator) = config.generator_version.as_ref()
-            {
+            if mismatch && let Some(generator) = config.generator_version.as_ref() {
                 reasons.push(StaleReason::GeneratorSdkMismatch {
                     config: generator.to_string(),
                     current: dart_version.to_owned(),

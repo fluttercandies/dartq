@@ -562,14 +562,16 @@ impl Serialize for ValueOrSentinel {
     {
         match self {
             Self::Instance(instance) => {
-                let mut value = serde_json::to_value(instance).map_err(serde::ser::Error::custom)?;
+                let mut value =
+                    serde_json::to_value(instance).map_err(serde::ser::Error::custom)?;
                 if let Some(object) = value.as_object_mut() {
                     object.insert("type".to_owned(), Value::String("Instance".to_owned()));
                 }
                 value.serialize(serializer)
             }
             Self::Sentinel(sentinel) => {
-                let mut value = serde_json::to_value(sentinel).map_err(serde::ser::Error::custom)?;
+                let mut value =
+                    serde_json::to_value(sentinel).map_err(serde::ser::Error::custom)?;
                 if let Some(object) = value.as_object_mut() {
                     object.insert("type".to_owned(), Value::String("Sentinel".to_owned()));
                 }

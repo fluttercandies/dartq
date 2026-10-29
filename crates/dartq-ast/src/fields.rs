@@ -533,8 +533,7 @@ mod tests {
         ];
         for &(kind, row) in anchors {
             assert_eq!(
-                PAYLOAD_FIELDS[kind as usize],
-                row,
+                PAYLOAD_FIELDS[kind as usize], row,
                 "{kind:?}: row must match its anchor"
             );
         }

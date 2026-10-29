@@ -50,7 +50,10 @@ use dartq_ast::TOKEN_NONE;
 
 /// The payload word at `index` read as a token index.
 fn payload_token(ast: &SyntaxTable, id: u32, index: usize) -> Option<usize> {
-    ast.payload(id).get(index).copied().map(|token| token as usize)
+    ast.payload(id)
+        .get(index)
+        .copied()
+        .map(|token| token as usize)
 }
 
 /// Whether the literal node is a set literal (`has_set_entry` payload bit —
@@ -103,10 +106,7 @@ fn written_type_arguments(
     // From the creation head: a leading `const`/`new` keyword, then the
     // (possibly prefixed) type name, then an optional `<…>` group.
     let mut cursor = token_at(tokens, creation_span.start)?;
-    while matches!(
-        tokens.lexeme(text, cursor),
-        "const" | "new"
-    ) {
+    while matches!(tokens.lexeme(text, cursor), "const" | "new") {
         cursor += 1;
     }
     while matches!(
@@ -118,9 +118,7 @@ fn written_type_arguments(
     if cursor >= open || tokens.get(cursor)?.kind != TokenKind::Lt {
         return Some(String::new());
     }
-    let close = tokens
-        .matching_end(cursor)
-        .filter(|&close| close < open)?;
+    let close = tokens.matching_end(cursor).filter(|&close| close < open)?;
     Some(
         slice16(
             text,
@@ -142,7 +140,9 @@ fn written_type_arguments(
 /// `if` element — `if (condition) then else`. The outermost parenthesized
 /// wrapper joins the replacement (the producer's `nodeToReplace` walk);
 /// the three arms read unparenthesized.
-pub(crate) fn convert_to_if_element(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_if_element(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -291,10 +291,7 @@ fn compute_spread_element_text(context: &AssistContext<'_>, from16: u32) -> Opti
     let text = context.text;
     let tokens = context.tokens;
     let ast = context.ast;
-    let arg = unwrap_parens(
-        context,
-        covering_node(tokens, text, ast, from16)?,
-    )?;
+    let arg = unwrap_parens(context, covering_node(tokens, text, ast, from16)?)?;
     let arg_span = trim_span16(text, expression_extent(tokens, text, ast, arg)?)?;
     if ast.kind(arg) == NodeKind::BinaryExpression {
         let (_, right, operator, left_span, right_span) = binary_parts(context, arg)?;
@@ -309,10 +306,7 @@ fn compute_spread_element_text(context: &AssistContext<'_>, from16: u32) -> Opti
     }
     if ast.kind(arg) == NodeKind::Conditional {
         let (condition, then_arm, else_arm, ..) = conditional_parts(context, arg)?;
-        let else_text = slice16(
-            text,
-            &node_span16(tokens, text, ast, else_arm)?,
-        )?;
+        let else_text = slice16(text, &node_span16(tokens, text, ast, else_arm)?)?;
         if (else_text == "[]" || else_text == "const []")
             && direct_children(ast, else_arm).is_empty()
         {
@@ -342,7 +336,9 @@ fn compute_spread_element_text(context: &AssistContext<'_>, from16: u32) -> Opti
 /// output — an explicit `<…>` carried over, or the bare head (upstream
 /// renders `{}` there too); a creation whose immediate context could
 /// infer non-dynamic arguments — an invocation argument — declines.
-pub(crate) fn convert_to_map_literal(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_map_literal(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let creation = literal_creation_head(context, &["Map", "LinkedHashMap"])?;
     // One argument-less `(` `)` pair; no named constructor between.
     let (open, close) = creation.arguments?;
@@ -398,10 +394,8 @@ fn literal_creation_head(context: &AssistContext<'_>, names: &[&str]) -> Option<
         cursor += 1;
     }
     // The (possibly prefixed) type name.
-    if !matches!(
-        tokens.get(cursor)?.kind,
-        TokenKind::Identifier
-    ) || !names.contains(&tokens.lexeme(text, cursor))
+    if !matches!(tokens.get(cursor)?.kind, TokenKind::Identifier)
+        || !names.contains(&tokens.lexeme(text, cursor))
     {
         return None;
     }
@@ -467,7 +461,9 @@ fn literal_creation_head(context: &AssistContext<'_>, names: &[&str]) -> Option<
 ///   parameter-context leg (the `correspondingParameter` type) is absent —
 ///   the offer requires the enclosing variable declaration's written
 ///   `Set` type or an unambiguous element, the two decidable legs.
-pub(crate) fn convert_to_set_literal(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_set_literal(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     convert_list_to_set(context).or_else(|| convert_set_creation(context))
 }
 
@@ -501,7 +497,12 @@ fn convert_list_to_set(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, Str
     let dot = name - 1;
     let target = unwrap_parens(
         context,
-        covering_node(tokens, text, ast, tokens.get(dot.checked_sub(1)?)?.utf16_offset)?,
+        covering_node(
+            tokens,
+            text,
+            ast,
+            tokens.get(dot.checked_sub(1)?)?.utf16_offset,
+        )?,
     )?;
     if ast.kind(target) != NodeKind::ListLiteral {
         return None;
@@ -652,7 +653,9 @@ fn head_name_at(context: &AssistContext<'_>, offset16: u32) -> Option<String> {
 /// closure bodies through a parameter-reference finder and stay absent).
 /// The creation head spelling is re-verified on the assist's own trigger
 /// span, the covering walk standing in for the fix report.
-pub(crate) fn convert_to_for_element(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_for_element(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let text = context.text;
     let tokens = context.tokens;
     let ast = context.ast;
@@ -692,7 +695,9 @@ pub(crate) fn convert_to_for_element(context: &AssistContext<'_>) -> Option<Vec<
 /// reads only the name/type/`get` chain); a static getter never
 /// converts to the abstract face (the official's own guard), and an
 /// extension/extension-type getter must be static.
-pub(crate) fn getter_to_final_field(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn getter_to_final_field(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let text = context.text;
     let ast = context.ast;
     let node = covering_node(context.tokens, text, ast, context.selection.start)?;
@@ -840,10 +845,7 @@ fn type_start_or_get(
             if context.ast.kind(child) == NodeKind::Identifier {
                 break;
             }
-            if matches!(
-                context.ast.kind(child),
-                NodeKind::Type | NodeKind::VoidType
-            ) {
+            if matches!(context.ast.kind(child), NodeKind::Type | NodeKind::VoidType) {
                 return node_span16(context.tokens, context.text, context.ast, child)
                     .map(|span| span.start);
             }
@@ -996,19 +998,11 @@ pub(crate) fn field_formal_to_normal(
         Some(row) => {
             let last = direct_children(ast, row).into_iter().last()?;
             let last_end = node_span16(tokens, text, ast, last)?.end;
-            edits.push((
-                last_end,
-                0,
-                format!(", {name_text} = {parameter_name}"),
-            ));
+            edits.push((last_end, 0, format!(", {name_text} = {parameter_name}")));
         }
         None => {
             let list_close = parameters_close16(context, parameters)?;
-            edits.push((
-                list_close,
-                0,
-                format!(" : {name_text} = {parameter_name}"),
-            ));
+            edits.push((list_close, 0, format!(" : {name_text} = {parameter_name}")));
         }
     }
     Some(sort_edits(edits))
@@ -1037,10 +1031,7 @@ struct PriorDeclaration {
 
 /// The statement before `if` in the same statement list, declaring exactly
 /// one variable with an initializer (upstream `asSingleVariableDeclaration`).
-fn prior_declaration(
-    context: &AssistContext<'_>,
-    if_statement: u32,
-) -> Option<PriorDeclaration> {
+fn prior_declaration(context: &AssistContext<'_>, if_statement: u32) -> Option<PriorDeclaration> {
     let text = context.text;
     let ast = context.ast;
     let parent = ast.parent(if_statement)?;
@@ -1177,7 +1168,9 @@ fn collect_identifier_spans(
             continue;
         }
         if let Some(row_span) = node_span16(context.tokens, context.text, context.ast, row) {
-            if row_span.start >= span.start && row_span.end <= span.end && row_span.start < row_span.end
+            if row_span.start >= span.start
+                && row_span.end <= span.end
+                && row_span.start < row_span.end
             {
                 out.push(row_span);
             }
@@ -1196,9 +1189,7 @@ fn collect_identifier_spans(
 /// local-binding face; the upstream `is!`-condition conversion (the
 /// producer never checks the not-flag — the pattern binds the positive
 /// type, mirroring the observable behavior verbatim) converts too.
-pub(crate) fn if_case_statement(
-    context: &AssistContext<'_>,
-) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn if_case_statement(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
     if !context.features.patterns {
         return None;
     }
@@ -1236,8 +1227,7 @@ pub(crate) fn if_case_statement(
             format!("{keyword}{type_text} {}", declaration.name_text)
         }
         NodeKind::BinaryExpression => {
-            let (_, right_root, operator, left_span, _) =
-                binary_parts(context, parts.condition)?;
+            let (_, right_root, operator, left_span, _) = binary_parts(context, parts.condition)?;
             let keyword = if declaration.is_final { "final" } else { "var" };
             if context.tokens.lexeme(text, operator) != "!="
                 || context.ast.kind(right_root) != NodeKind::LiteralNull
@@ -1391,7 +1381,13 @@ pub(crate) fn if_case_statement_chain(
 ) -> Option<Vec<(u32, u32, String)>> {
     let text = context.text;
     let node = covering_node(context.tokens, text, context.ast, context.selection.start)?;
-    let switch = ancestor_or_self_kind(context.tokens, text, context.ast, node, NodeKind::SwitchStatement)?;
+    let switch = ancestor_or_self_kind(
+        context.tokens,
+        text,
+        context.ast,
+        node,
+        NodeKind::SwitchStatement,
+    )?;
     let block = child_of_kind(context.ast, switch, NodeKind::SwitchBlock)?;
     let groups = switch_chain_groups(context, block)?;
     let condition = child_of_kind(context.ast, switch, NodeKind::ParenthesizedCondition)?;
@@ -1421,7 +1417,10 @@ pub(crate) fn if_case_statement_chain(
         if let (Some(first), Some(last)) = (statements.first(), statements.last()) {
             let first_span = node_span16(context.tokens, text, context.ast, *first)?;
             let last_span = node_span16(context.tokens, text, context.ast, *last)?;
-            let lines = slice16(text, &(line_start16(text, first_span.start)?..last_span.end))?;
+            let lines = slice16(
+                text,
+                &(line_start16(text, first_span.start)?..last_span.end),
+            )?;
             let first_indent = line_indent_of(text, first_span.start);
             let new_indent = format!("{indent}  ");
             out.push_str(&reindent(lines, first_indent, &new_indent, eol, true));
@@ -1483,8 +1482,7 @@ pub(crate) fn for_each_to_for_index(
     let text = context.text;
     let tokens = context.tokens;
     let node = covering_node(tokens, text, context.ast, context.selection.start)?;
-    let for_in =
-        ancestor_or_self_kind(tokens, text, context.ast, node, NodeKind::ForIn)?;
+    let for_in = ancestor_or_self_kind(tokens, text, context.ast, node, NodeKind::ForIn)?;
     let for_span = node_span16(tokens, text, context.ast, for_in)?;
     let parts = child_of_kind(context.ast, for_in, NodeKind::ForInParts)?;
     let lparen = payload_token(context.ast, parts, 1)?;
@@ -1521,8 +1519,7 @@ pub(crate) fn for_each_to_for_index(
     // run between the `(` and the name (the token run carries the
     // written type).
     let head_start = tokens.get(lparen)?.utf16_offset + 1;
-    let variable_text =
-        slice16(text, &trim_span16(text, head_start..name_span.end)?)?.to_owned();
+    let variable_text = slice16(text, &trim_span16(text, head_start..name_span.end)?)?.to_owned();
     // The iterable: the bare identifier in the head run, resolving to a
     // `List`-typed variable (the upstream `staticType` gate alone — no
     // binding-kind filter).
@@ -1583,7 +1580,8 @@ pub(crate) fn for_each_to_for_index(
     }
     let insert_at = dartq_source::byte_offset_to_utf16(text, byte);
     let prefix = line_indent_of(text, for_span.start);
-    let header = format!("for (int {index_name} = 0; {index_name} < {list_text}.length; {index_name}++)");
+    let header =
+        format!("for (int {index_name} = 0; {index_name} < {list_text}.length; {index_name}++)");
     let insertion = format!(
         "{prefix}  {variable_text} = {list_text}[{index_name}];{}",
         eol_of(text)
@@ -1620,7 +1618,10 @@ fn self_or_block_statements(context: &AssistContext<'_>, statement: u32) -> Vec<
 /// (the `Function` construct) carry the `x _` pattern; everything else
 /// named is undecided here (the interface/alias split is the missing
 /// face) and declines.
-fn is_pattern_suffix_wildcard(context: &AssistContext<'_>, type_span: &core::ops::Range<u32>) -> Option<bool> {
+fn is_pattern_suffix_wildcard(
+    context: &AssistContext<'_>,
+    type_span: &core::ops::Range<u32>,
+) -> Option<bool> {
     let text = context.text;
     let trimmed = trim_span16(text, type_span.clone())?;
     let head = slice16(text, &(trimmed.start..trimmed.start + 1))?;
@@ -1640,7 +1641,9 @@ fn is_pattern_suffix_wildcard(context: &AssistContext<'_>, type_span: &core::ops
         index += 1;
     }
     // `dynamic` is no interface type (the `dynamic _` pattern).
-    let head_lexeme = context.tokens.lexeme(text, token_at(context.tokens, trimmed.start)?);
+    let head_lexeme = context
+        .tokens
+        .lexeme(text, token_at(context.tokens, trimmed.start)?);
     if head_lexeme == "dynamic" {
         return Some(true);
     }
@@ -1831,11 +1834,7 @@ fn convert_if_chain_to_switch(context: &AssistContext<'_>) -> Option<Vec<(u32, u
     }
     out.push_str(&indent);
     out.push('}');
-    Some(vec![(
-        if_span.start,
-        if_span.end - if_span.start,
-        out,
-    )])
+    Some(vec![(if_span.start, if_span.end - if_span.start, out)])
 }
 
 // ---------------------------------------------------------------------------
@@ -1860,9 +1859,7 @@ fn rewrite_switch_expression_cases(
         .into_iter()
         .filter(|&child| context.ast.kind(child) == NodeKind::SwitchExpressionCase)
     {
-        let mut children: Vec<u32> = direct_children(context.ast, case)
-            .into_iter()
-            .collect();
+        let mut children: Vec<u32> = direct_children(context.ast, case).into_iter().collect();
         let expression = children.pop()?;
         // The guarded pattern: adopted type rows precede the head (a
         // `NoType` row stands for the absent written type, a real `Type`
@@ -1892,9 +1889,8 @@ fn rewrite_switch_expression_cases(
         // The pure untyped wildcard: no written type and no `when`
         // (upstream `GuardedPattern.isPureUntypedWildcard`); the typed
         // `X _` face keeps the `case ` prefix.
-        let is_pure_wildcard = !written_type
-            && !has_when
-            && context.ast.kind(pattern) == NodeKind::WildcardPattern;
+        let is_pure_wildcard =
+            !written_type && !has_when && context.ast.kind(pattern) == NodeKind::WildcardPattern;
         if is_pure_wildcard {
             edits.push((
                 pattern_span.start,
@@ -1932,12 +1928,7 @@ fn trailing_semicolon_edit(
     context: &AssistContext<'_>,
     expression: u32,
 ) -> Option<(u32, u32, String)> {
-    let end = expression_end16(
-        context.tokens,
-        context.text,
-        context.ast,
-        expression,
-    )?;
+    let end = expression_end16(context.tokens, context.text, context.ast, expression)?;
     let index = token_at(context.tokens, end)?;
     if context.tokens.lexeme(context.text, index) != ";" {
         return None;
@@ -1963,7 +1954,11 @@ fn convert_switch_expression_to_switch(
     let switch_expression =
         ancestor_or_self_kind(tokens, text, context.ast, node, NodeKind::SwitchExpression)?;
     let switch_span = node_span16(tokens, text, context.ast, switch_expression)?;
-    let block = child_of_kind(context.ast, switch_expression, NodeKind::SwitchExpressionBlock)?;
+    let block = child_of_kind(
+        context.ast,
+        switch_expression,
+        NodeKind::SwitchExpressionBlock,
+    )?;
     if direct_children(context.ast, block).is_empty() {
         return None;
     }
@@ -2020,7 +2015,10 @@ fn convert_switch_expression_to_switch(
             // `var`/`final` face, which declines (the writeType inference
             // face is absent).
             let prev = token_at(tokens, name_span.start)?.checked_sub(1)?;
-            if matches!(tokens.lexeme(text, prev), "var" | "final" | "const" | "late") {
+            if matches!(
+                tokens.lexeme(text, prev),
+                "var" | "final" | "const" | "late"
+            ) {
                 return None;
             }
             let name_text = slice16(text, &name_span)?.to_owned();
@@ -2059,7 +2057,9 @@ fn convert_switch_expression_to_switch(
             return None;
         }
     }
-    edits.extend(rewrite_switch_expression_cases(context, block, &indent, &prefix)?);
+    edits.extend(rewrite_switch_expression_cases(
+        context, block, &indent, &prefix,
+    )?);
     edits.push(trailing_semicolon_edit(context, switch_expression)?);
     Some(sort_edits(edits))
 }
@@ -2093,10 +2093,7 @@ fn posix_relative(target: &str, from: &str) -> String {
     let target = path_segments(target);
     let from = path_segments(from);
     let mut common = 0;
-    while common < target.len()
-        && common < from.len()
-        && target[common] == from[common]
-    {
+    while common < target.len() && common < from.len() && target[common] == from[common] {
         common += 1;
     }
     let mut parts: Vec<&str> = vec![".."; from.len() - common];

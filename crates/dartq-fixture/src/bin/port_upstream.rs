@@ -25,12 +25,18 @@ fn main() {
     match std::fs::File::open(&input) {
         Ok(mut file) => {
             if let Err(e) = file.read_to_string(&mut source) {
-                eprintln!("port_upstream: cannot read {}: {e}", input.to_string_lossy());
+                eprintln!(
+                    "port_upstream: cannot read {}: {e}",
+                    input.to_string_lossy()
+                );
                 std::process::exit(2);
             }
         }
         Err(e) => {
-            eprintln!("port_upstream: cannot open {}: {e}", input.to_string_lossy());
+            eprintln!(
+                "port_upstream: cannot open {}: {e}",
+                input.to_string_lossy()
+            );
             std::process::exit(2);
         }
     }
@@ -48,7 +54,10 @@ fn main() {
     match output {
         Some(path) => {
             if let Err(e) = std::fs::write(&path, rendered) {
-                eprintln!("port_upstream: cannot write {}: {e}", path.to_string_lossy());
+                eprintln!(
+                    "port_upstream: cannot write {}: {e}",
+                    path.to_string_lossy()
+                );
                 std::process::exit(2);
             }
         }

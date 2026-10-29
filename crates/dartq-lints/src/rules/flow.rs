@@ -182,39 +182,39 @@ fn check_if_without_else(c: &mut Check<'_>, node: u32, then: u32) {
 }
 
 // Per-rule modules (mechanical split 2026-10-19; registry paths unchanged).
-pub(crate) mod control_flow_in_finally;
-pub(crate) mod no_duplicate_case_values;
-pub(crate) mod use_rethrow_when_possible;
-pub(crate) mod avoid_returning_null_for_void;
-pub(crate) mod type_literal_in_constant_pattern;
-pub(crate) mod exhaustive_cases;
 pub(crate) mod always_put_control_body_on_new_line;
 pub(crate) mod avoid_catches_without_on_clauses;
-pub(crate) mod require_trailing_commas;
-pub(crate) mod use_test_throws_matchers;
-#[cfg(test)]
-mod tests;
+/// The catch family: an `on` clause catching the dart:core `Error`
+/// family.
+pub(crate) mod avoid_catching_errors;
+pub(crate) mod avoid_returning_null_for_void;
+pub(crate) mod control_flow_in_finally;
+pub(crate) mod exhaustive_cases;
 /// The Dart-3.0 migration family: legacy `case` heads whose expression
 /// changes meaning (or errors) under patterns.
 pub(crate) mod invalid_case_patterns;
+/// The join family: an assignment statement a following `return` makes
+/// redundant.
+pub(crate) mod join_return_with_assignment;
+/// The enum-switch family: a `default` clause on a switch whose scrutinee
+/// names an enum type.
+pub(crate) mod no_default_cases;
+pub(crate) mod no_duplicate_case_values;
+pub(crate) mod require_trailing_commas;
 /// The pattern-shape family: a variable pattern whose explicit field name
 /// spells the variable twice.
 pub(crate) mod simplify_variable_pattern;
 /// The type-scrutinee family: a switch whose scrutinee is a `Type` value.
 pub(crate) mod switch_on_type;
-/// The enum-switch family: a `default` clause on a switch whose scrutinee
-/// names an enum type.
-pub(crate) mod no_default_cases;
-/// The join family: an assignment statement a following `return` makes
-/// redundant.
-pub(crate) mod join_return_with_assignment;
-/// The catch family: an `on` clause catching the dart:core `Error`
-/// family.
-pub(crate) mod avoid_catching_errors;
+#[cfg(test)]
+mod tests;
+pub(crate) mod type_literal_in_constant_pattern;
+pub(crate) mod use_build_context_synchronously;
+#[cfg(test)]
+mod use_build_context_synchronously_tests;
+pub(crate) mod use_rethrow_when_possible;
+pub(crate) mod use_test_throws_matchers;
 /// The W5 (#1124) approximation pins over real parser trees (the rule
 /// dispatches [`NodeKind::TryStatement`] — production parses throughout).
 #[cfg(test)]
 mod w5_approx_pins;
-pub(crate) mod use_build_context_synchronously;
-#[cfg(test)]
-mod use_build_context_synchronously_tests;

@@ -91,12 +91,15 @@ fn ports_upstream_rule_tests_when_configured() {
 /// methods — two markup, two clean, one raw `assertDiagnostics` — with the
 /// first markup case's marked range pinned to the `;` of the empty else.
 fn pin_avoid_empty_else(corpus: &Path) {
-    let source =
-        std::fs::read_to_string(corpus.join("avoid_empty_else_test.dart")).expect("read");
+    let source = std::fs::read_to_string(corpus.join("avoid_empty_else_test.dart")).expect("read");
     let outcome = dartq_fixture::port_file(&source).expect("ports");
     assert_eq!(outcome.rule, "avoid_empty_else");
     let (ported, skipped) = outcome.tally();
-    assert_eq!((ported, skipped), (4, 1), "2 markup + 2 clean ported, 1 raw rejected");
+    assert_eq!(
+        (ported, skipped),
+        (4, 1),
+        "2 markup + 2 clean ported, 1 raw rejected"
+    );
     assert!(
         outcome.skipped[0]
             .0
@@ -104,11 +107,7 @@ fn pin_avoid_empty_else(corpus: &Path) {
         "the rejected case is the raw assertDiagnostics one: {:?}",
         outcome.skipped
     );
-    let names: Vec<&str> = outcome
-        .ported
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
+    let names: Vec<&str> = outcome.ported.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         names,
         vec![

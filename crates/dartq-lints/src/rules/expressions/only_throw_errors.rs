@@ -12,11 +12,8 @@ use super::{Check, NodeKind, RuleSpec};
 /// operands (identifiers, invocations) stay silent, and a user
 /// `Exception` subclass construction under-reports the same way.
 /// Message: `diagnostic.g.dart` `onlyThrowErrors`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "only_throw_errors",
-    &[NodeKind::ThrowExpression],
-    check,
-);
+pub(crate) static SPEC: RuleSpec =
+    crate::spec!("only_throw_errors", &[NodeKind::ThrowExpression], check,);
 
 fn check(c: &mut Check<'_>) {
     // The production tiling: throw is a childless adopted container

@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{
-    Control, MockVm, Reply, default_reply, instance_ref, isolate_ref, ok,
-    pause_breakpoint_event, source_location, stack_with_vars,
+    Control, MockVm, Reply, default_reply, instance_ref, isolate_ref, ok, pause_breakpoint_event,
+    source_location, stack_with_vars,
 };
 use dartq_debug::{
     BreakpointLocationSpec, BreakpointSpec, ConditionalResumeLimit, DebugSession, EventKind,

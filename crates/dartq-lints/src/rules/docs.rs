@@ -56,18 +56,16 @@ pub(crate) const DOC_KINDS: &[NodeKind] = &[
 ];
 
 pub(crate) mod slash_for_doc_comments {
-    use super::{Check, DOC_KINDS, NodeKind, RuleSpec, comment_lexeme, doc_group, group_span_utf16};
+    use super::{
+        Check, DOC_KINDS, NodeKind, RuleSpec, comment_lexeme, doc_group, group_span_utf16,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/slash_for_doc_comments.dart:26-30`
     /// — a Java-style (`/** ... */`) doc comment on a registered declaration
     /// reports at the whole doc comment. `isJavaStyle` (:22-24) checks the
     /// first doc token's lexeme. Message: `diagnostic.g.dart`
     /// `slashForDocComments`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "slash_for_doc_comments",
-    DOC_KINDS,
-    check,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("slash_for_doc_comments", DOC_KINDS, check,);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -128,10 +126,10 @@ pub(crate) mod unintended_html_in_doc_comment {
     /// `Comment` AST node, i.e. documentation comments only). Message:
     /// `diagnostic.g.dart` `unintendedHtmlInDocComment`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unintended_html_in_doc_comment",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+        "unintended_html_in_doc_comment",
+        &[NodeKind::CompilationUnit],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         // The official face is per documentation comment
@@ -577,7 +575,10 @@ pub(crate) mod unintended_html_in_doc_comment {
 }
 
 pub(crate) mod dangling_library_doc_comments {
-    use super::{Check, Comment, NodeKind, RuleSpec, blank_between, comment_span_utf16, group_span_utf16, is_doc_form, line_of};
+    use super::{
+        Check, Comment, NodeKind, RuleSpec, blank_between, comment_span_utf16, group_span_utf16,
+        is_doc_form, line_of,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/dangling_library_doc_comments.dart:42-134`
     /// — a doc comment that reads like library documentation reports. The
@@ -596,10 +597,10 @@ pub(crate) mod dangling_library_doc_comments {
     /// (:112-131).
     /// Message: `diagnostic.g.dart` `danglingLibraryDocComments`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "dangling_library_doc_comments",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+        "dangling_library_doc_comments",
+        &[NodeKind::CompilationUnit],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -742,11 +743,8 @@ pub(crate) mod document_ignores {
     /// the trailing [`IgnoredDiagnosticComment`] — documents the ignore.
     /// An empty citation (`// ignore:` or `// ignore: 42`) never reports.
     /// Message: `diagnostic.g.dart` `documentIgnores`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "document_ignores",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("document_ignores", &[NodeKind::CompilationUnit], check,);
 
     fn check(c: &mut Check<'_>) {
         for comment in c.comments.all() {
@@ -930,11 +928,8 @@ pub(crate) mod flutter_style_todos {
     /// (`String.startsWith`), so a `TODO` after other text never fires and
     /// `/// TODO(…)…` reports (the expected `//` cannot cross the third
     /// slash). Message: `diagnostic.g.dart` `flutterStyleTodos`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "flutter_style_todos",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+    pub(crate) static SPEC: RuleSpec =
+        crate::spec!("flutter_style_todos", &[NodeKind::CompilationUnit], check,);
 
     fn check(c: &mut Check<'_>) {
         for comment in c.comments.all() {
@@ -1046,10 +1041,10 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
     /// markdown code region never open blocks. Message:
     /// `diagnostic.g.dart` `missingCodeBlockLanguageInDocComment`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "missing_code_block_language_in_doc_comment",
-    &[NodeKind::CompilationUnit],
-    check,
-);
+        "missing_code_block_language_in_doc_comment",
+        &[NodeKind::CompilationUnit],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         // The official face is per documentation comment (`registry
@@ -1220,8 +1215,11 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
 }
 
 pub(crate) mod public_member_api_docs {
-    use super::{PayloadField, Check, NodeKind, RuleSpec, is_doc_form};
-    use crate::rules::{MemberQuery, NONE_TOKEN, body_members, get_set_token, initialized_identifier_name, member_annotations, member_matches, member_name, same_file_ancestors, utf16_token_span};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, is_doc_form};
+    use crate::rules::{
+        MemberQuery, NONE_TOKEN, body_members, get_set_token, initialized_identifier_name,
+        member_annotations, member_matches, member_name, same_file_ancestors, utf16_token_span,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/public_member_api_docs.dart` — a
     /// public declaration or member without a preceding doc comment reports
@@ -1263,8 +1261,8 @@ pub(crate) mod public_member_api_docs {
     /// substrate (the [`DOC_KINDS`] note), so their two faces (:55-56,
     /// :251-291) stay unported.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "public_member_api_docs",
-    &[
+        "public_member_api_docs",
+        &[
             NodeKind::ClassDeclaration,
             NodeKind::MixinDeclaration,
             NodeKind::NamedMixinApplication,
@@ -1280,8 +1278,8 @@ pub(crate) mod public_member_api_docs {
             NodeKind::Fields,
             NodeKind::TopLevelFields,
         ],
-    check,
-);
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         // The registration gate (:37-40): the official visitors mount only
@@ -1762,7 +1760,8 @@ pub(crate) mod public_member_api_docs {
             .find(|&kid| is_declared_name(kid))
             .or_else(|| member_name(c, member))?;
         Some(if c.kind(name) == NodeKind::OperatorName {
-            c.field(name, PayloadField::Name).unwrap_or_else(|| c.head_token(name))
+            c.field(name, PayloadField::Name)
+                .unwrap_or_else(|| c.head_token(name))
         } else {
             c.head_token(name)
         })
@@ -2035,7 +2034,10 @@ fn container_name(c: &Check<'_>, row: u32) -> Option<u32> {
 }
 
 pub(crate) mod comment_references {
-    use super::{PayloadField, Check, Comment, NodeKind, RuleSpec, comment_lexeme, container_name_token, doc_group_of, is_doc_form};
+    use super::{
+        Check, Comment, NodeKind, PayloadField, RuleSpec, comment_lexeme, container_name_token,
+        doc_group_of, is_doc_form,
+    };
     use crate::comments::CommentKind;
     use dartq_parser::IdentifierContext;
     use dartq_source::StringId;
@@ -2107,11 +2109,7 @@ pub(crate) mod comment_references {
     /// (the official leaves its own skip as an open note at :50-52) and
     /// link definitions do not exempt keywords. Message: `diagnostic.g.dart`
     /// `commentReferences`.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "comment_references",
-    REFERENCE_KINDS,
-    check,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("comment_references", REFERENCE_KINDS, check,);
 
     fn check(c: &mut Check<'_>) {
         if c.kind(c.node()) == NodeKind::CompilationUnit {
@@ -2611,11 +2609,7 @@ pub(crate) mod unnecessary_ignore {
     /// promotion this name joins `STRUCTURALLY_SILENT`
     /// (`tests/registry_pin.rs`) beside the freeze regen — the freeze flip
     /// stays the serial-phase step gated on the differential.
-    pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "unnecessary_ignore",
-    &[],
-    not_dispatched,
-);
+    pub(crate) static SPEC: RuleSpec = crate::spec!("unnecessary_ignore", &[], not_dispatched,);
 }
 
 #[cfg(test)]

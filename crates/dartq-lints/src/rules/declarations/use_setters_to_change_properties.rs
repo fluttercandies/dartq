@@ -1,5 +1,12 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, container_members, fields_declare, is_identifier_token, name_row_token, override_annotation, parameter_rows, sole_statement_tokens};
-use crate::rules::{MemberQuery, NONE_TOKEN, get_set_token, member_matches, member_name, same_file_ancestors, type_before, utf16_token_span};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, container_members, fields_declare,
+    is_identifier_token, name_row_token, override_annotation, parameter_rows,
+    sole_statement_tokens,
+};
+use crate::rules::{
+    MemberQuery, NONE_TOKEN, get_set_token, member_matches, member_name, same_file_ancestors,
+    type_before, utf16_token_span,
+};
 
 const STATIC_BIT: u16 = 1 << 3;
 

@@ -54,9 +54,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use dartq_flow::ty::{
-    ArgTy, Base, Classification, EMPTY_ARGS, NameTypeOps, TypeOps, Ty as FlowTy,
-};
+use dartq_flow::ty::{ArgTy, Base, Classification, EMPTY_ARGS, NameTypeOps, Ty as FlowTy, TypeOps};
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -266,12 +264,7 @@ impl ClauseTrees {
     /// producer calls it — the engine-side wiring lands beside
     /// `semdiag::build_index` (Phase D's engine one-liner).
     #[allow(dead_code)] // the transport face; consumed once the engine threads captures through
-    pub(crate) fn insert(
-        &mut self,
-        file: FileId,
-        name: StringId,
-        capture: ClauseCapture,
-    ) {
+    pub(crate) fn insert(&mut self, file: FileId, name: StringId, capture: ClauseCapture) {
         self.trees.entry((file, name)).or_insert(capture);
     }
 
@@ -294,25 +287,73 @@ impl ClauseTrees {
 const SDK_LIBRARY_TYPE_NAMES: &[(&str, &[&str])] = &[(
     "dart:io",
     &[
-        "CompressionOptions", "ContentType", "Cookie", "Directory", "File",
-        "FileLock", "FileMode", "FileStat", "FileSystemEntity",
-        "FileSystemEvent", "FileSystemException", "GZipCodec", "HttpBody",
-        "HttpCompressionOptions", "HttpConnectionsInfo", "HttpDate",
-        "HttpHeaders", "HttpClient", "HttpClientBadResponseCertificate",
-        "HttpClientBasicCredentials", "HttpClientCredentials",
-        "HttpClientDigestCredentials", "HttpClientRequest",
-        "HttpClientResponse", "HttpOverrides", "HttpRequest", "HttpResponse",
-        "HttpServer", "HttpSession", "HttpStatus", "InternetAddress",
-        "InternetAddressType", "IOException", "IOSink", "Link",
-        "NetworkInterface", "OSError", "Process", "ProcessException",
-        "ProcessInfo", "ProcessMode", "ProcessResult", "ProcessSignal",
-        "RandomAccessFile", "RawDatagramSocket", "RawSecureServerSocket",
-        "RawSecureSocket", "RawSocket", "RawSocketEvent",
-        "RawSynchronousSocket", "SecureServerSocket", "SecurityContext",
-        "ServerSocket", "Socket", "SocketDirection", "SocketException",
-        "SocketOption", "Stdin", "StdioType", "Stdout", "WebSocket",
-        "WebSocketException", "WebSocketStatus", "WebSocketTransformer",
-        "X509Certificate", "ZLibCodec", "ZLibOption",
+        "CompressionOptions",
+        "ContentType",
+        "Cookie",
+        "Directory",
+        "File",
+        "FileLock",
+        "FileMode",
+        "FileStat",
+        "FileSystemEntity",
+        "FileSystemEvent",
+        "FileSystemException",
+        "GZipCodec",
+        "HttpBody",
+        "HttpCompressionOptions",
+        "HttpConnectionsInfo",
+        "HttpDate",
+        "HttpHeaders",
+        "HttpClient",
+        "HttpClientBadResponseCertificate",
+        "HttpClientBasicCredentials",
+        "HttpClientCredentials",
+        "HttpClientDigestCredentials",
+        "HttpClientRequest",
+        "HttpClientResponse",
+        "HttpOverrides",
+        "HttpRequest",
+        "HttpResponse",
+        "HttpServer",
+        "HttpSession",
+        "HttpStatus",
+        "InternetAddress",
+        "InternetAddressType",
+        "IOException",
+        "IOSink",
+        "Link",
+        "NetworkInterface",
+        "OSError",
+        "Process",
+        "ProcessException",
+        "ProcessInfo",
+        "ProcessMode",
+        "ProcessResult",
+        "ProcessSignal",
+        "RandomAccessFile",
+        "RawDatagramSocket",
+        "RawSecureServerSocket",
+        "RawSecureSocket",
+        "RawSocket",
+        "RawSocketEvent",
+        "RawSynchronousSocket",
+        "SecureServerSocket",
+        "SecurityContext",
+        "ServerSocket",
+        "Socket",
+        "SocketDirection",
+        "SocketException",
+        "SocketOption",
+        "Stdin",
+        "StdioType",
+        "Stdout",
+        "WebSocket",
+        "WebSocketException",
+        "WebSocketStatus",
+        "WebSocketTransformer",
+        "X509Certificate",
+        "ZLibCodec",
+        "ZLibOption",
     ],
 )];
 
@@ -518,8 +559,7 @@ impl LibraryTypes {
                 if !edge.combinators.allows(name) {
                     continue;
                 }
-                if registry.registry.contains_key(&name)
-                    || registry.non_containers.contains(&name)
+                if registry.registry.contains_key(&name) || registry.non_containers.contains(&name)
                 {
                     continue;
                 }
@@ -595,11 +635,7 @@ impl LibraryTypes {
                 let Some(&decl) = registry.registry.get(&name) else {
                     continue;
                 };
-                let joined = format!(
-                    "{}.{}",
-                    strings.resolve(prefix),
-                    strings.resolve(name)
-                );
+                let joined = format!("{}.{}", strings.resolve(prefix), strings.resolve(name));
                 registry
                     .registry
                     .entry(strings.intern(&joined))
@@ -846,8 +882,15 @@ impl LibraryTypes {
                 let Some(tree) = bound_tree else {
                     continue;
                 };
-                let bound =
-                    clause_arg_ty(strings, &table, &registry, &decl_params, &facts, &scope, tree);
+                let bound = clause_arg_ty(
+                    strings,
+                    &table,
+                    &registry,
+                    &decl_params,
+                    &facts,
+                    &scope,
+                    tree,
+                );
                 facts.set(
                     param_id,
                     ParamFacts {
@@ -878,12 +921,15 @@ impl LibraryTypes {
             if let Some(capture) = clauses.get(file, name) {
                 let scope = scope_of(capture, decl);
                 for tree in &capture.supers {
-                    if let Some(ty) =
-                        clause_tree_ty(strings, &table, &registry, &decl_params, &facts, &scope, tree)
-                        && matches!(
-                            table.get(ty).kind(),
-                            TypeKind::Interface { .. }
-                        )
+                    if let Some(ty) = clause_tree_ty(
+                        strings,
+                        &table,
+                        &registry,
+                        &decl_params,
+                        &facts,
+                        &scope,
+                        tree,
+                    ) && matches!(table.get(ty).kind(), TypeKind::Interface { .. })
                     {
                         builder = builder.supertype(decl, ty);
                     }
@@ -938,9 +984,7 @@ impl LibraryTypes {
         // sentinels, so the error arm is unreachable by construction and
         // only the bare core answers it.
         let hierarchy = match builder.build_lenient(&table) {
-            Ok((hierarchy, _dropped)) => {
-                hierarchy
-            }
+            Ok((hierarchy, _dropped)) => hierarchy,
             Err(_) => TypeHierarchy::builder(CoreDecls {
                 object,
                 future,
@@ -1010,7 +1054,9 @@ impl DeclAction {
                     },
                     false,
                 );
-                builder.enumeration(decl, constants).supertype(decl, enum_itf)
+                builder
+                    .enumeration(decl, constants)
+                    .supertype(decl, enum_itf)
             }
         }
     }
@@ -1128,7 +1174,8 @@ impl Registry {
             // invokable face as a whole — the over-approximation
             // `call_head_unresolved` refuses on (an instance or static
             // member spelling somewhere beats the unresolved-call face).
-            self.invokable_members.extend(container.members.keys().copied());
+            self.invokable_members
+                .extend(container.members.keys().copied());
             // The property-type heads for the object-pattern coverage
             // gate: a field's declared type / a getter's return type
             // whose head resolves nowhere makes the property sub-pattern
@@ -1148,8 +1195,7 @@ impl Registry {
                 actions.push(DeclAction::Sealed(decl));
             }
             if container.kind == ContainerKind::Enum {
-                let constants =
-                    u16::try_from(container.enum_constants.len()).unwrap_or(u16::MAX);
+                let constants = u16::try_from(container.enum_constants.len()).unwrap_or(u16::MAX);
                 actions.push(DeclAction::Enum(decl, constants));
             }
         }
@@ -1246,9 +1292,14 @@ impl Registry {
                 if !shape_worthy {
                     continue;
                 }
-                let Some((shape, nullable)) =
-                    self.flatten_rhs(table, elements.type_args(), strings, decl.var_ty, name, &decl.type_param_names)
-                else {
+                let Some((shape, nullable)) = self.flatten_rhs(
+                    table,
+                    elements.type_args(),
+                    strings,
+                    decl.var_ty,
+                    name,
+                    &decl.type_param_names,
+                ) else {
                     continue;
                 };
                 let params = decl
@@ -1297,13 +1348,18 @@ impl Registry {
                 let shape = pool.record_shape(shape);
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for &field in &shape.positional {
-                    positional.push(self.flatten_rhs(table, pool, strings, field, alias, own_params)?.0);
+                    positional.push(
+                        self.flatten_rhs(table, pool, strings, field, alias, own_params)?
+                            .0,
+                    );
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for &(field_name, field) in &shape.named {
                     named.push(NamedMember {
                         name: strings.resolve(field_name).to_string(),
-                        ty: self.flatten_rhs(table, pool, strings, field, alias, own_params)?.0,
+                        ty: self
+                            .flatten_rhs(table, pool, strings, field, alias, own_params)?
+                            .0,
                         required: false,
                     });
                 }
@@ -1316,17 +1372,23 @@ impl Registry {
             }
             Ty::Function { shape, nullable } => {
                 let shape = pool.function_shape(shape);
-                let return_ty =
-                    self.flatten_rhs(table, pool, strings, shape.return_ty, alias, own_params)?.0;
+                let return_ty = self
+                    .flatten_rhs(table, pool, strings, shape.return_ty, alias, own_params)?
+                    .0;
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for &formal in &shape.positional {
-                    positional.push(self.flatten_rhs(table, pool, strings, formal, alias, own_params)?.0);
+                    positional.push(
+                        self.flatten_rhs(table, pool, strings, formal, alias, own_params)?
+                            .0,
+                    );
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for &(formal_name, formal) in &shape.named {
                     named.push(NamedMember {
                         name: strings.resolve(formal_name).to_string(),
-                        ty: self.flatten_rhs(table, pool, strings, formal, alias, own_params)?.0,
+                        ty: self
+                            .flatten_rhs(table, pool, strings, formal, alias, own_params)?
+                            .0,
                         required: false,
                     });
                 }
@@ -1347,8 +1409,7 @@ impl Registry {
                     );
                     type_parameters.push(id);
                 }
-                let required_positional =
-                    u32::try_from(positional.len()).unwrap_or(u32::MAX);
+                let required_positional = u32::try_from(positional.len()).unwrap_or(u32::MAX);
                 Some((
                     table
                         .intern_function(
@@ -1384,7 +1445,10 @@ impl Registry {
                 }
                 let mut flattened = Vec::with_capacity(pool.get(args).len());
                 for &arg in pool.get(args) {
-                    flattened.push(self.flatten_rhs(table, pool, strings, arg, alias, own_params)?.0);
+                    flattened.push(
+                        self.flatten_rhs(table, pool, strings, arg, alias, own_params)?
+                            .0,
+                    );
                 }
                 self.flatten_named_head(table, strings, name, nullable, &flattened, alias)
             }
@@ -1462,10 +1526,7 @@ impl Registry {
     ) -> Option<(TypeId, bool)> {
         let &decl = self.registry.get(&name)?;
         let args = if args.is_empty() {
-            let params = self
-                .decl_params
-                .get(&decl)
-                .map_or(&[][..], Vec::as_slice);
+            let params = self.decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
             if params.is_empty() {
                 Vec::new()
             } else {
@@ -1523,10 +1584,7 @@ fn builtin_super(
                     )?);
                     continue;
                 }
-                args.push(table.intern(
-                    UninternedType::TypeParameter { parameter: param },
-                    false,
-                ));
+                args.push(table.intern(UninternedType::TypeParameter { parameter: param }, false));
             }
             args
         }
@@ -1628,9 +1686,7 @@ fn clause_tree_ty(
     if tree.args.is_empty()
         && let Some(&parameter) = scope.get(&tree.head)
     {
-        return Some(
-            table.intern(UninternedType::TypeParameter { parameter }, false),
-        );
+        return Some(table.intern(UninternedType::TypeParameter { parameter }, false));
     }
     if tree.args.is_empty()
         && let Some(builtin) = clause_builtin_ty(table, strings.resolve(tree.head), false)
@@ -1656,7 +1712,15 @@ fn clause_tree_ty(
             // tree nullable at ITS root maps nullable (subtype.dart's
             // argument nullability is per-node), so the `tree.nullable`
             // gate above is root-only.
-            args.push(clause_arg_ty(strings, table, registry, decl_params, facts, scope, arg)?);
+            args.push(clause_arg_ty(
+                strings,
+                table,
+                registry,
+                decl_params,
+                facts,
+                scope,
+                arg,
+            )?);
         }
         args
     };
@@ -1681,9 +1745,7 @@ fn clause_arg_ty(
     if tree.args.is_empty()
         && let Some(&parameter) = scope.get(&tree.head)
     {
-        return Some(
-            table.intern(UninternedType::TypeParameter { parameter }, tree.nullable),
-        );
+        return Some(table.intern(UninternedType::TypeParameter { parameter }, tree.nullable));
     }
     if tree.args.is_empty()
         && let Some(builtin) = clause_builtin_ty(table, strings.resolve(tree.head), tree.nullable)
@@ -1705,7 +1767,15 @@ fn clause_arg_ty(
         }
         let mut args = Vec::with_capacity(tree.args.len());
         for arg in &tree.args {
-            args.push(clause_arg_ty(strings, table, registry, decl_params, facts, scope, arg)?);
+            args.push(clause_arg_ty(
+                strings,
+                table,
+                registry,
+                decl_params,
+                facts,
+                scope,
+                arg,
+            )?);
         }
         args
     };
@@ -1724,15 +1794,13 @@ fn instantiate_to_bounds(
 ) -> Option<TypeId> {
     let params = decl_params.get(&decl)?;
     if params.is_empty() {
-        return Some(
-            table.intern(
-                UninternedType::Interface {
-                    decl,
-                    args: Vec::new(),
-                },
-                false,
-            ),
-        );
+        return Some(table.intern(
+            UninternedType::Interface {
+                decl,
+                args: Vec::new(),
+            },
+            false,
+        ));
     }
     let instantiation = instantiate_type_formals_to_bounds(table, facts, params);
     Some(table.intern(
@@ -2040,30 +2108,34 @@ impl<'a> ResolvedTypeOps<'a> {
         }
         cache.reserve(names.len() - start);
         for (offset, lexeme) in names[start..].iter().enumerate() {
-            if self.snapshot.lossy_overloads.contains(&self.strings.intern(lexeme)) {
-                self.overload_ids.borrow_mut().insert((start + offset) as u32);
+            if self
+                .snapshot
+                .lossy_overloads
+                .contains(&self.strings.intern(lexeme))
+            {
+                self.overload_ids
+                    .borrow_mut()
+                    .insert((start + offset) as u32);
             }
             let name = self.strings.intern(lexeme);
             let pair = if let Some(param) = self.scoped_param(name) {
                 (
-                    self.snapshot.table.intern(
-                        UninternedType::TypeParameter { parameter: param },
-                        false,
-                    ),
-                    self.snapshot.table.intern(
-                        UninternedType::TypeParameter { parameter: param },
-                        true,
-                    ),
+                    self.snapshot
+                        .table
+                        .intern(UninternedType::TypeParameter { parameter: param }, false),
+                    self.snapshot
+                        .table
+                        .intern(UninternedType::TypeParameter { parameter: param }, true),
                 )
             } else if lexeme.as_ref() == "FutureOr" {
-                let non_null = self.snapshot.table.intern(
-                    UninternedType::FutureOr { base: self.dynamic },
-                    false,
-                );
-                let nullable = self.snapshot.table.intern(
-                    UninternedType::FutureOr { base: self.dynamic },
-                    true,
-                );
+                let non_null = self
+                    .snapshot
+                    .table
+                    .intern(UninternedType::FutureOr { base: self.dynamic }, false);
+                let nullable = self
+                    .snapshot
+                    .table
+                    .intern(UninternedType::FutureOr { base: self.dynamic }, true);
                 (non_null, nullable)
             } else {
                 self.snapshot
@@ -2112,8 +2184,7 @@ impl<'a> ResolvedTypeOps<'a> {
                                 |non_null| {
                                     (
                                         non_null,
-                                        self.builtin_spelling(lexeme, true)
-                                            .unwrap_or(non_null),
+                                        self.builtin_spelling(lexeme, true).unwrap_or(non_null),
                                     )
                                 },
                             )
@@ -2126,10 +2197,10 @@ impl<'a> ResolvedTypeOps<'a> {
                                 },
                                 false,
                             );
-                            let nullable = self.snapshot.table.intern(
-                                UninternedType::Interface { decl, args },
-                                true,
-                            );
+                            let nullable = self
+                                .snapshot
+                                .table
+                                .intern(UninternedType::Interface { decl, args }, true);
                             (non_null, nullable)
                         },
                     )
@@ -2204,9 +2275,7 @@ impl<'a> ResolvedTypeOps<'a> {
                 );
             }
             if let Some(non_null) = self.builtin_spelling(lexeme, chased_nullable) {
-                let nullable = self
-                    .builtin_spelling(lexeme, true)
-                    .unwrap_or(non_null);
+                let nullable = self.builtin_spelling(lexeme, true).unwrap_or(non_null);
                 return (non_null, nullable);
             }
             return (self.invalid, self.invalid);
@@ -2231,8 +2300,7 @@ impl<'a> ResolvedTypeOps<'a> {
         let mut chased = name;
         let mut nullable = false;
         for _ in 0..=self.snapshot.typedef_targets.len() {
-            let Some(&(rhs_name, rhs_nullable)) = self.snapshot.typedef_targets.get(&chased)
-            else {
+            let Some(&(rhs_name, rhs_nullable)) = self.snapshot.typedef_targets.get(&chased) else {
                 break;
             };
             chased = rhs_name;
@@ -2365,7 +2433,9 @@ impl<'a> ResolvedTypeOps<'a> {
             .registry
             .get(&name)
             .filter(|_| !self.snapshot.non_containers.contains(&name));
-        if registered.is_none() && let Some(&param) = self.snapshot.type_params.get(&name) {
+        if registered.is_none()
+            && let Some(&param) = self.snapshot.type_params.get(&name)
+        {
             // A spelling no container registers but SOME file declares as a
             // type parameter — the member-signature leaf of a foreign
             // generic (`Iterable<E>`'s `E` reaching the flow layer through
@@ -2407,10 +2477,13 @@ impl<'a> ResolvedTypeOps<'a> {
                     nullable,
                 );
             };
-            return self
-                .snapshot
-                .table
-                .intern(UninternedType::Interface { decl, args: mapped_args }, nullable);
+            return self.snapshot.table.intern(
+                UninternedType::Interface {
+                    decl,
+                    args: mapped_args,
+                },
+                nullable,
+            );
         }
         if let Some(builtin) = self.builtin_spelling(lexeme, nullable) {
             return builtin;
@@ -2430,12 +2503,8 @@ impl<'a> ResolvedTypeOps<'a> {
                     .map(|arg| self.map_node(arg, arena, names))
                     .collect();
                 mapped.resize(entry.params.len(), self.dynamic);
-                let map: Vec<(TypeParamId, TypeId)> = entry
-                    .params
-                    .iter()
-                    .copied()
-                    .zip(mapped)
-                    .collect();
+                let map: Vec<(TypeParamId, TypeId)> =
+                    entry.params.iter().copied().zip(mapped).collect();
                 let shape = self.snapshot.table.substitute(entry.shape, &map);
                 return self.with_question(shape, entry.nullable || nullable);
             }
@@ -2450,13 +2519,7 @@ impl<'a> ResolvedTypeOps<'a> {
                 // through the full precedence chain (a container, a
                 // builtin spelling, or `Invalid` when it declares
                 // nowhere).
-                return self.map_name(
-                    self.strings.resolve(chased),
-                    args,
-                    arena,
-                    names,
-                    nullable,
-                );
+                return self.map_name(self.strings.resolve(chased), args, arena, names, nullable);
             }
             let written = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
             let mapped = self.opaque_args(written, arena, names);
@@ -2505,11 +2568,7 @@ impl<'a> ResolvedTypeOps<'a> {
     fn builtin_spelling(&self, lexeme: &str, nullable: bool) -> Option<TypeId> {
         match lexeme {
             "Null" => Some(self.null),
-            "Never" => Some(
-                self.snapshot
-                    .table
-                    .intern(UninternedType::Never, nullable),
-            ),
+            "Never" => Some(self.snapshot.table.intern(UninternedType::Never, nullable)),
             _ => None,
         }
     }
@@ -2532,20 +2591,12 @@ impl<'a> ResolvedTypeOps<'a> {
     /// `pool` is the boundary pool the `Ty`'s argument lists index — the
     /// caller projects foreign `Ty`s through [`Boundary::ty`] first, so a
     /// list here always resolves in the diagnosing universe.
-    pub(crate) fn map_ty_strict(
-        &self,
-        ty: Ty,
-        pool: &crate::model::ArgPool,
-    ) -> Option<TypeId> {
+    pub(crate) fn map_ty_strict(&self, ty: Ty, pool: &crate::model::ArgPool) -> Option<TypeId> {
         match ty {
             Ty::Unknown => None,
             Ty::Null => Some(self.null),
             Ty::Dynamic => Some(self.dynamic),
-            Ty::Never => Some(
-                self.snapshot
-                    .table
-                    .intern(UninternedType::Never, false),
-            ),
+            Ty::Never => Some(self.snapshot.table.intern(UninternedType::Never, false)),
             Ty::Void => Some(self.void),
             Ty::Named {
                 name,
@@ -2620,7 +2671,9 @@ impl<'a> ResolvedTypeOps<'a> {
             .registry
             .get(&name)
             .filter(|_| !self.snapshot.non_containers.contains(&name));
-        if registered.is_none() && let Some(&param) = self.snapshot.type_params.get(&name) {
+        if registered.is_none()
+            && let Some(&param) = self.snapshot.type_params.get(&name)
+        {
             // The foreign member-signature parameter leaf — see the same
             // arm in [`Self::map_name`]: after this unit's scope and the
             // visible registry both miss, the parameter face is the
@@ -2681,10 +2734,10 @@ impl<'a> ResolvedTypeOps<'a> {
         sup: Ty,
         pool: &crate::model::ArgPool,
     ) -> Option<bool> {
-        Some(
-            self.system
-                .is_subtype(self.map_ty_strict(sub, pool)?, self.map_ty_strict(sup, pool)?),
-        )
+        Some(self.system.is_subtype(
+            self.map_ty_strict(sub, pool)?,
+            self.map_ty_strict(sup, pool)?,
+        ))
     }
 
     /// Whether `ty` mentions a `TypeParameter` leaf anywhere in its
@@ -2795,8 +2848,7 @@ impl<'a> ResolvedTypeOps<'a> {
             );
         }
         let ids: Vec<TypeParamId> = face_params.iter().map(|(id, _)| *id).collect();
-        let instantiation =
-            instantiate_type_formals_to_bounds(&self.snapshot.table, &facts, &ids);
+        let instantiation = instantiate_type_formals_to_bounds(&self.snapshot.table, &facts, &ids);
         let map: Vec<(TypeParamId, TypeId)> = ids
             .iter()
             .copied()
@@ -2915,8 +2967,10 @@ impl<'a> ResolvedTypeOps<'a> {
         face_params: &[TypeParamId],
     ) -> Option<(TypeId, Vec<(TypeParamId, TypeId)>)> {
         let table = &self.snapshot.table;
-        let TypeKind::Interface { decl: on_decl, args: on_args } =
-            table.get(on).kind()
+        let TypeKind::Interface {
+            decl: on_decl,
+            args: on_args,
+        } = table.get(on).kind()
         else {
             // A non-interface `on` type has no parameter positions to
             // bind — the subtype answer stands on it as written.
@@ -3086,14 +3140,13 @@ impl<'a> ResolvedTypeOps<'a> {
             // branch of `var x; x is int` and vetoing every `var`
             // promotion.
             Base::Unknown => Some(self.dynamic),
-            Base::Function => Some(
-                self.snapshot
-                    .table
-                    .intern(UninternedType::Interface {
-                        decl: self.snapshot.hierarchy.core().function,
-                        args: Vec::new(),
-                    }, ty.nullable),
-            ),
+            Base::Function => Some(self.snapshot.table.intern(
+                UninternedType::Interface {
+                    decl: self.snapshot.hierarchy.core().function,
+                    args: Vec::new(),
+                },
+                ty.nullable,
+            )),
             Base::Name(id) => {
                 let (non_null, nullable) = self.mapped_name(id)?;
                 Some(if ty.nullable { nullable } else { non_null })
@@ -3202,7 +3255,14 @@ impl<'a> ResolvedTypeOps<'a> {
             )
         {
             if self.system.is_subtype(self.null, w) {
-                return self.factor_typed(from.non_null(), from_args, what, what_args, arena, names);
+                return self.factor_typed(
+                    from.non_null(),
+                    from_args,
+                    what,
+                    what_args,
+                    arena,
+                    names,
+                );
             }
             return self
                 .factor_typed(from.non_null(), from_args, what, what_args, arena, names)
@@ -3235,7 +3295,10 @@ impl<'a> ResolvedTypeOps<'a> {
                     base: Base::Name(future as u32),
                     nullable: false,
                 };
-                if self.system.is_subtype(self.map_scrutinee(future_ty, from_args, arena, names), w) {
+                if self
+                    .system
+                    .is_subtype(self.map_scrutinee(future_ty, from_args, arena, names), w)
+                {
                     return inner;
                 }
             }
@@ -3270,13 +3333,13 @@ impl<'a> ResolvedTypeOps<'a> {
             // question the instantiated face enters (subtype.dart's 0c
             // arm).
             Base::Unknown => self.dynamic,
-            Base::Function => self
-                .snapshot
-                .table
-                .intern(UninternedType::Interface {
+            Base::Function => self.snapshot.table.intern(
+                UninternedType::Interface {
                     decl: self.snapshot.hierarchy.core().function,
                     args: Vec::new(),
-                }, node.nullable),
+                },
+                node.nullable,
+            ),
             Base::Name(id) => {
                 let Some(lexeme) = names.get(id as usize) else {
                     return self.invalid;
@@ -3478,9 +3541,7 @@ impl<'a> ResolvedTypeOps<'a> {
             return false;
         }
         let name = self.strings.intern(lexeme);
-        if self.scoped_param(name).is_some()
-            || self.snapshot.non_containers.contains(&name)
-        {
+        if self.scoped_param(name).is_some() || self.snapshot.non_containers.contains(&name) {
             return false;
         }
         !self.snapshot.registry.contains_key(&name)
@@ -3555,8 +3616,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// Unmapped arms keep `NameTypeOps`'s pre-mount posture.
     fn try_promote_to(&self, to: FlowTy, from: FlowTy) -> Option<FlowTy> {
         if let (Some(t), Some(f)) = (self.map_base(to), self.map_base(from)) {
-            return (self.system.is_subtype(t, f) && !self.system.is_subtype(f, t))
-                .then_some(to);
+            return (self.system.is_subtype(t, f) && !self.system.is_subtype(f, t)).then_some(to);
         }
         NameTypeOps.try_promote_to(to, from)
     }
@@ -3580,9 +3640,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
     fn classify(&self, t: FlowTy) -> Classification {
         match self.map_base(t) {
             Some(mapped) if self.system.is_null(mapped) => Classification::NullOrEquivalent,
-            Some(mapped) if self.system.is_nullable(mapped) => {
-                Classification::PotentiallyNullable
-            }
+            Some(mapped) if self.system.is_nullable(mapped) => Classification::PotentiallyNullable,
             Some(_) => Classification::NonNullable,
             None => NameTypeOps.classify(t),
         }
@@ -3721,10 +3779,8 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// direction).
     fn object_property_invalid(&self, owner: u32, field: u32, names: &[Box<str>]) -> bool {
         self.observe_names(names);
-        let (Some(owner), Some(field)) = (
-            names.get(owner as usize),
-            names.get(field as usize),
-        ) else {
+        let (Some(owner), Some(field)) = (names.get(owner as usize), names.get(field as usize))
+        else {
             return false;
         };
         let pair = (self.strings.intern(owner), self.strings.intern(field));
@@ -3779,8 +3835,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
         }
         self.observe_names(names);
         let mark = self.work_mark();
-        let factored =
-            self.factor_typed_walk(from, from_args, what, what_args, arena, names);
+        let factored = self.factor_typed_walk(from, from_args, what, what_args, arena, names);
         if self.work_tripped_since(mark) {
             return from;
         }
@@ -4043,9 +4098,7 @@ mod tests {
     use dartq_flow::ty::{EMPTY_ARGS, Ty};
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
-    use dartq_resolution::{
-        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder,
-    };
+    use dartq_resolution::{Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder};
     use dartq_scanner::{ScanConfig, TokenTable};
     use dartq_source::FileTable;
     use std::path::Path;
@@ -4657,8 +4710,13 @@ mod tests {
         let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         // `names` is the recorder's table — ids index into it.
-        let names: Vec<Box<str>> =
-            vec!["S".into(), "A".into(), "Open".into(), "Missing".into(), "FutureOr".into()];
+        let names: Vec<Box<str>> = vec![
+            "S".into(),
+            "A".into(),
+            "Open".into(),
+            "Missing".into(),
+            "FutureOr".into(),
+        ];
         let empty_arena: Vec<Vec<ArgTy>> = vec![Vec::new()];
         // The `FutureOr` row: one arg node pointing at `S` (name id 0,
         // EMPTY_ARGS row of its own).
@@ -4672,37 +4730,44 @@ mod tests {
         ];
 
         assert!(ops.is_always_exhaustive(
-            Ty { base: Base::Name(0), nullable: false },
+            Ty {
+                base: Base::Name(0),
+                nullable: false
+            },
             EMPTY_ARGS,
             &empty_arena,
             &names,
         ));
         assert!(!ops.is_always_exhaustive(
-            Ty { base: Base::Name(2), nullable: false },
+            Ty {
+                base: Base::Name(2),
+                nullable: false
+            },
             EMPTY_ARGS,
             &empty_arena,
             &names,
         ));
         assert!(!ops.is_always_exhaustive(
-            Ty { base: Base::Name(3), nullable: false },
+            Ty {
+                base: Base::Name(3),
+                nullable: false
+            },
             EMPTY_ARGS,
             &empty_arena,
             &names,
         ));
         // `FutureOr<S>` over a sealed base closes.
         assert!(ops.is_always_exhaustive(
-            Ty { base: Base::Name(4), nullable: false },
+            Ty {
+                base: Base::Name(4),
+                nullable: false
+            },
             1,
             &future_or_arena,
             &names,
         ));
         // `Null` and `bool` split completely.
-        assert!(ops.is_always_exhaustive(
-            Ty::NULL,
-            EMPTY_ARGS,
-            &empty_arena,
-            &names,
-        ));
+        assert!(ops.is_always_exhaustive(Ty::NULL, EMPTY_ARGS, &empty_arena, &names,));
     }
 
     /// Cross-file sealed closure: `S` declared in `s.dart`, diagnosed in
@@ -4769,8 +4834,7 @@ mod tests {
         );
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
-        let library_types =
-            LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
         let ops = ResolvedTypeOps::new(&library_types, &strings, main_file);
         let fold = fold_unit_with_ops(
             main_source,
@@ -5159,7 +5223,12 @@ mod tests {
     fn signatureless_function_pair_claims_no_relation() {
         let strings = StringTable::new();
         let mut files = FileTable::new();
-        let elements = unit("class B {}\nclass D extends B {}", &strings, &mut files, "u.dart");
+        let elements = unit(
+            "class B {}\nclass D extends B {}",
+            &strings,
+            &mut files,
+            "u.dart",
+        );
         let file = files.try_file_id(Path::new("u.dart")).unwrap();
         let mut builder = LibraryGraphBuilder::new(&strings);
         let lib = builder.intern("package:t/u.dart");
@@ -5200,9 +5269,7 @@ mod tests {
         assert!(ops.is_subtype_typed(sub, EMPTY_ARGS, sup, EMPTY_ARGS, &[], &names));
         assert!(!ops.is_subtype_typed(sup, EMPTY_ARGS, sub, EMPTY_ARGS, &[], &names));
         // The signature-less function pair: both directions refuse.
-        assert!(!ops.is_subtype_typed(
-            function, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names
-        ));
+        assert!(!ops.is_subtype_typed(function, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names));
         assert!(!ops.is_subtype_typed(
             nullable_function,
             EMPTY_ARGS,
@@ -5212,12 +5279,8 @@ mod tests {
             &names
         ));
         // Function-vs-interface mixes refuse both ways.
-        assert!(!ops.is_subtype_typed(
-            function, EMPTY_ARGS, sup, EMPTY_ARGS, &[], &names
-        ));
-        assert!(!ops.is_subtype_typed(
-            sup, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names
-        ));
+        assert!(!ops.is_subtype_typed(function, EMPTY_ARGS, sup, EMPTY_ARGS, &[], &names));
+        assert!(!ops.is_subtype_typed(sup, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names));
         // `factor(Sig, Sig2)` keeps the operand — never the `Never`
         // collapse; `factor(Sig?, Sig2)` keeps the nullable face.
         assert_eq!(
@@ -5279,8 +5342,7 @@ mod tests {
             |_| None,
         );
         assert!(
-            !codes.contains(&"undefined_getter")
-                && !codes.contains(&"undefined_method"),
+            !codes.contains(&"undefined_getter") && !codes.contains(&"undefined_method"),
             "the strict narrowing must promote: {codes:?}"
         );
     }
@@ -5727,21 +5789,15 @@ mod tests {
                 supers: vec![s_of_int],
             },
         );
-        let library_types = LibraryTypes::build_with_clauses(
-            &graph,
-            &namespaces,
-            &index,
-            &strings,
-            lib,
-            &clauses,
-        );
+        let library_types =
+            LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
         let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         // `names` is the recorder's table — ids index into it.
         let names: Vec<Box<str>> = vec![
-            "A".into(), // 0
-            "S".into(), // 1
-            "num".into(), // 2
+            "A".into(),      // 0
+            "S".into(),      // 1
+            "num".into(),    // 2
             "String".into(), // 3
         ];
         // Arena rows: [num] = 1, [String] = 2 — `S<num>`/`S<String>`
@@ -5991,11 +6047,11 @@ mod tests {
     /// counted.
     #[test]
     fn fuel_f_bounded_generic_converges_and_trips_conservative() {
-        let source = "class C<T extends C<T>> {}\n\nvoid main(C c) {\n  if (c is C) {\n    c;\n  }\n}\n";
+        let source =
+            "class C<T extends C<T>> {}\n\nvoid main(C c) {\n  if (c is C) {\n    c;\n  }\n}\n";
         let (_, bailed, _) = diagnose_codes_probe(source, |_| None, |_, _| {}, None, |_| {});
         assert_eq!(bailed, 0);
-        let (codes, bailed, _) =
-            diagnose_codes_probe(source, |_| None, |_, _| {}, Some(2), |_| {});
+        let (codes, bailed, _) = diagnose_codes_probe(source, |_| None, |_, _| {}, Some(2), |_| {});
         assert!(bailed >= 1);
         assert!(
             !codes.contains(&"dead_code"),
@@ -6013,8 +6069,7 @@ mod tests {
         let source = "typedef F = List<F>;\n\nvoid main(F f) {\n  if (f is F) {\n    f;\n  }\n}\n";
         let (_, bailed, _) = diagnose_codes_probe(source, |_| None, |_, _| {}, None, |_| {});
         assert_eq!(bailed, 0);
-        let (codes, bailed, _) =
-            diagnose_codes_probe(source, |_| None, |_, _| {}, Some(2), |_| {});
+        let (codes, bailed, _) = diagnose_codes_probe(source, |_| None, |_, _| {}, Some(2), |_| {});
         assert!(bailed >= 1);
         assert!(
             !codes.contains(&"dead_code"),
@@ -6067,7 +6122,7 @@ fn non_nullable_of(table: &TypeTable, ty: TypeId) -> TypeId {
         },
         TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
         TypeKind::Function { .. } | TypeKind::FutureOr { .. } | TypeKind::Record { .. } => {
-            return ty
+            return ty;
         }
     };
     table.intern(uninterned, false)

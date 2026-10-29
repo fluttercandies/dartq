@@ -184,7 +184,10 @@ pub fn oracle_command(args: &OracleArgs) -> i32 {
         eprintln!("error: cannot write {}: {e}", args.out_path.display());
         return 2;
     }
-    let crashes = expected.values().filter(|e| matches!(e, Expected::Crash)).count();
+    let crashes = expected
+        .values()
+        .filter(|e| matches!(e, Expected::Crash))
+        .count();
     let rows: usize = expected.values().map(|e| e.rows().len()).sum();
     let _ = writeln!(
         std::io::stderr().lock(),
@@ -295,7 +298,10 @@ mod tests {
         assert_eq!(cache.get("k1"), Some(Expected::Rows(Vec::new())));
         cache.store("k2", "oracle_crash");
         assert_eq!(cache.get("k2"), Some(Expected::Crash));
-        cache.store("k3", "ERROR|code_a|lib/test.dart|1:5|3|m\nINFO|code_b|lib/other.dart|2:1|0|n");
+        cache.store(
+            "k3",
+            "ERROR|code_a|lib/test.dart|1:5|3|m\nINFO|code_b|lib/other.dart|2:1|0|n",
+        );
         let rows = match cache.get("k3") {
             Some(Expected::Rows(rows)) => rows,
             other => panic!("{other:?}"),
@@ -318,7 +324,8 @@ mod tests {
     #[test]
     fn version_guard_parses_banner_and_pin() {
         // Real banner shape, plus a fake wrong version to assert mismatch.
-        let banner = "Dart SDK version: 3.13.7 (stable) (Thu Oct 22 14:28:57 2026) on \"macos_arm64\"";
+        let banner =
+            "Dart SDK version: 3.13.7 (stable) (Thu Oct 22 14:28:57 2026) on \"macos_arm64\"";
         assert_eq!(version_from_banner(banner).as_deref(), Some("3.13.7"));
         let fake = "Dart SDK version: 3.13.5 (stable) (fake-build-id) on \"linux_x64\"";
         assert_eq!(version_from_banner(fake).as_deref(), Some("3.13.5"));
@@ -330,8 +337,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creates");
         let pin = dir.join("pin.toml");
-        std::fs::write(&pin, "sdk_version = \"3.13.7\"\nsdk_revision = \"416e33b0\"\n")
-            .expect("writes");
+        std::fs::write(
+            &pin,
+            "sdk_version = \"3.13.7\"\nsdk_revision = \"416e33b0\"\n",
+        )
+        .expect("writes");
         assert_eq!(pinned_sdk_version(&pin).as_deref(), Ok("3.13.7"));
         std::fs::write(&pin, "# no version key\nsdk_revision = \"416e33b0\"\n").expect("writes");
         assert!(pinned_sdk_version(&pin).is_err());

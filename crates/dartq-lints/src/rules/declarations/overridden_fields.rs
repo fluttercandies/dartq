@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{MemberQuery, class_declaration_name, member_matches, same_file_ancestors};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/overridden_fields.dart` — an
@@ -143,11 +143,7 @@ fn primary_field_keyword(c: &Check<'_>, param: u32, name_token: u32) -> Option<u
 
 /// The nearest ancestor in `chain` declaring a variable-backed field of
 /// `name`, as its class-like name (the defining interface, :74-78).
-fn inherited_variable_holder<'a>(
-    c: &'a Check<'_>,
-    chain: &[u32],
-    name: &str,
-) -> Option<&'a str> {
+fn inherited_variable_holder<'a>(c: &'a Check<'_>, chain: &[u32], name: &str) -> Option<&'a str> {
     chain.iter().find_map(|&ancestor| {
         crate::rules::body_members(c, ancestor)
             .into_iter()

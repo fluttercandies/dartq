@@ -367,10 +367,8 @@ impl AstListener {
     /// resolves against the open node's kind through the payload-field
     /// table).
     fn patch_token(&mut self, field: PayloadField, token: Option<TokenSpan>) {
-        self.b.patch_field(
-            field,
-            token.map_or(TOKEN_NONE, |t: TokenSpan| self.t(t.id)),
-        );
+        self.b
+            .patch_field(field, token.map_or(TOKEN_NONE, |t: TokenSpan| self.t(t.id)));
     }
 
     fn set_mods(&mut self, bits: u16) {
@@ -512,8 +510,7 @@ impl ParserListener for AstListener {
                 return;
             };
             self.b.begin(NodeKind::RecoverImport, anchor);
-            self.b
-                .patch_field(PayloadField::Semicolon, TOKEN_NONE);
+            self.b.patch_field(PayloadField::Semicolon, TOKEN_NONE);
             self.b.end(NodeKind::RecoverImport, anchor);
         }
     }
@@ -609,7 +606,8 @@ impl ParserListener for AstListener {
         semicolon: TokenSpan,
         has_name: bool,
     ) {
-        self.b.patch_field(PayloadField::OfKeyword, self.t(of_kw.id));
+        self.b
+            .patch_field(PayloadField::OfKeyword, self.t(of_kw.id));
         self.b
             .patch_field(PayloadField::HasName, u32::from(has_name));
         self.end_incl(NodeKind::PartOf, semicolon);
@@ -826,7 +824,8 @@ impl ParserListener for AstListener {
         let _ = end;
         self.b
             .begin(NodeKind::ExperimentNotEnabled, self.t(begin.id));
-        self.b.patch_field(PayloadField::ExperimentalFlag, flag as u32);
+        self.b
+            .patch_field(PayloadField::ExperimentalFlag, flag as u32);
         self.b
             .end(NodeKind::ExperimentNotEnabled, self.t(begin.id) + 1);
     }
@@ -996,7 +995,8 @@ impl ParserListener for AstListener {
         } else {
             MemberKind::NonStaticField
         };
-        self.b.patch_field(PayloadField::MemberKind, member_kind as u32);
+        self.b
+            .patch_field(PayloadField::MemberKind, member_kind as u32);
         self.end_incl(NodeKind::Fields, end);
     }
 
@@ -1026,7 +1026,8 @@ impl ParserListener for AstListener {
             None,
             var_final_or_const,
         ));
-        self.b.patch_field(PayloadField::DeclarationKind, kind as u32);
+        self.b
+            .patch_field(PayloadField::DeclarationKind, kind as u32);
     }
 
     fn end_constructor(
@@ -1065,7 +1066,8 @@ impl ParserListener for AstListener {
             None,
             var_final_or_const,
         ));
-        self.b.patch_field(PayloadField::DeclarationKind, kind as u32);
+        self.b
+            .patch_field(PayloadField::DeclarationKind, kind as u32);
     }
 
     fn end_method(
@@ -1103,7 +1105,8 @@ impl ParserListener for AstListener {
             bits |= mod_bits::VAR_FINAL_OR_CONST;
         }
         self.set_mods(bits);
-        self.b.patch_field(PayloadField::DeclarationKind, kind as u32);
+        self.b
+            .patch_field(PayloadField::DeclarationKind, kind as u32);
     }
 
     fn end_factory(
@@ -1187,7 +1190,8 @@ impl ParserListener for AstListener {
             .unwrap_or((None, None));
         self.b
             .patch_field(PayloadField::AsyncKeyword, async_kw.unwrap_or(TOKEN_NONE));
-        self.b.patch_field(PayloadField::Star, star.unwrap_or(TOKEN_NONE));
+        self.b
+            .patch_field(PayloadField::Star, star.unwrap_or(TOKEN_NONE));
     }
 
     fn end_block_function_body(&mut self, _count: usize, _begin: TokenSpan, end: TokenSpan) {
@@ -1236,7 +1240,8 @@ impl ParserListener for AstListener {
             .unwrap_or((None, None));
         self.b
             .patch_field(PayloadField::AsyncKeyword, async_kw.unwrap_or(TOKEN_NONE));
-        self.b.patch_field(PayloadField::Star, star.unwrap_or(TOKEN_NONE));
+        self.b
+            .patch_field(PayloadField::Star, star.unwrap_or(TOKEN_NONE));
         match end {
             Some(end) => self.end_incl(NodeKind::ExpressionBody, end),
             None => self.b.end(NodeKind::ExpressionBody, self.t(arrow.id) + 1),
@@ -1330,7 +1335,8 @@ impl ParserListener for AstListener {
         // Word 0 of `ClassDeclaration` is the `class` keyword (the native
         // clause rides its own event).
         if self.class_decl == ClassDecl::Class {
-            self.b.patch_field(PayloadField::ClassKeyword, self.t(class.id));
+            self.b
+                .patch_field(PayloadField::ClassKeyword, self.t(class.id));
         }
     }
 
@@ -1456,7 +1462,8 @@ impl ParserListener for AstListener {
         implements: Option<TokenSpan>,
         end: TokenSpan,
     ) {
-        self.b.patch_field(PayloadField::ClassKeyword, self.t(class.id));
+        self.b
+            .patch_field(PayloadField::ClassKeyword, self.t(class.id));
         self.b.patch_field(PayloadField::Equals, self.t(equals.id));
         self.patch_token(PayloadField::ImplementsKeyword, implements);
         self.class_decl = ClassDecl::None;
@@ -1687,7 +1694,8 @@ impl ParserListener for AstListener {
 
     fn begin_primary_constructor_body(&mut self, token: TokenSpan, augment: Option<TokenSpan>) {
         self.begin(NodeKind::PrimaryConstructorBody, token);
-        self.b.patch_field(PayloadField::ThisKeyword, self.t(token.id));
+        self.b
+            .patch_field(PayloadField::ThisKeyword, self.t(token.id));
         self.patch_token(PayloadField::AugmentKeyword, augment);
     }
 
@@ -1717,7 +1725,8 @@ impl ParserListener for AstListener {
         has_constructor_name: bool,
         _name: Option<TokenSpan>,
     ) {
-        self.b.patch_field(PayloadField::DeclarationKind, kind as u32);
+        self.b
+            .patch_field(PayloadField::DeclarationKind, kind as u32);
         self.patch_token(PayloadField::ConstKeyword, const_keyword);
         self.b.patch_field(
             PayloadField::HasConstructorName,
@@ -2025,7 +2034,8 @@ impl ParserListener for AstListener {
         self.b
             .patch_field(PayloadField::LeftParen, self.t(left_paren.id));
         self.patch_token(PayloadField::PatternKeyword, pattern_keyword);
-        self.b.patch_field(PayloadField::InKeyword, self.t(in_kw.id));
+        self.b
+            .patch_field(PayloadField::InKeyword, self.t(in_kw.id));
         let end = self.b.last_end_token().unwrap_or(self.t(in_kw.id) + 1);
         self.b
             .end(NodeKind::ForInParts, end.max(self.t(in_kw.id) + 1));
@@ -2332,7 +2342,8 @@ impl ParserListener for AstListener {
     fn handle_break_statement(&mut self, has_target: bool, break_kw: TokenSpan, end: TokenSpan) {
         let _ = end;
         self.b.begin(NodeKind::Break, self.t(break_kw.id));
-        self.b.patch_field(PayloadField::HasTarget, u32::from(has_target));
+        self.b
+            .patch_field(PayloadField::HasTarget, u32::from(has_target));
         self.b.end(NodeKind::Break, self.t(break_kw.id) + 1);
     }
 
@@ -2479,7 +2490,8 @@ impl ParserListener for AstListener {
 
     fn handle_symbol_void(&mut self, token: TokenSpan) {
         self.b.begin(NodeKind::SymbolVoid, self.t(token.id));
-        self.b.patch_field(PayloadField::VoidKeyword, self.t(token.id));
+        self.b
+            .patch_field(PayloadField::VoidKeyword, self.t(token.id));
         self.b.end(NodeKind::SymbolVoid, self.t(token.id) + 1);
     }
 
@@ -3227,7 +3239,8 @@ impl ParserListener for AstListener {
     fn handle_wildcard_pattern(&mut self, keyword: Option<TokenSpan>, wildcard: TokenSpan) {
         let head = keyword.unwrap_or(wildcard);
         self.b.begin(NodeKind::WildcardPattern, self.t(head.id));
-        self.b.patch_field(PayloadField::Wildcard, self.t(wildcard.id));
+        self.b
+            .patch_field(PayloadField::Wildcard, self.t(wildcard.id));
         self.b
             .end(NodeKind::WildcardPattern, self.t(wildcard.id) + 1);
     }
@@ -3246,7 +3259,8 @@ impl ParserListener for AstListener {
         let head = keyword.unwrap_or(variable);
         self.b
             .begin(NodeKind::DeclaredVariablePattern, self.t(head.id));
-        self.b.patch_field(PayloadField::Variable, self.t(variable.id));
+        self.b
+            .patch_field(PayloadField::Variable, self.t(variable.id));
         self.b
             .end(NodeKind::DeclaredVariablePattern, self.t(variable.id) + 1);
     }
@@ -3752,10 +3766,10 @@ mod tests {
                 continue;
             }
             if parsed.ast.kind(id) == NodeKind::ExpressionBody {
-                let async_word =
-                    parsed.ast.field(id, PayloadField::AsyncKeyword).expect(
-                        "ExpressionBody carries the async modifier word",
-                    );
+                let async_word = parsed
+                    .ast
+                    .field(id, PayloadField::AsyncKeyword)
+                    .expect("ExpressionBody carries the async modifier word");
                 let offset = if async_word == TOKEN_NONE {
                     u32::MAX
                 } else {

@@ -209,10 +209,7 @@ fn local_compound_statement_reports_unused_local() {
                   \x20 y += 1;\n\
                   }\n";
     let names = code_names(&report(source));
-    assert!(
-        names.contains(&"unused_local_variable"),
-        "{names:?}"
-    );
+    assert!(names.contains(&"unused_local_variable"), "{names:?}");
 }
 
 /// The local control: a later genuine read spares the variable.
@@ -225,8 +222,5 @@ fn local_compound_with_read_spares() {
                   }\n\
                   void print(int x) {}\n";
     let names = code_names(&report(source));
-    assert!(
-        !names.contains(&"unused_local_variable"),
-        "{names:?}"
-    );
+    assert!(!names.contains(&"unused_local_variable"), "{names:?}");
 }

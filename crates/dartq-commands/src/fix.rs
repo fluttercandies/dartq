@@ -501,7 +501,8 @@ pub fn select_by_role(per_file: Vec<FileFixSet>, role: FixRole) -> Vec<FileFixSe
                     keep.insert(fix.group);
                 }
             }
-            set.fixes.retain(|fix| fix.role == FixRole::Primary && keep.contains(&fix.group));
+            set.fixes
+                .retain(|fix| fix.role == FixRole::Primary && keep.contains(&fix.group));
         } else {
             set.fixes.retain(|fix| fix.role == role);
             set.plugin.clear();
@@ -588,13 +589,11 @@ pub use evidence::{EvidenceName, FileEvidence, FixEvidence, evidence_json};
 pub use ignore::{ignore_file_fix, ignore_line_fix, ignore_options_edit};
 pub use pipeline::{assists, collect_set, collect_set_with_evidence, from_plugin};
 pub use plugin_host::{
-    DeclaredPlugin, PluginHosts, declared_plugin_sources, declared_plugins,
-    plugin_package_config,
+    DeclaredPlugin, PluginHosts, declared_plugin_sources, declared_plugins, plugin_package_config,
 };
 
 #[cfg(test)]
 mod tests;
-
 
 // ---------------------------------------------------------------------------
 // Anchoring substrate

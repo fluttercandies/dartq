@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec, body_members, get_set_token};
+use super::{Check, NodeKind, PayloadField, RuleSpec, body_members, get_set_token};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_classes_with_only_static_members.dart:30-71`
 /// — a class whose members are all static (and whose fields are not all
@@ -105,8 +105,7 @@ fn bridge_supertype_has_instance_members(c: &Check<'_>, class_row: u32) -> bool 
     let Some(class_name) = crate::rules::class_declaration_name(c, class_row) else {
         return false;
     };
-    analysis.supertype_has_instance_members(analysis.strings().intern(class_name))
-        != Some(false)
+    analysis.supertype_has_instance_members(analysis.strings().intern(class_name)) != Some(false)
 }
 
 /// The class-like declaration's name row: the direct child with a

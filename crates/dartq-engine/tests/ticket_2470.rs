@@ -126,7 +126,11 @@ fn analyze(source: &str) -> (Vec<Diagnostic>, Engine) {
     let mut engine = fixture.engine();
     engine.set_content(&fixture.path("lib/main.dart"), source.as_bytes());
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::default())
+        .analyze(
+            &[],
+            &mut |_| {},
+            &dartq_engine::CancellationToken::default(),
+        )
         .expect("analyze completes");
     (diagnostics, engine)
 }
@@ -185,7 +189,11 @@ fn default_literal_types_stay_out_of_the_formal_face() {
     let main = fixture.path("lib/main.dart");
     engine.set_content(&main, DEFAULT_LITERAL.as_bytes());
     engine
-        .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::default())
+        .analyze(
+            &[],
+            &mut |_| {},
+            &dartq_engine::CancellationToken::default(),
+        )
         .expect("analyze completes");
     let file = engine.file_table().try_file_id(&main).expect("file id");
     let facts = engine.file_facts(file).expect("facts");

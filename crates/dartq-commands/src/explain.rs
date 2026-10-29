@@ -264,10 +264,7 @@ fn explain_answer(
     let file_labels: Vec<String> = ids
         .iter()
         .map(|&file| {
-            crate::pkg_label::locate(
-                analysis_root,
-                file_table.path(file).expect("answer file"),
-            )
+            crate::pkg_label::locate(analysis_root, file_table.path(file).expect("answer file"))
         })
         .collect();
 
@@ -276,8 +273,7 @@ fn explain_answer(
     // from the engine's file table rather than parsed back out of any
     // spelling) and the 1-based line resolution the `others` rows locate
     // by.
-    let is_test_of =
-        |file: FileId| engine.file_table().path(file).is_some_and(is_test_path);
+    let is_test_of = |file: FileId| engine.file_table().path(file).is_some_and(is_test_path);
     let line_of = |file: FileId, offset: u32| {
         let index = engine.line_index(file).expect("answer file line index");
         let content = engine.content(file).expect("answer file content");
@@ -459,17 +455,14 @@ fn explain_diagnostic_answer(
             };
             match (sel.line, sel.column) {
                 (Some(line), Some(column)) => run.diagnostics.iter().find(|d| {
-                    d.code.name == code
-                        && file_hit(d)
-                        && covers(layout, d, line, column)
+                    d.code.name == code && file_hit(d) && covers(layout, d, line, column)
                 }),
-                (Some(line), None) => run
-                    .diagnostics
-                    .iter()
-                    .find(|d| d.code.name == code && file_hit(d) && {
+                (Some(line), None) => run.diagnostics.iter().find(|d| {
+                    d.code.name == code && file_hit(d) && {
                         let (hit_line, _) = layout.line_col(d.file, d.range.offset);
                         hit_line == line
-                    }),
+                    }
+                }),
                 _ => run
                     .diagnostics
                     .iter()
@@ -486,9 +479,7 @@ fn explain_diagnostic_answer(
     let related_lines: Vec<u32> = run
         .diagnostics
         .iter()
-        .filter(|d| {
-            d.code.name == code && d.file == hit.file && !std::ptr::eq(*d, hit)
-        })
+        .filter(|d| d.code.name == code && d.file == hit.file && !std::ptr::eq(*d, hit))
         .map(|d| layout.line_col(d.file, d.range.offset).0)
         .collect();
     let total: u32 = run
@@ -551,12 +542,13 @@ fn explain_diagnostic_answer(
         Verbosity::Compact => dartq_schema::Verbosity::Compact,
         Verbosity::Full => dartq_schema::Verbosity::Full,
     };
-    dartq_schema::validate_at_tier(&json, dartq_schema::Domain::DiagnosticExplain, tier)
-        .map_err(|violation| {
+    dartq_schema::validate_at_tier(&json, dartq_schema::Domain::DiagnosticExplain, tier).map_err(
+        |violation| {
             ExplainError::Analyze(AnalyzeError::Discovery(io::Error::other(format!(
                 "explain report violates the published schema: {violation}"
             ))))
-        })?;
+        },
+    )?;
     Ok(value)
 }
 
@@ -1113,8 +1105,7 @@ mod tests {
         let repo = "lib/todo_repository.dart".to_owned();
 
         assert_eq!(
-            json["sym"],
-            "TodoRepositoryClient.createTask",
+            json["sym"], "TodoRepositoryClient.createTask",
             "the caller's spelling rides"
         );
         assert_eq!(json["declaration"]["file"], repo);
@@ -1298,16 +1289,12 @@ mod tests {
         assert_eq!(json["diagnostic"]["file"], file);
         assert_eq!(json["diagnostic"]["off"], 7);
         assert_eq!(
-            json["diagnostic"]["len"],
-            12,
+            json["diagnostic"]["len"], 12,
             "the unused import's URI-string span (`'dart:async'`)"
         );
         assert_eq!(json["why"]["code_family"], "STATIC_WARNING");
         assert_eq!(json["why"]["trigger_kind"], "unused-family");
-        assert_eq!(
-            json["doc"],
-            "https://dart.dev/diagnostics/unused_import"
-        );
+        assert_eq!(json["doc"], "https://dart.dev/diagnostics/unused_import");
         assert_eq!(json["related"]["total"], 2, "two unused imports in the run");
         assert!(
             json["related"].get("lines").is_none(),
@@ -1375,8 +1362,7 @@ mod tests {
         assert_eq!(json["diagnostic"]["code"], "avoid_print");
         assert_eq!(json["why"]["code_family"], "LINT");
         assert_eq!(
-            json["doc"],
-            "https://dart.dev/diagnostics/avoid_print",
+            json["doc"], "https://dart.dev/diagnostics/avoid_print",
             "the same URL the json face's row carries"
         );
 

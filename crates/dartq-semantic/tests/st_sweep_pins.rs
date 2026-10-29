@@ -88,42 +88,57 @@ macro_rules! case {
 }
 
 const CASES: &[Case] = &[
-    case!("4093e6ac", [
-        "invalid_use_of_null_value",
-        "invocation_of_non_function_expression",
-        "non_bool_condition",
-        "not_a_type",
-        // The record-literal operator face (#1748): `const(x-1) + 1`
-        // folds the one-positional literal into a record-typed row and
-        // the `+` miss resolves against it — oracle row 49:23, the
-        // record display `(int,)`.
-        "undefined_operator",
-    ]),
-    case!("6e0cf0a2", [
-        "invalid_reference_to_this",
-        "invalid_use_of_null_value",
-        "invocation_of_non_function_expression",
-        "non_bool_condition",
-        "not_a_type",
-        "super_in_invalid_context",
-    ]),
-    case!("666ddbb1", [
-        "conflicting_static_and_instance",
-        "const_instance_field",
-        "non_void_return_for_setter",
-        "final_not_initialized",
-        "const_not_initialized",
-    ]),
-    case!("7c5ae0fd", [
-        "const_instance_field",
-        "non_void_return_for_setter",
-        "final_not_initialized",
-    ]),
-    case!("8b3fc913", [
-        "non_void_return_for_setter",
-        "not_a_type",
-        "final_not_initialized",
-    ]),
+    case!(
+        "4093e6ac",
+        [
+            "invalid_use_of_null_value",
+            "invocation_of_non_function_expression",
+            "non_bool_condition",
+            "not_a_type",
+            // The record-literal operator face (#1748): `const(x-1) + 1`
+            // folds the one-positional literal into a record-typed row and
+            // the `+` miss resolves against it — oracle row 49:23, the
+            // record display `(int,)`.
+            "undefined_operator",
+        ]
+    ),
+    case!(
+        "6e0cf0a2",
+        [
+            "invalid_reference_to_this",
+            "invalid_use_of_null_value",
+            "invocation_of_non_function_expression",
+            "non_bool_condition",
+            "not_a_type",
+            "super_in_invalid_context",
+        ]
+    ),
+    case!(
+        "666ddbb1",
+        [
+            "conflicting_static_and_instance",
+            "const_instance_field",
+            "non_void_return_for_setter",
+            "final_not_initialized",
+            "const_not_initialized",
+        ]
+    ),
+    case!(
+        "7c5ae0fd",
+        [
+            "const_instance_field",
+            "non_void_return_for_setter",
+            "final_not_initialized",
+        ]
+    ),
+    case!(
+        "8b3fc913",
+        [
+            "non_void_return_for_setter",
+            "not_a_type",
+            "final_not_initialized",
+        ]
+    ),
     case!("e863c628", ["non_void_return_for_setter", "not_a_type"]),
     case!("f600b4ad", ["not_a_type"]),
     case!("a49cceb1", ["non_bool_condition"]),
@@ -136,7 +151,10 @@ const CASES: &[Case] = &[
     // The `Created` receiver's null-aware face rides the same pin
     // (`C2()?..new()` at 61 — a creation's result is its non-nullable
     // container, `_checkForUnnecessaryNullAware`).
-    case!("d1b3378f", ["undefined_method", "invalid_null_aware_operator"]),
+    case!(
+        "d1b3378f",
+        ["undefined_method", "invalid_null_aware_operator"]
+    ),
     // The function-typed formal face (#1758): `f()?.x` on `int f()`-shaped
     // parameters — the formal's name binds through the `end_formal_parameter`
     // arm (the parser's inline-name path fires no identifier event), and the
@@ -311,10 +329,7 @@ const GOLDEN: &[(&str, &[(&str, &[(usize, usize)])])] = &[
     (
         "d1b3378f",
         &[
-            (
-                "undefined_method",
-                &[(39, 57), (40, 70), (60, 9), (61, 10)],
-            ),
+            ("undefined_method", &[(39, 57), (40, 70), (60, 9), (61, 10)]),
             ("invalid_null_aware_operator", &[(61, 7)]),
         ],
     ),

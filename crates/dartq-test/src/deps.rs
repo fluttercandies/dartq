@@ -147,8 +147,17 @@ const MAX_PATH_LITERAL: usize = 255;
 /// [`FileFacts::nondeterministic`]: the drift happens inside the
 /// dependency, where the cache does not look.
 pub const DRIFT_PACKAGES: &[&str] = &[
-    "clock", "dio", "grpc", "http", "http2", "io", "process", "process_run", "shelf",
-    "web_socket", "web_socket_channel",
+    "clock",
+    "dio",
+    "grpc",
+    "http",
+    "http2",
+    "io",
+    "process",
+    "process_run",
+    "shelf",
+    "web_socket",
+    "web_socket_channel",
 ];
 
 /// Extract the facts of one Dart file's bytes. A leading BOM is skipped,
@@ -181,7 +190,10 @@ pub fn facts(bytes: &[u8]) -> FileFacts {
                 .and_then(|rest| rest.split_once('/'))
                 .is_some_and(|(package, _)| DRIFT_PACKAGES.contains(&package))
     });
-    out.engine_shared |= out.uris.iter().any(|uri| uri == "dart:ffi" || uri.starts_with("package:ffi/"));
+    out.engine_shared |= out
+        .uris
+        .iter()
+        .any(|uri| uri == "dart:ffi" || uri.starts_with("package:ffi/"));
     let [no_cache, attested, portable, shardable] = markers(source, &scanned.tokens);
     out.no_cache = no_cache;
     out.attested = attested;
@@ -222,10 +234,14 @@ fn markers(source: &str, tokens: &TokenTable) -> [bool; 4] {
         for line in gap.lines() {
             if let Some(rest) = line.trim_start().strip_prefix("//") {
                 let rest = rest.trim_start_matches('/').trim();
-                for (slot, marker) in
-                    [NO_CACHE_MARKER, DETERMINISTIC_MARKER, PORTABLE_MARKER, SHARDABLE_MARKER]
-                        .iter()
-                        .enumerate()
+                for (slot, marker) in [
+                    NO_CACHE_MARKER,
+                    DETERMINISTIC_MARKER,
+                    PORTABLE_MARKER,
+                    SHARDABLE_MARKER,
+                ]
+                .iter()
+                .enumerate()
                 {
                     if let Some(tail) = rest.strip_prefix(marker)
                         && (tail.is_empty() || tail.starts_with(char::is_whitespace))
@@ -381,7 +397,10 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
             TokenKind::Identifier => {
                 let lexeme = tokens.lexeme(source, index);
                 let after_period = index.checked_sub(1).and_then(kind) == Some(TokenKind::Period);
-                out.engine_shared |= matches!(lexeme, "FontLoader" | "loadFontFromList" | "IsolateNameServer");
+                out.engine_shared |= matches!(
+                    lexeme,
+                    "FontLoader" | "loadFontFromList" | "IsolateNameServer"
+                );
                 // Constructors and top-level reads of drifting sources
                 // (`HttpClient()`, dart:io's `stdin` getter). A named
                 // argument or a declaration of the same name is not a read.
@@ -393,16 +412,25 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                         ),
                         // Not a named argument, a declaration's name
                         // (`Object? stdin`), or an assignment target.
-                        "stdin" => !matches!(kind(index + 1), Some(TokenKind::Colon | TokenKind::Eq))
-                            && !matches!(
-                                index.checked_sub(1).and_then(kind),
-                                Some(TokenKind::Identifier | TokenKind::Keyword(_) | TokenKind::Question)
-                            ),
+                        "stdin" => {
+                            !matches!(kind(index + 1), Some(TokenKind::Colon | TokenKind::Eq))
+                                && !matches!(
+                                    index.checked_sub(1).and_then(kind),
+                                    Some(
+                                        TokenKind::Identifier
+                                            | TokenKind::Keyword(_)
+                                            | TokenKind::Question
+                                    )
+                                )
+                        }
                         _ => false,
                     };
                 }
                 if after_period
-                    && matches!(lexeme, "absolute" | "resolveSymbolicLinks" | "resolveSymbolicLinksSync")
+                    && matches!(
+                        lexeme,
+                        "absolute" | "resolveSymbolicLinks" | "resolveSymbolicLinksSync"
+                    )
                 {
                     out.located = true;
                 }
@@ -429,7 +457,10 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                     }
                 }
                 if kind(index + 1) != Some(TokenKind::Period)
-                    || !matches!(kind(index + 2), Some(TokenKind::Identifier | TokenKind::Keyword(_)))
+                    || !matches!(
+                        kind(index + 2),
+                        Some(TokenKind::Identifier | TokenKind::Keyword(_))
+                    )
                 {
                     continue;
                 }
@@ -443,15 +474,22 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                         | ("Process", "run" | "runSync" | "start")
                         | ("Platform", "localHostname")
                         | (
-                            "Socket" | "ServerSocket" | "RawSocket" | "RawServerSocket"
-                                | "SecureSocket" | "SecureServerSocket" | "RawDatagramSocket"
-                                | "WebSocket" | "InternetAddress" | "NetworkInterface",
+                            "Socket"
+                                | "ServerSocket"
+                                | "RawSocket"
+                                | "RawServerSocket"
+                                | "SecureSocket"
+                                | "SecureServerSocket"
+                                | "RawDatagramSocket"
+                                | "WebSocket"
+                                | "InternetAddress"
+                                | "NetworkInterface",
                             _
                         )
                 );
                 // `Directory.current = …` moves every engine's directory.
-                out.engine_shared |=
-                    (lexeme, member) == ("Directory", "current") && kind(index + 3) == Some(TokenKind::Eq);
+                out.engine_shared |= (lexeme, member) == ("Directory", "current")
+                    && kind(index + 3) == Some(TokenKind::Eq);
                 match (lexeme, member) {
                     ("Process", _) | ("Directory", "current") => out.ambient = true,
                     (prefix, "current") if path_imports.prefixes.contains(&prefix) => {
@@ -461,7 +499,9 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                     | ("Uri", "base")
                     | (
                         "Isolate",
-                        "packageConfig" | "packageConfigSync" | "resolvePackageUri"
+                        "packageConfig"
+                        | "packageConfigSync"
+                        | "resolvePackageUri"
                         | "resolvePackageUriSync",
                     ) => out.ambient = true,
                     (prefix, "absolute" | "relative" | "canonicalize")
@@ -489,7 +529,11 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                 if !continued && let Some(path) = absolute_path(body) {
                     out.absolute_paths.push(path);
                 }
-                let body = if continued { body.trim_start_matches('/') } else { body };
+                let body = if continued {
+                    body.trim_start_matches('/')
+                } else {
+                    body
+                };
                 if let Some(path) = path_candidate(body) {
                     out.path_literals.push(path);
                 }
@@ -598,7 +642,9 @@ fn segment_body(lexeme: &str) -> &str {
     } else {
         lexeme
     };
-    lexeme.trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"'])
+    lexeme
+        .trim_start_matches(['\'', '"'])
+        .trim_end_matches(['\'', '"'])
 }
 
 /// The absolute path a literal spells, if any: `/etc/hosts`, or the path
@@ -617,8 +663,13 @@ fn absolute_path(text: &str) -> Option<String> {
     let plausible = !rest.is_empty()
         && !rest.starts_with('/')
         && !rest.starts_with('*')
-        && rest.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
-        && !path.bytes().any(|b| b.is_ascii_whitespace() || b == b'$' || b == b'\\');
+        && rest
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+        && !path
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'$' || b == b'\\');
     plausible.then(|| path.trim_end_matches('/').to_owned())
 }
 
@@ -633,9 +684,35 @@ pub fn data_paths(bytes: &[u8]) -> Vec<String> {
         return Vec::new();
     };
     let mut out: Vec<String> = text
-        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | '[' | ']' | '{' | '}' | '(' | ')' | '<' | '>' | '='))
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\''
+                        | '`'
+                        | ','
+                        | ';'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | '='
+                )
+        })
         .map(|word| word.trim_end_matches(':'))
-        .filter(|word| word.contains('/') || word.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && (1..=8).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_alphanumeric()) && ext.bytes().any(|b| b.is_ascii_alphabetic())))
+        .filter(|word| {
+            word.contains('/')
+                || word.rsplit_once('.').is_some_and(|(stem, ext)| {
+                    !stem.is_empty()
+                        && (1..=8).contains(&ext.len())
+                        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && ext.bytes().any(|b| b.is_ascii_alphabetic())
+                })
+        })
         .filter_map(path_candidate)
         .filter(|word| word != ".")
         .collect();
@@ -650,7 +727,9 @@ fn path_candidate(text: &str) -> Option<String> {
     if text.is_empty()
         || text.len() > MAX_PATH_LITERAL
         || text.starts_with('/')
-        || text.bytes().any(|b| b.is_ascii_whitespace() || matches!(b, b'\\' | b'$' | b':'))
+        || text
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || matches!(b, b'\\' | b'$' | b':'))
     {
         return None;
     }
@@ -767,19 +846,40 @@ void main() {
         assert!(drift("void main() { Platform.localHostname; }"));
         assert!(drift("import 'dart:ffi';\nvoid main() {}"));
         assert!(drift("import 'package:clock/clock.dart';\nvoid main() {}"));
-        assert!(drift("import 'package:http/http.dart' as http;\nvoid main() {}"));
+        assert!(drift(
+            "import 'package:http/http.dart' as http;\nvoid main() {}"
+        ));
         // Stationary randomness, a `stdin:` named argument, a field named
         // `stdin`, and a `DateTime` constructed from a literal do not drift.
-        assert!(!drift("void main() { Random(1).nextInt(3); Stopwatch()..start(); }"));
-        assert!(!drift("void f({Object? stdin}) {} void main() { f(stdin: 1); }"));
-        assert!(drift("import 'dart:io' as io;\nvoid main() { io.stdin.readLineSync(); }"));
-        assert!(!drift("class A { Object? stdin; } void main() { DateTime(2020); }"));
-        assert!(!drift("import 'package:http_parser/http_parser.dart';\nvoid main() {}"));
+        assert!(!drift(
+            "void main() { Random(1).nextInt(3); Stopwatch()..start(); }"
+        ));
+        assert!(!drift(
+            "void f({Object? stdin}) {} void main() { f(stdin: 1); }"
+        ));
+        assert!(drift(
+            "import 'dart:io' as io;\nvoid main() { io.stdin.readLineSync(); }"
+        ));
+        assert!(!drift(
+            "class A { Object? stdin; } void main() { DateTime(2020); }"
+        ));
+        assert!(!drift(
+            "import 'package:http_parser/http_parser.dart';\nvoid main() {}"
+        ));
 
         let absolute = |source: &str| of(source).absolute_paths;
-        assert_eq!(absolute("void main() { File('/etc/hosts'); }"), ["/etc/hosts"]);
-        assert_eq!(absolute("void main() { Uri.parse('file:///tmp/x/'); }"), ["/tmp/x"]);
-        assert!(absolute("void main() { s.split('/'); x('// a'); y('/* c */'); print('$a/lib'); }").is_empty());
+        assert_eq!(
+            absolute("void main() { File('/etc/hosts'); }"),
+            ["/etc/hosts"]
+        );
+        assert_eq!(
+            absolute("void main() { Uri.parse('file:///tmp/x/'); }"),
+            ["/tmp/x"]
+        );
+        assert!(
+            absolute("void main() { s.split('/'); x('// a'); y('/* c */'); print('$a/lib'); }")
+                .is_empty()
+        );
 
         assert_eq!(
             data_paths(b"files:\n  - test/resources/a.dart\n  - 'b.yaml'\nname: x\nversion: 1.2\n"),
@@ -788,8 +888,12 @@ void main() {
 
         let shared = |source: &str| of(source).engine_shared;
         assert!(shared("void main() { FontLoader('x')..load(); }"));
-        assert!(shared("import 'dart:ui' as ui;\nvoid main() { ui.loadFontFromList(b); }"));
-        assert!(shared("void main() { IsolateNameServer.lookupPortByName('p'); }"));
+        assert!(shared(
+            "import 'dart:ui' as ui;\nvoid main() { ui.loadFontFromList(b); }"
+        ));
+        assert!(shared(
+            "void main() { IsolateNameServer.lookupPortByName('p'); }"
+        ));
         assert!(shared("import 'dart:ffi';\nvoid main() {}"));
         assert!(shared("import 'package:ffi/ffi.dart';\nvoid main() {}"));
         assert!(shared("void main() { Directory.current = '/tmp'; }"));
@@ -801,11 +905,17 @@ void main() {
         assert!(launch.launch && launch.ambient);
         assert!(!of("void main() {}").launch);
 
-        let marked = of("// dartq: no-cache talks to a local daemon\n// dartq: deterministic\n// dartq: portable\n// dartq: shardable\nvoid main() {}");
+        let marked = of(
+            "// dartq: no-cache talks to a local daemon\n// dartq: deterministic\n// dartq: portable\n// dartq: shardable\nvoid main() {}",
+        );
         assert!(marked.no_cache && marked.attested && marked.portable && marked.shardable);
         // A marker inside a string, a longer word, or a block comment does not count.
-        let unmarked = of("/* dartq: no-cache */\n// dartq: no-cacheable\n// dartq: shardablex\nvoid main() { print('// dartq: no-cache'); }");
-        assert!(!unmarked.no_cache && !unmarked.attested && !unmarked.portable && !unmarked.shardable);
+        let unmarked = of(
+            "/* dartq: no-cache */\n// dartq: no-cacheable\n// dartq: shardablex\nvoid main() { print('// dartq: no-cache'); }",
+        );
+        assert!(
+            !unmarked.no_cache && !unmarked.attested && !unmarked.portable && !unmarked.shardable
+        );
     }
 
     /// Location observers pin a result to its checkout without widening
@@ -816,17 +926,28 @@ void main() {
             let facts = of(source);
             (facts.located, facts.ambient)
         };
-        assert_eq!(located("void main() { File('a').absolute.path; }"), (true, false));
-        assert_eq!(located("void main() { Directory('a').resolveSymbolicLinksSync(); }"), (true, false));
-        assert_eq!(located("void main() { print(StackTrace.current); }"), (true, false));
+        assert_eq!(
+            located("void main() { File('a').absolute.path; }"),
+            (true, false)
+        );
+        assert_eq!(
+            located("void main() { Directory('a').resolveSymbolicLinksSync(); }"),
+            (true, false)
+        );
+        assert_eq!(
+            located("void main() { print(StackTrace.current); }"),
+            (true, false)
+        );
         let prefixed = "import 'package:path/path.dart' as p;\nvoid main() { p.absolute('a'); p.relative('b'); }";
         assert_eq!(located(prefixed), (true, false));
         let bare = "import 'package:path/path.dart';\nvoid main() { canonicalize('a'); }";
         assert_eq!(located(bare), (true, false));
         assert_eq!(located("void main() { Directory.current; }"), (true, true));
         // Unrelated members of the same names are not location reads.
-        assert_eq!(located("void main() { relative('a'); x.canonicalize; Zone.current; }"), (false, false));
-
+        assert_eq!(
+            located("void main() { relative('a'); x.canonicalize; Zone.current; }"),
+            (false, false)
+        );
     }
 
     /// `Platform.executableArguments` observes the launch exactly as
@@ -850,12 +971,30 @@ void main() {
     /// The opt-out markers match one exact spelling each.
     #[test]
     fn markers_match_one_spelling() {
-        assert!(!of("// dartq:no-cache\nvoid main() {}").no_cache, "no space after the colon");
-        assert!(!of("// dartq: no-cacheable\nvoid main() {}").no_cache, "a longer word");
-        assert!(of("/// dartq: no-cache why\nvoid main() {}").no_cache, "extra slashes and a reason");
-        assert!(!of("// dartq:shardable\nvoid main() {}").shardable, "no space after the colon");
-        assert!(!of("// dartq: shardable-suite\nvoid main() {}").shardable, "a longer word");
-        assert!(of("/// dartq: shardable split at groups\nvoid main() {}").shardable, "extra slashes and a reason");
+        assert!(
+            !of("// dartq:no-cache\nvoid main() {}").no_cache,
+            "no space after the colon"
+        );
+        assert!(
+            !of("// dartq: no-cacheable\nvoid main() {}").no_cache,
+            "a longer word"
+        );
+        assert!(
+            of("/// dartq: no-cache why\nvoid main() {}").no_cache,
+            "extra slashes and a reason"
+        );
+        assert!(
+            !of("// dartq:shardable\nvoid main() {}").shardable,
+            "no space after the colon"
+        );
+        assert!(
+            !of("// dartq: shardable-suite\nvoid main() {}").shardable,
+            "a longer word"
+        );
+        assert!(
+            of("/// dartq: shardable split at groups\nvoid main() {}").shardable,
+            "extra slashes and a reason"
+        );
     }
 
     /// Environment reads: literal indexes and `containsKey` name the
@@ -890,7 +1029,9 @@ void main() {
         }
 
         // A read inside a comment or string is not a read.
-        let none = of("// Platform.environment['HOME']\nvoid main() { const s = 'Platform.environment[\"X\"]'; }");
+        let none = of(
+            "// Platform.environment['HOME']\nvoid main() { const s = 'Platform.environment[\"X\"]'; }",
+        );
         assert!(!none.env_opaque && none.env_reads.is_empty());
     }
 
@@ -902,7 +1043,10 @@ void main() {
     #[test]
     fn dot_shorthand_environment_access_is_not_tracked() {
         let shorthand = of("void main() { print(.environment['HOME']); }");
-        assert!(!shorthand.env_opaque, "documented: dot-shorthand is neither named nor opaque");
+        assert!(
+            !shorthand.env_opaque,
+            "documented: dot-shorthand is neither named nor opaque"
+        );
         assert!(shorthand.env_reads.is_empty());
         let other_receiver = of("void main() { print(other.environment['HOME']); }");
         assert!(!other_receiver.env_opaque && other_receiver.env_reads.is_empty());

@@ -9,8 +9,8 @@
 use dartq_scanner::ScanConfig;
 
 use super::collector::{Collector, latest_features};
-use crate::parser::Parser;
 use crate::ParserFeatures;
+use crate::parser::Parser;
 
 /// Parses `source` and returns the scanner+parser rows as
 /// `(code, start, end)` sorted by offset (gate_bi_name_faces harness shape).
@@ -128,7 +128,7 @@ fn import_prefix_reserved_head() {
     assert_faces(
         leaked("import 'a.dart' as class A {}"),
         &[
-            ("expected_token", 16, 18),    // ';' at `as`
+            ("expected_token", 16, 18),     // ';' at `as`
             ("missing_identifier", 19, 24), // at `class`
         ],
     );
@@ -143,7 +143,7 @@ fn import_prefix_builtin_head() {
     assert_faces(
         leaked("import 'a.dart' as set a(b) {}"),
         &[
-            ("expected_token", 16, 18),   // ';' at `as`
+            ("expected_token", 16, 18),     // ';' at `as`
             ("missing_identifier", 19, 22), // at `set`
         ],
     );
@@ -156,7 +156,7 @@ fn import_combinator_reserved_head() {
     assert_faces(
         leaked("import 'a.dart' show class A {}"),
         &[
-            ("expected_token", 16, 20),    // ';' at `show`
+            ("expected_token", 16, 20),     // ';' at `show`
             ("missing_identifier", 21, 26), // at `class`
         ],
     );
@@ -173,7 +173,7 @@ fn for_in_await_iterable_recovery_no_stall() {
     assert_faces(
         leaked("\nf() async { await for (A a in break; }"),
         &[
-            ("expected_token", 31, 32),    // ')' at `break`
+            ("expected_token", 31, 32),     // ')' at `break`
             ("missing_identifier", 31, 36), // at `break`
         ],
     );
@@ -188,8 +188,8 @@ fn for_in_block_iterable_semicolon_anchor() {
     assert_faces(
         leaked("\nf() { for (var a in {} }"),
         &[
-            ("expected_token", 22, 23),    // ';' at the literal's `}`
-            ("expected_token", 24, 25),    // ')' at the block's `}`
+            ("expected_token", 22, 23),     // ';' at the literal's `}`
+            ("expected_token", 24, 25),     // ')' at the block's `}`
             ("missing_identifier", 24, 25), // at the block's `}`
         ],
     );

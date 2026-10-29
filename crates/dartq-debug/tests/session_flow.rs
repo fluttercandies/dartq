@@ -64,13 +64,10 @@ fn interrupt_event() -> Value {
     })
 }
 
-
 #[test]
 fn step_over_packages_stopped_snapshot() {
     let vm = MockVm::start(|request| match request.method.as_str() {
-        "addBreakpointWithScriptUri" => {
-            Reply::Ok(resolved_breakpoint("breakpoints/1"))
-        }
+        "addBreakpointWithScriptUri" => Reply::Ok(resolved_breakpoint("breakpoints/1")),
         "resume" => Reply::Prefixed {
             prelude: vec![pause_event(
                 "Debug",
@@ -92,7 +89,9 @@ fn step_over_packages_stopped_snapshot() {
         _ => default_reply(request),
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    session.add_breakpoint(line_spec(None)).expect("add breakpoint");
+    session
+        .add_breakpoint(line_spec(None))
+        .expect("add breakpoint");
     let snapshot = session
         .step_and_package(None, Some(StepOption::Over))
         .expect("step over");
@@ -401,7 +400,9 @@ fn conditional_resume_limit_reports_stop() {
     let settings = SessionConfig {
         pause_timeout: Duration::from_secs(5),
         rpc_timeout: Duration::from_secs(5),
-        conditional_resume_limit: dartq_debug::ConditionalResumeLimit { max_auto_resumes: 3 },
+        conditional_resume_limit: dartq_debug::ConditionalResumeLimit {
+            max_auto_resumes: 3,
+        },
         ..SessionConfig::default()
     };
     let mut session = DebugSession::attach_with(&vm.ws_uri, settings).expect("attach");
@@ -457,7 +458,10 @@ fn evaluate_in_frame_reports_compile_error() {
     let error = session
         .evaluate_in_frame(None, 0, "not dart(")
         .expect_err("compile error must surface");
-    assert!(matches!(error, Error::Rpc { code: 113, .. }), "got {error:?}");
+    assert!(
+        matches!(error, Error::Rpc { code: 113, .. }),
+        "got {error:?}"
+    );
 }
 
 #[test]
@@ -552,7 +556,10 @@ fn evaluate_in_root_lib_without_root_lib_is_protocol_error() {
         .requests
         .try_iter()
         .any(|request| request.method == "evaluate");
-    assert!(!evaluate_sent, "evaluate must not be issued without a root library");
+    assert!(
+        !evaluate_sent,
+        "evaluate must not be issued without a root library"
+    );
 }
 
 #[test]
@@ -688,8 +695,13 @@ fn expand_graph_respects_depth_limit() {
         ..SessionConfig::default()
     };
     let mut session = DebugSession::attach_with(&vm.ws_uri, settings).expect("attach");
-    let graph = session.expand_graph(None, "objects/root").expect("expand graph");
-    let names: Vec<&str> = graph.iter().map(|variable| variable.name.as_str()).collect();
+    let graph = session
+        .expand_graph(None, "objects/root")
+        .expect("expand graph");
+    let names: Vec<&str> = graph
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
     assert_eq!(names, ["a", "a.b", "a.b.c"]);
 }
 
@@ -712,7 +724,10 @@ fn reload_sources_conflict_is_error() {
     let error = session
         .reload_sources(None, false)
         .expect_err("reload conflict must surface");
-    assert!(matches!(error, Error::Rpc { code: 108, .. }), "got {error:?}");
+    assert!(
+        matches!(error, Error::Rpc { code: 108, .. }),
+        "got {error:?}"
+    );
 }
 
 #[test]
@@ -725,7 +740,10 @@ fn hot_restart_surfaces_registration_error() {
     let error = session
         .hot_restart()
         .expect_err("a bare VM has no hotRestart service");
-    assert!(matches!(error, Error::Rpc { code: -32601, .. }), "got {error:?}");
+    assert!(
+        matches!(error, Error::Rpc { code: -32601, .. }),
+        "got {error:?}"
+    );
 }
 
 #[test]

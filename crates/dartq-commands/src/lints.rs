@@ -76,10 +76,10 @@ use dartq_engine::{Engine, LibraryId, Reachability, YamlIgnores};
 use dartq_flow::FlowFact;
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_lints::{
-    AsyncContextUse, Comments, EnableSet, Features, IgnoreInfo, Lint, RULES,
-    ReachabilityFace, RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_section,
-    check_url, is_breaking_version, mounts_semantics, parse_unit, parse_unit_with_tokens,
-    rule_by_name, run, run_breaking_version_annotations, type_use_counts, unignorable_ignores,
+    AsyncContextUse, Comments, EnableSet, Features, IgnoreInfo, Lint, RULES, ReachabilityFace,
+    RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_section, check_url,
+    is_breaking_version, mounts_semantics, parse_unit, parse_unit_with_tokens, rule_by_name, run,
+    run_breaking_version_annotations, type_use_counts, unignorable_ignores,
     unnecessary_ignore_analyzer_rows, unnecessary_ignore_late_rows,
 };
 use dartq_package::PackageIdentity;
@@ -102,13 +102,15 @@ pub fn enable_set(rules: Option<&[String]>) -> EnableSet {
         None => EnableSet::none(),
         // A name the pinned registry does not know reports `undefined_lint`
         // and never runs, even when dartq implements a later SDK's rule.
-        Some(names) => EnableSet::resolve(
-            names
-                .iter()
-                .map(String::as_str)
-                .filter(|name| crate::lint_names::is_known(name)),
-        )
-        .0,
+        Some(names) => {
+            EnableSet::resolve(
+                names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| crate::lint_names::is_known(name)),
+            )
+            .0
+        }
     }
 }
 
@@ -846,7 +848,10 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         .into_par_iter()
         .filter_map(|library| {
             let members = library_members.get(&library)?;
-            Some((library, build_library_semantics(engine, members[0], members)))
+            Some((
+                library,
+                build_library_semantics(engine, members[0], members),
+            ))
         })
         .collect();
 
@@ -1346,11 +1351,7 @@ pub(crate) struct SemanticContext {
 /// posture (a query never fabricates a binding the context did not
 /// decide), not a divergence from the semantic tier's answers about *this*
 /// library's own declarations.
-fn build_library_semantics(
-    engine: &Engine,
-    file: FileId,
-    members: &[FileId],
-) -> LibrarySemantics {
+fn build_library_semantics(engine: &Engine, file: FileId, members: &[FileId]) -> LibrarySemantics {
     let strings = engine.strings();
     let mut builder = LibraryGraphBuilder::new(strings);
     // The library node's identity is internal to this per-library graph; the
@@ -1412,11 +1413,7 @@ fn build_library_semantics(
 /// Mounts one file's fold substrate: the library's shared tables by
 /// reference plus the file's own scan of the exact bytes the job
 /// analyzes.
-fn semantic_context(
-    text: &str,
-    file: FileId,
-    shared: &LibrarySemantics,
-) -> SemanticContext {
+fn semantic_context(text: &str, file: FileId, shared: &LibrarySemantics) -> SemanticContext {
     SemanticContext {
         lib: shared.lib,
         graph: Arc::clone(&shared.graph),
@@ -1599,8 +1596,8 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
                 let mut hits = Vec::new();
                 check_url(range.clone(), value, &mut hits);
                 rows.extend(hits.into_iter().filter_map(|hit| {
-                let (line, _) = lines.byte_to_line_col(saturate_slot_u32(hit.range.start));
-                (!ignores.ignored(line, "secure_pubspec_urls")).then(|| Lint {
+                    let (line, _) = lines.byte_to_line_col(saturate_slot_u32(hit.range.start));
+                    (!ignores.ignored(line, "secure_pubspec_urls")).then(|| Lint {
                         rule,
                         range: utf16_range(&lines, text, &hit.range),
                         message: spec.render_problem(&[hit.scheme]),
@@ -1760,7 +1757,6 @@ fn utf16_range(
 ) -> core::ops::Range<u32> {
     lines.byte_to_utf16(text, range.start as u32)..lines.byte_to_utf16(text, range.end as u32)
 }
-
 
 /// The options entry governing a file in `dir`: the nearest
 /// `analysis_options.yaml` at or above `dir`
@@ -3530,8 +3526,7 @@ void stray() {}
         let (config, _) =
             crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
         let mut engine = Engine::new(config).expect("engine");
-        crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
-            .expect("run");
+        crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
         (root, engine)
     }
 
@@ -3557,8 +3552,8 @@ void stray() {}
         let (root, engine) = part_library_engine("lints_shared_substrate");
         let members = part_library_members(&engine);
         let (main, part) = (members[0], members[1]);
-        let main_text = std::str::from_utf8(engine.content(main).expect("main bytes"))
-            .expect("main utf8");
+        let main_text =
+            std::str::from_utf8(engine.content(main).expect("main bytes")).expect("main utf8");
         let shared = build_library_semantics(&engine, main, &members);
         let mounted = semantic_context(main_text, main, &shared);
         let standalone = build_semantic_context(&engine, main_text, main, &members);
@@ -3568,12 +3563,16 @@ void stray() {}
             let id = strings.intern(name);
             assert_eq!(
                 mounted.namespaces.lookup(&mounted.graph, mounted.lib, id),
-                standalone.namespaces.lookup(&standalone.graph, standalone.lib, id),
+                standalone
+                    .namespaces
+                    .lookup(&standalone.graph, standalone.lib, id),
                 "the lookup of {name} agrees"
             );
         }
         assert_eq!(
-            mounted.namespaces.lookup(&mounted.graph, mounted.lib, strings.intern("PartWidget")),
+            mounted
+                .namespaces
+                .lookup(&mounted.graph, mounted.lib, strings.intern("PartWidget")),
             dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(part)),
             "the part-declared class resolves to the part's file"
         );
@@ -3601,9 +3600,8 @@ void stray() {}
         let (root, engine) = part_library_engine("lints_shared_identity");
         let members = part_library_members(&engine);
         let shared = build_library_semantics(&engine, members[0], &members);
-        let text = |file: FileId| {
-            std::str::from_utf8(engine.content(file).expect("bytes")).expect("utf8")
-        };
+        let text =
+            |file: FileId| std::str::from_utf8(engine.content(file).expect("bytes")).expect("utf8");
         let main = semantic_context(text(members[0]), members[0], &shared);
         let part = semantic_context(text(members[1]), members[1], &shared);
         assert!(Arc::ptr_eq(&main.graph, &shared.graph), "the graph shares");
@@ -3612,7 +3610,10 @@ void stray() {}
             "the namespaces share"
         );
         assert!(Arc::ptr_eq(&main.index, &shared.index), "the index shares");
-        assert!(Arc::ptr_eq(&part.graph, &shared.graph), "the part shares too");
+        assert!(
+            Arc::ptr_eq(&part.graph, &shared.graph),
+            "the part shares too"
+        );
         assert_ne!(
             main.scanned.tokens.len(),
             part.scanned.tokens.len(),

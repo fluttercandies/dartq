@@ -99,13 +99,7 @@ static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-const IMPACT_TOP: &[&str] = &[
-    "v",
-    "sym",
-    "files",
-    "tests",
-    "envs",
-];
+const IMPACT_TOP: &[&str] = &["v", "sym", "files", "tests", "envs"];
 /// The locator envelope's key — the analysis root the path columns locate
 /// against, riding exactly when a file-bearing row does.
 const IMPACT_LOCATOR: &[&str] = &["root"];
@@ -136,10 +130,7 @@ pub(crate) fn validate_impact(value: &Value) -> Result<(), SchemaViolation> {
         let obj = object(row, &p)?;
         exact_fields(obj, CHANGED_SYMBOL, &[], &p)?;
         symbol_ref(field(obj, "sym", &p)?, &join(&p, "sym"))?;
-        boolean(
-            field(obj, "sig_changed", &p)?,
-            &join(&p, "sig_changed"),
-        )?;
+        boolean(field(obj, "sig_changed", &p)?, &join(&p, "sig_changed"))?;
     }
     for (i, row) in rows(root, "files")? {
         let p = format!("files[{i}]");
@@ -255,10 +246,7 @@ mod tests {
     #[test]
     fn missing_section_is_named() {
         let mut payload = report();
-        payload
-            .as_object_mut()
-            .expect("object")
-            .remove("tests");
+        payload.as_object_mut().expect("object").remove("tests");
         let violation = validate_impact(&payload).expect_err("missing section must violate");
         assert_eq!(violation.path, "tests");
         assert_eq!(violation.found, "missing");
@@ -269,10 +257,7 @@ mod tests {
     #[test]
     fn the_locator_root_validates_and_a_non_string_is_named() {
         let mut payload = report();
-        payload
-            .as_object_mut()
-            .expect("object")
-            .remove("root");
+        payload.as_object_mut().expect("object").remove("root");
         assert!(validate_impact(&payload).is_ok());
 
         let mut payload = report();

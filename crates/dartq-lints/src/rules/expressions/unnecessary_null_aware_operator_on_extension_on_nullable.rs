@@ -1,6 +1,8 @@
 use dartq_semantic::model::Ty;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{
+    Check, NodeKind, PayloadField, RuleSpec, query_site, slice, static_type_faces as faces,
+};
 use crate::rules::{MemberQuery, body_members, type_face, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -102,8 +104,7 @@ fn verdict(
     let Some(dot) = dot else {
         return;
     };
-    let Some(Ty::Named { nullable: true, .. }) = analysis.type_of(query_site(c, receiver))
-    else {
+    let Some(Ty::Named { nullable: true, .. }) = analysis.type_of(query_site(c, receiver)) else {
         return;
     };
     if !extension_on_nullable_member(c, c.lexeme(selector)) {

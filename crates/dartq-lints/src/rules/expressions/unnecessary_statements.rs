@@ -1,6 +1,6 @@
 use dartq_semantic::model::MemberKind;
 
-use super::{PayloadField, Check, NodeKind, RuleSpec, query_site, same_file};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, same_file};
 use crate::rules::{body_members, get_set_token, same_file_declaration, slice, type_face};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_statements.dart`
@@ -345,12 +345,7 @@ fn content_end_row(c: &Check<'_>, root: u32, run: &[u32]) -> u32 {
 /// upstream `visitNode` verdict), and a cross-file top-level
 /// declaration stays silent (the binding face cannot split a getter
 /// from a value — the conservative family).
-fn walk_access(
-    c: &mut Check<'_>,
-    analysis: &dartq_semantic::Analysis<'_>,
-    run: &[u32],
-    root: u32,
-) {
+fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32], root: u32) {
     // A bare name: no access marker seals the run.
     let marker = run
         .iter()
@@ -391,8 +386,7 @@ fn walk_access(
             Some(binding)
                 if matches!(
                     binding.kind,
-                    dartq_semantic::BindingKind::TypeParam
-                        | dartq_semantic::BindingKind::Prefix
+                    dartq_semantic::BindingKind::TypeParam | dartq_semantic::BindingKind::Prefix
                 ) =>
             {
                 report(c, root, run);
@@ -537,9 +531,8 @@ fn is_same_file_getter(c: &Check<'_>, use_node: u32, name: &str) -> bool {
             }
         }
     }
-    enclosing_class(c, use_node).is_some_and(|class_row| {
-        matches!(class_member(c, class_row, name), Some(Member::Getter))
-    })
+    enclosing_class(c, use_node)
+        .is_some_and(|class_row| matches!(class_member(c, class_row, name), Some(Member::Getter)))
 }
 
 /// The innermost enclosing class-like declaration row of the use site.
@@ -814,8 +807,7 @@ fn member_function_typed(c: &Check<'_>, class_row: u32, name: &str) -> bool {
                     None => return true,
                     // A getter's written return type decides.
                     Some("get") => {
-                        if let Some((type_row, _)) =
-                            crate::rules::type_before(c, member, name_row)
+                        if let Some((type_row, _)) = crate::rules::type_before(c, member, name_row)
                             && type_face(c, type_row).is_function_type
                         {
                             return true;
@@ -834,11 +826,12 @@ fn member_function_typed(c: &Check<'_>, class_row: u32, name: &str) -> bool {
                         }
                         NodeKind::Identifier
                             if c.field(kid, PayloadField::Context)
-                                == Some(dartq_parser::IdentifierContext::FieldDeclaration as u32)
+                                == Some(
+                                    dartq_parser::IdentifierContext::FieldDeclaration as u32,
+                                )
                                 && c.lexeme(c.head_token(kid)) == name =>
                         {
-                            return written
-                                .is_some_and(|row| type_face(c, row).is_function_type);
+                            return written.is_some_and(|row| type_face(c, row).is_function_type);
                         }
                         _ => {}
                     }
@@ -891,10 +884,12 @@ fn arm_runs(c: &Check<'_>, run: &[u32], root: u32) -> Vec<Vec<u32>> {
             .tokens
             .get(question as usize)
             .map(|t| (t.byte_offset + t.byte_len) as usize),
-        c.unit
-            .tokens
-            .get(colon as usize)
-            .map(|t| (t.byte_offset as usize, (t.byte_offset + t.byte_len) as usize)),
+        c.unit.tokens.get(colon as usize).map(|t| {
+            (
+                t.byte_offset as usize,
+                (t.byte_offset + t.byte_len) as usize,
+            )
+        }),
     ) else {
         return Vec::new();
     };

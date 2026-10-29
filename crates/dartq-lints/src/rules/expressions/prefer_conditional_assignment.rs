@@ -1,5 +1,5 @@
 use super::prefer_null_aware_method_calls::then_branch_run;
-use super::{PayloadField, Check, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, PayloadField, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_conditional_assignment.dart`
 /// — an `if` without `else` (`visitIfStatement` :70-79) whose condition
@@ -281,9 +281,8 @@ mod tests {
     /// (34 chars of `if (label == null) label = 'none';`).
     #[test]
     fn corpus_if_null_assign_reports() {
-        let f = Fixture::parse(
-            "void f(String? label) {\n  if (label == null) label = 'none';\n}\n",
-        );
+        let f =
+            Fixture::parse("void f(String? label) {\n  if (label == null) label = 'none';\n}\n");
         let lints = f.run(&one_rule("prefer_conditional_assignment"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.end - lints[0].range.start, 34);
@@ -315,8 +314,7 @@ mod tests {
     /// A prefixed chain matches itself on both sides.
     #[test]
     fn chain_target_reports() {
-        let source =
-            "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (a.b == null) a.b = '';\n}\n";
+        let source = "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (a.b == null) a.b = '';\n}\n";
         assert_eq!(run(source).len(), 1);
     }
 
@@ -346,7 +344,8 @@ mod tests {
     /// the singly wrapped shape.
     #[test]
     fn double_wrapped_target_reports() {
-        let source = "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (((a)).b == null) ((a)).b = '';\n}\n";
+        let source =
+            "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (((a)).b == null) ((a)).b = '';\n}\n";
         assert_eq!(run(source).len(), 1);
     }
 
@@ -396,9 +395,11 @@ mod tests {
         // `AssignmentExpression` — the upstream `_checkExpression` gate
         // keeps it silent.
         assert!(run("void f(int? x, int s) {\n  if (x == null) (x) = s;\n}\n").is_empty());
-        assert!(run(
-            "class C {\n  int? x;\n  void f() {\n    if (this.x == null) this.x = 1;\n  }\n}\n"
-        )
-        .is_empty());
+        assert!(
+            run(
+                "class C {\n  int? x;\n  void f() {\n    if (this.x == null) this.x = 1;\n  }\n}\n"
+            )
+            .is_empty()
+        );
     }
 }

@@ -1544,8 +1544,8 @@ mod tests {
             format!("plugins:\n  {plugin}:\n    path: .\n    diagnostics:\n{diagnostics}")
         };
         std::fs::write(file, text).expect("write options");
-        let config = PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
-            .expect("valid config");
+        let config =
+            PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#).expect("valid config");
         AnalysisOptions::load(file, &config, file.parent().unwrap_or(Path::new("")))
     }
 
@@ -1579,8 +1579,11 @@ mod tests {
         // One directory enables the lint, leaves the warning unconfigured
         // (still enabled — a warning rule's default-on posture holds while
         // the plugin is declared in its map).
-        let declared =
-            options_with_plugin(&file, "p", "      opt_in_lint: true\n      opt_out_warning: false\n");
+        let declared = options_with_plugin(
+            &file,
+            "p",
+            "      opt_in_lint: true\n      opt_out_warning: false\n",
+        );
         let governing: Vec<&AnalysisOptions> = vec![&declared];
         let resolved = resolve_census(&census, "p", &governing);
         assert!(resolved[0].enabled, "the explicit config enables the lint");
@@ -1652,7 +1655,10 @@ mod tests {
         let file = workspace.path().join("analysis_options.yaml");
         let declared = options_with_plugin(&file, "plugin_a", "");
         let _ = file; // the second declaration rides the same options file.
-        let file_b = workspace.path().join("nested").join("analysis_options.yaml");
+        let file_b = workspace
+            .path()
+            .join("nested")
+            .join("analysis_options.yaml");
         std::fs::create_dir_all(file_b.parent().expect("nested dir")).expect("nested dir");
         let declared_b = options_with_plugin(&file_b, "plugin_b", "");
         let governing: Vec<&AnalysisOptions> = vec![&declared, &declared_b];
@@ -1735,13 +1741,9 @@ mod tests {
         }];
 
         let workspace = TempWorkspace::new("resolve_positions");
-        let declared = options_with_plugin(
-            &workspace.path().join("analysis_options.yaml"),
-            "echo",
-            "",
-        );
-        let findings =
-            resolve_findings(&batches, &files, resident, &[&declared]);
+        let declared =
+            options_with_plugin(&workspace.path().join("analysis_options.yaml"), "echo", "");
+        let findings = resolve_findings(&batches, &files, resident, &[&declared]);
         assert_eq!(findings.len(), 1, "unknown and non-resident files skip");
         let row = &findings[0];
         assert_eq!(row.file, a);
@@ -1789,11 +1791,8 @@ mod tests {
         }];
 
         let workspace = TempWorkspace::new("resolve_stale");
-        let declared = options_with_plugin(
-            &workspace.path().join("analysis_options.yaml"),
-            "echo",
-            "",
-        );
+        let declared =
+            options_with_plugin(&workspace.path().join("analysis_options.yaml"), "echo", "");
         let findings = resolve_findings(&batches, &files, resident, &[&declared]);
         assert_eq!(findings.len(), 1, "the row publishes degraded");
         // Both bounds clamp to the file's UTF-16 end (7 units): zero-width
@@ -1828,11 +1827,8 @@ mod tests {
         }];
 
         let workspace = TempWorkspace::new("resolve_bounds");
-        let declared = options_with_plugin(
-            &workspace.path().join("analysis_options.yaml"),
-            "echo",
-            "",
-        );
+        let declared =
+            options_with_plugin(&workspace.path().join("analysis_options.yaml"), "echo", "");
         let findings = resolve_findings(&batches, &files, resident, &[&declared]);
         assert_eq!(findings.len(), 2);
         let eof = wire::Position {

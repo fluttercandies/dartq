@@ -596,8 +596,7 @@ impl<'t> Flow<'t> {
             let Some(tail) = self.tokens.next(dot) else {
                 break;
             };
-            if self.tokens.get(tail).map(|t| t.kind)
-                != Some(dartq_scanner::TokenKind::Identifier)
+            if self.tokens.get(tail).map(|t| t.kind) != Some(dartq_scanner::TokenKind::Identifier)
                 || self.tokens.get(tail).is_none_or(|t| t.is_synthetic())
             {
                 break;
@@ -2260,12 +2259,12 @@ impl ParserListener for Flow<'_> {
                 if context == IdentifierContext::Expression
                     && let Some((head, false)) = self.extension_on_head
                 {
-                    self.staged_this.entry(token.range.offset).or_insert(
-                        crate::ty::Ty {
+                    self.staged_this
+                        .entry(token.range.offset)
+                        .or_insert(crate::ty::Ty {
                             base: crate::ty::Base::Name(head),
                             nullable: false,
-                        },
-                    );
+                        });
                 }
                 self.record(Ev::Ident {
                     name,
@@ -2632,10 +2631,7 @@ impl ParserListener for Flow<'_> {
             .next(colon.id as usize)
             .and_then(|index| self.span_at(index))
             .unwrap_or(colon);
-        self.record(Ev::CondEnd {
-            else_begin,
-            end,
-        });
+        self.record(Ev::CondEnd { else_begin, end });
     }
 
     fn handle_dot_access(&mut self, token: Token, member: Token, is_null_aware: bool) {
@@ -3190,9 +3186,7 @@ mod tests {
     /// implicit_bound keeps the unmatched path live).
     #[test]
     fn unbounded_type_param_keeps_the_body_end_reachable() {
-        let facts = run_facts(
-            "int f<T>(T v) {\n  switch (v) {\n    case 1: return 1;\n  }\n}\n",
-        );
+        let facts = run_facts("int f<T>(T v) {\n  switch (v) {\n    case 1: return 1;\n  }\n}\n");
         assert!(
             facts
                 .iter()

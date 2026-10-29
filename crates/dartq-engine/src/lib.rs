@@ -980,9 +980,7 @@ impl Engine {
                 self.state
                     .files
                     .path(*file)
-                    .and_then(|path| {
-                        path.ancestors().find_map(|dir| self.state.options.get(dir))
-                    })
+                    .and_then(|path| path.ancestors().find_map(|dir| self.state.options.get(dir)))
                     .is_none_or(|options| options.is_ignorable(name))
             };
             rows.extend(issues.into_iter().filter_map(|issue| {
@@ -2321,9 +2319,10 @@ impl YamlIgnores {
                 .is_some_and(|canonical| canonical.eq_ignore_ascii_case(name))
         };
         self.for_file.iter().any(cites)
-            || self.on_line.get(&line).is_some_and(|entries| {
-                entries.iter().any(cites)
-            })
+            || self
+                .on_line
+                .get(&line)
+                .is_some_and(|entries| entries.iter().any(cites))
     }
 }
 
@@ -2428,14 +2427,8 @@ struct DartIgnores {
 /// nested literals included).
 #[derive(Clone, Copy)]
 enum StringFrame {
-    Str {
-        quote: u8,
-        triple: bool,
-        raw: bool,
-    },
-    Interp {
-        depth: u32,
-    },
+    Str { quote: u8, triple: bool, raw: bool },
+    Interp { depth: u32 },
 }
 
 impl DartIgnores {
@@ -2443,9 +2436,7 @@ impl DartIgnores {
     /// `dtype` reported on 1-based `line` is suppressed (`_ignoredAt`,
     /// :186-212).
     fn ignored(&self, line: u32, name: &str, dtype: DiagnosticType) -> bool {
-        self.for_file
-            .iter()
-            .any(|entry| entry.matches(name, dtype))
+        self.for_file.iter().any(|entry| entry.matches(name, dtype))
             || self
                 .on_line
                 .get(&line)
@@ -2491,11 +2482,7 @@ impl DartIgnores {
                                 let raw = raw_prefix(bytes, i);
                                 i += if triple { 3 } else { 1 };
                                 stack.push(StringFrame::Interp { depth });
-                                stack.push(StringFrame::Str {
-                                    quote,
-                                    triple,
-                                    raw,
-                                });
+                                stack.push(StringFrame::Str { quote, triple, raw });
                             }
                             _ => {
                                 stack.push(StringFrame::Interp { depth });
@@ -2503,11 +2490,7 @@ impl DartIgnores {
                             }
                         }
                     }
-                    StringFrame::Str {
-                        quote,
-                        triple,
-                        raw,
-                    } => {
+                    StringFrame::Str { quote, triple, raw } => {
                         let b = bytes[i];
                         if !triple && b == b'\n' {
                             // Unterminated single-line literal: the scanner
@@ -2555,12 +2538,11 @@ impl DartIgnores {
                         .iter()
                         .position(|&b| b == b'\n')
                         .map_or(bytes.len(), |at| i + at);
-                    let target =
-                        if text[line_start..i].trim().is_empty() {
-                            line + 1
-                        } else {
-                            line
-                        };
+                    let target = if text[line_start..i].trim().is_empty() {
+                        line + 1
+                    } else {
+                        line
+                    };
                     parse_ignore_lexeme(&text[i..end], target, &mut info);
                     i = end;
                 }
@@ -2597,11 +2579,7 @@ impl DartIgnores {
                     let (quote, triple) = quote_run(bytes, i);
                     let raw = raw_prefix(bytes, i);
                     i += if triple { 3 } else { 1 };
-                    stack.push(StringFrame::Str {
-                        quote,
-                        triple,
-                        raw,
-                    });
+                    stack.push(StringFrame::Str { quote, triple, raw });
                 }
                 _ => i += 1,
             }
@@ -2636,7 +2614,10 @@ fn parse_ignore_lexeme(lexeme: &str, line: u32, info: &mut DartIgnores) {
     let line_form = body.trim_start_matches('/').trim_start();
     let for_file_form = body.trim_start();
     if let Some(rest) = line_form.strip_prefix("ignore:") {
-        info.on_line.entry(line).or_default().extend(citations(rest));
+        info.on_line
+            .entry(line)
+            .or_default()
+            .extend(citations(rest));
     } else if let Some(rest) = for_file_form.strip_prefix("ignore_for_file:") {
         info.for_file.extend(citations(rest));
     }
@@ -3330,7 +3311,8 @@ mod tests {
         let events = &mut |_: EngineEvent| {};
         let off = engine.analyze(&[], events, &cancel).expect("gate off");
         assert!(
-            off.iter().all(|row| row.code.name != "no_touchscreen_feature"),
+            off.iter()
+                .all(|row| row.code.name != "no_touchscreen_feature"),
             "default is off: {off:?}"
         );
         let mut options = analysis_options::AnalysisOptions::default();
@@ -3865,9 +3847,19 @@ mod tests {
             WARN
         ));
         // A wrong code is not a citation.
-        assert!(!suppresses("// ignore: dead_code\nvoid f() {}\n", 2, NAME, WARN));
+        assert!(!suppresses(
+            "// ignore: dead_code\nvoid f() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
         // The `type=` family form matches its family only (:67-76).
-        assert!(suppresses("// ignore: type=warning\nvoid f() {}\n", 2, "any_code", WARN));
+        assert!(suppresses(
+            "// ignore: type=warning\nvoid f() {}\n",
+            2,
+            "any_code",
+            WARN
+        ));
         assert!(!suppresses(
             "// ignore: type=warning\nvoid f() {}\n",
             2,
@@ -3900,18 +3892,21 @@ mod tests {
         // An interpolation hole holds code again (its literal's contents
         // never cite), and the outer literal resumes after the hole — the
         // trailing comment on the resumed code line does cite.
-        let interp = "var s = 'a ${'// ignore: x'} b'; // ignore: text_direction_code_point_in_comment\n";
-        assert!(!suppresses(
-            "var s = 'a ${'// ignore: text_direction_code_point_in_comment'} b';\nvoid f() {}\n",
-            1,
-            NAME,
-            WARN
-        ) && !suppresses(
-            "var s = 'a ${'// ignore: text_direction_code_point_in_comment'} b';\nvoid f() {}\n",
-            2,
-            NAME,
-            WARN
-        ));
+        let interp =
+            "var s = 'a ${'// ignore: x'} b'; // ignore: text_direction_code_point_in_comment\n";
+        assert!(
+            !suppresses(
+                "var s = 'a ${'// ignore: text_direction_code_point_in_comment'} b';\nvoid f() {}\n",
+                1,
+                NAME,
+                WARN
+            ) && !suppresses(
+                "var s = 'a ${'// ignore: text_direction_code_point_in_comment'} b';\nvoid f() {}\n",
+                2,
+                NAME,
+                WARN
+            )
+        );
         assert!(suppresses(interp, 1, NAME, WARN));
     }
 

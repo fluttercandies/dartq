@@ -59,7 +59,10 @@ impl Kind {
 #[must_use]
 pub fn color_default() -> bool {
     let set = |name: &str| std::env::var_os(name).is_some();
-    if set("NO_COLOR") || std::env::var("TERM").as_deref() == Ok("dumb") || std::env::var("CLICOLOR").as_deref() == Ok("0") {
+    if set("NO_COLOR")
+        || std::env::var("TERM").as_deref() == Ok("dumb")
+        || std::env::var("CLICOLOR").as_deref() == Ok("0")
+    {
         return false;
     }
     if set("FORCE_COLOR") || set("CLICOLOR_FORCE") {
@@ -181,17 +184,39 @@ impl Renderer {
             }
         }
         if test.load {
-            name = format!("{}{}{name}{}", self.paint(BOLD), self.paint(GRAY), self.paint(NO_COLOR));
+            name = format!(
+                "{}{}{name}{}",
+                self.paint(BOLD),
+                self.paint(GRAY),
+                self.paint(NO_COLOR)
+            );
         }
         name
     }
 
     /// The `+P ~S -F: message` progress line, deduplicated as the runner
     /// does: unchanged counts, message and suffix print nothing.
-    fn progress(&mut self, out: &mut dyn Write, message: &str, color: Option<&'static str>, suffix: Option<&str>) -> io::Result<()> {
-        let state = (self.passed, self.skipped, self.failed, message.to_owned(), suffix.map(str::to_owned));
+    fn progress(
+        &mut self,
+        out: &mut dyn Write,
+        message: &str,
+        color: Option<&'static str>,
+        suffix: Option<&str>,
+    ) -> io::Result<()> {
+        let state = (
+            self.passed,
+            self.skipped,
+            self.failed,
+            message.to_owned(),
+            suffix.map(str::to_owned),
+        );
         if let Some(last) = &self.last {
-            if last.0 == state.0 && last.1 == state.1 && last.2 == state.2 && last.3 == state.3 && (suffix.is_none() || last.4 == state.4) {
+            if last.0 == state.0
+                && last.1 == state.1
+                && last.2 == state.2
+                && last.3 == state.3
+                && (suffix.is_none() || last.4 == state.4)
+            {
                 return Ok(());
             }
         }
@@ -201,12 +226,27 @@ impl Renderer {
             let elapsed = self.started.elapsed().as_secs();
             line.push_str(&format!("{:02}:{:02} ", elapsed / 60, elapsed % 60));
         }
-        line.push_str(&format!("{}+{}{}", self.paint(GREEN), self.passed, self.paint(NO_COLOR)));
+        line.push_str(&format!(
+            "{}+{}{}",
+            self.paint(GREEN),
+            self.passed,
+            self.paint(NO_COLOR)
+        ));
         if self.skipped > 0 {
-            line.push_str(&format!("{} ~{}{}", self.paint(YELLOW), self.skipped, self.paint(NO_COLOR)));
+            line.push_str(&format!(
+                "{} ~{}{}",
+                self.paint(YELLOW),
+                self.skipped,
+                self.paint(NO_COLOR)
+            ));
         }
         if self.failed > 0 {
-            line.push_str(&format!("{} -{}{}", self.paint(RED), self.failed, self.paint(NO_COLOR)));
+            line.push_str(&format!(
+                "{} -{}{}",
+                self.paint(RED),
+                self.failed,
+                self.paint(NO_COLOR)
+            ));
         }
         line.push_str(": ");
         line.push_str(color.map_or("", |c| self.paint(c)));
@@ -239,7 +279,10 @@ fn strip_colors(text: &str) -> String {
 
 /// Two spaces before every line (the runner's `indent`).
 fn indent(text: &str) -> String {
-    text.split('\n').map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n")
+    text.split('\n')
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Renderer {
@@ -269,7 +312,10 @@ impl Renderer {
         }
         match event.kind() {
             "suite" => {
-                if let (Some(id), Some(path)) = (event.u64_at(&["suite", "id"]), event.str_at(&["suite", "path"])) {
+                if let (Some(id), Some(path)) = (
+                    event.u64_at(&["suite", "id"]),
+                    event.str_at(&["suite", "path"]),
+                ) {
                     self.suites.insert(id, path.to_owned());
                 }
             }
@@ -297,7 +343,12 @@ impl Renderer {
         let test = Test {
             load: !groups && name.starts_with("loading "),
             synthetic: individual == "(setUpAll)" || individual == "(tearDownAll)",
-            skip: event.get("test").and_then(|test| test.get("metadata")).and_then(|meta| meta.get("skip")).and_then(Json::as_bool).unwrap_or(false),
+            skip: event
+                .get("test")
+                .and_then(|test| test.get("metadata"))
+                .and_then(|meta| meta.get("skip"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             suite: event.u64_at(&["test", "suiteID"]).unwrap_or(u64::MAX),
             name,
             done: false,
@@ -324,7 +375,11 @@ impl Renderer {
     }
 
     fn print(&mut self, event: &Json, out: &mut dyn Write) -> io::Result<()> {
-        let Some(test) = event.u64_at(&["testID"]).and_then(|id| self.tests.get(&id)).cloned() else {
+        let Some(test) = event
+            .u64_at(&["testID"])
+            .and_then(|id| self.tests.get(&id))
+            .cloned()
+        else {
             return Ok(());
         };
         let message = event.str_at(&["message"]).unwrap_or("");
@@ -335,7 +390,12 @@ impl Renderer {
         let description = self.description(&test);
         self.progress(out, &description, None, None)?;
         if self.kind == Kind::Expanded && skip_type {
-            writeln!(out, "  {}{message}{}", self.paint(YELLOW), self.paint(NO_COLOR))
+            writeln!(
+                out,
+                "  {}{message}{}",
+                self.paint(YELLOW),
+                self.paint(NO_COLOR)
+            )
         } else {
             writeln!(out, "{message}")
         }
@@ -375,20 +435,34 @@ impl Renderer {
         // reporter answers a state change with the oldest active test.
         if test.done && !test.load {
             let failure = event.get("isFailure").and_then(Json::as_bool) == Some(true);
-            let next = if failure && test.result != "error" { "failure" } else { "error" };
+            let next = if failure && test.result != "error" {
+                "failure"
+            } else {
+                "error"
+            };
             if next != test.result {
                 if let Some(entry) = self.tests.get_mut(&id) {
                     entry.result = next;
                 }
                 if self.kind == Kind::Expanded {
-                    if let Some(first) = self.active.first().and_then(|first| self.tests.get(first)).cloned() {
+                    if let Some(first) = self
+                        .active
+                        .first()
+                        .and_then(|first| self.tests.get(first))
+                        .cloned()
+                    {
                         let description = self.description(&first);
                         self.progress(out, &description, None, None)?;
                     }
                 }
             }
         }
-        let suffix = format!(" {}{}[E]{}", self.paint(BOLD), self.paint(RED), self.paint(NO_COLOR));
+        let suffix = format!(
+            " {}{}[E]{}",
+            self.paint(BOLD),
+            self.paint(RED),
+            self.paint(NO_COLOR)
+        );
         let description = self.description(&test);
         self.progress(out, &description, None, Some(&suffix))?;
         if !test.load {
@@ -418,7 +492,10 @@ impl Renderer {
             return Ok(());
         };
         let hidden = event.get("hidden").and_then(Json::as_bool).unwrap_or(false);
-        let skipped = event.get("skipped").and_then(Json::as_bool).unwrap_or(false);
+        let skipped = event
+            .get("skipped")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         let result = event.str_at(&["result"]).unwrap_or("").to_owned();
         let Some(test) = self.tests.get_mut(&id) else {
             return Ok(());
@@ -449,7 +526,10 @@ impl Renderer {
         } else if result == "success" && !test.counted {
             self.passed += 1;
         } else if !test.counted {
-            let entry = (self.suites.get(&test.suite).cloned().unwrap_or_default(), test.name.clone());
+            let entry = (
+                self.suites.get(&test.suite).cloned().unwrap_or_default(),
+                test.name.clone(),
+            );
             self.failed += 1;
             self.failures.push(entry);
         }
@@ -476,12 +556,22 @@ impl Renderer {
             .active
             .iter()
             .filter_map(|id| self.tests.get(id))
-            .map(|test| (self.suites.get(&test.suite).cloned().unwrap_or_default(), test.name.clone()))
+            .map(|test| {
+                (
+                    self.suites.get(&test.suite).cloned().unwrap_or_default(),
+                    test.name.clone(),
+                )
+            })
             .collect();
         if self.live == 0 && unfinished.is_empty() {
             writeln!(out, "No tests ran.")?;
         } else if self.failed > 0 || !unfinished.is_empty() {
-            let suffix = format!(" - did not complete {}{}[E]{}", self.paint(BOLD), self.paint(RED), self.paint(NO_COLOR));
+            let suffix = format!(
+                " - did not complete {}{}[E]{}",
+                self.paint(BOLD),
+                self.paint(RED),
+                self.paint(NO_COLOR)
+            );
             for description in &unfinished {
                 self.progress(out, description, None, Some(&suffix))?;
             }
@@ -493,20 +583,32 @@ impl Renderer {
             let message = if self.kind == Kind::Expanded {
                 "All tests skipped.".to_owned()
             } else {
-                format!("{}All tests skipped.{}", self.paint(YELLOW), self.paint(NO_COLOR))
+                format!(
+                    "{}All tests skipped.{}",
+                    self.paint(YELLOW),
+                    self.paint(NO_COLOR)
+                )
             };
             self.progress(out, &message, None, None)?;
         } else if self.kind == Kind::Expanded || self.skipped == 0 {
             self.progress(out, "All tests passed!", None, None)?;
         } else {
             let noun = if self.skipped == 1 { "test" } else { "tests" };
-            let message = format!("{}{} skipped {noun}.{}", self.paint(YELLOW), self.skipped, self.paint(NO_COLOR));
+            let message = format!(
+                "{}{} skipped {noun}.{}",
+                self.paint(YELLOW),
+                self.skipped,
+                self.paint(NO_COLOR)
+            );
             self.progress(out, &message, None, None)?;
             self.progress(out, "All other tests passed!", None, None)?;
         }
         if self.chain_notice {
             writeln!(out)?;
-            writeln!(out, "Consider enabling the flag chain-stack-traces to receive more detailed exceptions.")?;
+            writeln!(
+                out,
+                "Consider enabling the flag chain-stack-traces to receive more detailed exceptions."
+            )?;
             writeln!(out, "For example, 'dart test --chain-stack-traces'.")?;
         }
         Ok(())
@@ -515,22 +617,39 @@ impl Renderer {
     /// The expanded reporter's `Failing tests:` list: sorted by path then
     /// name, at most five entries; `incomplete` are the tests the run ended
     /// on without completing, each annotated.
-    fn summary(&mut self, out: &mut dyn Write, incomplete: Vec<(String, String)>) -> io::Result<()> {
+    fn summary(
+        &mut self,
+        out: &mut dyn Write,
+        incomplete: Vec<(String, String)>,
+    ) -> io::Result<()> {
         let mut entries: Vec<(String, String, bool)> = self
             .failures
             .iter()
             .map(|(path, name)| (path.clone(), name.clone(), false))
-            .chain(incomplete.into_iter().map(|(path, name)| (path, name, true)))
+            .chain(
+                incomplete
+                    .into_iter()
+                    .map(|(path, name)| (path, name, true)),
+            )
             .collect();
         if entries.is_empty() {
             return Ok(());
         }
         entries.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         writeln!(out)?;
-        writeln!(out, "{}Failing tests:{}", self.paint(RED), self.paint(NO_COLOR))?;
+        writeln!(
+            out,
+            "{}Failing tests:{}",
+            self.paint(RED),
+            self.paint(NO_COLOR)
+        )?;
         let shown = if entries.len() > 5 { 4 } else { entries.len() };
         for (path, name, incomplete) in &entries[..shown] {
-            let suffix = if *incomplete { " (did not complete)" } else { "" };
+            let suffix = if *incomplete {
+                " (did not complete)"
+            } else {
+                ""
+            };
             writeln!(out, "  {path}: {name}{suffix}")?;
         }
         if entries.len() > shown {
@@ -587,7 +706,8 @@ fn truncate(text: &str, max: usize) -> String {
     }
     // The trailing `max - 4` code units, from a word start when possible.
     let units: Vec<u16> = text.encode_utf16().collect();
-    let tail = String::from_utf16_lossy(&units[units.len() - max.saturating_sub(4).min(units.len())..]);
+    let tail =
+        String::from_utf16_lossy(&units[units.len() - max.saturating_sub(4).min(units.len())..]);
     let tail = match tail.find(' ') {
         Some(space) if space > 0 => tail[space..].to_owned(),
         _ => tail,
@@ -665,19 +785,34 @@ impl Compact {
             }
         }
         if test.load {
-            name = format!("{}{}{name}{}", self.paint(BOLD), self.paint(GRAY), self.paint(NO_COLOR));
+            name = format!(
+                "{}{}{name}{}",
+                self.paint(BOLD),
+                self.paint(GRAY),
+                self.paint(NO_COLOR)
+            );
         }
         name
     }
 
     fn describe(&self, id: u64) -> String {
-        self.tests.get(&id).map(|test| self.description(test)).unwrap_or_default()
+        self.tests
+            .get(&id)
+            .map(|test| self.description(test))
+            .unwrap_or_default()
     }
 
     /// `_progressLine`: unchanged counts, message, suffix and truncation
     /// print nothing, unless the line is still the terminal's last and the
     /// elapsed second changed.
-    fn progress(&mut self, out: &mut dyn Write, message: &str, color: &str, truncate_line: bool, suffix: Option<&str>) -> io::Result<()> {
+    fn progress(
+        &mut self,
+        out: &mut dyn Write,
+        message: &str,
+        color: &str,
+        truncate_line: bool,
+        suffix: Option<&str>,
+    ) -> io::Result<()> {
         let elapsed = self.started.elapsed().as_secs();
         if let Some(last) = &self.last {
             if last.0 == self.passed
@@ -691,14 +826,38 @@ impl Compact {
                 return Ok(());
             }
         }
-        self.last = Some((self.passed, self.skipped, self.failed, message.to_owned(), suffix.map(str::to_owned), truncate_line));
+        self.last = Some((
+            self.passed,
+            self.skipped,
+            self.failed,
+            message.to_owned(),
+            suffix.map(str::to_owned),
+            truncate_line,
+        ));
         self.last_elapsed = elapsed;
-        let mut line = format!("\r{:02}:{:02} {}+{}{}", elapsed / 60, elapsed % 60, self.paint(GREEN), self.passed, self.paint(NO_COLOR));
+        let mut line = format!(
+            "\r{:02}:{:02} {}+{}{}",
+            elapsed / 60,
+            elapsed % 60,
+            self.paint(GREEN),
+            self.passed,
+            self.paint(NO_COLOR)
+        );
         if self.skipped > 0 {
-            line.push_str(&format!("{} ~{}{}", self.paint(YELLOW), self.skipped, self.paint(NO_COLOR)));
+            line.push_str(&format!(
+                "{} ~{}{}",
+                self.paint(YELLOW),
+                self.skipped,
+                self.paint(NO_COLOR)
+            ));
         }
         if self.failed > 0 {
-            line.push_str(&format!("{} -{}{}", self.paint(RED), self.failed, self.paint(NO_COLOR)));
+            line.push_str(&format!(
+                "{} -{}{}",
+                self.paint(RED),
+                self.failed,
+                self.paint(NO_COLOR)
+            ));
         }
         line.push_str(": ");
         line.push_str(color);
@@ -735,7 +894,10 @@ impl Compact {
         for event in events {
             match event.kind() {
                 "suite" => {
-                    if let (Some(id), Some(path)) = (event.u64_at(&["suite", "id"]), event.str_at(&["suite", "path"])) {
+                    if let (Some(id), Some(path)) = (
+                        event.u64_at(&["suite", "id"]),
+                        event.str_at(&["suite", "path"]),
+                    ) {
                         self.suites.insert(id, path.to_owned());
                     }
                 }
@@ -755,22 +917,37 @@ impl Compact {
     }
 
     fn start(&mut self, event: &Json, out: &mut dyn Write) -> io::Result<()> {
-        let Some(id) = event.u64_at(&["test", "id"]) else { return Ok(()) };
+        let Some(id) = event.u64_at(&["test", "id"]) else {
+            return Ok(());
+        };
         let name = event.str_at(&["test", "name"]).unwrap_or("").to_owned();
         let groups = matches!(event.get("test").and_then(|test| test.get("groupIDs")), Some(Json::Array(ids)) if !ids.is_empty());
         let test = Live {
             load: !groups && name.starts_with("loading "),
-            skip: event.get("test").and_then(|test| test.get("metadata")).and_then(|meta| meta.get("skip")).and_then(Json::as_bool).unwrap_or(false),
+            skip: event
+                .get("test")
+                .and_then(|test| test.get("metadata"))
+                .and_then(|meta| meta.get("skip"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             suite: event.u64_at(&["test", "suiteID"]).unwrap_or(u64::MAX),
             name,
             done: false,
             result: "success",
             hidden: false,
         };
-        if test.load { self.loads.push(id) } else { self.active.push(id) }
+        if test.load {
+            self.loads.push(id)
+        } else {
+            self.active.push(id)
+        }
         let load = test.load;
         self.tests.insert(id, test);
-        let first = if load { self.active.is_empty() && self.loads.len() == 1 } else { self.active.len() == 1 };
+        let first = if load {
+            self.active.is_empty() && self.loads.len() == 1
+        } else {
+            self.active.len() == 1
+        };
         if first {
             let description = self.describe(id);
             self.progress(out, &description, "", true, None)?;
@@ -779,8 +956,12 @@ impl Compact {
     }
 
     fn message(&mut self, event: &Json, out: &mut dyn Write) -> io::Result<()> {
-        let Some(id) = event.u64_at(&["testID"]) else { return Ok(()) };
-        let Some(test) = self.tests.get(&id) else { return Ok(()) };
+        let Some(id) = event.u64_at(&["testID"]) else {
+            return Ok(());
+        };
+        let Some(test) = self.tests.get(&id) else {
+            return Ok(());
+        };
         if test.skip {
             return Ok(());
         }
@@ -794,7 +975,9 @@ impl Compact {
     /// `setState(complete, error|failure)` that precedes every error report.
     /// A passed or skipped test leaves its set.
     fn fail(&mut self, id: u64) {
-        let Some(test) = self.tests.get_mut(&id) else { return };
+        let Some(test) = self.tests.get_mut(&id) else {
+            return;
+        };
         let was = if test.done { test.result } else { "running" };
         if was == "failed" {
             return;
@@ -812,14 +995,23 @@ impl Compact {
     }
 
     fn error(&mut self, event: &Json, out: &mut dyn Write) -> io::Result<()> {
-        let Some(id) = event.u64_at(&["testID"]) else { return Ok(()) };
-        let Some(test) = self.tests.get(&id).cloned() else { return Ok(()) };
+        let Some(id) = event.u64_at(&["testID"]) else {
+            return Ok(());
+        };
+        let Some(test) = self.tests.get(&id).cloned() else {
+            return Ok(());
+        };
         if !test.load && !self.opts.chain_stack_traces {
             self.chain_notice = true;
         }
         // `_onStateChange` ignores a failing result; `_onError` prints.
         self.fail(id);
-        let suffix = format!(" {}{}[E]{}", self.paint(BOLD), self.paint(RED), self.paint(NO_COLOR));
+        let suffix = format!(
+            " {}{}[E]{}",
+            self.paint(BOLD),
+            self.paint(RED),
+            self.paint(NO_COLOR)
+        );
         let description = self.description(&test);
         self.progress(out, &description, "", false, Some(&suffix))?;
         self.newline(out)?;
@@ -830,7 +1022,9 @@ impl Compact {
             return writeln!(out, "{}", indent(stack));
         }
         let rendered = match error.split_once(':') {
-            Some((head, rest)) if self.opts.color && head.starts_with("Failed to load \"") => format!("{RED}{head}:{NO_COLOR}{rest}"),
+            Some((head, rest)) if self.opts.color && head.starts_with("Failed to load \"") => {
+                format!("{RED}{head}:{NO_COLOR}{rest}")
+            }
             _ => error.to_owned(),
         };
         writeln!(out, "{}", indent(&rendered))?;
@@ -841,11 +1035,18 @@ impl Compact {
     }
 
     fn complete(&mut self, event: &Json, out: &mut dyn Write) -> io::Result<()> {
-        let Some(id) = event.u64_at(&["testID"]) else { return Ok(()) };
+        let Some(id) = event.u64_at(&["testID"]) else {
+            return Ok(());
+        };
         let hidden = event.get("hidden").and_then(Json::as_bool).unwrap_or(false);
-        let skipped = event.get("skipped").and_then(Json::as_bool).unwrap_or(false);
+        let skipped = event
+            .get("skipped")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         let result = event.str_at(&["result"]).unwrap_or("");
-        let Some(test) = self.tests.get_mut(&id) else { return Ok(()) };
+        let Some(test) = self.tests.get_mut(&id) else {
+            return Ok(());
+        };
         test.hidden = hidden;
         if test.result != "failed" {
             // A non-success outcome no error event announced is the engine's
@@ -859,7 +1060,11 @@ impl Compact {
             test.done = true;
             test.result = if skipped { "skipped" } else { "success" };
             if !hidden {
-                if skipped { self.skipped += 1 } else { self.passed += 1 }
+                if skipped {
+                    self.skipped += 1
+                } else {
+                    self.passed += 1
+                }
             }
             self.active.retain(|&active| active != id);
             self.loads.retain(|&load| load != id);
@@ -904,11 +1109,20 @@ impl Compact {
             let message = "No tests ran.";
             write!(out, "{message}")?;
             if !self.printed_newline {
-                write!(out, "{}", " ".repeat(self.opts.line_length.saturating_sub(message.len())))?;
+                write!(
+                    out,
+                    "{}",
+                    " ".repeat(self.opts.line_length.saturating_sub(message.len()))
+                )?;
             }
             writeln!(out)?;
         } else if self.failed > 0 || !unfinished.is_empty() {
-            let suffix = format!(" - did not complete {}{}[E]{}", self.paint(BOLD), self.paint(RED), self.paint(NO_COLOR));
+            let suffix = format!(
+                " - did not complete {}{}[E]{}",
+                self.paint(BOLD),
+                self.paint(RED),
+                self.paint(NO_COLOR)
+            );
             for description in &unfinished {
                 self.progress(out, description, "", false, Some(&suffix))?;
                 writeln!(out)?;
@@ -917,7 +1131,11 @@ impl Compact {
             self.progress(out, "Some tests failed.", red, true, None)?;
             writeln!(out)?;
         } else if self.passed == 0 {
-            let message = format!("{}All tests skipped.{}", self.paint(YELLOW), self.paint(NO_COLOR));
+            let message = format!(
+                "{}All tests skipped.{}",
+                self.paint(YELLOW),
+                self.paint(NO_COLOR)
+            );
             self.progress(out, &message, "", true, None)?;
             writeln!(out)?;
         } else if self.skipped == 0 {
@@ -925,7 +1143,12 @@ impl Compact {
             writeln!(out)?;
         } else {
             let noun = if self.skipped == 1 { "test" } else { "tests" };
-            let message = format!("{}{} skipped {noun}.{}", self.paint(YELLOW), self.skipped, self.paint(NO_COLOR));
+            let message = format!(
+                "{}{} skipped {noun}.{}",
+                self.paint(YELLOW),
+                self.skipped,
+                self.paint(NO_COLOR)
+            );
             self.progress(out, &message, "", true, None)?;
             writeln!(out)?;
             self.progress(out, "All other tests passed!", "", true, None)?;
@@ -933,7 +1156,10 @@ impl Compact {
         }
         if self.chain_notice {
             writeln!(out)?;
-            writeln!(out, "Consider enabling the flag chain-stack-traces to receive more detailed exceptions.")?;
+            writeln!(
+                out,
+                "Consider enabling the flag chain-stack-traces to receive more detailed exceptions."
+            )?;
             writeln!(out, "For example, 'dart test --chain-stack-traces'.")?;
         }
         Ok(())
@@ -1017,7 +1243,10 @@ impl Github {
         for event in events {
             match event.kind() {
                 "suite" => {
-                    if let (Some(id), Some(path)) = (event.u64_at(&["suite", "id"]), event.str_at(&["suite", "path"])) {
+                    if let (Some(id), Some(path)) = (
+                        event.u64_at(&["suite", "id"]),
+                        event.str_at(&["suite", "path"]),
+                    ) {
                         self.suites.insert(id, path.to_owned());
                     }
                 }
@@ -1027,30 +1256,39 @@ impl Github {
                     writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
                 }
                 "testStart" => {
-                    let Some(id) = event.u64_at(&["test", "id"]) else { continue };
+                    let Some(id) = event.u64_at(&["test", "id"]) else {
+                        continue;
+                    };
                     let name = event.str_at(&["test", "name"]).unwrap_or("").to_owned();
                     let groups = matches!(event.get("test").and_then(|test| test.get("groupIDs")), Some(Json::Array(ids)) if !ids.is_empty());
                     let individual = name.rsplit(' ').next().unwrap_or("");
-                    self.tests.insert(id, Test {
-                        load: !groups && name.starts_with("loading "),
-                        synthetic: individual == "(setUpAll)" || individual == "(tearDownAll)",
-                        skip: false,
-                        suite: event.u64_at(&["test", "suiteID"]).unwrap_or(u64::MAX),
-                        name,
-                        done: false,
-                        skipped: false,
-                        hidden: false,
-                        errors: Vec::new(),
-                        messages: Vec::new(),
-                        counted: false,
-                        result: "",
-                    });
+                    self.tests.insert(
+                        id,
+                        Test {
+                            load: !groups && name.starts_with("loading "),
+                            synthetic: individual == "(setUpAll)" || individual == "(tearDownAll)",
+                            skip: false,
+                            suite: event.u64_at(&["test", "suiteID"]).unwrap_or(u64::MAX),
+                            name,
+                            done: false,
+                            skipped: false,
+                            hidden: false,
+                            errors: Vec::new(),
+                            messages: Vec::new(),
+                            counted: false,
+                            result: "",
+                        },
+                    );
                 }
                 "print" => {
-                    let Some(id) = event.u64_at(&["testID"]) else { continue };
+                    let Some(id) = event.u64_at(&["testID"]) else {
+                        continue;
+                    };
                     let message = event.str_at(&["message"]).unwrap_or("").to_owned();
                     let kind = event.str_at(&["messageType"]).unwrap_or("").to_owned();
-                    let Some(test) = self.tests.get_mut(&id) else { continue };
+                    let Some(test) = self.tests.get_mut(&id) else {
+                        continue;
+                    };
                     // The legacy engine prints a skipped test's late
                     // output in place too.
                     if test.done && (!test.skipped || self.legacy) {
@@ -1061,10 +1299,14 @@ impl Github {
                     }
                 }
                 "error" => {
-                    let Some(id) = event.u64_at(&["testID"]) else { continue };
+                    let Some(id) = event.u64_at(&["testID"]) else {
+                        continue;
+                    };
                     let error = event.str_at(&["error"]).unwrap_or("").to_owned();
                     let stack = event.str_at(&["stackTrace"]).unwrap_or("").to_owned();
-                    let Some(test) = self.tests.get(&id).cloned() else { continue };
+                    let Some(test) = self.tests.get(&id).cloned() else {
+                        continue;
+                    };
                     if test.done {
                         // The completed test joins the engine's failed set;
                         // a passed one leaves the passed set (a skipped one
@@ -1081,7 +1323,11 @@ impl Github {
                         }
                         let name = self.name(&test);
                         self.end_passing(out)?;
-                        writeln!(out, "::group::{}", format!("❌ {name} (failed after test completion)").replace('\n', " "))?;
+                        writeln!(
+                            out,
+                            "::group::{}",
+                            format!("❌ {name} (failed after test completion)").replace('\n', " ")
+                        )?;
                         writeln!(out, "{error}")?;
                         writeln!(out, "{}", stack.trim_end())?;
                         writeln!(out, "::endgroup::")?;
@@ -1090,15 +1336,26 @@ impl Github {
                     }
                 }
                 "testDone" => {
-                    let Some(id) = event.u64_at(&["testID"]) else { continue };
+                    let Some(id) = event.u64_at(&["testID"]) else {
+                        continue;
+                    };
                     let hidden = event.get("hidden").and_then(Json::as_bool).unwrap_or(false);
-                    let skipped = event.get("skipped").and_then(Json::as_bool).unwrap_or(false);
+                    let skipped = event
+                        .get("skipped")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false);
                     let result = event.str_at(&["result"]).unwrap_or("").to_owned();
-                    let Some(test) = self.tests.get_mut(&id) else { continue };
+                    let Some(test) = self.tests.get_mut(&id) else {
+                        continue;
+                    };
                     test.done = true;
                     test.skipped = skipped;
                     test.hidden = hidden;
-                    test.result = if result == "success" && test.errors.is_empty() { "success" } else { "error" };
+                    test.result = if result == "success" && test.errors.is_empty() {
+                        "success"
+                    } else {
+                        "error"
+                    };
                     let test = test.clone();
                     if !hidden {
                         if skipped {
@@ -1146,7 +1403,11 @@ impl Github {
                         }
                     } else {
                         self.end_passing(out)?;
-                        writeln!(out, "::group::{}", format!("❌ {name} (failed)").replace('\n', " "))?;
+                        writeln!(
+                            out,
+                            "::group::{}",
+                            format!("❌ {name} (failed)").replace('\n', " ")
+                        )?;
                         for (_, message) in &test.messages {
                             writeln!(out, "{message}")?;
                         }
@@ -1283,14 +1544,13 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
     /// (`parentID == null`), if the block reached it.
     fn root_group(events: &[Json]) -> Option<(u64, u64, usize)> {
         events.iter().enumerate().find_map(|(index, event)| {
-            (event.kind() == "group" && event.u64_at(&["group", "parentID"]).is_none())
-                .then(|| {
-                    (
-                        event.u64_at(&["group", "id"]).unwrap_or(u64::MAX),
-                        event.u64_at(&["group", "testCount"]).unwrap_or(0),
-                        index,
-                    )
-                })
+            (event.kind() == "group" && event.u64_at(&["group", "parentID"]).is_none()).then(|| {
+                (
+                    event.u64_at(&["group", "id"]).unwrap_or(u64::MAX),
+                    event.u64_at(&["group", "testCount"]).unwrap_or(0),
+                    index,
+                )
+            })
         })
     }
     /// True for a `testStart` of a test that ran hidden directly on the
@@ -1332,7 +1592,9 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
             ("test", &["id", "suiteID"][..]),
             ("group", &["id", "suiteID", "parentID"][..]),
         ] {
-            let Some(inner) = event.get(object) else { continue };
+            let Some(inner) = event.get(object) else {
+                continue;
+            };
             for key in keys {
                 if let Some(id) = inner.get(key).and_then(Json::as_u64) {
                     out(id);
@@ -1348,7 +1610,11 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
     /// The event indexes of one block's root-fixture pairs — `testStart`
     /// through its `testDone`, everything between included — marked for
     /// dropping.
-    fn fixture_drops(events: &[Json], root: u64, hidden_ids: &rustc_hash::FxHashSet<u64>) -> rustc_hash::FxHashSet<usize> {
+    fn fixture_drops(
+        events: &[Json],
+        root: u64,
+        hidden_ids: &rustc_hash::FxHashSet<u64>,
+    ) -> rustc_hash::FxHashSet<usize> {
         let mut drops = rustc_hash::FxHashSet::default();
         let mut open: Option<u64> = None;
         for (index, event) in events.iter().enumerate() {
@@ -1372,8 +1638,11 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
     let a_failed = failed_load(&a.events);
     let b_failed = failed_load(&b.events);
     // The surviving shard's `suite`+load header is kept; `a` on ties.
-    let (kept, other): (&SuiteBlock, &SuiteBlock) =
-        if a_failed && !b_failed { (&b, &a) } else { (&a, &b) };
+    let (kept, other): (&SuiteBlock, &SuiteBlock) = if a_failed && !b_failed {
+        (&b, &a)
+    } else {
+        (&a, &b)
+    };
     let mut events = kept.events.clone();
     if !std::ptr::eq(kept, &a) {
         // `b` survived while `a`'s load failed: `b`'s header spells the
@@ -1387,7 +1656,9 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
     }
     let (kept_load_end, kept_load_id) = load_end(&events);
     let kept_root = root_group(&events).map(|(id, _, _)| id);
-    let kept_suite = events.first().and_then(|event| event.u64_at(&["suite", "id"]));
+    let kept_suite = events
+        .first()
+        .and_then(|event| event.u64_at(&["suite", "id"]));
     // The kept shard's root fixtures license dropping the other shard's
     // (same declared tree: one has them iff the other does — `a`'s own
     // check closes the "user test named setUpAll" collision).
@@ -1399,7 +1670,10 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
     });
     let (other_load_end, other_load_id) = load_end(&other.events);
     let other_root = root_group(&other.events[other_load_end..]);
-    let other_suite = other.events.first().and_then(|event| event.u64_at(&["suite", "id"]));
+    let other_suite = other
+        .events
+        .first()
+        .and_then(|event| event.u64_at(&["suite", "id"]));
 
     // Id unification: seed with the pairs both blocks share by meaning —
     // suite id, load-test id, root group id — then renumber the rest
@@ -1452,7 +1726,11 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
                 let mut drops: rustc_hash::FxHashSet<usize> = [index].into_iter().collect();
                 if kept_has_fixture {
                     let hidden = hidden_ids(&other.events[other_load_end..]);
-                    drops.extend(fixture_drops(&other.events[other_load_end..], root, &hidden));
+                    drops.extend(fixture_drops(
+                        &other.events[other_load_end..],
+                        root,
+                        &hidden,
+                    ));
                 }
                 drops
             }
@@ -1485,7 +1763,6 @@ pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
     }
 }
 
-
 /// The `json` reporter over several runs: one `start`, every suite's
 /// events (already [`rebase`]d into one id space and one clock), then
 /// `allSuites` and `done` — the shape one `dart test --reporter json` run
@@ -1506,7 +1783,8 @@ pub struct JsonMerge {
 }
 
 /// The tool's device event under `--machine`, as `EventPrinter` writes it.
-const STARTED_PROCESS: &str = "\n[{\"event\":\"test.startedProcess\",\"params\":{\"vmServiceUri\":null}}]";
+const STARTED_PROCESS: &str =
+    "\n[{\"event\":\"test.startedProcess\",\"params\":{\"vmServiceUri\":null}}]";
 
 impl JsonMerge {
     /// Begin the stream with the runner's `start` event; `started` is the
@@ -1515,17 +1793,31 @@ impl JsonMerge {
     /// # Errors
     ///
     /// Write failures on `out`.
-    pub fn start(out: &mut dyn Write, runner_version: Option<&str>, started: Instant, total: u64) -> io::Result<Self> {
+    pub fn start(
+        out: &mut dyn Write,
+        runner_version: Option<&str>,
+        started: Instant,
+        total: u64,
+    ) -> io::Result<Self> {
         let version = runner_version.map_or(Json::Null, |v| Json::String(v.to_owned()));
         let start = Json::Object(vec![
-            ("protocolVersion".to_owned(), Json::String("0.1.1".to_owned())),
+            (
+                "protocolVersion".to_owned(),
+                Json::String("0.1.1".to_owned()),
+            ),
             ("runnerVersion".to_owned(), version),
             ("pid".to_owned(), u64::from(std::process::id()).into()),
             ("type".to_owned(), Json::String("start".to_owned())),
             ("time".to_owned(), 0u64.into()),
         ]);
         writeln!(out, "{}", start.to_line())?;
-        Ok(Self { started, suites: 0, total, announced: false, machine: false })
+        Ok(Self {
+            started,
+            suites: 0,
+            total,
+            announced: false,
+            machine: false,
+        })
     }
 
     fn now(&self) -> u64 {
@@ -1547,7 +1839,11 @@ impl JsonMerge {
                 writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
                 continue;
             }
-            if self.machine && event.kind() == "testDone" && load.is_some() && event.u64_at(&["testID"]) == load {
+            if self.machine
+                && event.kind() == "testDone"
+                && load.is_some()
+                && event.u64_at(&["testID"]) == load
+            {
                 if !self.announced {
                     self.announce(event.u64_at(&["time"]), out)?;
                 }
@@ -1613,7 +1909,10 @@ mod tests {
     use crate::event::parse;
 
     fn events(lines: &[&str]) -> Vec<Json> {
-        lines.iter().map(|line| parse(line).expect("event")).collect()
+        lines
+            .iter()
+            .map(|line| parse(line).expect("event"))
+            .collect()
     }
 
     fn suite_a() -> Vec<Json> {
@@ -1639,7 +1938,13 @@ mod tests {
         let mut out = Vec::new();
         let mut renderer = Renderer::new(
             kind,
-            Options { color: false, print_path: true, line_length: 200, executable: "dart".into(), chain_stack_traces: false },
+            Options {
+                color: false,
+                print_path: true,
+                line_length: 200,
+                executable: "dart".into(),
+                chain_stack_traces: false,
+            },
         );
         for block in blocks {
             renderer.block(block, &mut out).expect("render");
@@ -1702,9 +2007,18 @@ mod tests {
              test/exit_test.dart: exits (did not complete)\n"
         );
         // The failures-only and compact reporters print the same marker.
-        assert!(render(Kind::FailuresOnly, &[suite.clone()]).contains("test/exit_test.dart: exits - did not complete [E]"));
+        assert!(
+            render(Kind::FailuresOnly, &[suite.clone()])
+                .contains("test/exit_test.dart: exits - did not complete [E]")
+        );
         let mut out = Vec::new();
-        let mut compact = Compact::new(Options { color: false, print_path: true, line_length: 200, executable: "dart".into(), chain_stack_traces: false });
+        let mut compact = Compact::new(Options {
+            color: false,
+            print_path: true,
+            line_length: 200,
+            executable: "dart".into(),
+            chain_stack_traces: false,
+        });
         compact.block(&suite, &mut out).expect("block");
         compact.done(&mut out).expect("done");
         let text = String::from_utf8(out).expect("utf8");
@@ -1789,7 +2103,8 @@ mod tests {
     #[test]
     fn json_merge_renumbers_ids() {
         let mut out = Vec::new();
-        let mut merge = JsonMerge::start(&mut out, Some("1.0.0"), Instant::now(), 2).expect("start");
+        let mut merge =
+            JsonMerge::start(&mut out, Some("1.0.0"), Instant::now(), 2).expect("start");
         let mut next = 0;
         for _ in 0..2 {
             let mut block = suite_a();
@@ -1798,12 +2113,22 @@ mod tests {
         }
         merge.done(false, &mut out).expect("done");
         let text = String::from_utf8(out).expect("utf8");
-        let lines: Vec<Json> = text.lines().map(|line| parse(line).expect("event")).collect();
+        let lines: Vec<Json> = text
+            .lines()
+            .map(|line| parse(line).expect("event"))
+            .collect();
         assert_eq!(lines.first().map(Json::kind), Some("start"));
         assert_eq!(lines.last().map(Json::kind), Some("done"));
-        let suites: Vec<u64> = lines.iter().filter_map(|e| e.u64_at(&["suite", "id"])).collect();
+        let suites: Vec<u64> = lines
+            .iter()
+            .filter_map(|e| e.u64_at(&["suite", "id"]))
+            .collect();
         assert_eq!(suites, [0, 7]);
-        let second_start = lines.iter().filter(|e| e.kind() == "testStart").nth(4).expect("start");
+        let second_start = lines
+            .iter()
+            .filter(|e| e.kind() == "testStart")
+            .nth(4)
+            .expect("start");
         assert_eq!(second_start.u64_at(&["test", "suiteID"]), Some(7));
         assert!(text.contains(r#"{"count":2,"#));
     }
@@ -1828,13 +2153,25 @@ mod tests {
         // `\r` rides in front of it, outside the segment).
         let first = text.split('\n').next().expect("line");
         let segments: Vec<&str> = first.split('\r').collect();
-        assert!(segments.first().is_some_and(|piece| piece.is_empty()), "the run opens with \\r");
-        assert!(segments.iter().skip(1).all(|segment| segment.len() + 1 == 200), "{segments:?}");
+        assert!(
+            segments.first().is_some_and(|piece| piece.is_empty()),
+            "the run opens with \\r"
+        );
+        assert!(
+            segments
+                .iter()
+                .skip(1)
+                .all(|segment| segment.len() + 1 == 200),
+            "{segments:?}"
+        );
         // The reporter rewrites in place: each `\r` segment, and each
         // newline-terminated line, is one printed piece.
         let body = text.strip_prefix('\r').expect("opens with \\r");
         let body = body.strip_suffix('\n').expect("ends with a newline");
-        let pieces: Vec<String> = body.split(['\r', '\n']).map(|piece| piece.trim_end().to_owned()).collect();
+        let pieces: Vec<String> = body
+            .split(['\r', '\n'])
+            .map(|piece| piece.trim_end().to_owned())
+            .collect();
         assert_eq!(
             pieces,
             [
@@ -1895,7 +2232,10 @@ mod tests {
         let pieces: Vec<&str> = body.split(['\r', '\n']).collect();
         let truncated = format!("00:00 +0: ...{}", "a".repeat(25));
         assert_eq!(pieces[1].trim_end(), truncated, "the long name is cut");
-        assert!(pieces.iter().all(|piece| piece.trim_end().len() <= 40), "{pieces:?}");
+        assert!(
+            pieces.iter().all(|piece| piece.trim_end().len() <= 40),
+            "{pieces:?}"
+        );
         assert!(text.contains("All tests passed!"));
     }
 
@@ -1936,18 +2276,45 @@ mod tests {
         let mut merge = JsonMerge::start(&mut out, None, Instant::now(), 1).expect("start");
         merge.machine = true;
         merge.block(&suite, &mut out).expect("block");
-        merge.block(&[crate::event::shell("Shell: from the tool")], &mut out).expect("block");
+        merge
+            .block(&[crate::event::shell("Shell: from the tool")], &mut out)
+            .expect("block");
         merge.done(false, &mut out).expect("done");
         let text = String::from_utf8(out).expect("utf8");
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with(r#"{"protocolVersion":"0.1.1","runnerVersion":null,"pid":"#));
         assert!(lines[0].ends_with(r#","type":"start","time":0}"#));
-        let kinds: Vec<String> = lines.iter().filter_map(|line| parse(line).map(|event| event.kind().to_owned())).collect();
-        assert_eq!(kinds, ["start", "suite", "testStart", "allSuites", "testDone", "done"]);
-        let started = lines.iter().position(|line| line.contains("test.startedProcess")).expect("started");
-        assert_eq!(lines[started], r#"[{"event":"test.startedProcess","params":{"vmServiceUri":null}}]"#);
-        assert_eq!(lines[started - 2], r#"{"count":1,"time":1,"type":"allSuites"}"#);
-        assert!(lines.contains(&"Shell: from the tool"), "the shell line prints raw");
+        let kinds: Vec<String> = lines
+            .iter()
+            .filter_map(|line| parse(line).map(|event| event.kind().to_owned()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "suite",
+                "testStart",
+                "allSuites",
+                "testDone",
+                "done"
+            ]
+        );
+        let started = lines
+            .iter()
+            .position(|line| line.contains("test.startedProcess"))
+            .expect("started");
+        assert_eq!(
+            lines[started],
+            r#"[{"event":"test.startedProcess","params":{"vmServiceUri":null}}]"#
+        );
+        assert_eq!(
+            lines[started - 2],
+            r#"{"count":1,"time":1,"type":"allSuites"}"#
+        );
+        assert!(
+            lines.contains(&"Shell: from the tool"),
+            "the shell line prints raw"
+        );
     }
 
     /// An error after a test passed takes it back out of the passed count

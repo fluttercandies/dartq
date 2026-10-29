@@ -1586,7 +1586,11 @@ fn parent_column_adoption_resolves_to_the_first_coverer() {
     b.end(NodeKind::CompilationUnit, 5); // row 3: window [0, 3)
     let ast = b.finish();
 
-    assert_eq!(ast.parent(0), Some(2), "adopted row parents to the borrower");
+    assert_eq!(
+        ast.parent(0),
+        Some(2),
+        "adopted row parents to the borrower"
+    );
     assert_eq!(ast.parent(1), Some(2));
     assert_eq!(ast.parent(2), Some(3));
     assert_eq!(ast.parent(3), None);

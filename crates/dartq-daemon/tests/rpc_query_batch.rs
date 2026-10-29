@@ -118,10 +118,7 @@ fn batch_answers_every_pair_in_request_order() {
     assert_eq!(results[2]["refs"].as_array().expect("refs").len(), 1);
     assert_eq!(results[3]["refs"].as_array().expect("refs").len(), 1);
     assert_eq!(results[4]["refs"].as_array().expect("refs").len(), 0);
-    assert_eq!(
-        results[4]["decls"].as_array().expect("decls").len(),
-        1
-    );
+    assert_eq!(results[4]["decls"].as_array().expect("decls").len(), 1);
 
     for envelope in &results {
         let text = serde_json::to_string(envelope).expect("serialize");

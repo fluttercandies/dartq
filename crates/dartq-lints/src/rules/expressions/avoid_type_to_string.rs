@@ -16,11 +16,7 @@ use crate::rules::utf16_token_span;
 /// bare-name tear-off faces (:116-131), and the enclosing-class
 /// `thisType` face stay silent. Message: `diagnostic.g.dart`
 /// `avoidTypeToString`.
-pub(crate) static SPEC: RuleSpec = crate::spec!(
-    "avoid_type_to_string",
-    &[NodeKind::Send],
-    check,
-);
+pub(crate) static SPEC: RuleSpec = crate::spec!("avoid_type_to_string", &[NodeKind::Send], check,);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

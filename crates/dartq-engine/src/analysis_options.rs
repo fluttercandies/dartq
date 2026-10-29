@@ -4349,7 +4349,8 @@ impl PubspecNode {
     /// The node's raw source extent (bytes).
     fn raw(&self) -> (usize, usize) {
         match self {
-            PubspecNode::Scalar { raw, .. } | PubspecNode::Seq { raw, .. }
+            PubspecNode::Scalar { raw, .. }
+            | PubspecNode::Seq { raw, .. }
             | PubspecNode::Map { raw, .. } => *raw,
         }
     }
@@ -4359,7 +4360,11 @@ impl PubspecNode {
     /// node is no string).
     fn as_str(&self) -> Option<&str> {
         match self {
-            PubspecNode::Scalar { text, kind: ScalarKind::Str, .. } => Some(text),
+            PubspecNode::Scalar {
+                text,
+                kind: ScalarKind::Str,
+                ..
+            } => Some(text),
             _ => None,
         }
     }
@@ -4369,7 +4374,10 @@ impl PubspecNode {
     fn is_null(&self) -> bool {
         matches!(
             self,
-            PubspecNode::Scalar { kind: ScalarKind::Null, .. }
+            PubspecNode::Scalar {
+                kind: ScalarKind::Null,
+                ..
+            }
         )
     }
 
@@ -4651,9 +4659,7 @@ impl<'a> PubspecYaml<'a> {
             Some(q @ (b'\'' | b'"')) => {
                 let mut at = start + 1;
                 while at < content_end {
-                    if self.bytes[at] == *q
-                        && !(*q == b'"' && self.bytes[at - 1] == b'\\')
-                    {
+                    if self.bytes[at] == *q && !(*q == b'"' && self.bytes[at - 1] == b'\\') {
                         return at + 1;
                     }
                     at += 1;
@@ -4825,9 +4831,7 @@ impl<'a> PubspecYaml<'a> {
                 }
                 let value = match self.bytes.get(value_at) {
                     Some(b'[') | Some(b'{') => self.parse_flow(value_at).0,
-                    _ => {
-                        self.quoted_or_plain_scalar(value_at, self.scalar_end(value_at, tail))
-                    }
+                    _ => self.quoted_or_plain_scalar(value_at, self.scalar_end(value_at, tail)),
                 };
                 entries.push((key, value));
             } else {
@@ -4965,10 +4969,18 @@ impl ScalarKind {
 fn is_yaml_number(text: &str) -> bool {
     if matches!(
         text,
-        ".inf" | ".Inf" | ".INF"
-            | "+.inf" | "+.Inf" | "+.INF"
-            | "-.inf" | "-.Inf" | "-.INF"
-            | ".nan" | ".NaN" | ".NAN"
+        ".inf"
+            | ".Inf"
+            | ".INF"
+            | "+.inf"
+            | "+.Inf"
+            | "+.INF"
+            | "-.inf"
+            | "-.Inf"
+            | "-.INF"
+            | ".nan"
+            | ".NaN"
+            | ".NAN"
     ) {
         return true;
     }
@@ -5206,7 +5218,9 @@ fn validate_path_entries(
                 issues.push(pubspec_row(
                     PATH_DOES_NOT_EXIST,
                     format!("The path '{path}' doesn't exist."),
-                    Some("Try creating the referenced path or using a path that exists.".to_owned()),
+                    Some(
+                        "Try creating the referenced path or using a path that exists.".to_owned(),
+                    ),
                     yaml.text,
                     value.raw(),
                 ));
@@ -5236,7 +5250,11 @@ fn validate_path_entries(
 }
 
 /// The `invalid_dependency` row at one form's key span.
-fn invalid_dependency_row(yaml: &PubspecYaml<'_>, key_raw: (usize, usize), kind: &str) -> OptionsIssue {
+fn invalid_dependency_row(
+    yaml: &PubspecYaml<'_>,
+    key_raw: (usize, usize),
+    kind: &str,
+) -> OptionsIssue {
     pubspec_row(
         INVALID_DEPENDENCY,
         format!("Publishable packages can't have '{kind}' dependencies."),
@@ -5251,11 +5269,7 @@ fn invalid_dependency_row(yaml: &PubspecYaml<'_>, key_raw: (usize, usize), kind:
 
 /// `fieldValidator` (field_validator.dart:12-26): every top-level key whose
 /// name is one of the deprecated spellings, reported at the key.
-fn field_validator(
-    yaml: &PubspecYaml<'_>,
-    root: &PubspecNode,
-    issues: &mut Vec<OptionsIssue>,
-) {
+fn field_validator(yaml: &PubspecYaml<'_>, root: &PubspecNode, issues: &mut Vec<OptionsIssue>) {
     let Some(entries) = root.as_map() else {
         return;
     };
@@ -5347,9 +5361,7 @@ fn flutter_validator(
                     yaml.text,
                     item.raw(),
                 )),
-                Some(path)
-                    if !matches!(path, PubspecNode::Scalar { .. }) =>
-                {
+                Some(path) if !matches!(path, PubspecNode::Scalar { .. }) => {
                     issues.push(pubspec_row(
                         ASSET_PATH_NOT_STRING,
                         "Asset paths are required to be file paths (strings).".to_owned(),
@@ -5454,11 +5466,7 @@ fn asset_exists_at_path(path: &Path) -> bool {
 /// `nameValidator` (name_validator.dart:12-26): the document must be a map
 /// carrying a string `name:`; a missing field reports at the origin, a
 /// non-string value at its own node.
-fn name_validator(
-    yaml: &PubspecYaml<'_>,
-    root: &PubspecNode,
-    issues: &mut Vec<OptionsIssue>,
-) {
+fn name_validator(yaml: &PubspecYaml<'_>, root: &PubspecNode, issues: &mut Vec<OptionsIssue>) {
     let Some(entries) = root.as_map() else {
         issues.push(OptionsIssue {
             code: MISSING_NAME,
@@ -5525,11 +5533,7 @@ fn screenshots_validator(
 /// `platformsValidator` (platforms_validator.dart:22-53): the `platforms`
 /// field must be a map whose keys name known platforms and whose values are
 /// empty; keys report at their key nodes, values at theirs.
-fn platforms_validator(
-    yaml: &PubspecYaml<'_>,
-    root: &PubspecNode,
-    issues: &mut Vec<OptionsIssue>,
-) {
+fn platforms_validator(yaml: &PubspecYaml<'_>, root: &PubspecNode, issues: &mut Vec<OptionsIssue>) {
     let Some(platforms) = root.get(PLATFORMS_FIELD) else {
         return;
     };
@@ -5544,7 +5548,9 @@ fn platforms_validator(
         return;
     };
     for (key, _) in entries {
-        let known = key.as_str().is_some_and(|name| KNOWN_PLATFORMS.contains(&name));
+        let known = key
+            .as_str()
+            .is_some_and(|name| KNOWN_PLATFORMS.contains(&name));
         if !known {
             let argument = match key {
                 PubspecNode::Scalar { text, .. } => text.clone(),
@@ -5713,9 +5719,7 @@ fn resolve_dependency_path(dir: &Path, entry: &str) -> PathBuf {
 /// `_isGlobPattern` (workspace_validator.dart:66-68): `Glob.quote` changes
 /// the text — any of the quote set `* { [ ? \ } ] , - ( )` present.
 fn is_glob_pattern(value: &str) -> bool {
-    value
-        .bytes()
-        .any(|b| b"*{[?\\}],-()".contains(&b))
+    value.bytes().any(|b| b"*{[?\\}],-()".contains(&b))
 }
 
 /// `_globBasePath` (workspace_validator.dart:70-78): the non-glob prefix of
@@ -5932,11 +5936,7 @@ fn validate_touchscreen_feature(
 /// `_validateFeatures` (manifest_validator.dart:515-555): every retained
 /// `uses-feature` naming an unsupported hardware feature reports per its
 /// `android:required` shape.
-fn validate_features(
-    text: &str,
-    features: &[&ManifestElement],
-    issues: &mut Vec<OptionsIssue>,
-) {
+fn validate_features(text: &str, features: &[&ManifestElement], issues: &mut Vec<OptionsIssue>) {
     for element in features {
         let Some(name) = element.attribute_value("android:name") else {
             continue;
@@ -5977,7 +5977,9 @@ fn validate_permissions(
         .iter()
         .any(|f| f.attribute_value("android:name") == Some("android.hardware.camera.autofocus"));
     for permission in permissions {
-        let name_span = permission.attribute("android:name").map(|(_, _, span)| *span);
+        let name_span = permission
+            .attribute("android:name")
+            .map(|(_, _, span)| *span);
         if permission.attribute_value("android:name") == Some("android.permission.CAMERA") {
             if !has_camera || !has_autofocus {
                 issues.push(manifest_row(
@@ -6071,11 +6073,7 @@ fn validate_activity(text: &str, activity: &ManifestElement, issues: &mut Vec<Op
 }
 
 /// The `unsupported_chrome_os_hardware` row at one `android:name` span.
-fn unsupported_hardware_row(
-    text: &str,
-    span: Option<(usize, usize)>,
-    name: &str,
-) -> OptionsIssue {
+fn unsupported_hardware_row(text: &str, span: Option<(usize, usize)>, name: &str) -> OptionsIssue {
     manifest_row(
         UNSUPPORTED_CHROME_OS_HARDWARE,
         format!("The feature {name} isn't supported on Chrome OS, consider making it optional."),
@@ -6086,11 +6084,7 @@ fn unsupported_hardware_row(
 }
 
 /// The `unsupported_chrome_os_feature` row at one `android:name` span.
-fn unsupported_feature_row(
-    text: &str,
-    span: Option<(usize, usize)>,
-    name: &str,
-) -> OptionsIssue {
+fn unsupported_feature_row(text: &str, span: Option<(usize, usize)>, name: &str) -> OptionsIssue {
     manifest_row(
         UNSUPPORTED_CHROME_OS_FEATURE,
         format!("The feature {name} isn't supported on Chrome OS, consider making it optional."),
@@ -6197,10 +6191,7 @@ impl<'a> ManifestParser<'a> {
 
     fn parse_comment(&mut self) -> TagResult {
         self.pos += 4;
-        while !(self.at(0) == Some(b'-')
-            && self.at(1) == Some(b'-')
-            && self.at(2) == Some(b'>'))
-        {
+        while !(self.at(0) == Some(b'-') && self.at(1) == Some(b'-') && self.at(2) == Some(b'>')) {
             self.pos += 1;
             if self.pos >= self.bytes.len() {
                 return TagResult::Error;
@@ -6310,7 +6301,10 @@ impl<'a> ManifestParser<'a> {
     /// Parses attributes up to the tag's close; `None` on a malformed
     /// attribute. Attribute names lowercase, values keep their case, the
     /// span runs to the closing quote's index.
-    fn parse_attributes(&mut self, is_relevant: bool) -> Option<(Vec<(String, String, (usize, usize))>, bool)> {
+    fn parse_attributes(
+        &mut self,
+        is_relevant: bool,
+    ) -> Option<(Vec<(String, String, (usize, usize))>, bool)> {
         let mut attributes = Vec::new();
         loop {
             if self.pos >= self.bytes.len() {
@@ -6516,8 +6510,10 @@ pub fn text_direction_issues(text: &str) -> Vec<OptionsIssue> {
             }
             TextRegion::BlockComment { depth } => {
                 let rest = text[at + size..].as_bytes();
-                let (opener, closer) = (c == '/' && rest.first() == Some(&b'*'),
-                    c == '*' && rest.first() == Some(&b'/'));
+                let (opener, closer) = (
+                    c == '/' && rest.first() == Some(&b'*'),
+                    c == '*' && rest.first() == Some(&b'/'),
+                );
                 if opener || closer {
                     at += 2 * size;
                     utf16 += 2 * units;
@@ -6552,8 +6548,7 @@ pub fn text_direction_issues(text: &str) -> Vec<OptionsIssue> {
                     '\'' | '"' => {
                         let quote = c as u8;
                         let rest = text[at + size..].as_bytes();
-                        let triple =
-                            rest.first() == Some(&quote) && rest.get(1) == Some(&quote);
+                        let triple = rest.first() == Some(&quote) && rest.get(1) == Some(&quote);
                         let span = if triple { 3 * size } else { size };
                         let span_units = if triple { 3 * units } else { units };
                         at += span;
@@ -6570,8 +6565,7 @@ pub fn text_direction_issues(text: &str) -> Vec<OptionsIssue> {
                     'r' if matches!(next, Some(b'\'' | b'"')) => {
                         let quote = next.expect("matched above");
                         let rest = text[at + 2 * size..].as_bytes();
-                        let triple =
-                            rest.first() == Some(&quote) && rest.get(1) == Some(&quote);
+                        let triple = rest.first() == Some(&quote) && rest.get(1) == Some(&quote);
                         let span = if triple { 3 * size } else { 2 * size };
                         let span_units = if triple { 3 * units } else { 2 * units };
                         at += span;
@@ -8916,7 +8910,9 @@ mod pubspec_manifest_pins {
             at(text, 2, 15),
             9,
         );
-        assert!(pubspec_issues("name: test\ndependencies: {}\n", &temp_root("deps-flow")).is_empty());
+        assert!(
+            pubspec_issues("name: test\ndependencies: {}\n", &temp_root("deps-flow")).is_empty()
+        );
         // invalid_dependency /1 — publishable (a version, no
         // `publish_to: none`) with a git dependency reports at the key;
         // /2 — no version, not publishable, silent.
@@ -8963,7 +8959,13 @@ mod pubspec_manifest_pins {
             at(text, 2, 1),
             6,
         );
-        assert!(pubspec_issues("name: test\nmaintainer: someone\n", &temp_root("deprecated-neg")).is_empty());
+        assert!(
+            pubspec_issues(
+                "name: test\nmaintainer: someone\n",
+                &temp_root("deprecated-neg")
+            )
+            .is_empty()
+        );
         // missing_name /1 — an empty document reports at the origin; /2 a
         // named document stays silent.
         let issues = pubspec_issues("", &temp_root("missing-name"));
@@ -9018,8 +9020,11 @@ mod pubspec_manifest_pins {
             10,
         );
         assert!(
-            pubspec_issues("name: test\nflutter:\n  assets: []\n", &temp_root("assets-neg"))
-                .is_empty()
+            pubspec_issues(
+                "name: test\nflutter:\n  assets: []\n",
+                &temp_root("assets-neg")
+            )
+            .is_empty()
         );
         // asset_directory_does_not_exist /1 — the trailing-slash entry
         // with no folder; /2 the folder present.
@@ -9035,7 +9040,9 @@ mod pubspec_manifest_pins {
         );
         let root = temp_root("asset-dir-neg");
         write(&root, "assets/keep.txt", "x");
-        assert!(pubspec_issues("name: test\nflutter:\n  assets:\n    - assets/\n", &root).is_empty());
+        assert!(
+            pubspec_issues("name: test\nflutter:\n  assets:\n    - assets/\n", &root).is_empty()
+        );
         // asset_does_not_exist /1 — the file entry missing; /2 present.
         let text = "name: test\nflutter:\n  assets:\n    - missing.png\n";
         let issues = pubspec_issues(text, &temp_root("asset-file"));
@@ -9049,7 +9056,9 @@ mod pubspec_manifest_pins {
         );
         let root = temp_root("asset-file-neg");
         write(&root, "logo.png", "x");
-        assert!(pubspec_issues("name: test\nflutter:\n  assets:\n    - logo.png\n", &root).is_empty());
+        assert!(
+            pubspec_issues("name: test\nflutter:\n  assets:\n    - logo.png\n", &root).is_empty()
+        );
         // asset_missing_path /1 — the map entry without `path:` reports at
         // the map node's span; /2 the map with an existing path.
         let text = "name: test\nflutter:\n  assets:\n    - source: images/x.png\n";
@@ -9065,8 +9074,11 @@ mod pubspec_manifest_pins {
         let root = temp_root("asset-map-neg");
         write(&root, "images/x.png", "x");
         assert!(
-            pubspec_issues("name: test\nflutter:\n  assets:\n    - path: images/x.png\n", &root)
-                .is_empty()
+            pubspec_issues(
+                "name: test\nflutter:\n  assets:\n    - path: images/x.png\n",
+                &root
+            )
+            .is_empty()
         );
         // asset_not_string /1 — an int `path:`; /2 the string form exists.
         let text = "name: test\nflutter:\n  assets:\n    - path: 42\n";
@@ -9104,7 +9116,9 @@ mod pubspec_manifest_pins {
         );
         let root = temp_root("asset-kind-neg");
         write(&root, "logo.png", "x");
-        assert!(pubspec_issues("name: test\nflutter:\n  assets:\n    - logo.png\n", &root).is_empty());
+        assert!(
+            pubspec_issues("name: test\nflutter:\n  assets:\n    - logo.png\n", &root).is_empty()
+        );
     }
 
     #[test]
@@ -9120,7 +9134,13 @@ mod pubspec_manifest_pins {
             at(text, 2, 12),
             9,
         );
-        assert!(pubspec_issues("name: test\nplatforms:\n  android:\n", &temp_root("platforms-neg")).is_empty());
+        assert!(
+            pubspec_issues(
+                "name: test\nplatforms:\n  android:\n",
+                &temp_root("platforms-neg")
+            )
+            .is_empty()
+        );
         // unknown_platform /1 — an unrecognized key; /2 a known one.
         let text = "name: test\nplatforms:\n  brower:\n";
         let issues = pubspec_issues(text, &temp_root("platform-unknown"));
@@ -9132,7 +9152,13 @@ mod pubspec_manifest_pins {
             at(text, 3, 3),
             6,
         );
-        assert!(pubspec_issues("name: test\nplatforms:\n  linux:\n", &temp_root("platform-unknown-neg")).is_empty());
+        assert!(
+            pubspec_issues(
+                "name: test\nplatforms:\n  linux:\n",
+                &temp_root("platform-unknown-neg")
+            )
+            .is_empty()
+        );
         // platform_value_disallowed /1 — a flow-map value; /2 the null
         // value stays silent.
         let text = "name: test\nplatforms:\n  android: {}\n";
@@ -9145,7 +9171,13 @@ mod pubspec_manifest_pins {
             at(text, 3, 12),
             2,
         );
-        assert!(pubspec_issues("name: test\nplatforms:\n  android:\n", &temp_root("platform-value-neg")).is_empty());
+        assert!(
+            pubspec_issues(
+                "name: test\nplatforms:\n  android:\n",
+                &temp_root("platform-value-neg")
+            )
+            .is_empty()
+        );
         // workspace_field_not_list /1 — a scalar section; /2 the list
         // form over an existing subdirectory.
         let text = "name: test\nworkspace: not_a_list\n";
@@ -9213,8 +9245,7 @@ mod pubspec_manifest_pins {
 
     #[test]
     fn the_manifest_validator_pins_its_seven_codes() {
-        let touchscreen =
-            "    <uses-feature android:name=\"android.hardware.touchscreen\" android:required=\"false\" />\n";
+        let touchscreen = "    <uses-feature android:name=\"android.hardware.touchscreen\" android:required=\"false\" />\n";
         // camera_permissions_incompatible /1 — CAMERA without the camera
         // feature pair; /2 both features declared optional.
         let text = format!(
@@ -9324,7 +9355,10 @@ mod pubspec_manifest_pins {
             at(&text, 4, 59),
             35,
         );
-        assert!(manifest_issues(&activity("android:screenOrientation=\"unspecified\""), true).is_empty());
+        assert!(
+            manifest_issues(&activity("android:screenOrientation=\"unspecified\""), true)
+                .is_empty()
+        );
         // non_resizable_activity /1 — `resizeableActivity="false"`; /2
         // `"true"`.
         let text = activity("android:resizeableActivity=\"false\"");
@@ -9526,7 +9560,8 @@ mod options_verifier_pins {
         // incompatible_lint /1 — the later declaration conflicts with the
         // earlier enabled one; the message nests the quoted join inside
         // the template's own quotes (4:7|23).
-        let text = "linter:\n  rules:\n    - always_use_package_imports\n    - prefer_relative_imports\n";
+        let text =
+            "linter:\n  rules:\n    - always_use_package_imports\n    - prefer_relative_imports\n";
         let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
         let declared = declared_rule_names(&map["linter"]["rules"], text);
         let row = OptionsIssue::incompatible_lint(&declared[1], &["always_use_package_imports"]);
@@ -9588,7 +9623,8 @@ mod options_verifier_pins {
     fn the_unicode_text_face_splits_comment_from_literal() {
         let bidi = '\u{202E}';
         // text_direction_code_point_in_comment /1 — the flipped comment.
-        let text = format!("// The text direction is silently flipped here {bidi}\nvoid f() {{\n}}\n");
+        let text =
+            format!("// The text direction is silently flipped here {bidi}\nvoid f() {{\n}}\n");
         let issues = text_direction_issues(&text);
         assert_eq!(issues.len(), 1);
         assert_row(
@@ -9601,13 +9637,13 @@ mod options_verifier_pins {
         );
         assert_eq!(
             issues[0].correction.as_deref(),
-            Some(
-                "Try removing the code point or using the Unicode escape sequence '\u{5c}u202E'."
-            )
+            Some("Try removing the code point or using the Unicode escape sequence '\u{5c}u202E'.")
         );
         // /2 — an unchanged comment stays silent.
-        assert!(text_direction_issues("// The text direction is unchanged here.\nvoid f() {}\n")
-            .is_empty());
+        assert!(
+            text_direction_issues("// The text direction is unchanged here.\nvoid f() {}\n")
+                .is_empty()
+        );
         // text_direction_code_point_in_literal /1 — the flipped literal.
         let text = format!("var s = 'a{bidi}b';\n\nvoid f() {{\n  print(s);\n}}\n");
         let issues = text_direction_issues(&text);
@@ -9617,7 +9653,9 @@ mod options_verifier_pins {
         assert_eq!(issues[0].length, 1);
         // /2 — a bidi code point in a comment beside a clean literal
         // reports the in_comment arm at the comment's own code point.
-        let text = format!("// The flagged code point only appears in a comment: {bidi}\nvar s = 'ab';\n\nvoid f() {{\n  print(s);\n}}\n");
+        let text = format!(
+            "// The flagged code point only appears in a comment: {bidi}\nvar s = 'ab';\n\nvoid f() {{\n  print(s);\n}}\n"
+        );
         let issues = text_direction_issues(&text);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code.name, "text_direction_code_point_in_comment");
@@ -9628,7 +9666,10 @@ mod options_verifier_pins {
         let text = "\u{2066}a\u{202A}b";
         let issues = text_direction_issues(text);
         assert_eq!(issues.len(), 2);
-        assert_eq!(issues[0].message, "The Unicode code point 'U+2066' changes the appearance of text from how it's interpreted by the compiler.");
+        assert_eq!(
+            issues[0].message,
+            "The Unicode code point 'U+2066' changes the appearance of text from how it's interpreted by the compiler."
+        );
         let text = format!("var a = r'{bidi}';\nvar b = '\\u{{202E}}';\n");
         let issues = text_direction_issues(&text);
         assert_eq!(issues.len(), 1);

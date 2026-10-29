@@ -573,7 +573,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // body (its `extension_on_head` latch must not race the members'
         // own annotations — `this` staging and the implicit-`this`
         // transport read the on-type long after the header parsed).
-        self.flow().begin_class_or_mixin_or_extension_body(kind, token);
+        self.flow()
+            .begin_class_or_mixin_or_extension_body(kind, token);
         self.engine.bounds.finish_header();
         self.engine.var_finish_header();
         // The header's clause spans are complete: the deferred use-site
@@ -1353,7 +1354,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // The flow recorder's local-function name latch rides this hook
         // ([`dartq_flow::ev::Ev::LocalFnName`]) — the call-resolution face
         // must see function-local names before the body's events run.
-        self.flow().end_function_name(begin, end, is_function_expression);
+        self.flow()
+            .end_function_name(begin, end, is_function_expression);
         if is_function_expression {
             return;
         }
@@ -1749,107 +1751,109 @@ impl ParserListener for DiagnoseListener<'_> {
                         Some((mark, ifnull_ty))
                     } else {
                         match engine.rows.len() {
-                        // The single-row window every fold-as-one shape keeps.
-                        count if count == mark + 1 => Some((mark, None)),
-                        // The `[]` fold leaves the receiver's operator row plus
-                        // the result's value row (#2521): the initializer's
-                        // expression row is the value row — one past the
-                        // operator — so `var symbols = map[key]!` infers the
-                        // index result's type exactly like a plain read. Only
-                        // the assertion-decided NON-NULL face binds: a nullable
-                        // index result (`var h = headers[k]`, `var r =
-                        // byIndex[i]`) owes the null-check promotion and the
-                        // reassignment writes the staged faces re-decide
-                        // downstream, and binding it here fires the return/
-                        // unchecked/undefined verdicts before those re-decides
-                        // run (the analyzer corpus's map-inferred locals) —
-                        // the under-report stands until the write-side staging
-                        // carries them. The `!`-asserted face is the one shape
-                        // with no such question standing: the assertion itself
-                        // decided nullness, the type is the index result's own,
-                        // and no promotion re-decide can change it.
-                        count
-                            if count == mark + 2
-                                && matches!(
-                                    engine.rows[mark].intent,
-                                    Intent::Operator(op, _) if op == engine.intern("[]")
-                                )
-                                && matches!(engine.rows[mark + 1].shape, RowShape::Value)
-                                && engine.rows[mark + 1].ty != Ty::UNKNOWN
-                                && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
-                                && (engine.byte_at(engine.rows[mark + 1].range.end())
-                                    == Some(b'!')
-                                    || (engine.strictly_non_nullable(engine.rows[mark + 1].ty)
-                                        && !engine.index_receiver_latched(&engine.rows[mark]))) =>
-                        {
-                            
-                            Some((mark + 1, None))
-                        }
-                        // A typed literal over an unresolvable element head
-                        // (`var r = <Und>[]`) leaves the head's verdict row
-                        // ahead of the literal's value row: the literal is
-                        // the expression (`List<InvalidType>` — a typed row
-                        // only when the literal face typed it).
-                        count
-                            if count == mark + 2
-                                && matches!(engine.rows[mark].shape, RowShape::TypeUse(..))
-                                && matches!(engine.rows[mark + 1].shape, RowShape::Value)
-                                && engine.rows[mark + 1].ty != Ty::UNKNOWN
-                                && engine.rows[mark + 1].range.offset <= engine.rows[mark].range.offset
-                                && engine.rows[mark].range.end() <= engine.rows[mark + 1].range.end() =>
-                        {
-                            Some((mark + 1, None))
-                        }
-                        // A plain-`=` assignment initializer (`var w = _w =
-                        // Impl()`): the window holds the write target and the
-                        // right side, and the assignment expression's static
-                        // type is the right side's (assignment_expression_
-                        // resolver.dart `_resolveTypes`: `=` writes
-                        // `rightType`), so the right row is the expression.
-                        count
-                            if count == mark + 2
-                                && engine.rows[mark].intent == Intent::Write
-                                && engine.rows[mark].write_op.is_none()
-                                && engine.plain_assign_between(
-                                    engine.rows[mark].range.end(),
-                                    engine.rows[mark + 1].range.offset,
-                                ) =>
-                        {
-                            Some((mark + 1, None))
-                        }
-                        _ => None,
+                            // The single-row window every fold-as-one shape keeps.
+                            count if count == mark + 1 => Some((mark, None)),
+                            // The `[]` fold leaves the receiver's operator row plus
+                            // the result's value row (#2521): the initializer's
+                            // expression row is the value row — one past the
+                            // operator — so `var symbols = map[key]!` infers the
+                            // index result's type exactly like a plain read. Only
+                            // the assertion-decided NON-NULL face binds: a nullable
+                            // index result (`var h = headers[k]`, `var r =
+                            // byIndex[i]`) owes the null-check promotion and the
+                            // reassignment writes the staged faces re-decide
+                            // downstream, and binding it here fires the return/
+                            // unchecked/undefined verdicts before those re-decides
+                            // run (the analyzer corpus's map-inferred locals) —
+                            // the under-report stands until the write-side staging
+                            // carries them. The `!`-asserted face is the one shape
+                            // with no such question standing: the assertion itself
+                            // decided nullness, the type is the index result's own,
+                            // and no promotion re-decide can change it.
+                            count
+                                if count == mark + 2
+                                    && matches!(
+                                        engine.rows[mark].intent,
+                                        Intent::Operator(op, _) if op == engine.intern("[]")
+                                    )
+                                    && matches!(engine.rows[mark + 1].shape, RowShape::Value)
+                                    && engine.rows[mark + 1].ty != Ty::UNKNOWN
+                                    && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
+                                    && (engine.byte_at(engine.rows[mark + 1].range.end())
+                                        == Some(b'!')
+                                        || (engine
+                                            .strictly_non_nullable(engine.rows[mark + 1].ty)
+                                            && !engine
+                                                .index_receiver_latched(&engine.rows[mark]))) =>
+                            {
+                                Some((mark + 1, None))
+                            }
+                            // A typed literal over an unresolvable element head
+                            // (`var r = <Und>[]`) leaves the head's verdict row
+                            // ahead of the literal's value row: the literal is
+                            // the expression (`List<InvalidType>` — a typed row
+                            // only when the literal face typed it).
+                            count
+                                if count == mark + 2
+                                    && matches!(engine.rows[mark].shape, RowShape::TypeUse(..))
+                                    && matches!(engine.rows[mark + 1].shape, RowShape::Value)
+                                    && engine.rows[mark + 1].ty != Ty::UNKNOWN
+                                    && engine.rows[mark + 1].range.offset
+                                        <= engine.rows[mark].range.offset
+                                    && engine.rows[mark].range.end()
+                                        <= engine.rows[mark + 1].range.end() =>
+                            {
+                                Some((mark + 1, None))
+                            }
+                            // A plain-`=` assignment initializer (`var w = _w =
+                            // Impl()`): the window holds the write target and the
+                            // right side, and the assignment expression's static
+                            // type is the right side's (assignment_expression_
+                            // resolver.dart `_resolveTypes`: `=` writes
+                            // `rightType`), so the right row is the expression.
+                            count
+                                if count == mark + 2
+                                    && engine.rows[mark].intent == Intent::Write
+                                    && engine.rows[mark].write_op.is_none()
+                                    && engine.plain_assign_between(
+                                        engine.rows[mark].range.end(),
+                                        engine.rows[mark + 1].range.offset,
+                                    ) =>
+                            {
+                                Some((mark + 1, None))
+                            }
+                            _ => None,
                         }
                     }
                 }
-                && let Some(ty) = ifnull_ty.or_else(|| engine
-                    .initializer_static_ty(&engine.rows[expr])
-                    .map(|ty| engine.staged_read_ty(&engine.rows[expr]).unwrap_or(ty))
-                    .or_else(|| {
-                        // The #2481 face: a member read the window's own
-                        // faces leave `Unknown` still owns a static type —
-                        // the accessor's declared return (instance getter)
-                        // or the applied extension face's (the census's
-                        // `var element = elementAnnotation?.element`
-                        // shape), nullable re-armed for a `?.` merge. The
-                        // bind and the flow staging below ride it, so an
-                        // extension use through the inferred local
-                        // resolves and credits.
-                        let row = engine.rows[expr].clone();
-                        let derived = engine.initializer_read_ty(&row);
-                        (derived != Ty::UNKNOWN).then_some(derived)
-                    }))
+                && let Some(ty) = ifnull_ty.or_else(|| {
+                    engine
+                        .initializer_static_ty(&engine.rows[expr])
+                        .map(|ty| engine.staged_read_ty(&engine.rows[expr]).unwrap_or(ty))
+                        .or_else(|| {
+                            // The #2481 face: a member read the window's own
+                            // faces leave `Unknown` still owns a static type —
+                            // the accessor's declared return (instance getter)
+                            // or the applied extension face's (the census's
+                            // `var element = elementAnnotation?.element`
+                            // shape), nullable re-armed for a `?.` merge. The
+                            // bind and the flow staging below ride it, so an
+                            // extension use through the inferred local
+                            // resolves and credits.
+                            let row = engine.rows[expr].clone();
+                            let derived = engine.initializer_read_ty(&row);
+                            (derived != Ty::UNKNOWN).then_some(derived)
+                        })
+                })
             {
                 // The await operand's extent re-applies the flatten here
                 // (#2506): the close-time rewrite reads an `Unknown` row
                 // (member rows resolve in the later pass), so the resolved
                 // `Future<T>`-shaped type flattens at the bind — the local
                 // holds `T`, nullability preserved.
-                let ty = if engine.await_operand_extents.iter().any(
-                    |&(start, end)| {
-                        engine.rows[expr].range.offset >= start
-                            && engine.rows[expr].range.end() <= end
-                    },
-                ) {
+                let ty = if engine.await_operand_extents.iter().any(|&(start, end)| {
+                    engine.rows[expr].range.offset >= start && engine.rows[expr].range.end() <= end
+                }) {
                     engine.flatten(ty)
                 } else {
                     ty
@@ -1871,8 +1875,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 // replace it.
                 if let Some(expr_row) = engine.rows.get(expr)
                     && !engine.cast_rewrites.iter().any(|(span, _)| {
-                        span.offset <= expr_row.range.offset
-                            && span.end() >= expr_row.range.end()
+                        span.offset <= expr_row.range.offset && span.end() >= expr_row.range.end()
                     })
                     && engine
                         .promoted_recv_reads
@@ -1880,9 +1883,11 @@ impl ParserListener for DiagnoseListener<'_> {
                         .is_ok()
                     && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
                 {
-                    engine
-                        .deferred_var_rebinds
-                        .push((decl.range.offset, expr_row.range.offset, ty));
+                    engine.deferred_var_rebinds.push((
+                        decl.range.offset,
+                        expr_row.range.offset,
+                        ty,
+                    ));
                 }
                 // The bare-identifier twin (#2567): `var x = p;` defers the
                 // same re-bind — the initializer read's flow type (a
@@ -1890,10 +1895,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 // face in pass 2. A plain bare read only; every other
                 // shape's face decided above.
                 if let Some(expr_row) = engine.rows.get(expr)
-                    && matches!(
-                        expr_row.shape,
-                        RowShape::Bare(BareInfo::Plain { .. })
-                    )
+                    && matches!(expr_row.shape, RowShape::Bare(BareInfo::Plain { .. }))
                     && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
                 {
                     engine
@@ -1938,12 +1940,9 @@ impl ParserListener for DiagnoseListener<'_> {
                     // posture. A tree the flow lattice cannot spell
                     // (`staged_arg_tree`'s `None`) stages the bare head —
                     // the pre-#2506 under-report, never a wrong tree.
-                    let tree = staged_arg_tree(
-                        &engine.boundary.args.borrow(),
-                        &engine.strings,
-                        args,
-                    )
-                    .unwrap_or_default();
+                    let tree =
+                        staged_arg_tree(&engine.boundary.args.borrow(), &engine.strings, args)
+                            .unwrap_or_default();
                     staged = Some((decl_range.offset, lexeme, nullable, tree));
                 }
             } else if let Some(mark) = engine.init_mark
@@ -1970,9 +1969,12 @@ impl ParserListener for DiagnoseListener<'_> {
                         .iter()
                         .find(|read| read.offset == row_offset)
                         .is_some_and(|read| engine.member_read_invalid(read));
-                
+
                 if invalid {
-                    engine.invalid_init_locals.borrow_mut().insert(decl_range.offset);
+                    engine
+                        .invalid_init_locals
+                        .borrow_mut()
+                        .insert(decl_range.offset);
                 }
             }
             staged
@@ -2165,10 +2167,8 @@ impl ParserListener for DiagnoseListener<'_> {
                     // named shapes ride (the same gate the `this` stage
                     // applies); anything else keeps the unknown face.
                     if let Some((container, kind)) = engine.container_context() {
-                        let mut face = engine.accessor_face_for(
-                            &Receiver::This { container, kind },
-                            name,
-                        );
+                        let mut face =
+                            engine.accessor_face_for(&Receiver::This { container, kind }, name);
                         // A member the enclosing class declares itself reads
                         // through the identity substitution (`this` is
                         // `C<T1..Tn>` inside `C`): a field typed by one of
@@ -2205,8 +2205,7 @@ impl ParserListener for DiagnoseListener<'_> {
                                 ..
                             } = engine.fold_alias_ty(face)
                             {
-                                let lexeme =
-                                    engine.strings.resolve(ty_name).to_string();
+                                let lexeme = engine.strings.resolve(ty_name).to_string();
                                 let base = self.flow().intern_name(&lexeme);
                                 self.flow().stage_this_member_type(
                                     token.range.offset,
@@ -2376,8 +2375,9 @@ impl ParserListener for DiagnoseListener<'_> {
                             }
                         }
                     }
-                    let type_level = engine.fn_type_formal_lists > 0 || engine.formal_list_depth > 1;
-                    
+                    let type_level =
+                        engine.fn_type_formal_lists > 0 || engine.formal_list_depth > 1;
+
                     if type_level {
                         // The inner formal's written type is consumed but
                         // binds nothing in the enclosing body's scope.
@@ -2420,10 +2420,11 @@ impl ParserListener for DiagnoseListener<'_> {
                     // generic local function (`T f<T>()`) needs the call's
                     // instantiation the table cannot carry.
                     if engine.byte_at(token.range.end()) != Some(b'<')
-                        && let Some(ret) = engine.frames.last().and_then(|frame| match &frame.kind {
-                            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
-                            _ => None,
-                        })
+                        && let Some(ret) =
+                            engine.frames.last().and_then(|frame| match &frame.kind {
+                                FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
+                                _ => None,
+                            })
                         && ret != Ty::UNKNOWN
                         && let Some(enclosing) = engine.frames.len().checked_sub(2)
                     {
@@ -2981,11 +2982,7 @@ impl ParserListener for DiagnoseListener<'_> {
             // feeds the faces keyed by the written segment (the bounds
             // capture, the header spans).
             Some((leaf_id, _)) => {
-                let joined = format!(
-                    "{}.{}",
-                    text,
-                    engine.strings.resolve(leaf_id)
-                );
+                let joined = format!("{}.{}", text, engine.strings.resolve(leaf_id));
                 let head_id = engine.strings.intern(&joined);
                 (joined, leaf_id, head_id)
             }
@@ -3525,8 +3522,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     .get(token.id as usize + 1)
                     .map(|member| {
                         let raw = &engine.source[member.byte_range()];
-                        member.utf16_offset
-                            + raw.chars().map(char::len_utf16).sum::<usize>() as u32
+                        member.utf16_offset + raw.chars().map(char::len_utf16).sum::<usize>() as u32
                     })
                     .unwrap_or_else(|| end.range.end())
             });
@@ -3602,8 +3598,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     .get(operator.id as usize + 1)
                     .map(|member| {
                         let raw = &engine.source[member.byte_range()];
-                        member.utf16_offset
-                            + raw.chars().map(char::len_utf16).sum::<usize>() as u32
+                        member.utf16_offset + raw.chars().map(char::len_utf16).sum::<usize>() as u32
                     })
                     .unwrap_or_else(|| end.range.end())
             });
@@ -3634,8 +3629,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // spellable named shapes ride (the same tree posture the
         // assignment-RHS staging applies); anything else keeps the
         // unknown-result under-report.
-        let staged_call = self.engine.send_return_staging.take().and_then(
-            |(offset, ty)| {
+        let staged_call = self
+            .engine
+            .send_return_staging
+            .take()
+            .and_then(|(offset, ty)| {
                 let Ty::Named {
                     name,
                     nullable,
@@ -3651,8 +3649,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 )?;
                 let lexeme = self.engine.strings.resolve(name).to_string();
                 Some((offset, nullable, lexeme, tree))
-            },
-        );
+            });
         if let Some((offset, nullable, lexeme, tree)) = staged_call {
             let base = self.flow().intern_name(&lexeme);
             self.flow().stage_call_result(
@@ -3726,9 +3723,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 && engine.byte_at(after_op + 3) == Some(b't')
                 && engine.byte_at(after_op + 4) == Some(b'c')
                 && engine.byte_at(after_op + 5) == Some(b'h')
-                && engine
-                    .byte_at(after_op + 6)
-                    .is_none_or(|b| b == b' ' || b == b'(' || b == b'\n' || b == b'\t' || b == b'\r');
+                && engine.byte_at(after_op + 6).is_none_or(|b| {
+                    b == b' ' || b == b'(' || b == b'\n' || b == b'\t' || b == b'\r'
+                });
             if is_switch_rhs {
                 return None;
             }
@@ -3834,21 +3831,16 @@ impl ParserListener for DiagnoseListener<'_> {
                                 // callee row. The bare head would stage a
                                 // `C` write and demote the target's
                                 // promoted `C<int>`.
-                                let rhs_offset = engine
-                                    .rows
-                                    .get(rhs_index)
-                                    .map(|r| r.range.offset);
+                                let rhs_offset = engine.rows.get(rhs_index).map(|r| r.range.offset);
                                 let explicit = engine
                                     .call_type_args
                                     .iter()
                                     .find(|(row, _)| Some(*row) == rhs_offset)
                                     .map(|(_, tys)| tys.clone());
                                 match explicit {
-                                    Some(tys) => engine
-                                        .boundary
-                                        .args
-                                        .borrow_mut()
-                                        .named(*name, false, &tys),
+                                    Some(tys) => {
+                                        engine.boundary.args.borrow_mut().named(*name, false, &tys)
+                                    }
                                     None => Ty::Named {
                                         name: *name,
                                         nullable: false,
@@ -3957,9 +3949,7 @@ impl ParserListener for DiagnoseListener<'_> {
                             ),
                         );
                     } else {
-                        engine
-                            .staged_write_tys
-                            .remove(&engine.rows[target].name);
+                        engine.staged_write_tys.remove(&engine.rows[target].name);
                     }
                 }
                 // The flow face: the head's lexeme plus the written-argument
@@ -4232,9 +4222,10 @@ impl ParserListener for DiagnoseListener<'_> {
                 // exactly like the var-inferred bind's deferred face
                 // (#2506): `!await f()` negates the flattened `bool`.
                 let ty = if ty != Ty::UNKNOWN
-                    && engine.await_operand_extents.iter().any(|&(start, end)| {
-                        row.range.offset >= start && row.range.end() <= end
-                    })
+                    && engine
+                        .await_operand_extents
+                        .iter()
+                        .any(|&(start, end)| row.range.offset >= start && row.range.end() <= end)
                 {
                     engine.flatten(ty)
                 } else {
@@ -4526,7 +4517,7 @@ impl ParserListener for DiagnoseListener<'_> {
             // type made nullable, never the bare member face.
             let operand = engine.operand_row().map_or(Ty::Unknown, |row| {
                 let shorted = engine.null_aware_members.contains(&row.range.offset);
-                
+
                 if shorted && row.ty != Ty::UNKNOWN {
                     Engine::nullable_form(row.ty)
                 } else {
@@ -5429,7 +5420,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 ty if question.is_some() => Engine::nullable_form(ty),
                 ty => ty,
             };
-            
+
             // The operand rows leave the stack, but every operand still
             // owes its pass-2 resolution — the official resolves every
             // subexpression (`builder..foo[bar]`'s `bar` reports its
@@ -5446,8 +5437,10 @@ impl ParserListener for DiagnoseListener<'_> {
             // too: the whole chain node reads nullable, and the chain
             // continuation (`a?.l[i].t`) joins through the value row.
             let shorted = !engine.in_cascade
-                && engine.null_aware_members.contains(&engine.rows[pos].range.offset);
-            
+                && engine
+                    .null_aware_members
+                    .contains(&engine.rows[pos].range.offset);
+
             if shorted {
                 engine.null_aware_members.insert(close.range.offset);
             }
@@ -6041,9 +6034,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // binder face (`AsyncData() && final transformer` — the binder
         // takes the head's type, the matched-type binding for the
         // and-pattern's right operand).
-        if head.is_some()
-            && (engine.switch.case_sink_open || !engine.switch.switches.is_empty())
-        {
+        if head.is_some() && (engine.switch.case_sink_open || !engine.switch.switches.is_empty()) {
             engine.last_case_object_head = head;
         }
         let mut staged_binders: Vec<(Ty, SourceRange)> = Vec::new();
@@ -6084,7 +6075,9 @@ impl ParserListener for DiagnoseListener<'_> {
                         .null_check_binder_candidates
                         .retain(|(name, _)| *name != binder);
                     if let Some(mut ty) = engine.object_pattern_binder_ty(head, getter) {
-                        if field.binder_non_null && let Ty::Named { nullable, .. } = &mut ty {
+                        if field.binder_non_null
+                            && let Ty::Named { nullable, .. } = &mut ty
+                        {
                             *nullable = false;
                         }
                         engine.bind_var_type(binder, ty.clone());
@@ -6632,7 +6625,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // arm's own row, e.g. a `throw`'s `AssertionError` operand).
         let engine = &mut self.engine;
         let mark = engine.switch_expr_marks.pop();
-        
+
         if count > 0
             && let Some(mark) = mark
             && {
@@ -6651,7 +6644,7 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         {
             let scrutinee_end = mark + 1;
-            
+
             if engine.rows.len() > scrutinee_end {
                 for row in engine.rows.drain(mark..) {
                     engine.deferred_miss_rows.push(row);
@@ -7337,7 +7330,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // expression pushes no result row, so the last row's type is the
         // right operand's, not the comparison's `bool`), the parent's
         // `inner_ty` is `bool` — the composite's own static type.
-        let open_offset = engine.record_marks.last().map_or(u32::MAX, |(_, open)| open.range.offset);
+        let open_offset = engine
+            .record_marks
+            .last()
+            .map_or(u32::MAX, |(_, open)| open.range.offset);
         let inner_row = engine.record_marks.last().and_then(|(_, open)| {
             engine
                 .rows
@@ -7903,7 +7899,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 if serial != frame.serial {
                     continue;
                 }
-                
+
                 frame.locals.remove(&name);
                 frame.var_types.remove(&name);
             }
@@ -8236,9 +8232,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // flow lattice cannot spell stay untyped, the under-report
         // posture). A formal with a written annotation never arrives: the
         // written `pending_ty` owns the declaration.
-        if self.engine.formal_written.is_none()
-            && this_keyword.is_none()
-            && super_keyword.is_none()
+        if self.engine.formal_written.is_none() && this_keyword.is_none() && super_keyword.is_none()
         {
             let staged = self
                 .engine
@@ -8640,10 +8634,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // through the written `?`, the same extent the collector arms).
         let range = SourceRange {
             offset: function.range.offset,
-            length: question
-                .map_or(function.range, |q| q.range)
-                .end()
-                - function.range.offset,
+            length: question.map_or(function.range, |q| q.range).end() - function.range.offset,
         };
         self.engine.bounds.end_function(question.is_some(), range);
         self.flow().end_function_type(function, question);
@@ -9115,9 +9106,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // The flow-side staging rides the same bind (the destructured
         // local's VarMeta declared raw-unknown; the element face reaches
         // it through `inferred_locals`, the #2567 seam).
-        for (name, span, ty) in
-            self.engine
-                .destructure_record(equals.range.end(), semicolon.range.offset)
+        for (name, span, ty) in self
+            .engine
+            .destructure_record(equals.range.end(), semicolon.range.offset)
         {
             if let Ty::Named {
                 name: head,
@@ -9991,7 +9982,11 @@ impl Engine<'_> {
                                     })
                             })
                     });
-                    return if has_entry { LeafSide::Map } else { LeafSide::Blind };
+                    return if has_entry {
+                        LeafSide::Map
+                    } else {
+                        LeafSide::Blind
+                    };
                 }
                 _ => {}
             }

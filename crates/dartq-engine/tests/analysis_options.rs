@@ -1698,7 +1698,10 @@ fn the_unique_name_spelling_resolves_for_citation_matching() {
     );
     // Unknown and name-field spellings name nothing through this face.
     assert_eq!(canonical_diagnostic_name("not_a_real_code"), None);
-    assert_eq!(canonical_diagnostic_name("invalid_null_aware_operator"), None);
+    assert_eq!(
+        canonical_diagnostic_name("invalid_null_aware_operator"),
+        None
+    );
     // The joined admission never fires on a dead name.
     let admitted = |citation: &str| {
         is_known_diagnostic_code(citation) || canonical_diagnostic_name(citation).is_some()

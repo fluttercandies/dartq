@@ -84,8 +84,8 @@ use crate::model::{
     MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
-    DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
-    TokenId,
+    DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures,
+    ParserListener, TokenId,
 };
 use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
@@ -571,7 +571,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             field_external: false,
             field_final: false,
             field_augment: None,
-            field_static: None,            pending_member: None,
+            field_static: None,
+            pending_member: None,
             pending_top: None,
             pending_typedef: None,
             ctor_open: None,
@@ -694,11 +695,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// Zips the type-variable group's parallel buffers into the augment
     /// capture's rows: names and bounds from the taken group, spans from the
     /// range buffers (drained — they belong to this group only).
-    fn zip_type_var_rows(
-        &mut self,
-        names: &[StringId],
-        bounds: &[Ty],
-    ) -> Vec<AugmentTypeParam> {
+    fn zip_type_var_rows(&mut self, names: &[StringId], bounds: &[Ty]) -> Vec<AugmentTypeParam> {
         let ranges = std::mem::take(&mut self.type_var_ranges);
         let bound_ranges = std::mem::take(&mut self.type_var_bound_ranges);
         names
@@ -707,9 +704,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .filter_map(|(index, &name)| {
                 let name_range = ranges.get(index).copied()?;
                 let bound = match (bounds.get(index), bound_ranges.get(index)) {
-                    (Some(ty), Some(Some(range))) if *ty != Ty::Dynamic => {
-                        Some((*ty, *range))
-                    }
+                    (Some(ty), Some(Some(range))) if *ty != Ty::Dynamic => Some((*ty, *range)),
                     _ => None,
                 };
                 Some(AugmentTypeParam {
@@ -906,10 +901,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             }
             match bytes.get(i)? {
                 b';' | b',' => break,
-                b'+' | b'-' | b'*' | b'/' | b'%' | b'~' | b'|' | b'^' | b'&'
-                | b'(' | b')' => i += 1,
+                b'+' | b'-' | b'*' | b'/' | b'%' | b'~' | b'|' | b'^' | b'&' | b'(' | b')' => {
+                    i += 1
+                }
                 b'<' | b'>' => {
-                    let run = bytes[i..].iter().take_while(|&&b| b == b'<' || b == b'>').count();
+                    let run = bytes[i..]
+                        .iter()
+                        .take_while(|&&b| b == b'<' || b == b'>')
+                        .count();
                     if run > 3 {
                         return None;
                     }
@@ -962,9 +961,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         Self::skip_literal_ws(&bytes, &mut i);
         // A `const` keyword may ride the literal (`= const <int>[]`).
         if bytes.get(i..i + 5) == Some("const".as_bytes())
-            && bytes
-                .get(i + 5)
-                .is_some_and(|b| b.is_ascii_whitespace())
+            && bytes.get(i + 5).is_some_and(|b| b.is_ascii_whitespace())
         {
             i += 5;
             Self::skip_literal_ws(&bytes, &mut i);
@@ -984,7 +981,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|spelling| self.literal_spelling_ty(spelling))
             .collect();
-        Some(self.type_args.named(self.strings.intern(head), false, &args))
+        Some(
+            self.type_args
+                .named(self.strings.intern(head), false, &args),
+        )
     }
 
     /// The face of an unannotated declarator whose initializer is an
@@ -1112,9 +1112,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         i += 1;
         Self::skip_literal_ws(bytes, &mut i);
         if bytes.get(i..i + 5) == Some(b"const")
-            && bytes
-                .get(i + 5)
-                .is_some_and(|b| b.is_ascii_whitespace())
+            && bytes.get(i + 5).is_some_and(|b| b.is_ascii_whitespace())
         {
             i += 5;
             Self::skip_literal_ws(bytes, &mut i);
@@ -1204,7 +1202,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             {
                 // An empty segment (the trailing comma) or a positional
                 // argument: only the empty tail is admissible.
-                if bytes[label_start..end].iter().all(|b| b.is_ascii_whitespace()) {
+                if bytes[label_start..end]
+                    .iter()
+                    .all(|b| b.is_ascii_whitespace())
+                {
                     continue;
                 }
                 return None;
@@ -1242,10 +1243,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// Parses `<t1, t2, ...>` (the opening `<` at `*i`) into its
     /// top-level spellings, leaving `*i` past the closing `>`.
-    fn parse_literal_spellings(
-        bytes: &[u8],
-        i: &mut usize,
-    ) -> Option<Vec<LiteralTypeSpelling>> {
+    fn parse_literal_spellings(bytes: &[u8], i: &mut usize) -> Option<Vec<LiteralTypeSpelling>> {
         *i += 1;
         let mut spellings = Vec::new();
         loop {
@@ -1329,8 +1327,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|arg| self.literal_spelling_ty(arg))
             .collect();
-        self.type_args
-            .named(self.strings.intern(&spelling.head), spelling.nullable, &args)
+        self.type_args.named(
+            self.strings.intern(&spelling.head),
+            spelling.nullable,
+            &args,
+        )
     }
 
     /// Latches the head identifier of the annotation being parsed (the
@@ -1590,9 +1591,16 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 ContainerKind::ExtensionType => AugKind::ExtensionType,
             };
             let type_params = std::mem::take(&mut open.augment_type_params);
-            let (name, name_range) = open
-                .name
-                .map_or((self.strings.intern(""), SourceRange { offset: 0, length: 0 }), |(n, r)| (n, r));
+            let (name, name_range) = open.name.map_or(
+                (
+                    self.strings.intern(""),
+                    SourceRange {
+                        offset: 0,
+                        length: 0,
+                    },
+                ),
+                |(n, r)| (n, r),
+            );
             self.augmentations.push(AugmentDecl {
                 kind,
                 name,
@@ -2161,7 +2169,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             };
             let (names, bounds) = {
                 let open = builder.containers.last().expect("just opened");
-                (open.type_param_names.clone(), open.type_param_bounds.clone())
+                (
+                    open.type_param_names.clone(),
+                    open.type_param_bounds.clone(),
+                )
             };
             let type_params = builder.zip_type_var_rows(&names, &bounds);
             if let Some(open) = builder.containers.last_mut() {
@@ -2254,7 +2265,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             };
             let (names, bounds) = {
                 let open = builder.containers.last().expect("just opened");
-                (open.type_param_names.clone(), open.type_param_bounds.clone())
+                (
+                    open.type_param_names.clone(),
+                    open.type_param_bounds.clone(),
+                )
             };
             let type_params = builder.zip_type_var_rows(&names, &bounds);
             if let Some(open) = builder.containers.last_mut() {
@@ -2313,7 +2327,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let base_span = base_kw.map(|t| builder.span_of(t));
             let (names, bounds) = {
                 let open = builder.containers.last().expect("just opened");
-                (open.type_param_names.clone(), open.type_param_bounds.clone())
+                (
+                    open.type_param_names.clone(),
+                    open.type_param_bounds.clone(),
+                )
             };
             let type_params = builder.zip_type_var_rows(&names, &bounds);
             if let Some(open) = builder.containers.last_mut() {
@@ -2346,7 +2363,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let span = builder.span_of(kw);
             let (names, bounds) = {
                 let open = builder.containers.last().expect("just opened");
-                (open.type_param_names.clone(), open.type_param_bounds.clone())
+                (
+                    open.type_param_names.clone(),
+                    open.type_param_bounds.clone(),
+                )
             };
             let type_params = builder.zip_type_var_rows(&names, &bounds);
             if let Some(open) = builder.containers.last_mut() {
@@ -2394,7 +2414,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let span = builder.span_of(kw);
             let (names, bounds) = {
                 let open = builder.containers.last().expect("just opened");
-                (open.type_param_names.clone(), open.type_param_bounds.clone())
+                (
+                    open.type_param_names.clone(),
+                    open.type_param_bounds.clone(),
+                )
             };
             let type_params = builder.zip_type_var_rows(&names, &bounds);
             if let Some(open) = builder.containers.last_mut() {
@@ -2428,7 +2451,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let span = builder.span_of(kw);
             let (names, bounds) = {
                 let open = builder.containers.last().expect("just opened");
-                (open.type_param_names.clone(), open.type_param_bounds.clone())
+                (
+                    open.type_param_names.clone(),
+                    open.type_param_bounds.clone(),
+                )
             };
             let type_params = builder.zip_type_var_rows(&names, &bounds);
             if let Some(open) = builder.containers.last_mut() {
@@ -2829,8 +2855,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // `join_qualified` matches it by id — a fresh reference
                 // overwrites any stale latch, a synthetic prefix (no
                 // honest name) clears it.
-                builder.pending_qualified = name_with_range
-                    .map(|(name, _)| (token.id, name, StringId::NONE));
+                builder.pending_qualified =
+                    name_with_range.map(|(name, _)| (token.id, name, StringId::NONE));
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 // The return type parsed between the begin event and the
@@ -2931,10 +2957,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             let name_end = if builder.source.is_ascii() {
                                 range.end()
                             } else {
-                                dartq_source::utf16_offset_to_byte(
-                                    builder.source,
-                                    range.end(),
-                                ) as u32
+                                dartq_source::utf16_offset_to_byte(builder.source, range.end())
+                                    as u32
                             };
                             if let Some(face) = builder.const_creation_face(name_end) {
                                 builder.const_creations.insert(name, face);
@@ -3365,10 +3389,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.declaring_augment = augment_kw.is_some();
         if let (Some(kw), Some((spelling, range))) = (augment_kw, shape.map(|(s, _, r)| (s, r))) {
             let accessor = get_or_set.and_then(|t| builder.name_of(t));
-            let kind = match accessor
-                .map(|id| builder.strings.resolve(id))
-                .unwrap_or("")
-            {
+            let kind = match accessor.map(|id| builder.strings.resolve(id)).unwrap_or("") {
                 "get" => AugKind::Getter,
                 "set" => AugKind::Setter,
                 _ => AugKind::Method,
@@ -3383,7 +3404,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 display_name,
                 name_range: range,
                 augment_kw: builder.span_of(kw),
-                container: builder.containers.last().and_then(|open| open.name).map(|(n, _)| n),
+                container: builder
+                    .containers
+                    .last()
+                    .and_then(|open| open.name)
+                    .map(|(n, _)| n),
                 is_static: static_kw.is_some(),
                 type_params: Vec::new(),
                 type_params_close: None,
@@ -3554,7 +3579,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 kind: AugKind::Function,
                 name: builder.strings.intern(""),
                 display_name: builder.strings.intern(""),
-                name_range: SourceRange { offset: 0, length: 0 },
+                name_range: SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
                 augment_kw: builder.span_of(kw),
                 container: None,
                 is_static: false,
@@ -3749,7 +3777,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             .get(_last_consumed.id as usize)
             .filter(|t| &builder.source[t.byte_range()] == "factory")
             // The ASCII literal matched above: byte length == UTF-16 length.
-            .map(|t| SourceRange { offset: t.utf16_offset, length: t.byte_len });
+            .map(|t| SourceRange {
+                offset: t.utf16_offset,
+                length: t.byte_len,
+            });
         builder.declaring_augment = augment_kw.is_some();
         if let Some(kw) = augment_kw
             && let Some(open) = builder.containers.last()
@@ -3759,7 +3790,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 kind: AugKind::Constructor,
                 name: container,
                 display_name: container,
-                name_range: open.name.map_or(SourceRange { offset: 0, length: 0 }, |(_, r)| r),
+                name_range: open.name.map_or(
+                    SourceRange {
+                        offset: 0,
+                        length: 0,
+                    },
+                    |(_, r)| r,
+                ),
                 augment_kw: builder.span_of(kw),
                 container: Some(container),
                 is_static: false,
@@ -3840,7 +3877,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             }
         }
         let augment_selector = if capture_named.is_empty() {
-            builder.containers.last().and_then(|open| open.name).map(|(n, _)| n)
+            builder
+                .containers
+                .last()
+                .and_then(|open| open.name)
+                .map(|(n, _)| n)
         } else {
             capture_named.first().copied()
         };
@@ -3980,7 +4021,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 kind: AugKind::Constructor,
                 name: container,
                 display_name: container,
-                name_range: open.name.map_or(SourceRange { offset: 0, length: 0 }, |(_, r)| r),
+                name_range: open.name.map_or(
+                    SourceRange {
+                        offset: 0,
+                        length: 0,
+                    },
+                    |(_, r)| r,
+                ),
                 augment_kw: builder.span_of(kw),
                 container: Some(container),
                 is_static: false,
@@ -4053,7 +4100,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             }
         }
         let augment_selector = if ctor_selectors.is_empty() {
-            builder.containers.last().and_then(|open| open.name).map(|(n, _)| n)
+            builder
+                .containers
+                .last()
+                .and_then(|open| open.name)
+                .map(|(n, _)| n)
         } else {
             ctor_selectors.first().copied()
         };
@@ -4233,7 +4284,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if builder.formal_depth == 0 {
             let open_span = builder.span_of(_token);
             if let Some(pending) = &mut builder.pending_aug {
-                pending.parens = Some((open_span, SourceRange { offset: 0, length: 0 }));
+                pending.parens = Some((
+                    open_span,
+                    SourceRange {
+                        offset: 0,
+                        length: 0,
+                    },
+                ));
             }
         }
         // Every depth-0 group opens a fresh formal list. Sibling top-level
@@ -4413,9 +4470,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let ty = builder.take_armed();
         // The augment capture's own formal row: the written type pair and
         // the modifier spans the parameter checks compare.
-        if let (Some(pending), Some((start, covariant_kw, required_kw))) =
-            (builder.pending_aug.as_mut(), builder.aug_formal_start.take())
-        {
+        if let (Some(pending), Some((start, covariant_kw, required_kw))) = (
+            builder.pending_aug.as_mut(),
+            builder.aug_formal_start.take(),
+        ) {
             let explicit_ty = (ty != Ty::UNKNOWN && ty != Ty::Never)
                 .then_some(ty)
                 .zip(builder.armed_ty_range.take());
@@ -5910,11 +5968,7 @@ fn numeric_literal_shape(bytes: &[u8]) -> Option<LiteralShape> {
     // An exponent marker without a following digit (`1e`) is not a
     // literal this face claims; the leading position rules out `e`
     // starting the run (the digit-first caller guarantees it).
-    if saw_exp
-        && !bytes
-            .iter()
-            .any(|&b| b.is_ascii_digit() && b != b'_')
-    {
+    if saw_exp && !bytes.iter().any(|&b| b.is_ascii_digit() && b != b'_') {
         return None;
     }
     Some(if saw_dot || saw_exp {

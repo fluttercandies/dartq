@@ -88,11 +88,7 @@ fn unit_report(source: &str) -> FileReport {
 }
 
 fn codes(report: &FileReport) -> Vec<&str> {
-    report
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect()
+    report.diagnostics.iter().map(|d| d.code.name).collect()
 }
 
 // —— A2a: generator-body promotion loss ——————————————————————————————————————

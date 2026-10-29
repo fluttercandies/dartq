@@ -101,13 +101,11 @@ fn run() -> Result<(), Failure> {
     let pin = Pin::load().map_err(|e| (format!("conformance pin: {e}"), 1))?;
     let checkout_stamp = pin.verify_checkout(&sdk_src).map_err(|e| (e, 1))?;
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = out.unwrap_or_else(|| {
-        manifest.join("../../crates/dartq-lints/src/generated/rule_meta.rs")
+    let out =
+        out.unwrap_or_else(|| manifest.join("../../crates/dartq-lints/src/generated/rule_meta.rs"));
+    let docs_out = docs_out.unwrap_or_else(|| {
+        manifest.join("../../crates/dartq-diagnostics/src/generated/lint_docs_table.rs")
     });
-    let docs_out =
-        docs_out.unwrap_or_else(|| {
-            manifest.join("../../crates/dartq-diagnostics/src/generated/lint_docs_table.rs")
-        });
 
     let read = |path: &Path| -> Result<String, Failure> {
         fs::read_to_string(path).map_err(|e| (format!("reading {}: {e}", path.display()), 1))
@@ -116,9 +114,9 @@ fn run() -> Result<(), Failure> {
     let entries = parse_messages(&messages).map_err(|e| (e, 1))?;
     let lint_names = read(&sdk_src.join("pkg/linter/lib/src/lint_names.g.dart"))?;
     validate_names(&entries, &lint_names).map_err(|e| (e, 1))?;
-    let versions = version_consts(&read(&sdk_src.join(
-        "pkg/analyzer/lib/analysis_rule/rule_state.dart",
-    ))?);
+    let versions = version_consts(&read(
+        &sdk_src.join("pkg/analyzer/lib/analysis_rule/rule_state.dart"),
+    )?);
     let mut rule_files: Vec<(String, String)> = Vec::new();
     let rules_dir = sdk_src.join("pkg/linter/lib/src/rules");
     let mut names: Vec<String> = fs::read_dir(&rules_dir)
@@ -233,7 +231,11 @@ fn print_tally(rows: &[RuleRow], entries: &[linter_meta::ConstEntry]) {
         }
     }
     println!("rows: {}", rows.len());
-    println!("consts: {} ({} multi-variant families)", entries.len(), multi);
+    println!(
+        "consts: {} ({} multi-variant families)",
+        entries.len(),
+        multi
+    );
     println!("by group: {groups:?}");
     println!("by state: {states:?}");
 }

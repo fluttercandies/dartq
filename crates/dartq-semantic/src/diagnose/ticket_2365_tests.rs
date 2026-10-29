@@ -167,7 +167,12 @@ fn non_callable_bare_invocation_keeps_non_function_face() {
                   \x20}";
     let report = report(source);
     let at = codes(&report, "invocation_of_non_function_expression");
-    assert_eq!(at, vec![source.find("p(1)").unwrap() as u32], "{:?}", report.diagnostics);
+    assert_eq!(
+        at,
+        vec![source.find("p(1)").unwrap() as u32],
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// The dot-spelled control: `body.call(inner)` resolves the same `call`

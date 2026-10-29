@@ -364,16 +364,24 @@ mod tests {
         };
         let mut out = Vec::new();
         write_json(&mut out, &output).expect("write");
-        let envelope: serde_json::Value =
-            serde_json::from_slice(&out).expect("one JSON object");
+        let envelope: serde_json::Value = serde_json::from_slice(&out).expect("one JSON object");
         let rows = envelope["diagnostics"].as_array().expect("rows");
-        assert_eq!(rows[0]["documentation"], "https://dart.dev/diagnostics/avoid_empty_else");
+        assert_eq!(
+            rows[0]["documentation"],
+            "https://dart.dev/diagnostics/avoid_empty_else"
+        );
         assert_eq!(
             rows[1]["documentation"],
             "https://dart.dev/lints/always_require_non_null_named_parameters"
         );
-        assert!(rows[2].get("documentation").is_none(), "plugin lint: no URL");
-        assert!(rows[3].get("documentation").is_none(), "unpublished analyzer code");
+        assert!(
+            rows[2].get("documentation").is_none(),
+            "plugin lint: no URL"
+        );
+        assert!(
+            rows[3].get("documentation").is_none(),
+            "unpublished analyzer code"
+        );
         assert_eq!(
             rows[4]["documentation"],
             "https://dart.dev/diagnostics/built_in_identifier_in_declaration",

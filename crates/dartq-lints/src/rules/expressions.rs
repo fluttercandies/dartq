@@ -109,114 +109,18 @@ fn written_type_sibling(c: &Check<'_>, var: u32, kinds: &[NodeKind]) -> Option<u
 }
 
 // Per-rule modules (mechanical split 2026-10-19; registry paths unchanged).
-pub(crate) mod literal_only_boolean_expressions;
 pub(crate) mod avoid_bool_literals_in_conditional_expressions;
-pub(crate) mod unnecessary_parenthesis;
-pub(crate) mod prefer_int_literals;
-pub(crate) mod unnecessary_new;
-pub(crate) mod unnecessary_null_in_if_null_operators;
-pub(crate) mod prefer_is_not_operator;
-pub(crate) mod unnecessary_type_check;
-pub(crate) mod prefer_adjacent_string_concatenation;
-pub(crate) mod avoid_single_cascade_in_expression_statements;
-pub(crate) mod prefer_conditional_assignment;
-pub(crate) mod prefer_if_null_operators;
-pub(crate) mod prefer_null_aware_method_calls;
-pub(crate) mod prefer_null_aware_operators;
-pub(crate) mod unnecessary_null_aware_assignments;
-pub(crate) mod prefer_contains;
-pub(crate) mod unnecessary_const;
-pub(crate) mod prefer_is_empty;
-pub(crate) mod prefer_is_not_empty;
-pub(crate) mod avoid_function_literals_in_foreach_calls;
-/// Same-file declaration facts for the rules that stand in for an
-/// element-model face (`null_closures` type chains, `unnecessary_this`
-/// shadow bail). Everything here is same-file only: a name that resolves to
-/// another file stays `Unknown` and lands in the caller's documented
-/// fallback family. `prefer_collection_literals` (collections.rs) reads the
-/// same scan for its typedef/shadow exemptions.
-pub(crate) mod same_file;
-pub(crate) mod null_closures;
-pub(crate) mod unnecessary_this;
-pub(crate) mod prefer_interpolation_to_compose_strings;
-pub(crate) mod prefer_final_fields;
-pub(crate) mod await_only_futures;
-pub(crate) mod unrelated_type_equality_checks;
-pub(crate) mod no_literal_bool_comparisons;
-pub(crate) mod void_checks;
-pub(crate) mod null_check_on_nullable_type_parameter;
-pub(crate) mod implicit_call_tearoffs;
-pub(crate) mod invalid_runtime_check_with_js_interop_types;
 pub(crate) mod avoid_double_and_int_checks;
-pub(crate) mod avoid_js_rounded_ints;
-pub(crate) mod unnecessary_statements;
-pub(crate) mod avoid_null_checks_in_equality_operators;
-pub(crate) mod noop_primitive_operations;
-pub(crate) mod unnecessary_lambdas;
-pub(crate) mod prefer_expression_function_bodies;
-#[cfg(test)]
-mod tests;
-/// The W3 (#992) production-bridge pins: `no_literal_bool_comparisons` over
-/// real parser trees.
-#[cfg(test)]
-mod w3_pins;
-#[cfg(test)]
-mod w4_pins;
-/// The wildcard-name family: a multi-underscore parameter or local whose
-/// name the wildcard-variables feature (Dart 3.7) makes redundant.
-pub(crate) mod unnecessary_underscores;
-pub(crate) mod cascade_invocations;
-pub(crate) mod do_not_use_environment;
-pub(crate) mod only_throw_errors;
-pub(crate) mod unnecessary_await_in_return;
-pub(crate) mod use_if_null_to_convert_nulls_to_bools;
-pub(crate) mod use_is_even_rather_than_modulo;
-/// The static-type-consumer family's shared faces: the piece-run static
-/// type over the semantic query row (`Ty`), the exact single-name
-/// receiver of a member selector, the unparenthesized root, and the
-/// explicit-cast bail the official dynamic rules read. Every consumer
-/// keeps the wave posture: the face absent means the rule stays silent.
-pub(crate) mod static_type_faces;
 pub(crate) mod avoid_dynamic_calls;
-pub(crate) mod no_dynamic_casts;
-pub(crate) mod avoid_type_to_string;
-pub(crate) mod cast_nullable_to_non_nullable;
-pub(crate) mod unnecessary_null_checks;
-pub(crate) mod unnecessary_unawaited;
-/// The GAP-1 static-type-consumer wave's production-bridge pins: each rule
-/// runs with the semantic face mounted (the #1049 face construction), so
-/// the pins decide the tiling reading, not just the registration.
-#[cfg(test)]
-mod gap1_pins;
-pub(crate) mod discarded_futures;
-pub(crate) mod unawaited_futures;
-/// The shared walk behind `discarded_futures` and `unawaited_futures` (the
-/// upstream `util/unused_futures.dart` visitor): a `Future`/`FutureOr`-typed
-/// expression dropped as a statement reports at its selector. `want_async`
-/// is the context gate — `discarded_futures` wants sync bodies,
-/// `unawaited_futures` async ones.
-mod unused_futures;
-pub(crate) mod unnecessary_null_aware_operator_on_extension_on_nullable;
-pub(crate) mod use_truncating_division;
-/// The GAP-1 tranche-2 static-type-consumer wave's production-bridge pins:
-/// each rule runs with the semantic face mounted (the #1049 face
-/// construction), so the pins decide the tiling reading, not just the
-/// registration.
-#[cfg(test)]
-mod gap1_pins_t2;
+pub(crate) mod avoid_function_literals_in_foreach_calls;
+pub(crate) mod avoid_js_rounded_ints;
+pub(crate) mod avoid_null_checks_in_equality_operators;
 pub(crate) mod avoid_print;
-pub(crate) mod no_runtimetype_tostring;
-pub(crate) mod prefer_const_constructors;
-pub(crate) mod use_named_constants;
 pub(crate) mod avoid_redundant_argument_values;
+pub(crate) mod avoid_single_cascade_in_expression_statements;
 pub(crate) mod avoid_slow_async_io;
-pub(crate) mod future_sync_value;
-pub(crate) mod unnecessary_this_alias;
-/// The W2-remainder expression rules' production-bridge pins: each rule
-/// runs with the semantic face mounted (the gap1 face construction), so
-/// the pins decide the tiling reading, not just the registration.
-#[cfg(test)]
-mod w2_expr_pins;
+pub(crate) mod avoid_type_to_string;
+pub(crate) mod await_only_futures;
 /// The #589 W-A B4 wave's production-bridge pins: the four rules turned
 /// resolution-bound (`literal_only_boolean_expressions`,
 /// `noop_primitive_operations`, `unnecessary_statements`,
@@ -225,3 +129,99 @@ mod w2_expr_pins;
 /// cross-library closures.
 #[cfg(test)]
 mod b4_expr_pins;
+pub(crate) mod cascade_invocations;
+pub(crate) mod cast_nullable_to_non_nullable;
+pub(crate) mod discarded_futures;
+pub(crate) mod do_not_use_environment;
+pub(crate) mod future_sync_value;
+/// The GAP-1 static-type-consumer wave's production-bridge pins: each rule
+/// runs with the semantic face mounted (the #1049 face construction), so
+/// the pins decide the tiling reading, not just the registration.
+#[cfg(test)]
+mod gap1_pins;
+/// The GAP-1 tranche-2 static-type-consumer wave's production-bridge pins:
+/// each rule runs with the semantic face mounted (the #1049 face
+/// construction), so the pins decide the tiling reading, not just the
+/// registration.
+#[cfg(test)]
+mod gap1_pins_t2;
+pub(crate) mod implicit_call_tearoffs;
+pub(crate) mod invalid_runtime_check_with_js_interop_types;
+pub(crate) mod literal_only_boolean_expressions;
+pub(crate) mod no_dynamic_casts;
+pub(crate) mod no_literal_bool_comparisons;
+pub(crate) mod no_runtimetype_tostring;
+pub(crate) mod noop_primitive_operations;
+pub(crate) mod null_check_on_nullable_type_parameter;
+pub(crate) mod null_closures;
+pub(crate) mod only_throw_errors;
+pub(crate) mod prefer_adjacent_string_concatenation;
+pub(crate) mod prefer_conditional_assignment;
+pub(crate) mod prefer_const_constructors;
+pub(crate) mod prefer_contains;
+pub(crate) mod prefer_expression_function_bodies;
+pub(crate) mod prefer_final_fields;
+pub(crate) mod prefer_if_null_operators;
+pub(crate) mod prefer_int_literals;
+pub(crate) mod prefer_interpolation_to_compose_strings;
+pub(crate) mod prefer_is_empty;
+pub(crate) mod prefer_is_not_empty;
+pub(crate) mod prefer_is_not_operator;
+pub(crate) mod prefer_null_aware_method_calls;
+pub(crate) mod prefer_null_aware_operators;
+/// Same-file declaration facts for the rules that stand in for an
+/// element-model face (`null_closures` type chains, `unnecessary_this`
+/// shadow bail). Everything here is same-file only: a name that resolves to
+/// another file stays `Unknown` and lands in the caller's documented
+/// fallback family. `prefer_collection_literals` (collections.rs) reads the
+/// same scan for its typedef/shadow exemptions.
+pub(crate) mod same_file;
+/// The static-type-consumer family's shared faces: the piece-run static
+/// type over the semantic query row (`Ty`), the exact single-name
+/// receiver of a member selector, the unparenthesized root, and the
+/// explicit-cast bail the official dynamic rules read. Every consumer
+/// keeps the wave posture: the face absent means the rule stays silent.
+pub(crate) mod static_type_faces;
+#[cfg(test)]
+mod tests;
+pub(crate) mod unawaited_futures;
+pub(crate) mod unnecessary_await_in_return;
+pub(crate) mod unnecessary_const;
+pub(crate) mod unnecessary_lambdas;
+pub(crate) mod unnecessary_new;
+pub(crate) mod unnecessary_null_aware_assignments;
+pub(crate) mod unnecessary_null_aware_operator_on_extension_on_nullable;
+pub(crate) mod unnecessary_null_checks;
+pub(crate) mod unnecessary_null_in_if_null_operators;
+pub(crate) mod unnecessary_parenthesis;
+pub(crate) mod unnecessary_statements;
+pub(crate) mod unnecessary_this;
+pub(crate) mod unnecessary_this_alias;
+pub(crate) mod unnecessary_type_check;
+pub(crate) mod unnecessary_unawaited;
+/// The wildcard-name family: a multi-underscore parameter or local whose
+/// name the wildcard-variables feature (Dart 3.7) makes redundant.
+pub(crate) mod unnecessary_underscores;
+pub(crate) mod unrelated_type_equality_checks;
+/// The shared walk behind `discarded_futures` and `unawaited_futures` (the
+/// upstream `util/unused_futures.dart` visitor): a `Future`/`FutureOr`-typed
+/// expression dropped as a statement reports at its selector. `want_async`
+/// is the context gate — `discarded_futures` wants sync bodies,
+/// `unawaited_futures` async ones.
+mod unused_futures;
+pub(crate) mod use_if_null_to_convert_nulls_to_bools;
+pub(crate) mod use_is_even_rather_than_modulo;
+pub(crate) mod use_named_constants;
+pub(crate) mod use_truncating_division;
+pub(crate) mod void_checks;
+/// The W2-remainder expression rules' production-bridge pins: each rule
+/// runs with the semantic face mounted (the gap1 face construction), so
+/// the pins decide the tiling reading, not just the registration.
+#[cfg(test)]
+mod w2_expr_pins;
+/// The W3 (#992) production-bridge pins: `no_literal_bool_comparisons` over
+/// real parser trees.
+#[cfg(test)]
+mod w3_pins;
+#[cfg(test)]
+mod w4_pins;

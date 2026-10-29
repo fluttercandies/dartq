@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// `x == null ? a : x` → `x ?? a` (the official `ConvertToIfNull`
 /// replacement text: nullable operand, `??`, default arm — parenthesized
 /// when the arm is itself a bare conditional).

@@ -1,4 +1,4 @@
-use super::{PayloadField, Check, NodeKind, RuleSpec};
+use super::{Check, NodeKind, PayloadField, RuleSpec};
 use crate::rules::{first_child, slice};
 
 /// The source-head row of the paren's inner expression (the outermost
@@ -494,11 +494,7 @@ fn has_null_aware_token(c: &Check<'_>, node: u32) -> bool {
 
 /// The name of the selector that follows the paren in the owner slice,
 /// when a covering access marker confirms the paren is the target.
-fn access_selector_name<'a>(
-    c: &'a Check<'_>,
-    owner_kids: &[u32],
-    pos: usize,
-) -> Option<&'a str> {
+fn access_selector_name<'a>(c: &'a Check<'_>, owner_kids: &[u32], pos: usize) -> Option<&'a str> {
     let selector = *owner_kids.get(pos + 1)?;
     if c.kind(selector) != NodeKind::Identifier {
         return None;

@@ -380,7 +380,9 @@ impl ParserListener for SharedFlow<'_> {
     }
 
     fn handle_binary_rhs_end(&mut self, operator: Token, rhs_last: Token) {
-        self.0.borrow_mut().handle_binary_rhs_end(operator, rhs_last);
+        self.0
+            .borrow_mut()
+            .handle_binary_rhs_end(operator, rhs_last);
     }
 
     fn begin_const_expression(&mut self, const_keyword: Token) {
@@ -1786,9 +1788,7 @@ impl ParserListener for SharedFlow<'_> {
     }
 
     fn handle_for_updaters_end(&mut self, updaters_last: Token) {
-        self.0
-            .borrow_mut()
-            .handle_for_updaters_end(updaters_last);
+        self.0.borrow_mut().handle_for_updaters_end(updaters_last);
     }
 
     fn begin_for_in_body(&mut self, token: Token) {
@@ -2145,7 +2145,9 @@ impl ParserListener for SharedFlow<'_> {
     }
 
     fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {
-        self.0.borrow_mut().handle_else_control_flow(else_kw, else_start);
+        self.0
+            .borrow_mut()
+            .handle_else_control_flow(else_kw, else_start);
     }
 
     fn end_if_control_flow(&mut self, token: Token) {

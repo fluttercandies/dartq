@@ -7,8 +7,8 @@
 //! is `dart:ffi`, and every byte-level capture (`@Native`, `@Array`,
 //! `@Packed`, the invocation shapes) runs exactly as in the engine.
 
-use super::test_rig::{rows, report_ops_imports, CORE_PRELUDE, RigImport};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, RigImport, report_ops_imports, rows};
 
 /// The `dart:ffi` mount: the compound roots, the generic natives, and
 /// the primitive types the trigger shapes write. Identity for the
@@ -95,7 +95,8 @@ fn assert_row(report: &FileReport, code: &str, offset: usize, length: u32) {
         .find(|d| d.code.name == code)
         .unwrap_or_else(|| panic!("missing {code}; rows: {:#?}", rows(report)));
     assert_eq!(
-        hit.range.offset as usize, offset,
+        hit.range.offset as usize,
+        offset,
         "offset for {code}; rows: {:#?}",
         rows(report)
     );
@@ -195,12 +196,7 @@ fn argument_must_be_a_constant() {
              \nint exceptionalReturn() => 0;\n\
              \nvoid g() {\n\
              \x20 Pointer.fromFunction<Int8 Function(Int8)>(f, exceptionalReturn());\n}\n";
-    assert_row(
-        &report(f),
-        "argument_must_be_a_constant",
-        at(f, 8, 48),
-        19,
-    );
+    assert_row(&report(f), "argument_must_be_a_constant", at(f, 8, 48), 19);
 }
 
 #[test]
@@ -480,12 +476,7 @@ fn negative_variable_dimension() {
     let f = "\nfinal class MyStruct extends Struct {\n\
              \x20 @Array.variableWithVariableDimension(-1)\n\
              \x20 external Array<Uint8> a0;\n}\n";
-    assert_row(
-        &report(f),
-        "negative_variable_dimension",
-        at(f, 4, 40),
-        2,
-    );
+    assert_row(&report(f), "negative_variable_dimension", at(f, 4, 40), 2);
 }
 
 #[test]
@@ -512,12 +503,7 @@ fn non_native_function_type_argument_to_pointer() {
 fn non_positive_array_dimension() {
     let f = "\nfinal class MyStruct extends Struct {\n  @Array(-8)\n\
              \x20 external Array<Uint8> a0;\n}\n";
-    assert_row(
-        &report(f),
-        "non_positive_array_dimension",
-        at(f, 4, 10),
-        2,
-    );
+    assert_row(&report(f), "non_positive_array_dimension", at(f, 4, 10), 2);
 }
 
 #[test]

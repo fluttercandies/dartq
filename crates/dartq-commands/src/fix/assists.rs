@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The evidence one built-in assist producer reads: the file text, the
 /// request selection (`[offset, offset + length)` in UTF-16), and the
 /// parsed unit substrate (token stream plus the arena tree) built once per
@@ -503,7 +502,12 @@ pub(crate) fn node_span16(
 /// expression layer spreads operand rows beside their containers, so when
 /// the direct-child peel finds no covering child the window is scanned
 /// for the smallest covering row (the deep leaf the peel skipped).
-pub(crate) fn covering_node(tokens: &TokenTable, text: &str, ast: &SyntaxTable, offset16: u32) -> Option<u32> {
+pub(crate) fn covering_node(
+    tokens: &TokenTable,
+    text: &str,
+    ast: &SyntaxTable,
+    offset16: u32,
+) -> Option<u32> {
     let covers = |id: u32| {
         node_span16(tokens, text, ast, id).filter(|span| {
             span.start < span.end && (span.contains(&offset16) || span.end == offset16)
@@ -611,18 +615,24 @@ pub(crate) fn convert_quotes_direction(
     convert_quotes(context.tokens, context.text, &span, Some(to_single))
 }
 
-pub(crate) fn convert_quotes_to_single(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_quotes_to_single(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     Some(vec![convert_quotes_direction(context, true)?])
 }
 
-pub(crate) fn convert_quotes_to_double(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_quotes_to_double(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     Some(vec![convert_quotes_direction(context, false)?])
 }
 
 /// `convert.toMultilineString` (`ConvertToMultilineString`): the opening
 /// quote character becomes the triple quote plus a newline, the closing
 /// quote the triple quote — raw literals keep their prefix.
-pub(crate) fn convert_to_multiline_string(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_multiline_string(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let text = context.text;
     let span = string_literal_span(context)?;
     let head = slice16(text, &(span.start..span.start + 2))?;
@@ -664,7 +674,9 @@ pub(crate) fn convert_to_multiline_string(context: &AssistContext<'_>) -> Option
 /// value is integral loses its fraction — the tail after the `.` deletes
 /// verbatim, separators included — and an exponential spelling rewrites
 /// whole (the producer's two legs).
-pub(crate) fn convert_to_int_literal(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_int_literal(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let text = context.text;
     let token = covering_token(context)?;
     if context.tokens.get(token)?.kind != TokenKind::Double {
@@ -780,7 +792,9 @@ pub(crate) fn add_separators(digits: &str, per_group: usize, minimum: usize) -> 
 
 /// `remove.digitSeparators` (`RemoveDigitSeparators`): every `_` leaves
 /// the literal; an unchanged lexeme never offers.
-pub(crate) fn remove_digit_separators(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn remove_digit_separators(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let text = context.text;
     let token = covering_token(context)?;
     if !matches!(
@@ -804,7 +818,9 @@ pub(crate) fn remove_digit_separators(context: &AssistContext<'_>) -> Option<Vec
 /// head line holds the selection, each line verified to sit in a token
 /// gap — a `///`-shaped line inside a multiline string never verifies.
 /// Returns the run's span plus its style (`"line"` / `"block"`).
-pub(crate) fn doc_comment_at(context: &AssistContext<'_>) -> Option<(core::ops::Range<u32>, &'static str)> {
+pub(crate) fn doc_comment_at(
+    context: &AssistContext<'_>,
+) -> Option<(core::ops::Range<u32>, &'static str)> {
     let text = context.text;
     let byte = utf16_offset_to_byte(text, context.selection.start);
     let line_start = text[..byte].rfind('\n').map_or(0, |i| i + 1);
@@ -1036,7 +1052,11 @@ pub(crate) fn child_of_kind(ast: &SyntaxTable, id: u32, wanted: NodeKind) -> Opt
 
 /// The first logical child of `id` with the given kind (the flat-layer
 /// child read — see [`logical_children`]).
-pub(crate) fn logical_child_of_kind(context: &AssistContext<'_>, id: u32, wanted: NodeKind) -> Option<u32> {
+pub(crate) fn logical_child_of_kind(
+    context: &AssistContext<'_>,
+    id: u32,
+    wanted: NodeKind,
+) -> Option<u32> {
     logical_children(context, id)
         .into_iter()
         .find(|&child| context.ast.kind(child) == wanted)
@@ -1170,7 +1190,12 @@ pub(crate) fn expression_extent_start(
 /// expression leaves (a `Type`'s own nullable suffix keeps it); a
 /// `)`/`]`/`}` clips only when its opener lies outside the node's own
 /// range (the enclosing group's close).
-pub(crate) fn expression_end16(tokens: &TokenTable, text: &str, ast: &SyntaxTable, id: u32) -> Option<u32> {
+pub(crate) fn expression_end16(
+    tokens: &TokenTable,
+    text: &str,
+    ast: &SyntaxTable,
+    id: u32,
+) -> Option<u32> {
     let range = ast.token_range(id);
     // The last real token of the range: synthetic zero-width marks (the
     // `[]` bracket pair) ride at the tail without text of their own.
@@ -1245,7 +1270,10 @@ pub(crate) fn expression_extent(
 
 /// The whitespace-trimmed sub-span of `text` inside `span` (`None` when
 /// nothing but whitespace remains).
-pub(crate) fn trim_span16(text: &str, span: core::ops::Range<u32>) -> Option<core::ops::Range<u32>> {
+pub(crate) fn trim_span16(
+    text: &str,
+    span: core::ops::Range<u32>,
+) -> Option<core::ops::Range<u32>> {
     let content = slice16(text, &span)?;
     let start_trim = content.len() - content.trim_start().len();
     let end_trim = content.len() - content.trim_end().len();
@@ -1396,7 +1424,13 @@ pub(crate) fn sort_edits(mut edits: Vec<(u32, u32, String)>) -> Vec<(u32, u32, S
 /// Re-indents every line of `source` from `old_indent` to `new_indent`
 /// (the official `replaceSourceIndent` posture), with a trailing eol
 /// ensured when asked.
-pub(crate) fn reindent(source: &str, old_indent: &str, new_indent: &str, eol: &str, trailing: bool) -> String {
+pub(crate) fn reindent(
+    source: &str,
+    old_indent: &str,
+    new_indent: &str,
+    eol: &str,
+    trailing: bool,
+) -> String {
     let body = source.strip_suffix(eol).unwrap_or(source);
     let mut out = String::with_capacity(body.len() + new_indent.len());
     for (index, line) in body.split(eol).enumerate() {
@@ -1647,7 +1681,10 @@ pub(crate) fn condition_text<'a>(context: &AssistContext<'a>, parts: &IfParts) -
 
 /// `shouldWrapParenthesisBeforeAnd`: only a binary expression binding
 /// looser than `&&` wraps — a depth-0 `||` or `??` in the span.
-pub(crate) fn binds_looser_than_and(context: &AssistContext<'_>, span: &core::ops::Range<u32>) -> bool {
+pub(crate) fn binds_looser_than_and(
+    context: &AssistContext<'_>,
+    span: &core::ops::Range<u32>,
+) -> bool {
     let open = match token_at(context.tokens, span.start) {
         Some(index) => index,
         None => return false,
@@ -1853,7 +1890,9 @@ pub(crate) fn convert_to_is_not(context: &AssistContext<'_>) -> Option<Vec<(u32,
 /// `x.isNotEmpty`. The element-resolution guards (the property must exist
 /// and carry `isNotEmpty`) are beyond the token substrate — the shape
 /// (`!` prefix, `.isEmpty` property access) is what verifies here.
-pub(crate) fn convert_to_is_not_empty(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_is_not_empty(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let identifier = covering_token(context)?;
     if context.tokens.lexeme(context.text, identifier) != "isEmpty" {
         return None;
@@ -1907,7 +1946,9 @@ pub(crate) fn convert_to_is_not_empty(context: &AssistContext<'_>) -> Option<Vec
 /// source-text prefix of the non-null arm's access chain (the official
 /// walk compares node texts the same way), the chain's first separator
 /// gains the `?`, and the rest deletes.
-pub(crate) fn convert_to_null_aware(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_null_aware(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -2311,7 +2352,9 @@ pub(crate) fn token_end16(tokens: &TokenTable, text: &str, index: usize) -> Opti
 /// `convert.conditionalToIfElse` (`ReplaceConditionalWithIfElse`): the
 /// conditional in a `return`, an `=` assignment, or a typed variable's
 /// initializer rewrites to an `if/else` with the same arms.
-pub(crate) fn conditional_to_if_else(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn conditional_to_if_else(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let statement = statement_at(context)?;
     let text = context.text;
     let ast = context.ast;
@@ -2427,7 +2470,9 @@ pub(crate) fn conditional_to_if_else(context: &AssistContext<'_>) -> Option<Vec<
 /// `convert.ifElseToConditional` (`ReplaceIfElseWithConditional`): an
 /// `if/else` whose branches both `return` — or both assign the same
 /// target with `=` — rewrites to the conditional expression.
-pub(crate) fn if_else_to_conditional(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn if_else_to_conditional(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let statement = statement_at(context)?;
     if context.ast.kind(statement) != NodeKind::IfStatement {
         return None;
@@ -2763,7 +2808,9 @@ pub(crate) fn inline_else_block(context: &AssistContext<'_>) -> Option<Vec<(u32,
 /// `inlineEnclosingElseBlock` (`JoinIfWithElse`): the selection sits on
 /// the inner `if` keyword whose statement is the sole statement of the
 /// enclosing `if`'s else block — the same join from the inside.
-pub(crate) fn inline_enclosing_else_block(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn inline_enclosing_else_block(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let statement = statement_at(context)?;
     if context.ast.kind(statement) != NodeKind::IfStatement {
         return None;
@@ -2810,7 +2857,9 @@ pub(crate) fn keyword_range_contains(start: u32, end: u32, offset: u32) -> bool 
 /// flat layer anchors the `PatternField` on its pattern (the `x:` name
 /// sits *before* the span head), so the name is the identifier directly
 /// before the field's colon payload word.
-pub(crate) fn remove_unnecessary_name(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn remove_unnecessary_name(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -2893,7 +2942,9 @@ pub(crate) fn prev_token_end16(tokens: &TokenTable, text: &str, offset16: u32) -
 /// own type arguments (a bare `{…}` stays ambiguous and drops). The
 /// dot-shorthand and instance-creation faces need element facts and
 /// never fire here.
-pub(crate) fn remove_type_annotation(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn remove_type_annotation(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -3194,7 +3245,9 @@ pub(crate) fn convert_to_generic_function_syntax(
 /// behind a non-void return type), the `=>` body rewrites to a block
 /// with the `return` the declared (non-void) return type asks for. The
 /// set-literal registration's element-per-element face stays out.
-pub(crate) fn convert_to_block_body(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_to_block_body(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -3815,7 +3868,9 @@ pub(crate) fn variable_declaration_at(context: &AssistContext<'_>) -> Option<u32
 /// replaces the `var` keyword, or inserts before the name of a
 /// `final`/`const` local. The other official faces (formal parameters,
 /// patterns, typed literals, for-in) are later increments.
-pub(crate) fn add_type_annotation_local(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn add_type_annotation_local(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let analysis = context.semantics()?;
     let declaration = variable_declaration_at(context)?;
     // A local: the declaration is a statement in a block (fields live in
@@ -3863,7 +3918,9 @@ pub(crate) fn add_type_annotation_local(context: &AssistContext<'_>) -> Option<V
 /// the trailing semicolon; the method/declaration faces keep it). The
 /// attached-comment preservation of the official producer is a later
 /// increment — comments inside the converted body drop.
-pub(crate) fn convert_body_to_expression(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_body_to_expression(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -3948,7 +4005,9 @@ pub(crate) fn convert_body_to_expression(context: &AssistContext<'_>) -> Option<
 /// previous token when there is no space) and its written return type
 /// wraps `Future<…>`. Closures and constructors decline (the official
 /// guards).
-pub(crate) fn convert_body_to_async(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn convert_body_to_async(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -4051,7 +4110,11 @@ pub(crate) fn remove_async(context: &AssistContext<'_>) -> Option<Vec<(u32, u32,
 /// The climb from a covered node up to its `kind` member row, over the
 /// wrapper rows this AST inserts (identifier/list/type/initializer and
 /// the member-body wrappers).
-pub(crate) fn climb_to_member(context: &AssistContext<'_>, node: u32, kind: NodeKind) -> Option<u32> {
+pub(crate) fn climb_to_member(
+    context: &AssistContext<'_>,
+    node: u32,
+    kind: NodeKind,
+) -> Option<u32> {
     let skip = |current: u32| {
         matches!(
             context.ast.kind(current),
@@ -4103,7 +4166,11 @@ pub(crate) fn keyword_zone_member(context: &AssistContext<'_>, kind: NodeKind) -
 
 /// Whether every token in `[from16, to16)` is a declaration keyword (the
 /// gap check for [`keyword_zone_member`]; token starts are monotone).
-pub(crate) fn keyword_zone_only(context: &AssistContext<'_>, from16: u32, to16: u32) -> Option<bool> {
+pub(crate) fn keyword_zone_only(
+    context: &AssistContext<'_>,
+    from16: u32,
+    to16: u32,
+) -> Option<bool> {
     let mut index = token_at(context.tokens, from16)?;
     loop {
         let token = context.tokens.get(index)?;
@@ -4179,7 +4246,9 @@ pub(crate) fn span_inner_row(
 /// `writeType(null)` default posture). The `{0}`-parameterized official
 /// title instantiates the member name; the static table title carries
 /// the unparameterized spelling.
-pub(crate) fn final_field_to_getter(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn final_field_to_getter(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     // The official ancestor walk: skip the identifier/list/type wrappers
     // (plus the initializer wrapper this AST inserts). A cursor resting
     // on the field's keyword finds no covering row below the member
@@ -4291,7 +4360,9 @@ pub(crate) fn final_field_to_getter(context: &AssistContext<'_>) -> Option<Vec<(
 /// locates its statement by span (expression rows carry no child
 /// windows); the assignment payload is the row completing right before
 /// the statement.
-pub(crate) fn join_variable_declaration(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn join_variable_declaration(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let node = covering_node(
         context.tokens,
         context.text,
@@ -4410,7 +4481,9 @@ pub(crate) fn declared_single(
 /// the name (`;` + newline + indent + name). The official inferred-type
 /// face — the `var` keyword replaced with the model-namable initializer
 /// type — rides the mounted face.
-pub(crate) fn split_variable_declaration(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn split_variable_declaration(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let declaration = variable_declaration_at(context)?;
     if context
         .ast
@@ -4652,7 +4725,12 @@ pub(crate) fn surround_prep(context: &AssistContext<'_>) -> Option<SurroundPrep>
 /// `indentOld + head + eol + indented + indentOld` run plus the tail. The
 /// upstream insertion+replacement groups compose into exactly one
 /// replacement here (the pinned edit law).
-pub(crate) fn surround_replacement(prep: &SurroundPrep, eol: &str, head: &str, tail: &str) -> String {
+pub(crate) fn surround_replacement(
+    prep: &SurroundPrep,
+    eol: &str,
+    head: &str,
+    tail: &str,
+) -> String {
     let mut out = String::with_capacity(
         2 * prep.indent_old.len() + head.len() + tail.len() + 2 * eol.len() + prep.indented.len(),
     );
@@ -4707,7 +4785,9 @@ pub(crate) fn surround_with_block(context: &AssistContext<'_>) -> Option<Vec<(u3
 }
 
 /// `dart.assist.surround.doWhile` (`_SurroundWithDoWhile`).
-pub(crate) fn surround_with_do_while(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn surround_with_do_while(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let prep = surround_prep(context)?;
     let eol = eol_of(context.text);
     Some(surround_edit(
@@ -4752,7 +4832,9 @@ pub(crate) fn surround_with_if(context: &AssistContext<'_>) -> Option<Vec<(u32, 
 }
 
 /// `dart.assist.surround.tryCatch` (`_SurroundWithTryCatch`).
-pub(crate) fn surround_with_try_catch(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn surround_with_try_catch(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let prep = surround_prep(context)?;
     let eol = eol_of(context.text);
     Some(surround_edit(
@@ -4762,7 +4844,9 @@ pub(crate) fn surround_with_try_catch(context: &AssistContext<'_>) -> Option<Vec
 }
 
 /// `dart.assist.surround.tryFinally` (`_SurroundWithTryFinally`).
-pub(crate) fn surround_with_try_finally(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, String)>> {
+pub(crate) fn surround_with_try_finally(
+    context: &AssistContext<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
     let prep = surround_prep(context)?;
     let eol = eol_of(context.text);
     Some(surround_edit(

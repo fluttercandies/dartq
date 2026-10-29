@@ -44,12 +44,12 @@ pub use graph::{
 pub use lock::{DependencyKind, LockDescription, LockFile, LockedPackage, SourceKind};
 pub use pubspec::{DependencySpec, Environment, Pubspec, Resolution};
 pub use pubspec_facts::{PubspecFacts, Scalar};
-pub use version::{LanguageVersion, Version, VersionConstraint, VersionRange};
-pub use workspace::{WorkspaceLayout, find_workspace_root, normalize, workspace_ref_mismatches};
 pub use universe::{
     BoundaryEntry, BoundaryReason, PackageEntry, PackageKind, ScanOptions, ScanReport, Universe,
     enclosing_universe, scan,
 };
+pub use version::{LanguageVersion, Version, VersionConstraint, VersionRange};
+pub use workspace::{WorkspaceLayout, find_workspace_root, normalize, workspace_ref_mismatches};
 
 /// Errors from parsing or consuming pub artifacts.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

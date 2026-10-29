@@ -77,9 +77,8 @@ fn guarded_stays_silent_unrelated_guard_upgrades() {
 /// Rows report in face order at their own spans.
 #[test]
 fn rows_report_in_order_at_their_spans() {
-    let f = Fixture::parse(
-        "void f() {}\n\n// The row anchors below must sit inside the source.\n\n",
-    );
+    let f =
+        Fixture::parse("void f() {}\n\n// The row anchors below must sit inside the source.\n\n");
     let lints = run(&f, &[unguarded(8), unguarded(40), unguarded(64)]);
     assert_eq!(lints.len(), 3, "{lints:?}");
     assert_eq!(lints[0].range.start, 8);

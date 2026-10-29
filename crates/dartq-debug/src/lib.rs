@@ -29,8 +29,8 @@ pub use error::{Error, Result};
 pub use protocol::{
     BoundField, BoundVariable, Breakpoint, BreakpointLocation, ClassRef, Event, EventKind,
     ExceptionPauseMode, Frame, FrameKind, FunctionRef, Instance, InstanceKind, InstanceRef,
-    Isolate, IsolateRef, LibraryRef, MapAssociation, ReloadReport, ScriptList, ScriptRef,
-    Sentinel, SentinelKind, SourceLocation, Stack, StepOption, Success, UnresolvedSourceLocation,
+    Isolate, IsolateRef, LibraryRef, MapAssociation, ReloadReport, ScriptList, ScriptRef, Sentinel,
+    SentinelKind, SourceLocation, Stack, StepOption, Success, UnresolvedSourceLocation,
     ValueOrSentinel, Version, Vm, VmObject,
 };
 pub use ring::Ring;

@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ---------------------------------------------------------------------------
 // Semantic source: the cross-file create-file family
 //
@@ -74,10 +73,15 @@ pub(crate) fn create_missing_uri_target(input: &FixInput<'_>) -> Option<(String,
 /// The URI the `uri_does_not_exist` message quotes —
 /// `Target of URI doesn't exist: '<uri>'.` — accepted only when it equals
 /// the hit span's inner text (a single quoted literal, quotes stripped).
-pub(crate) fn quoted_uri<'a>(text: &'a str, range: core::ops::Range<u32>, message: &str) -> Option<&'a str> {
+pub(crate) fn quoted_uri<'a>(
+    text: &'a str,
+    range: core::ops::Range<u32>,
+    message: &str,
+) -> Option<&'a str> {
     let rest = message.strip_suffix("'.")?;
     let quoted = &rest[rest.rfind('\'')? + 1..];
-    let literal = &text[utf16_offset_to_byte(text, range.start)..utf16_offset_to_byte(text, range.end)];
+    let literal =
+        &text[utf16_offset_to_byte(text, range.start)..utf16_offset_to_byte(text, range.end)];
     let quote = literal.chars().next()?;
     if quote != '\'' && quote != '"' {
         return None;
@@ -110,8 +114,6 @@ pub(crate) fn relative_uri(from_dir: &Path, to_file: &Path) -> Option<String> {
     }
     (!out.is_empty()).then_some(out)
 }
-
-
 
 /// Whether the slice is an identifier shape: non-empty, not digit-led, all
 /// Dart word characters (the drop-family rewrites' name proof).
@@ -491,7 +493,10 @@ pub(crate) fn conditional_assignment(input: &FixInput<'_>) -> Option<(u32, u32, 
 /// line with a sibling, the cut takes exactly the reported span plus its
 /// leading horizontal whitespace, the same-line deletion face of
 /// [`drop_import_directive`].
-pub(crate) fn drop_span_statement(text: &str, range: &core::ops::Range<u32>) -> Option<(u32, u32, String)> {
+pub(crate) fn drop_span_statement(
+    text: &str,
+    range: &core::ops::Range<u32>,
+) -> Option<(u32, u32, String)> {
     let start = utf16_offset_to_byte(text, range.start);
     let end = utf16_offset_to_byte(text, range.end);
     if let Some((line_start, line_end)) = line_bounds(text, start, end)
@@ -942,7 +947,10 @@ pub(crate) fn curly_braces_head(input: &FixInput<'_>) -> Option<(u32, u32, Strin
 /// `do` (the control head the rules report at), must not already be a
 /// block, and its line prefix — the control keyword's line prefix — must
 /// be whitespace only; anything else drops.
-pub(crate) fn wrap_control_body(input: &FixInput<'_>, expand_head: bool) -> Option<(u32, u32, String)> {
+pub(crate) fn wrap_control_body(
+    input: &FixInput<'_>,
+    expand_head: bool,
+) -> Option<(u32, u32, String)> {
     let tokens = input.tokens?;
     let text = input.text;
     let (first, last) = hit_tokens(tokens, &input.range)?;
@@ -1409,7 +1417,11 @@ pub(crate) fn bool_literal(tokens: &TokenTable, text: &str, index: usize) -> Opt
 /// `!` + optional parentheses around the text of a token range — the
 /// negation face the boolean rewrites share (`needsParens` read by
 /// [`binds_loose`]).
-pub(crate) fn bang_wrapped(tokens: &TokenTable, text: &str, range: core::ops::Range<usize>) -> Option<String> {
+pub(crate) fn bang_wrapped(
+    tokens: &TokenTable,
+    text: &str,
+    range: core::ops::Range<usize>,
+) -> Option<String> {
     let body = token_text(tokens, text, range.clone())?;
     Some(if binds_loose(tokens, range) {
         format!("!({body})")

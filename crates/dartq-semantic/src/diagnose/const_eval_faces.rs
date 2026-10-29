@@ -688,9 +688,7 @@ impl<'a> Engine<'a> {
             let selector = text
                 .strip_prefix(head)
                 .and_then(|rest| rest.strip_prefix('.'))
-                .map(|rest| {
-                    rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or("")
-                })
+                .map(|rest| rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or(""))
                 .unwrap_or("");
             (container, selector)
         } else {
@@ -1214,7 +1212,9 @@ impl<'a> Engine<'a> {
         // The declaration keyword, behind any written class modifiers.
         for _ in 0..4 {
             let mut end = i;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$') {
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$')
+            {
                 end += 1;
             }
             match &bytes[i..end] {
@@ -2200,8 +2200,7 @@ impl<'a> Engine<'a> {
         }
         let mut values = self.literal_payload(fields)?;
         let tail = values.split_off(values.len() - named);
-        let mut pairs: Vec<(StringId, ConstantValue)> =
-            names.iter().copied().zip(tail).collect();
+        let mut pairs: Vec<(StringId, ConstantValue)> = names.iter().copied().zip(tail).collect();
         pairs.sort_by_key(|(name, _)| *name);
         Some(ConstantValue::Record {
             positional: values.into(),
@@ -2278,11 +2277,7 @@ impl<'a> Engine<'a> {
     ///   file denote one value, so the repeat is certain — different
     ///   spellings defer (under-report: `P(1)` beside `P(0+1)` stays
     ///   silent where the oracle's equal field maps would report).
-    fn report_duplicate_elements(
-        &mut self,
-        code: SemanticCode,
-        parts: &[crate::const_eval::Node],
-    ) {
+    fn report_duplicate_elements(&mut self, code: SemanticCode, parts: &[crate::const_eval::Node]) {
         let mut seen: Vec<ConstantValue> = Vec::new();
         let mut seen_keys: Vec<InstanceRefKey> = Vec::new();
         let mut seen_created: Vec<SourceRange> = Vec::new();
@@ -2415,9 +2410,14 @@ impl<'a> Engine<'a> {
                 break;
             };
             let sup_lib = self.graph.library_of_file(hop.2)?;
-            let Some((sup_container, sup_file)) =
-                resolve_container(self.graph, self.namespaces, self.index, sup_lib, hop.2, sup_name)
-            else {
+            let Some((sup_container, sup_file)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                sup_lib,
+                hop.2,
+                sup_name,
+            ) else {
                 pending.clear();
                 break;
             };
@@ -2459,8 +2459,14 @@ impl<'a> Engine<'a> {
         let face = elements.const_creation(name)?;
         let var_ty = elements.decl(name)?.var_ty;
         let decl_lib = self.graph.library_of_file(decl_file)?;
-        let (container, cont_file) =
-            resolve_container(self.graph, self.namespaces, self.index, decl_lib, decl_file, face.container)?;
+        let (container, cont_file) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            decl_lib,
+            decl_file,
+            face.container,
+        )?;
         if !container.has_const_constructor {
             return None;
         }

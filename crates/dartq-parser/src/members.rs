@@ -2387,10 +2387,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 let name = if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
                     let new_kw = self.peek_span();
                     self.cursor.advance();
-                    self.listener.handle_identifier(
-                        new_kw,
-                        IdentifierContext::ExpressionContinuation,
-                    );
+                    self.listener
+                        .handle_identifier(new_kw, IdentifierContext::ExpressionContinuation);
                     new_kw
                 } else {
                     self.ensure_identifier(IdentifierContext::ExpressionContinuation)
