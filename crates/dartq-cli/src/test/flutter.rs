@@ -940,18 +940,50 @@ fn grouped_pass(
         .map(|&index| plan.suites[index].abs.clone())
         .collect();
     let placements = dartq_test::flutter::place(root, &files)?;
+    // A deterministic per-file digest of the import closure plus the
+    // toolchain stamps — the chunk key folds it so a one-byte edit anywhere
+    // in a suite's closure (or its flutter_test_config) re-keys the chunk.
+    // Suites and their configs are digested in one resolution pass; a
+    // config's digest folds into each suite it wraps.
+    let configs_of: Vec<Option<PathBuf>> = files
+        .iter()
+        .map(|file| dartq_test::cache::flutter_inputs(root, file).0.into_iter().next())
+        .collect();
+    let mut seeds = files.clone();
+    let mut config_ids: FxHashMap<PathBuf, usize> = FxHashMap::default();
+    for config in configs_of.iter().flatten() {
+        let next = seeds.len();
+        config_ids.entry(config.clone()).or_insert_with(|| {
+            seeds.push(config.clone());
+            next
+        });
+    }
+    let digests = dartq_test::flutter::closure_digests(root, &sdk, &seeds).unwrap_or_default();
     let mut hosted: Vec<Hosted> = Vec::new();
     let mut hosted_index: Vec<usize> = Vec::new();
-    for ((&index, file), placement) in indices.iter().zip(&files).zip(&placements) {
+    for (pos, ((&index, file), placement)) in indices.iter().zip(&files).zip(&placements).enumerate() {
         if *placement == Placement::Stock {
             stock.push(index);
             continue;
         }
-        let (configs, _) = dartq_test::cache::flutter_inputs(root, file);
+        let config = configs_of[pos].clone();
+        // The config wraps the suite's `main`: the chunk key must change
+        // when either the suite's or the config's closure changes. Each is
+        // already a content digest, so joining them with a separator is a
+        // sound composite — no further hash needed.
+        let suite_d = digests.get(pos).cloned();
+        let digest = match (suite_d, &config) {
+            (Some(suite_d), Some(config)) => Some(match config_ids.get(config).and_then(|&ci| digests.get(ci)) {
+                Some(config_d) => format!("{suite_d}+{config_d}"),
+                None => suite_d,
+            }),
+            (suite_d, _) => suite_d,
+        };
         hosted.push(Hosted {
             path: file.clone(),
-            config: configs.into_iter().next(),
+            config,
             fresh: *placement == Placement::Fresh,
+            digest,
         });
         hosted_index.push(index);
     }
@@ -959,10 +991,20 @@ fn grouped_pass(
         stock.extend(hosted_index);
         return Ok(true);
     }
-    // Shared suites in the selection's order, fresh ones last: their own
-    // testers start once the shared chunks run.
+    // Dispatch order inside the pass: fresh suites last (their own testers
+    // start once the shared chunks run), and within each tier the suites
+    // with the longest recorded durations first — durations.json is only
+    // ever a scheduling hint, a cold run with no records keeps walk order.
+    // A stable sort keeps unknown-duration suites in their recorded-order
+    // neighbours' wake and preserves the fresh-last partition as a tier.
+    let durations = dartq_test::group::Durations::load(root);
     let mut order: Vec<usize> = (0..hosted.len()).collect();
-    order.sort_by_key(|&i| hosted[i].fresh);
+    order.sort_by_key(|&i| {
+        (
+            hosted[i].fresh,
+            std::cmp::Reverse(durations.get(root, &hosted[i].path).unwrap_or(0)),
+        )
+    });
     let hosted: Vec<Hosted> = order.iter().map(|&i| hosted[i].clone()).collect();
     let hosted_index: Vec<usize> = order.iter().map(|&i| hosted_index[i]).collect();
 

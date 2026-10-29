@@ -219,6 +219,11 @@ pub struct Hosted {
     pub config: Option<PathBuf>,
     /// Runs alone in a tester of its own.
     pub fresh: bool,
+    /// A deterministic digest of the suite's import-closure bytes plus the
+    /// toolchain stamps ([`closure_digests`]). `None` only when the package
+    /// configuration could not be read — the chunk key then falls back to
+    /// the suite's own file bytes.
+    pub digest: Option<String>,
 }
 
 /// The entry point of one chunk: the fixed tester part, the chunk's
@@ -266,6 +271,69 @@ fn file_uri(path: &Path) -> String {
         }
     }
     out
+}
+
+/// The content identity of one chunk's kernel: everything the compiler
+/// reads to emit it. A change to any input re-keys the chunk to a fresh
+/// compile; only an exact match adopts the previous run's kernel.
+///
+/// Inputs, per chunk:
+/// - the generated entry source (every suite's URI, its
+///   `flutter_test_config` wiring, the membership set and the chunk index);
+/// - the resolved `package_config.json` the compiler reads;
+/// - the recipe's compiler command line;
+/// - **each hosted suite's run-cache key**, which already folds that
+///   suite's whole import-closure content digests, its
+///   `flutter_test_config.dart` closure bytes and the toolchain stamp —
+///   folding it verbatim covers a source/lib/dependency/config edit
+///   without a second hashing pass over the closure. A suite with no
+///   cache key (a refused key) falls back to its own file bytes plus its
+///   config's bytes, a conservative floor — any doubt re-keys.
+///
+/// `hosted` is the local-index subset actually compiled (a failed suite is
+/// retried out, so the key follows the reduced set, not the original).
+fn chunk_key(plan: &Plan<'_>, index: usize, hosted: &[usize], member_of: impl Fn(usize) -> usize) -> String {
+    let suites: Vec<(usize, &Hosted)> = hosted
+        .iter()
+        .map(|&local| (local, &plan.suites[member_of(local)]))
+        .collect();
+    let entry = chunk_entry(index, &suites);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(entry.as_bytes());
+    hasher.update(&std::fs::read(plan.packages).unwrap_or_default());
+    for arg in &plan.recipe.compiler {
+        hasher.update(&(arg.len() as u64).to_le_bytes());
+        hasher.update(arg.as_bytes());
+    }
+    for (_, suite) in &suites {
+        // Some: the deterministic closure digest carries this suite's
+        // reachable-file bytes, its config's bytes and the toolchain
+        // stamps.
+        if let Some(digest) = &suite.digest {
+            hasher.update(digest.as_bytes());
+            continue;
+        }
+        // None: no closure to lean on — key the chunk on the suite's and
+        // its config's own bytes so a content edit still re-keys.
+        hasher.update(&std::fs::read(&suite.path).unwrap_or_default());
+        if let Some(config) = &suite.config {
+            hasher.update(&std::fs::read(config).unwrap_or_default());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The `.key` a fresh chunk *wants* (full member set), and the member
+/// lookup for it — adoption compares this against the stored `.key`.
+fn chunk_keys(plan: &Plan<'_>, chunks: &[Vec<usize>]) -> Vec<String> {
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(index, members)| {
+            let locals: Vec<usize> = (0..members.len()).collect();
+            chunk_key(plan, index, &locals, |local| members[local])
+        })
+        .collect()
 }
 
 /// One resident `frontend_server`, compiling chunk after chunk: the first
@@ -464,10 +532,40 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     let dir = work_dir(plan.root);
     std::fs::create_dir_all(&dir)?;
     let runner = runner_kernel(plan.vm, plan.tool_packages, &dir)?;
-    let chunks: Vec<Vec<usize>> = (0..plan.suites.len()).collect::<Vec<_>>().chunks(CHUNK).map(<[usize]>::to_vec).collect();
+    // Chunk membership and each member's `local` (its `_s{local}`
+    // entrypoint label) are canonical — members sorted by suite path —
+    // so the chunk's compiled kernel is a pure function of *which* suites
+    // it holds and their code, never of dispatch order. A run that sorts
+    // suites differently for scheduling (longest-first) still wants the
+    // same kernel and adopts it.
+    let mut indices: Vec<usize> = (0..plan.suites.len()).collect();
+    indices.sort_by(|&a, &b| plan.suites[a].path.cmp(&plan.suites[b].path));
+    let chunks: Vec<Vec<usize>> = indices.chunks(CHUNK).map(<[usize]>::to_vec).collect();
     let kernels: Vec<PathBuf> = (0..chunks.len()).map(|index| dir.join(format!("chunk{index}.dill"))).collect();
-    for kernel in &kernels {
-        for stale in [kernel.clone(), kernel.with_extension("dill.failed"), kernel.with_extension("dill.json")] {
+    // Chunk kernels persist across runs, keyed on the content they were
+    // compiled from: a run whose chunk source is unchanged adopts the
+    // previous run's kernel and skips the ~5 s framework-load compile
+    // entirely (the store's `.key` sidecar names the inputs the compiler
+    // saw). Any doubt re-keys to a compile — serving a stale kernel is the
+    // one unrecoverable sin of this pass.
+    let wanted_keys = chunk_keys(plan, &chunks);
+    for (index, kernel) in kernels.iter().enumerate() {
+        let adopted = kernel.is_file()
+            && std::fs::read_to_string(kernel.with_extension("dill.key"))
+                .ok()
+                .is_some_and(|stored| stored.trim() == wanted_keys[index]);
+        if adopted {
+            // The sidecar was already written whole when the kernel landed;
+            // only the hosted-suite list may still be missing (a run killed
+            // between the two writes) — rewrite it idempotently.
+            let locals: Vec<usize> = (0..chunks[index].len()).collect();
+            crate::stamp::write_atomic(
+                &kernel.with_extension("dill.json"),
+                serde_json::to_string(&locals).map_err(io::Error::other)?.as_bytes(),
+            )?;
+            continue;
+        }
+        for stale in [kernel.clone(), kernel.with_extension("dill.failed"), kernel.with_extension("dill.json"), kernel.with_extension("dill.key")] {
             let _ = std::fs::remove_file(stale);
         }
     }
@@ -547,6 +645,11 @@ fn compile_chunks(
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        // An adopted kernel needs no compiler at all — its `.key` matched,
+        // `.json` is already in place, and the runner unblocks on the file.
+        if kernels[index].is_file() {
+            continue;
+        }
         let mut hosted: Vec<usize> = (0..members.len()).collect();
         let mut retried = false;
         loop {
@@ -568,8 +671,16 @@ fn compile_chunks(
             };
             match result {
                 Compiled::Kernel => {
-                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.json"), serde_json::to_string(&hosted)?.as_bytes())?;
+                    // Order matters: `.key` lands after the kernel rename so
+                    // an interrupted run never leaves a key claiming a kernel
+                    // that isn't there (adoption requires both).
                     std::fs::rename(&output, &kernels[index])?;
+                    // Key the kernel on what was actually compiled — a
+                    // retried chunk's reduced set, so a later run wanting
+                    // the full set re-keys and recompiles instead of
+                    // adopting a kernel missing the excluded suite.
+                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.key"), chunk_key(plan, index, &hosted, |local| members[local]).as_bytes())?;
+                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.json"), serde_json::to_string(&hosted)?.as_bytes())?;
                     break;
                 }
                 Compiled::Errors(text) if !retried => {
@@ -760,6 +871,149 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Placement>> {
         .collect())
 }
 
+/// A per-suite content digest over its whole import closure: the resolved
+/// reachable files' bytes, plus the toolchain stamps a `flutter upgrade`
+/// replaces in place. Deterministic across runs — it keys nothing on the
+/// environment or on timing — so an unchanged tree digests identically and
+/// a one-byte edit anywhere in the closure re-keys the chunk that suite
+/// belongs to. This is the same resolution the run cache and [`place`]
+/// perform (`package_config` → `lib_dirs`, framework files excluded — a
+/// `flutter upgrade` is covered by the toolchain stamps instead); it is a
+/// content digest, not a verdict, so it never refuses.
+///
+/// `None` only when the package configuration cannot be read at all — the
+/// caller then keys the chunk on the suites' own file bytes as a floor.
+#[must_use]
+pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Vec<String>> {
+    use rayon::prelude::*;
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    let config_path = crate::cache::package_config_path(root);
+    let text = std::fs::read_to_string(&config_path).ok()?;
+    let config = dartq_pub::PackageConfig::parse(&text).ok()?;
+    let dart_tool = config_path.parent()?;
+    let packages = config.resolve(dart_tool).ok()?;
+    let lib_dirs: FxHashMap<&str, &Path> =
+        packages.iter().map(|package| (package.name.as_str(), package.lib_dir.as_path())).collect();
+    let framework: Option<PathBuf> = config
+        .additional_properties
+        .get("flutterRoot")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|uri| uri.strip_prefix("file://"))
+        .map(PathBuf::from);
+    let in_framework = |path: &Path| framework.as_deref().is_some_and(|sdk| path.starts_with(sdk));
+
+    // Breadth-first over the union closure, one frontier read in parallel.
+    // Framework files are the toolchain every suite runs on and are covered
+    // by the stamps below, not entered per suite.
+    let mut ids: FxHashMap<PathBuf, u32> = FxHashMap::default();
+    let mut file_of: Vec<PathBuf> = Vec::new();
+    let mut deps_of: Vec<Vec<u32>> = Vec::new();
+    let mut frontier: Vec<PathBuf> = Vec::new();
+    for suite in suites {
+        if !ids.contains_key(suite) {
+            ids.insert(suite.clone(), file_of.len() as u32);
+            file_of.push(suite.clone());
+            deps_of.push(Vec::new());
+            frontier.push(suite.clone());
+        }
+    }
+    while !frontier.is_empty() {
+        let read: Vec<(PathBuf, Option<Vec<PathBuf>>)> = frontier
+            .par_drain(..)
+            .map(|path| {
+                let Ok(bytes) = std::fs::read(&path) else { return (path, None) };
+                let facts = crate::deps::facts(&bytes);
+                let deps = facts
+                    .uris
+                    .iter()
+                    .map(|uri| crate::cache::resolve_uri(&path, uri, &lib_dirs))
+                    .collect::<Option<Vec<Option<PathBuf>>>>()
+                    .map(|deps| deps.into_iter().flatten().filter(|dep| !in_framework(dep)).collect());
+                (path, deps)
+            })
+            .collect();
+        for (path, deps) in read {
+            let id = ids[&path] as usize;
+            let Some(deps) = deps else { continue };
+            for dep in deps {
+                let dep_id = match ids.get(&dep) {
+                    Some(&dep_id) => dep_id,
+                    None => {
+                        let dep_id = file_of.len() as u32;
+                        ids.insert(dep.clone(), dep_id);
+                        file_of.push(dep);
+                        deps_of.push(Vec::new());
+                        frontier.push(file_of[dep_id as usize].clone());
+                        dep_id
+                    }
+                };
+                deps_of[id].push(dep_id);
+            }
+        }
+    }
+
+    // Forward-reachable set per suite, then a digest over that set's file
+    // bytes. Suites in one chunk share most of the closure, so per-file
+    // digests are computed once across all suites.
+    let suite_ids: Vec<u32> = suites.iter().map(|suite| ids[suite]).collect();
+    let mut needed: FxHashSet<u32> = FxHashSet::default();
+    {
+        let mut stack = suite_ids.clone();
+        while let Some(id) = stack.pop() {
+            if needed.insert(id) {
+                stack.extend(deps_of[id as usize].iter().copied());
+            }
+        }
+    }
+    let mut digest_of: FxHashMap<u32, [u8; 32]> = FxHashMap::default();
+    for id in needed {
+        let path = &file_of[id as usize];
+        let mut leaf = blake3::Hasher::new();
+        leaf.update(path.as_os_str().as_encoded_bytes());
+        leaf.update(&std::fs::read(path).unwrap_or_default());
+        digest_of.insert(id, *leaf.finalize().as_bytes());
+    }
+
+    // The toolchain stamps a `flutter upgrade` replaces in place (the same
+    // files `Recipe::load` reads), so an upgrade re-keys every chunk even
+    // with argv and package_config unchanged.
+    let mut stamps = blake3::Hasher::new();
+    for stamp in ["bin/cache/flutter.version.json", "bin/cache/engine.stamp", "bin/cache/dart-sdk/version"] {
+        stamps.update(&std::fs::read(sdk.join(stamp)).unwrap_or_default());
+    }
+    let stamps: [u8; 32] = *stamps.finalize().as_bytes();
+
+    Some(
+        suite_ids
+            .iter()
+            .map(|&seed| {
+                let mut seen: FxHashSet<u32> = FxHashSet::default();
+                let mut stack = vec![seed];
+                while let Some(id) = stack.pop() {
+                    if seen.insert(id) {
+                        stack.extend(deps_of[id as usize].iter().copied());
+                    }
+                }
+                // Feed the reachable files' digests in canonical order —
+                // discovery order is nondeterministic (parallel frontier
+                // reads), so the digest must not depend on it.
+                let mut leaves: Vec<[u8; 32]> = seen
+                    .iter()
+                    .map(|id| digest_of.get(id).copied().unwrap_or([0u8; 32]))
+                    .collect();
+                leaves.sort_unstable();
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&stamps);
+                for leaf in leaves {
+                    hasher.update(&leaf);
+                }
+                hasher.finalize().to_hex().to_string()
+            })
+            .collect(),
+    )
+}
+
 impl Recipe {
     /// The recipe for `args`, from the checkout's cache when the toolchain,
     /// the arguments, the package configuration and the environment are
@@ -801,10 +1055,13 @@ impl Recipe {
             hasher.update(asset.to_string_lossy().as_bytes());
             hasher.update(&std::fs::read(&asset).unwrap_or_default());
         }
+        // The prepared bundle is the probe's other output: its *bytes* key
+        // it, not len+mtime — the tool touches it on every one of its own
+        // runs without changing contents, and mtime would re-probe forever.
         let bundle = root.join("build").join("unit_test_assets");
         for name in ["AssetManifest.bin", "FontManifest.json", "NativeAssetsManifest.json"] {
-            let meta = std::fs::metadata(bundle.join(name)).ok();
-            hasher.update(format!("{name}:{:?}:{:?}", meta.as_ref().map(std::fs::Metadata::len), meta.and_then(|meta| meta.modified().ok())).as_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&std::fs::read(bundle.join(name)).unwrap_or_default());
         }
         let key = hasher.finalize().to_hex().to_string();
         let path = work_dir(root).join("recipe.json");
@@ -874,11 +1131,12 @@ mod tests {
 
     #[test]
     fn chunk_entries_wire_each_suite_like_the_stock_bootstrap() {
-        let plain = Hosted { path: PathBuf::from("/p/test/a b_test.dart"), config: None, fresh: false };
+        let plain = Hosted { path: PathBuf::from("/p/test/a b_test.dart"), config: None, fresh: false, digest: None };
         let wrapped = Hosted {
             path: PathBuf::from("/p/test/w/x_test.dart"),
             config: Some(PathBuf::from("/p/test/flutter_test_config.dart")),
             fresh: false,
+            digest: None,
         };
         let src = chunk_entry(3, &[(0, &plain), (2, &wrapped)]);
         assert!(src.contains("import 'file:///p/test/a%20b_test.dart' as s0;"));
@@ -962,6 +1220,7 @@ mod tests {
             path: PathBuf::from(path),
             config: Some(config.to_path_buf()),
             fresh: false,
+            digest: None,
         };
         let a = wrapped("/p/test/one/a_test.dart", &one);
         let b = wrapped("/p/test/one/b_test.dart", &one);
@@ -1013,5 +1272,189 @@ mod tests {
             place(&root, &[own, unknown, framework]).expect("placed"),
             [Placement::Fresh, Placement::Stock, Placement::Shared]
         );
+    }
+
+    /// The chunk key is a content identity: identical inputs produce the
+    /// same key (cross-run adoption), while a changed resolution, a
+    /// different suite set, or a different compiler command re-keys to a
+    /// fresh compile. Anything not keyed would serve a stale kernel.
+    #[test]
+    fn chunk_key_rekeys_on_every_input() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let packages = tmp.path().join("package_config.json");
+        std::fs::write(&packages, br#"{"configVersion":2,"packages":[]}"#).expect("write");
+        let recipe = Recipe {
+            compiler: vec!["fe".to_owned(), "--target=flutter".to_owned()],
+            tester: vec!["tester".to_owned()],
+            environment: Vec::new(),
+            fonts: String::new(),
+        };
+        // Each suite carries a run-cache key (the closure+config+toolchain
+        // digest); the chunk key folds it verbatim.
+        let suites = [
+            Hosted {
+                path: PathBuf::from("/p/test/a_test.dart"),
+                config: None,
+                fresh: false,
+                digest: Some("cachekey-a".to_owned()),
+            },
+            Hosted {
+                path: PathBuf::from("/p/test/b_test.dart"),
+                config: None,
+                fresh: false,
+                digest: Some("cachekey-b".to_owned()),
+            },
+        ];
+        let plan = Plan {
+            root: tmp.path(),
+            vm: Path::new("/vm"),
+            tool_packages: Path::new("/tool"),
+            packages: &packages,
+            recipe: &recipe,
+            suites: &suites,
+            runner_args: &[],
+            concurrency: 1,
+        };
+        let members = vec![0usize, 1usize];
+        let locals = vec![0usize, 1usize];
+        let key = chunk_key(&plan, 0, &locals, |local| members[local]);
+        assert_eq!(key, chunk_key(&plan, 0, &locals, |local| members[local]), "same inputs same key");
+        // The resolution bytes are an input.
+        std::fs::write(&packages, br#"{"configVersion":2,"packages":[{"name":"x","rootUri":"../","packageUri":"lib/"}]}"#).expect("write");
+        assert_ne!(key, chunk_key(&plan, 0, &locals, |local| members[local]), "resolution change re-keys");
+        std::fs::write(&packages, br#"{"configVersion":2,"packages":[]}"#).expect("write");
+        // A different member set re-keys (and a retried subset differs from
+        // the full set it was reduced from).
+        let subset = vec![0usize];
+        assert_ne!(key, chunk_key(&plan, 0, &subset, |local| members[local]), "member set re-keys");
+        // A different chunk index re-keys (the entry's `_chunk` differs).
+        assert_ne!(key, chunk_key(&plan, 1, &locals, |local| members[local]), "chunk index re-keys");
+        // A different compiler command re-keys.
+        let other_recipe = Recipe { compiler: vec!["fe".to_owned(), "--target=flutter2".to_owned()], ..recipe.clone() };
+        let other_plan = Plan { recipe: &other_recipe, ..plan };
+        assert_ne!(key, chunk_key(&other_plan, 0, &locals, |local| members[local]), "compiler command re-keys");
+        // A changed run-cache key re-keys (that key is what carries a
+        // source/lib/dependency/config byte change into the chunk).
+        let moved = [
+            Hosted { digest: Some("cachekey-a2".to_owned()), ..suites[0].clone() },
+            suites[1].clone(),
+        ];
+        let moved_plan = Plan { suites: &moved, ..plan };
+        assert_ne!(key, chunk_key(&moved_plan, 0, &locals, |local| members[local]), "suite cache-key change re-keys");
+    }
+
+    /// A byte flip inside a suite's import closure — not an entry input —
+    /// re-keys the chunk because the suite's run-cache key (which folds the
+    /// closure's content digests) changes. With no cache key to lean on, the
+    /// suite's own file bytes are the floor and re-key on any edit too.
+    #[test]
+    fn chunk_key_rekeys_on_a_closure_or_source_byte_change() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let packages = tmp.path().join("package_config.json");
+        std::fs::write(&packages, br#"{"configVersion":2,"packages":[]}"#).expect("write");
+        let suite_file = tmp.path().join("a_test.dart");
+        std::fs::write(&suite_file, b"void main() {}").expect("write");
+        let recipe = Recipe {
+            compiler: vec!["fe".to_owned()],
+            tester: vec![],
+            environment: Vec::new(),
+            fonts: String::new(),
+        };
+        // No run-cache key: the file bytes are the chunk key's floor.
+        let no_key = [Hosted { path: suite_file.clone(), config: None, fresh: false, digest: None }];
+        let plan = Plan {
+            root: tmp.path(),
+            vm: Path::new("/vm"),
+            tool_packages: Path::new("/tool"),
+            packages: &packages,
+            recipe: &recipe,
+            suites: &no_key,
+            runner_args: &[],
+            concurrency: 1,
+        };
+        let members = vec![0usize];
+        let locals = vec![0usize];
+        let before = chunk_key(&plan, 0, &locals, |local| members[local]);
+        std::fs::write(&suite_file, b"void main() {}\n").expect("write");
+        assert_ne!(before, chunk_key(&plan, 0, &locals, |local| members[local]), "a source byte re-keys");
+        // With a run-cache key the file bytes are no longer hashed — the key
+        // is. A changed cache key re-keys even when file bytes are identical.
+        let with_key = [Hosted { digest: Some("closure-digest-v1".to_owned()), ..no_key[0].clone() }];
+        let plan = Plan { suites: &with_key, ..plan };
+        let k1 = chunk_key(&plan, 0, &locals, |local| members[local]);
+        let with_key2 = [Hosted { digest: Some("closure-digest-v2".to_owned()), ..no_key[0].clone() }];
+        let plan = Plan { suites: &with_key2, ..plan };
+        assert_ne!(k1, chunk_key(&plan, 0, &locals, |local| members[local]), "a closure digest change re-keys");
+    }
+
+    /// A `flutter_test_config.dart` is read as bytes when the suite has no
+    /// run-cache key; a byte flip in it re-keys the chunk. (With a cache key
+    /// the config's closure is already inside it — the previous test.)
+    #[test]
+    fn chunk_key_rekeys_on_a_config_byte_change() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let packages = tmp.path().join("package_config.json");
+        std::fs::write(&packages, br#"{"configVersion":2,"packages":[]}"#).expect("write");
+        let suite_file = tmp.path().join("w_test.dart");
+        let config_file = tmp.path().join("flutter_test_config.dart");
+        std::fs::write(&suite_file, b"void main() {}").expect("write");
+        std::fs::write(&config_file, b"// config v1").expect("write");
+        let recipe = Recipe { compiler: vec!["fe".to_owned()], tester: vec![], environment: vec![], fonts: String::new() };
+        let suites = [Hosted { path: suite_file, config: Some(config_file.clone()), fresh: false, digest: None }];
+        let plan = Plan {
+            root: tmp.path(),
+            vm: Path::new("/vm"),
+            tool_packages: Path::new("/tool"),
+            packages: &packages,
+            recipe: &recipe,
+            suites: &suites,
+            runner_args: &[],
+            concurrency: 1,
+        };
+        let members = vec![0usize];
+        let locals = vec![0usize];
+        let before = chunk_key(&plan, 0, &locals, |local| members[local]);
+        std::fs::write(&config_file, b"// config v2").expect("write");
+        assert_ne!(before, chunk_key(&plan, 0, &locals, |local| members[local]), "a config byte re-keys");
+    }
+
+    /// `closure_digests` digests every file a suite's imports reach: a byte
+    /// flip in a `lib/` source the suite transitively imports — a file that
+    /// is *not* one of the chunk entry's inputs — changes that suite's
+    /// digest, which re-keys its chunk. An unchanged tree digests
+    /// identically across calls (deterministic, no env or timing inputs).
+    #[test]
+    fn closure_digests_rekey_on_a_transitively_imported_byte() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canon");
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, text).expect("write");
+            path
+        };
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion":2,"packages":[{"name":"p","rootUri":"../","packageUri":"lib/"}]}"#,
+        );
+        let dep = write("lib/helper.dart", "int answer() => 41;");
+        let suite = write("test/a_test.dart", "import 'package:p/helper.dart';\nvoid main() {}");
+        let sdk = root.join("sdk");
+        std::fs::create_dir_all(sdk.join("bin/cache/dart-sdk")).expect("sdk dirs");
+        std::fs::write(sdk.join("bin/cache/dart-sdk/version"), b"3.13.1").expect("version");
+
+        let first = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        // Same tree, same digest — deterministic across calls.
+        let again = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        assert_eq!(first, again, "an unchanged tree digests identically");
+        // One byte in a transitively-imported lib file re-keys the suite.
+        std::fs::write(&dep, "int answer() => 42;").expect("write");
+        let changed = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        assert_ne!(first, changed, "a lib byte flip re-keys the suite");
+        // And the toolchain stamp is an input: a version bump re-keys even
+        // with argv and package_config untouched.
+        std::fs::write(sdk.join("bin/cache/dart-sdk/version"), b"3.13.2").expect("version");
+        let upgraded = closure_digests(&root, &sdk, std::slice::from_ref(&suite)).expect("digests")[0].clone();
+        assert_ne!(changed, upgraded, "a toolchain stamp bump re-keys");
     }
 }
