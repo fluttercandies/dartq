@@ -42,7 +42,10 @@
 use dartq_scanner::{Keyword, TokenKind};
 
 use crate::expr_const::SELECTOR_PRECEDENCE;
-use crate::listener::{AssertKind, ConstructorReferenceContext, IdentifierContext, ParserListener};
+use crate::listener::{
+    AssertKind, BlockKind, ConstructorReferenceContext, IdentifierContext, MemberKind,
+    ParserListener,
+};
 use crate::message::msg;
 use crate::parser::{AsyncModifier, Parser};
 use crate::recovery::is_identifier;
@@ -497,77 +500,93 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     TokenKind::Period | TokenKind::QuestionPeriod => {
                         let dot = self.peek_span();
                         self.cursor.advance();
-                        // The null-aware split rides the `?`: the member
-                        // (and any invocation arguments on it) runs on the
-                        // receiver's not-null path — same `rightBegin`
-                        // timing as the `?[` face.
-                        if kind == TokenKind::QuestionPeriod {
-                            self.listener.handle_null_aware_member_begin(dot);
-                        }
-                        // AstBuilder `doDotExpression` (ast_builder.dart:918):
-                        // the operand after `.` must be a name — a literal or
-                        // bracket operand (`a?.[0]`) is reported as a missing
-                        // identifier and replaced by a synthetic name. The
-                        // report anchors here only when the operand parsed as
-                        // a complete expression (literal, bracket group, or
-                        // keyword head): junk that fell through to the
-                        // identifier recovery (`x.;`, `a.class`) already took
-                        // its single `expectedIdentifier` row there, and a
-                        // second anchor here would double the oracle's one
-                        // row (`x.;` surfaces exactly one missing_identifier).
-                        let operand = self.peek_span();
-                        let operand_kind = self.peek_kind();
-                        left = self.parse_primary(IdentifierContext::ExpressionContinuation);
-                        if matches!(
-                            operand_kind,
-                            TokenKind::Int
-                                | TokenKind::Hexadecimal
-                                | TokenKind::Double
-                                | TokenKind::String
-                                | TokenKind::Hash
-                                | TokenKind::OpenParen
-                                | TokenKind::OpenSquare
-                                | TokenKind::Index
-                                | TokenKind::OpenCurly
-                                | TokenKind::Lt
-                        ) || matches!(
-                            operand_kind,
-                            TokenKind::Keyword(
-                                Keyword::True
-                                    | Keyword::False
-                                    | Keyword::Null
-                                    | Keyword::This
-                                    | Keyword::Super
-                                    | Keyword::Const
-                                    | Keyword::Void
-                                    | Keyword::Assert
-                            )
-                        ) {
-                            self.report(msg::missing_identifier(), operand);
-                        }
-                        // A bracket operand (`c1?.[0] = 1`) is replaced by a
-                        // synthetic name: the official shape is (null-aware)
-                        // property extraction, an assignable target (oracle
-                        // null_shorting_index line 13 reports only the
-                        // missing_identifier row on the assignment — no
-                        // selector rows). The last real token is the `]`, so
-                        // the shape flag must carry the assignability.
-                        lhs_ends_index =
-                            matches!(operand_kind, TokenKind::OpenSquare | TokenKind::Index);
-                        if is_dot_shorthand {
-                            self.listener.handle_dot_shorthand_head(dot);
-                            self.report_dot_shorthands_gate(dot);
-                            is_dot_shorthand = false;
+                        // Anonymous-methods experiment (:7292-7295): the
+                        // gate reads the token after the dot before
+                        // anything else; the anonymous arm fires no
+                        // null-aware split and no dot-access member —
+                        // begin/endAnonymousMethodInvocation carry the
+                        // member instead. With the experiment off (or an
+                        // ordinary member following) the ordinary path
+                        // below stands, which is the oracle's own posture:
+                        // the upstream not-enabled report is an upstream
+                        // unimplemented stub and never fires.
+                        if self.features.anonymous_methods_enabled && self.begins_anonymous_method()
+                        {
+                            left = self.parse_anonymous_method(dot);
+                            lhs_ends_index = false;
                         } else {
-                            self.listener.handle_dot_access(
-                                dot,
-                                left,
-                                kind == TokenKind::QuestionPeriod,
-                            );
+                            // The null-aware split rides the `?`: the member
+                            // (and any invocation arguments on it) runs on the
+                            // receiver's not-null path — same `rightBegin`
+                            // timing as the `?[` face.
+                            if kind == TokenKind::QuestionPeriod {
+                                self.listener.handle_null_aware_member_begin(dot);
+                            }
+                            // AstBuilder `doDotExpression` (ast_builder.dart:918):
+                            // the operand after `.` must be a name — a literal or
+                            // bracket operand (`a?.[0]`) is reported as a missing
+                            // identifier and replaced by a synthetic name. The
+                            // report anchors here only when the operand parsed as
+                            // a complete expression (literal, bracket group, or
+                            // keyword head): junk that fell through to the
+                            // identifier recovery (`x.;`, `a.class`) already took
+                            // its single `expectedIdentifier` row there, and a
+                            // second anchor here would double the oracle's one
+                            // row (`x.;` surfaces exactly one missing_identifier).
+                            let operand = self.peek_span();
+                            let operand_kind = self.peek_kind();
+                            left = self.parse_primary(IdentifierContext::ExpressionContinuation);
+                            if matches!(
+                                operand_kind,
+                                TokenKind::Int
+                                    | TokenKind::Hexadecimal
+                                    | TokenKind::Double
+                                    | TokenKind::String
+                                    | TokenKind::Hash
+                                    | TokenKind::OpenParen
+                                    | TokenKind::OpenSquare
+                                    | TokenKind::Index
+                                    | TokenKind::OpenCurly
+                                    | TokenKind::Lt
+                            ) || matches!(
+                                operand_kind,
+                                TokenKind::Keyword(
+                                    Keyword::True
+                                        | Keyword::False
+                                        | Keyword::Null
+                                        | Keyword::This
+                                        | Keyword::Super
+                                        | Keyword::Const
+                                        | Keyword::Void
+                                        | Keyword::Assert
+                                )
+                            ) {
+                                self.report(msg::missing_identifier(), operand);
+                            }
+                            // A bracket operand (`c1?.[0] = 1`) is replaced by a
+                            // synthetic name: the official shape is (null-aware)
+                            // property extraction, an assignable target (oracle
+                            // null_shorting_index line 13 reports only the
+                            // missing_identifier row on the assignment — no
+                            // selector rows). The last real token is the `]`, so
+                            // the shape flag must carry the assignability.
+                            lhs_ends_index =
+                                matches!(operand_kind, TokenKind::OpenSquare | TokenKind::Index);
+                            if is_dot_shorthand {
+                                self.listener.handle_dot_shorthand_head(dot);
+                                self.report_dot_shorthands_gate(dot);
+                                is_dot_shorthand = false;
+                            } else {
+                                self.listener.handle_dot_access(
+                                    dot,
+                                    left,
+                                    kind == TokenKind::QuestionPeriod,
+                                );
+                            }
+                            let (end, ta) = self.parse_method_type_args_block(left);
+                            left = end;
+                            type_arg = ta;
                         }
-                        let (end, ta) = self.parse_method_type_args_block(left);
-                        left = end;
-                        type_arg = ta;
                     }
                     TokenKind::OpenParen | TokenKind::OpenSquare => {
                         let (end, ta, ends_index) =
@@ -1260,6 +1279,88 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.parse_send(IdentifierContext::ExpressionContinuation)
     }
 
+    /// Upstream `_beginsAnonymousMethod` (parser_impl.dart:7524-7547): the
+    /// cursor sits on the token after the `.`/`?.`/`..`/`?..` punctuation.
+    /// `{` or `=>` open the member directly; a `(` whose endGroup match is
+    /// followed by `{` or `=>` opens an explicitly parameterized one. The
+    /// probe reads the raw token table (the `endGroup.next` face); a
+    /// recovery synthetic spliced later between the group's closer and the
+    /// body would make the body check in
+    /// [`Self::parse_anonymous_method`] see a different follower — that
+    /// gap is exactly what its missing-body arm covers.
+    fn begins_anonymous_method(&self) -> bool {
+        match self.peek_kind() {
+            TokenKind::OpenCurly | TokenKind::Function => true,
+            TokenKind::OpenParen => {
+                let after = self
+                    .cursor
+                    .table_matching_end(self.peek_id())
+                    .map(|close| self.kind_at(self.offset_of(close) + 1));
+                matches!(after, Some(TokenKind::OpenCurly | TokenKind::Function))
+            }
+            _ => false,
+        }
+    }
+
+    /// Upstream `_parseAnonymousMethod` (parser_impl.dart:7550-7590); the
+    /// cursor sits on the token after the punctuation and
+    /// [`Self::begins_anonymous_method`] just returned true. Explicit
+    /// `(params)` go through the formal-parameter parser with
+    /// [`crate::listener::MemberKind::AnonymousMethod`], otherwise the
+    /// parameters are implicit; the body is a block or an arrow expression
+    /// (no cascade), with the upstream missing-body recovery splicing a
+    /// synthetic `=>` when neither shape survived to the parse. The member
+    /// fires no dot-access/null-aware events — `begin`/
+    /// `endAnonymousMethodInvocation` carry it instead.
+    fn parse_anonymous_method(&mut self, punctuation: TokenSpan) -> TokenSpan {
+        self.listener.begin_anonymous_method_invocation(punctuation);
+        if self.peek_kind() == TokenKind::OpenParen {
+            let _ = self.parse_formal_parameters_rest(MemberKind::AnonymousMethod);
+        } else {
+            self.listener.handle_implicit_formal_parameters(punctuation);
+        }
+        let mut function_definition = None;
+        let is_expression;
+        let end = match self.peek_kind() {
+            TokenKind::OpenCurly => {
+                is_expression = false;
+                self.parse_block(BlockKind::FunctionBody, crate::message::BlockKind::Body)
+            }
+            TokenKind::Function => {
+                is_expression = true;
+                function_definition = Some(self.peek_span());
+                // The cursor sits ON the `=>` (dartq's on-token convention;
+                // upstream passes the arrow and parses from its `.next`).
+                self.cursor.advance();
+                self.parse_expression_without_cascade()
+            }
+            _ => {
+                // Upstream `expectedButGot2(expected: "{", expected2: "=>")`
+                // — the pseudo-shared re-render surfaces only the first
+                // expected (error_converter.dart:89-96), the plain
+                // `expected_but_got("{")` face. The synthetic `=>` is
+                // spliced in front of the real follower and the expression
+                // parse resumes after it.
+                let at = self.peek_span();
+                self.report(msg::expected_but_got("{"), at);
+                let arrow = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Function, at.range.offset);
+                function_definition = Some(self.span_of(arrow));
+                is_expression = true;
+                self.cursor.advance();
+                self.parse_expression_without_cascade()
+            }
+        };
+        self.listener.end_anonymous_method_invocation(
+            punctuation,
+            function_definition,
+            end,
+            is_expression,
+        );
+        end
+    }
+
     /// Official `parseCascadeExpression`; the cursor sits on the `..`/`?..`
     /// operator, `left` the cascade target expression span.
     fn parse_cascade_expression(&mut self, left: TokenSpan) -> TokenSpan {
@@ -1270,6 +1371,11 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let mut end = if self.peek_kind() == TokenKind::OpenSquare {
             self.parse_argument_or_index_star(left, TypeParamOrArg::None, false)
                 .0
+        } else if self.features.anonymous_methods_enabled && self.begins_anonymous_method() {
+            // Anonymous-methods experiment (:7770-7774): the initial
+            // section's member is an anonymous method; no
+            // handleCascadeAccess fires for it.
+            self.parse_anonymous_method(cascade_operator)
         } else {
             let sent = self.parse_send_continuation();
             self.listener
@@ -1285,11 +1391,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let period = self.peek_span();
                 let is_null_aware = self.peek_kind() == TokenKind::QuestionPeriod;
                 self.cursor.advance();
-                if is_null_aware {
-                    self.listener.handle_null_aware_member_begin(period);
+                if self.features.anonymous_methods_enabled && self.begins_anonymous_method() {
+                    // Anonymous-methods experiment (:7795-7798): a later
+                    // section's member is an anonymous method; no
+                    // null-aware split and no dot-access fire for it.
+                    end = self.parse_anonymous_method(period);
+                } else {
+                    if is_null_aware {
+                        self.listener.handle_null_aware_member_begin(period);
+                    }
+                    end = self.parse_send_continuation();
+                    self.listener.handle_dot_access(period, end, is_null_aware);
                 }
-                end = self.parse_send_continuation();
-                self.listener.handle_dot_access(period, end, is_null_aware);
             } else if self.peek_kind() == TokenKind::Bang {
                 let bang = self.peek_span();
                 self.listener.handle_non_null_assert_expression(bang);

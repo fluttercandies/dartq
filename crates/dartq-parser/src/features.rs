@@ -62,6 +62,16 @@ pub struct ParserFeatures {
     /// always parses the shorthand shape; when off, the head anchors report
     /// `experiment_not_enabled` (`Parser::report_dot_shorthands_gate`).
     pub dot_shorthands_enabled: bool,
+    /// `isAnonymousMethodsFeatureEnabled` (`parser_impl.dart:364-365`): the
+    /// anonymous-method member family — `receiver.{ ... }`, `receiver.=> e`,
+    /// `receiver.(p) { ... }` and their `?.`/`..`/`?..` faces
+    /// (`parser_impl.dart:7292-7295` selector, :7770-7801 cascade). Opt-in
+    /// with no `enabledIn`. When off, the member dispatch falls through to
+    /// the ordinary selector path: the upstream `reportExperimentNotEnabled`
+    /// call is an upstream unimplemented stub that never fires, so the off
+    /// posture is plain `missing_identifier`/`expected_token` noise
+    /// (oracle-pinned).
+    pub anonymous_methods_enabled: bool,
     /// The sound-flow-analysis posture (`enabledIn: 3.9.0`, expired — the
     /// analyzer wires it as `soundFlowAnalysisEnabled:
     /// featureSet.isEnabled(Feature.sound_flow_analysis)`,
@@ -83,6 +93,7 @@ impl ParserFeatures {
         augmentations_enabled: false,
         enhanced_parts_enabled: false,
         dot_shorthands_enabled: false,
+        anonymous_methods_enabled: false,
         sound_flow_analysis: false,
     };
 
@@ -117,6 +128,9 @@ impl ParserFeatures {
             Feature::Augmentations => self.augmentations_enabled = true,
             Feature::EnhancedParts => self.enhanced_parts_enabled = true,
             Feature::DotShorthands => self.dot_shorthands_enabled = true,
+            // Grammar gate: the anonymous-method member family (the field's
+            // doc) — dispatched in the selector and cascade arms.
+            Feature::AnonymousMethods => self.anonymous_methods_enabled = true,
             // Not a grammar gate: the fold carries the posture for the
             // flow-analysis replay (the field's doc).
             Feature::SoundFlowAnalysis => self.sound_flow_analysis = true,
@@ -136,7 +150,6 @@ impl ParserFeatures {
             | Feature::InferenceUpdate4
             | Feature::ThisPromotion
             | Feature::StaticExtensions
-            | Feature::AnonymousMethods
             | Feature::TestExperiment
             | Feature::PrivateNamedParameters
             | Feature::NativeAssets
@@ -233,6 +246,7 @@ mod tests {
                 augmentations_enabled: shipped(Feature::Augmentations, version),
                 enhanced_parts_enabled: shipped(Feature::EnhancedParts, version),
                 dot_shorthands_enabled: shipped(Feature::DotShorthands, version),
+                anonymous_methods_enabled: shipped(Feature::AnonymousMethods, version),
                 sound_flow_analysis: shipped(Feature::SoundFlowAnalysis, version),
             };
             assert_eq!(folded, expected, "parser fold drifts at {version}");
@@ -245,8 +259,19 @@ mod tests {
     #[test]
     fn experiment_opt_in_folds_only_through_the_set() {
         let latest = dartq_language::FeatureSet::latest();
-        assert!(!ParserFeatures::from_feature_set(latest).variance_enabled);
-        let opted_in = latest.with_experiment(Feature::Variance);
-        assert!(ParserFeatures::from_feature_set(opted_in).variance_enabled);
+        assert!(
+            !ParserFeatures::from_feature_set(latest).variance_enabled,
+            "no enabledIn: latest never ships the bit"
+        );
+        assert!(
+            !ParserFeatures::from_feature_set(latest).anonymous_methods_enabled,
+            "no enabledIn: latest never ships the bit"
+        );
+        let opted_in = latest
+            .with_experiment(Feature::Variance)
+            .with_experiment(Feature::AnonymousMethods);
+        let folded = ParserFeatures::from_feature_set(opted_in);
+        assert!(folded.variance_enabled);
+        assert!(folded.anonymous_methods_enabled);
     }
 }

@@ -271,44 +271,92 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let mut vfc_done = false;
         loop {
             match self.peek_kind() {
-                TokenKind::Keyword(Keyword::External)
-                    if mods.external.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::External) if self.is_modifier_at(0) => {
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if mods.external.is_some() {
+                        // Official `_parseExternal` recovery: one
+                        // `duplicated_modifier` row, the first token stays
+                        // recorded.
+                        self.report(msg::duplicated_modifier("external"), t);
+                    } else {
+                        // Official `_parseExternal` order chain (the
+                        // augment/external pair conflicts, :523).
+                        if let Some(c) = mods.const_kw {
+                            let earlier = self.cursor.lexeme(c.id);
+                            self.report(msg::modifier_out_of_order("external", earlier), t);
+                        } else if mods.static_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "static"), t);
+                        } else if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "late"), t);
+                        } else if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("external", earlier), t);
+                        } else if mods.covariant.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "covariant"), t);
+                        } else if mods.augment.is_some() {
+                            self.report(msg::conflicting_modifiers("external", "augment"), t);
+                        }
+                        mods.external = Some(t);
+                    }
+                }
+                TokenKind::Keyword(Keyword::Augment) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     if mods.augment.is_some() {
-                        self.report(msg::modifier_out_of_order("external", "augment"), t);
+                        // Official `_parseAugment` recovery.
+                        self.report(msg::duplicated_modifier("augment"), t);
+                    } else {
+                        // Official `_parseAugment` order chain (the
+                        // augment/external pair conflicts, :431).
+                        if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("augment", earlier), t);
+                        } else if let Some(a) = mods.abstract_kw {
+                            self.report(
+                                msg::modifier_out_of_order("augment", self.cursor.lexeme(a.id)),
+                                t,
+                            );
+                        } else if mods.const_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "const"), t);
+                        } else if mods.covariant.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "covariant"), t);
+                        } else if mods.final_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "final"), t);
+                        } else if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "late"), t);
+                        } else if mods.static_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "static"), t);
+                        } else if mods.external.is_some() {
+                            self.report(msg::conflicting_modifiers("augment", "external"), t);
+                        }
+                        mods.augment = Some(t);
                     }
-                    if mods.var_final_or_const.is_some() {
-                        self.report(msg::modifier_out_of_order("external", "var"), t);
-                    }
-                    mods.external = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Augment)
-                    if mods.augment.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::Abstract) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    mods.augment = Some(t);
-                }
-                TokenKind::Keyword(Keyword::Abstract)
-                    if mods.abstract_kw.is_none() && self.is_modifier_at(0) =>
-                {
-                    let t = self.peek_span();
-                    self.cursor.advance();
-                    // Official `_parseAbstract` order chain (top-level member
-                    // flavor): `var/final/const` before `abstract`.
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("abstract", earlier), t);
-                    } else if let Some(c) = mods.covariant {
-                        self.report(
-                            msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
-                            t,
-                        );
+                    if mods.abstract_kw.is_some() {
+                        // Official `_parseAbstract` recovery: only the
+                        // duplicate row — the extraneous report belongs to
+                        // the first token.
+                        self.report(msg::duplicated_modifier("abstract"), t);
+                    } else {
+                        // Official `_parseAbstract` order chain (top-level
+                        // member flavor): `var/final/const` before
+                        // `abstract`.
+                        if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                        } else if let Some(c) = mods.covariant {
+                            self.report(
+                                msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
+                                t,
+                            );
+                        }
+                        self.report(msg::extraneous_modifier("abstract"), t);
+                        mods.abstract_kw = Some(t);
                     }
-                    self.report(msg::extraneous_modifier("abstract"), t);
-                    mods.abstract_kw = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Static) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
@@ -322,16 +370,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     self.report(msg::extraneous_modifier("covariant"), t);
                     mods.covariant = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Late)
-                    if mods.late_kw.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::Late) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("late", earlier), t);
+                    if mods.late_kw.is_some() {
+                        // Official `_parseLate` recovery: only the duplicate
+                        // row.
+                        self.report(msg::duplicated_modifier("late"), t);
+                    } else {
+                        if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("late", earlier), t);
+                        }
+                        mods.late_kw = Some(t);
                     }
-                    mods.late_kw = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Var | Keyword::Final | Keyword::Const) if !vfc_done => {
                     let t = self.peek_span();
@@ -820,72 +872,92 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let mut covariant_seen = false;
         loop {
             match self.peek_kind() {
-                TokenKind::Keyword(Keyword::External)
-                    if mods.external.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::External) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    // Official `_parseExternal` order chain (no augment arm).
-                    if let Some(c) = mods.const_kw {
-                        let earlier = self.cursor.lexeme(c.id);
-                        self.report(msg::modifier_out_of_order("external", earlier), t);
-                    } else if mods.static_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("external", "static"), t);
-                    } else if mods.late_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("external", "late"), t);
-                    } else if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("external", earlier), t);
-                    } else if mods.covariant.is_some() {
-                        self.report(msg::modifier_out_of_order("external", "covariant"), t);
+                    if mods.external.is_some() {
+                        // Official `_parseExternal` recovery: one
+                        // `duplicated_modifier` row, the first token stays
+                        // recorded (:529).
+                        self.report(msg::duplicated_modifier("external"), t);
+                    } else {
+                        // Official `_parseExternal` order chain.
+                        if let Some(c) = mods.const_kw {
+                            let earlier = self.cursor.lexeme(c.id);
+                            self.report(msg::modifier_out_of_order("external", earlier), t);
+                        } else if mods.static_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "static"), t);
+                        } else if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "late"), t);
+                        } else if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("external", earlier), t);
+                        } else if mods.covariant.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "covariant"), t);
+                        } else if mods.augment.is_some() {
+                            // `reportConflictingModifiers(next, augmentToken)`
+                            // (:523) — the augment/external pair is a
+                            // conflict, not an ordering error.
+                            self.report(msg::conflicting_modifiers("external", "augment"), t);
+                        }
+                        mods.external = Some(t);
                     }
-                    mods.external = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Augment)
-                    if mods.augment.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::Augment) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    // Official `_parseAugment` order chain.
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("augment", earlier), t);
-                    } else if let Some(a) = mods.abstract_kw {
-                        self.report(
-                            msg::modifier_out_of_order("augment", self.cursor.lexeme(a.id)),
-                            t,
-                        );
-                    } else if mods.const_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("augment", "const"), t);
-                    } else if mods.covariant.is_some() {
-                        self.report(msg::modifier_out_of_order("augment", "covariant"), t);
-                    } else if mods.final_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("augment", "final"), t);
-                    } else if mods.late_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("augment", "late"), t);
-                    } else if mods.static_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("augment", "static"), t);
-                    } else if mods.external.is_some() {
-                        self.report(msg::modifier_out_of_order("augment", "external"), t);
+                    if mods.augment.is_some() {
+                        // Official `_parseAugment` recovery (:437).
+                        self.report(msg::duplicated_modifier("augment"), t);
+                    } else {
+                        // Official `_parseAugment` order chain.
+                        if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("augment", earlier), t);
+                        } else if let Some(a) = mods.abstract_kw {
+                            self.report(
+                                msg::modifier_out_of_order("augment", self.cursor.lexeme(a.id)),
+                                t,
+                            );
+                        } else if mods.const_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "const"), t);
+                        } else if mods.covariant.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "covariant"), t);
+                        } else if mods.final_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "final"), t);
+                        } else if mods.late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "late"), t);
+                        } else if mods.static_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "static"), t);
+                        } else if mods.external.is_some() {
+                            // `reportConflictingModifiers(next, externalToken)`
+                            // (:431) — oracle member_errors 4|12: "Members
+                            // can't be declared to be both 'augment' and
+                            // 'external'."
+                            self.report(msg::conflicting_modifiers("augment", "external"), t);
+                        }
+                        mods.augment = Some(t);
                     }
-                    mods.augment = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Abstract)
-                    if mods.abstract_kw.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::Abstract) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    // Official `_parseAbstract` order chain.
-                    if let Some(vfc) = mods.var_final_or_const {
-                        let earlier = self.cursor.lexeme(vfc.id);
-                        self.report(msg::modifier_out_of_order("abstract", earlier), t);
-                    } else if let Some(c) = mods.covariant {
-                        self.report(
-                            msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
-                            t,
-                        );
+                    if mods.abstract_kw.is_some() {
+                        // Official `_parseAbstract` recovery (:406).
+                        self.report(msg::duplicated_modifier("abstract"), t);
+                    } else {
+                        // Official `_parseAbstract` order chain.
+                        if let Some(vfc) = mods.var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                        } else if let Some(c) = mods.covariant {
+                            self.report(
+                                msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
+                                t,
+                            );
+                        }
+                        mods.abstract_kw = Some(t);
                     }
-                    mods.abstract_kw = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Static) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
@@ -938,20 +1010,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.report(msg::conflicting_modifiers("covariant", "const"), t);
                     }
                 }
-                TokenKind::Keyword(Keyword::Late)
-                    if mods.late_kw.is_none() && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::Late) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
-                    // Official `_parseLate` order chain.
-                    if mods.const_kw.is_some() {
-                        self.report(msg::conflicting_modifiers("late", "const"), t);
-                    } else if mods.var_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("late", "var"), t);
-                    } else if mods.final_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("late", "final"), t);
+                    if mods.late_kw.is_some() {
+                        // Official `_parseLate` recovery (:575).
+                        self.report(msg::duplicated_modifier("late"), t);
+                    } else {
+                        // Official `_parseLate` order chain.
+                        if mods.const_kw.is_some() {
+                            self.report(msg::conflicting_modifiers("late", "const"), t);
+                        } else if mods.var_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("late", "var"), t);
+                        } else if mods.final_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("late", "final"), t);
+                        }
+                        mods.late_kw = Some(t);
                     }
-                    mods.late_kw = Some(t);
                 }
                 TokenKind::Keyword(Keyword::Final) => {
                     let t = self.peek_span();
@@ -1009,23 +1084,30 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     self.cursor.advance();
                     // Official `_parseRequired` order chain (the member-level
                     // extraneous report happens in `parse_class_member_impl`
-                    // via `parseClassMemberModifiers`).
-                    if let Some(c) = mods.const_kw {
-                        self.report(
-                            msg::modifier_out_of_order("required", self.cursor.lexeme(c.id)),
-                            t,
-                        );
-                    } else if let Some(c) = mods.covariant {
-                        self.report(
-                            msg::modifier_out_of_order("required", self.cursor.lexeme(c.id)),
-                            t,
-                        );
-                    } else if mods.final_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("required", "final"), t);
-                    } else if mods.var_kw.is_some() {
-                        self.report(msg::modifier_out_of_order("required", "var"), t);
+                    // via `parseClassMemberModifiers`). A repeat is the
+                    // `_parseRequired` recovery (:598): one
+                    // `duplicated_modifier` row and the FIRST token stays
+                    // recorded, so the walk-end extraneous anchors there.
+                    if mods.required.is_some() {
+                        self.report(msg::duplicated_modifier("required"), t);
+                    } else {
+                        if let Some(c) = mods.const_kw {
+                            self.report(
+                                msg::modifier_out_of_order("required", self.cursor.lexeme(c.id)),
+                                t,
+                            );
+                        } else if let Some(c) = mods.covariant {
+                            self.report(
+                                msg::modifier_out_of_order("required", self.cursor.lexeme(c.id)),
+                                t,
+                            );
+                        } else if mods.final_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("required", "final"), t);
+                        } else if mods.var_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("required", "var"), t);
+                        }
+                        mods.required = Some(t);
                     }
-                    mods.required = Some(t);
                 }
                 _ => break,
             }

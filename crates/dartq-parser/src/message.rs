@@ -1572,7 +1572,7 @@ pub(crate) mod msg {
                 "extension_declares_instance_field",
                 "EXTENSION_DECLARES_INSTANCE_FIELD",
             ),
-            "Extensions can't declare instance fields",
+            "Extensions can't declare instance fields.",
         )
     }
 
@@ -1582,7 +1582,7 @@ pub(crate) mod msg {
                 "extension_type_declares_instance_field",
                 "EXTENSION_TYPE_DECLARES_INSTANCE_FIELD",
             ),
-            "Extension types can't declare instance fields",
+            "Extension types can't declare instance fields.",
         )
     }
 
@@ -1698,7 +1698,7 @@ pub(crate) mod msg {
     pub(crate) fn pattern_variable_declaration_outside_function_or_method() -> Message {
         Message::new(
             PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD,
-            "Pattern variable declarations can't be used outside of a function or method.",
+            "A pattern variable declaration may not appear outside a function or method.",
         )
     }
 
@@ -1902,10 +1902,7 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn named_function_expression() -> Message {
-        Message::new(
-            NAMED_FUNCTION_EXPRESSION,
-            "A function expression can't have a name.",
-        )
+        Message::new(NAMED_FUNCTION_EXPRESSION, "Function expressions can't be named.")
     }
 
     pub(crate) fn binary_operator_written_out(written: &str, operator: &str) -> Message {

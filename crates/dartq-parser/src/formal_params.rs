@@ -386,12 +386,30 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // duplicated@second, probed 3.13.1), where a lone `required` stays
         // silent.
         let mut duplicate_required = false;
+        // Chain-only records of the shared `_parseModifiers` walker
+        // (modifier_context.dart): `const` is reported in place and never
+        // flows into `var_final_or_const` (the walk-end VAR/FINAL split must
+        // stay silent for it), the rest mirror the upstream tokens purely
+        // for the per-modifier order chains and the walk-end extraneous
+        // gates (:271-274).
+        let mut const_kw: Option<TokenSpan> = None;
+        let mut late_kw: Option<TokenSpan> = None;
+        let mut external: Option<TokenSpan> = None;
+        let mut static_kw: Option<TokenSpan> = None;
+        let mut abstract_kw: Option<TokenSpan> = None;
+        let mut augment: Option<TokenSpan> = None;
         // Modifier walk (official parseFormalParameter head +
-        // `parseFormalParameterModifiers` recovery).
+        // `parseFormalParameterModifiers` → `_parseModifiers`): every arm
+        // mirrors its official `_parse<Key>` handler — order checks against
+        // already-seen modifiers, then duplicate/recovery reports — and
+        // ALWAYS consumes the keyword when the `isModifier` follower rule
+        // holds, so `late`/`external`/... never derail into the type/name
+        // lane.
         loop {
             match self.peek_kind() {
                 TokenKind::Keyword(Keyword::Required)
-                    if parameter_kind == FormalParameterKind::OptionalNamed =>
+                    if parameter_kind == FormalParameterKind::OptionalNamed
+                        && self.is_modifier_at(0) =>
                 {
                     parameter_kind = FormalParameterKind::RequiredNamed;
                     let t = self.peek_span();
@@ -402,31 +420,56 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     if matches!(
                         member_kind,
                         MemberKind::ExtensionNonStaticMethod | MemberKind::ExtensionStaticMethod
-                    ) =>
+                    ) && self.is_modifier_at(0) =>
                 {
                     // `reportExtraneousModifierInExtension`
                     // (modifier_context.dart:230, analyzer code
-                    // invalid_use_of_covariant_in_extension).
+                    // invalid_use_of_covariant_in_extension): the FIRST
+                    // token reports (in place here, same anchor as the
+                    // upstream walk end); a repeat takes the `_parseCovariant`
+                    // recovery instead (:491).
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::invalid_use_of_covariant_in_extension("covariant"), t);
+                    if covariant.is_some() {
+                        self.report(msg::duplicated_modifier("covariant"), t);
+                    } else {
+                        covariant.get_or_insert(t);
+                        self.report(msg::invalid_use_of_covariant_in_extension("covariant"), t);
+                    }
                 }
                 TokenKind::Keyword(Keyword::Covariant)
                     if !matches!(
                         member_kind,
-                        MemberKind::StaticMethod
-                            | MemberKind::TopLevelMethod
-                            | MemberKind::ExtensionTypeNonStaticMethod
+                        MemberKind::ExtensionTypeNonStaticMethod
                             | MemberKind::ExtensionTypeStaticMethod
-                    ) =>
+                    ) && self.is_modifier_at(0) =>
                 {
-                    // Recorded silently; the walk-end gate reports the
-                    // primary-constructor case (modifier_context.dart:238)
-                    // once `var`/`final`/`const` is known.
-                    covariant.get_or_insert(self.peek_span());
+                    // Official `_parseCovariant` (:470-502): the accepted
+                    // face records with the order chain, the recovery face
+                    // reports per the recorded set. The walk-end gate
+                    // (:223-233) reports `extraneous_modifier` for the
+                    // method flavors that forbid `covariant`.
+                    let t = self.peek_span();
                     self.cursor.advance();
+                    if const_kw.is_none() && covariant.is_none() && static_kw.is_none() {
+                        if let Some(v) = var_final_or_const {
+                            let earlier = self.cursor.lexeme(v.id);
+                            self.report(msg::modifier_out_of_order("covariant", earlier), t);
+                        } else if late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("covariant", "late"), t);
+                        }
+                        covariant.get_or_insert(t);
+                    } else if covariant.is_some() {
+                        self.report(msg::duplicated_modifier("covariant"), t);
+                    } else if const_kw.is_some() {
+                        self.report(msg::conflicting_modifiers("covariant", "const"), t);
+                    } else {
+                        self.report(msg::covariant_and_static(), t);
+                    }
                 }
-                TokenKind::Keyword(Keyword::Var | Keyword::Final) if !in_function_type => {
+                TokenKind::Keyword(Keyword::Var | Keyword::Final)
+                    if !in_function_type && self.is_modifier_at(0) =>
+                {
                     if var_final_or_const.is_some() {
                         let t = self.peek_span();
                         self.report(msg::duplicated_modifier(self.cursor.lexeme(t.id)), t);
@@ -435,7 +478,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     }
                     self.cursor.advance();
                 }
-                TokenKind::Keyword(Keyword::Var | Keyword::Final) if in_function_type => {
+                TokenKind::Keyword(Keyword::Var | Keyword::Final)
+                    if in_function_type && self.is_modifier_at(0) =>
+                {
                     // Function-type formals take the official recovery route
                     // (`parseFormalParameterModifiers`): the modifier is
                     // consumed and recorded — it flows back into
@@ -454,30 +499,168 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     }
                     self.cursor.advance();
                 }
-                TokenKind::Keyword(Keyword::Const) if var_final_or_const.is_none() => {
-                    // `const` routes to the recovery walk's `constToken`
-                    // branch in both flavors: `extraneous_modifier` only —
-                    // the `function_typed_parameter_var` arm is the `else
-                    // if` of the const test (modifier_context.dart:270-286),
-                    // and the recorded token is never a `const`, so the
-                    // walk-end VAR/FINAL split stays silent for it.
+                TokenKind::Keyword(Keyword::Const) if self.is_modifier_at(0) => {
+                    // Official `_parseConst` (:441-468): the accepted face
+                    // records `constToken` and the walk end reports
+                    // `extraneous_modifier` on it (in place here, same
+                    // anchor); the recovery face reports per the recorded
+                    // set. `const` is kept out of `var_final_or_const`, so
+                    // the walk-end VAR/FINAL split stays silent for it.
                     let t = self.peek_span();
                     self.cursor.advance();
-                    self.report(msg::extraneous_modifier("const"), t);
+                    if var_final_or_const.is_none() && const_kw.is_none() && covariant.is_none() {
+                        if late_kw.is_some() {
+                            self.report(msg::conflicting_modifiers("const", "late"), t);
+                        }
+                        const_kw = Some(t);
+                        self.report(msg::extraneous_modifier("const"), t);
+                    } else if const_kw.is_some() {
+                        self.report(msg::duplicated_modifier("const"), t);
+                    } else if covariant.is_some() {
+                        self.report(msg::conflicting_modifiers("const", "covariant"), t);
+                    } else {
+                        let is_var = var_final_or_const
+                            .is_some_and(|v| self.cursor.lexeme(v.id) == "var");
+                        let is_final = var_final_or_const
+                            .is_some_and(|v| self.cursor.lexeme(v.id) == "final");
+                        if is_final {
+                            self.report(msg::const_and_final(), t);
+                        } else if is_var {
+                            self.report(msg::conflicting_modifiers("const", "var"), t);
+                        }
+                    }
                 }
-                TokenKind::Keyword(Keyword::Required) if required.is_some() => {
+                TokenKind::Keyword(Keyword::Required)
+                    if required.is_some() && self.is_modifier_at(0) =>
+                {
                     // `_parseRequired` recovery (modifier_context.dart:596).
                     let t = self.peek_span();
                     self.cursor.advance();
                     self.report(msg::duplicated_modifier("required"), t);
                     duplicate_required = true;
                 }
-                TokenKind::Keyword(Keyword::Required) => {
+                TokenKind::Keyword(Keyword::Required) if self.is_modifier_at(0) => {
                     // Recorded silently; the walk-end gate reports it once
                     // (modifier_context.dart:212-221).
                     let t = self.peek_span();
                     self.cursor.advance();
                     required.get_or_insert(t);
+                }
+                TokenKind::Keyword(Keyword::Late) if self.is_modifier_at(0) => {
+                    // Official `_parseLate` (:558-577): consumed and
+                    // recorded; the walk-end gate (:273) reports
+                    // `extraneous_modifier`, so `late` never derails into
+                    // the type/name lane.
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if late_kw.is_some() {
+                        self.report(msg::duplicated_modifier("late"), t);
+                    } else {
+                        if const_kw.is_some() {
+                            self.report(msg::conflicting_modifiers("late", "const"), t);
+                        } else if let Some(vfc) = var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("late", earlier), t);
+                        }
+                        late_kw = Some(t);
+                    }
+                }
+                TokenKind::Keyword(Keyword::External) if self.is_modifier_at(0) => {
+                    // Official `_parseExternal` (:504-531); the walk-end gate
+                    // (:272) reports `extraneous_modifier`.
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if external.is_some() {
+                        self.report(msg::duplicated_modifier("external"), t);
+                    } else {
+                        if const_kw.is_some() {
+                            let earlier = self.cursor.lexeme(const_kw.unwrap().id);
+                            self.report(msg::modifier_out_of_order("external", earlier), t);
+                        } else if static_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "static"), t);
+                        } else if late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "late"), t);
+                        } else if let Some(vfc) = var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("external", earlier), t);
+                        } else if covariant.is_some() {
+                            self.report(msg::modifier_out_of_order("external", "covariant"), t);
+                        } else if augment.is_some() {
+                            self.report(msg::conflicting_modifiers("external", "augment"), t);
+                        }
+                        external = Some(t);
+                    }
+                }
+                TokenKind::Keyword(Keyword::Abstract) if self.is_modifier_at(0) => {
+                    // Official `_parseAbstract` (:391-408); the walk-end gate
+                    // (:271) reports `extraneous_modifier`.
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if abstract_kw.is_some() {
+                        self.report(msg::duplicated_modifier("abstract"), t);
+                    } else {
+                        if let Some(vfc) = var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("abstract", earlier), t);
+                        } else if let Some(c) = covariant {
+                            self.report(
+                                msg::modifier_out_of_order("abstract", self.cursor.lexeme(c.id)),
+                                t,
+                            );
+                        }
+                        abstract_kw = Some(t);
+                    }
+                }
+                TokenKind::Keyword(Keyword::Static) if self.is_modifier_at(0) => {
+                    // Official `_parseStatic` (:602-633); the walk-end gate
+                    // (:274) reports `extraneous_modifier`.
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if covariant.is_none() && static_kw.is_none() {
+                        if abstract_kw.is_some() && self.features.augmentations_enabled {
+                            self.report(msg::modifier_out_of_order("static", "abstract"), t);
+                        } else if let Some(vfc) = var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("static", earlier), t);
+                        } else if late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("static", "late"), t);
+                        }
+                        static_kw = Some(t);
+                    } else if covariant.is_some() {
+                        self.report(msg::covariant_and_static(), t);
+                    } else {
+                        self.report(msg::duplicated_modifier("static"), t);
+                    }
+                }
+                TokenKind::Keyword(Keyword::Augment) if self.is_modifier_at(0) => {
+                    // Official `_parseAugment` (:410-439). Consumed and
+                    // recorded; `parseFormalParameterModifiers` has NO
+                    // augment extraneous gate, so a lone `augment` formal
+                    // modifier stays silent.
+                    let t = self.peek_span();
+                    self.cursor.advance();
+                    if augment.is_some() {
+                        self.report(msg::duplicated_modifier("augment"), t);
+                    } else {
+                        if let Some(vfc) = var_final_or_const {
+                            let earlier = self.cursor.lexeme(vfc.id);
+                            self.report(msg::modifier_out_of_order("augment", earlier), t);
+                        } else if abstract_kw.is_some() {
+                            let earlier = self.cursor.lexeme(abstract_kw.unwrap().id);
+                            self.report(msg::modifier_out_of_order("augment", earlier), t);
+                        } else if const_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "const"), t);
+                        } else if covariant.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "covariant"), t);
+                        } else if late_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "late"), t);
+                        } else if static_kw.is_some() {
+                            self.report(msg::modifier_out_of_order("augment", "static"), t);
+                        } else if external.is_some() {
+                            self.report(msg::conflicting_modifiers("augment", "external"), t);
+                        }
+                        augment = Some(t);
+                    }
                 }
                 _ => break,
             }
@@ -502,6 +685,34 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             if gate {
                 self.report(msg::extraneous_modifier("required"), t);
             }
+        }
+        // Walk-end covariant gate (modifier_context.dart:223-233): the
+        // method flavors that forbid `covariant` report `extraneous_modifier`
+        // once, on the first token. The extension flavors report
+        // `invalid_use_of_covariant_in_extension` in the walk, the
+        // primary-constructor face is gated below, and the extension-type
+        // flavors never record (`extraneous_modifier_in_extension_type` is
+        // not minted in dartq-diagnostics yet — those stay in the name lane).
+        if matches!(
+            member_kind,
+            MemberKind::StaticMethod | MemberKind::TopLevelMethod | MemberKind::AnonymousMethod
+        ) && let Some(t) = covariant
+        {
+            self.report(msg::extraneous_modifier("covariant"), t);
+        }
+        // Walk-end extraneous gates for the never-legal formal modifiers
+        // (modifier_context.dart:271-274, in the upstream order).
+        if let Some(t) = abstract_kw {
+            self.report(msg::extraneous_modifier("abstract"), t);
+        }
+        if let Some(t) = external {
+            self.report(msg::extraneous_modifier("external"), t);
+        }
+        if let Some(t) = late_kw {
+            self.report(msg::extraneous_modifier("late"), t);
+        }
+        if let Some(t) = static_kw {
+            self.report(msg::extraneous_modifier("static"), t);
         }
         if member_kind == MemberKind::GeneralizedFunctionType
             && let Some(t) = var_final_or_const

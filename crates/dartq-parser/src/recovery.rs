@@ -243,13 +243,24 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // `parse_send_continuation` before any identifier entry, so the
         // set here covers the dot-continuation paths that do reach this
         // gate (selector chains, dot shorthands, pattern selectors).
+        // `allowsNewAsIdentifier` is `true` for exactly five upstream
+        // context classes (:200, :391, :544, :1112, :1141) — the two
+        // constructor-reference continuations, `expressionContinuation`,
+        // `fieldInitializer` (unconditionally), the two metadata
+        // continuations, and `methodDeclarationContinuation` +
+        // `primaryConstructorDeclaration` (the primary-constructor head
+        // reaches this gate only when the feature flag enabled the face).
         if peek.kind == TokenKind::Keyword(Keyword::New)
             && matches!(
                 context,
                 crate::listener::IdentifierContext::ConstructorReferenceContinuation
                     | crate::listener::IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments
                     | crate::listener::IdentifierContext::ExpressionContinuation
+                    | crate::listener::IdentifierContext::FieldInitializer
+                    | crate::listener::IdentifierContext::MetadataContinuation
+                    | crate::listener::IdentifierContext::MetadataContinuationAfterTypeArguments
                     | crate::listener::IdentifierContext::MethodDeclarationContinuation
+                    | crate::listener::IdentifierContext::PrimaryConstructorDeclaration
             )
         {
             let id = self.cursor.advance();
@@ -1231,17 +1242,20 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // to the next real token too (bare `enum` + a next declaration: the
         // synthetic name inserted behind a reserved head anchors the body
         // row on that head, oracle `issue_48371_prime3` col 1 length 5). The
-        // switch-expression lane pins the same last-consumed anchor (its
-        // report lands on the `)` of `switch (n);`). The
-        // try/catch/finally/switch-statement lanes keep the follower anchor
-        // of their own milestones pending their differential passes.
+        // switch lanes pin the same last-consumed anchor (the
+        // switch-expression report lands on the `)` of `switch (n);`; the
+        // switch-statement report on the `)` of `switch (x-1) + 1;` —
+        // oracle keyword_named_top_level_methods 289|20). The
+        // try/catch/finally lanes keep the follower anchor of their own
+        // milestones pending their differential passes.
         let follower = self.peek_span();
         let at = match kind {
             crate::message::BlockKind::Class
             | crate::message::BlockKind::Mixin
             | crate::message::BlockKind::Extension
             | crate::message::BlockKind::ExtensionType
-            | crate::message::BlockKind::SwitchExpression => match self.cursor.last_consumed_id() {
+            | crate::message::BlockKind::SwitchExpression
+            | crate::message::BlockKind::SwitchStatement => match self.cursor.last_consumed_id() {
                 Some(id) if self.span_of(id).range.length > 0 => self.span_of(id),
                 _ => follower,
             },

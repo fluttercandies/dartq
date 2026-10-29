@@ -648,6 +648,25 @@ pub trait ParserListener {
     /// an anonymous function literal `(...) { ... }` (C22).
     fn begin_function_expression(&mut self, token: Token) {}
     fn end_function_expression(&mut self, begin: Token, end: Token) {}
+    /// `beginAnonymousMethodInvocation(token)` (listener.dart:1756): an
+    /// anonymous-method member of the anonymous-methods experiment opens at
+    /// the `.`/`?.`/`..`/`?..` punctuation (`receiver.{ ... }`,
+    /// `receiver.=> e`, `receiver.(p) { ... }`).
+    fn begin_anonymous_method_invocation(&mut self, token: Token) {}
+    /// `endAnonymousMethodInvocation` (listener.dart:1764): closes the
+    /// anonymous-method member; `function_definition` is the `=>` (real or
+    /// recovery-synthetic) of an expression body, `None` for a block body.
+    fn end_anonymous_method_invocation(
+        &mut self,
+        begin: Token,
+        function_definition: Option<Token>,
+        end: Token,
+        is_expression: bool,
+    ) {
+    }
+    /// `handleImplicitFormalParameters(token)` (listener.dart:1775): the
+    /// anonymous-method member carries no explicit parameter list.
+    fn handle_implicit_formal_parameters(&mut self, token: Token) {}
     /// `beginNamedFunctionExpression(token)` /
     /// `endNamedFunctionExpression(end)`: the named-function-expression
     /// recovery shape `T name(...) { ... }` (C23).

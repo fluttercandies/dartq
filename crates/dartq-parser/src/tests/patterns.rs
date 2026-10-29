@@ -145,6 +145,7 @@ fn patterns_disabled_reports_experiment() {
         augmentations_enabled: false,
         enhanced_parts_enabled: false,
         dot_shorthands_enabled: false,
+        anonymous_methods_enabled: false,
         sound_flow_analysis: false,
     };
     let mut collector = super::collector::Collector::default();

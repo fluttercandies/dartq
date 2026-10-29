@@ -120,6 +120,7 @@ const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     augmentations_enabled: true,
     enhanced_parts_enabled: false,
     dot_shorthands_enabled: true,
+    anonymous_methods_enabled: false,
     sound_flow_analysis: true,
 };
 
