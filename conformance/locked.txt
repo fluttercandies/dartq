@@ -59,6 +59,7 @@ diagnostic/equality_cannot_be_equality_operand
 diagnostic/expected_case_or_default
 diagnostic/expected_instead
 diagnostic/expected_list_or_map_literal
+diagnostic/expected_representation_field
 diagnostic/experiment_not_enabled_off_by_default
 diagnostic/export_directive_after_part_directive
 diagnostic/extension_augmentation_has_on_clause
@@ -145,6 +146,7 @@ diagnostic/missing_catch_or_finally
 diagnostic/missing_closing_parenthesis
 diagnostic/missing_dependency
 diagnostic/missing_digit
+diagnostic/missing_enum_body
 diagnostic/missing_expression_in_initializer
 diagnostic/missing_expression_in_throw
 diagnostic/missing_function_keyword
@@ -155,6 +157,7 @@ diagnostic/missing_name_for_named_parameter
 diagnostic/missing_name_in_library_directive
 diagnostic/missing_name_in_part_of_directive
 diagnostic/missing_prefix_in_deferred_import
+diagnostic/missing_primary_constructor
 diagnostic/missing_quote
 diagnostic/missing_star_after_sync
 diagnostic/missing_variable_in_for_each
@@ -235,6 +238,7 @@ diagnostic/unexpected_separator_in_number
 diagnostic/unknown_platform
 diagnostic/unnecessary_dev_dependency
 diagnostic/unnecessary_no_such_method
+diagnostic/unnecessary_question_mark
 diagnostic/unsupported_chrome_os_feature
 diagnostic/unsupported_chrome_os_hardware
 diagnostic/unsupported_operator
