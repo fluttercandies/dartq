@@ -325,6 +325,28 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
         is_identifier(self.cursor.peek_kind())
     }
 
+    /// The verifier's built-in-name gate
+    /// (`_checkForBuiltInIdentifierAsName`, error_verifier.dart:3760-3781):
+    /// a built-in keyword, or — under the variance experiment — the pseudo
+    /// pair `inout`/`out` (:3774-3780). Other pseudo keywords stay silent
+    /// (`isPseudo != true` skips the report).
+    pub(crate) fn is_built_in_name_token(&self, n: usize) -> bool {
+        match self.cursor.look_kind(n) {
+            TokenKind::Keyword(kw) => match kw.style() {
+                dartq_scanner::KeywordStyle::BuiltIn => true,
+                dartq_scanner::KeywordStyle::Pseudo => {
+                    self.features.variance_enabled
+                        && matches!(
+                            kw,
+                            dartq_scanner::Keyword::Inout | dartq_scanner::Keyword::Out
+                        )
+                }
+                dartq_scanner::KeywordStyle::Reserved => false,
+            },
+            _ => false,
+        }
+    }
+
     // --- depth + bailout guards ---------------------------------------------
 
     /// Enters a nested statement/expression structure; `false` means a cap was

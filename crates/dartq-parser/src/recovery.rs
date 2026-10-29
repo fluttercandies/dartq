@@ -150,6 +150,50 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         self.span_of(id)
     }
 
+    /// Whether a reserved word at the cursor taking `context`'s name
+    /// position takes the official insert-synthetic face instead of the
+    /// keyword-tolerant consume. Per-context recovery templates
+    /// (`identifier_context_impl.dart`): `LibraryName` branch 2b (:977-991)
+    /// and `TopLevelVariableDeclaration` branch 1 (:1321-1332) insert when
+    /// the keyword heads a top-level declaration and the follower does not
+    /// continue the name; `Combinator` (:133-165) inserts when the keyword
+    /// heads a top-level declaration and the follower is not one of the
+    /// context's values (`;` `,` `if` `as` `show` `hide` eof);
+    /// `LocalVariableDeclaration` (:1011-1050) inserts on a statement
+    /// start — a reserved non-statement word (`var class = 1;`) keeps the
+    /// tolerant consume face, exactly like upstream.
+    fn reserved_name_recovery_at(
+        &self,
+        context: crate::listener::IdentifierContext,
+    ) -> bool {
+        match context {
+            crate::listener::IdentifierContext::LibraryName
+            | crate::listener::IdentifierContext::TopLevelVariableDeclaration => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+                    && !self.name_continuation_follower(context)
+            }
+            crate::listener::IdentifierContext::Combinator => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+                    && !matches!(
+                        self.cursor.look_kind(1),
+                        TokenKind::Semicolon
+                            | TokenKind::Comma
+                            | TokenKind::Keyword(
+                                Keyword::If
+                                    | Keyword::As
+                                    | Keyword::Show
+                                    | Keyword::Hide
+                            )
+                            | TokenKind::Eof
+                    )
+            }
+            crate::listener::IdentifierContext::LocalVariableDeclaration => {
+                self.looks_like_statement_start_at(0)
+            }
+            _ => false,
+        }
+    }
+
     /// Official `ensureIdentifier` (`parser_impl.dart:4076`) dispatched
     /// through the context's recovery template
     /// (`identifier_context_impl.dart`): consumes an identifier-shaped
@@ -215,8 +259,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             context,
             crate::listener::IdentifierContext::LibraryName
                 | crate::listener::IdentifierContext::TopLevelVariableDeclaration
-        ) && self.looks_like_start_of_next_top_level_declaration_at(0)
-            && !self.name_continuation_follower(context)
+                | crate::listener::IdentifierContext::Combinator
+                | crate::listener::IdentifierContext::LocalVariableDeclaration
+        ) && self.reserved_name_recovery_at(context)
         {
             self.report(msg::missing_identifier(), peek.span);
             let id = self
@@ -232,7 +277,12 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             return span;
         }
         if matches!(peek.kind, TokenKind::Keyword(_))
-            && let Some(message) = keyword_as_name_message(context, &peek, &self.cursor)
+            && let Some(message) = keyword_as_name_message(
+                context,
+                &peek,
+                &self.cursor,
+                self.features.variance_enabled,
+            )
         {
             self.report(message, peek.span);
             let id = self.cursor.advance();
@@ -1303,20 +1353,43 @@ fn context_tolerates_keyword_as_name(context: crate::listener::IdentifierContext
 }
 
 /// The report (if any) for consuming `view` as an identifier in `context`,
-/// mirroring the official context templates: class/mixin/extension names
-/// reject built-in identifiers (`builtInIdentifierInDeclaration`);
-/// keyword-tolerant contexts report `expectedIdentifierButGotKeyword` for
-/// reserved words; everything else falls back to the generic
-/// `missing_identifier` path.
+/// mirroring the official context templates: keyword-tolerant contexts
+/// report `expectedIdentifierButGotKeyword` for reserved words; the
+/// declaration-name contexts carry the per-context built-in face (the
+/// converter re-faces the shared parser's `builtInIdentifierInDeclaration`
+/// through `_checkForBuiltInIdentifierAsName`, error_verifier.dart:3760);
+/// everything else falls back to the generic `missing_identifier` path.
+/// `variance_enabled` gates the verifier's variance branch
+/// (error_verifier.dart:3774-3780): the pseudo pair `inout`/`out` takes the
+/// built-in face exactly like built-in keywords when variance is on.
 fn keyword_as_name_message(
     context: crate::listener::IdentifierContext,
     view: &crate::cursor::TokenView,
     cursor: &crate::cursor::TokenCursor<'_, '_>,
+    variance_enabled: bool,
 ) -> Option<crate::message::Message> {
     let TokenKind::Keyword(kw) = view.kind else {
         return None;
     };
     let lexeme = cursor.lexeme(view.span.id);
+    let built_in_face = matches!(kw.style(), dartq_scanner::KeywordStyle::BuiltIn)
+        || (variance_enabled && matches!(kw, dartq_scanner::Keyword::Inout | dartq_scanner::Keyword::Out));
+    if built_in_face {
+        use crate::message::msg::BuiltInNameKind;
+        let kind = match context {
+            crate::listener::IdentifierContext::EnumDeclaration => Some(BuiltInNameKind::Type),
+            crate::listener::IdentifierContext::ImportPrefixDeclaration => {
+                Some(BuiltInNameKind::Prefix)
+            }
+            crate::listener::IdentifierContext::TypeVariableDeclaration => {
+                Some(BuiltInNameKind::TypeParameter)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return Some(msg::built_in_identifier_as_name(kind, lexeme));
+        }
+    }
     match kw.style() {
         dartq_scanner::KeywordStyle::Reserved => {
             if context_tolerates_keyword_as_name(context) {
@@ -1324,21 +1397,6 @@ fn keyword_as_name_message(
             } else {
                 None
             }
-        }
-        dartq_scanner::KeywordStyle::BuiltIn
-            if context
-                == crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration =>
-        {
-            Some(msg::built_in_identifier_in_declaration(lexeme))
-        }
-        // Type-variable names reject built-in keywords outright: the oracle
-        // reports `expectedIdentifierButGotKeyword` for `Function` in
-        // `<...>` type parameters (issue_45703 line 4) and consumes it as
-        // the name.
-        dartq_scanner::KeywordStyle::BuiltIn
-            if context == crate::listener::IdentifierContext::TypeVariableDeclaration =>
-        {
-            Some(msg::expected_identifier_but_got_keyword(lexeme))
         }
         // Typedef names ride the official recovered-identifier template
         // (parseTypedef passes `isIdentifierRecovered = true` for any

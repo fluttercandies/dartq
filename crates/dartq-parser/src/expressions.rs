@@ -1167,6 +1167,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             .end_conditional_expression_then_arm(question, then_begin, colon, then_end);
         self.listener.handle_conditional_expression_colon();
         let end = self.parse_expression_without_cascade();
+        // The else arm's own last token: the `end` above tiles a bare-send
+        // operand through its follower, so the dead else-arm row's extent
+        // rides this hook (official `flowEnd(elseExpression)`,
+        // type_analyzer.dart:2616).
+        self.listener
+            .end_conditional_expression_else_arm(self.last_consumed_span());
         self.listener
             .end_conditional_expression(question, colon, end);
         end

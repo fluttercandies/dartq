@@ -880,7 +880,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// ahead of the built-in row.
     fn builtin_typedef_name_row(&self) -> Option<(TokenSpan, TokenKind)> {
         if let TokenKind::Keyword(kw) = self.peek_kind()
-            && kw.style() != dartq_scanner::KeywordStyle::Pseudo
+            // The verifier gate (error_verifier.dart:3767): any non-pseudo
+            // keyword — built-in and reserved alike — plus, under the
+            // variance experiment, its pseudo `inout`/`out` branch
+            // (:3774-3780).
+            && (kw.style() != dartq_scanner::KeywordStyle::Pseudo
+                || (self.features.variance_enabled
+                    && matches!(kw, Keyword::Inout | Keyword::Out)))
             && matches!(
                 self.cursor.look_kind(1),
                 TokenKind::OpenParen
@@ -898,7 +904,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     fn report_builtin_typedef_name_at(&mut self, at: TokenSpan, kind: TokenKind) {
         if let TokenKind::Keyword(_) = kind {
             let lexeme = self.cursor.lexeme(at.id);
-            self.report(msg::built_in_identifier_as_typedef_name(lexeme), at);
+            self.report(
+                msg::built_in_identifier_as_name(msg::BuiltInNameKind::Typedef, lexeme),
+                at,
+            );
         }
     }
 
@@ -1248,6 +1257,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             const_keyword = Some(self.peek_span());
             self.cursor.advance();
         }
+        // The built-in-name face is captured here but emitted after the
+        // type-parameter parse: the verifier visit decides the template by
+        // the declaration shape — a named mixin application (`class C = A
+        // with B;`) reports the typedef-name text (visitClassTypeAlias,
+        // error_verifier.dart:635), a plain class the type-name text
+        // (:573) — and the `=` only surfaces once the `<...>` group is
+        // consumed. ensure_identifier consumes the keyword silently (the
+        // keyword-name gate carries no arm for this context).
+        let built_in_name = if self.is_built_in_name_token(0) {
+            Some(self.peek_span())
+        } else {
+            None
+        };
         let name = self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
         // Official parseClassOrNamedMixinApplication passes inDeclaration:
         // true, allowsVariance: true (parser_impl.dart:2981): the header
@@ -1255,6 +1277,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // same entry).
         let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
+        if let Some(at) = built_in_name {
+            let kind = if self.peek_kind() == TokenKind::Eq {
+                msg::BuiltInNameKind::Typedef
+            } else {
+                msg::BuiltInNameKind::Type
+            };
+            self.report(
+                msg::built_in_identifier_as_name(kind, self.cursor.lexeme(at.id)),
+                at,
+            );
+        }
 
         // Official modifier-trio check (parser_impl.dart:2975-3001): an
         // `abstract` class paired with `sealed`, or `final` paired with
@@ -1725,6 +1758,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             const_keyword = Some(self.peek_span());
             self.cursor.advance();
         }
+        // Mixin names take the type-name face unconditionally
+        // (visitMixinDeclaration, error_verifier.dart:1840 — mixin
+        // declarations have no `=` mixin-application form). ensure_identifier
+        // consumes the keyword silently (no keyword-name gate arm for this
+        // context).
+        if self.is_built_in_name_token(0) {
+            self.report(
+                msg::built_in_identifier_as_name(
+                    msg::BuiltInNameKind::Type,
+                    self.cursor.lexeme(self.peek_id()),
+                ),
+                self.peek_span(),
+            );
+        }
         let name = self.ensure_identifier(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
         // Official parseMixin passes inDeclaration: true, allowsVariance: true
         // (parser_impl.dart:3412): the header accepts variance modifiers.
@@ -1895,9 +1942,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         let mut name: Option<TokenSpan> = None;
         if self.peek_is_identifier() && self.peek_kind() != TokenKind::Keyword(Keyword::On) {
-            if is_builtin_identifier(self.peek_kind()) {
+            // Extension names take the extension-name face
+            // (visitExtensionDeclaration, error_verifier.dart:1124).
+            if self.is_built_in_name_token(0) {
                 self.report(
-                    msg::built_in_identifier_in_declaration(self.cursor.lexeme(self.peek_id())),
+                    msg::built_in_identifier_as_name(
+                        msg::BuiltInNameKind::Extension,
+                        self.cursor.lexeme(self.peek_id()),
+                    ),
                     self.peek_span(),
                 );
             }
@@ -1936,9 +1988,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 self.peek_kind(),
                 TokenKind::Keyword(Keyword::Extends | Keyword::Implements | Keyword::With)
             ) {
+                // Official expectedInstead: anchored on the offending
+                // clause keyword itself (parser_impl.dart:3713-3719).
                 self.report(msg::expected_instead("on"), at);
             } else {
-                self.report(msg::expected_after_but_got("on"), at);
+                // Official expectedAfterButGot: anchored on `token` — the
+                // last consumed header token (the name/type-argument end),
+                // not the junk it precedes (parser_impl.dart:3720-3728;
+                // oracle test_missing_on_withBlock anchors the row on the
+                // extension name).
+                let anchor = self.last_consumed_anchor();
+                self.report(msg::expected_after_but_got("on"), anchor);
                 let id = self
                     .cursor
                     .insert_synthetic(TokenKind::Keyword(Keyword::On), at.range.offset);
@@ -2010,9 +2070,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
         }
         let name = if self.peek_is_identifier() {
-            if is_builtin_identifier(self.peek_kind()) {
+            // Extension-type names take the extension-type-name face
+            // (visitExtensionTypeDeclaration, error_verifier.dart:1150).
+            if self.is_built_in_name_token(0) {
                 self.report(
-                    msg::built_in_identifier_in_declaration(self.cursor.lexeme(self.peek_id())),
+                    msg::built_in_identifier_as_name(
+                        msg::BuiltInNameKind::ExtensionType,
+                        self.cursor.lexeme(self.peek_id()),
+                    ),
                     self.peek_span(),
                 );
             }
@@ -2464,10 +2529,6 @@ struct ClassModifiers {
     final_kw: Option<TokenSpan>,
     late_kw: Option<TokenSpan>,
     covariant: Option<TokenSpan>,
-}
-
-fn is_builtin_identifier(kind: TokenKind) -> bool {
-    matches!(kind, TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::BuiltIn)
 }
 
 fn msg_block_kind_class() -> crate::message::BlockKind {

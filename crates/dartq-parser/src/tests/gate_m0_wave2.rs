@@ -314,14 +314,17 @@ fn typedef_type_arguments_only() {
     );
 }
 
-/// A built-in keyword in type-parameter position reports
-/// `expectedIdentifierButGotKeyword` and is consumed as the name (oracle
-/// `typedef F<Function> = int;`).
+/// A built-in keyword in type-parameter position takes the per-context
+/// built-in face and is consumed as the name — the oracle row for
+/// `typedef F<Function> = int;` (issue_45703 line 5) is
+/// `built_in_identifier_in_declaration` with the type-parameter template
+/// only; the keyword face at 4:9 in the same oracle file belongs to the
+/// typedef NAME on line 4 (`typedef Function = int;`).
 #[test]
 fn typedef_type_parameter_built_in_keyword() {
     assert_codes(
         "typedef F<Function> = int;\n",
-        &["expected_identifier_but_got_keyword"],
+        &["built_in_identifier_in_declaration"],
         "Function type parameter",
     );
 }

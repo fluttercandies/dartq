@@ -630,6 +630,15 @@ pub trait ParserListener {
         _then_end: Token,
     ) {
     }
+    /// Flow-face extension fired immediately before
+    /// [`ParserListener::end_conditional_expression`]: the else arm's own
+    /// last consumed token. The `end` param of `endConditionalExpression`
+    /// tiles a bare-send operand through its follower (the statement's
+    /// `;`, a `)`), one token past the arm, so the official
+    /// `flowEnd(elseExpression)` row extent (`type_analyzer.dart:2616`)
+    /// must come from this hook instead. No official counterpart;
+    /// existing listeners ignore it.
+    fn end_conditional_expression_else_arm(&mut self, _else_last: Token) {}
     /// Prefix `++`/`--` (`handleUnaryPrefixAssignmentExpression`); the plain
     /// unary prefixes `-`/`!`/`~` use [`ParserListener::handle_unary_prefix_expression`].
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {}
@@ -1254,6 +1263,13 @@ pub trait ParserListener {
     }
     fn begin_for_statement_body(&mut self, token: Token) {}
     fn end_for_statement_body(&mut self, end: Token) {}
+    /// Flow-face extension fired after the C-style header's updaters have
+    /// been parsed and before the header's closer handling: the updaters'
+    /// own last consumed token (`dead_code_verifier.dart:324-326` trims a
+    /// header-anchored dead row to `updaters.last.end`). Fires only when
+    /// at least one updater was parsed. No official counterpart; existing
+    /// listeners ignore it.
+    fn handle_for_updaters_end(&mut self, _updaters_last: Token) {}
     /// `endForStatement(endToken)` (the for-in counterpart is
     /// [`ParserListener::end_for_in`]; exactly one of the two fires).
     /// `end` is the statement's own last consumed token — its `node.end`

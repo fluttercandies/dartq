@@ -1525,30 +1525,45 @@ pub(crate) mod msg {
         true,
     );
 
-    pub(crate) fn built_in_identifier_in_declaration(lexeme: &str) -> Message {
-        Message::new(
-            local_code(
-                "built_in_identifier_in_declaration",
-                "BUILT_IN_IDENTIFIER_IN_DECLARATION",
-            ),
-            format!("Can't use '{lexeme}' as a name here."),
-        )
+    /// The declaration-name position a built-in identifier was rejected
+    /// from: selects the per-context template text of the shared
+    /// `builtInIdentifierInDeclaration` registry code.
+    pub(crate) enum BuiltInNameKind {
+        Extension,
+        ExtensionType,
+        Prefix,
+        Type,
+        TypeParameter,
+        Typedef,
     }
 
-    /// The typedef-name variant of the same analyzer code family: every
-    /// `built_in_identifier_*_name` registry entry shares the
-    /// `built_in_identifier_in_declaration` name
-    /// (`builtInIdentifierAsTypedefName`, diagnostic.g.dart:1717-1726), with
-    /// the per-context template text the oracle carries on
-    /// `keyword_named_typedefs.dart` ("The built-in identifier 'abstract'
+    /// Per-context faces of the shared `builtInIdentifierInDeclaration`
+    /// registry code. The analyzer registry carries six
+    /// `builtInIdentifierAs*Name` entries under `sharedName` (upstream Dart
+    /// SDK source, pkg/analyzer/messages.yaml:2421-2492: extension :2421,
+    /// extension type :2453, prefix :2461, type :2469, type parameter :2477,
+    /// typedef :2485), all phrased "The built-in identifier '{name}' can't
+    /// be used as a ... name." The converter drops the shared parser's
+    /// message in favor of the ErrorVerifier's per-visit face
+    /// (`_checkForBuiltInIdentifierAsName`, error_verifier.dart:3760), so
+    /// each declaration kind names its own position
+    /// (`keyword_named_typedefs.dart`: "The built-in identifier 'abstract'
     /// can't be used as a typedef name.").
-    pub(crate) fn built_in_identifier_as_typedef_name(lexeme: &str) -> Message {
+    pub(crate) fn built_in_identifier_as_name(kind: BuiltInNameKind, lexeme: &str) -> Message {
+        let what = match kind {
+            BuiltInNameKind::Extension => "an extension name",
+            BuiltInNameKind::ExtensionType => "an extension type name",
+            BuiltInNameKind::Prefix => "a prefix name",
+            BuiltInNameKind::Type => "a type name",
+            BuiltInNameKind::TypeParameter => "a type parameter name",
+            BuiltInNameKind::Typedef => "a typedef name",
+        };
         Message::new(
             local_code(
                 "built_in_identifier_in_declaration",
                 "BUILT_IN_IDENTIFIER_IN_DECLARATION",
             ),
-            format!("The built-in identifier '{lexeme}' can't be used as a typedef name."),
+            format!("The built-in identifier '{lexeme}' can't be used as {what}."),
         )
     }
 

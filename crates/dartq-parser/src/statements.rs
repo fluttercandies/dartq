@@ -1251,6 +1251,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
             self.cursor.advance();
         }
+        if expression_count > 0 {
+            // The updaters' own last token: a header-anchored dead row
+            // trims to `updaters.last.end` (dead_code_verifier.dart
+            // :324-326), and the follower tile cannot carry that end.
+            self.listener
+                .handle_for_updaters_end(self.last_consumed_span());
+        }
         // Official :10369-10373 runs no `ensureCloseParen` here: if the parts
         // parse did not land on the `(` group's closer, the landing token is
         // reported as unexpected and the cursor jumps to the closer.

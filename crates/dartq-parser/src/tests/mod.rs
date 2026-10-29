@@ -15,6 +15,7 @@ mod gate_351;
 mod gate_410;
 mod gate_445;
 mod gate_acceptance;
+mod gate_bi_name_faces;
 mod gate_dark_pins;
 mod gate_fam11_restricted_patterns;
 mod gate_fp_pins;
