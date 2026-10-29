@@ -34,6 +34,11 @@
 //!   server, native memory, the working directory. A suite reaching any of
 //!   them ([`crate::deps::FileFacts::engine_shared`]) gets a tester of its
 //!   own, retired after it.
+//! - A suite whose own file carries `// dartq: shardable` may occupy two
+//!   rows ([`Hosted::shard_total`]): two engines of its chunk run
+//!   complementary selections of its top-level entries (the same mechanism
+//!   the runner's own `--total-shards` uses, applied per row), and the
+//!   caller merges the two blocks back into the suite's one.
 //! - The tool prints whatever a tester writes to its standard streams
 //!   (`Shell: …`, under `--machine` too). A suite is only reported clean
 //!   when its tester wrote nothing but the runner's markers while the suite
@@ -224,6 +229,18 @@ pub struct Hosted {
     /// configuration could not be read — the chunk key then falls back to
     /// the suite's own file bytes.
     pub digest: Option<String>,
+    /// How many rows the suite occupies in the pass: `1` runs it whole;
+    /// `2` splits its top-level entries into two complementary selections
+    /// run as two engines of its chunk (opt-in — the suite's own file must
+    /// carry [`crate::deps::SHARDABLE_MARKER`], and the caller decides by
+    /// the gate: long enough, workers available, no user sharding).
+    ///
+    /// A suite with a `flutter_test_config` is never sharded by the caller:
+    /// the config's `testExecutable` wraps the suite's `main` *outside* the
+    /// shard filter, so both shards would run the wrapper's own
+    /// `setUpAll`-level effects twice with no complementary benefit, and a
+    /// config that adds tests of its own would report them twice.
+    pub shard_total: u32,
 }
 
 /// The entry point of one chunk: the fixed tester part, the chunk's
@@ -325,13 +342,14 @@ fn chunk_key(plan: &Plan<'_>, index: usize, hosted: &[usize], member_of: impl Fn
 
 /// The `.key` a fresh chunk *wants* (full member set), and the member
 /// lookup for it — adoption compares this against the stored `.key`.
-fn chunk_keys(plan: &Plan<'_>, chunks: &[Vec<usize>]) -> Vec<String> {
+/// `chunks` hold row indices; `rows` maps a row to its suite.
+fn chunk_keys(plan: &Plan<'_>, rows: &[Row], chunks: &[Vec<usize>]) -> Vec<String> {
     chunks
         .iter()
         .enumerate()
         .map(|(index, members)| {
             let locals: Vec<usize> = (0..members.len()).collect();
-            chunk_key(plan, index, &locals, |local| members[local])
+            chunk_key(plan, index, &locals, |local| rows[members[local]].suite)
         })
         .collect()
 }
@@ -520,6 +538,40 @@ pub struct Outcome {
     pub excluded: Vec<PathBuf>,
 }
 
+/// One row of the grouped pass: the `(suite, shard)` a row of `run.json`
+/// describes. An unsharded suite has exactly one row (`shard == 0`); a
+/// sharded one has [`Hosted::shard_total`] rows whose engines run
+/// complementary selections of the suite's top-level entries.
+#[derive(Debug, Clone, Copy)]
+struct Row {
+    /// Index into `plan.suites`.
+    suite: usize,
+    /// This row's shard index, `< plan.suites[suite].shard_total`.
+    shard: u32,
+}
+
+/// The suite path a shard's run.json row and argv entry spell: the real
+/// path for shard 0; for shard `i` the real path with `i` `/./` components
+/// injected before the file name — a distinct map key for the runner's
+/// `testSelections` (its entries collapse identical spellings) that still
+/// stats and reads the real file, so `@Tags`/`@TestOn` metadata parse and
+/// no shim file is needed.
+fn shard_spelling(path: &Path, shard: u32) -> String {
+    if shard == 0 {
+        return path.display().to_string();
+    }
+    let mut out = String::with_capacity(path.as_os_str().len() + 2 * shard as usize);
+    if let Some(parent) = path.parent() {
+        out.push_str(&parent.display().to_string());
+        out.push('/');
+    }
+    for _ in 0..shard {
+        out.push_str("./");
+    }
+    out.push_str(&path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned()));
+    out
+}
+
 /// Run `plan.suites` through the grouped pass: chunks compile in the
 /// background, one after another, while the runner already runs the
 /// suites of the chunks done; each suite's block reaches `cfg.sink` as the
@@ -540,7 +592,17 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     // same kernel and adopts it.
     let mut indices: Vec<usize> = (0..plan.suites.len()).collect();
     indices.sort_by(|&a, &b| plan.suites[a].path.cmp(&plan.suites[b].path));
-    let chunks: Vec<Vec<usize>> = indices.chunks(CHUNK).map(<[usize]>::to_vec).collect();
+    // Chunk membership counts *rows*, not suites: a sharded suite occupies
+    // `shard_total` consecutive rows (each its own `_s{local}` entrypoint
+    // and `testSelections` key) of one chunk — both shards' engines load
+    // the same compiled kernel.
+    let mut rows: Vec<Row> = Vec::new();
+    for &suite in &indices {
+        for shard in 0..plan.suites[suite].shard_total {
+            rows.push(Row { suite, shard });
+        }
+    }
+    let chunks: Vec<Vec<usize>> = (0..rows.len()).collect::<Vec<usize>>().chunks(CHUNK).map(<[usize]>::to_vec).collect();
     let kernels: Vec<PathBuf> = (0..chunks.len()).map(|index| dir.join(format!("chunk{index}.dill"))).collect();
     // Chunk kernels persist across runs, keyed on the content they were
     // compiled from: a run whose chunk source is unchanged adopts the
@@ -548,7 +610,7 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     // entirely (the store's `.key` sidecar names the inputs the compiler
     // saw). Any doubt re-keys to a compile — serving a stale kernel is the
     // one unrecoverable sin of this pass.
-    let wanted_keys = chunk_keys(plan, &chunks);
+    let wanted_keys = chunk_keys(plan, &rows, &chunks);
     for (index, kernel) in kernels.iter().enumerate() {
         let adopted = kernel.is_file()
             && std::fs::read_to_string(kernel.with_extension("dill.key"))
@@ -574,11 +636,19 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     let mut environment: serde_json::Map<String, serde_json::Value> =
         plan.recipe.environment.iter().map(|(key, value)| (key.clone(), value.clone().into())).collect();
     environment.insert("FONTCONFIG_FILE".to_owned(), fonts.display().to_string().into());
-    let mut rows = Vec::with_capacity(plan.suites.len());
+    let mut run_rows = Vec::with_capacity(rows.len());
     for (chunk, members) in chunks.iter().enumerate() {
-        for (local, &index) in members.iter().enumerate() {
-            let suite = &plan.suites[index];
-            rows.push(serde_json::json!([suite.path.display().to_string(), chunk, local, suite.fresh]));
+        for (local, &row) in members.iter().enumerate() {
+            let Row { suite, shard } = rows[row];
+            let suite = &plan.suites[suite];
+            run_rows.push(serde_json::json!([
+                shard_spelling(&suite.path, shard),
+                chunk,
+                local,
+                suite.fresh,
+                shard,
+                suite.shard_total,
+            ]));
         }
     }
     let mut args: Vec<String> = plan.runner_args.to_vec();
@@ -593,13 +663,19 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
         "json".to_owned(),
         "--".to_owned(),
     ]);
-    args.extend(plan.suites.iter().map(|suite| suite.path.display().to_string()));
+    // One argv entry per row: a sharded suite's two rows stay adjacent, so
+    // its shard engines co-start on two testers.
+    for suite in plan.suites {
+        for shard in 0..suite.shard_total {
+            args.push(shard_spelling(&suite.path, shard));
+        }
+    }
     let config = serde_json::json!({
         "tester": plan.recipe.tester,
         "environment": environment,
         "chunks": kernels.iter().map(|kernel| kernel.display().to_string()).collect::<Vec<_>>(),
         "concurrency": plan.concurrency.max(1),
-        "suites": rows,
+        "suites": run_rows,
         "args": args,
     });
     let config_path = dir.join("run.json");
@@ -608,7 +684,7 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
     let excluded = std::sync::Mutex::new(Vec::new());
     let stop = std::sync::atomic::AtomicBool::new(false);
     let result = std::thread::scope(|scope| {
-        let compiling = scope.spawn(|| compile_chunks(plan, &dir, &chunks, &kernels, &excluded, &stop));
+        let compiling = scope.spawn(|| compile_chunks(plan, &rows, &dir, &chunks, &kernels, &excluded, &stop));
         let mut cmd = Command::new(plan.vm);
         cmd.arg("--disable-dart-dev")
             .arg(&runner)
@@ -627,12 +703,13 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
 }
 
 /// Compile every chunk in order through one resident compiler, writing
-/// each kernel (then its `.json` list of hosted suites) once whole, or a
+/// each kernel (then its `.json` list of hosted locals) once whole, or a
 /// `.failed` marker. A suite whose own file fails is dropped and its chunk
-/// recompiled once without it; its row in the runner stays, and loading
-/// it fails, which the caller reruns stock.
+/// recompiled once without it; its rows in the runner stay, and loading
+/// them fails, which the caller reruns stock.
 fn compile_chunks(
     plan: &Plan<'_>,
+    rows: &[Row],
     dir: &Path,
     chunks: &[Vec<usize>],
     kernels: &[PathBuf],
@@ -641,6 +718,8 @@ fn compile_chunks(
 ) -> io::Result<()> {
     let output = dir.join("compile.dill");
     let mut compiler: Option<Compiler> = None;
+    // `members` are row indices; a suite index resolves through `rows`.
+    let suite_of = |local: usize, members: &[usize]| rows[members[local]].suite;
     for (index, members) in chunks.iter().enumerate() {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -653,7 +732,7 @@ fn compile_chunks(
         let mut hosted: Vec<usize> = (0..members.len()).collect();
         let mut retried = false;
         loop {
-            let suites: Vec<(usize, &Hosted)> = hosted.iter().map(|&local| (local, &plan.suites[members[local]])).collect();
+            let suites: Vec<(usize, &Hosted)> = hosted.iter().map(|&local| (local, &plan.suites[suite_of(local, members)])).collect();
             let entry = dir.join(format!("chunk{index}.dart"));
             crate::stamp::write_atomic(&entry, chunk_entry(index, &suites).as_bytes())?;
             if compiler.is_none() {
@@ -679,27 +758,27 @@ fn compile_chunks(
                     // retried chunk's reduced set, so a later run wanting
                     // the full set re-keys and recompiles instead of
                     // adopting a kernel missing the excluded suite.
-                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.key"), chunk_key(plan, index, &hosted, |local| members[local]).as_bytes())?;
+                    crate::stamp::write_atomic(&kernels[index].with_extension("dill.key"), chunk_key(plan, index, &hosted, |local| suite_of(local, members)).as_bytes())?;
                     crate::stamp::write_atomic(&kernels[index].with_extension("dill.json"), serde_json::to_string(&hosted)?.as_bytes())?;
                     break;
                 }
                 Compiled::Errors(text) if !retried => {
-                    let paths: Vec<PathBuf> = hosted.iter().map(|&local| plan.suites[members[local]].path.clone()).collect();
+                    let paths: Vec<PathBuf> = hosted.iter().map(|&local| plan.suites[suite_of(local, members)].path.clone()).collect();
                     let broken = crate::group::broken_suites(plan.root, &paths, &text);
                     match broken.filter(|broken| broken.len() < paths.len()) {
                         Some(broken) => {
-                            hosted.retain(|&local| !broken.contains(&plan.suites[members[local]].path));
+                            hosted.retain(|&local| !broken.contains(&plan.suites[suite_of(local, members)].path));
                             excluded.lock().map_err(|_| io::Error::other("poisoned"))?.extend(broken);
                             retried = true;
                         }
                         None => {
-                            fail_chunk(plan, members, &hosted, &kernels[index], excluded)?;
+                            fail_chunk(plan, &hosted, &kernels[index], excluded, |local| suite_of(local, members))?;
                             break;
                         }
                     }
                 }
                 Compiled::Errors(_) => {
-                    fail_chunk(plan, members, &hosted, &kernels[index], excluded)?;
+                    fail_chunk(plan, &hosted, &kernels[index], excluded, |local| suite_of(local, members))?;
                     break;
                 }
             }
@@ -710,15 +789,15 @@ fn compile_chunks(
 
 fn fail_chunk(
     plan: &Plan<'_>,
-    members: &[usize],
     hosted: &[usize],
     kernel: &Path,
     excluded: &std::sync::Mutex<Vec<PathBuf>>,
+    suite_of: impl Fn(usize) -> usize,
 ) -> io::Result<()> {
     excluded
         .lock()
         .map_err(|_| io::Error::other("poisoned"))?
-        .extend(hosted.iter().map(|&local| plan.suites[members[local]].path.clone()));
+        .extend(hosted.iter().map(|&local| plan.suites[suite_of(local)].path.clone()));
     crate::stamp::write_atomic(&kernel.with_extension("dill.failed"), b"")
 }
 
@@ -735,6 +814,16 @@ pub enum Placement {
     Stock,
 }
 
+/// Where a suite runs and whether its author opted it into intra-suite
+/// sharding ([`crate::deps::FileFacts::shardable`], read from the suite's
+/// own file only — a marker inside a helper means nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hosting {
+    pub placement: Placement,
+    /// The suite file carries `// dartq: shardable`.
+    pub shardable: bool,
+}
+
 /// Place every suite (absolute paths) by its import closure. The Flutter
 /// SDK's own packages are the framework every suite runs on either way
 /// and are not entered; the package's own code and its hosted
@@ -743,13 +832,21 @@ pub enum Placement {
 /// # Errors
 ///
 /// I/O failures reading the package configuration.
-pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Placement>> {
+pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Hosting>> {
     use rayon::prelude::*;
     use rustc_hash::FxHashMap;
 
     let config_path = crate::cache::package_config_path(root);
     let text = std::fs::read_to_string(&config_path)?;
-    let stock = || vec![Placement::Stock; suites.len()];
+    let stock = || {
+        vec![
+            Hosting {
+                placement: Placement::Stock,
+                shardable: false,
+            };
+            suites.len()
+        ]
+    };
     let Ok(config) = dartq_pub::PackageConfig::parse(&text) else {
         return Ok(stock());
     };
@@ -776,6 +873,7 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Placement>> {
         launch: bool,
         shared: bool,
         untrusted: bool,
+        shardable: bool,
     }
     let mut ids: FxHashMap<PathBuf, u32> = FxHashMap::default();
     let mut nodes: Vec<Node> = Vec::new();
@@ -814,6 +912,7 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Placement>> {
             };
             nodes[id].launch = facts.launch;
             nodes[id].shared = facts.engine_shared;
+            nodes[id].shardable = facts.shardable;
             for dep in deps {
                 let next = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
                 let dep_id = *ids.entry(dep.clone()).or_insert_with(|| {
@@ -860,13 +959,17 @@ pub fn place(root: &Path, suites: &[PathBuf]) -> io::Result<Vec<Placement>> {
         .iter()
         .map(|suite| {
             let id = ids[suite] as usize;
-            if to_stock[id] {
+            // `shardable` is the suite file's own attestation — it never
+            // propagates over the closure like `launch`/`shared` do.
+            let shardable = nodes[id].shardable;
+            let placement = if to_stock[id] {
                 Placement::Stock
             } else if to_fresh[id] {
                 Placement::Fresh
             } else {
                 Placement::Shared
-            }
+            };
+            Hosting { placement, shardable }
         })
         .collect())
 }
@@ -1131,12 +1234,13 @@ mod tests {
 
     #[test]
     fn chunk_entries_wire_each_suite_like_the_stock_bootstrap() {
-        let plain = Hosted { path: PathBuf::from("/p/test/a b_test.dart"), config: None, fresh: false, digest: None };
+        let plain = Hosted { path: PathBuf::from("/p/test/a b_test.dart"), config: None, fresh: false, digest: None, shard_total: 1 };
         let wrapped = Hosted {
             path: PathBuf::from("/p/test/w/x_test.dart"),
             config: Some(PathBuf::from("/p/test/flutter_test_config.dart")),
             fresh: false,
             digest: None,
+            shard_total: 1,
         };
         let src = chunk_entry(3, &[(0, &plain), (2, &wrapped)]);
         assert!(src.contains("import 'file:///p/test/a%20b_test.dart' as s0;"));
@@ -1170,9 +1274,39 @@ mod tests {
         let fresh = write("test/b_test.dart", "import 'package:p/via.dart';\nvoid main() {}");
         let stock = write("test/c_test.dart", "import '../lib/script.dart';\nvoid main() {}");
         let opaque = write("test/d_test.dart", "import 'x$y.dart';\nvoid main() {}");
+        let placements: Vec<Placement> = place(&root, &[plain, fresh, stock, opaque])
+            .expect("placed")
+            .iter()
+            .map(|hosting| hosting.placement)
+            .collect();
+        assert_eq!(placements, [Placement::Shared, Placement::Fresh, Placement::Stock, Placement::Stock]);
+    }
+
+    /// `shardable` is read from the suite's own file only: a marker in a
+    /// helper the suite imports means nothing, and the suite file's own
+    /// marker is not propagated to anyone importing it.
+    #[test]
+    fn shardable_attests_the_suite_file_only() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, text).expect("write");
+            path
+        };
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion":2,"packages":[{"name":"p","rootUri":"../","packageUri":"lib/"}]}"#,
+        );
+        write("lib/marked.dart", "// dartq: shardable\nvoid f() {}");
+        let marked = write("test/marked_test.dart", "// dartq: shardable both halves are independent\nvoid main() {}");
+        let via_helper = write("test/helper_test.dart", "import 'package:p/marked.dart';\nvoid main() {}");
+        let plain = write("test/plain_test.dart", "void main() {}");
+        let hostings = place(&root, &[marked, via_helper, plain]).expect("placed");
         assert_eq!(
-            place(&root, &[plain, fresh, stock, opaque]).expect("placed"),
-            [Placement::Shared, Placement::Fresh, Placement::Stock, Placement::Stock]
+            hostings.iter().map(|hosting| hosting.shardable).collect::<Vec<_>>(),
+            [true, false, false]
         );
     }
 
@@ -1221,6 +1355,7 @@ mod tests {
             config: Some(config.to_path_buf()),
             fresh: false,
             digest: None,
+            shard_total: 1,
         };
         let a = wrapped("/p/test/one/a_test.dart", &one);
         let b = wrapped("/p/test/one/b_test.dart", &one);
@@ -1268,10 +1403,12 @@ mod tests {
         let own = write(&root, "test/own_test.dart", "void main() { FontLoader('x'); }");
         let unknown = write(&root, "test/unknown_test.dart", "import 'package:nosuch/x.dart';\nvoid main() {}");
         let framework = write(&root, "test/fw_test.dart", "import 'package:fw/launch.dart';\nvoid main() {}");
-        assert_eq!(
-            place(&root, &[own, unknown, framework]).expect("placed"),
-            [Placement::Fresh, Placement::Stock, Placement::Shared]
-        );
+        let placements: Vec<Placement> = place(&root, &[own, unknown, framework])
+            .expect("placed")
+            .iter()
+            .map(|hosting| hosting.placement)
+            .collect();
+        assert_eq!(placements, [Placement::Fresh, Placement::Stock, Placement::Shared]);
     }
 
     /// The chunk key is a content identity: identical inputs produce the
@@ -1297,12 +1434,14 @@ mod tests {
                 config: None,
                 fresh: false,
                 digest: Some("cachekey-a".to_owned()),
+                shard_total: 1,
             },
             Hosted {
                 path: PathBuf::from("/p/test/b_test.dart"),
                 config: None,
                 fresh: false,
                 digest: Some("cachekey-b".to_owned()),
+                shard_total: 1,
             },
         ];
         let plan = Plan {
@@ -1361,7 +1500,7 @@ mod tests {
             fonts: String::new(),
         };
         // No run-cache key: the file bytes are the chunk key's floor.
-        let no_key = [Hosted { path: suite_file.clone(), config: None, fresh: false, digest: None }];
+        let no_key = [Hosted { path: suite_file.clone(), config: None, fresh: false, digest: None, shard_total: 1 }];
         let plan = Plan {
             root: tmp.path(),
             vm: Path::new("/vm"),
@@ -1400,7 +1539,7 @@ mod tests {
         std::fs::write(&suite_file, b"void main() {}").expect("write");
         std::fs::write(&config_file, b"// config v1").expect("write");
         let recipe = Recipe { compiler: vec!["fe".to_owned()], tester: vec![], environment: vec![], fonts: String::new() };
-        let suites = [Hosted { path: suite_file, config: Some(config_file.clone()), fresh: false, digest: None }];
+        let suites = [Hosted { path: suite_file, config: Some(config_file.clone()), fresh: false, digest: None, shard_total: 1 }];
         let plan = Plan {
             root: tmp.path(),
             vm: Path::new("/vm"),

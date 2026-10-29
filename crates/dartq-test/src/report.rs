@@ -8,6 +8,7 @@
 //! driven by the events that counterpart listens to: test start, test
 //! output (`print`), errors, test end, and the end of the run.
 
+use crate::SuiteBlock;
 use crate::event::Json;
 use std::io::{self, Write};
 use std::time::Instant;
@@ -1224,6 +1225,266 @@ pub fn rebase(events: &mut [Json], next_id: &mut u64, base: u64) {
         }
     }
 }
+
+/// Merge the two shard blocks of one suite into the block the suite would
+/// have produced unsharded (three rules):
+///
+/// 1. keep `a`'s `suite` event and hidden load pair, drop `b`'s (its
+///    load test's name carries the `/./` shard spelling);
+/// 2. `a`'s post-load events, then `b`'s post-load events — the split's
+///    contiguity makes concatenation declaration order — with `b`'s root
+///    artifacts folded: its root `group` event drops and its `testCount`
+///    is added to `a`'s (each shard's root counts only its share; the sum
+///    is the whole), and its root `setUpAll`/`tearDownAll` pairs drop —
+///    every hidden `testStart`..`testDone` span whose `groupIDs` is
+///    exactly `[root]`, dropped only when `a` also ran a root fixture
+///    (both declare the same tree; a user test named `setUpAll` is never
+///    hidden and never matches);
+/// 3. `b`'s kept events renumber through one [`rebase`]-style walk seeded
+///    with `b.suiteID → a.suiteID` and `b.rootGroupID → a.rootGroupID`;
+///    `time` fields pass through (both shards share the runner's clock).
+///
+/// `a` is shard 0's block (real path), `b` shard 1's (`/./` spelling). A
+/// block whose engine never ran — an `error` event and no `group` event —
+/// is a *failed load*: the surviving shard's header is kept instead (for
+/// `b` that means rewriting its suite path and load-test name/url to the
+/// real spelling) and the crashed block contributes only its
+/// `error`+`testDone`, remapped onto the kept load test's id. Both
+/// failed: `a`'s shape kept, `b`'s failure appended. An empty-share shard
+/// contributes nothing (its bare `[suite, load pair]` block drops whole).
+///
+/// `SHELL` (stray-line) events stay in their in-block positions;
+/// `clean`/`closed` are the conjunction of both shards'.
+#[must_use]
+pub fn merge_shards(a: SuiteBlock, b: SuiteBlock) -> SuiteBlock {
+    /// A block whose engine never ran the suite: a load error and no
+    /// group events (a runnable suite emits its root `group` at the first
+    /// test referencing it).
+    fn failed_load(events: &[Json]) -> bool {
+        events.iter().any(|event| event.kind() == "error")
+            && !events.iter().any(|event| event.kind() == "group")
+    }
+    /// The index just past the hidden load test's `testDone` (or the end
+    /// of the block when the load never finished), and the load test's id.
+    fn load_end(events: &[Json]) -> (usize, Option<u64>) {
+        let mut load = None;
+        for (index, event) in events.iter().enumerate() {
+            match event.kind() {
+                "testStart" if load.is_none() => load = event.u64_at(&["test", "id"]),
+                "testDone" if load.is_some() && event.u64_at(&["testID"]) == load => {
+                    return (index + 1, load);
+                }
+                _ => {}
+            }
+        }
+        (events.len(), load)
+    }
+    /// The `id`, `testCount` and position of the root `group` event
+    /// (`parentID == null`), if the block reached it.
+    fn root_group(events: &[Json]) -> Option<(u64, u64, usize)> {
+        events.iter().enumerate().find_map(|(index, event)| {
+            (event.kind() == "group" && event.u64_at(&["group", "parentID"]).is_none())
+                .then(|| {
+                    (
+                        event.u64_at(&["group", "id"]).unwrap_or(u64::MAX),
+                        event.u64_at(&["group", "testCount"]).unwrap_or(0),
+                        index,
+                    )
+                })
+        })
+    }
+    /// True for a `testStart` of a test that ran hidden directly on the
+    /// root group — a root `setUpAll`/`tearDownAll` (a user test literally
+    /// named `setUpAll` reports `hidden: false` on its `testDone` and
+    /// never matches; a grouped test has a longer `groupIDs`). `hidden`
+    /// is a `testDone` field, so `hidden_ids` comes from the same block.
+    fn root_fixture(event: &Json, root: u64, hidden_ids: &rustc_hash::FxHashSet<u64>) -> bool {
+        event.kind() == "testStart"
+            && event
+                .u64_at(&["test", "id"])
+                .is_some_and(|id| hidden_ids.contains(&id))
+            && matches!(
+                event.get("test").and_then(|test| test.get("groupIDs")),
+                Some(Json::Array(ids)) if ids.len() == 1 && ids[0].as_u64() == Some(root)
+            )
+    }
+    /// The ids of tests reported hidden (`hidden: true` on `testDone`) —
+    /// load tests, `setUpAll`/`tearDownAll`.
+    fn hidden_ids(events: &[Json]) -> rustc_hash::FxHashSet<u64> {
+        events
+            .iter()
+            .filter(|event| {
+                event.kind() == "testDone" && event.get("hidden") == Some(&Json::Bool(true))
+            })
+            .filter_map(|event| event.u64_at(&["testID"]))
+            .collect()
+    }
+    /// Every id an event carries (the same fields `crate::event::remap`
+    /// rewrites), visited read-only.
+    fn each_id(event: &Json, out: &mut impl FnMut(u64)) {
+        for key in ["testID", "suiteID"] {
+            if let Some(id) = event.get(key).and_then(Json::as_u64) {
+                out(id);
+            }
+        }
+        for (object, keys) in [
+            ("suite", &["id"][..]),
+            ("test", &["id", "suiteID"][..]),
+            ("group", &["id", "suiteID", "parentID"][..]),
+        ] {
+            let Some(inner) = event.get(object) else { continue };
+            for key in keys {
+                if let Some(id) = inner.get(key).and_then(Json::as_u64) {
+                    out(id);
+                }
+            }
+            if let Some(Json::Array(ids)) = inner.get("groupIDs") {
+                for id in ids.iter().filter_map(Json::as_u64) {
+                    out(id);
+                }
+            }
+        }
+    }
+    /// The event indexes of one block's root-fixture pairs — `testStart`
+    /// through its `testDone`, everything between included — marked for
+    /// dropping.
+    fn fixture_drops(events: &[Json], root: u64, hidden_ids: &rustc_hash::FxHashSet<u64>) -> rustc_hash::FxHashSet<usize> {
+        let mut drops = rustc_hash::FxHashSet::default();
+        let mut open: Option<u64> = None;
+        for (index, event) in events.iter().enumerate() {
+            match open {
+                Some(id) => {
+                    drops.insert(index);
+                    if event.kind() == "testDone" && event.u64_at(&["testID"]) == Some(id) {
+                        open = None;
+                    }
+                }
+                None if root_fixture(event, root, hidden_ids) => {
+                    open = event.u64_at(&["test", "id"]);
+                    drops.insert(index);
+                }
+                None => {}
+            }
+        }
+        drops
+    }
+
+    let a_failed = failed_load(&a.events);
+    let b_failed = failed_load(&b.events);
+    // The surviving shard's `suite`+load header is kept; `a` on ties.
+    let (kept, other): (&SuiteBlock, &SuiteBlock) =
+        if a_failed && !b_failed { (&b, &a) } else { (&a, &b) };
+    let mut events = kept.events.clone();
+    if !std::ptr::eq(kept, &a) {
+        // `b` survived while `a`'s load failed: `b`'s header spells the
+        // shard path — rewrite it to the real suite path (suite event,
+        // load-test name and url) so the merged block reads as the
+        // suite's own.
+        let (end, _) = load_end(&events);
+        for event in &mut events[..end] {
+            crate::event::replace_all(event, &[(b.path.as_str(), a.path.as_str())]);
+        }
+    }
+    let (kept_load_end, kept_load_id) = load_end(&events);
+    let kept_root = root_group(&events).map(|(id, _, _)| id);
+    let kept_suite = events.first().and_then(|event| event.u64_at(&["suite", "id"]));
+    // The kept shard's root fixtures license dropping the other shard's
+    // (same declared tree: one has them iff the other does — `a`'s own
+    // check closes the "user test named setUpAll" collision).
+    let kept_hidden = hidden_ids(&events[kept_load_end..]);
+    let kept_has_fixture = kept_root.is_some_and(|root| {
+        events[kept_load_end..]
+            .iter()
+            .any(|event| root_fixture(event, root, &kept_hidden))
+    });
+    let (other_load_end, other_load_id) = load_end(&other.events);
+    let other_root = root_group(&other.events[other_load_end..]);
+    let other_suite = other.events.first().and_then(|event| event.u64_at(&["suite", "id"]));
+
+    // Id unification: seed with the pairs both blocks share by meaning —
+    // suite id, load-test id, root group id — then renumber the rest
+    // sequentially above the kept block's maximum id.
+    let mut ids: rustc_hash::FxHashMap<u64, u64> = rustc_hash::FxHashMap::default();
+    for pair in [
+        (other_suite, kept_suite),
+        (other_load_id, kept_load_id),
+        (other_root.map(|(id, _, _)| id), kept_root),
+    ] {
+        if let (Some(from), Some(to)) = pair {
+            ids.insert(from, to);
+        }
+    }
+    let mut next_id = {
+        let mut max = 0u64;
+        for event in &events {
+            each_id(event, &mut |id| max = max.max(id));
+        }
+        max + 1
+    };
+    let mut remap = |event: &mut Json| {
+        crate::event::remap(event, &mut |old| {
+            *ids.entry(old).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                id
+            })
+        });
+    };
+
+    if !failed_load(&other.events) {
+        // `other`'s root `group` event drops; its `testCount` joins the
+        // kept block's root (the sum is the whole-suite count).
+        if let Some((_, count, _)) = other_root
+            && let Some((_, _, index)) = root_group(&events)
+        {
+            let group_event = &mut events[index];
+            let current = group_event.u64_at(&["group", "testCount"]).unwrap_or(0);
+            if let Some(group) = group_event.get_mut("group") {
+                group.set("testCount", (current + count).into());
+            }
+        }
+        // `other`'s post-load events minus its root artifacts: the root
+        // `group` event always, its root fixture pairs only when the kept
+        // shard ran them too (positionally, `a`'s own fixture presence is
+        // the cross-check — an empty-share shard has neither anyway).
+        let drops: rustc_hash::FxHashSet<usize> = match other_root {
+            Some((root, _, index)) => {
+                let mut drops: rustc_hash::FxHashSet<usize> = [index].into_iter().collect();
+                if kept_has_fixture {
+                    let hidden = hidden_ids(&other.events[other_load_end..]);
+                    drops.extend(fixture_drops(&other.events[other_load_end..], root, &hidden));
+                }
+                drops
+            }
+            None => rustc_hash::FxHashSet::default(),
+        };
+        for (index, event) in other.events[other_load_end..].iter().enumerate() {
+            if drops.contains(&index) {
+                continue;
+            }
+            let mut event = event.clone();
+            remap(&mut event);
+            events.push(event);
+        }
+    } else {
+        // A crashed shard contributes only its `error`+`testDone` tail —
+        // the events past its `suite` + `load testStart` header, remapped
+        // onto the kept load test's id.
+        for event in &other.events[2.min(other_load_end)..other_load_end] {
+            let mut event = event.clone();
+            remap(&mut event);
+            events.push(event);
+        }
+    }
+
+    SuiteBlock {
+        path: a.path,
+        events,
+        closed: a.closed && b.closed,
+        clean: a.clean && b.clean,
+    }
+}
+
 
 /// The `json` reporter over several runs: one `start`, every suite's
 /// events (already [`rebase`]d into one id space and one clock), then

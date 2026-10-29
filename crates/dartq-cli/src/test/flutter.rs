@@ -445,9 +445,14 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         let mut stock: Vec<usize> = Vec::new();
         let grouped = grouped_pass(plan, &args, &to_run, &mut stock, &mut |index, block| {
             stats.grouped += 1;
-            if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
-                cache.stage(key, &block.events)?;
-                staged.insert(index, key.to_owned());
+            // Stage only green verdicts — a sharded suite's red verdict is
+            // delivered too (it must not rerun stock), and a cached red
+            // would replay a failure as fact.
+            if tally(&block.events).green {
+                if let (Some(cache), Some(key)) = (cache.as_mut(), keys[index].as_deref()) {
+                    cache.stage(key, &block.events)?;
+                    staged.insert(index, key.to_owned());
+                }
             }
             slots[index] = Some(block.events);
             emit(&mut slots, &mut outputs, &mut totals)
@@ -945,7 +950,7 @@ fn grouped_pass(
         .iter()
         .map(|&index| plan.suites[index].abs.clone())
         .collect();
-    let placements = dartq_test::flutter::place(root, &files)?;
+    let hostings = dartq_test::flutter::place(root, &files)?;
     // A deterministic per-file digest of the import closure plus the
     // toolchain stamps — the chunk key folds it so a one-byte edit anywhere
     // in a suite's closure (or its flutter_test_config) re-keys the chunk.
@@ -965,10 +970,25 @@ fn grouped_pass(
         });
     }
     let digests = dartq_test::flutter::closure_digests(root, &sdk, &seeds).unwrap_or_default();
+    // Intra-suite sharding (opt-in): a suite whose own file attests
+    // `// dartq: shardable` and whose recorded span clears the floor runs
+    // as two rows with complementary selections of its top-level entries.
+    // Off by default and refused when the invocation already partitions
+    // the suites' tests (user `--total-shards`/`--shard-index`, a random
+    // ordering seed) or when fewer than two workers could ever hold its
+    // two engines.
+    let durations = dartq_test::group::Durations::load(root);
+    let shardable = std::env::var_os("DARTQ_TEST_NO_SHARD").is_none()
+        && plan.workers >= 2
+        && !args.iter().any(|arg| {
+            arg.starts_with("--total-shards")
+                || arg.starts_with("--shard-index")
+                || arg.starts_with("--test-randomize-ordering-seed")
+        });
     let mut hosted: Vec<Hosted> = Vec::new();
     let mut hosted_index: Vec<usize> = Vec::new();
-    for (pos, ((&index, file), placement)) in indices.iter().zip(&files).zip(&placements).enumerate() {
-        if *placement == Placement::Stock {
+    for (pos, ((&index, file), hosting)) in indices.iter().zip(&files).zip(&hostings).enumerate() {
+        if hosting.placement == Placement::Stock {
             stock.push(index);
             continue;
         }
@@ -985,11 +1005,19 @@ fn grouped_pass(
             }),
             (suite_d, _) => suite_d,
         };
+        // The 4 s floor keeps the per-shard engine-load tax (~0.4–0.6 s)
+        // from ever dominating; the marker alone never shards.
+        let shard_total = u32::from(
+            shardable
+                && hosting.shardable
+                && durations.get(root, file).unwrap_or(0) >= SHARD_FLOOR_MS,
+        ) + 1;
         hosted.push(Hosted {
             path: file.clone(),
             config,
-            fresh: *placement == Placement::Fresh,
+            fresh: hosting.placement == Placement::Fresh,
             digest,
+            shard_total,
         });
         hosted_index.push(index);
     }
@@ -1003,7 +1031,8 @@ fn grouped_pass(
     // ever a scheduling hint, a cold run with no records keeps walk order.
     // A stable sort keeps unknown-duration suites in their recorded-order
     // neighbours' wake and preserves the fresh-last partition as a tier.
-    let durations = dartq_test::group::Durations::load(root);
+    // A sharded suite still ranks by its whole-suite duration; its rows
+    // stay adjacent downstream.
     let mut order: Vec<usize> = (0..hosted.len()).collect();
     order.sort_by_key(|&i| {
         (
@@ -1016,7 +1045,11 @@ fn grouped_pass(
 
     let profile = dartq_test::Profile::FLUTTER_GROUPED.calibrated("flutter-grouped");
     let deadline = Instant::now() + idle_timeout();
-    let target = plan.workers.min(hosted.len()).max(1);
+    // The lease target counts *rows*, not suites: a sharded suite occupies
+    // two testers for its window, which is exactly what its two engines
+    // cost.
+    let rows: usize = hosted.iter().map(|hosted| hosted.shard_total as usize).sum();
+    let target = plan.workers.min(rows).max(1);
     let (lease, workers) = dartq_test::lease(profile, target, deadline)?.ok_or_else(|| {
         io::Error::other("timed out waiting for host memory held by other dartq runs")
     })?;
@@ -1045,6 +1078,17 @@ fn grouped_pass(
         runner_args: &runner_args,
         concurrency: workers,
     };
+    // Which suite indices run sharded — their two row-blocks merge into
+    // one before the verdict check.
+    let sharded: FxHashSet<usize> = hosted_index
+        .iter()
+        .copied()
+        .zip(hosted.iter())
+        .filter_map(|(index, hosted)| (hosted.shard_total > 1).then_some(index))
+        .collect();
+    // A sharded suite's row-blocks arrive as two `Settled` items under two
+    // spellings; the first waits here until its sibling lands.
+    let mut pending: FxHashMap<usize, SuiteBlock> = FxHashMap::default();
     let mut settled: FxHashSet<usize> = FxHashSet::default();
     let mut failure: Option<io::Error> = None;
     let mut recorded: Vec<(PathBuf, u64)> = Vec::new();
@@ -1064,13 +1108,44 @@ fn grouped_pass(
             if failure.is_some() {
                 continue;
             }
-            let Some(&index) = index_of.get(Path::new(&block.path)) else {
+            // A shard row's `block.path` carries the `/./` spelling;
+            // normalizing maps every row back to the suite's real path.
+            let real = dartq_source::normalize_lexical(Path::new(&block.path));
+            let Some(&index) = index_of.get(real.as_path()) else {
                 continue;
             };
-            if !(block.clean && complete(&block) && tally(&block.events).green) {
+            let block = match pending.remove(&index) {
+                None if sharded.contains(&index) => {
+                    pending.insert(index, block);
+                    continue;
+                }
+                None => block,
+                Some(sibling) => {
+                    // The real-path row is shard 0; the `/./` one shard 1.
+                    if real.as_os_str() == Path::new(&block.path).as_os_str() {
+                        dartq_test::report::merge_shards(block, sibling)
+                    } else {
+                        dartq_test::report::merge_shards(sibling, block)
+                    }
+                }
+            };
+            let verdict = block.clean && complete(&block);
+            // A block whose engines never ran (a load error and no group
+            // events) is no verdict: the suite reruns stock, exactly like
+            // any other unproven suite.
+            let no_verdict = block.events.iter().all(|event| event.kind() != "group")
+                && block.events.iter().any(|event| event.kind() == "error");
+            if !verdict || no_verdict {
                 continue;
             }
-            if let Some(ms) = block_duration(&block.events) {
+            if !tally(&block.events).green && !sharded.contains(&index) {
+                // An unsharded suite with a red verdict still reruns stock
+                // (the grouped pass only ever proves green suites).
+                continue;
+            }
+            if tally(&block.events).green
+                && let Some(ms) = block_duration(&block.events)
+            {
                 let abs = &plan.suites[index].abs;
                 recorded.push((abs.strip_prefix(root).unwrap_or(abs).to_path_buf(), ms));
             }
@@ -1113,6 +1188,11 @@ const STARTUP_LOCK: &str = "Waiting for another flutter command to release the s
 /// widget-test package (10-core host): one process at `-j 5` 23.2 s /
 /// 1.43 GB, at `-j 4` 25.4 s / 1.33 GB; four processes of two 11.1 s.
 const SUITES_PER_SHARD: usize = 2;
+
+/// The recorded suite span below which intra-suite sharding can never pay
+/// for itself: each extra shard costs one engine spawn+load (~0.4–0.6 s),
+/// so below the floor that tax approaches or exceeds the halved span.
+const SHARD_FLOOR_MS: u64 = 4000;
 
 /// The span between a block's first and last `time` stamp.
 fn block_duration(events: &[Json]) -> Option<u64> {

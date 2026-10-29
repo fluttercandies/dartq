@@ -23,6 +23,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:stream_channel/stream_channel.dart';
+import 'package:test_api/src/backend/group.dart';
+import 'package:test_api/src/backend/group_entry.dart';
+import 'package:test_api/src/backend/test.dart';
 import 'package:test_core/src/executable.dart' as executable;
 import 'package:test_core/src/platform.dart';
 import 'package:test_core/src/runner/configuration/reporters.dart';
@@ -39,7 +42,7 @@ const Duration _settleTimeout = Duration(seconds: 30);
 const String _marker = '\u0001dartq.settled ';
 
 class _Suite {
-  _Suite(this.id, this.path, this.chunk, this.local, this.fresh);
+  _Suite(this.id, this.path, this.chunk, this.local, this.fresh, this.shardIndex, this.shardTotal);
   final int id;
   final String path;
   final int chunk;
@@ -49,6 +52,14 @@ class _Suite {
   /// (fonts, native memory, the isolate name server): runs alone in a
   /// tester started for it and retired after it.
   final bool fresh;
+
+  /// Which shard this row runs, of `shardTotal`: `0/1` runs the suite
+  /// whole; `i/t` runs the i-th contiguous, group-atomic share of the
+  /// suite's top-level entries (the runner's own `_shardSuite` mechanism
+  /// applied per row). Both shards' engines declare the suite's identical
+  /// tree; each filters its own deserialized suite down to its share.
+  final int shardIndex;
+  final int shardTotal;
 }
 
 class _Host {
@@ -411,8 +422,60 @@ class _Platform extends PlatformPlugin {
       socket.map<Object?>((Object? data) => jsonDecode(data! as String)),
       _Sink(socket, tester),
     );
-    return deserializeSuite(path, platform, suiteConfig, const PluginEnvironment(), channel, message)
-        .suite;
+    final RunnerSuite loaded = await deserializeSuite(
+      path,
+      platform,
+      suiteConfig,
+      const PluginEnvironment(),
+      channel,
+      message,
+    ).suite;
+    return _shard(loaded, suite.shardIndex, suite.shardTotal);
+  }
+
+  /// Filter `suite` down to this row's shard of its top-level entries —
+  /// the runner's own `_shardSuite` mechanism (`--total-shards`) applied
+  /// per row instead of globally. The split is a pure function of the
+  /// declared tree, identical on every engine: entries are contiguous
+  /// runs, never split mid-group, balanced by the stock slice's test-count
+  /// boundaries (a shard owns every entry whose first test falls in its
+  /// slice).
+  static RunnerSuite _shard(RunnerSuite suite, int shardIndex, int shardTotal) {
+    if (shardTotal <= 1) return suite;
+    final List<GroupEntry> entries = suite.group.entries;
+    if (entries.length < 2) {
+      // A degenerate tree has nothing to partition: shard 0 runs the whole
+      // suite, later shards run nothing (an empty share still closes
+      // cleanly, and its block is the bare load pair the merge drops).
+      return shardIndex == 0 ? suite : suite.filter((_) => false);
+    }
+    // Boundaries of the stock slice B(i) = round(i*C/t): entry j belongs to
+    // the shard whose slice contains its first test, i.e. the i with
+    // B(i) <= prefix[j] < B(i+1).
+    final List<int> prefix = List<int>.filled(entries.length + 1, 0);
+    for (int j = 0; j < entries.length; j++) {
+      final GroupEntry entry = entries[j];
+      prefix[j + 1] = prefix[j] + (entry is Group ? entry.testCount : 1);
+    }
+    final int total = prefix[entries.length];
+    final int lo = (total * shardIndex / shardTotal).round();
+    final int hi = (total * (shardIndex + 1) / shardTotal).round();
+    final Set<GroupEntry> mine = <GroupEntry>{};
+    for (int j = 0; j < entries.length; j++) {
+      if (prefix[j] >= lo && prefix[j] < hi) mine.add(entries[j]);
+    }
+    if (mine.isEmpty) {
+      // This shard's boundaries gave it no entry (a dominant entry owns
+      // the tail of the count space): run nothing, as the degenerate case.
+      return suite.filter((_) => false);
+    }
+    return suite.filter((Test test) {
+      GroupEntry top = test;
+      while (top.parent != null && !identical(top.parent, suite.group)) {
+        top = top.parent!;
+      }
+      return mine.contains(top);
+    });
   }
 }
 
@@ -422,8 +485,15 @@ Future<void> main(List<String> args) async {
   final List<Object?> suites = host.config['suites']! as List<Object?>;
   for (int id = 0; id < suites.length; id++) {
     final List<Object?> row = suites[id]! as List<Object?>;
-    final _Suite suite =
-        _Suite(id, row[0]! as String, row[1]! as int, row[2]! as int, row[3]! as bool);
+    final _Suite suite = _Suite(
+      id,
+      row[0]! as String,
+      row[1]! as int,
+      row[2]! as int,
+      row[3]! as bool,
+      row.length > 4 ? row[4]! as int : 0,
+      row.length > 5 ? row[5]! as int : 1,
+    );
     host.suites[suite.path] = suite;
     host.byId.add(suite);
   }

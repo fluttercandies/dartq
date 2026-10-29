@@ -101,6 +101,18 @@ pub struct FileFacts {
     /// written before this fact existed fails to load and is rebuilt,
     /// rather than vouching `false` for files it never examined.)
     pub engine_shared: bool,
+    /// Carries the `// dartq: shardable` attestation: the author vouches
+    /// that this suite's verdict is unchanged when its top-level entries
+    /// run partitioned across two engines of one chunk, i.e. that (a) its
+    /// suite-level `setUpAll`/`tearDownAll` (and its
+    /// `flutter_test_config.dart` wrapper) may run twice in the checkout
+    /// concurrently, and (b) no ordering or shared statics tie one
+    /// top-level entry to another. Unlike [`Self::attested`], which vouches
+    /// for a file's reads wherever the suite reaches it, this marker counts
+    /// only in the suite's own file — it attests the suite's declaration
+    /// structure and fixtures, so a marker inside a helper means nothing.
+    /// (No serde default, like `engine_shared`.)
+    pub shardable: bool,
     /// Environment variable names this file reads by literal key:
     /// `Platform.environment['NAME']` and
     /// `Platform.environment.containsKey('NAME')`, deduplicated in source
@@ -170,10 +182,11 @@ pub fn facts(bytes: &[u8]) -> FileFacts {
                 .is_some_and(|(package, _)| DRIFT_PACKAGES.contains(&package))
     });
     out.engine_shared |= out.uris.iter().any(|uri| uri == "dart:ffi" || uri.starts_with("package:ffi/"));
-    let [no_cache, attested, portable] = markers(source, &scanned.tokens);
+    let [no_cache, attested, portable, shardable] = markers(source, &scanned.tokens);
     out.no_cache = no_cache;
     out.attested = attested;
     out.portable = portable;
+    out.shardable = shardable;
     out
 }
 
@@ -191,20 +204,28 @@ pub const DETERMINISTIC_MARKER: &str = "dartq: deterministic";
 /// [`FileFacts::portable`]).
 pub const PORTABLE_MARKER: &str = "dartq: portable";
 
-/// Which of [`NO_CACHE_MARKER`], [`DETERMINISTIC_MARKER`] and
-/// [`PORTABLE_MARKER`] a `//` comment line of the source carries (text
-/// after the marker is a free reason). The scanner emits no tokens for
-/// comments, so comment text is what lies between tokens; a marker spelled
-/// inside a string literal is a token and never counts.
-fn markers(source: &str, tokens: &TokenTable) -> [bool; 3] {
+/// The comment line vouching that a suite's top-level entries may run
+/// partitioned across two engines of one chunk (see
+/// [`FileFacts::shardable`]). Only the suite's own file is consulted.
+pub const SHARDABLE_MARKER: &str = "dartq: shardable";
+
+/// Which of [`NO_CACHE_MARKER`], [`DETERMINISTIC_MARKER`],
+/// [`PORTABLE_MARKER`] and [`SHARDABLE_MARKER`] a `//` comment line of the
+/// source carries (text after the marker is a free reason). The scanner
+/// emits no tokens for comments, so comment text is what lies between
+/// tokens; a marker spelled inside a string literal is a token and never
+/// counts.
+fn markers(source: &str, tokens: &TokenTable) -> [bool; 4] {
     let mut gap_start = 0usize;
-    let mut found = [false; 3];
+    let mut found = [false; 4];
     let mut scan_gap = |gap: &str| {
         for line in gap.lines() {
             if let Some(rest) = line.trim_start().strip_prefix("//") {
                 let rest = rest.trim_start_matches('/').trim();
                 for (slot, marker) in
-                    [NO_CACHE_MARKER, DETERMINISTIC_MARKER, PORTABLE_MARKER].iter().enumerate()
+                    [NO_CACHE_MARKER, DETERMINISTIC_MARKER, PORTABLE_MARKER, SHARDABLE_MARKER]
+                        .iter()
+                        .enumerate()
                 {
                     if let Some(tail) = rest.strip_prefix(marker)
                         && (tail.is_empty() || tail.starts_with(char::is_whitespace))
@@ -780,11 +801,11 @@ void main() {
         assert!(launch.launch && launch.ambient);
         assert!(!of("void main() {}").launch);
 
-        let marked = of("// dartq: no-cache talks to a local daemon\n// dartq: deterministic\n// dartq: portable\nvoid main() {}");
-        assert!(marked.no_cache && marked.attested && marked.portable);
+        let marked = of("// dartq: no-cache talks to a local daemon\n// dartq: deterministic\n// dartq: portable\n// dartq: shardable\nvoid main() {}");
+        assert!(marked.no_cache && marked.attested && marked.portable && marked.shardable);
         // A marker inside a string, a longer word, or a block comment does not count.
-        let unmarked = of("/* dartq: no-cache */\n// dartq: no-cacheable\nvoid main() { print('// dartq: no-cache'); }");
-        assert!(!unmarked.no_cache && !unmarked.attested && !unmarked.portable);
+        let unmarked = of("/* dartq: no-cache */\n// dartq: no-cacheable\n// dartq: shardablex\nvoid main() { print('// dartq: no-cache'); }");
+        assert!(!unmarked.no_cache && !unmarked.attested && !unmarked.portable && !unmarked.shardable);
     }
 
     /// Location observers pin a result to its checkout without widening
@@ -832,6 +853,9 @@ void main() {
         assert!(!of("// dartq:no-cache\nvoid main() {}").no_cache, "no space after the colon");
         assert!(!of("// dartq: no-cacheable\nvoid main() {}").no_cache, "a longer word");
         assert!(of("/// dartq: no-cache why\nvoid main() {}").no_cache, "extra slashes and a reason");
+        assert!(!of("// dartq:shardable\nvoid main() {}").shardable, "no space after the colon");
+        assert!(!of("// dartq: shardable-suite\nvoid main() {}").shardable, "a longer word");
+        assert!(of("/// dartq: shardable split at groups\nvoid main() {}").shardable, "extra slashes and a reason");
     }
 
     /// Environment reads: literal indexes and `containsKey` name the
