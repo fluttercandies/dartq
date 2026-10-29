@@ -346,6 +346,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the engine reports ten more memory families (element models,
   index captures, postings, warm-start, session scratch) for a full
   residency census at 100k-file scale (#2236).
+- `dartq test --flutter`: cached green verdicts replay across runs
+  (the `DateTime.now`/`timestamp` reads move from `nondeterministic`
+  into a separate `time_read` fact that `lib/` files are exempt from,
+  taking a 203-suite Flutter corpus from 1/160 to 160/160 replayed);
+  `stock_early` suites run concurrently with the grouped phase instead
+  of serially after it; `dart_test.yaml` no longer forces whole-run
+  delegation (selective `file_config` gate); tester-window prints no
+  longer dirty the suite block. Measured on the corpus: warm 140 s →
+  81.7 s, cold 166 s → 121.6 s, results byte-identical to
+  `flutter test` (#2819–#2826).
 
 ## [1.0.0] - 2026-10-12
 
