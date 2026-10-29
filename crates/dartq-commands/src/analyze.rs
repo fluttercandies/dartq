@@ -3580,29 +3580,28 @@ mod tests {
             let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
             let mut engine = Engine::new(config).expect("engine");
             let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
-            let rows: Vec<&Diagnostic> = run
+            let rows: usize = run
                 .diagnostics
                 .iter()
                 .filter(|d| d.code.name == "plugins_in_inner_options")
-                .collect();
+                .count();
             std::fs::remove_dir_all(&root).ok();
             rows
         };
         // The file-wide citation names the row's code: silent.
-        assert!(
+        assert_eq!(
             mount(
                 "analyze_inner_plugins_ignored",
                 "# ignore_for_file: plugins_in_inner_options\n"
-            )
-            .is_empty()
+            ),
+            0
         );
         // A wrong-code citation names nothing: the row reports.
         assert_eq!(
             mount(
                 "analyze_inner_plugins_kept",
                 "# ignore_for_file: some_other_code\n"
-            )
-            .len(),
+            ),
             1
         );
     }
