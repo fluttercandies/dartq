@@ -1560,6 +1560,11 @@ pub(crate) struct DeclSite {
     /// sites set it (the unnamed factory's member-captured head never
     /// joins a `this()` edge, whose selector is what this bit keys).
     pub(crate) is_factory: bool,
+    /// The declaration is an `augment` (constructor sites only — the
+    /// `duplicate_constructor` pass and the generative-constructor gate
+    /// skip them; the fragment chain, not a second declaration, carries
+    /// the augmentation).
+    pub(crate) is_augment: bool,
 }
 
 /// The package:meta `@UseResult` face of one declaration.
@@ -2331,6 +2336,12 @@ pub(crate) struct Engine<'a> {
     /// The constructor declaration in flight carries the `const` modifier
     /// (its initializer list is a const context; bodies are not).
     pub(crate) in_const_ctor: bool,
+    /// The constructor declaration in flight is an `augment` (the
+    /// site-consumed latch — `note_decl_site` takes it): the
+    /// `duplicate_constructor` pass skips augment sites (the merge rule
+    /// folds them into the introductory element — no second declaration),
+    /// and `hasGenerativeConstructor` reads origin declarations only.
+    pub(crate) ctor_augment_pending: bool,
     /// The open constructor-initializer list depth (`super.named()` in an
     /// initializer is the `undefined_constructor_in_initializer` shape).
     /// The depth arms the F-C routing: bare and `this.`-selector rows
@@ -3029,8 +3040,15 @@ pub(crate) struct Engine<'a> {
     /// `_CatchClausesVerifier` state).
     pub(crate) try_clauses: Vec<Vec<CatchClauseFact>>,
     /// Open `??` binary groups: rows-stack mark at `begin_binary_expression`,
-    /// for the strictly-non-nullable left operand check at close.
-    pub(crate) if_null_groups: Vec<(usize, SourceRange)>,
+    /// for the strictly-non-nullable left operand check at close, beside the
+    /// right operand's first-token offset (the `dead_null_aware_expression`
+    /// row's start — the official range is the right operand's own node
+    /// range, which a degenerate value row cannot spell).
+    pub(crate) if_null_groups: Vec<(usize, SourceRange, u32)>,
+    /// The open `??`'s right operand's own `node.end` (the
+    /// `handle_binary_rhs_end` latch). Set by the rhs-end hook, consumed
+    /// (and cleared) by `end_if_null`.
+    pub(crate) if_null_rhs_end: Option<u32>,
     /// Closed `??` expressions' static types, keyed by the right operand
     /// row's offset (the group's last row) → (left operand row offset,
     /// `LUB(NonNull(lhs), rhs)`). Only name-decidable joins land here; the

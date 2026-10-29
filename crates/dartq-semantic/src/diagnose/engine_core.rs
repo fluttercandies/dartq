@@ -34,6 +34,7 @@ impl<'a> Engine<'a> {
             boundary,
             source,
             tokens,
+            ctor_augment_pending: false,
             wide_chars: std::cell::OnceCell::new(),
             prefix_names: std::cell::OnceCell::new(),
             prefix_head_memo: std::cell::RefCell::new(FxHashMap::default()),
@@ -317,6 +318,7 @@ impl<'a> Engine<'a> {
             catch_params: 0,
             try_clauses: Vec::new(),
             if_null_groups: Vec::new(),
+            if_null_rhs_end: None,
             if_null_results: FxHashMap::default(),
             eq_spans: Vec::new(),
             condition_staged: Vec::new(),
@@ -1178,6 +1180,10 @@ impl<'a> Engine<'a> {
                 StagedKind::Argument if from == check.from => {
                     (!self.prefix_head_ty(from)).then_some(false)
                 }
+                // The assignment face closes the nominal blind spot (the
+                // declared-subtype negative); the yield face keeps the
+                // matrix posture.
+                StagedKind::Assignment => self.assignment_verdict(from, check.to, check.literal),
                 _ => self.assignable(from, check.to, check.literal),
             };
             if verdict != Some(false) {
@@ -1661,24 +1667,130 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The strict subtype verdict over the resolved operand faces
-    /// (`subtype.dart`'s `isSubtypeOf`): [`Engine::slot_subtype`] plus
-    /// the three upstream rules the slot cannot ask at `Ty` level —
-    /// 0c `InvalidType` (an unresolvable head is a subtype of
-    /// everything and vice-versa, [`Self::is_invalid_ty`]), rule 6
-    /// Left `FutureOr` (`FutureOr<S> <: T` iff `S <: T` and
-    /// `Future<S> <: T`, subtype.dart:372-385) and rule 10 Right
-    /// `FutureOr` (`S <: FutureOr<T>` iff `S <: Future<T>` or
-    /// `S <: T`, subtype.dart:418-449 — the assignable face's own
-    /// `FutureOr` arm answers the looser question, this ask needs the
-    /// strict one). A `FutureOr` with no written argument reads
-    /// `FutureOr<dynamic>` — the same raw-head face
-    /// [`Engine::assignable`]'s Right-`FutureOr` arm applies. `true`
-    /// is the proven-constant answer only; every undecidable shape
-    /// answers `false` — the under-report direction every consumer of
-    /// the fold already takes.
+    /// The strict subtype verdict over the resolved operand faces — the
+    /// official `TypeSystem.isSubtypeOf` walk (`_isSubtypeOf`, upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/element/subtype.dart
+    /// 64-524) mirrored at the [`Ty`] shapes the resolved face spells:
+    ///
+    /// - 0c `InvalidType` either side answers `true`
+    ///   ([`Self::is_invalid_ty`]; subtype.dart 72-74);
+    /// - Left Bottom `Never` (163-165);
+    /// - Left/Right `FutureOr` flattening (371-449: `FutureOr<S> <: T`
+    ///   iff `S <: T` and `Future<S> <: T`; `S <: FutureOr<T>` iff
+    ///   `S <: Future<T>` or `S <: T`, the bound leg included);
+    /// - Right Top (216-224: `dynamic`, `void`, `Object?`), Left Top
+    ///   (226-231: `dynamic`/`void` fit only the tops), Right `Object`
+    ///   (233-317: `Null`, the tops, and every `S?` fail; a bare
+    ///   in-scope type parameter answers through its bound);
+    /// - Left Null (319-344: `Null` fits only the tops, every nullable
+    ///   spelling, and `FutureOr<S>` iff `Null <: S`);
+    /// - Left Nullable (346-351: `S0? <: T1` iff `S0 <: T1` and
+    ///   `Null <: T1`) and Right Nullable (452-478: `S0 <: S1?` iff
+    ///   `S0 <: S1`, the `Null` leg kept);
+    /// - function/record faces: a function (record) type subtypes the
+    ///   bare `Function` (`Record`) head (505-520), function- and
+    ///   record-shape pairs keep [`Engine::slot_subtype`] (its function
+    ///   rule is real subtyping — contravariant formals, covariant
+    ///   return — and its record rule the shape identity), and every
+    ///   other pairing is false (interface types never subtype
+    ///   `Function`/record shapes, subtype.dart 196-200);
+    /// - same-head interface pairs decide through the type-argument
+    ///   list ([`Self::same_head_args`], the `_interfaceArguments`
+    ///   variance walk over the element model's covariant default) and
+    ///   distinct heads keep the declared-edge lattice
+    ///   ([`Self::name_subtype`]).
+    ///
+    /// `true` is the proven-constant answer only; every undecidable
+    /// shape answers `false` — the under-report direction every
+    /// consumer of the fold already takes. The name-level fallback is
+    /// deliberately NOT [`Engine::slot_subtype`]: its same-head matrix
+    /// runs the assignable face, whose legacy `Null` and top leniencies
+    /// answer `Null → C` beyond the strict relation — as a subtype
+    /// answer that over-fires the constant-true verdict
+    /// (`List<Null> is List<Object>`: the covariant argument leg asks
+    /// `Null <: Object` and Left Null refuses — the oracle is silent).
     pub(crate) fn resolved_subtype(&self, sub: Ty, sup: Ty) -> bool {
+        self.strict_subtype(sub, sup, 0)
+    }
+
+    /// `ty` with the `?` flag cleared — the Left/Right Nullable strips
+    /// (`T0.withNullability(none)` / `T1.withNullability(none)`,
+    /// subtype.dart 347-348 / 453-454). `Ty` is an enum, so the fields
+    /// copy explicitly per variant; the non-nullable faces pass through.
+    fn non_nullable_ty(ty: Ty) -> Ty {
+        match ty {
+            Ty::Named { name, args, .. } => Ty::Named {
+                name,
+                nullable: false,
+                args,
+            },
+            Ty::Record { shape, .. } => Ty::Record {
+                shape,
+                nullable: false,
+            },
+            Ty::Function { shape, .. } => Ty::Function {
+                shape,
+                nullable: false,
+            },
+            other => other,
+        }
+    }
+
+    /// The canonical `Null` face: a bare `Named{Null}` spelling reads as
+    /// [`Ty::Null`] (every spelling of `Null` resolves to the one
+    /// `NullType` — `isDartCoreNull`'s identity, the type-position
+    /// capture's identifier row and the inference face's unit meeting
+    /// at one variant before any structural ask).
+
+    /// The canonical `Null` face: a bare `Named{Null}` spelling reads as
+    /// [`Ty::Null`] (every spelling of `Null` resolves to the one
+    /// `NullType` — `isDartCoreNull`'s identity, the type-position
+    /// capture's identifier row and the inference face's unit meeting
+    /// at one variant before any structural ask).
+    fn normalized_null(&self, ty: Ty) -> Ty {
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args: ArgListId::EMPTY,
+        } = ty
+            && name == self.intern("Null")
+        {
+            return Ty::Null;
+        }
+        ty
+    }
+
+    /// The recursion cap of [`Self::strict_subtype`]: bounded depth in
+    /// place of the official `TypeOperationDepthLimitExceeded` circuit
+    /// (subtype.dart 18-25 — the over-limit ask answers `false`), the
+    /// engine's termination invariant for the mutual-recursion the
+    /// argument walk and the bound legs drive.
+    const SUBTYPE_DEPTH: u32 = 10;
+
+    fn strict_subtype(&self, sub: Ty, sup: Ty, depth: u32) -> bool {
+        if depth >= Self::SUBTYPE_DEPTH {
+            return false;
+        }
+        // The `Null` head normalizes to the canonical unit face: a
+        // type-position capture spells `Named{Null}` (the identifier's
+        // own row) while inference-side faces carry `Ty::Null`, and the
+        // official resolves every spelling to the one `NullType`
+        // (`isDartCoreNull`, the NullTypeImpl identity).
+        let sub = self.normalized_null(sub);
+        let sup = self.normalized_null(sup);
+        let next = depth + 1;
+        // Reflexivity (subtype.dart 66-68) — the argument pool's
+        // canonical ids make the structural ask an `Eq` ask.
+        if sub == sup {
+            return true;
+        }
+        // 0c: an `InvalidType` on either side answers `true`
+        // (subtype.dart 72-74).
         if self.is_invalid_ty(sub) || self.is_invalid_ty(sup) {
+            return true;
+        }
+        // Left Bottom: `Never <: T1` (subtype.dart 163-165).
+        if sub == Ty::Never {
             return true;
         }
         let future_or_parts = |ty: Ty| -> Option<(Ty, ArgListId)> {
@@ -1699,40 +1811,248 @@ impl<'a> Engine<'a> {
             };
             Some((value, args))
         };
+        // Left FutureOr (subtype.dart 371-385): `FutureOr<S0> <: T1` iff
+        // `S0 <: T1` and `Future<S0> <: T1`.
         if let Some((value, args)) = future_or_parts(sub) {
             let future = Ty::Named {
                 name: self.intern("Future"),
                 nullable: false,
                 args,
             };
-            return self.resolved_subtype(value, sup) && self.resolved_subtype(future, sup);
+            return self.strict_subtype(value, sup, next)
+                && self.strict_subtype(future, sup, next);
         }
+        // Right FutureOr (subtype.dart 418-449): `S0 <: FutureOr<S1>`
+        // iff `S0 <: Future<S1>` or `S0 <: S1` — the type-parameter
+        // bound leg included (`X0` with bound `B0`: `B0 <: FutureOr<S1>`).
         if let Some((value, args)) = future_or_parts(sup) {
             let future = Ty::Named {
                 name: self.intern("Future"),
                 nullable: false,
                 args,
             };
-            return self.resolved_subtype(sub, future) || self.resolved_subtype(sub, value);
-        }
-        // The terminal ask is the declared-edge lattice
-        // ([`Self::name_subtype`] — `NameWorld::is_subtype_of`), never
-        // [`Self::slot_subtype`]'s assignability fallback: the M1 matrix
-        // answers every nullable named target as a Right Top
-        // (`Ty::assignable_from`, the assignment question `S → T?`), and
-        // as a subtype answer it over-fires the constant-true verdict
-        // (`num? a; a is int?` — the oracle is silent,
-        // subtype.dart's interface rule needs the supertype graph).
-        // Function- and record-shape pairs keep the slot walk: its
-        // function rule is real subtyping (contravariant formals,
-        // covariant return) and its record rule the shape identity —
-        // the strict faces the name-level columns cannot spell.
-        match (sub, sup) {
-            (Ty::Record { .. } | Ty::Function { .. }, Ty::Record { .. } | Ty::Function { .. }) => {
-                self.slot_subtype(sub, sup) == Some(true)
+            if self.strict_subtype(sub, future, next) || self.strict_subtype(sub, value, next) {
+                return true;
             }
-            _ => self.name_subtype(sub, sup),
+            if let Ty::Named {
+                name: param,
+                args: ArgListId::EMPTY,
+                nullable: false,
+            } = sub
+                && self.is_scope_param(param)
+                && let Some(bound) = self.param_bound_of(param)
+                && bound != Ty::Dynamic
+            {
+                return self.strict_subtype(bound, sup, next);
+            }
+            return false;
         }
+        // Right Top (subtype.dart 216-224): `dynamic`, `void`, `Object?`.
+        if sup == Ty::Dynamic || sup == Ty::Void {
+            return true;
+        }
+        if let Ty::Named {
+            name,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        } = sup
+            && name == self.intern("Object")
+        {
+            return true;
+        }
+        // Right Null: nothing but `Null`/`Never` (both caught above)
+        // subtypes `Null` (subtype.dart 342-344's tail).
+        if sup == Ty::Null {
+            return false;
+        }
+        // Left Null (subtype.dart 319-344): the tops and every nullable
+        // spelling fit; `FutureOr<S>` rode the Right leg above
+        // (`Null <: S`); a non-nullable concrete face never does.
+        if sub == Ty::Null {
+            return matches!(
+                sup,
+                Ty::Named { nullable: true, .. }
+                    | Ty::Record { nullable: true, .. }
+                    | Ty::Function { nullable: true, .. }
+            );
+        }
+        // Left Nullable (subtype.dart 346-351): `S0? <: T1` iff `S0 <: T1`
+        // and `Null <: T1`.
+        if matches!(
+            sub,
+            Ty::Named { nullable: true, .. }
+                | Ty::Record { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+        ) {
+            return self.strict_subtype(Self::non_nullable_ty(sub), sup, next)
+                && self.strict_subtype(Ty::Null, sup, next);
+        }
+        // Left Top (subtype.dart 226-231): `dynamic`/`void` fit only the
+        // tops — every fit the Right Top arm above answers, so a
+        // remaining target is no fit.
+        if sub == Ty::Dynamic || sub == Ty::Void {
+            return false;
+        }
+        // Right Object's tail (subtype.dart 307-317): after the `Null`,
+        // top, and `S?` rejections above, every source fits `Object` —
+        // except a bare in-scope type parameter, which answers through
+        // its bound (`B0 <: Object`; an unbounded parameter is bounded
+        // by `dynamic`, no fit).
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args: ArgListId::EMPTY,
+        } = sup
+            && name == self.intern("Object")
+        {
+            if let Ty::Named {
+                name: param,
+                args: ArgListId::EMPTY,
+                ..
+            } = sub
+                && self.is_scope_param(param)
+            {
+                return match self.param_bound_of(param) {
+                    Some(bound) if bound != Ty::Dynamic => self.strict_subtype(bound, sup, next),
+                    _ => false,
+                };
+            }
+            return true;
+        }
+        // Function/record faces (subtype.dart 505-520): the bare
+        // `Function`/`Record` heads fit; shape pairs keep the slot walk;
+        // every other target is false — interface types never subtype
+        // `Function` or a record shape (subtype.dart 196-200).
+        match sub {
+            Ty::Function { .. } => match sup {
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                } if name == self.intern("Function") => true,
+                Ty::Function { .. } => self.slot_subtype(sub, sup) == Some(true),
+                _ => false,
+            },
+            Ty::Record { .. } => match sup {
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                } if name == self.intern("Record") => true,
+                Ty::Record { .. } => self.slot_subtype(sub, sup) == Some(true),
+                _ => false,
+            },
+            // The interface faces. The Right Nullable strip precedes the
+            // argument walk (`S <: C<A>?` iff `S <: C<A>`); the bare
+            // in-scope type parameter answers through its bound (Left
+            // Type Variable Bound, subtype.dart 484-493).
+            Ty::Named {
+                name,
+                args: sub_args_id,
+                ..
+            } => {
+                let Ty::Named {
+                    name: sup_name,
+                    nullable: sup_nullable,
+                    args: sup_args_id,
+                } = sup
+                else {
+                    return false;
+                };
+                if sup_nullable {
+                    return self.strict_subtype(sub, Self::non_nullable_ty(sup), next);
+                }
+                if sub_args_id == ArgListId::EMPTY
+                    && self.is_scope_param(name)
+                    && let Some(bound) = self.param_bound_of(name)
+                {
+                    // An unbounded parameter is bounded by `dynamic` —
+                    // `dynamic <: C` is no fit (Left Top above).
+                    return bound != Ty::Dynamic && self.strict_subtype(bound, sup, next);
+                }
+                if sup_name == name {
+                    return self.same_head_args(name, sub_args_id, sup_args_id, sub, sup, next);
+                }
+                // Distinct heads: the declared-edge lattice keeps the
+                // walk (under-report direction — the official answers
+                // through `allSupertypes` with substitution, a face the
+                // name-level model cannot spell).
+                self.name_subtype(sub, sup)
+            }
+            _ => false,
+        }
+    }
+
+    /// The same-head argument walk (`_interfaceArguments`,
+    /// subtype.dart 44-82): per position the declared variance decides,
+    /// and the element model's default for an unmarked parameter is
+    /// COVARIANT (`TypeParameterElementImpl.variance` = `_variance ??
+    /// Variance.covariant`, element.dart 11559-11561 — the summary
+    /// builder sets a variance only for a written keyword,
+    /// variance_builder.dart 244-256), so every position the model
+    /// cannot spell a marker for walks the covariant leg
+    /// `strict(subArgument, superArgument)`. The leg is the strict
+    /// subtype ask — never the assignable slot, whose legacy `Null` and
+    /// top leniencies over-fire (`List<Null> is List<Object>`: `Null
+    /// <: Object` is false, Left Null — the oracle is silent). The
+    /// top-type relief rides the recursion (`int <: List<dynamic>`
+    /// through Right Top). A bare side materializes the all-dynamic
+    /// raw face (`C` reads `C<dynamic>` — the oracle's raw
+    /// instantiation), and an arity the container cannot answer
+    /// under-reports through the head walk. Explicit `inout` markers
+    /// (the variance experiment's invariant positions) stay unmodeled —
+    /// the covariant default over-proves those rare rows.
+    fn same_head_args(
+        &self,
+        head: StringId,
+        sub_args: ArgListId,
+        sup_args: ArgListId,
+        sub: Ty,
+        sup: Ty,
+        depth: u32,
+    ) -> bool {
+        if depth >= Self::SUBTYPE_DEPTH {
+            return false;
+        }
+        let arity = match resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        ) {
+            Some((container, _)) => container.type_params as usize,
+            None => return self.name_subtype(sub, sup),
+        };
+        let args_of = |args: ArgListId| -> Option<Vec<Ty>> {
+            if args == ArgListId::EMPTY {
+                return Some(vec![Ty::Dynamic; arity]);
+            }
+            Some(self.boundary.args.borrow().get(args).to_vec())
+        };
+        let (Some(sub_list), Some(sup_list)) = (args_of(sub_args), args_of(sup_args)) else {
+            return self.name_subtype(sub, sup);
+        };
+        // A written argument count the container cannot take reads as the
+        // recovered `C<Invalid>` interface (the wrong-number-of-type-
+        // arguments face, #2380's recv_arity probes): every argument
+        // comparison is 0c-vacuous (subtype.dart 72-74 — an `InvalidType`
+        // on either side answers `true`), so the same-head question is
+        // constant-true on BOTH polarity directions — a bare side is the
+        // raw all-dynamic face, not an invalid one, and stays out.
+        if (sub_args != ArgListId::EMPTY && sub_list.len() != arity)
+            || (sup_args != ArgListId::EMPTY && sup_list.len() != arity)
+        {
+            return true;
+        }
+        if sub_list.len() != sup_list.len() {
+            return false;
+        }
+        sub_list
+            .iter()
+            .zip(sup_list.iter())
+            .all(|(&sub_arg, &sup_arg)| self.strict_subtype(sub_arg, sup_arg, depth + 1))
     }
 
     /// The name-level `canBeSubtypeOf`
@@ -1762,11 +2082,14 @@ impl<'a> Engine<'a> {
 
     /// The `is`/`is!` operand's resolved static type
     /// (`leftNode.typeOrThrow`, best_practices_verifier.dart:1011): the
-    /// nearest operand row's push-time snapshot, or — a bare local's —
-    /// the declared/inferred type the frame bound (`var self = this`
-    /// reads `self`'s inferred `this` type, not the row's `Unknown` —
-    /// mutation plays no part in the verdict). [`Ty::Unknown`] when no
-    /// operand row exists or the frame binds nothing — the every-check
+    /// nearest operand row's push-time snapshot, a bare local's
+    /// declared/inferred type the frame bound (`var self = this` reads
+    /// `self`'s inferred `this` type, not the row's `Unknown` —
+    /// mutation plays no part in the verdict), or a bare read's
+    /// tear-off face ([`Self::operand_tear_off_ty`] — a function,
+    /// method, getter, or field spelled as its own value carries its
+    /// declared face as the static type). [`Ty::Unknown`] when no
+    /// operand row exists or nothing resolves — the every-check
     /// suppresses sentinel the callers gate on.
     pub(crate) fn type_check_operand_ty(&self) -> Ty {
         let Some(operand) = self.operand_row() else {
@@ -1777,11 +2100,91 @@ impl<'a> Engine<'a> {
         } else if let RowShape::Bare(BareInfo::Plain { ty }) = &operand.shape {
             if *ty != Ty::UNKNOWN {
                 *ty
+            } else if let Some(ty) = self.typed_local(operand.name) {
+                ty
             } else {
-                self.typed_local(operand.name).unwrap_or(Ty::Unknown)
+                self.operand_tear_off_ty(operand).unwrap_or(Ty::Unknown)
             }
         } else {
             Ty::Unknown
+        }
+    }
+
+    /// The bare-read tear-off face at an `is` operand (`f0 is F0<int>`
+    /// over a top-level `int f0(...)`, `m0 is F0<T>` over an instance
+    /// `int m0(...)` — the operand's static type is the callable's
+    /// declared signature as a function type, the official
+    /// `FunctionType` a tear-off expression carries): a top-level
+    /// function answers through [`Engine::tear_off_sig`], an
+    /// enclosing-container member through the member walk — a method
+    /// interns its signature (generic members stay untyped: the
+    /// instantiate-to-bounds freshening is outside the declared-face
+    /// model), a getter its return type, a field its declared type.
+    /// Value reads only: a completed send's row is the call's operand,
+    /// never a tear-off. The under-report direction keeps every
+    /// unresolvable spelling at `None`.
+    fn operand_tear_off_ty(&self, operand: &Row) -> Option<Ty> {
+        if operand.qualified || operand.intent != Intent::Read {
+            return None;
+        }
+        // A frame local shadows any member/top-level spelling (the
+        // precedence `resolve_bare` applies): the read is the local's
+        // own value, and `typed_local` already answered it.
+        if self.frames.iter().any(|f| f.locals.contains(&operand.name)) {
+            return None;
+        }
+        if !matches!(
+            operand.shape,
+            RowShape::Bare(BareInfo::Plain { .. } | BareInfo::Missing { .. })
+        ) {
+            return None;
+        }
+        // The top-level function face (`tear_off_sig`'s value-read
+        // gate): the signature interns whole.
+        if let Some(sig) = self.tear_off_sig(operand) {
+            let named: Vec<(StringId, Ty)> = sig
+                .named
+                .iter()
+                .map(|(name, ty, _)| (*name, *ty))
+                .collect();
+            return Some(self.boundary.intern_function_ty(
+                0,
+                sig.return_ty,
+                &sig.positional,
+                &named,
+                false,
+            ));
+        }
+        // The enclosing-container member face: the unqualified read of a
+        // method/getter/field of `this`'s container (`m0` inside the
+        // class). Getters and fields carry no formals — their value face
+        // is the declared type.
+        let (container, _) = self.container_context()?;
+        let entry = match self.walk_members(container, operand.name) {
+            Walk::Found(entry) => entry,
+            _ => return None,
+        };
+        match entry.kind {
+            MemberKind::Method if entry.type_params == 0 => {
+                let formals = entry.formals.as_deref()?;
+                let named: Vec<(StringId, Ty)> = formals
+                    .named
+                    .iter()
+                    .map(|formal| (formal.name, formal.ty))
+                    .collect();
+                let positional: Vec<Ty> =
+                    formals.positional.iter().map(|formal| formal.ty).collect();
+                Some(self.boundary.intern_function_ty(
+                    0,
+                    entry.return_ty,
+                    &positional,
+                    &named,
+                    false,
+                ))
+            }
+            MemberKind::Getter if entry.return_ty != Ty::Unknown => Some(entry.return_ty),
+            MemberKind::Field if entry.var_ty != Ty::Unknown => Some(entry.var_ty),
+            _ => None,
         }
     }
 
@@ -2018,10 +2421,18 @@ impl<'a> Engine<'a> {
         // operand is the same silence (the prefix answers no subtype
         // question — the under-report direction every unresolved side
         // already takes).
+        // The operand's resolved static type (`leftNode.typeOrThrow`,
+        // best_practices_verifier.dart:1011) — the alias fold mirrors the
+        // target side's: `f0 is F0<int>` over a tear-off typed
+        // `F0<int>` reads both sides' aliased function shapes, the pair
+        // the strict face's function rule answers (an unfolded operand
+        // would strand the pair as (Named, Function) — informative,
+        // the under-report the oracle's flag answers true).
         let operand_ty = match keyword_operand {
             Some((ty, _)) => ty,
             None => self.type_check_operand_ty(),
         };
+        let operand_ty = self.fold_alias_ty(operand_ty);
         if operand_ty == Ty::Unknown
             || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)
@@ -2044,8 +2455,10 @@ impl<'a> Engine<'a> {
                     .operand_row()
                     .is_some_and(|row| row.ty == Ty::Null && matches!(row.shape, RowShape::Value));
             if null_literal {
-                // `Null <: T` decides the literal check's polarity.
-                Some(self.name_subtype(Ty::Null, checked))
+                // `Null <: T` decides the literal check's polarity — the
+                // strict face (the official walk is
+                // `isSubtypeOf(Null, rightType)`, the same relation).
+                Some(self.resolved_subtype(Ty::Null, checked))
             } else {
                 self.stage_type_check_null(at, negated);
                 return;
@@ -2166,6 +2579,16 @@ impl<'a> Engine<'a> {
                         if top {
                             continue;
                         }
+                        // The gate owns TYPE-PARAMETER positions only: a
+                        // bare spelling that names no in-scope parameter
+                        // (`Null`'s identifier row, an unresolvable head)
+                        // is not a parameter with a bound to prove — it
+                        // defers to the strict ask below, which reads the
+                        // `Null` identity and the 0c faces itself.
+                        if !self.is_scope_param(param) {
+                            non_param_position = true;
+                            continue;
+                        }
                         let bound = match self.param_bound_of(param) {
                             Some(Ty::Dynamic) => return,
                             Some(bound) => bound,
@@ -2216,20 +2639,20 @@ impl<'a> Engine<'a> {
                 Some(true)
             } else if param_pair_true && !non_param_position {
                 Some(true)
-            } else if !self.name_subtype(operand_ty, checked)
-                && !self.resolved_subtype(operand_ty, checked)
-            {
+            } else if !self.resolved_subtype(operand_ty, checked) {
                 // A non-matching pair is informative — the official order
                 // has no subtype-negative verdict
                 // (`TypeSystem::type_check_verdict`'s doc): only the
                 // constant-true answer reports here, with `is!` mapping
-                // to the 'false' row below. The name-level lattice
-                // answers first; pairs it cannot pose (a `FutureOr`
-                // source — `FutureOr<S> <: T` needs rule 6's legs — or an
-                // `InvalidType` nested inside the arguments, which only
-                // the resolved face reads as 0c-vacuous) re-ask through
-                // [`Self::resolved_subtype`], the same strict-subtype
-                // question over the operand's full face.
+                // to the 'false' row below. The ask is
+                // [`Self::resolved_subtype`], the strict mirror of
+                // `TypeSystem.isSubtypeOf` — the name-level lattice
+                // alone cannot stand here: its same-head argument walk
+                // delegates to the assignability slot, whose legacy
+                // `Null` and top leniencies answer `Null → C` beyond
+                // the strict relation (`List<Null> is List<Object>` —
+                // the covariant argument leg asks `Null <: Object`,
+                // Left Null refuses, the oracle is silent).
                 return;
             } else {
                 Some(true)

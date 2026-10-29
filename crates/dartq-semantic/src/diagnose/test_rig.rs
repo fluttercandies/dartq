@@ -214,6 +214,99 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
     report
 }
 
+/// [`report_ops`] with `augment_source` mounted as a SECOND unit of the
+/// SAME library (the multi-unit augmentation layout the fixtures carry —
+/// an `augment` declaration resolving against a preceding file's
+/// introductory declarations through the library graph). Returns the second
+/// unit's report: the augmentation rows land on the declaring file.
+pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let source = format!("{CORE_PRELUDE}{main}");
+    let scanned = scan_fixture(&source, file);
+    let aug_file = files.intern(Path::new("aug.dart"));
+    let aug_scanned = scan_fixture(augment_source, aug_file);
+    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let features = ParserFeatures::from_feature_set(set);
+    let elements = collect(&source, &scanned.tokens, features, &strings);
+    let aug_elements = collect(augment_source, &aug_scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let core_lib = builder.intern("dart:core");
+    let core_file = files.intern(Path::new("<dart:core>"));
+    for name in CORE_STUB_NAMES {
+        builder.declare(core_lib, strings.intern(name), core_file);
+    }
+    builder.import(
+        lib,
+        ImportEdge {
+            target: Some(core_lib),
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    index.insert(aug_file, aug_elements.clone());
+    builder.unit(lib, file);
+    builder.unit(lib, aug_file);
+    let mut clauses = ClauseTrees::empty();
+    for (unit_file, unit_source, unit_scanned, unit_elements) in [
+        (file, source.as_str(), &scanned, &elements),
+        (aug_file, augment_source, &aug_scanned, &aug_elements),
+    ] {
+        for (name, decl) in unit_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            if matches!(decl.kind, MicroKind::Class | MicroKind::Enum | MicroKind::Mixin) {
+                builder.declare_class(lib, name, unit_file, ClassModifiers::default());
+            } else {
+                builder.declare(lib, name, unit_file);
+            }
+        }
+        crate::capture_clause_trees(
+            unit_file,
+            unit_source,
+            &unit_scanned.tokens,
+            features,
+            &strings,
+            &mut clauses,
+        );
+    }
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let types = LibraryTypes::build_with_clauses(
+        &graph,
+        &namespaces,
+        &index,
+        &strings,
+        lib,
+        &clauses,
+    );
+    let ops = ResolvedTypeOps::new(&types, &strings, aug_file);
+    let fold = fold_unit_with_ops(
+        augment_source,
+        &aug_scanned.tokens,
+        features,
+        &strings,
+        aug_file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(Feature::InferenceUpdate2),
+        Some(&ops),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    report
+}
+
 /// The diagnostic code names of `report` in source order.
 pub(super) fn code_names(report: &FileReport) -> Vec<&'static str> {
     report.diagnostics.iter().map(|d| d.code.name).collect()

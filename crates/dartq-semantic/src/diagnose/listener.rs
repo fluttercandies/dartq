@@ -1124,6 +1124,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // target (the #279 arg-check gate); its initializer list is a
         // const context too (the #749 candidate guard).
         engine.in_const_ctor = var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const");
+        // The augment bit rides onto the constructor's site at its head
+        // (the `duplicate_constructor` pass skips augment sites).
+        engine.ctor_augment_pending = augment_kw.is_some();
         engine.open_member_setter = false;
         engine.open_member_static = false;
         engine.open_toplevel_site = None;
@@ -3506,7 +3509,28 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_dot(is_null_aware);
         engine.ur_seal_used();
-        engine.merge_member(is_null_aware, token.range, end.range.end());
+        // The dead-chain row's extent is the ACCESS node's own end
+        // (`_verifyUnassignedSimpleIdentifier`'s `node.end -
+        // operator.offset`, dead_code_verifier.dart:578-590): a folded
+        // send ends at its `)`, a plain member at its identifier — the
+        // handler's `end` param is the send-tiling follower, one token
+        // past both.
+        let chain_end = engine
+            .last_send_callee
+            .as_ref()
+            .map(|(_, send_end)| *send_end)
+            .unwrap_or_else(|| {
+                engine
+                    .tokens
+                    .get(token.id as usize + 1)
+                    .map(|member| {
+                        let raw = &engine.source[member.byte_range()];
+                        member.utf16_offset
+                            + raw.chars().map(char::len_utf16).sum::<usize>() as u32
+                    })
+                    .unwrap_or_else(|| end.range.end())
+            });
+        engine.merge_member(is_null_aware, token.range, chain_end);
         // The explicit-receiver member read's declared face stages for the
         // flow's member-access fold (the implicit-this stage's sibling):
         // the name-level fold cannot walk the receiver's members, so a
@@ -3566,7 +3590,24 @@ impl ParserListener for DiagnoseListener<'_> {
         // The first section carried the `?..` verdict (`is_null_aware`) —
         // the pending op's stand-in duty ends here.
         engine.cascade_null_aware_op = None;
-        engine.merge_member(is_null_aware, operator.range, end.range.end());
+        // The dead-chain extent mirrors `handle_dot_access`'s: the access
+        // node's own end, never the send-tiling follower.
+        let chain_end = engine
+            .last_send_callee
+            .as_ref()
+            .map(|(_, send_end)| *send_end)
+            .unwrap_or_else(|| {
+                engine
+                    .tokens
+                    .get(operator.id as usize + 1)
+                    .map(|member| {
+                        let raw = &engine.source[member.byte_range()];
+                        member.utf16_offset
+                            + raw.chars().map(char::len_utf16).sum::<usize>() as u32
+                    })
+                    .unwrap_or_else(|| end.range.end())
+            });
+        engine.merge_member(is_null_aware, operator.range, chain_end);
         // The merged row is the section's selector: its discarded value
         // reports at this token even when the target's type is unknown to
         // the model (the official walk answers on the section node).
@@ -3989,7 +4030,14 @@ impl ParserListener for DiagnoseListener<'_> {
             .const_capture
             .begin_binary(bin_op_of(text), operator.range);
         if text == "??" {
-            engine.begin_if_null(operator.range);
+            // The right operand's node range's start: the first token after
+            // the operator (whitespace and comments ride no token).
+            let rhs_offset = engine
+                .tokens
+                .get(operator.id as usize + 1)
+                .map(|token| token.utf16_offset)
+                .unwrap_or_else(|| operator.range.end());
+            engine.begin_if_null(operator.range, rhs_offset);
         }
         if text == "==" || text == "!=" {
             // The comparison walk parks the left operand's row index (the
@@ -4005,6 +4053,11 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_binary_rhs_end(&mut self, operator: Token, rhs_last: Token) {
         self.flow().handle_binary_rhs_end(operator, rhs_last);
+        // The `??` right operand's own node end: the dead-null-aware row's
+        // extent latch (consumed by `end_if_null`).
+        if self.engine.text_of(operator) == Some("??") {
+            self.engine.if_null_rhs_end = Some(rhs_last.range.end());
+        }
     }
 
     fn end_binary_expression(&mut self, operator: Token, end: Token) {

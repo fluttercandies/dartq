@@ -1130,13 +1130,16 @@ fn inner_plugins_rows(engine: &Engine) -> Vec<Diagnostic> {
         .into_iter()
         .filter_map(|options| {
             let file = table.try_file_id(&options.file_path)?;
-            Some(
-                analysis_options::OptionsIssue::plugins_in_inner_options(
-                    &context_root.display().to_string(),
-                    options.plugins_section_anchor(),
-                )
-                .to_diagnostic(file),
+            let row = analysis_options::OptionsIssue::plugins_in_inner_options(
+                &context_root.display().to_string(),
+                options.plugins_section_anchor(),
             )
+            .to_diagnostic(file);
+            // The YAML ignore-comment face over the options file's own text
+            // — the same face every options-file row passes (the
+            // `IgnoreInfo.forYaml` filter, upstream Dart SDK source,
+            // `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart` :80-83).
+            (!options.ignored_at(row.range.offset, row.code.name)).then_some(row)
         })
         .collect()
 }
@@ -3497,6 +3500,103 @@ mod tests {
         );
         assert_eq!(row.range.length, 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The text-direction rows' ignore face end to end: the oracle's
+    /// Dart-file filter (`_filterIgnoredDiagnostics`, upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/dart/analysis/library_analyzer.dart`
+    /// :539-563) drops a row its file's `// ignore:` citation names — the
+    /// row's own line, the next line from an alone-on-its-line comment, or
+    /// file-wide through `// ignore_for_file:` — while a wrong-code
+    /// citation suppresses nothing.
+    #[test]
+    fn run_overlaid_text_direction_rows_honor_ignore_comments() {
+        let bidi = '\u{202E}';
+        let flipped = |directive: &str| {
+            format!("{directive}// The text direction is flipped here {bidi}\nvoid f() {{\n}}\n")
+        };
+        let line_ignored = flipped("// ignore: text_direction_code_point_in_comment\n");
+        let same_line_ignored =
+            format!("var s = 'a{bidi}b'; // ignore: text_direction_code_point_in_literal\n");
+        let for_file_ignored = flipped("// ignore_for_file: text_direction_code_point_in_comment\n");
+        let wrong_code_file = flipped("// ignore: some_other_code\n");
+        let root = workspace(
+            "analyze_text_direction_ignores",
+            &[
+                // The citation alone on its line targets the flagged line
+                // below it (forDart :123-133).
+                ("lib/line_ignored.dart", line_ignored.as_str()),
+                // The row rides the literal's line; the trailing citation is
+                // on that same line.
+                ("lib/same_line_ignored.dart", same_line_ignored.as_str()),
+                // The file-wide citation suppresses wherever the row lands.
+                ("lib/for_file_ignored.dart", for_file_ignored.as_str()),
+                // A wrong-code citation names nothing on this face.
+                ("lib/wrong_code.dart", wrong_code_file.as_str()),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let rows: Vec<&Diagnostic> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name.starts_with("text_direction_"))
+            .collect();
+        let wrong_code = engine
+            .file_table()
+            .try_file_id(&root.join("lib/wrong_code.dart"))
+            .expect("the cited file is interned");
+        assert_eq!(rows.len(), 1, "only the wrong-code file's row: {rows:?}");
+        assert_eq!(rows[0].file, wrong_code);
+        assert_eq!(rows[0].code.name, "text_direction_code_point_in_comment");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The inner-options plugins row's ignore face: the options file's own
+    /// YAML `# ignore_for_file:` citation drops the row before it joins the
+    /// output; a wrong-code citation keeps it (the same `IgnoreInfo.forYaml`
+    /// filter the oracle's YAML validators run,
+    /// pubspec_validator.dart:80-83).
+    #[test]
+    fn run_overlaid_inner_plugins_row_honors_yaml_ignore_comments() {
+        let mount = |name: &str, citation: &str| {
+            let root = workspace(name, &[("lib/test.dart", "void f() {}\n")]);
+            let root = root.canonicalize().expect("canonical root");
+            std::fs::write(
+                root.join("lib/analysis_options.yaml"),
+                format!("{citation}plugins:\n  custom_lint:\n    path: .\n"),
+            )
+            .expect("inner options");
+            std::fs::write(
+                root.join("analysis_options.yaml"),
+                "plugins:\n  root_plugin:\n    path: .\n",
+            )
+            .expect("root options");
+            let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+            let mut engine = Engine::new(config).expect("engine");
+            let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+            let rows: Vec<&Diagnostic> = run
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.name == "plugins_in_inner_options")
+                .collect();
+            std::fs::remove_dir_all(&root).ok();
+            rows
+        };
+        // The file-wide citation names the row's code: silent.
+        assert!(mount(
+            "analyze_inner_plugins_ignored",
+            "# ignore_for_file: plugins_in_inner_options\n"
+        )
+        .is_empty());
+        // A wrong-code citation names nothing: the row reports.
+        assert_eq!(
+            mount("analyze_inner_plugins_kept", "# ignore_for_file: some_other_code\n").len(),
+            1
+        );
     }
 
     /// The inner-plugins face through the real pipeline: an inner options

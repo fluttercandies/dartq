@@ -1114,7 +1114,7 @@ pub enum SemanticCode {
     /// (`non_void_return_for_setter`, error_verifier.dart:7015-7025, at the
     /// written annotation).
     NonVoidReturnForSetter,
-    /// `'{0}' isn't a type.` — a name in type position resolving to a
+    /// `{0} isn't a type.` — a name in type position resolving to a
     /// non-type element (`not_a_type`, named_type_resolver.dart:199/:596,
     /// the plain resolver path; local variables and local functions route
     /// to `referenced_before_declaration` instead and stay out of scope
@@ -1495,6 +1495,106 @@ pub enum SemanticCode {
     /// `Pointer<NativeFunction<T>>` whose `T` is not a valid native
     /// function type, at the type argument or invocation.
     NonNativeFunctionTypeArgumentToPointer,
+
+    // ── the augmentation face (upstream Dart SDK source,
+    // pkg/analyzer/messages.yaml:1829-2014, `experiment: augmentations`;
+    // the verifier order mirrors error_verifier.dart's per-declaration
+    // augmentation checks) ────────────────────────────────────────────────
+    /// `The augmentation has an 'extends' clause, but an augmentation
+    /// target already includes an 'extends' clause and it isn't allowed to
+    /// be repeated or changed.` — at the `extends` keyword.
+    AugmentationExtendsClauseAlreadyPresent,
+    /// `The augmentation has the '{0}' modifier that the declaration
+    /// doesn't have.` — at the extra modifier's own keyword.
+    AugmentationModifierExtra,
+    /// `The augmentation is missing the '{0}' modifier that the declaration
+    /// has.` — at the `augment` keyword.
+    AugmentationModifierMissing,
+    /// `The augmentation has a named formal parameter '{0}', but the
+    /// declaration doesn't.` — at the extra parameter's name.
+    AugmentationNamedFormalParameterExtra,
+    /// `The augmentation is missing the named formal parameter '{0}' from
+    /// the declaration.` — at the parameter list's `)`.
+    AugmentationNamedFormalParameterMissing,
+    /// `The augmentation has {1} optional positional formal parameters, but
+    /// the declaration has {0}.` — at the anchor the oracle picks (the `(`,
+    /// the offending parameter, or the `)`).
+    AugmentationOptionalPositionalFormalParameterCount,
+    /// `The augmentation has {1} required positional formal parameters, but
+    /// the declaration has {0}.` — same anchor family as the optional row.
+    AugmentationRequiredPositionalFormalParameterCount,
+    /// `The augmentation has the '{0}' modifier on this formal parameter,
+    /// but the declaration doesn't.` — at the extra keyword.
+    AugmentationFormalParameterModifierExtra,
+    /// `The augmentation is missing the '{0}' modifier on this formal
+    /// parameter that the declaration has.` — at the parameter's name (or
+    /// the parameter itself when unnamed).
+    AugmentationFormalParameterModifierMissing,
+    /// `The augmentation's formal parameter type '{1}' must be the same as
+    /// the declaration's formal parameter type '{0}'.` — at the written
+    /// type annotation (or the parameter entity when the type is absent).
+    AugmentationFormalParameterTypeMismatch,
+    /// `The parameter name '{1}' must either match the name '{0}' from a
+    /// preceding declaration or be '_'.` — at the parameter's name.
+    AugmentationPositionalFormalParameterName,
+    /// `Can't augment a {0} with a {1}.` — the names resolved against an
+    /// existing declaration of a different kind, at the `augment` keyword.
+    AugmentationOfDifferentDeclarationKind,
+    /// `Mixin application classes can't be augmented.` — the name resolves
+    /// to a `class B = A with M;` declaration, at the `augment` keyword.
+    AugmentationOfMixinApplicationClass,
+    /// `The augmentation type parameter must have the same bound as the
+    /// corresponding type parameter of the declaration.` — at the written
+    /// bound.
+    AugmentationTypeParameterBound,
+    /// `The augmentation must have the same number of type parameters as
+    /// the declaration.` — at the first surplus parameter's name, the `>`
+    /// when fewer, or the declaration name when none.
+    AugmentationTypeParameterCount,
+    /// `The augmentation type parameter must have the same name as the
+    /// corresponding type parameter of the declaration.` — at the
+    /// parameter's name.
+    AugmentationTypeParameterName,
+    /// `The declaration being augmented doesn't exist.` — the shared code
+    /// of the without-declaration family (upstream `sharedName`:
+    /// `augmentationWithoutGetterDeclaration` / `...SetterDeclaration` ride
+    /// the same name); the shape enum picks the message.
+    AugmentationWithoutDeclaration(WithoutDeclarationShape),
+    /// `The augmentation's return type '{1}' must be the same as the
+    /// introductory declaration's return type '{0}'.` — the shared code of
+    /// the return-mismatch family (the induced-getter variant shares the
+    /// name upstream); the shape enum picks the message.
+    AugmentationReturnTypeMismatch(ReturnShape),
+    /// `Type aliases can't be augmented.` — the parser-level rejection
+    /// (`parser_impl.dart:1453` reports it at the `augment` keyword); the
+    /// capture log rides the merged output observably identically.
+    TypedefAugmentation,
+}
+
+/// The message shapes of the shared `augmentation_without_declaration` code
+/// (upstream `sharedName` — one analyzer code, three problemMessages).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WithoutDeclarationShape {
+    /// `The declaration being augmented doesn't exist.`
+    Plain,
+    /// `This augmentation induces a getter, but no getter declaration named
+    /// '{0}' exists to augment.`
+    Getter,
+    /// `This augmentation induces a setter, but no setter declaration named
+    /// '{0}' exists to augment.`
+    Setter,
+}
+
+/// The message shapes of the shared `augmentation_return_type_mismatch`
+/// code (upstream `sharedName` — the induced-getter variant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReturnShape {
+    /// `The augmentation's return type '{1}' must be the same as the
+    /// introductory declaration's return type '{0}'.`
+    Plain,
+    /// `The getter induced by this augmentation has return type '{1}', but
+    /// the getter being augmented has return type '{0}'.`
+    InducedGetter,
 }
 
 /// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
@@ -2108,6 +2208,81 @@ impl SemanticCode {
                 "non_native_function_type_argument_to_pointer",
                 "NON_NATIVE_FUNCTION_TYPE_ARGUMENT_TO_POINTER",
             ),
+            // The augmentation face (one registry name per family; the
+            // without-declaration and return-mismatch families share their
+            // name across their message shapes, upstream `sharedName`).
+            Self::AugmentationExtendsClauseAlreadyPresent => (
+                "augmentation_extends_clause_already_present",
+                "AUGMENTATION_EXTENDS_CLAUSE_ALREADY_PRESENT",
+            ),
+            Self::AugmentationModifierExtra => {
+                ("augmentation_modifier_extra", "AUGMENTATION_MODIFIER_EXTRA")
+            }
+            Self::AugmentationModifierMissing => (
+                "augmentation_modifier_missing",
+                "AUGMENTATION_MODIFIER_MISSING",
+            ),
+            Self::AugmentationNamedFormalParameterExtra => (
+                "augmentation_named_formal_parameter_extra",
+                "AUGMENTATION_NAMED_FORMAL_PARAMETER_EXTRA",
+            ),
+            Self::AugmentationNamedFormalParameterMissing => (
+                "augmentation_named_formal_parameter_missing",
+                "AUGMENTATION_NAMED_FORMAL_PARAMETER_MISSING",
+            ),
+            Self::AugmentationOptionalPositionalFormalParameterCount => (
+                "augmentation_optional_positional_formal_parameter_count",
+                "AUGMENTATION_OPTIONAL_POSITIONAL_FORMAL_PARAMETER_COUNT",
+            ),
+            Self::AugmentationRequiredPositionalFormalParameterCount => (
+                "augmentation_required_positional_formal_parameter_count",
+                "AUGMENTATION_REQUIRED_POSITIONAL_FORMAL_PARAMETER_COUNT",
+            ),
+            Self::AugmentationFormalParameterModifierExtra => (
+                "augmentation_formal_parameter_modifier_extra",
+                "AUGMENTATION_FORMAL_PARAMETER_MODIFIER_EXTRA",
+            ),
+            Self::AugmentationFormalParameterModifierMissing => (
+                "augmentation_formal_parameter_modifier_missing",
+                "AUGMENTATION_FORMAL_PARAMETER_MODIFIER_MISSING",
+            ),
+            Self::AugmentationFormalParameterTypeMismatch => (
+                "augmentation_formal_parameter_type_mismatch",
+                "AUGMENTATION_FORMAL_PARAMETER_TYPE_MISMATCH",
+            ),
+            Self::AugmentationPositionalFormalParameterName => (
+                "augmentation_positional_formal_parameter_name",
+                "AUGMENTATION_POSITIONAL_FORMAL_PARAMETER_NAME",
+            ),
+            Self::AugmentationOfDifferentDeclarationKind => (
+                "augmentation_of_different_declaration_kind",
+                "AUGMENTATION_OF_DIFFERENT_DECLARATION_KIND",
+            ),
+            Self::AugmentationOfMixinApplicationClass => (
+                "augmentation_of_mixin_application_class",
+                "AUGMENTATION_OF_MIXIN_APPLICATION_CLASS",
+            ),
+            Self::AugmentationTypeParameterBound => (
+                "augmentation_type_parameter_bound",
+                "AUGMENTATION_TYPE_PARAMETER_BOUND",
+            ),
+            Self::AugmentationTypeParameterCount => (
+                "augmentation_type_parameter_count",
+                "AUGMENTATION_TYPE_PARAMETER_COUNT",
+            ),
+            Self::AugmentationTypeParameterName => (
+                "augmentation_type_parameter_name",
+                "AUGMENTATION_TYPE_PARAMETER_NAME",
+            ),
+            Self::AugmentationWithoutDeclaration(_) => (
+                "augmentation_without_declaration",
+                "AUGMENTATION_WITHOUT_DECLARATION",
+            ),
+            Self::AugmentationReturnTypeMismatch(_) => (
+                "augmentation_return_type_mismatch",
+                "AUGMENTATION_RETURN_TYPE_MISMATCH",
+            ),
+            Self::TypedefAugmentation => ("typedef_augmentation", "TYPEDEF_AUGMENTATION"),
             // The #743 W1-micro cluster. The NaN pair keeps one registry
             // name (sharedName `unnecessaryNanComparison`; the polarity
             // lives in the message shape), like the null-comparison pair.
@@ -3338,7 +3513,7 @@ impl SemanticCode {
             Self::NonVoidReturnForSetter => {
                 "The return type of the setter must be 'void' or absent.".to_string()
             }
-            Self::NotAType => format!("'{a0}' isn't a type."),
+            Self::NotAType => format!("{a0} isn't a type."),
             Self::NonBoolCondition => "Conditions must have a static type of 'bool'.".to_string(),
             Self::NonBoolNegationExpression => {
                 "A negation operand must have a static type of 'bool'.".to_string()
@@ -3414,6 +3589,73 @@ impl SemanticCode {
             Self::AmbiguousSetOrMapLiteralBoth => {
                 "The literal can't be either a map or a set because it contains at least one literal map entry or a spread operator spreading a 'Map', and at least one element which is neither of these.".to_string()
             }
+            // The #2784 augmentation faces (messages.yaml, the
+            // `augmentation*` block:1829-2014 — templates transcribed
+            // verbatim; `a0`/`a1` carry the `_withArguments` order).
+            Self::AugmentationExtendsClauseAlreadyPresent => {
+                "The augmentation has an 'extends' clause, but an augmentation target already includes an 'extends' clause and it isn't allowed to be repeated or changed.".to_string()
+            }
+            Self::AugmentationModifierExtra => {
+                format!("The augmentation has the '{a0}' modifier that the declaration doesn't have.")
+            }
+            Self::AugmentationModifierMissing => {
+                format!("The augmentation is missing the '{a0}' modifier that the declaration has.")
+            }
+            Self::AugmentationNamedFormalParameterExtra => {
+                format!("The augmentation has a named formal parameter '{a0}', but the declaration doesn't.")
+            }
+            Self::AugmentationNamedFormalParameterMissing => {
+                format!("The augmentation is missing the named formal parameter '{a0}' from the declaration.")
+            }
+            Self::AugmentationOptionalPositionalFormalParameterCount => {
+                format!("The augmentation has {a0} optional positional formal parameters, but the declaration has {a1}.")
+            }
+            Self::AugmentationRequiredPositionalFormalParameterCount => {
+                format!("The augmentation has {a0} required positional formal parameters, but the declaration has {a1}.")
+            }
+            Self::AugmentationFormalParameterModifierExtra => {
+                format!("The augmentation has the '{a0}' modifier on this formal parameter, but the declaration doesn't.")
+            }
+            Self::AugmentationFormalParameterModifierMissing => {
+                format!("The augmentation is missing the '{a0}' modifier on this formal parameter that the declaration has.")
+            }
+            Self::AugmentationFormalParameterTypeMismatch => {
+                format!("The augmentation's formal parameter type '{a0}' must be the same as the declaration's formal parameter type '{a1}'.")
+            }
+            Self::AugmentationPositionalFormalParameterName => {
+                format!("The parameter name '{a0}' must either match the name '{a1}' from a preceding declaration or be '_'.")
+            }
+            Self::AugmentationOfDifferentDeclarationKind => {
+                format!("Can't augment a {a0} with a {a1}.")
+            }
+            Self::AugmentationOfMixinApplicationClass => {
+                "Mixin application classes can't be augmented.".to_string()
+            }
+            Self::AugmentationTypeParameterBound => {
+                "The augmentation type parameter must have the same bound as the corresponding type parameter of the declaration.".to_string()
+            }
+            Self::AugmentationTypeParameterCount => {
+                "The augmentation must have the same number of type parameters as the declaration.".to_string()
+            }
+            Self::AugmentationTypeParameterName => {
+                "The augmentation type parameter must have the same name as the corresponding type parameter of the declaration.".to_string()
+            }
+            Self::AugmentationWithoutDeclaration(WithoutDeclarationShape::Plain) => {
+                "The declaration being augmented doesn't exist.".to_string()
+            }
+            Self::AugmentationWithoutDeclaration(WithoutDeclarationShape::Getter) => {
+                format!("This augmentation induces a getter, but no getter declaration named '{a0}' exists to augment.")
+            }
+            Self::AugmentationWithoutDeclaration(WithoutDeclarationShape::Setter) => {
+                format!("This augmentation induces a setter, but no setter declaration named '{a0}' exists to augment.")
+            }
+            Self::AugmentationReturnTypeMismatch(ReturnShape::Plain) => {
+                format!("The augmentation's return type '{a0}' must be the same as the introductory declaration's return type '{a1}'.")
+            }
+            Self::AugmentationReturnTypeMismatch(ReturnShape::InducedGetter) => {
+                format!("The getter induced by this augmentation has return type '{a0}', but the getter being augmented has return type '{a1}'.")
+            }
+            Self::TypedefAugmentation => "Type aliases can't be augmented.".to_string(),
         }
     }
 
@@ -4649,6 +4891,12 @@ mod tests {
                 .message("render", "package:test/other.dart"),
             "The member 'render' can only be used within 'package:test/other.dart' or a template library."
         );
+        // The interpolated name is unquoted (diagnostic.g.dart:13403,
+        // `notAType` problemMessage "{0} isn't a type.").
+        assert_eq!(
+            SemanticCode::NotAType.message("int", ""),
+            "int isn't a type."
+        );
         assert_eq!(
             SemanticCode::MemberWithClassName.message("", ""),
             "A class member can't have the same name as the enclosing class."
@@ -4987,6 +5235,28 @@ mod tests {
             SemanticCode::AmbiguousExtensionMemberTwo
             | SemanticCode::AmbiguousExtensionMemberThreeOrMore
             | SemanticCode::ArgumentTypeNotAssignable
+            // The #2784 augmentation faces — none registry-backed (the
+            // dartq-diagnostics table predates them; the inline `message`
+            // arms above are the sole template source).
+            | SemanticCode::AugmentationExtendsClauseAlreadyPresent
+            | SemanticCode::AugmentationFormalParameterModifierExtra
+            | SemanticCode::AugmentationFormalParameterModifierMissing
+            | SemanticCode::AugmentationFormalParameterTypeMismatch
+            | SemanticCode::AugmentationModifierExtra
+            | SemanticCode::AugmentationModifierMissing
+            | SemanticCode::AugmentationNamedFormalParameterExtra
+            | SemanticCode::AugmentationNamedFormalParameterMissing
+            | SemanticCode::AugmentationOfDifferentDeclarationKind
+            | SemanticCode::AugmentationOfMixinApplicationClass
+            | SemanticCode::AugmentationOptionalPositionalFormalParameterCount
+            | SemanticCode::AugmentationPositionalFormalParameterName
+            | SemanticCode::AugmentationRequiredPositionalFormalParameterCount
+            | SemanticCode::AugmentationReturnTypeMismatch(_)
+            | SemanticCode::AugmentationTypeParameterBound
+            | SemanticCode::AugmentationTypeParameterCount
+            | SemanticCode::AugmentationTypeParameterName
+            | SemanticCode::AugmentationWithoutDeclaration(_)
+            | SemanticCode::TypedefAugmentation
             | SemanticCode::BodyMightCompleteNormally
             | SemanticCode::BodyMightCompleteNormallyNullable
             | SemanticCode::CastFromNullAlwaysFails
@@ -5262,6 +5532,28 @@ mod tests {
             SemanticCode::AmbiguousExtensionMemberTwo,
             SemanticCode::AmbiguousExtensionMemberThreeOrMore,
             SemanticCode::ArgumentTypeNotAssignable,
+            SemanticCode::AugmentationExtendsClauseAlreadyPresent,
+            SemanticCode::AugmentationFormalParameterModifierExtra,
+            SemanticCode::AugmentationFormalParameterModifierMissing,
+            SemanticCode::AugmentationFormalParameterTypeMismatch,
+            SemanticCode::AugmentationModifierExtra,
+            SemanticCode::AugmentationModifierMissing,
+            SemanticCode::AugmentationNamedFormalParameterExtra,
+            SemanticCode::AugmentationNamedFormalParameterMissing,
+            SemanticCode::AugmentationOfDifferentDeclarationKind,
+            SemanticCode::AugmentationOfMixinApplicationClass,
+            SemanticCode::AugmentationOptionalPositionalFormalParameterCount,
+            SemanticCode::AugmentationPositionalFormalParameterName,
+            SemanticCode::AugmentationRequiredPositionalFormalParameterCount,
+            SemanticCode::AugmentationReturnTypeMismatch(ReturnShape::Plain),
+            SemanticCode::AugmentationReturnTypeMismatch(ReturnShape::InducedGetter),
+            SemanticCode::AugmentationTypeParameterBound,
+            SemanticCode::AugmentationTypeParameterCount,
+            SemanticCode::AugmentationTypeParameterName,
+            SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Plain),
+            SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Getter),
+            SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Setter),
+            SemanticCode::TypedefAugmentation,
             SemanticCode::BodyMightCompleteNormally,
             SemanticCode::BodyMightCompleteNormallyNullable,
             SemanticCode::CastFromNullAlwaysFails,

@@ -1853,7 +1853,7 @@ fn name_captured(c: &Check<'_>, closures: &[core::ops::Range<u32>], name: &str) 
 
 /// The UTF-16 span of a token range (the written-type report spans).
 /// `None` on the shared token-helper miss — the caller's report drops.
-fn utf16_token_run_span(
+pub(crate) fn utf16_token_run_span(
     c: &Check<'_>,
     range: core::ops::Range<u32>,
 ) -> Option<core::ops::Range<u32>> {

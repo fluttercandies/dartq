@@ -78,9 +78,10 @@
 
 use crate::capture::{TreeSink, TypeTree};
 use crate::model::{
-    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, ConstCreationFace, Container,
-    ContainerKind, DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry,
-    MemberKind, MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
+    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, AugKind, AugTarget, AugmentDecl,
+    AugmentFormal, AugmentModifiers, AugmentTypeParam, ConstCreationFace, Container, ContainerKind,
+    DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind,
+    MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
@@ -166,6 +167,19 @@ struct OpenContainer {
     /// The declaration's metadata star (`crate::model::Annotation`),
     /// drained from the builder's pending buffer at the open.
     annotations: Vec<Annotation>,
+    /// The header's `augment` keyword (the container is an augmentation
+    /// declaration) with its span.
+    augment_kw: Option<SourceRange>,
+    /// The header's own modifier keyword spans (the modifier-extra rows
+    /// anchor at them).
+    augment_modifiers: AugmentModifiers,
+    /// The header's type parameters as written (names, bounds, spans) —
+    /// zipped at the open from the buffered header group when the container
+    /// is an augmentation.
+    augment_type_params: Vec<AugmentTypeParam>,
+    /// The header's `extends` keyword span, latched at
+    /// `handle_class_extends` while the container is an augmentation.
+    augment_extends: Option<SourceRange>,
 }
 
 /// The open constructor's capture: the named selectors it declares plus
@@ -258,6 +272,29 @@ struct PendingTypedef {
     type_param_names: Vec<StringId>,
 }
 
+/// An `augment` executable under construction (`begin_method` /
+/// `begin_top_level_method` / `begin_constructor` / `begin_factory` through
+/// its end event): the staged [`AugmentDecl`] facts, fields filled by the
+/// events between the pair.
+struct PendingAug {
+    kind: AugKind,
+    name: StringId,
+    display_name: StringId,
+    name_range: SourceRange,
+    augment_kw: SourceRange,
+    container: Option<StringId>,
+    is_static: bool,
+    type_params: Vec<AugmentTypeParam>,
+    type_params_close: Option<SourceRange>,
+    return_ty: Option<Ty>,
+    return_ty_range: Option<SourceRange>,
+    formals: Vec<AugmentFormal>,
+    parens: Option<(SourceRange, SourceRange)>,
+    group_open: Option<SourceRange>,
+    const_kw: Option<SourceRange>,
+    factory_kw: Option<SourceRange>,
+}
+
 /// The capture state shared between the listener and [`collect`].
 #[expect(clippy::struct_excessive_bools)] // latch flags mirror the parser's event stream
 struct Builder<'src, 'tab> {
@@ -290,6 +327,35 @@ struct Builder<'src, 'tab> {
     /// [`Builder::finish`].
     duplicates: Vec<DuplicateDecl>,
     arity_violations: Vec<ArityDecl>,
+    /// Finished `augment` declarations (the augmentation verifier's facts);
+    /// sealed into boxed slices at [`Builder::finish`].
+    augmentations: Vec<AugmentDecl>,
+    /// The augmentation-target kind rows (top-level executable accessor
+    /// faces, variable finality, per-constructor const/factory faces, named
+    /// mixin applications); sealed at [`Builder::finish`].
+    decl_kinds: Vec<AugTarget>,
+    /// The last completed type annotation's span (parallel to
+    /// [`Builder::armed_ty`]): a type-variable bound's row anchor, a
+    /// formal's type-mismatch anchor.
+    armed_ty_range: Option<SourceRange>,
+    /// The declaration currently being captured is an `augment` form: its
+    /// second-declaration collision is the augmentation verifier's business
+    /// (an augment of an existing name is not a `duplicate_definition`).
+    declaring_augment: bool,
+    /// An `augment` executable (member or top-level) is open; its staged
+    /// facts drain into a finished [`AugmentDecl`] at the end event.
+    pending_aug: Option<PendingAug>,
+    /// The current type-variable group's name-token spans, parallel to
+    /// [`Builder::type_var_group`]; a header or executable augment takes its
+    /// type-parameter rows from here.
+    type_var_ranges: Vec<SourceRange>,
+    /// The current type-variable group's bound spans, parallel to
+    /// [`Builder::type_var_bounds`] (`None` = unbounded).
+    type_var_bound_ranges: Vec<Option<SourceRange>>,
+    /// The last closed depth-1 type-variable group's `>` span (the header
+    /// group's close feeds a container augment's capture, an executable's
+    /// its own rows).
+    type_group_close: Option<SourceRange>,
     /// A class-family header is open (`with`/`implements` type names route
     /// to [`Builder::header_interfaces`]).
     in_class_header: bool,
@@ -334,15 +400,29 @@ struct Builder<'src, 'tab> {
     field_external: bool,
     /// The field group's `final` modifier (the abstract-field setter split).
     field_final: bool,
+    /// The field group's `augment` keyword span (`begin_fields` latches,
+    /// `end_fields`/`end_top_level_fields` clears) — every group member is
+    /// an augmentation declaration.
+    field_augment: Option<SourceRange>,
+    /// The field group's written type annotation span (latched with the
+    /// group type at the first name).
+    field_group_ty_range: Option<SourceRange>,
     /// The current field group's static bit (`None` = no group open).
     field_static: Option<bool>,
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
     pending_typedef: Option<PendingTypedef>,
-    /// A constructor is open (`begin_constructor`..`end_constructor`): the
-    /// named selectors it declares plus its unnamed flag. `A()` records the
-    /// unnamed shape; `A.named()` records `named` only.
+    /// A constructor or factory is open (`begin_constructor`/
+    /// `begin_factory` .. their end events): its name event captures the
+    /// unnamed/named shape; the end settles the capture.
     ctor_open: Option<CtorCapture>,
+    /// The open constructor/factory wrote `const` (drained at the end into
+    /// the constructor's own target-kind row).
+    pending_ctor_const: Option<bool>,
+    /// The formal parameter under capture inside an `augment` executable:
+    /// its start span and the `covariant`/`required` keyword spans, latched
+    /// at `begin_formal_parameter`, drained at `end_formal_parameter`.
+    aug_formal_start: Option<(SourceRange, Option<SourceRange>, Option<SourceRange>)>,
     /// A factory declaration is open (`begin_factory`..`end_factory`): its
     /// name event is a constructor shape, not a method one.
     factory_ctor_open: bool,
@@ -472,6 +552,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_faces: Vec::new(),
             duplicates: Vec::new(),
             arity_violations: Vec::new(),
+            augmentations: Vec::new(),
+            decl_kinds: Vec::new(),
+            armed_ty_range: None,
+            declaring_augment: false,
+            pending_aug: None,
+            type_var_ranges: Vec::new(),
+            type_var_bound_ranges: Vec::new(),
+            type_group_close: None,
             in_class_header: false,
             header_interfaces: Vec::new(),
             header_residue: Vec::new(),
@@ -482,11 +570,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             field_abstract: false,
             field_external: false,
             field_final: false,
-            field_static: None,
-            pending_member: None,
+            field_augment: None,
+            field_static: None,            pending_member: None,
             pending_top: None,
             pending_typedef: None,
             ctor_open: None,
+            pending_ctor_const: None,
+            aug_formal_start: None,
             factory_ctor_open: false,
             factory_ctor_head: None,
             pending_ctor_formals: None,
@@ -510,6 +600,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_type_head: None,
             pending_qualified: None,
             field_group_ty: None,
+            field_group_ty_range: None,
             pending_annotations: Vec::new(),
             field_annotations: Vec::new(),
             open_annotation: None,
@@ -565,8 +656,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.arity_violations.push(ArityDecl { violation, range });
     }
 
-    /// Declares a top-level name, logging a duplicate when taken.
+    /// Declares a top-level name, logging a duplicate when taken. An
+    /// `augment` declaration never logs one: augmenting an existing name is
+    /// the augmentation face's business (the oracle reports
+    /// `duplicate_definition` for same-name introductions only).
     fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) {
+        let augmenting = self.declaring_augment;
         match self.decls.entry(name) {
             // A type parameter's placeholder (declaration-scoped in truth)
             // never collides with a top-level declaration: the real
@@ -574,6 +669,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             Entry::Occupied(existing) if existing.kind == MicroKind::TypeParam => {
                 self.decls.insert(name, decl);
             }
+            Entry::Occupied(_) if augmenting => {}
             Entry::Occupied(_) => self.record_duplicate(name, range),
             Entry::Vacant(slot) => {
                 slot.insert(decl);
@@ -587,6 +683,42 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.tokens
             .get(token.id as usize)
             .map(|t| self.strings.intern(&self.source[t.byte_range()]))
+    }
+
+    /// The token's own span (the parser's UTF-16 projection of the token —
+    /// recovery synthetics carry the parser's chosen fallback span).
+    fn span_of(&self, token: Token) -> SourceRange {
+        token.range
+    }
+
+    /// Zips the type-variable group's parallel buffers into the augment
+    /// capture's rows: names and bounds from the taken group, spans from the
+    /// range buffers (drained — they belong to this group only).
+    fn zip_type_var_rows(
+        &mut self,
+        names: &[StringId],
+        bounds: &[Ty],
+    ) -> Vec<AugmentTypeParam> {
+        let ranges = std::mem::take(&mut self.type_var_ranges);
+        let bound_ranges = std::mem::take(&mut self.type_var_bound_ranges);
+        names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &name)| {
+                let name_range = ranges.get(index).copied()?;
+                let bound = match (bounds.get(index), bound_ranges.get(index)) {
+                    (Some(ty), Some(Some(range))) if *ty != Ty::Dynamic => {
+                        Some((*ty, *range))
+                    }
+                    _ => None,
+                };
+                Some(AugmentTypeParam {
+                    name,
+                    name_range,
+                    bound,
+                })
+            })
+            .collect()
     }
 
     /// The prefixed annotation's one-head spelling: the completing
@@ -741,6 +873,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn field_group_ty(&mut self) -> Ty {
         if self.field_group_ty.is_none() {
             self.field_group_ty = Some(self.take_armed());
+            self.field_group_ty_range = self.armed_ty_range.take();
         }
         self.field_group_ty.expect("latched above")
     }
@@ -1416,6 +1549,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ctor_formals: NameMapBuilder::default(),
             factory_formals: NameMapBuilder::default(),
             annotations,
+            augment_kw: None,
+            augment_modifiers: AugmentModifiers::default(),
+            augment_type_params: Vec::new(),
+            augment_extends: None,
         });
         // The `extends` head latches on class-family declarations only
         // (including a named mixin application's head type); enum
@@ -1431,6 +1568,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.in_class_header = false;
         self.header_capture_open = false;
         self.header_interfaces.clear();
+        self.declaring_augment = false;
         // A trailing star (recovery residue after the last member) binds to
         // nothing once the body closed — drop it before it could leak into
         // the next container's own star.
@@ -1441,6 +1579,42 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         let Some(mut open) = self.containers.pop() else {
             return;
         };
+        if let Some(augment_kw) = open.augment_kw {
+            // The augmentation declaration's own capture: the kind word and
+            // the header face the verifier compares against the target.
+            let kind = match open.kind {
+                ContainerKind::Class => AugKind::Class,
+                ContainerKind::Mixin => AugKind::Mixin,
+                ContainerKind::Enum => AugKind::Enum,
+                ContainerKind::Extension => AugKind::Extension,
+                ContainerKind::ExtensionType => AugKind::ExtensionType,
+            };
+            let type_params = std::mem::take(&mut open.augment_type_params);
+            let (name, name_range) = open
+                .name
+                .map_or((self.strings.intern(""), SourceRange { offset: 0, length: 0 }), |(n, r)| (n, r));
+            self.augmentations.push(AugmentDecl {
+                kind,
+                name,
+                display_name: name,
+                name_range,
+                augment_kw,
+                container: None,
+                is_static: false,
+                is_final: false,
+                modifiers: open.augment_modifiers,
+                extends_kw: open.augment_extends,
+                type_params: type_params.into_boxed_slice(),
+                type_params_close: self.type_group_close,
+                return_ty: None,
+                return_ty_range: None,
+                formals: Box::new([]),
+                parens: None,
+                group_open: None,
+                const_kw: None,
+                factory_kw: None,
+            });
+        }
         let members = open.members;
         let type_param_names = std::mem::take(&mut open.type_param_names).into_boxed_slice();
         let type_param_bounds = std::mem::take(&mut open.type_param_bounds).into_boxed_slice();
@@ -1846,6 +2020,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_faces: self.extension_faces.into_boxed_slice(),
             duplicates: self.duplicates.into_boxed_slice(),
             arity_violations: self.arity_violations.into_boxed_slice(),
+            augmentations: self.augmentations.into_boxed_slice(),
+            decl_kinds: self.decl_kinds.into_boxed_slice(),
             type_args: self.type_args,
         }
     }
@@ -1952,13 +2128,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         base_kw: Option<Token>,
         interface_kw: Option<Token>,
         final_kw: Option<Token>,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         mixin_kw: Option<Token>,
         name: Token,
     ) {
         let sealed = sealed_kw.is_some();
         let builder = &mut self.builder;
         let name = builder.capture_name(name);
+        builder.declaring_augment = augment_kw.is_some();
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
         if sealed {
             builder.mark_sealed();
@@ -1972,6 +2149,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             open.is_final = final_kw.is_some();
             open.is_mixin_class = mixin_kw.is_some();
         });
+        if let Some(kw) = augment_kw {
+            let span = builder.span_of(kw);
+            let modifiers = AugmentModifiers {
+                abstract_kw: abstract_kw.map(|t| builder.span_of(t)),
+                base_kw: base_kw.map(|t| builder.span_of(t)),
+                final_kw: final_kw.map(|t| builder.span_of(t)),
+                interface_kw: interface_kw.map(|t| builder.span_of(t)),
+                sealed_kw: sealed_kw.map(|t| builder.span_of(t)),
+                mixin_kw: mixin_kw.map(|t| builder.span_of(t)),
+            };
+            let (names, bounds) = {
+                let open = builder.containers.last().expect("just opened");
+                (open.type_param_names.clone(), open.type_param_bounds.clone())
+            };
+            let type_params = builder.zip_type_var_rows(&names, &bounds);
+            if let Some(open) = builder.containers.last_mut() {
+                open.augment_kw = Some(span);
+                open.augment_modifiers = modifiers;
+                open.augment_type_params = type_params;
+            }
+        }
     }
 
     fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
@@ -2007,12 +2205,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         base_kw: Option<Token>,
         interface_kw: Option<Token>,
         final_kw: Option<Token>,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         _mixin_kw: Option<Token>,
         name: Token,
     ) {
         let builder = &mut self.builder;
         let name = builder.capture_name(name);
+        builder.declaring_augment = augment_kw.is_some();
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
         if abstract_kw.is_some() {
             builder.mark_abstract();
@@ -2023,6 +2222,47 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             open.is_final = final_kw.is_some();
             open.sealed = sealed_kw.is_some();
         });
+        // A named mixin application is never a valid augmentation target:
+        // every `augment` of the name reports
+        // `augmentation_of_mixin_application_class` (the oracle's merge rule
+        // refuses the fragment chain, element_builder.dart:244-250).
+        if let Some((container, _)) = name {
+            // Introductory mixin applications only: an augment-spelled
+            // `augment class B = A with M;` must not register a target row
+            // (the merge rule reads the intro's mixin-application bit).
+            if !builder.declaring_augment {
+                builder.decl_kinds.push(AugTarget {
+                    container: None,
+                    name: container,
+                    kind: AugKind::Class,
+                    is_final: false,
+                    is_mixin_application: true,
+                    is_const: false,
+                    is_factory: false,
+                });
+            }
+        }
+        if let Some(kw) = augment_kw {
+            let span = builder.span_of(kw);
+            let modifiers = AugmentModifiers {
+                abstract_kw: abstract_kw.map(|t| builder.span_of(t)),
+                base_kw: base_kw.map(|t| builder.span_of(t)),
+                final_kw: final_kw.map(|t| builder.span_of(t)),
+                interface_kw: interface_kw.map(|t| builder.span_of(t)),
+                sealed_kw: sealed_kw.map(|t| builder.span_of(t)),
+                mixin_kw: None,
+            };
+            let (names, bounds) = {
+                let open = builder.containers.last().expect("just opened");
+                (open.type_param_names.clone(), open.type_param_bounds.clone())
+            };
+            let type_params = builder.zip_type_var_rows(&names, &bounds);
+            if let Some(open) = builder.containers.last_mut() {
+                open.augment_kw = Some(span);
+                open.augment_modifiers = modifiers;
+                open.augment_type_params = type_params;
+            }
+        }
     }
 
     fn end_named_mixin_application(
@@ -2044,13 +2284,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_mixin_declaration(
         &mut self,
         _begin: Token,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         base_kw: Option<Token>,
         mixin: Token,
         name: Token,
     ) {
         let builder = &mut self.builder;
         let name = builder.capture_name(name);
+        builder.declaring_augment = augment_kw.is_some();
         builder.open_container(ContainerKind::Mixin, name, MicroKind::Mixin);
         // `base` is the only legal mixin modifier, and the plain-`mixin`
         // dispatch consumes it in the walk lookahead without forwarding it
@@ -2067,6 +2308,23 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 .and_then(|previous| builder.tokens.get(previous as usize))
                 .is_some_and(|token| token.kind == TokenKind::Keyword(Keyword::Base));
         builder.mark_modifier(|open| open.is_base = wrote_base);
+        if let Some(kw) = augment_kw {
+            let span = builder.span_of(kw);
+            let base_span = base_kw.map(|t| builder.span_of(t));
+            let (names, bounds) = {
+                let open = builder.containers.last().expect("just opened");
+                (open.type_param_names.clone(), open.type_param_bounds.clone())
+            };
+            let type_params = builder.zip_type_var_rows(&names, &bounds);
+            if let Some(open) = builder.containers.last_mut() {
+                open.augment_kw = Some(span);
+                open.augment_modifiers = AugmentModifiers {
+                    base_kw: base_span,
+                    ..AugmentModifiers::default()
+                };
+                open.augment_type_params = type_params;
+            }
+        }
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {
@@ -2076,13 +2334,26 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_enum_declaration(
         &mut self,
         _begin: Token,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         _enum_keyword: Token,
         name: Token,
     ) {
         let builder = &mut self.builder;
         let name = builder.capture_name(name);
+        builder.declaring_augment = augment_kw.is_some();
         builder.open_container(ContainerKind::Enum, name, MicroKind::Enum);
+        if let Some(kw) = augment_kw {
+            let span = builder.span_of(kw);
+            let (names, bounds) = {
+                let open = builder.containers.last().expect("just opened");
+                (open.type_param_names.clone(), open.type_param_bounds.clone())
+            };
+            let type_params = builder.zip_type_var_rows(&names, &bounds);
+            if let Some(open) = builder.containers.last_mut() {
+                open.augment_kw = Some(span);
+                open.augment_type_params = type_params;
+            }
+        }
     }
 
     fn end_enum_declaration(
@@ -2111,13 +2382,26 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_extension_declaration(
         &mut self,
-        _augment: Option<Token>,
+        augment_kw: Option<Token>,
         _extension_keyword: Token,
         name: Option<Token>,
     ) {
         let builder = &mut self.builder;
         let name = name.and_then(|token| builder.capture_name(token));
+        builder.declaring_augment = augment_kw.is_some();
         builder.open_container(ContainerKind::Extension, name, MicroKind::Extension);
+        if let Some(kw) = augment_kw {
+            let span = builder.span_of(kw);
+            let (names, bounds) = {
+                let open = builder.containers.last().expect("just opened");
+                (open.type_param_names.clone(), open.type_param_bounds.clone())
+            };
+            let type_params = builder.zip_type_var_rows(&names, &bounds);
+            if let Some(open) = builder.containers.last_mut() {
+                open.augment_kw = Some(span);
+                open.augment_type_params = type_params;
+            }
+        }
     }
 
     fn end_extension_declaration(
@@ -2132,13 +2416,26 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_extension_type_declaration(
         &mut self,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         _extension_keyword: Token,
         name: Token,
     ) {
         let builder = &mut self.builder;
         let name = builder.capture_name(name);
+        builder.declaring_augment = augment_kw.is_some();
         builder.open_container(ContainerKind::ExtensionType, name, MicroKind::Extension);
+        if let Some(kw) = augment_kw {
+            let span = builder.span_of(kw);
+            let (names, bounds) = {
+                let open = builder.containers.last().expect("just opened");
+                (open.type_param_names.clone(), open.type_param_bounds.clone())
+            };
+            let type_params = builder.zip_type_var_rows(&names, &bounds);
+            if let Some(open) = builder.containers.last_mut() {
+                open.augment_kw = Some(span);
+                open.augment_type_params = type_params;
+            }
+        }
     }
 
     fn end_extension_type_declaration(
@@ -2152,11 +2449,19 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         self.builder.close_container();
     }
 
-    fn handle_class_extends(&mut self, _extends: Option<Token>, _count: usize) {
+    fn handle_class_extends(&mut self, extends: Option<Token>, _count: usize) {
         // The supertype's type events fired before this event (official
         // `parseClassExtendsSeenExtendsClause`), so the buffered header
         // reference — present only with `extends` — is the edge.
         self.builder.commit_super_candidate();
+        // The augmentation face's extends-presence capture: the keyword's
+        // span rides the open container only when it is an augmentation.
+        let extends_span = extends.map(|kw| self.builder.span_of(kw));
+        if let (Some(span), Some(open)) = (extends_span, self.builder.containers.last_mut())
+            && open.augment_kw.is_some()
+        {
+            open.augment_extends = Some(span);
+        }
     }
 
     fn handle_named_mixin_application_with_clause(&mut self, with: Token) {
@@ -2261,10 +2566,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     },
                     None => name.range,
                 };
+                builder.armed_ty_range = Some(range);
                 builder.complete_type_site(spelling, question.is_some(), range)
             })
         };
         builder.armed_ty = if in_default {
+            builder.armed_ty_range = None;
             None
         } else {
             spelling.map(|spelling| match builder.strings.resolve(spelling) {
@@ -2293,6 +2600,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn handle_no_type(&mut self, _last_consumed: Token) {
         let builder = &mut self.builder;
         builder.armed_ty = None;
+        builder.armed_ty_range = None;
         builder.armed_tree = None;
     }
 
@@ -2310,12 +2618,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.armed_tree = None;
         }
         builder.armed_ty = (!in_default).then_some(Ty::Void);
+        builder.armed_ty_range = (!in_default).then_some(token.range);
     }
 
     fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
         let builder = &mut self.builder;
         builder.armed_tree = None;
-        builder.armed_ty = (builder.formal_default_depth == 0).then_some(Ty::Void);
+        let in_default = builder.formal_default_depth > 0;
+        builder.armed_ty = (!in_default).then_some(Ty::Void);
+        builder.armed_ty_range = (!in_default).then_some(builder.span_of(_token));
     }
 
     fn begin_formal_parameter_default_value_expression(&mut self, _token: Token) {
@@ -2525,9 +2836,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // The return type parsed between the begin event and the
                 // name; the armed type is it.
                 let armed = builder.take_armed();
+                let armed_range = builder.armed_ty_range.take();
                 if let Some(pending) = &mut builder.pending_top {
                     pending.name = name_with_range;
                     pending.return_ty = armed;
+                }
+                if let Some(pending) = &mut builder.pending_aug {
+                    pending.return_ty = (armed != Ty::UNKNOWN).then_some(armed);
+                    pending.return_ty_range = armed_range;
                 }
             }
             IdentifierContext::MethodDeclaration => {
@@ -2535,8 +2851,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // name; the armed type is it. Operators never re-fire
                 // their name here — their return types stay unknown.
                 let armed = builder.take_armed();
+                let armed_range = builder.armed_ty_range.take();
                 if let Some(pending) = &mut builder.pending_member {
                     pending.return_ty = armed;
+                }
+                if let Some(pending) = &mut builder.pending_aug {
+                    pending.return_ty = (armed != Ty::UNKNOWN).then_some(armed);
+                    pending.return_ty_range = armed_range;
                 }
                 // A factory declaration's name is a constructor shape:
                 // matching the container it is the unnamed face
@@ -2619,6 +2940,46 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 builder.const_creations.insert(name, face);
                             }
                         }
+                        // The target-kind row every INTRODUCTORY top-level
+                        // variable contributes: the induced-setter face
+                        // reads the finality (`final` induces no setter).
+                        // An `augment` group chains through its own
+                        // AugmentDecl row — it is never a target.
+                        if !builder.declaring_augment {
+                            builder.decl_kinds.push(AugTarget {
+                                container: None,
+                                name,
+                                kind: AugKind::TopLevelVar,
+                                is_final,
+                                is_mixin_application: false,
+                                is_const: false,
+                                is_factory: false,
+                            });
+                        }
+                        if let Some(augment_kw) = builder.field_augment {
+                            let group_ty = builder.field_group_ty();
+                            builder.augmentations.push(AugmentDecl {
+                                kind: AugKind::TopLevelVar,
+                                name,
+                                display_name: name,
+                                name_range: range,
+                                augment_kw,
+                                container: None,
+                                is_static: false,
+                                is_final: builder.field_final,
+                                modifiers: AugmentModifiers::default(),
+                                extends_kw: None,
+                                type_params: Box::new([]),
+                                type_params_close: None,
+                                return_ty: (group_ty != Ty::UNKNOWN).then_some(group_ty),
+                                return_ty_range: builder.field_group_ty_range,
+                                formals: Box::new([]),
+                                parens: None,
+                                group_open: None,
+                                const_kw: None,
+                                factory_kw: None,
+                            });
+                        }
                         builder.declare_top(
                             name,
                             range,
@@ -2635,7 +2996,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         // The group's latched star rides every group member
                         // (`@meta int a, b;` annotates both).
                         let annotations = builder.field_annotations.clone().into_boxed_slice();
-                        match open.members.entry(name) {
+                        let augmenting = builder.field_augment;
+                        let duplicate = match open.members.entry(name) {
                             Entry::Vacant(slot) => {
                                 slot.insert(MemberEntry {
                                     kind: MemberKind::Field,
@@ -2652,16 +3014,44 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     annotations,
                                     name_range: range,
                                 });
+                                false
                             }
                             // Same-bit collision: the second field is a
                             // duplicate. Keep-first; a cross-bit coexistence
                             // is `conflicting_static_and_instance`'s
-                            // business, not a duplicate.
+                            // business, not a duplicate. An `augment` group
+                            // never duplicates: augmenting an existing field
+                            // is the augmentation face's business.
                             Entry::Occupied(existing) => {
-                                if existing.is_static == is_static {
-                                    builder.record_duplicate(name, range);
-                                }
+                                existing.is_static == is_static && augmenting.is_none()
                             }
+                        };
+                        let container = open.name.map(|(n, _)| n);
+                        if duplicate {
+                            builder.record_duplicate(name, range);
+                        }
+                        if let Some(augment_kw) = augmenting {
+                            builder.augmentations.push(AugmentDecl {
+                                kind: AugKind::Field,
+                                name,
+                                display_name: name,
+                                name_range: range,
+                                augment_kw,
+                                container,
+                                is_static,
+                                is_final: builder.field_final,
+                                modifiers: AugmentModifiers::default(),
+                                extends_kw: None,
+                                type_params: Box::new([]),
+                                type_params_close: None,
+                                return_ty: (ty != Ty::UNKNOWN).then_some(ty),
+                                return_ty_range: builder.field_group_ty_range,
+                                formals: Box::new([]),
+                                parens: None,
+                                group_open: None,
+                                const_kw: None,
+                                factory_kw: None,
+                            });
                         }
                     }
                 }
@@ -2743,6 +3133,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         }
         builder.type_var_group.clear();
         builder.type_var_bounds.clear();
+        builder.type_var_ranges.clear();
+        builder.type_var_bound_ranges.clear();
+        builder.type_group_close = None;
         if let Some(site) = builder.capture.as_mut() {
             site.type_variables_begin();
         }
@@ -2761,6 +3154,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // The bound latches at the variable's `end_type_variable`;
                 // until then the slot carries the unbounded reading.
                 builder.type_var_bounds.push(Ty::Dynamic);
+                builder.type_var_ranges.push(range);
+                builder.type_var_bound_ranges.push(None);
             }
             builder
                 .decls
@@ -2805,15 +3200,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if at < builder.type_var_bounds.len() {
             builder.type_var_bounds[at] = builder.take_armed();
         }
+        if at < builder.type_var_bound_ranges.len() {
+            builder.type_var_bound_ranges[at] = builder.armed_ty_range.take();
+        }
     }
 
-    fn end_type_variables(&mut self, _begin: Token, _end: Token) {
+    fn end_type_variables(&mut self, _begin: Token, end: Token) {
         let builder = &mut self.builder;
-        if builder.type_group_depth == 1 && !builder.attach_type_param_count() {
-            // A container header: the count carries into the container's
-            // `begin_*_declaration` open (official order — the type
-            // variables parse before `beginClassDeclaration`).
-            builder.header_type_params = builder.type_param_count;
+        if builder.type_group_depth == 1 {
+            builder.type_group_close = Some(builder.span_of(end));
+            if !builder.attach_type_param_count() {
+                // A container header: the count carries into the container's
+                // `begin_*_declaration` open (official order — the type
+                // variables parse before `beginClassDeclaration`).
+                builder.header_type_params = builder.type_param_count;
+            }
         }
         // The group's spellings in declaration order — the use-site
         // substitution face zips the written arguments against them. The
@@ -2834,7 +3235,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_fields(
         &mut self,
         _kind: DeclarationKind,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         abstract_kw: Option<Token>,
         external_kw: Option<Token>,
         static_kw: Option<Token>,
@@ -2862,6 +3263,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             && _var_final_or_const
                 .and_then(|t| builder.tokens.get(t.id as usize))
                 .is_some_and(|tok| &builder.source[tok.byte_range()] == "const");
+        builder.field_augment = augment_kw.map(|t| builder.span_of(t));
+        builder.declaring_augment = augment_kw.is_some();
     }
 
     fn end_fields(
@@ -2881,11 +3284,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut self.builder;
         builder.field_static = None;
         builder.field_group_ty = None;
+        builder.field_group_ty_range = None;
         builder.armed_ty = None;
         builder.armed_tree = None;
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_augment = None;
+        builder.declaring_augment = false;
         builder.top_const_group = false;
         // The group closed: its star latch clears with it, and anything a
         // closure initializer buffered (local-declaration metadata) binds
@@ -2910,11 +3316,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut self.builder;
         builder.field_static = None;
         builder.field_group_ty = None;
+        builder.field_group_ty_range = None;
         builder.armed_ty = None;
         builder.armed_tree = None;
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_augment = None;
+        builder.declaring_augment = false;
         builder.top_const_group = false;
         builder.field_annotations.clear();
         builder.drop_pending_annotations();
@@ -2924,7 +3333,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_method(
         &mut self,
         _kind: DeclarationKind,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         external_kw: Option<Token>,
         static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
@@ -2953,6 +3362,40 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             formals: None,
             annotations,
         });
+        builder.declaring_augment = augment_kw.is_some();
+        if let (Some(kw), Some((spelling, range))) = (augment_kw, shape.map(|(s, _, r)| (s, r))) {
+            let accessor = get_or_set.and_then(|t| builder.name_of(t));
+            let kind = match accessor
+                .map(|id| builder.strings.resolve(id))
+                .unwrap_or("")
+            {
+                "get" => AugKind::Getter,
+                "set" => AugKind::Setter,
+                _ => AugKind::Method,
+            };
+            let spelling_text = builder.strings.resolve(spelling);
+            let display_name = builder
+                .strings
+                .intern(spelling_text.strip_suffix('=').unwrap_or(spelling_text));
+            builder.pending_aug = Some(PendingAug {
+                kind,
+                name: spelling,
+                display_name,
+                name_range: range,
+                augment_kw: builder.span_of(kw),
+                container: builder.containers.last().and_then(|open| open.name).map(|(n, _)| n),
+                is_static: static_kw.is_some(),
+                type_params: Vec::new(),
+                type_params_close: None,
+                return_ty: None,
+                return_ty_range: None,
+                formals: Vec::new(),
+                parens: None,
+                group_open: None,
+                const_kw: None,
+                factory_kw: None,
+            });
+        }
         builder.executable_header_done = false;
     }
 
@@ -2983,6 +3426,50 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
     ) {
         let builder = &mut self.builder;
+        // The augment capture drains before the pending member: its
+        // type-parameter rows pair the executable's own group (already taken
+        // into the pending member/top by the count attach) with the parallel
+        // range buffers, which survive until here.
+        if let Some(mut pending) = builder.pending_aug.take() {
+            let (names, bounds) = builder
+                .pending_member
+                .as_ref()
+                .map(|m| (m.type_param_names.clone(), m.type_param_bounds.clone()))
+                .or_else(|| {
+                    builder
+                        .pending_top
+                        .as_ref()
+                        .map(|t| (t.type_param_names.clone(), Vec::new()))
+                })
+                .unwrap_or_default();
+            pending.type_params = builder.zip_type_var_rows(&names, &bounds);
+            pending.type_params_close = builder.type_group_close;
+            if pending.return_ty == Some(Ty::UNKNOWN) {
+                pending.return_ty = None;
+                pending.return_ty_range = None;
+            }
+            builder.augmentations.push(AugmentDecl {
+                kind: pending.kind,
+                name: pending.name,
+                display_name: pending.display_name,
+                name_range: pending.name_range,
+                augment_kw: pending.augment_kw,
+                container: pending.container,
+                is_static: pending.is_static,
+                is_final: false,
+                modifiers: AugmentModifiers::default(),
+                extends_kw: None,
+                type_params: pending.type_params.into_boxed_slice(),
+                type_params_close: pending.type_params_close,
+                return_ty: pending.return_ty,
+                return_ty_range: pending.return_ty_range,
+                formals: pending.formals.into_boxed_slice(),
+                parens: pending.parens,
+                group_open: pending.group_open,
+                const_kw: None,
+                factory_kw: None,
+            });
+        }
         if let Some(pending) = builder.pending_member.take()
             && let Some((name, kind, range)) = pending.shape
         {
@@ -3029,7 +3516,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             && existing.kind == MemberKind::Method
                             && entry.kind == MemberKind::Method
                             && arity(existing) != arity(&entry);
-                        if existing.is_static == pending.is_static && !is_minus_split {
+                        if existing.is_static == pending.is_static
+                            && !is_minus_split
+                            && !builder.declaring_augment
+                        {
                             builder.record_duplicate(name, range);
                         }
                     }
@@ -3039,13 +3529,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // Anything buffered inside the body (local-declaration metadata)
         // binds to no member — drop it with the executable.
         builder.drop_pending_annotations();
+        builder.declaring_augment = false;
         builder.executable_header_done = false;
     }
 
     fn begin_top_level_method(
         &mut self,
         _last_consumed: Token,
-        _augment: Option<Token>,
+        augment: Option<Token>,
         _external: Option<Token>,
     ) {
         let builder = &mut self.builder;
@@ -3057,6 +3548,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             return_ty: Ty::UNKNOWN,
             formals: None,
         });
+        builder.declaring_augment = augment.is_some();
+        if let Some(kw) = augment {
+            builder.pending_aug = Some(PendingAug {
+                kind: AugKind::Function,
+                name: builder.strings.intern(""),
+                display_name: builder.strings.intern(""),
+                name_range: SourceRange { offset: 0, length: 0 },
+                augment_kw: builder.span_of(kw),
+                container: None,
+                is_static: false,
+                type_params: Vec::new(),
+                type_params_close: None,
+                return_ty: None,
+                return_ty_range: None,
+                formals: Vec::new(),
+                parens: None,
+                group_open: None,
+                const_kw: None,
+                factory_kw: None,
+            });
+        }
         builder.executable_header_done = false;
     }
 
@@ -3096,6 +3608,73 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 MemberKind::Method
             };
             builder.drain_arity(spelling, kind, range, pending.formals.as_deref());
+            // The intro-kind row every INTRODUCTORY top-level executable
+            // contributes (the augmentation target lookup resolves the
+            // exact accessor face through it); an augment chains through
+            // its AugmentDecl row instead.
+            let aug_kind = if setter {
+                AugKind::Setter
+            } else if get_or_set.is_some() {
+                AugKind::Getter
+            } else {
+                AugKind::Function
+            };
+            if !builder.declaring_augment {
+                builder.decl_kinds.push(AugTarget {
+                    container: None,
+                    name: spelling,
+                    kind: aug_kind,
+                    is_final: false,
+                    is_mixin_application: false,
+                    is_const: false,
+                    is_factory: false,
+                });
+            }
+            if let Some(mut augment) = builder.pending_aug.take() {
+                let names = builder
+                    .pending_top
+                    .as_ref()
+                    .map(|t| t.type_param_names.clone())
+                    .unwrap_or_default();
+                augment.type_params = builder.zip_type_var_rows(&names, &[]);
+                augment.type_params_close = builder.type_group_close;
+                augment.name = spelling;
+                let spelling_text = builder.strings.resolve(spelling);
+                augment.display_name = builder
+                    .strings
+                    .intern(spelling_text.strip_suffix('=').unwrap_or(spelling_text));
+                augment.name_range = range;
+                augment.kind = aug_kind;
+                let unknown = augment.return_ty == Some(Ty::UNKNOWN);
+                if unknown {
+                    // No accessor keyword face here: an omitted return type
+                    // stays `None` (the mismatch check compares explicit
+                    // spellings only).
+                    augment.return_ty = None;
+                    augment.return_ty_range = None;
+                }
+                builder.augmentations.push(AugmentDecl {
+                    kind: augment.kind,
+                    name: augment.name,
+                    display_name: augment.display_name,
+                    name_range: augment.name_range,
+                    augment_kw: augment.augment_kw,
+                    container: None,
+                    is_static: false,
+                    is_final: false,
+                    modifiers: AugmentModifiers::default(),
+                    extends_kw: None,
+                    type_params: augment.type_params.into_boxed_slice(),
+                    type_params_close: augment.type_params_close,
+                    return_ty: augment.return_ty,
+                    return_ty_range: augment.return_ty_range,
+                    formals: augment.formals.into_boxed_slice(),
+                    parens: augment.parens,
+                    group_open: augment.group_open,
+                    const_kw: None,
+                    factory_kw: None,
+                });
+            }
             builder.declare_top(
                 spelling,
                 range,
@@ -3109,6 +3688,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 },
             );
         }
+        builder.declaring_augment = false;
         builder.executable_header_done = false;
     }
 
@@ -3138,16 +3718,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         &mut self,
         _kind: DeclarationKind,
         _last_consumed: Token,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         _external_kw: Option<Token>,
-        _const_keyword: Option<Token>,
+        const_keyword: Option<Token>,
     ) {
         let builder = &mut self.builder;
         builder.drop_pending_annotations();
+        let factory_is_const = const_keyword.is_some();
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
-            open.ctor_const |= _const_keyword.is_some();
+            open.ctor_const |= factory_is_const;
         }
+        builder.pending_ctor_const = Some(factory_is_const);
         // The factory's own parameter group joins the constructor formal
         // table under the same lookup spelling a body constructor uses
         // (the class name — the unnamed face's key — rewritten to the
@@ -3162,6 +3744,36 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         }
         builder.factory_ctor_open = true;
         builder.factory_ctor_head = None;
+        let factory_kw = builder
+            .tokens
+            .get(_last_consumed.id as usize)
+            .filter(|t| &builder.source[t.byte_range()] == "factory")
+            // The ASCII literal matched above: byte length == UTF-16 length.
+            .map(|t| SourceRange { offset: t.utf16_offset, length: t.byte_len });
+        builder.declaring_augment = augment_kw.is_some();
+        if let Some(kw) = augment_kw
+            && let Some(open) = builder.containers.last()
+            && let Some((container, _)) = open.name
+        {
+            builder.pending_aug = Some(PendingAug {
+                kind: AugKind::Constructor,
+                name: container,
+                display_name: container,
+                name_range: open.name.map_or(SourceRange { offset: 0, length: 0 }, |(_, r)| r),
+                augment_kw: builder.span_of(kw),
+                container: Some(container),
+                is_static: false,
+                type_params: Vec::new(),
+                type_params_close: None,
+                return_ty: None,
+                return_ty_range: None,
+                formals: Vec::new(),
+                parens: None,
+                group_open: None,
+                const_kw: const_keyword.map(|t| builder.span_of(t)),
+                factory_kw,
+            });
+        }
     }
 
     fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
@@ -3173,6 +3785,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             named: Vec::new(),
             has_unnamed: true,
         }));
+        let mut capture_named: Vec<StringId> = Vec::new();
+        let mut capture_unnamed = false;
         if let Some(capture) = capture
             && let Some(open) = builder.containers.last_mut()
         {
@@ -3191,13 +3805,73 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     *key = head;
                 }
             }
-            for name in named {
-                if !open.ctor_named.contains(&name) {
-                    open.ctor_named.push(name);
+            capture_unnamed = capture.has_unnamed;
+            for name in &named {
+                if !open.ctor_named.contains(name) {
+                    open.ctor_named.push(*name);
                 }
             }
-            open.ctor_has_unnamed |= capture.has_unnamed;
+            capture_named = named;
+            open.ctor_has_unnamed |= capture_unnamed;
         }
+        // The factory's target-kind rows: `factory` faces the augment
+        // modifier check against the per-selector row. Introductory faces
+        // only — an augment chains through its AugmentDecl row.
+        let factory_const = builder.pending_ctor_const.take().unwrap_or(false);
+        if !builder.declaring_augment
+            && let Some((container, _)) = builder.containers.last().and_then(|open| open.name)
+        {
+            let push = |builder: &mut Builder, name: StringId| {
+                builder.decl_kinds.push(AugTarget {
+                    container: Some(container),
+                    name,
+                    kind: AugKind::Constructor,
+                    is_final: false,
+                    is_mixin_application: false,
+                    is_const: factory_const,
+                    is_factory: true,
+                });
+            };
+            if capture_named.is_empty() {
+                push(builder, container);
+            }
+            for selector in &capture_named {
+                push(builder, *selector);
+            }
+        }
+        let augment_selector = if capture_named.is_empty() {
+            builder.containers.last().and_then(|open| open.name).map(|(n, _)| n)
+        } else {
+            capture_named.first().copied()
+        };
+        if let Some(mut augment) = builder.pending_aug.take() {
+            if let Some(selector) = augment_selector {
+                augment.name = selector;
+                augment.display_name = selector;
+            }
+            builder.augmentations.push(AugmentDecl {
+                kind: AugKind::Constructor,
+                name: augment.name,
+                display_name: augment.display_name,
+                name_range: augment.name_range,
+                augment_kw: augment.augment_kw,
+                container: augment.container,
+                is_static: false,
+                is_final: false,
+                modifiers: AugmentModifiers::default(),
+                extends_kw: None,
+                type_params: Box::new([]),
+                type_params_close: None,
+                return_ty: None,
+                return_ty_range: None,
+                formals: augment.formals.into_boxed_slice(),
+                parens: augment.parens,
+                group_open: augment.group_open,
+                const_kw: augment.const_kw,
+                factory_kw: augment.factory_kw,
+            });
+        }
+        builder.declaring_augment = false;
         // The captured formal table joins the container's FACTORY formals
         // (the separate lane: the plain ctor table's other consumers —
         // the closure-formal solver's substitution chains especially —
@@ -3216,11 +3890,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_constructor(
         &mut self,
         _kind: DeclarationKind,
-        _augment_kw: Option<Token>,
+        augment_kw: Option<Token>,
         _external_kw: Option<Token>,
         _static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
-        _var_final_or_const: Option<Token>,
+        var_final_or_const: Option<Token>,
         _get_or_set: Option<Token>,
         new_kw: Option<Token>,
         _name: Token,
@@ -3289,12 +3963,37 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         };
         // Every declared constructor kills the close's "none at all" fold —
         // including a mismatched-name factory registering no selector.
-        let is_const = _var_final_or_const
+        let is_const = var_final_or_const
             .and_then(|token| builder.tokens.get(token.id as usize))
             .is_some_and(|t| &builder.source[t.byte_range()] == "const");
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
             open.ctor_const |= is_const;
+        }
+        builder.pending_ctor_const = Some(is_const);
+        builder.declaring_augment = augment_kw.is_some();
+        if let Some(kw) = augment_kw
+            && let Some(open) = builder.containers.last()
+            && let Some((container, _)) = open.name
+        {
+            builder.pending_aug = Some(PendingAug {
+                kind: AugKind::Constructor,
+                name: container,
+                display_name: container,
+                name_range: open.name.map_or(SourceRange { offset: 0, length: 0 }, |(_, r)| r),
+                augment_kw: builder.span_of(kw),
+                container: Some(container),
+                is_static: false,
+                type_params: Vec::new(),
+                type_params_close: None,
+                return_ty: None,
+                return_ty_range: None,
+                formals: Vec::new(),
+                parens: None,
+                group_open: None,
+                const_kw: is_const.then(|| builder.span_of(var_final_or_const.expect("is_const"))),
+                factory_kw: None,
+            });
         }
     }
 
@@ -3308,21 +4007,84 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
     ) {
         let builder = &mut self.builder;
+        let mut ctor_selectors: Vec<StringId> = Vec::new();
+        let mut ctor_unnamed = false;
+        let mut ctor_const = false;
         if let Some(capture) = builder.ctor_open.take()
             && let Some(open) = builder.containers.last_mut()
         {
-            for name in capture.named {
-                if !open.ctor_named.contains(&name) {
-                    open.ctor_named.push(name);
+            ctor_const = builder.pending_ctor_const.take().unwrap_or(false);
+            ctor_unnamed = capture.has_unnamed;
+            for name in &capture.named {
+                if !open.ctor_named.contains(name) {
+                    open.ctor_named.push(*name);
                 }
             }
+            ctor_selectors = capture.named;
             // The unnamed face stands when ANY declared constructor is
             // unnamed (`E(); E.named();` keeps `E()`); a named-only
             // declaration drops it. The no-declared-constructor case folds
             // into the close (`ctor_named` stays empty there), which reads
             // the implicit default.
-            open.ctor_has_unnamed |= capture.has_unnamed;
+            open.ctor_has_unnamed |= ctor_unnamed;
         }
+        // The constructor's target-kind rows: the per-selector const/factory
+        // faces the augment modifier check compares against. Introductory
+        // faces only — an augment chains through its AugmentDecl row.
+        if !builder.declaring_augment
+            && let Some((container, _)) = builder.containers.last().and_then(|open| open.name)
+        {
+            let push = |builder: &mut Builder, name: StringId| {
+                builder.decl_kinds.push(AugTarget {
+                    container: Some(container),
+                    name,
+                    kind: AugKind::Constructor,
+                    is_final: false,
+                    is_mixin_application: false,
+                    is_const: ctor_const,
+                    is_factory: false,
+                });
+            };
+            if ctor_selectors.is_empty() && ctor_unnamed {
+                push(builder, container);
+            }
+            for selector in &ctor_selectors {
+                push(builder, *selector);
+            }
+        }
+        let augment_selector = if ctor_selectors.is_empty() {
+            builder.containers.last().and_then(|open| open.name).map(|(n, _)| n)
+        } else {
+            ctor_selectors.first().copied()
+        };
+        if let Some(mut augment) = builder.pending_aug.take() {
+            if let Some(selector) = augment_selector {
+                augment.name = selector;
+                augment.display_name = selector;
+            }
+            builder.augmentations.push(AugmentDecl {
+                kind: AugKind::Constructor,
+                name: augment.name,
+                display_name: augment.display_name,
+                name_range: augment.name_range,
+                augment_kw: augment.augment_kw,
+                container: augment.container,
+                is_static: false,
+                is_final: false,
+                modifiers: AugmentModifiers::default(),
+                extends_kw: None,
+                type_params: Box::new([]),
+                type_params_close: None,
+                return_ty: None,
+                return_ty_range: None,
+                formals: augment.formals.into_boxed_slice(),
+                parens: augment.parens,
+                group_open: augment.group_open,
+                const_kw: augment.const_kw,
+                factory_kw: augment.factory_kw,
+            });
+        }
+        builder.declaring_augment = false;
         // The captured formal table joins the container's constructor
         // formals under its lookup spelling (a redirecting or body-less
         // shape with no group simply carries nothing).
@@ -3392,6 +4154,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
     ) {
         let builder = &mut self.builder;
+        // A type alias can never be augmented: the parser reports the shape
+        // outright (`parser_impl.dart:1453` reports `typedefAugmentation` at
+        // the `augment` keyword) and recovers into the plain alias — no
+        // augmentation capture joins the verifier's chain.
         if let Some(pending) = builder.pending_typedef.take()
             && let Some((name, range)) = pending.name
         {
@@ -3410,6 +4176,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 Some(_) => builder.take_armed(),
                 None => Ty::UNKNOWN,
             };
+            builder.decl_kinds.push(AugTarget {
+                container: None,
+                name,
+                kind: AugKind::TypeAlias,
+                is_final: false,
+                is_mixin_application: false,
+                is_const: false,
+                is_factory: false,
+            });
             builder.declare_top(
                 name,
                 range,
@@ -3453,6 +4228,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             && site.top_is_function()
         {
             site.function_formals_begin();
+        }
+        // The augment capture's `(` anchor (the executable's own group only).
+        if builder.formal_depth == 0 {
+            let open_span = builder.span_of(_token);
+            if let Some(pending) = &mut builder.pending_aug {
+                pending.parens = Some((open_span, SourceRange { offset: 0, length: 0 }));
+            }
         }
         // Every depth-0 group opens a fresh formal list. Sibling top-level
         // `Function({…})` type literals — a generated table of `const …
@@ -3507,14 +4289,36 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.formal_depth += 1;
     }
 
+    fn begin_optional_formal_parameters(&mut self, token: Token) {
+        let builder = &mut self.builder;
+        // The augment capture's group delimiter (`[` or `{`): the count
+        // rows anchor there before falling back to a parameter or the `)`
+        // (the oracle's `formalParameterList.leftDelimiter`).
+        if builder.formal_depth == 1 {
+            let group_span = builder.span_of(token);
+            if let Some(pending) = &mut builder.pending_aug {
+                pending.group_open = Some(group_span);
+            }
+        }
+    }
+
     fn end_formal_parameters(
         &mut self,
         _count: usize,
         _begin: Token,
-        _end: Token,
+        end: Token,
         kind: ParserMemberKind,
     ) {
         let builder = &mut self.builder;
+        // The augment capture's `)` anchor closes with the group.
+        if builder.formal_depth == 1 {
+            let close_span = builder.span_of(end);
+            if let Some(pending) = &mut builder.pending_aug
+                && let Some((left, _)) = pending.parens
+            {
+                pending.parens = Some((left, close_span));
+            }
+        }
         builder.formal_depth -= 1;
         // Symmetric with the begin guard: a depth-0 function-type group
         // leaves the executable's formals slot untouched for the real
@@ -3527,6 +4331,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn handle_no_formal_parameters(&mut self, _token: Token, _kind: ParserMemberKind) {
         let builder = &mut self.builder;
         builder.executable_header_done = true;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_formal_parameter(
+        &mut self,
+        token: Token,
+        _kind: ParserMemberKind,
+        required: Option<Token>,
+        covariant_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+    ) {
+        let builder = &mut self.builder;
+        // Only the executable's own group feeds the augment capture (a
+        // function-type shape's nested list is the shape's columns).
+        if builder.formal_depth == 1 && builder.pending_aug.is_some() {
+            builder.aug_formal_start = Some((
+                builder.span_of(token),
+                covariant_kw.map(|t| builder.span_of(t)),
+                required.map(|t| builder.span_of(t)),
+            ));
+        }
     }
 
     fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
@@ -3586,6 +4411,37 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             return;
         };
         let ty = builder.take_armed();
+        // The augment capture's own formal row: the written type pair and
+        // the modifier spans the parameter checks compare.
+        if let (Some(pending), Some((start, covariant_kw, required_kw))) =
+            (builder.pending_aug.as_mut(), builder.aug_formal_start.take())
+        {
+            let explicit_ty = (ty != Ty::UNKNOWN && ty != Ty::Never)
+                .then_some(ty)
+                .zip(builder.armed_ty_range.take());
+            let (required_positional, optional_positional, named) = match kind {
+                FormalParameterKind::RequiredPositional => (true, false, false),
+                FormalParameterKind::OptionalPositional => (false, true, false),
+                FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed => {
+                    (false, false, true)
+                }
+            };
+            pending.formals.push(AugmentFormal {
+                name: Some(name),
+                name_range: range,
+                full_range: SourceRange {
+                    offset: start.offset,
+                    length: range.end().saturating_sub(start.offset),
+                },
+                ty: explicit_ty.map(|(ty, _)| ty),
+                ty_range: explicit_ty.map(|(_, range)| range),
+                required_positional,
+                optional_positional,
+                named,
+                covariant_kw,
+                required_kw,
+            });
+        }
         let required = matches!(
             kind,
             FormalParameterKind::RequiredPositional | FormalParameterKind::RequiredNamed

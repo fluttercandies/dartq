@@ -395,10 +395,38 @@ impl<'a> Engine<'a> {
                 recv_span = popped.range;
                 was_local = self.local_hits.contains_key(&recv_span.offset);
                 // The dead-chain candidate: a null-aware operator over a
-                // local's nullable read (`c1?.g()`, `c1?..g()`).
-                if is_null_aware && was_local && Self::is_nullable_ty(receiver_ty) {
-                    self.dead_null_chains
-                        .push((op_range.offset, chain_end, recv_span));
+                // local's nullable read (`c1?.g()`, `c1?..g()`). A merge
+                // INSIDE a latched chain's extent (`c1?.a.b`'s `.b`) is the
+                // upstream parent climb, not a new chain — the row stays
+                // anchored at the first operator and extends to the outer
+                // access's end (dead_code_verifier.dart:560-566).
+                // The chain face ends exactly where the next selector
+                // begins, so the boundary case (`<=`) is the chain's own
+                // continuation — a selector further right starts a
+                // different access and must not touch the row. A
+                // continuation (plain or aware, latched) climbs the parent
+                // chain unconditionally (the official walk answers on the
+                // chain, not the selector's own receiver); a NEW chain
+                // still needs the unassigned-nullable local root.
+                let inside_chain = self
+                    .dead_null_chains
+                    .iter()
+                    .any(|(op, end, _)| *op <= op_range.offset && op_range.offset <= *end);
+                let rooted = is_null_aware && was_local && Self::is_nullable_ty(receiver_ty);
+                if inside_chain || rooted {
+                    match self
+                        .dead_null_chains
+                        .iter_mut()
+                        .find(|(op, end, _)| *op <= op_range.offset && op_range.offset <= *end)
+                    {
+                        Some((_, end, _)) => *end = (*end).max(chain_end),
+                        None => {
+                            if rooted {
+                                self.dead_null_chains
+                                    .push((op_range.offset, chain_end, recv_span));
+                            }
+                        }
+                    }
                 }
                 // The receiver's read counts for the local it resolved to
                 // (`v.m` reads `v`): the member row inherits the hit. The

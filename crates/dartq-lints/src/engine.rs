@@ -865,6 +865,13 @@ fn collapse_duplicate_rows(out: &mut Vec<Lint>) {
 ///
 /// Bounded: one pass over the citations plus one pass over the suppression
 /// record into two hash sets — linear in citations + suppressed hits.
+///
+/// The file-scope face's problem template — `messages.yaml`
+/// `unnecessaryIgnoreFile` (the second code of the `unnecessaryIgnore`
+/// shared name; the generated meta table holds the line-scope code only).
+const PROBLEM_IN_FILE: &str =
+    "The diagnostic '{0}' isn't produced in this file so it doesn't need to be ignored.";
+
 #[expect(
     clippy::implicit_hasher,
     reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
@@ -955,7 +962,18 @@ fn unnecessary_ignore_rows(
         out.push(Lint {
             rule,
             range: entry.offset..entry.offset + entry.length,
-            message: crate::registry::render(spec.problem, &[&entry.name]),
+            // The two official templates of the shared name: the meta
+            // table carries the line-scope one (`unnecessaryIgnore`,
+            // messages.yaml:15138); a file-scope citation reports the
+            // `unnecessaryIgnoreFile` wording (messages.yaml:15174).
+            message: crate::registry::render(
+                if entry.scope.is_none() {
+                    PROBLEM_IN_FILE
+                } else {
+                    spec.problem
+                },
+                &[&entry.name],
+            ),
             correction: (!spec.correction.is_empty())
                 .then(|| crate::registry::render(spec.correction, &[&entry.name])),
         });
@@ -1959,6 +1977,35 @@ mod tests {
         // The name token: `// ignore: ` is 11 chars, the name 21.
         assert_eq!(rows[0].range, 11..32);
         assert!(rows[0].message.contains("unused_local_variable"));
+    }
+
+    /// The two official templates of the shared name: a line-scope
+    /// citation reports the `unnecessaryIgnore` wording, a file-scope
+    /// (`ignore_for_file:`) one the `unnecessaryIgnoreFile` wording
+    /// (`messages.yaml`:15138/:15174) — the #2116 analyzer half's
+    /// `UnnecessaryIgnoreTest/test_file` face.
+    #[test]
+    fn file_scope_citation_uses_the_in_file_template() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore_for_file: unused_local_variable\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        let rows = unnecessary_ignore_analyzer_rows(
+            &unit,
+            &one_rule("unnecessary_ignore"),
+            &rustc_hash::FxHashSet::default(),
+            &[],
+            |name| name == "unused_local_variable",
+            |_| None,
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].message,
+            "The diagnostic 'unused_local_variable' isn't produced in this file so it \
+             doesn't need to be ignored."
+        );
     }
 
     /// The #2116 NEGATIVE faces: a citation the analyzer layer consumed

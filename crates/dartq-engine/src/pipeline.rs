@@ -4652,7 +4652,8 @@ mod tests {
             self.inner.put(bytes)
         }
         fn get(&self, id: ContentId) -> Option<&[u8]> {
-            if self.get_calls.fetch_add(1, Ordering::Relaxed) + 1 == self.flip_at {
+            let n = self.get_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == self.flip_at {
                 self.token.cancel();
             }
             self.inner.get(id)
@@ -4778,19 +4779,26 @@ mod tests {
         };
         assert!(baseline_gets > 0);
 
-        // The flipped run: the token fires `PARTS` reads before the
-        // baseline's end — inside the single library's recompute by
-        // construction (the member fold reads once per member and the
-        // surface build's reads trail it, so the last `PARTS` reads all
-        // sit past the per-library job-head check). `Err` here can only
-        // come from the intra-library cadence — the head-check alone
-        // would have let the library run to `Ok`.
+        // The flipped run: the flip targets the fold's OWN read window,
+        // not the run's read tail. The content-`get` order is: apply
+        // issues none, the member fold reads once per member (gets
+        // `1..=PARTS`, each past the per-library job-head check), and the
+        // engine's post-pipeline faces read every residency file only
+        // AFTER `pipeline::analyze` returned — `text_direction_rows`
+        // (727482e7) added that trailing per-file pass, so a
+        // tail-calibrated flip (`baseline_gets - PARTS`) fires inside it,
+        // past every checkpoint, and the run completes `Ok` (the #2784
+        // batch's gate catch). Flipping at `PARTS - STRIDE` keeps one
+        // full cadence stride (`Checkpoint::STRIDE` = 8) of member reads
+        // after the flip, so the fold's own stride poll observes it:
+        // `Err` here can only come from the intra-library cadence — the
+        // head-check alone would have let the library run to `Ok`.
         let token = CancellationToken::new();
         let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store = FlipStore {
             inner: memory_store(),
             get_calls: Arc::clone(&gets),
-            flip_at: baseline_gets - PARTS,
+            flip_at: PARTS - 8,
             token: token.clone(),
         };
         let mut engine = store_engine(&root, Box::new(store));

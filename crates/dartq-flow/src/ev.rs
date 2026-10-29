@@ -181,6 +181,13 @@ pub enum Ev {
     ForParts {
         left_sep: TokenSpan,
         right_sep: TokenSpan,
+        /// The updaters' own last-token end (0 when the header has no
+        /// updaters): the header-anchored dead-row trim face — a row whose
+        /// anchor sits in the condition-or-updater region ends at the last
+        /// updater's `node.end` (official
+        /// dead_code_verifier.dart:324-326), never at a later statement
+        /// end.
+        updaters_end: u32,
     },
     ForBodyBegin,
     ForBodyEnd,
@@ -371,6 +378,13 @@ pub enum Ev {
     IsEnd,
     IsOperator {
         is_not: bool,
+        /// The tested type's first token (the `is` operator's own token
+        /// when recovery parsed no type): the dead-node poll's anchor —
+        /// the official walk's first unreachable node after a
+        /// Never-typed operand's exit is the type annotation
+        /// (`dead_code_verifier.dart`'s `_visitNode` at the `TypeAnnotation`
+        /// child, its `beginToken`), mirroring [`Ev::AsBegin`]'s poll.
+        type_head: TokenSpan,
     },
     /// The `as` cast's type spelling begins; `span` is the `as` operator
     /// token — the dead-window poll for a Never-typed operand's exit (the
@@ -421,8 +435,16 @@ pub enum Ev {
         null_aware: bool,
         /// The member expression's end token: a plain-identifier member is
         /// exactly that token — the property rows' anchor (#1409), aligned
-        /// with the semantic member row's own span.
+        /// with the semantic member row's own span. A completed send's
+        /// re-access hands the send's tiled end here instead (the #585
+        /// contract), which is why the dead-node poll anchors through
+        /// `ident` below.
         member: TokenSpan,
+        /// The member's own identifier token (the first token after the
+        /// selector's dot): the dead-node poll's anchor — the official
+        /// first dead node is the member name (`doNotReturn().hashCode`
+        /// anchors at `hashCode`, never at the tiled follower).
+        ident: TokenSpan,
     },
     /// The `?[` of a null-aware index selector was just consumed — the
     /// receiver is the top of the expression stack and the operand's events
@@ -441,6 +463,10 @@ pub enum Ev {
     NullAwareMemberBegin,
     IndexAccess {
         null_aware: bool,
+        /// The `]` closer's end: the access's own `node.end` — the
+        /// null-shorted chain row's end face (`c1?[0]` ends after `]`,
+        /// never at the follower).
+        close_end: u32,
     },
     /// An invocation's close. `args` is the invocation's own method
     /// type-argument tree (`C<int>()`'s written `<int>`, an arena index;
@@ -449,10 +475,19 @@ pub enum Ev {
     /// the callee identifier — so the send carries it beside the callee's
     /// implicit-creation face (#2243), and taking it here keeps a
     /// dangling group from leaking into the next construct's type row.
+    /// `end` is the closing `)`'s end — the invocation's own `node.end`
+    /// (the chain-row end face inside a dead null-shorted region; the
+    /// follower tiling that plagues the expression-end params cannot
+    /// reach a send's own closer).
     Send {
         args: u32,
+        end: u32,
     },
-    SendNoArgs,
+    SendNoArgs {
+        /// The bare head's own end: the chain-row end face for a member
+        // read chain (`a?.foo` ends after `foo`).
+        end: u32,
+    },
     ArgumentsBegin,
     /// One argument's value expression is complete. Official analyzes an
     /// argument list one expression at a time, and each argument's

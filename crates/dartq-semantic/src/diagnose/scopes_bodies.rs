@@ -418,9 +418,12 @@ impl<'a> Engine<'a> {
     }
 
     /// `begin_binary_expression` for `??`: the left operand's row parks
-    /// with the operator span.
-    pub(crate) fn begin_if_null(&mut self, op_range: SourceRange) {
-        self.if_null_groups.push((self.rows.len(), op_range));
+    /// with the operator span, beside the right operand's first-token
+    /// offset (its node range's start — the first token after the
+    /// operator).
+    pub(crate) fn begin_if_null(&mut self, op_range: SourceRange, rhs_offset: u32) {
+        self.if_null_groups
+            .push((self.rows.len(), op_range, rhs_offset));
     }
 
     /// The dead-coalesce operand's never-null verdict
@@ -466,9 +469,10 @@ impl<'a> Engine<'a> {
     /// equality comparison as the whole left operand counts too: its
     /// static type is `bool` (`x != null ?? false`).
     pub(crate) fn end_if_null(&mut self) {
-        let Some((mark, op_range)) = self.if_null_groups.pop() else {
+        let Some((mark, op_range, rhs_offset)) = self.if_null_groups.pop() else {
             return;
         };
+        let rhs_end = self.if_null_rhs_end.take();
         self.stage_if_null_result(mark, op_range);
         let mut lhs_is_bool_comparison = false;
         if let Some(eq) = self.eq_spans.last().copied() {
@@ -511,8 +515,26 @@ impl<'a> Engine<'a> {
         if !non_null {
             return;
         }
-        if let Some(rhs) = self.rows.last() {
-            let range = rhs.range;
+        // The row's range IS the right operand's own node range
+        // (`_checkForDeadNullCoalesce` reports at `node.rightOperand`):
+        // first token after the operator through the rhs-end latch — a
+        // degenerate value row (a collection literal's closing-token face)
+        // cannot spell it, and an open latch beats a stale row geometry.
+        let range = match rhs_end {
+            Some(end) if end > rhs_offset => SourceRange {
+                offset: rhs_offset,
+                length: end - rhs_offset,
+            },
+            _ => self
+                .rows
+                .last()
+                .map(|rhs| rhs.range)
+                .unwrap_or(SourceRange {
+                    offset: rhs_offset,
+                    length: 0,
+                }),
+        };
+        if range.length > 0 {
             self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
         }
     }

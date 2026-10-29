@@ -12,6 +12,7 @@ mod features;
 mod gate_1315_p3_families;
 mod gate_1600_declaring_parameters;
 mod gate_2791_recovery;
+mod gate_2800_super_qdot_recovery;
 mod gate_351;
 mod gate_410;
 mod gate_445;

@@ -359,6 +359,11 @@ pub(crate) struct ForBounds {
     /// for the loop's body close (an anchor past it is a body descendant,
     /// one at or before it belongs to the header).
     pub header_end: u32,
+    /// The updaters' own last-token end (0 when the header has none): the
+    /// trim face — a header-tail-anchored row ends here
+    /// (dead_code_verifier.dart:324-326), or at the header's end when no
+    /// updaters exist (`node` stays the ForParts).
+    pub upd_end: u32,
 }
 
 impl ForBounds {
@@ -379,6 +384,7 @@ impl ForBounds {
         right: u32,
         header_end: u32,
         end: usize,
+        updaters_end: u32,
     ) -> Self {
         let mut cond_start = parts;
         let mut upd_start = parts;
@@ -403,6 +409,7 @@ impl ForBounds {
             upd: upd_start..parts,
             body: parts + 1..end,
             header_end,
+            upd_end: updaters_end,
         }
     }
 }
@@ -606,30 +613,41 @@ pub(crate) const STEP_BUDGET_PER_EVENT: u64 = 128;
 /// One open null-shorting context (official `_NullAwareAccessContext`,
 /// flow_analysis.dart:9664): the skip path captured at the `?.`/`?[`/`?..`
 /// and the access-path state the condition face can still read back.
-pub(crate) struct NullShort {
-    /// The receiver-was-null path (upstream `shortcutControlPath` —
-    /// `flow_analysis.dart:9206`): the pre-split state, made unreachable
-    /// when the receiver type can never be null (:9217-9221).
-    pub shortcut: State,
-    /// The receiver-was-non-null path (upstream's promoted `_current` at
-    /// the access): the consumer-visible branch pair's non-null half, kept
-    /// so the expression's `branches` still splits a condition on it.
-    pub matched: Option<State>,
-    /// `exprs` depth when the context opened: the `?` belongs to the
-    /// expression whose operand region began at this depth, so a consumer
-    /// closing a deeper operand (`throw e`, `f(e)`, `x[e]`) leaves it open
-    /// — the official `nullShortingDepth` bound (`finishNullShorting`'s
-    /// `targetDepth`, type_analyzer.dart:804-827).
-    pub exprs_depth: usize,
-    /// Whether the access path was already dead when the context opened —
-    /// the pre-split state was unreachable, or a never-null/Null-typed
-    /// receiver classified it dead (:9214-9221). The member-level dead-node
-    /// poll (`checkUnreachableNode`, type_analyzer.dart:2082) reads the
-    /// state as the member STARTED — a `throw`/Never inside the member's own
-    /// tail (`x?.m(throw _)`) dies after the poll, so it must not anchor the
-    /// access row; a dead-at-open path is the genuine dead member.
-    pub dead_at_open: bool,
-}
+    pub(crate) struct NullShort {
+        /// The receiver-was-null path (upstream `shortcutControlPath` —
+        /// `flow_analysis.dart:9206`): the pre-split state, made unreachable
+        /// when the receiver type can never be null (:9217-9221).
+        pub shortcut: State,
+        /// The receiver-was-non-null path (upstream's promoted `_current` at
+        /// the access): the consumer-visible branch pair's non-null half, kept
+        /// so the expression's `branches` still splits a condition on it.
+        pub matched: Option<State>,
+        /// The chain's own end face seen so far (a send's `)`, an index's
+        /// `]`, a member's identifier): recorded even while no dead window
+        /// exists yet — the send fires before the member poll opens the
+        /// window (the stream is post-order) — and applied at the close.
+        pub face_end: u32,
+        /// `exprs` depth when the context opened: the `?` belongs to the
+        /// expression whose operand region began at this depth, so a consumer
+        /// closing a deeper operand (`throw e`, `f(e)`, `x[e]`) leaves it open
+        /// — the official `nullShortingDepth` bound (`finishNullShorting`'s
+        /// `targetDepth`, type_analyzer.dart:804-827).
+        pub exprs_depth: usize,
+        /// Whether the access path was already dead when the context opened —
+        /// the pre-split state was unreachable, or a never-null/Null-typed
+        /// receiver classified it dead (:9214-9221). The member-level dead-node
+        /// poll (`checkUnreachableNode`, type_analyzer.dart:2082) reads the
+        /// state as the member STARTED — a `throw`/Never inside the member's own
+        /// tail (`x?.m(throw _)`) dies after the poll, so it must not anchor the
+        /// access row; a dead-at-open path is the genuine dead member.
+        pub dead_at_open: bool,
+        /// The receiver read's own offset: the chain-region bound the
+        /// completion row uses (`handleNullShortingFinished`'s
+        /// `flowEnd(expression)` — dead_code_verifier.dart:408-414 — fires
+        /// only when the first dead node sits INSIDE the chain, never for an
+        /// interval opened before the receiver).
+        pub recv_offset: u32,
+    }
 
 /// The receiver-invalidation sweep over one state's property slots: the
 /// state-level half of [`Interp::join_state_with_sweep`], also driven
@@ -745,6 +763,11 @@ pub(crate) struct DeadWindow {
     /// unreachable nodes continue it, a covering `flowEnd` retires it),
     /// so following dead statements extend it; only the emission skips.
     suppressed: bool,
+    /// Frozen row end (the C-style header's ForParts trim,
+    /// dead_code_verifier.dart:324-326): set when the anchor sits in the
+    /// loop's condition-or-updater region — the row ends at the last
+    /// updater's `node.end`, later statement ends never extend it.
+    trim_end: Option<u32>,
 }
 
 impl DeadWindow {
@@ -759,6 +782,7 @@ impl DeadWindow {
             split_start: None,
             split_broken: false,
             suppressed: false,
+            trim_end: None,
         }
     }
 
@@ -780,6 +804,7 @@ impl DeadWindow {
             split_start: None,
             split_broken: false,
             suppressed: false,
+            trim_end: None,
         }
     }
 
@@ -804,10 +829,26 @@ impl DeadWindow {
     }
 
     /// Grows the interval's end to a later dead statement's end (the
-    /// official trim to the covering block's last statement).
+    /// official trim to the covering block's last statement). A
+    /// ForParts-frozen interval is sealed: its row ends at the header's
+    /// last updater regardless of later statement ends
+    /// (dead_code_verifier.dart:324-326).
     pub(crate) fn extend(&mut self, end: u32) {
+        if self.trim_end.is_some() {
+            return;
+        }
         if end > self.end {
             self.end = end;
+        }
+    }
+
+    /// Freezes the interval's row end at the C-style header's last
+    /// updater's `node.end` (`parent is ForParts` trim): a condition- or
+    /// updater-anchored row ends there however far the loop body's
+    /// statements would extend the enclosing block's window.
+    pub(crate) fn freeze_end(&mut self, end: u32) {
+        if end > self.anchor.range.offset {
+            self.trim_end = Some(end);
         }
     }
 
@@ -1096,6 +1137,12 @@ pub(crate) struct Interp<'o> {
     /// still reads a live state, so a following statement compares the
     /// exit position with its own begin.
     pub(crate) exit_at: Option<u32>,
+    /// The outermost executable's own end offset when it is a `;` (an
+    /// arrow body's terminator — the official covering node is the
+    /// ExpressionFunctionBody, whose `node.end` includes it). Zero for
+    /// block bodies (their rows trim to the last statement, never past
+    /// it) and for non-`;` ends.
+    pub(crate) outer_exec_end: u32,
     /// Open `??=` skip-path snapshots (paired with [`crate::ev::Ev::
     /// IfNullAssignBegin`]): the state at the operator — the live path
     /// that skips the RHS. An RHS that exits (`x ??= throw e`) restores
@@ -1127,6 +1174,14 @@ pub(crate) struct Interp<'o> {
     /// (`_join(_current, context._previous).unsplit()`, :7403) — which the
     /// event stream marks at every value-consumer event.
     pub(crate) null_shorts: Vec<NullShort>,
+
+    /// Whether a cascade head's `?..` null-shorting context is currently
+    /// open and spans into the next section of the same cascade (official
+    /// `cascadeExpression_afterTarget` opens ONE context for the whole
+    /// cascade, `nullAwareAccess_end` closes it after the LAST section —
+    /// flow_analysis.dart:6561-6603). Set by a `?..` head, inherited by
+    /// the following sections, cleared at the closing section's flush.
+    pub(crate) cascade_head_open: bool,
 
     /// The expression-stack depth each OPEN argument list began at — the
     /// per-argument flush bound ([`Ev::ArgumentEnd`]): a `?.` short opened
@@ -1316,12 +1371,14 @@ impl<'o> Interp<'o> {
             dead: None,
             stmt_began_dead: false,
             exit_at: None,
+            outer_exec_end: 0,
             if_null_skips: Vec::new(),
             vacuous_object: None,
             vacuous_fields: Vec::new(),
             pattern_binds: Vec::new(),
             init_exec_depth: None,
             null_shorts: Vec::new(),
+            cascade_head_open: false,
             args_bases: Vec::new(),
             collect: None,
             snapshot: None,
@@ -1408,7 +1465,16 @@ impl<'o> Interp<'o> {
         // records no trailing ExecEnd for it (the pipeline runs from its
         // own `exec_end`), so the close covering every interval still open
         // fires at the end of the buffer. Nested executables closed their
-        // windows at their recorded ExecEnd.
+        // windows at their recorded ExecEnd. An arrow body's covering node
+        // ends at its `;` ([`Interp::outer_exec_end`]), so a still-open
+        // interval folds out to it first (oracle `doNotReturn().hashCode;`
+        // reports `hashCode;`); block bodies trim to the last statement,
+        // whose own StmtEnd already ended the window.
+        if self.outer_exec_end > 0
+            && let Some(window) = &mut self.dead
+        {
+            window.extend(self.outer_exec_end);
+        }
         self.flow_end(Covered::Exec);
     }
 
@@ -1765,7 +1831,7 @@ impl<'o> Interp<'o> {
     /// The caller hands over the receiver's `(reference, ty, args)`
     /// triple — read off the expression stack — rather than the `Expr`
     /// itself, so the call holds no borrow into `self`.
-    pub(crate) fn null_short_begin(&mut self, receiver: (Option<u32>, Ty, u32)) {
+    pub(crate) fn null_short_begin(&mut self, receiver: (Option<u32>, Ty, u32), recv_offset: u32) {
         self.split_cur();
         let mut shortcut = self.current.clone();
         let mut matched = None;
@@ -1794,20 +1860,91 @@ impl<'o> Interp<'o> {
         self.null_shorts.push(NullShort {
             shortcut,
             matched,
+            face_end: 0,
             exprs_depth: self.exprs.len(),
             dead_at_open: !self.reachable(),
+            recv_offset,
         });
     }
 
     /// Closes one open null-shorting context (official
     /// `nullAwareAccess_end`, flow_analysis.dart:7400-7404): joins the
     /// access path into the skip path and drops the checkpoint.
+    ///
+    /// The dead chain's completion row fires here too (official
+    /// `handleNullShortingFinished`'s `flowEnd(expression)`,
+    /// dead_code_verifier.dart:408-414): a chain that ran dead from its
+    /// open anchors the interval at the member poll and reports
+    /// `anchor .. chainExpression.end` at the chain's own boundary — the
+    /// row never runs into the statement's trailing `;`, and the window
+    /// resets so a later dead node of the same statement opens fresh. An
+    /// interval opened BEFORE the receiver is not the chain's (upstream
+    /// `_containsFirstDeadNode` fails) and keeps running; a suppressed
+    /// interval (the semantic as-cast tail face's row) retires silently.
     pub(crate) fn null_short_end(&mut self) -> Option<NullShort> {
         let short = self.null_shorts.pop()?;
+        let close = short.dead_at_open
+            && self
+                .dead
+                .as_ref()
+                .is_some_and(|window| {
+                    !window.suppressed && window.anchor.range.offset >= short.recv_offset
+                });
+        if close {
+            let window = self.dead.take().expect("close gate checked the window");
+            let offset = window.anchor.range.offset;
+            // A frozen trim is the LATEST face (the member's own ident,
+            // recorded after the bare-leaf send's tiled follower rode in
+            // earlier) and therefore the most precise one; without a trim
+            // the stored faces still bound the row to the chain's end.
+            let end = window
+                .trim_end
+                .unwrap_or(window.end.max(short.face_end))
+                .max(offset);
+            if end > offset {
+                self.emit(FlowFact::DeadCode {
+                    span: TokenSpan {
+                        id: window.anchor.id,
+                        range: SourceRange {
+                            offset,
+                            length: end - offset,
+                        },
+                    },
+                });
+            }
+        }
         self.current = self
             .join(Some(self.current.clone()), Some(short.shortcut.clone()))
             .unsplit(&mut self.reach);
         Some(short)
+    }
+
+    /// Bounds the dead row by the null-shorted chain's own end face
+    /// (official `handleNullShortingFinished`'s row extent: the chain
+    /// expression's `node.end` — a send's `)`, an index's `]`, a plain
+    /// member's identifier). The face counts only while the innermost open
+    /// short runs dead from its open. A live window whose anchor sits
+    /// inside that chain (at or after the receiver read) FREEZES at the
+    /// face — the statement's own `;` end must not grow the row past the
+    /// chain (the official row ends at `flowEnd(expression)`, before the
+    /// statement's terminator). A face that arrives before any window
+    /// (the send fires before the member poll, post-order stream) rides
+    /// the short to the close.
+    pub(crate) fn chain_face_end(&mut self, end: u32) {
+        let Some(short) = self.null_shorts.last_mut() else {
+            return;
+        };
+        if !short.dead_at_open {
+            return;
+        }
+        short.face_end = short.face_end.max(end);
+        let recv = short.recv_offset;
+        if let Some(window) = &mut self.dead
+            && !window.suppressed
+            && window.anchor.range.offset >= recv
+        {
+            window.freeze_end(end);
+        }
     }
 
     /// Ends the null-shorting contexts opened inside the operand region the
@@ -2185,6 +2322,9 @@ impl<'o> Interp<'o> {
         if window.suppressed {
             return;
         }
+        // A ForParts-frozen window's row ends at the trim, not `end` (the
+        // body's statement ends never reach the header-anchored row).
+        let end = window.trim_end.unwrap_or(window.end);
         if let Some(while_part) = window.split {
             self.emit(FlowFact::DeadCode {
                 span: TokenSpan {
@@ -2194,25 +2334,25 @@ impl<'o> Interp<'o> {
             });
             if !window.split_broken
                 && let Some(start) = window.split_start
-                && window.end > start
+                && end > start
             {
                 self.emit(FlowFact::DeadCode {
                     span: TokenSpan {
                         id: window.anchor.id,
                         range: SourceRange {
                             offset: start,
-                            length: window.end - start,
+                            length: end - start,
                         },
                     },
                 });
             }
-        } else if window.end > window.anchor.range.offset {
+        } else if end > window.anchor.range.offset {
             self.emit(FlowFact::DeadCode {
                 span: TokenSpan {
                     id: window.anchor.id,
                     range: SourceRange {
                         offset: window.anchor.range.offset,
-                        length: window.end - window.anchor.range.offset,
+                        length: end - window.anchor.range.offset,
                     },
                 },
             });
@@ -3018,6 +3158,7 @@ impl Interp<'_> {
         let Ev::ForParts {
             left_sep,
             right_sep,
+            updaters_end,
         } = events[parts]
         else {
             // A for-in: the linear walk delivers its `ForInParts` event.
@@ -3031,6 +3172,7 @@ impl Interp<'_> {
             right_sep.range.offset,
             right_sep.range.end(),
             end,
+            updaters_end,
         );
         self.replay_c_for(&bounds, events, match_of, false);
         Control::Jump(end + 1)
@@ -3099,6 +3241,36 @@ impl Interp<'_> {
         // the header) keeps owning the reporting — the updaters never fire
         // their own row (probe u5).
         let had_dead = self.dead.is_some();
+        // The condition-node freeze (official `parent is ForParts`'s
+        // `node = updaters.last` trim, dead_code_verifier.dart:324-326):
+        // when the FIRST dead node IS the condition expression (its AST
+        // parent is the ForParts) and updaters exist, the row ends at the
+        // last updater's `node.end` — `for (throw 0; true; 1) {}` reports
+        // `true; 1`, never the statement's own tail. Without updaters the
+        // arm misses (`updaters.lastOrNull` is null) and the row keeps the
+        // covering close's full fold (`for (throw 0; c;) {}` reports
+        // `c;) {}`). A DEEPER anchor (a dead argument inside the condition
+        // — its parent is an ArgumentList, the arm misses) keeps the fold
+        // too: `for (; g(throw 0, 1); 2) {}` reports `1; 2) {}`. The
+        // condition's own offset is its first spanned event's (the
+        // post-order stream keeps leaf order). Statement and element
+        // forms share the face (oracle rows 3:17|7 and 2:23|7). A
+        // recovery-spliced header (the comma-init list's `ForInit` marker
+        // lands past the offset scan's updater boundary) inverts the
+        // condition region — every other consumer iterates it (an empty
+        // walk); the raw slice here must do the same and answer no
+        // anchor, leaving the freeze to the well-formed headers it pins.
+        let cond_begin = events
+            .get(bounds.cond.clone())
+            .and_then(|region| region.iter().find_map(|ev| ev.span()))
+            .map(|span| span.range.offset);
+        if bounds.upd_end > 0
+            && let Some(cond_begin) = cond_begin
+            && let Some(window) = &mut self.dead
+            && window.anchor.range.offset == cond_begin
+        {
+            window.freeze_end(bounds.upd_end);
+        }
         // Body.
         self.run_range(events, bounds.body.clone(), match_of);
         if !collection {
@@ -3113,7 +3285,10 @@ impl Interp<'_> {
             // for the outer covering close. The close runs BEFORE the
             // updaters: the official row ends at the body's own end, so an
             // updater's statement end never folds into a body row and a
-            // live tail after the loop stays row-free (probes u1/u6).
+            // live tail after the loop stays row-free (probes u1/u6). An
+            // updater-region anchor (past the right separator, at or before
+            // the updaters' own end) is the `parent is ForParts` face —
+            // its row trims to the last updater.
             self.flow_end_body(bounds.header_end);
         }
         // Updaters run on the back-edge state: join pending continues
@@ -3173,6 +3348,13 @@ impl Interp<'_> {
                     }
                     _ => {}
                 }
+            }
+            // The updaters' own last-token end (the `ForParts` event's
+            // `updaters_end` face): the event spans' ends miss a trailing
+            // selector closer (`values[0]` ends at the operand, the `]`
+            // rides no event span).
+            if bounds.upd_end > 0 {
+                last = Some(last.map_or(bounds.upd_end, |current| current.max(bounds.upd_end)));
             }
             if let (Some(begin), Some(last)) = (begin, last)
                 && last > begin.range.offset
@@ -3272,6 +3454,7 @@ impl Interp<'_> {
             let Ev::ForParts {
                 left_sep,
                 right_sep,
+                updaters_end,
             } = events[parts]
             else {
                 return Control::Jump(end + 1);
@@ -3284,6 +3467,7 @@ impl Interp<'_> {
                 right_sep.range.offset,
                 right_sep.range.end(),
                 end,
+                updaters_end,
             );
             self.replay_c_for(&bounds, events, match_of, true);
             // The wholesale jump skips the `ForControlFlowEnd` event:

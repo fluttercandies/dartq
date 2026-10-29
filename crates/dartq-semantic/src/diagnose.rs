@@ -392,6 +392,7 @@ macro_rules! dq_probe {
 }
 
 mod assignability;
+mod augmentations;
 mod best_practices_verifier;
 mod const_eval_faces;
 mod call_result;
@@ -1886,6 +1887,12 @@ pub fn fold_unit_with_ops<'t>(
                 None,
             ));
         }
+        // The augmentation verifier resolves this unit's `augment`
+        // declarations against the whole library's declaration space
+        // (fragment-chain merge semantics — #2784).
+        diagnostics.extend(augmentations::augmentation_diagnostics(
+            file, elements, graph, index, strings, lib,
+        ));
     }
     diagnostics.append(&mut report.diagnostics);
     apply_ignore_suppression(&mut diagnostics, source, tokens);
@@ -5072,6 +5079,20 @@ mod ticket_2781_tests;
 #[cfg(test)]
 mod ticket_2782_tests;
 
+/// The #2790 is-check constant-verdict pins: the verdict asks the strict
+/// `TypeSystem.isSubtypeOf` mirror over the alias-folded, tear-off-typed
+/// operand — invariant type arguments (`List<Null>` vs `List<Object>`),
+/// the top-type edges, and the function/method tear-off operand faces.
+#[cfg(test)]
+mod ticket_2790_tests;
+
+/// The #2784 augmentation-verifier pins: one exact oracle row per code
+/// family (the `augment`-keyword anchor everywhere except the variable
+/// rows), the resolved-shape silences, the augment-ctor
+/// `duplicate_constructor` suppression, and the multi-unit library walk.
+#[cfg(test)]
+mod ticket_2784_tests;
+
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.
 #[cfg(test)]
@@ -5125,3 +5146,5 @@ mod extension_nullable_on_param_tests;
 mod nullable_extension_condition_tests;
 #[cfg(test)]
 mod foreign_alias_invocation_tests;
+#[cfg(test)]
+mod ticket_2789_tests;

@@ -602,6 +602,12 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().handle_conditional_expression_colon();
     }
 
+    fn end_conditional_expression_else_arm(&mut self, else_last: Token) {
+        self.0
+            .borrow_mut()
+            .end_conditional_expression_else_arm(else_last);
+    }
+
     fn end_conditional_expression(&mut self, question: Token, colon: Token, end: Token) {
         self.0
             .borrow_mut()
@@ -1777,6 +1783,12 @@ impl ParserListener for SharedFlow<'_> {
             right_separator,
             expression_count,
         );
+    }
+
+    fn handle_for_updaters_end(&mut self, updaters_last: Token) {
+        self.0
+            .borrow_mut()
+            .handle_for_updaters_end(updaters_last);
     }
 
     fn begin_for_in_body(&mut self, token: Token) {

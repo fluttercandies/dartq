@@ -2067,9 +2067,12 @@ impl<'a> Engine<'a> {
     /// The assignment check (`invalid_assignment`,
     /// `assignment_expression_resolver.dart:795`): a single-row right-hand
     /// side whose type the M1 facts know (`Null` or a captured declared
-    /// type) against the target's declared type. Compound operators ride
-    /// [`Self::check_compound_assignment`] (the augmented operator's
-    /// result type against the same target).
+    /// type) against the target's declared type. The `??=` face shares the
+    /// same verdict — `resolveIfNull` closes with the plain
+    /// `_checkForInvalidAssignment(writeAcceptedType, node.value,
+    /// valueType)` (:697-703), the RHS against the target's write type.
+    /// Compound operators ride [`Self::check_compound_assignment`] (the
+    /// augmented operator's result type against the same target).
     pub(crate) fn check_assignment(&mut self, operator: Token) {
         // F-C: a constructor-initializer list owns its assignments — the
         // field-initializer assignability question codes through the
@@ -2080,7 +2083,7 @@ impl<'a> Engine<'a> {
         let Some(op_text) = self.text_of(operator) else {
             return;
         };
-        if op_text != "=" {
+        if op_text != "=" && op_text != "??=" {
             self.check_compound_assignment(op_text, operator);
             return;
         }
@@ -2124,7 +2127,17 @@ impl<'a> Engine<'a> {
         // result (`x = a?.b` asks `B?` against `x`'s slot) —
         // [`Engine::expression_row_ty`] re-arms the `?` the merge could not
         // join onto the row's declared face.
-        let (from, range) = (self.expression_row_ty(&rhs_row), rhs_row.range);
+        let range = rhs_row.range;
+        let mut from = self.expression_row_ty(&rhs_row);
+        // The promoted read (upstream feeds the flow-promoted `valueType`
+        // into `_checkForInvalidAssignment`, :694-703): an unpromoted
+        // dynamic/unknown right side a flow fact promoted (`y is String`
+        // over an untyped parameter) re-decides at the read's exact span.
+        if matches!(from, Ty::Unknown | Ty::Dynamic)
+            && let Some(promoted) = self.read_type_at(range)
+        {
+            from = promoted;
+        }
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
         // A bare initializer-list target names the FIELD (the
@@ -2152,7 +2165,8 @@ impl<'a> Engine<'a> {
         if self.written_ty_invalid(from) {
             return;
         }
-        if self.assignable(from, to, literal) == Some(false) {
+        let verdict = self.assignment_verdict(from, to, literal);
+        if verdict == Some(false) {
             if in_initializer {
                 let (from_text, to_text) = (self.ty_display(from), self.ty_display(to));
                 // The oracle anchors at the whole right-hand expression —
@@ -2173,6 +2187,20 @@ impl<'a> Engine<'a> {
             } else {
                 self.stage(StagedKind::Assignment, range, from, to, literal);
             }
+        } else if !in_initializer
+            && matches!(from, Ty::Unknown | Ty::Dynamic)
+            && matches!(rhs_row.shape, RowShape::Bare(_))
+        {
+            // The promotable-read staging: an unknown/dynamic bare-read
+            // right side stages even on a non-negative parse-time verdict —
+            // upstream checks the flow-PROMOTED `valueType`
+            // (assignment_expression_resolver.dart:694-703), so `y is
+            // String` over an untyped parameter CREATES the rejection the
+            // parse-time dynamic face accepted. Only a variable read can
+            // promote; every other face stays promotion-cleans-only (a
+            // row with no flow fact re-derives to its parse-time capture
+            // and suppresses at the teardown).
+            self.stage(StagedKind::Assignment, range, from, to, literal);
         }
     }
 
@@ -2269,17 +2297,37 @@ impl<'a> Engine<'a> {
         let literal = Self::primitive_literal(row, &self.members.primitive_ids);
         // A `?.`-merged initializer reads the short-circuit's nullable
         // result (`int x = a?.b` asks `B?` against `int`).
-        let from = self.expression_row_ty(row);
+        let mut from = self.expression_row_ty(row);
+        // The promoted read: an unpromoted dynamic/unknown initializer a
+        // flow fact promoted (`int x = y` under `y is String`) re-decides —
+        // the oracle checks the promoted `valueType`
+        // (assignment_expression_resolver.dart:783-800).
+        if matches!(from, Ty::Unknown | Ty::Dynamic)
+            && let Some(promoted) = self.read_type_at(row.range)
+        {
+            from = promoted;
+        }
         // The invalid-source gate: a written head that resolves to no type
         // poisons the whole spelling (upstream `InvalidType`) — probed
         // 3.47.1: `int x = astNodeVal` over an undefined-class parameter
         // stays silent. The declared target gates nothing: the group's
-        // written annotation is the question's own face.
+        // written annotation is the question's own face (the projected
+        // foreign-type posture [`Self::check_assignment` records).
         if self.written_ty_invalid(from) {
             self.init_mark = None;
             return;
         }
-        if self.assignable(from, to, literal) == Some(false) {
+        let verdict = self.assignment_verdict(from, to, literal);
+        if verdict == Some(false)
+            || (matches!(from, Ty::Unknown | Ty::Dynamic)
+                && matches!(row.shape, RowShape::Bare(_)))
+        {
+            // The promotable-read staging twin (see `check_assignment`):
+            // the flow-promoted initializer face creates the rejection the
+            // parse-time dynamic/unknown capture accepted
+            // (assignment_expression_resolver.dart:694-703's promoted
+            // `valueType`); a row with no flow fact suppresses at the
+            // teardown.
             self.stage(StagedKind::Assignment, row.range, from, to, literal);
         }
         self.init_mark = None;
@@ -3032,6 +3080,64 @@ impl<'a> Engine<'a> {
     /// a written edge the closure carries. `Object` is the universal
     /// supertype and stays out of the question. Everything unresolved
     /// suppresses (the under-report direction).
+    /// The assignment face's verdict: the matrix, closed by the
+    /// declared-subtype negative for the nominal pairs the matrix cannot
+    /// ask. A non-null NAMED source against a distinct-head NAMED target
+    /// is a hierarchy question — the nullable-target Right Top arm
+    /// answers `true` unconditionally and the non-null pair suppresses —
+    /// but `S <: T?` iff `S <: T` (`Null` rides the Right Top leg
+    /// separately, so a nullable SOURCE stays true), so the question
+    /// projects the target's `?` away and consults the declared closure:
+    /// a provably-unrelated pair answers `false` (subtype.dart's nominal
+    /// rule — the oracle's `invalid_assignment`), every other pair keeps
+    /// the matrix verdict. Scoped to the assignment faces only: the
+    /// return/argument/override faces keep their own pinned postures over
+    /// synthetic hierarchies. An int-literal source sits out — its
+    /// implicit `double` conversion (`double d = 1;`, oracle-legal) is
+    /// decided by the matrix's later literal-refinement arms, which a
+    /// negative evaluated before them would preempt.
+    pub(crate) fn assignment_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        let verdict = self.assignable(from, to, from_literal);
+        if verdict == Some(false) || from_literal {
+            return verdict;
+        }
+        let negative = match (from, to) {
+            (
+                Ty::Named {
+                    name: from_name,
+                    nullable: false,
+                    ..
+                },
+                Ty::Named {
+                    name: to_name,
+                    args: to_args,
+                    ..
+                },
+            ) if from_name != to_name
+                && to_name != self.intern("Object")
+                // An in-scope type parameter's relation to the target is
+                // decided only at the instantiation — the parse-time `T`
+                // capture stays under-report (`operator []=`'s `T v`
+                // against `int? prop`).
+                && !self.type_params.contains(&from_name)
+                && !self.pending_type_params.contains(&from_name) =>
+            {
+                let to_base = Ty::Named {
+                    name: to_name,
+                    nullable: false,
+                    args: to_args,
+                };
+                self.declared_subtype_negative(&from, &to_base)
+            }
+            _ => None,
+        };
+        if negative == Some(false) {
+            Some(false)
+        } else {
+            verdict
+        }
+    }
+
     pub(crate) fn declared_subtype_negative(&self, from: &Ty, to: &Ty) -> Option<bool> {
         let (
             Ty::Named {

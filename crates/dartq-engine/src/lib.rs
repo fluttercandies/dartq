@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 use std::time::SystemTime;
 
-use dartq_diagnostics::Diagnostic;
+use dartq_diagnostics::{Diagnostic, DiagnosticType};
 use dartq_index::{FileCapture, LibraryIndex};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_package::PackageTable;
@@ -816,7 +816,9 @@ impl Engine {
     /// returned rows and re-sort canonically (the engine rows leave the
     /// pipeline sorted). Rows emit in options-file path order, one row set
     /// per distinct loaded path — locally canonical, never hash order.
-    /// Empty in the common case.
+    /// The file's own `# ignore:` / `# ignore_for_file:` citations drop
+    /// their rows first (the [`YamlIgnores`] face). Empty in the common
+    /// case.
     fn option_issue_rows(&mut self) -> Vec<Diagnostic> {
         // Intern every loaded options file once (the CLI's `undefined_lint`
         // face attributes against the same table), keeping the
@@ -842,10 +844,28 @@ impl Engine {
         loaded
             .into_iter()
             .flat_map(|(file, _, options)| {
-                options
-                    .issues
-                    .iter()
-                    .map(move |issue| issue.to_diagnostic(file))
+                // The YAML ignore-comment face over the options file's own
+                // text (the `IgnoreInfo.forYaml` filter the oracle's YAML
+                // validators run — upstream Dart SDK source,
+                // `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart`
+                // :80-83, shared with [`Self::validator_issue_rows`] and the
+                // CLI's options faces through
+                // [`analysis_options::AnalysisOptions::ignored_at`]): a
+                // `# ignore:` naming the code on the row's line — or
+                // `# ignore_for_file:` anywhere in the file — drops the row
+                // before it joins the output.
+                let suppression = options
+                    .layout()
+                    .map(|(text, index)| (YamlIgnores::parse(text), text, index));
+                options.issues.iter().filter_map(move |issue| {
+                    if let Some((ignores, text, index)) = &suppression {
+                        let (line, _) = index.line_col_utf16(text, issue.offset);
+                        if ignores.ignored(line, issue.code.name) {
+                            return None;
+                        }
+                    }
+                    Some(issue.to_diagnostic(file))
+                })
             })
             .collect()
     }
@@ -918,8 +938,12 @@ impl Engine {
     /// whole residency every call — the rows are a pure function of current
     /// bytes, so the incremental result equals the full recompute (a
     /// dirty-only walk would drop the untouched files' rows from the
-    /// standing output between passes). Callers append the returned rows
-    /// and re-sort canonically. Empty in the common case (the scan's
+    /// standing output between passes). Each row-carrying file's own
+    /// `// ignore:` / `// ignore_for_file:` citations drop its rows first
+    /// (the Dart-file [`DartIgnores`] face — the unit filter the oracle's
+    /// verifier rows ride, `library_analyzer.dart`:539-563), gated by the
+    /// governing `analyzer.cannot-ignore` set. Callers append the returned
+    /// rows and re-sort canonically. Empty in the common case (the scan's
     /// pre-pass rejects any file without a flagged code point).
     fn text_direction_rows(&self) -> Vec<Diagnostic> {
         let mut rows = Vec::new();
@@ -930,11 +954,48 @@ impl Engine {
             let Ok(text) = std::str::from_utf8(bytes) else {
                 continue;
             };
-            rows.extend(
-                analysis_options::text_direction_issues(text)
-                    .into_iter()
-                    .map(|issue| issue.to_diagnostic(*file)),
-            );
+            let issues = analysis_options::text_direction_issues(text);
+            if issues.is_empty() {
+                continue;
+            }
+            // The Dart-file ignore face, only for the row-carrying files
+            // whose text cites at all (`_filterIgnoredDiagnostics`,
+            // upstream Dart SDK source,
+            // `pkg/analyzer/lib/src/dart/analysis/library_analyzer.dart`
+            // :135, :539-563 — the verifier's rows ride the unit's filter
+            // like every Dart-file row): `// ignore:` naming the code on
+            // the row's line (a comment alone on its line targets the next)
+            // or `// ignore_for_file:` drops the row, unless the governing
+            // options' `analyzer.cannot-ignore` set claims the code
+            // (:552-555).
+            let suppression = if text.contains("ignore:") || text.contains("ignore_for_file:") {
+                Some((DartIgnores::parse(text), LineIndex::new(text)))
+            } else {
+                None
+            };
+            // The `analyzer.cannot-ignore` gate resolves per row against the
+            // file's governing options — a file under no options (or whose
+            // governing set lacks the code) keeps its rows suppressible.
+            let gate_open = |name: &str| {
+                self.state
+                    .files
+                    .path(*file)
+                    .and_then(|path| {
+                        path.ancestors().find_map(|dir| self.state.options.get(dir))
+                    })
+                    .is_none_or(|options| options.is_ignorable(name))
+            };
+            rows.extend(issues.into_iter().filter_map(|issue| {
+                if let Some((ignores, index)) = &suppression
+                    && gate_open(issue.code.name)
+                {
+                    let (line, _) = index.line_col_utf16(text, issue.offset);
+                    if ignores.ignored(line, issue.code.name, issue.code.dtype) {
+                        return None;
+                    }
+                }
+                Some(issue.to_diagnostic(*file))
+            }));
         }
         rows
     }
@@ -2247,16 +2308,22 @@ impl YamlIgnores {
     }
 
     /// Whether a diagnostic named `name` reported on 1-based `line` is
-    /// suppressed (`_ignoredAt`, ignore_info.dart:186-212).
+    /// suppressed (`_ignoredAt`, ignore_info.dart:186-212; the entries'
+    /// `_matches`, :39-52 — a citation equals the code's name or resolves
+    /// through its lowercased `uniqueName` spelling).
     #[must_use]
     pub fn ignored(&self, line: u32, name: &str) -> bool {
-        self.for_file
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(name))
-            || self
-                .on_line
-                .get(&line)
-                .is_some_and(|entries| entries.iter().any(|entry| entry.eq_ignore_ascii_case(name)))
+        let cites = |entry: &String| {
+            entry.eq_ignore_ascii_case(name)
+                || crate::analysis_options::known_error_codes::canonical_name(
+                    &entry.to_ascii_lowercase(),
+                )
+                .is_some_and(|canonical| canonical.eq_ignore_ascii_case(name))
+        };
+        self.for_file.iter().any(cites)
+            || self.on_line.get(&line).is_some_and(|entries| {
+                entries.iter().any(cites)
+            })
     }
 }
 
@@ -2293,6 +2360,390 @@ fn yaml_ignore_entry<'a>(line: &'a str, marker: &str) -> Option<(&'a str, Vec<St
                 .collect(),
         )
     })
+}
+
+/// One Dart-file ignore-comment citation: a diagnostic name, a `type=`
+/// family, or a plugin-qualified `plugin/name` pair (the `ignoredElements`
+/// walk, upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/ignore_comments/ignore_info.dart` :292-472).
+#[derive(Debug, PartialEq, Eq)]
+enum DartIgnoreEntry {
+    /// The lowercased citation (`IgnoredDiagnosticName` — the constructor
+    /// lowercases, ignore_info.dart:35-36).
+    Name(String),
+    /// The lowercased `type=<family>` family (`IgnoredDiagnosticType`).
+    Type(String),
+    /// `plugin/name` — an `IgnoredDiagnosticName` carrying a `pluginName`,
+    /// which never matches a non-plugin row (:40-42); parsed to keep the
+    /// citation walk's shape, dead weight for the engine's non-plugin rows.
+    Plugin(String, String),
+}
+
+impl DartIgnoreEntry {
+    /// The citation-vs-row match (`_matches`, ignore_info.dart:39-76): a
+    /// name citation equals the row's code name, or its lowercased
+    /// `uniqueName` spelling resolves to the code through the registry
+    /// aliases ([`known_error_codes::canonical_name`], :44-51 — the
+    /// `uniqueName` compared after its first period); a `type=` citation
+    /// matches hint, lint, and static-warning rows only (:67-76 — errors
+    /// and syntactic codes match no family).
+    fn matches(&self, name: &str, dtype: DiagnosticType) -> bool {
+        match self {
+            Self::Name(citation) => {
+                citation.eq_ignore_ascii_case(name)
+                    || crate::analysis_options::known_error_codes::canonical_name(citation)
+                        .is_some_and(|canonical| canonical.eq_ignore_ascii_case(name))
+            }
+            Self::Type(family) => match dtype {
+                DiagnosticType::Hint => family == "hint",
+                DiagnosticType::Lint => family == "lint",
+                DiagnosticType::StaticWarning => family == "warning",
+                _ => false,
+            },
+            Self::Plugin(..) => false,
+        }
+    }
+}
+
+/// The Dart-file ignore-comment suppression table (`IgnoreInfo.forDart`,
+/// upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/ignore_comments/ignore_info.dart` :118-141):
+/// `// ignore:` / `/// ignore:` citations suppress by 1-based line — a
+/// comment alone on its line targets the NEXT line (:123-133) — plus `//
+/// ignore_for_file:` entries file-wide (the for-file head tolerates no
+/// extra-slash run, :259-263, unlike the line form :226-229). Citations
+/// exist only in real line comments: the walk tracks the scanner's string
+/// and block-comment states, so an `ignore:` spelling inside a literal or
+/// a block comment never cites.
+#[derive(Default)]
+struct DartIgnores {
+    /// 1-based line -> citations (`ignore:` heads).
+    on_line: FxHashMap<u32, Vec<DartIgnoreEntry>>,
+    /// `ignore_for_file:` citations.
+    for_file: Vec<DartIgnoreEntry>,
+}
+
+/// One nesting frame of the citation walk's string state: inside a literal,
+/// or inside a `${...}` interpolation hole of one (holes hold code again —
+/// nested literals included).
+#[derive(Clone, Copy)]
+enum StringFrame {
+    Str {
+        quote: u8,
+        triple: bool,
+        raw: bool,
+    },
+    Interp {
+        depth: u32,
+    },
+}
+
+impl DartIgnores {
+    /// Whether a row named `name` (the lowercase code name) of family
+    /// `dtype` reported on 1-based `line` is suppressed (`_ignoredAt`,
+    /// :186-212).
+    fn ignored(&self, line: u32, name: &str, dtype: DiagnosticType) -> bool {
+        self.for_file
+            .iter()
+            .any(|entry| entry.matches(name, dtype))
+            || self
+                .on_line
+                .get(&line)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.matches(name, dtype)))
+    }
+
+    /// Parses one Dart file's ignore comments: a single byte walk holding
+    /// the scanner's string/comment states, feeding every line comment's
+    /// lexeme to the head classifiers.
+    fn parse(text: &str) -> Self {
+        let mut info = Self::default();
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        // 1-based line of `i`, and its line's first byte — the alone-on-its
+        // line test's window.
+        let (mut line, mut line_start) = (1u32, 0usize);
+        let mut stack: Vec<StringFrame> = Vec::new();
+        while i < bytes.len() {
+            if let Some(&frame) = stack.last() {
+                match frame {
+                    StringFrame::Interp { depth } => {
+                        stack.pop();
+                        match bytes[i] {
+                            b'{' => {
+                                stack.push(StringFrame::Interp { depth: depth + 1 });
+                                i += 1;
+                            }
+                            b'}' => {
+                                // Depth 1 is the hole's own brace: closing
+                                // it resumes the string (the frame below).
+                                if depth > 1 {
+                                    stack.push(StringFrame::Interp { depth: depth - 1 });
+                                }
+                                i += 1;
+                            }
+                            b'\n' => {
+                                line += 1;
+                                line_start = i + 1;
+                                i += 1;
+                            }
+                            b'\'' | b'"' => {
+                                let (quote, triple) = quote_run(bytes, i);
+                                let raw = raw_prefix(bytes, i);
+                                i += if triple { 3 } else { 1 };
+                                stack.push(StringFrame::Interp { depth });
+                                stack.push(StringFrame::Str {
+                                    quote,
+                                    triple,
+                                    raw,
+                                });
+                            }
+                            _ => {
+                                stack.push(StringFrame::Interp { depth });
+                                i += 1;
+                            }
+                        }
+                    }
+                    StringFrame::Str {
+                        quote,
+                        triple,
+                        raw,
+                    } => {
+                        let b = bytes[i];
+                        if !triple && b == b'\n' {
+                            // Unterminated single-line literal: the scanner
+                            // recovers at the line end; so does the walk.
+                            stack.pop();
+                            line += 1;
+                            line_start = i + 1;
+                            i += 1;
+                        } else if b == b'\\' && !raw {
+                            i += 1;
+                            if i < bytes.len() {
+                                if bytes[i] == b'\n' {
+                                    line += 1;
+                                    line_start = i + 1;
+                                }
+                                i += 1;
+                            }
+                        } else if b == b'$' && !raw && bytes.get(i + 1) == Some(&b'{') {
+                            stack.push(StringFrame::Interp { depth: 1 });
+                            i += 2;
+                        } else if b == quote
+                            && (!triple
+                                || (bytes.get(i + 1) == Some(&quote)
+                                    && bytes.get(i + 2) == Some(&quote)))
+                        {
+                            stack.pop();
+                            i += if triple { 3 } else { 1 };
+                        } else {
+                            if b == b'\n' {
+                                line += 1;
+                                line_start = i + 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    // The line comment's lexeme runs to the line end; its
+                    // alone-on-its-line test reads the bytes before the `//`
+                    // (forDart :123-133's `beforeMatch`).
+                    let end = bytes[i..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(bytes.len(), |at| i + at);
+                    let target =
+                        if text[line_start..i].trim().is_empty() {
+                            line + 1
+                        } else {
+                            line
+                        };
+                    parse_ignore_lexeme(&text[i..end], target, &mut info);
+                    i = end;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    // Block comments nest; their content never cites
+                    // (`isIgnoreComment` requires a `//` head, :217-245).
+                    let mut depth = 1u32;
+                    i += 2;
+                    while i < bytes.len() && depth > 0 {
+                        match bytes[i] {
+                            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                                depth += 1;
+                                i += 2;
+                            }
+                            b'*' if bytes.get(i + 1) == Some(&b'/') => {
+                                depth -= 1;
+                                i += 2;
+                            }
+                            b'\n' => {
+                                line += 1;
+                                line_start = i + 1;
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                }
+                b'\n' => {
+                    line += 1;
+                    line_start = i + 1;
+                    i += 1;
+                }
+                b'\'' | b'"' => {
+                    let (quote, triple) = quote_run(bytes, i);
+                    let raw = raw_prefix(bytes, i);
+                    i += if triple { 3 } else { 1 };
+                    stack.push(StringFrame::Str {
+                        quote,
+                        triple,
+                        raw,
+                    });
+                }
+                _ => i += 1,
+            }
+        }
+        info
+    }
+}
+
+/// The quote character and triple-ness of the string literal opening at
+/// `bytes[at]` (`'` or `"`; three equal quotes open a triple form).
+fn quote_run(bytes: &[u8], at: usize) -> (u8, bool) {
+    let quote = bytes[at];
+    let triple = bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote);
+    (quote, triple)
+}
+
+/// Whether the string whose opening quotes sit at `at` carries a standalone
+/// `r` raw prefix — the byte before the quotes is `r` and itself not an
+/// identifier continuation (Dart's raw spelling is the lowercase `r` only).
+fn raw_prefix(bytes: &[u8], at: usize) -> bool {
+    at >= 1
+        && bytes[at - 1] == b'r'
+        && (at < 2 || (!bytes[at - 2].is_ascii_alphanumeric() && bytes[at - 2] != b'_'))
+}
+
+/// Classifies one line-comment lexeme and records its citations
+/// (`isIgnoreComment`/`isIgnoreForFileComment` heads, ignore_info.dart
+/// :217-289): the line form tolerates any extra-slash run before the
+/// spaces, the for-file form exactly `//`.
+fn parse_ignore_lexeme(lexeme: &str, line: u32, info: &mut DartIgnores) {
+    let body = lexeme.strip_prefix("//").expect("line comment lexeme");
+    let line_form = body.trim_start_matches('/').trim_start();
+    let for_file_form = body.trim_start();
+    if let Some(rest) = line_form.strip_prefix("ignore:") {
+        info.on_line.entry(line).or_default().extend(citations(rest));
+    } else if let Some(rest) = for_file_form.strip_prefix("ignore_for_file:") {
+        info.for_file.extend(citations(rest));
+    }
+}
+
+/// Whether `b` is the whitespace the citation walk skips (Dart
+/// `isWhitespace` minus the line breaks a lexeme cannot contain).
+fn citation_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | 0x0B | 0x0C)
+}
+
+/// The comma-separated citations after an ignore head (the
+/// `ignoredElements` walk, ignore_info.dart:292-472): words of
+/// `[A-Za-z_][A-Za-z0-9_]*`, `type=<family>` forms, `plugin/name` pairs.
+/// The list continues only through commas; everything after the first
+/// non-conforming character is unstructured comment text (`IgnoredDiagnosticComment`,
+/// :15-24 — never matching, so the walk simply stops).
+fn citations(rest: &str) -> Vec<DartIgnoreEntry> {
+    let mut entries = Vec::new();
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < bytes.len() && citation_space(bytes[i]) {
+            i += 1;
+        }
+        let Some(&b) = bytes.get(i) else {
+            return entries;
+        };
+        // A word starts with a letter or underscore (:308-313); anything
+        // else ends the citation list.
+        if !b.is_ascii_alphabetic() && b != b'_' {
+            return entries;
+        }
+        let word_start = i;
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let word = &rest[word_start..i];
+        if word.eq_ignore_ascii_case("type") {
+            while i < bytes.len() && citation_space(bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&b'=') {
+                return entries;
+            }
+            i += 1;
+            while i < bytes.len() && citation_space(bytes[i]) {
+                i += 1;
+            }
+            let Some(&b) = bytes.get(i) else {
+                return entries;
+            };
+            if !b.is_ascii_alphabetic() && b != b'_' {
+                return entries;
+            }
+            let family_start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            // The family word must end at whitespace or a comma (:372-387).
+            if i < bytes.len() && !citation_space(bytes[i]) && bytes[i] != b',' {
+                return entries;
+            }
+            entries.push(DartIgnoreEntry::Type(
+                rest[family_start..i].to_ascii_lowercase(),
+            ));
+        } else {
+            let head = word.to_ascii_lowercase();
+            if bytes.get(i) == Some(&b'/') {
+                // `plugin/name` (:398-423): the first word is the plugin
+                // name, the second the diagnostic name.
+                i += 1;
+                let Some(&b) = bytes.get(i) else {
+                    return entries;
+                };
+                if !b.is_ascii_alphabetic() && b != b'_' {
+                    return entries;
+                }
+                let name_start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                entries.push(DartIgnoreEntry::Plugin(
+                    head,
+                    rest[name_start..i].to_ascii_lowercase(),
+                ));
+            } else {
+                // The name must end at whitespace or a comma (:424-439 — a
+                // URL like `ignore: http://x` cites nothing).
+                if i < bytes.len() && !citation_space(bytes[i]) && bytes[i] != b',' {
+                    return entries;
+                }
+                entries.push(DartIgnoreEntry::Name(head));
+            }
+        }
+        // The list continues only through a comma (:450-469).
+        while i < bytes.len() && citation_space(bytes[i]) {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b',') {
+            return entries;
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -3288,6 +3739,180 @@ mod tests {
             "the second path's row set follows: {:?}",
             rows[1].message
         );
+    }
+
+    /// The options-file rows' YAML ignore face: the file's own
+    /// `# ignore:` citation on a row's line — or a file-wide
+    /// `# ignore_for_file:` — drops the row before it joins the output,
+    /// while a wrong-code citation suppresses nothing (the
+    /// `IgnoreInfo.forYaml` filter, upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart` :80-83).
+    #[test]
+    fn option_rows_honor_yaml_ignore_comments() {
+        let (root, mut engine) = facade_engine();
+        let empty = |root: &Path| {
+            PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+                .map(|config| (config, root.to_path_buf()))
+                .expect("empty config")
+        };
+        let rows_for = |engine: &mut Engine, text: &str| {
+            std::fs::write(root.join("analysis_options.yaml"), text).expect("options");
+            let (config, config_dir) = empty(&root);
+            let options = Arc::new(analysis_options::AnalysisOptions::load(
+                &root.join("analysis_options.yaml"),
+                &config,
+                &config_dir,
+            ));
+            assert!(
+                !options.issues.is_empty(),
+                "the broken include must record a real row: {text:?}"
+            );
+            engine.state.options.insert(root.clone(), options);
+            engine.option_issue_rows()
+        };
+
+        // The baseline: the missing include reports.
+        assert_eq!(rows_for(&mut engine, "include: missing.yaml\n").len(), 1);
+        // A wrong-code citation is not a citation.
+        assert_eq!(
+            rows_for(
+                &mut engine,
+                "include: missing.yaml # ignore: some_other_code\n"
+            )
+            .len(),
+            1
+        );
+        // The row's own line carries the citation: suppressed.
+        assert!(
+            rows_for(
+                &mut engine,
+                "include: missing.yaml # ignore: include_file_not_found\n"
+            )
+            .is_empty()
+        );
+        // The citation alone on its line targets the row's line below.
+        assert!(
+            rows_for(
+                &mut engine,
+                "# ignore: include_file_not_found\ninclude: missing.yaml\n"
+            )
+            .is_empty()
+        );
+        // The file-wide citation suppresses wherever the row lands.
+        assert!(
+            rows_for(
+                &mut engine,
+                "# ignore_for_file: include_file_not_found\ninclude: missing.yaml\n"
+            )
+            .is_empty()
+        );
+    }
+
+    /// The Dart-file ignore table's matching rules, mirrored from
+    /// `IgnoreInfo` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/ignore_comments/ignore_info.dart`): head
+    /// forms, line scope, `type=` families, plugin-qualified citations, and
+    /// the string/block-comment bounds of a citation.
+    #[test]
+    fn dart_ignores_mirror_the_upstream_matching_rules() {
+        const WARN: DiagnosticType = DiagnosticType::StaticWarning;
+        const NAME: &str = "text_direction_code_point_in_comment";
+        let suppresses = |text: &str, line: u32, name: &str, dtype: DiagnosticType| {
+            DartIgnores::parse(text).ignored(line, name, dtype)
+        };
+
+        // Same-line scope: the citation on the row's line only.
+        assert!(suppresses(
+            "void f() {} // ignore: text_direction_code_point_in_comment\n",
+            1,
+            NAME,
+            WARN
+        ));
+        assert!(!suppresses(
+            "void f() {} // ignore: text_direction_code_point_in_comment\nvoid g() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
+        // Alone on its line: the NEXT line (:123-133).
+        assert!(suppresses(
+            "// ignore: text_direction_code_point_in_comment\nvoid f() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
+        assert!(!suppresses(
+            "// ignore: text_direction_code_point_in_comment\nvoid f() {}\n",
+            1,
+            NAME,
+            WARN
+        ));
+        // The line head tolerates the `///` extra-slash run (:226-229).
+        assert!(suppresses(
+            "/// ignore: text_direction_code_point_in_comment\nvoid f() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
+        // The for-file head tolerates no extra slashes (:259-263), and
+        // suppresses file-wide once recognized.
+        let slashed = "/// ignore_for_file: text_direction_code_point_in_comment\nvoid f() {}\n";
+        assert!(!suppresses(slashed, 1, NAME, WARN) && !suppresses(slashed, 2, NAME, WARN));
+        assert!(suppresses(
+            "// ignore_for_file: text_direction_code_point_in_comment\nvoid f() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
+        // A wrong code is not a citation.
+        assert!(!suppresses("// ignore: dead_code\nvoid f() {}\n", 2, NAME, WARN));
+        // The `type=` family form matches its family only (:67-76).
+        assert!(suppresses("// ignore: type=warning\nvoid f() {}\n", 2, "any_code", WARN));
+        assert!(!suppresses(
+            "// ignore: type=warning\nvoid f() {}\n",
+            2,
+            "any_code",
+            DiagnosticType::Lint
+        ));
+        // A plugin-qualified citation never matches a non-plugin row (:40-42).
+        assert!(!suppresses(
+            "// ignore: some_plugin/text_direction_code_point_in_comment\nvoid f() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
+        // A `uniqueName` spelling resolves through the registry aliases
+        // (:44-51).
+        assert!(suppresses(
+            "// ignore: unnecessary_type_check_false\nvoid f() {}\n",
+            2,
+            "unnecessary_type_check",
+            WARN
+        ));
+        // Citations exist only in real line comments: an `ignore:` spelling
+        // inside a literal, a raw literal, or a block comment never cites.
+        let literal = "var s = '// ignore: text_direction_code_point_in_comment';\nvoid f() {}\n";
+        assert!(!suppresses(literal, 1, NAME, WARN) && !suppresses(literal, 2, NAME, WARN));
+        let raw = "var s = r'// ignore: text_direction_code_point_in_comment';\nvoid f() {}\n";
+        assert!(!suppresses(raw, 2, NAME, WARN));
+        let block = "/* // ignore: text_direction_code_point_in_comment */\nvoid f() {}\n";
+        assert!(!suppresses(block, 1, NAME, WARN) && !suppresses(block, 2, NAME, WARN));
+        // An interpolation hole holds code again (its literal's contents
+        // never cite), and the outer literal resumes after the hole — the
+        // trailing comment on the resumed code line does cite.
+        let interp = "var s = 'a ${'// ignore: x'} b'; // ignore: text_direction_code_point_in_comment\n";
+        assert!(!suppresses(
+            "var s = 'a ${'// ignore: text_direction_code_point_in_comment'} b';\nvoid f() {}\n",
+            1,
+            NAME,
+            WARN
+        ) && !suppresses(
+            "var s = 'a ${'// ignore: text_direction_code_point_in_comment'} b';\nvoid f() {}\n",
+            2,
+            NAME,
+            WARN
+        ));
+        assert!(suppresses(interp, 1, NAME, WARN));
     }
 
     /// A throwaway three-package workspace: the root `t`, an in-tree nested

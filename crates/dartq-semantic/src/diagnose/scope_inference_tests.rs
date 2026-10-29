@@ -250,7 +250,11 @@ fn a_named_constructor_outranks_members_and_statics_do_not_inherit() {
 /// unprefixed `fb.Reader()`): the created value rows stack over the whole
 /// written span, so a following member never pops the enclosing
 /// assignment's receiver — `b ??= fb.R().get(0)` reads `get` on the
-/// created `R`, never on `b` (dart analyze 3.13.1: silent).
+/// created `R`, never on `b` (dart analyze 3.13.1: silent). The created
+/// value conforms to the write target (the import's `get` returns the
+/// target's own head) — an incompatible value is the oracle's
+/// `invalid_assignment` (#2789's declared-subtype negative), noise this
+/// row-folding pin does not ask about.
 #[test]
 fn a_prefixed_creation_folds_a_value_row_under_its_members() {
     let source = |call: &str| {
@@ -267,7 +271,7 @@ fn a_prefixed_creation_folds_a_value_row_under_its_members() {
             &[RigImport {
                 uri: "package:probe/reader.dart",
                 prefix: Some("fb"),
-                source: "class R { int get(int i) => i; }\n",
+                source: "class B {}\nclass R { B get(int i) => i; }\n",
             }],
         );
         assert_silent(&report);

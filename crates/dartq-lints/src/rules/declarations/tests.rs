@@ -5968,6 +5968,70 @@ fn prefer_final_locals_gate() {
     assert!(f.run(&one_rule("prefer_final_locals")).is_empty());
 }
 
+/// The case-clause faces (`prefer_final_locals.dart:79-124`): an if-case
+/// or switch-case declared-variable pattern reports at the pattern node —
+/// a typed row's span covers the type (`int x`); a `final` field stays
+/// silent; a join reports its first binder only (:63-70).
+#[test]
+fn prefer_final_locals_case_patterns() {
+    let f = Fixture::parse("void f(Object o) {\n  if (o case [int x, final int y]) x;\n}\n");
+    let lints = f.run(&one_rule("prefer_final_locals"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "int", 0));
+    assert_eq!(lints[0].range, start..start + 5, "{lints:?}");
+
+    let f =
+        Fixture::parse("void f(Object o) {\n  switch (o) {\n    case (int a, int b):\n      a; b;\n  }\n}\n");
+    let lints = f.run(&one_rule("prefer_final_locals"));
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let first = utf16_at(&f, tok(&f.source, &f.tokens, "int", 0));
+    let second = utf16_at(&f, tok(&f.source, &f.tokens, "int", 1));
+    assert_eq!(lints[0].range, first..first + 5, "{lints:?}");
+    assert_eq!(lints[1].range, second..second + 5, "{lints:?}");
+
+    let f = Fixture::parse(
+        "void fn(Object val) {\n  if (val case String(:var isEmpty) || List(:var isEmpty)) {}\n}\n",
+    );
+    let lints = f.run(&one_rule("prefer_final_locals"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "var", 0));
+    assert_eq!(lints[0].range, start..start + 11, "{lints:?}");
+}
+
+/// The for-each pattern face (:126-140): every binder reports at its own
+/// node; a `final` for-each pattern stays silent.
+#[test]
+fn prefer_final_locals_for_each_patterns() {
+    let f = Fixture::parse("void f() {\n  for (var (a, b) in [(1, 2)]) {}\n}\n");
+    let lints = f.run(&one_rule("prefer_final_locals"));
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let a = utf16_at(&f, tok(&f.source, &f.tokens, "a", 0));
+    let b = utf16_at(&f, tok(&f.source, &f.tokens, "b", 0));
+    assert_eq!(lints[0].range, a..a + 1, "{lints:?}");
+    assert_eq!(lints[1].range, b..b + 1, "{lints:?}");
+
+    let f = Fixture::parse("void f() {\n  for (final (a, b) in [(1, 2)]) {}\n}\n");
+    assert!(f.run(&one_rule("prefer_final_locals")).is_empty());
+}
+
+/// The statement face (`visitPatternVariableDeclaration`, :144-163): a
+/// `var <pattern> = ...` reports once at the keyword; a mutated binder
+/// stays silent; a just-wildcards pattern binds nothing and stays silent.
+#[test]
+fn prefer_final_locals_pattern_variable_declarations() {
+    let f = Fixture::parse("void f() {\n  var [a, b] = ['a', 'b'];\n  print(a); print(b);\n}\n");
+    let lints = f.run(&one_rule("prefer_final_locals"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let keyword = tok(&f.source, &f.tokens, "var", 0);
+    assert_eq!(lints[0].range, utf16_at(&f, keyword)..utf16_at(&f, keyword) + 3);
+
+    let f = Fixture::parse("void f() {\n  var [a] = [1];\n  a = 2;\n}\n");
+    assert!(f.run(&one_rule("prefer_final_locals")).is_empty());
+
+    let f = Fixture::parse("void f() {\n  var [_] = [1];\n}\n");
+    assert!(f.run(&one_rule("prefer_final_locals")).is_empty());
+}
+
 /// A call-initialized untyped local reports at the declaration; a
 /// typed one and a literal-initialized one pass.
 #[test]

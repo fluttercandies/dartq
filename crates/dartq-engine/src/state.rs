@@ -168,6 +168,12 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// capture output; the bump invalidates such snapshots and forces
 /// re-capture. The fold moves on the shape lane — the formals ride the
 /// container row this version governs, so `SIGNATURE_VERSION` stays 13.
+/// v21: element models carry the `augment` capture face (#2784 —
+/// `PersistedElements::augmentations` + `decl_kinds`, `serde(default)`).
+/// A v20 payload decodes augment-less, so a warm start would report every
+/// resolved augmentation as `augmentation_without_declaration`; the bump
+/// forks such snapshots and forces re-capture. The columns ride the
+/// element row this version governs, so `SIGNATURE_VERSION` stays 13.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -186,7 +192,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 20;
+const FACTS_SHAPE_VERSION: u32 = 21;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

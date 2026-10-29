@@ -1710,6 +1710,220 @@ pub struct DuplicateDecl {
     pub range: SourceRange,
 }
 
+/// The oracle declaration-kind word of an augmentation capture or target
+/// (upstream Dart SDK source, `pkg/analyzer/lib/src/generated/
+/// error_verifier.dart` `_checkAugmentationWithoutDeclaration` —
+/// `element.kind.displayName`; the `augmentationOfDifferentDeclarationKind`
+/// message interpolates the two words).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AugKind {
+    /// `class` (a named mixin application stays a class row; its form rides
+    /// [`AugTarget::is_mixin_application`]).
+    Class,
+    /// `mixin`.
+    Mixin,
+    /// `enum`.
+    Enum,
+    /// `extension`.
+    Extension,
+    /// `extension type`.
+    ExtensionType,
+    /// `top level variable`.
+    TopLevelVar,
+    /// `function` (a top-level executable, no accessor keyword).
+    Function,
+    /// `getter`.
+    Getter,
+    /// `setter`.
+    Setter,
+    /// `method` (a class-member executable, no accessor keyword).
+    Method,
+    /// `field`.
+    Field,
+    /// `constructor` (factories included; the factory face rides
+    /// [`AugTarget::is_factory`] and the capture's own flags).
+    Constructor,
+    /// `type alias` — never a target: the parser rejects the shape
+    /// (`typedef_augmentation`); the row exists so a `typedef` never
+    /// resolves as a same-name target of another kind.
+    TypeAlias,
+}
+
+impl AugKind {
+    /// The verbatim oracle word the different-kind message interpolates.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Class => "class",
+            Self::Mixin => "mixin",
+            Self::Enum => "enum",
+            Self::Extension => "extension",
+            Self::ExtensionType => "extension type",
+            Self::TopLevelVar => "top level variable",
+            Self::Function => "function",
+            Self::Getter => "getter",
+            Self::Setter => "setter",
+            Self::Method => "method",
+            Self::Field => "field",
+            Self::Constructor => "constructor",
+            Self::TypeAlias => "type alias",
+        }
+    }
+}
+
+/// One augmentation-target kind row: a declaration fact the kept model
+/// surfaces cannot answer, captured at the declaration event. Only the gaps
+/// log here — containers and members read their own tables; every other row
+/// kind exists so the target lookup resolves the exact oracle face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AugTarget {
+    /// The enclosing container's name (class members: the container
+    /// spelling); `None` for top-level rows.
+    pub container: Option<StringId>,
+    /// The lookup spelling: setters under `name=`, constructors by selector
+    /// (the unnamed face under the container's own name), everything else
+    /// by the written name.
+    pub name: StringId,
+    /// The oracle kind word.
+    pub kind: AugKind,
+    /// A `final` variable (top-level or field group): induces no setter.
+    pub is_final: bool,
+    /// A named mixin application (`class B = A with M;`): every augment of
+    /// the name reports `augmentation_of_mixin_application_class`.
+    pub is_mixin_application: bool,
+    /// A `const` constructor (generative) or `const factory`.
+    pub is_const: bool,
+    /// A factory (`factory` head).
+    pub is_factory: bool,
+}
+
+/// One formal parameter of an `augment` declaration: the written facts the
+/// parameter-pair checks compare and the spans the rows anchor at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AugmentFormal {
+    /// The written name; `None` when the parameter is unnamed (the row
+    /// anchors at the parameter's own span instead).
+    pub name: Option<StringId>,
+    /// The name token's span; [`AugmentFormal::MISSING_RANGE`] when unnamed.
+    pub name_range: SourceRange,
+    /// The parameter's own span (first modifier through the name — the
+    /// oracle's `parameter.name ?? parameter` error entity fallback).
+    pub full_range: SourceRange,
+    /// The explicit written type; `None` when the parameter omits it (the
+    /// type-mismatch check compares explicit spellings only).
+    pub ty: Option<Ty>,
+    /// The type annotation's span, present with [`AugmentFormal::ty`].
+    pub ty_range: Option<SourceRange>,
+    /// Required positional.
+    pub required_positional: bool,
+    /// Optional positional.
+    pub optional_positional: bool,
+    /// Named.
+    pub named: bool,
+    /// The `covariant` keyword's span.
+    pub covariant_kw: Option<SourceRange>,
+    /// The `required` keyword's span.
+    pub required_kw: Option<SourceRange>,
+}
+
+impl AugmentFormal {
+    /// The missing-span sentinel (a recovered parameter with no honest
+    /// tokens): consumers must test before anchoring.
+    pub const MISSING_RANGE: SourceRange = SourceRange {
+        offset: u32::MAX,
+        length: 0,
+    };
+
+    /// The row anchor for the parameter (the oracle's
+    /// `formalParameterErrorEntity`: the name token, else the parameter).
+    #[must_use]
+    pub fn entity(&self) -> SourceRange {
+        if self.name_range.offset != Self::MISSING_RANGE.offset {
+            self.name_range
+        } else {
+            self.full_range
+        }
+    }
+}
+
+/// One type parameter of an `augment` declaration: the written name and
+/// bound the type-parameter checks compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AugmentTypeParam {
+    /// The written name.
+    pub name: StringId,
+    /// The name token's span.
+    pub name_range: SourceRange,
+    /// The written bound and its annotation span; `None` when unbounded
+    /// (the bound check is one-directional: an absent bound never reports).
+    pub bound: Option<(Ty, SourceRange)>,
+}
+
+/// The class-family header modifiers an `augment` declaration wrote, each
+/// with its own token span (the extra-modifier rows anchor at the token).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AugmentModifiers {
+    pub abstract_kw: Option<SourceRange>,
+    pub base_kw: Option<SourceRange>,
+    pub final_kw: Option<SourceRange>,
+    pub interface_kw: Option<SourceRange>,
+    pub sealed_kw: Option<SourceRange>,
+    pub mixin_kw: Option<SourceRange>,
+}
+
+/// One `augment` declaration: the written facts the augmentation verifier
+/// compares against its target and the spans its rows anchor at. Captured
+/// only for `augment` declarations — a file without them pays an empty
+/// boxed slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AugmentDecl {
+    /// The oracle kind word.
+    pub kind: AugKind,
+    /// The lookup spelling: setters under `name=`, constructors by selector
+    /// (the unnamed face under the container's name), everything else by
+    /// the written name.
+    pub name: StringId,
+    /// The written name spelling (messages interpolate it).
+    pub display_name: StringId,
+    /// The name token's span (fields' induced-accessor rows anchor here).
+    pub name_range: SourceRange,
+    /// The `augment` keyword's span (the without-declaration and
+    /// missing-modifier anchor).
+    pub augment_kw: SourceRange,
+    /// The enclosing container's name; `None` for top-level declarations.
+    pub container: Option<StringId>,
+    /// The `static` bit (member rows).
+    pub is_static: bool,
+    /// The variable group's `final` modifier (variable rows): a final
+    /// augmentation induces no setter, so the induced-setter check skips.
+    pub is_final: bool,
+    /// The header modifiers (class family).
+    pub modifiers: AugmentModifiers,
+    /// The `extends` keyword's span, present with a written extends clause.
+    pub extends_kw: Option<SourceRange>,
+    /// The written type parameters, in declaration order.
+    pub type_params: Box<[AugmentTypeParam]>,
+    /// The type-parameter list's closing `>` span (the count row anchors
+    /// there when the augmentation declares fewer parameters).
+    pub type_params_close: Option<SourceRange>,
+    /// The written return/variable type; `None` when omitted (`dynamic`).
+    pub return_ty: Option<Ty>,
+    /// The return/variable type annotation's span.
+    pub return_ty_range: Option<SourceRange>,
+    /// The written formal parameters, in declaration order.
+    pub formals: Box<[AugmentFormal]>,
+    /// The parameter list's `(` and `)` spans.
+    pub parens: Option<(SourceRange, SourceRange)>,
+    /// The optional/named group's opening delimiter (`[` or `{`), present
+    /// when the parameter list declares one (the count rows anchor there
+    /// before falling back to a parameter or the `)`).
+    pub group_open: Option<SourceRange>,
+    /// The `const` keyword's span (constructor/factory rows).
+    pub const_kw: Option<SourceRange>,
+    /// The `factory` keyword's span (constructor rows).
+    pub factory_kw: Option<SourceRange>,
+}
+
 /// Everything one compilation unit contributes to the semantic model.
 ///
 /// Built by [`crate::collector::collect`]; queried per library through
@@ -1727,6 +1941,13 @@ pub struct FileElements {
     pub(crate) extension_faces: Box<[ExtensionFace]>,
     pub(crate) duplicates: Box<[DuplicateDecl]>,
     pub(crate) arity_violations: Box<[ArityDecl]>,
+    /// Every `augment` declaration of the unit, in source order (the
+    /// augmentation verifier's capture face).
+    pub(crate) augmentations: Box<[AugmentDecl]>,
+    /// The augmentation-target kind rows (top-level executable accessor
+    /// faces, variable finality, per-constructor const/factory, named mixin
+    /// applications), in source order.
+    pub(crate) decl_kinds: Box<[AugTarget]>,
     /// The top-level const variables whose initializer is one bare const
     /// creation, by name (the cross-library instance-equality face,
     /// [`ConstCreationFace`]).
@@ -1815,6 +2036,23 @@ impl FileElements {
     #[must_use]
     pub fn arity_violations(&self) -> &[ArityDecl] {
         &self.arity_violations
+    }
+
+    /// Every `augment` declaration captured in this unit, in source order
+    /// (the augmentation verifier's facts; empty for models restored from a
+    /// payload written before the face shipped — an under-report).
+    #[must_use]
+    pub fn augmentations(&self) -> &[AugmentDecl] {
+        &self.augmentations
+    }
+
+    /// The declaration-kind rows the augmentation target lookup reads
+    /// (top-level executable accessor faces, variable finality, constructor
+    /// modifier faces, named mixin applications) — the facts the kept model
+    /// surfaces cannot answer, in source order.
+    #[must_use]
+    pub fn decl_kinds(&self) -> &[AugTarget] {
+        &self.decl_kinds
     }
 
     /// The unit's canonical argument pool ([`Ty::Named`] slots index into

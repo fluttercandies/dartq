@@ -604,6 +604,35 @@ fn interpolated_part_of_is_an_orphan_singleton() {
     );
 }
 
+/// The `uri_with_interpolation` row anchors on the whole interpolated
+/// literal — the oracle reports `uriWithInterpolation.at(directive.uri)`,
+/// the URI node's beginToken..endToken (upstream Dart SDK source,
+/// library_analyzer.dart:732/:993/:1031), so `'${'foo'}.dart'` spans from
+/// its opening quote through the closing quote (conformance
+/// `UriWithInterpolationTest.test_library_import`, `2:8|15`), never a
+/// zero-width face at offset 0.
+#[test]
+fn interpolated_uri_row_spans_the_whole_literal() {
+    const A: &str = "import '${'foo'}.dart';\nint f() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/a.dart", A)]);
+    let a_path = fixture.path("lib/a.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&a_path, A.as_bytes());
+    let a = engine.file_table().try_file_id(&a_path).expect("interned");
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("cold");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    let row = &diagnostics[0];
+    assert_eq!(row.code.name, "uri_with_interpolation");
+    assert_eq!(row.file, a, "the row anchors on the directive's file");
+    assert_eq!(row.range.offset, 7, "the opening quote of the literal");
+    assert_eq!(row.range.length, 15, "through the closing quote");
+    assert_eq!(row.message, "URIs can't use string interpolation.");
+}
+
 /// A part URI included twice by one library reports `duplicate_part` on
 /// the second include's URI span (the part-graph's attached-set check).
 /// Oracle probed 3.13.1: error `duplicate_part` on the second directive,

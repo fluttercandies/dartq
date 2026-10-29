@@ -41,6 +41,17 @@ pub struct Flow<'t> {
     /// it — the close's own `end` param is the send-tiling follower for a
     /// bare-send operand, never `rightOperand.end`.
     binary_rhs_end: Option<u32>,
+    /// The else arm's true end offset of the conditional closing next:
+    /// `end_conditional_expression_else_arm` sets it,
+    /// `end_conditional_expression` consumes it — the same follower-tiling
+    /// hazard as `binary_rhs_end` (`flowEnd(elseExpression)`,
+    /// type_analyzer.dart:2616).
+    cond_else_end: Option<u32>,
+    /// The C-style header updaters' true end offset:
+    /// `handle_for_updaters_end` sets it, `handle_for_loop_parts` consumes
+    /// it into the `ForParts` event (the header-anchored dead-row trim
+    /// face, dead_code_verifier.dart:324-326).
+    for_updaters_end: Option<u32>,
     /// Open type-argument groups (nested annotations stack). Each group
     /// collects the argument rows recorded inside it; the parser fires
     /// `begin_type_arguments` at `<` and `end_type_arguments` immediately
@@ -207,6 +218,10 @@ pub struct Flow<'t> {
     /// declared name (dead_code_verifier's node offset — the `Token` of
     /// `Token token = ...;`, oracle-probed).
     type_head: Option<Token>,
+    /// The tested type's head token of the is-check now parsing
+    /// (`begin_is_operator_type` clears, `end_is_operator_type` latches):
+    /// the is-continuation dead row's anchor (see [`Ev::IsOperator`]).
+    is_type_head: Option<Token>,
     /// Inside a local-function statement (between its `begin` and `end`
     /// hooks): gates [`Ev::LocalFnName`] to the statement's own name —
     /// the name event fires before the body, so nested declarations
@@ -294,6 +309,8 @@ impl<'t> Flow<'t> {
             names: FxHashMap::default(),
             names_by_id: Vec::new(),
             binary_rhs_end: None,
+            cond_else_end: None,
+            for_updaters_end: None,
             type_arg_groups: Vec::new(),
             type_args: vec![Vec::new()],
             non_promotions: vec![Vec::new()],
@@ -324,6 +341,7 @@ impl<'t> Flow<'t> {
             top_level: FxHashMap::default(),
             top_last_type: None,
             type_head: None,
+            is_type_head: None,
             in_local_fn: false,
             top_decl: None,
             container_depth: 0,
@@ -937,6 +955,12 @@ impl<'t> Flow<'t> {
         // The interned name lexemes: the send fold's class-head face reads
         // the callee's spelling (`x = C()` vs a lowercase function call).
         interp.names = &self.names_by_id;
+        // An arrow body's terminator rides no StmtEnd (the `;` closes the
+        // declaration, after the body's replay) — hand the outer close its
+        // end so a still-open interval folds to the body's `node.end`.
+        if self.kind(end) == Some(dartq_scanner::TokenKind::Semicolon) {
+            interp.outer_exec_end = end.range.end();
+        }
         interp.run(&events);
         if interp.bailed {
             // The step budget ran out mid-replay (a non-converging event
@@ -1915,6 +1939,10 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::ForBegin { span: token });
     }
 
+    fn handle_for_updaters_end(&mut self, updaters_last: Token) {
+        self.for_updaters_end = Some(updaters_last.range.end());
+    }
+
     fn handle_for_loop_parts(
         &mut self,
         _for_kw: Token,
@@ -1923,9 +1951,11 @@ impl ParserListener for Flow<'_> {
         right_separator: Token,
         _expression_count: usize,
     ) {
+        let updaters_end = self.for_updaters_end.take().unwrap_or(0);
         self.record(Ev::ForParts {
             left_sep: left_separator,
             right_sep: right_separator,
+            updaters_end,
         });
     }
 
@@ -2415,6 +2445,10 @@ impl ParserListener for Flow<'_> {
     }
 
     fn begin_is_operator_type(&mut self, _operator: Token) {
+        // The tested type's head latch opens fresh: a stale `type_head`
+        // from an earlier construct must not anchor this is-check's dead
+        // row when recovery parses no type at all.
+        self.is_type_head = None;
         self.record(Ev::IsBegin);
     }
 
@@ -2423,11 +2457,23 @@ impl ParserListener for Flow<'_> {
     // before `handleIsOperator`), so the flow's completion pair is
     // emitted there: the interp applies the branch at `IsEnd` from the
     // `(is_not, tested)` state `IsOperator` establishes.
-    fn end_is_operator_type(&mut self, _operator: Token) {}
+    //
+    // The dead-row anchor latches here: the type annotation parsed just
+    // before this hook set `type_head` to its first token — the official
+    // walk's first unreachable node after a Never-typed operand's exit
+    // (an `is` continuation whose operand will not complete,
+    // `DeadCodeTest/test_isExpression_type`: the `DEAD_CODE` row runs
+    // from the tested type's head to the covering body's end). A
+    // type-less recovery keeps the `is` operator token itself.
+    fn end_is_operator_type(&mut self, operator: Token) {
+        self.is_type_head = Some(self.type_head.unwrap_or(operator));
+    }
 
-    fn handle_is_operator(&mut self, _is_operator: Token, not: Option<Token>) {
+    fn handle_is_operator(&mut self, is_operator: Token, not: Option<Token>) {
+        let type_head = self.is_type_head.take().unwrap_or(is_operator);
         self.record(Ev::IsOperator {
             is_not: not.is_some(),
+            type_head,
         });
         self.record(Ev::IsEnd);
     }
@@ -2570,9 +2616,17 @@ impl ParserListener for Flow<'_> {
         });
     }
 
+    fn end_conditional_expression_else_arm(&mut self, else_last: Token) {
+        self.cond_else_end = Some(else_last.range.end());
+    }
+
     fn end_conditional_expression(&mut self, _question: Token, colon: Token, end: Token) {
         // The else arm starts at the token after the colon (official
-        // `flowEnd(elseExpression)` rows span the arm's own range).
+        // `flowEnd(elseExpression)` rows span the arm's own range). The
+        // arm's end prefers the pre-close hook's true last token: the
+        // `end` param tiles a bare-send operand through its follower
+        // (mirroring `binary_rhs_end`).
+        let end = self.cond_else_end.take().unwrap_or_else(|| end.range.end());
         let else_begin = self
             .tokens
             .next(colon.id as usize)
@@ -2580,14 +2634,24 @@ impl ParserListener for Flow<'_> {
             .unwrap_or(colon);
         self.record(Ev::CondEnd {
             else_begin,
-            end: end.range.end(),
+            end,
         });
     }
 
-    fn handle_dot_access(&mut self, _token: Token, member: Token, is_null_aware: bool) {
+    fn handle_dot_access(&mut self, token: Token, member: Token, is_null_aware: bool) {
+        // The member's own identifier (the first token after the dot): the
+        // dead-node poll's anchor. The `member` param tiles a completed
+        // send through its follower (#585), one token past the access —
+        // `doNotReturn().hashCode;`'s tile is the `;`, never the member.
+        let ident = self
+            .tokens
+            .next(token.id as usize)
+            .and_then(|index| self.span_at(index))
+            .unwrap_or(member);
         self.record(Ev::DotAccess {
             null_aware: is_null_aware,
             member,
+            ident,
         });
     }
 
@@ -2599,13 +2663,14 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::NullAwareMemberBegin);
     }
 
-    fn handle_indexed_expression(&mut self, question: Option<Token>, _open: Token, _close: Token) {
+    fn handle_indexed_expression(&mut self, question: Option<Token>, _open: Token, close: Token) {
         self.record(Ev::IndexAccess {
             null_aware: question.is_some(),
+            close_end: close.range.end(),
         });
     }
 
-    fn handle_send(&mut self, _begin: Token, _end: Token) {
+    fn handle_send(&mut self, _begin: Token, end: Token) {
         // The invocation's own method type arguments (`C<int>()`) complete
         // with no head `handle_type` to consume them — the head is the
         // callee identifier — so they ride the send (the implicit-creation
@@ -2614,11 +2679,16 @@ impl ParserListener for Flow<'_> {
         // next construct's type row (the same posture
         // `handle_object_pattern` takes for its head-less group).
         let args = std::mem::take(&mut self.pending_type_args);
-        self.record(Ev::Send { args });
+        self.record(Ev::Send {
+            args,
+            end: end.range.end(),
+        });
     }
 
-    fn handle_send_without_arguments(&mut self, _begin: Token, _end: Token, _next: Token) {
-        self.record(Ev::SendNoArgs);
+    fn handle_send_without_arguments(&mut self, _begin: Token, end: Token, _next: Token) {
+        self.record(Ev::SendNoArgs {
+            end: end.range.end(),
+        });
     }
 
     fn begin_arguments(&mut self, _token: Token) {

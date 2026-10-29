@@ -1166,6 +1166,7 @@ impl GapPass {
             Ev::ForParts {
                 left_sep,
                 right_sep,
+                ..
             } => {
                 let (left, right) = (left_sep.range.offset, right_sep.range.offset);
                 let (base, pre) = match self.stack.last() {
@@ -1831,7 +1832,7 @@ impl GapPass {
                 self.pop_val();
                 self.markers.push(Mk::OTHER);
             }
-            Ev::Send { .. } | Ev::SendNoArgs => {
+            Ev::Send { .. } | Ev::SendNoArgs { .. } => {
                 // The bare head's own send fires mid-parse — before the
                 // selector's member name streams — so it must not consume
                 // the value marker: the member access (`x.y`), the mounted

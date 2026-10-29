@@ -70,6 +70,15 @@ pub struct PersistedElements {
     /// defers exactly as a pre-column binary did).
     #[serde(default)]
     pub const_creations: Vec<(u32, PersistedConstCreation)>,
+    /// The unit's `augment` declarations, in source order (the #2784
+    /// augmentation verifier's capture face). Additive: `default` so
+    /// pre-face payloads decode with no rows.
+    #[serde(default)]
+    pub augmentations: Vec<PersistedAugment>,
+    /// The augmentation-target kind rows, in source order. Additive like
+    /// `augmentations`.
+    #[serde(default)]
+    pub decl_kinds: Vec<PersistedAugTarget>,
 }
 
 /// One [`crate::model::ConstCreationFace`] in payload form.
@@ -392,6 +401,166 @@ pub struct PersistedDuplicate {
     pub range: PersistedRange,
 }
 
+/// The `augment` declaration family's mirrors (the #2784 augmentation
+/// verifier's capture face): plain-data projections of
+/// `crate::model::AugmentDecl` / `AugTarget`. Additive columns (`default`
+/// on the element payload) so payloads persisted before the face existed
+/// decode with no rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedAugKind {
+    Class,
+    Mixin,
+    Enum,
+    Extension,
+    ExtensionType,
+    TopLevelVar,
+    Function,
+    Getter,
+    Setter,
+    Method,
+    Field,
+    Constructor,
+    TypeAlias,
+}
+
+impl PersistedAugKind {
+    fn of(kind: crate::model::AugKind) -> Self {
+        match kind {
+            crate::model::AugKind::Class => Self::Class,
+            crate::model::AugKind::Mixin => Self::Mixin,
+            crate::model::AugKind::Enum => Self::Enum,
+            crate::model::AugKind::Extension => Self::Extension,
+            crate::model::AugKind::ExtensionType => Self::ExtensionType,
+            crate::model::AugKind::TopLevelVar => Self::TopLevelVar,
+            crate::model::AugKind::Function => Self::Function,
+            crate::model::AugKind::Getter => Self::Getter,
+            crate::model::AugKind::Setter => Self::Setter,
+            crate::model::AugKind::Method => Self::Method,
+            crate::model::AugKind::Field => Self::Field,
+            crate::model::AugKind::Constructor => Self::Constructor,
+            crate::model::AugKind::TypeAlias => Self::TypeAlias,
+        }
+    }
+}
+
+impl From<PersistedAugKind> for crate::model::AugKind {
+    fn from(kind: PersistedAugKind) -> Self {
+        match kind {
+            PersistedAugKind::Class => Self::Class,
+            PersistedAugKind::Mixin => Self::Mixin,
+            PersistedAugKind::Enum => Self::Enum,
+            PersistedAugKind::Extension => Self::Extension,
+            PersistedAugKind::ExtensionType => Self::ExtensionType,
+            PersistedAugKind::TopLevelVar => Self::TopLevelVar,
+            PersistedAugKind::Function => Self::Function,
+            PersistedAugKind::Getter => Self::Getter,
+            PersistedAugKind::Setter => Self::Setter,
+            PersistedAugKind::Method => Self::Method,
+            PersistedAugKind::Field => Self::Field,
+            PersistedAugKind::Constructor => Self::Constructor,
+            PersistedAugKind::TypeAlias => Self::TypeAlias,
+        }
+    }
+}
+
+/// The header modifiers an `augment` declaration wrote, each with its own
+/// token span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAugmentModifiers {
+    pub abstract_kw: Option<PersistedRange>,
+    pub base_kw: Option<PersistedRange>,
+    pub final_kw: Option<PersistedRange>,
+    pub interface_kw: Option<PersistedRange>,
+    pub sealed_kw: Option<PersistedRange>,
+    pub mixin_kw: Option<PersistedRange>,
+}
+
+impl PersistedAugmentModifiers {
+    fn of(m: &crate::model::AugmentModifiers) -> Self {
+        Self {
+            abstract_kw: m.abstract_kw.map(PersistedRange::of),
+            base_kw: m.base_kw.map(PersistedRange::of),
+            final_kw: m.final_kw.map(PersistedRange::of),
+            interface_kw: m.interface_kw.map(PersistedRange::of),
+            sealed_kw: m.sealed_kw.map(PersistedRange::of),
+            mixin_kw: m.mixin_kw.map(PersistedRange::of),
+        }
+    }
+}
+
+impl From<PersistedAugmentModifiers> for crate::model::AugmentModifiers {
+    fn from(m: PersistedAugmentModifiers) -> Self {
+        Self {
+            abstract_kw: m.abstract_kw.map(PersistedRange::source_range),
+            base_kw: m.base_kw.map(PersistedRange::source_range),
+            final_kw: m.final_kw.map(PersistedRange::source_range),
+            interface_kw: m.interface_kw.map(PersistedRange::source_range),
+            sealed_kw: m.sealed_kw.map(PersistedRange::source_range),
+            mixin_kw: m.mixin_kw.map(PersistedRange::source_range),
+        }
+    }
+}
+
+/// One formal parameter of an `augment` declaration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAugmentFormal {
+    pub name: Option<u32>,
+    pub name_range: PersistedRange,
+    pub full_range: PersistedRange,
+    pub ty: Option<PersistedTy>,
+    pub ty_range: Option<PersistedRange>,
+    pub required_positional: bool,
+    pub optional_positional: bool,
+    pub named: bool,
+    pub covariant_kw: Option<PersistedRange>,
+    pub required_kw: Option<PersistedRange>,
+}
+
+/// One type parameter of an `augment` declaration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAugmentTypeParam {
+    pub name: u32,
+    pub name_range: PersistedRange,
+    pub bound: Option<(PersistedTy, PersistedRange)>,
+}
+
+/// One `augment` declaration of the unit, in source order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAugment {
+    pub kind: PersistedAugKind,
+    pub name: u32,
+    pub display_name: u32,
+    pub name_range: PersistedRange,
+    pub augment_kw: PersistedRange,
+    pub container: Option<u32>,
+    pub is_static: bool,
+    pub is_final: bool,
+    pub modifiers: PersistedAugmentModifiers,
+    pub extends_kw: Option<PersistedRange>,
+    pub type_params: Vec<PersistedAugmentTypeParam>,
+    pub type_params_close: Option<PersistedRange>,
+    pub return_ty: Option<PersistedTy>,
+    pub return_ty_range: Option<PersistedRange>,
+    pub formals: Vec<PersistedAugmentFormal>,
+    pub parens: Option<(PersistedRange, PersistedRange)>,
+    pub group_open: Option<PersistedRange>,
+    pub const_kw: Option<PersistedRange>,
+    pub factory_kw: Option<PersistedRange>,
+}
+
+/// One augmentation-target kind row (the verifier's introductory-declaration
+/// identity facts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAugTarget {
+    pub container: Option<u32>,
+    pub name: u32,
+    pub kind: PersistedAugKind,
+    pub is_final: bool,
+    pub is_mixin_application: bool,
+    pub is_const: bool,
+    pub is_factory: bool,
+}
+
 /// The per-entry string slice under construction: every referenced
 /// `StringId` gets one slot, first-use ordered.
 struct Slice<'a> {
@@ -649,6 +818,71 @@ impl PersistedElements {
                 )
             })
             .collect();
+        let augmentations = elements
+            .augmentations
+            .iter()
+            .map(|aug| PersistedAugment {
+                kind: PersistedAugKind::of(aug.kind),
+                name: s.id(aug.name),
+                display_name: s.id(aug.display_name),
+                name_range: PersistedRange::of(aug.name_range),
+                augment_kw: PersistedRange::of(aug.augment_kw),
+                container: aug.container.map(|name| s.id(name)),
+                is_static: aug.is_static,
+                is_final: aug.is_final,
+                modifiers: PersistedAugmentModifiers::of(&aug.modifiers),
+                extends_kw: aug.extends_kw.map(PersistedRange::of),
+                type_params: aug
+                    .type_params
+                    .iter()
+                    .map(|p| PersistedAugmentTypeParam {
+                        name: s.id(p.name),
+                        name_range: PersistedRange::of(p.name_range),
+                        bound: p
+                            .bound
+                            .map(|(ty, range)| (s.ty(&ty), PersistedRange::of(range))),
+                    })
+                    .collect(),
+                type_params_close: aug.type_params_close.map(PersistedRange::of),
+                return_ty: aug.return_ty.map(|ty| s.ty(&ty)),
+                return_ty_range: aug.return_ty_range.map(PersistedRange::of),
+                formals: aug
+                    .formals
+                    .iter()
+                    .map(|f| PersistedAugmentFormal {
+                        name: f.name.map(|name| s.id(name)),
+                        name_range: PersistedRange::of(f.name_range),
+                        full_range: PersistedRange::of(f.full_range),
+                        ty: f.ty.map(|ty| s.ty(&ty)),
+                        ty_range: f.ty_range.map(PersistedRange::of),
+                        required_positional: f.required_positional,
+                        optional_positional: f.optional_positional,
+                        named: f.named,
+                        covariant_kw: f.covariant_kw.map(PersistedRange::of),
+                        required_kw: f.required_kw.map(PersistedRange::of),
+                    })
+                    .collect(),
+                parens: aug
+                    .parens
+                    .map(|(open, close)| (PersistedRange::of(open), PersistedRange::of(close))),
+                group_open: aug.group_open.map(PersistedRange::of),
+                const_kw: aug.const_kw.map(PersistedRange::of),
+                factory_kw: aug.factory_kw.map(PersistedRange::of),
+            })
+            .collect();
+        let decl_kinds = elements
+            .decl_kinds
+            .iter()
+            .map(|target| PersistedAugTarget {
+                container: target.container.map(|name| s.id(name)),
+                name: s.id(target.name),
+                kind: PersistedAugKind::of(target.kind),
+                is_final: target.is_final,
+                is_mixin_application: target.is_mixin_application,
+                is_const: target.is_const,
+                is_factory: target.is_factory,
+            })
+            .collect();
         Self {
             strings: s.values,
             decls,
@@ -658,6 +892,8 @@ impl PersistedElements {
             duplicates,
             arity_violations,
             const_creations,
+            augmentations,
+            decl_kinds,
         }
     }
 
@@ -756,6 +992,73 @@ impl PersistedElements {
                         PersistedArityViolation::Setter => ArityViolation::Setter,
                     },
                     range: arity.range.source_range(),
+                })
+                .collect(),
+            augmentations: self
+                .augmentations
+                .iter()
+                .map(|aug| crate::model::AugmentDecl {
+                    kind: aug.kind.into(),
+                    name: at_name(aug.name),
+                    display_name: at_name(aug.display_name),
+                    name_range: aug.name_range.source_range(),
+                    augment_kw: aug.augment_kw.source_range(),
+                    container: aug.container.map(&at_name),
+                    is_static: aug.is_static,
+                    is_final: aug.is_final,
+                    modifiers: aug.modifiers.into(),
+                    extends_kw: aug.extends_kw.map(PersistedRange::source_range),
+                    type_params: aug
+                        .type_params
+                        .iter()
+                        .map(|p| crate::model::AugmentTypeParam {
+                            name: at_name(p.name),
+                            name_range: p.name_range.source_range(),
+                            bound: p.bound.clone().map(|(ty, range)| {
+                                (into_ty(ty, &ids, &mut type_args), range.source_range())
+                            }),
+                        })
+                        .collect(),
+                    type_params_close: aug.type_params_close.map(PersistedRange::source_range),
+                    return_ty: aug.return_ty.clone().map(|ty| into_ty(ty, &ids, &mut type_args)),
+                    return_ty_range: aug.return_ty_range.map(PersistedRange::source_range),
+                    formals: aug
+                        .formals
+                        .iter()
+                        .map(|f| crate::model::AugmentFormal {
+                            name: f.name.map(&at_name),
+                            name_range: f.name_range.source_range(),
+                            full_range: f.full_range.source_range(),
+                            ty: f.ty.clone().map(|ty| into_ty(ty, &ids, &mut type_args)),
+                            ty_range: f.ty_range.map(PersistedRange::source_range),
+                            required_positional: f.required_positional,
+                            optional_positional: f.optional_positional,
+                            named: f.named,
+                            covariant_kw: f.covariant_kw.map(PersistedRange::source_range),
+                            required_kw: f.required_kw.map(PersistedRange::source_range),
+                        })
+                        .collect(),
+                    parens: aug
+                        .parens
+                        .map(|(open, close)| {
+                            (open.source_range(), close.source_range())
+                        }),
+                    group_open: aug.group_open.map(PersistedRange::source_range),
+                    const_kw: aug.const_kw.map(PersistedRange::source_range),
+                    factory_kw: aug.factory_kw.map(PersistedRange::source_range),
+                })
+                .collect(),
+            decl_kinds: self
+                .decl_kinds
+                .iter()
+                .map(|target| crate::model::AugTarget {
+                    container: target.container.map(&at_name),
+                    name: at_name(target.name),
+                    kind: target.kind.into(),
+                    is_final: target.is_final,
+                    is_mixin_application: target.is_mixin_application,
+                    is_const: target.is_const,
+                    is_factory: target.is_factory,
                 })
                 .collect(),
             type_args,

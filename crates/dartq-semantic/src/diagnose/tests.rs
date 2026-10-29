@@ -2312,7 +2312,7 @@ fn augment_gate_off_recovered_field_name_shadows_type_lookup() {
 
 /// The top-level host face (`top_level_declarations.dart` line 3): the
 /// getter's `augment` head resolves to the top-level variable — the
-/// resolver's `notAType` face reports `'augment' isn't a type.` at the
+/// resolver's `notAType` face reports `augment isn't a type.` at the
 /// written head (the oracle's 3.13 row), no `undefined_class` beside it —
 /// and the host is `InvalidType`, so the `=> null` body fires no
 /// `return_of_invalid_type`.
@@ -14193,6 +14193,87 @@ fn ifnull_bool_literal_lhs_reports_dead_rhs() {
     assert_eq!(dead.range.offset, offset_of(source, "?? x") + 3);
 }
 
+/// The `??` right operand's staged row spans the WHOLE operand
+/// expression, token-derived (oracle `x ?? []` over an unassigned
+/// non-nullable local: `dead_null_aware_expression` = the `[]` literal,
+/// and the flow's own `?? []` dead_code row keeps its full extent).
+/// Half-landed: the token-derived range (first token through
+/// `handle_binary_rhs_end`'s last) is in, but this shape needs two
+/// missing halves — the unassigned-non-null root never arms the
+/// `dead_null_aware_expression` face (only a literally non-null
+/// `true ?? x` does), and the flow's `??` row for an empty-literal RHS
+/// ends at the operand's FIRST token (the `binary_rhs_end` latch reads
+/// short through the list-literal parse), which the consumer clamp can
+/// only shrink, never grow. Revisit with #dead-null-aware-unassigned.
+#[ignore = "half-landed: needs the unassigned-root face and the flow's short `[]` rhs latch"]
+#[test]
+fn ifnull_rhs_row_spans_the_whole_operand() {
+    let source = "class List {} class int {} void f() { List x; var y = x ?? []; }";
+    let report = report(source);
+    let staged = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "dead_null_aware_expression")
+        .expect("dead_null_aware_expression present");
+    assert_eq!(staged.range.offset, offset_of(source, "[]"));
+    assert_eq!(staged.range.length, 2, "the whole `[]` literal");
+    let dead = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "dead_code" && d.range.offset == offset_of(source, "?? []"))
+        .expect("dead_code at the ?? operator");
+    assert_eq!(dead.range.length, "?? []".len() as u32);
+}
+
+/// The unassigned-receiver chain climbs to ONE row over the whole access
+/// path (official parent walk, oracle `?.sign.sign`, 11 chars over
+/// `(i)?.sign.sign;`): each downstream selector — plain ones included —
+/// extends the operator-anchored row to the chain's true end instead of
+/// stacking per-selector rows.
+#[test]
+fn null_aware_chain_climbs_to_one_row() {
+    let source = "class I { I get sign => this; } void f() { I? i; i?.sign.sign; }";
+    let report = report(source);
+    let dead = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "dead_code" && d.range.offset == offset_of(source, "?.sign"))
+        .expect("dead_code at the null-aware operator");
+    assert_eq!(dead.range.length, "?.sign.sign".len() as u32);
+}
+
+/// The parenthesized receiver shape of the same oracle face
+/// (`(i)?.sign.sign;`) stays silent here: the definitely-unassigned walk
+/// keys on the receiver identifier and does not unwrap a
+/// ParenthesizedExpression yet. Tracked with the unassigned-root gap.
+#[ignore = "the unassigned walk does not see through parens yet"]
+#[test]
+fn null_aware_chain_paren_receiver_stays_silent() {
+    let source = "class I { I get sign => this; } void f() { I? i; (i)?.sign.sign; }";
+    let report = report(source);
+    assert!(
+        dead_code_offsets(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
+}
+
+/// A single-selector chain ends at the member identifier (oracle
+/// `?.bitLength` ends at the `h`, 11 chars — not the follower tile two
+/// past it): the chain-end face is the member's own token, so the row
+/// cannot grow into the statement tail.
+#[test]
+fn null_aware_dot_chain_row_ends_at_the_member() {
+    let source = "class I { I get sign => this; } void f() { I? i; i?.sign; }";
+    let report = report(source);
+    let dead = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "dead_code" && d.range.offset == offset_of(source, "?.sign"))
+        .expect("dead_code at the null-aware operator");
+    assert_eq!(dead.range.length, "?.sign".len() as u32);
+}
+
 /// A Never-typed callee kills the flow state at the send's end, so the
 /// dead interval anchors at the FIRST statement after the call (the
 /// official `checkUnreachableNode` at the next statement's entry —
@@ -14203,6 +14284,23 @@ fn never_call_dead_row_starts_at_the_next_statement() {
     let source = "Never boom() => throw 0; void f() { boom(); g(); } void g() {}";
     let report = report(source);
     assert_eq!(dead_code_offsets(&report), [offset_of(source, "g();")]);
+}
+
+/// A Never receiver's junction exit lands right before the member
+/// spelling, so the property access is the first dead node and the row
+/// anchors at the member's own identifier (oracle
+/// `doNotReturn().hashCode;` = `hashCode;`, 9 chars) — not at the
+/// member param's follower tile (`;`).
+#[test]
+fn never_receiver_member_poll_anchors_at_the_member_name() {
+    let source = "Never doNotReturn() => throw 0;\ntest() => doNotReturn().hashCode;";
+    let report = report(source);
+    let dead = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "dead_code" && d.range.offset == offset_of(source, "hashCode"))
+        .expect("dead_code at the member");
+    assert_eq!(dead.range.length, "hashCode;".len() as u32);
 }
 
 /// An `_`-named local function is dead over the whole declaration,

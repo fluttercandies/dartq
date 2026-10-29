@@ -1196,6 +1196,34 @@ impl AnalysisOptions {
         !self.unignorable.contains(code)
     }
 
+    /// The initial options file's text and line index — the text every
+    /// recorded issue's span resolves against (the file is never resident
+    /// as Dart). `None` for the synthesized default (no options file).
+    #[must_use]
+    pub fn layout(&self) -> Option<(&str, &LineIndex)> {
+        self.layout
+            .as_ref()
+            .map(|(text, index)| (text.as_ref(), index))
+    }
+
+    /// Whether the YAML ignore-comment face suppresses one row anchored at
+    /// `offset` (UTF-16, the initial file's text) with the code `name`: the
+    /// file's `# ignore:` / `# ignore_for_file:` entries name it. The
+    /// shared application point for every options-file row face — the
+    /// `IgnoreInfo.forYaml` filter the oracle's YAML validators run
+    /// (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/pubspec/pubspec_validator.dart` :80-83); the
+    /// row's line resolves through the captured layout.
+    #[must_use]
+    pub fn ignored_at(&self, offset: u32, name: &str) -> bool {
+        let Some((text, index)) = self.layout() else {
+            return false;
+        };
+        let ignores = crate::YamlIgnores::parse(text);
+        let (line, _) = index.line_col_utf16(text, offset);
+        ignores.ignored(line, name)
+    }
+
     /// The lowercased `analyzer.cannot-ignore` set — the suppression-gate
     /// membership test the lint stage runs per file (`_filterIgnoredDiagnostics`)
     /// and the ignore-comment validator matches names against
@@ -6613,7 +6641,7 @@ pub fn text_direction_issues(text: &str) -> Vec<OptionsIssue> {
 /// the registry but still accepted live in `REMOVED_ERROR_CODES`, not here;
 /// lint-rule names are a separate registry (dartq-lints) — the CLI face's
 /// seam ORs them in.
-mod known_error_codes {
+pub(crate) mod known_error_codes {
     use dartq_diagnostics::Severity;
 
     /// Whether `lowered` — an already-lowercased `analyzer.errors` key —

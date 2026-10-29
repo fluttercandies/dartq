@@ -184,7 +184,10 @@ fn is_test(name: u32, ty: crate::ev::Ev, is_not: bool) -> Vec<crate::ev::Ev> {
         read(name),
         crate::ev::Ev::IsBegin,
         ty,
-        crate::ev::Ev::IsOperator { is_not },
+        crate::ev::Ev::IsOperator {
+            is_not,
+            type_head: tspan(name + 1),
+        },
         crate::ev::Ev::IsEnd,
     ]
 }
@@ -436,6 +439,71 @@ fn conditional_dead_then_arm_row() {
 fn conditional_dead_else_arm_row() {
     let source = "void f() { true ? 1 : 2; }";
     assert_eq!(dead_snippets(source), ["2"]);
+}
+
+/// The dead arm's row is the arm expression's own range (#2786): the
+/// official `flowEnd(elseExpression)` covers the arm node only, so an
+/// identifier operand reports without the statement's `;` (oracle
+/// `x`, not `x;` — the arm-end param tiles a bare leaf through its
+/// follower, so the true last token rides the pre-close hook).
+#[test]
+fn conditional_dead_else_arm_ends_at_the_operand() {
+    let source = "void f(int x) { true ? 1 : x; }";
+    assert_eq!(dead_snippets(source), ["x"]);
+}
+
+/// Same face with a send operand: the follower tile ends one token past
+/// the arm, so the row would grow to `g();` without the latch.
+#[test]
+fn conditional_dead_else_arm_send_operand_trims_the_follower() {
+    let source = "void f() { true ? 1 : g(); }";
+    assert_eq!(dead_snippets(source), ["g()"]);
+}
+
+/// Then-arm counterpart: the arm row stays the operand's own range (the
+/// colon-time face was already the arm node — re-pinned so the else-end
+/// latch cannot regress it).
+#[test]
+fn conditional_dead_then_arm_ends_at_the_operand() {
+    let source = "void f(int x) { false ? x : 1; }";
+    assert_eq!(dead_snippets(source), ["x"]);
+}
+
+/// A null-shorted chain that ran dead from its open reports at the
+/// chain's own boundary (official `handleNullShortingFinished`'s
+/// `flowEnd(expression)`): a call's row ends at the invocation's `)`,
+/// never the statement's `;` (oracle `foo()`, not `foo();`).
+#[test]
+fn null_aware_chain_dead_send_row_ends_at_the_close_paren() {
+    let source = "void f() { null?.foo(); }";
+    assert_eq!(dead_snippets(source), ["foo()"]);
+}
+
+/// A plain (send-less) selector ends at the member identifier, and the
+/// row resets at the chain's boundary — the statement after stays live
+/// and row-free (oracle `p` of `n?.p;`, `print('reached')` unreported).
+#[test]
+fn null_aware_chain_dead_member_row_ends_at_the_member() {
+    let source = "void f() { null?.p; print('reached'); }";
+    assert_eq!(dead_snippets(source), ["p"]);
+}
+
+/// The condition-node freeze (official `parent is ForParts`'s
+/// `node = updaters.last` trim, dead_code_verifier.dart:324-326): when
+/// the first dead node IS the condition, the row ends at the last
+/// updater's end — `true; 1`, never the statement's own tail (oracle
+/// `3:17|7`). Statement and element forms share the face (oracle
+/// `2:23|7` for the collection form).
+#[test]
+fn for_condition_death_row_trims_to_the_last_updater() {
+    let source = "void f() { for (throw 0; true; 1) {} }";
+    assert_eq!(dead_snippets(source), ["true; 1"]);
+}
+
+#[test]
+fn collection_for_condition_death_row_trims_to_the_last_updater() {
+    let source = "f() => [for (throw 0; true; 1) 0];";
+    assert_eq!(dead_snippets(source), ["true; 1"]);
 }
 
 /// Switch member-order faces (probe table G, r5): every member at/after the
@@ -2263,6 +2331,7 @@ fn unmatched_construct_begins_do_not_panic() {
         Ev::ForParts {
             left_sep: span(6),
             right_sep: span(7),
+            updaters_end: 0,
         },
         // Collection for without ForControlFlowEnd.
         Ev::ForControlFlowBegin,
@@ -2337,6 +2406,7 @@ fn c_style_collection_for_closes_its_loop_frame() {
         Ev::ForParts {
             left_sep: span(15),
             right_sep: span(25),
+            updaters_end: 0,
         },
         Ev::OtherExpr { span: span(40) },
         Ev::ForControlFlowEnd { for_in: false },
@@ -3249,7 +3319,7 @@ fn closure_await_demotes_captured_reads() {
             token: span(5),
             context: IdentifierContext::Expression,
         },
-        Ev::SendNoArgs,
+        Ev::SendNoArgs { end: 6 },
         Ev::AwaitEnd {
             span: dartq_source::SourceRange {
                 offset: 4,
@@ -3981,6 +4051,7 @@ fn never_call_in_body_kills_the_updaters_not_the_tail() {
         vec![crate::ev::Ev::ForParts {
             left_sep: tspan(16),
             right_sep: tspan(21),
+            updaters_end: 0,
         }],
         // Body `{ boom(); }` — the call's type resolves to Never, the
         // engine appends Exit after the arguments.
@@ -4148,6 +4219,7 @@ fn never_call_exit_inside_arguments_keeps_the_stack() {
             crate::ev::Ev::OtherExpr { span: tspan(11) },
             crate::ev::Ev::Send {
                 args: crate::ty::EMPTY_ARGS,
+                end: 19,
             },
             crate::ev::Ev::ArgumentsBegin,
             crate::ev::Ev::OtherExpr { span: tspan(13) },

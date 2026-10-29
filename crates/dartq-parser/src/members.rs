@@ -2336,7 +2336,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     }
 
     /// Official `parseSuperInitializerExpression` (:4918): lookahead over
-    /// `super (. name)?` to validate the shape, then the expression re-read.
+    /// `super (. name)?` to validate the shape — the `?.` recovery is
+    /// sequential, the `=`/`(` checks re-running after the member name
+    /// (:4934-4953) — then the expression re-read.
     fn parse_super_initializer_expression(&mut self) -> TokenSpan {
         let head = self.peek_span();
         let mut n = 1;
@@ -2354,15 +2356,70 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let next = self.cursor.look_kind(n);
         if next != TokenKind::OpenParen {
             if next == TokenKind::QuestionPeriod {
-                // `super?.` — the error itself is reported by the
-                // `parseSuperExpression` re-read; only a missing member name
-                // gets the synthetic here (:4936-4944).
-                let name = self.cursor.look_kind(n + 1);
-                if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
-                    let at = self.look_span_at(n + 1);
+                // `super?.` (:4936-4953) — the official consumes `?.`,
+                // splices a missing member name silently, re-runs the
+                // `=`/`(` checks on the follower, then re-reads the
+                // initializer as an expression. The cursor splices
+                // synthetics at the cursor only (never mid-stream), so the
+                // re-read's head is driven here with the official event
+                // shape — `handleSuperExpression`, the `?.`-on-super
+                // report itself (`parseSuperExpression` :7698), the
+                // null-aware selector pair — and the member send runs
+                // through the real send machinery.
+                self.cursor.advance(); // `super`
+                self.listener
+                    .handle_super_expression(head, IdentifierContext::Expression);
+                let qdot = self.peek_span();
+                self.report(msg::invalid_operator_questionmark_period_for_super(), qdot);
+                self.cursor.advance(); // `?.`
+                self.listener.handle_null_aware_member_begin(qdot);
+                if !(is_identifier(self.peek_kind())
+                    || self.peek_kind() == TokenKind::Keyword(Keyword::New))
+                {
+                    // Insert a synthetic identifier but don't report
+                    // another error (:4941-4943).
+                    let at = self.peek_span();
                     self.synthetic(TokenKind::Identifier, at.range.offset);
                 }
-            } else if next == TokenKind::Eq {
+                // The member-name head: `parse_send`'s first half (the
+                // identifier event), with `new` read as the name
+                // (`parseSendContinuation`'s head arm).
+                let name = if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
+                    let new_kw = self.peek_span();
+                    self.cursor.advance();
+                    self.listener.handle_identifier(
+                        new_kw,
+                        IdentifierContext::ExpressionContinuation,
+                    );
+                    new_kw
+                } else {
+                    self.ensure_identifier(IdentifierContext::ExpressionContinuation)
+                };
+                // The `=`/`(` checks re-run on the follower after the name
+                // (:4945-4953) — the official `?.` branch is sequential,
+                // not an alternative. The `=` rider anchors on the member
+                // name (the official's `token`); the `(`-expect wraps the
+                // name in empty parens spliced right at the cursor
+                // (`insertParens(includeIdentifier: false)`), where the
+                // send tail then reads them as the argument group.
+                match self.peek_kind() {
+                    TokenKind::Eq => {
+                        self.report(msg::field_initialized_outside_declaring_class(), name);
+                    }
+                    TokenKind::OpenParen => {}
+                    _ => {
+                        let at = self.peek_span();
+                        self.report(msg::expected_after_but_got("("), at);
+                        self.synthetic(TokenKind::OpenParen, at.range.offset);
+                        self.synthetic(TokenKind::CloseParen, at.range.offset);
+                    }
+                }
+                let operand = self.parse_send_from_identifier(name);
+                self.listener.handle_dot_access(qdot, operand, true);
+                self.listener.end_initializer(operand);
+                return operand;
+            }
+            if next == TokenKind::Eq {
                 let before_eq = self.cursor.look_kind(n - 1);
                 if before_eq == TokenKind::Keyword(Keyword::Super) {
                     // Bare `super = ...`: the parser stays silent ("parseExpression
@@ -2379,7 +2436,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.look_span_at(n - 1),
                     );
                 }
-            } else {
+            } else if next != TokenKind::OpenParen {
                 // `expectedAfterButGot('(')` + `insertParens(includeIdentifier:
                 // false)` (:4948-4952): wrap the follower in empty parens.
                 let at = self.look_span_at(n);
@@ -2404,7 +2461,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     // parens must not shadow the type group here or the
                     // member-recovery cascade fires.
                     for _ in 0..n {
-                        self.cursor.advance(); // `super` (. name)?
+                        self.cursor.advance(); // `super` (. name)? / `?.` name
                     }
                     let mut end_id = type_param.skip(self.peek_id());
                     let after = self.offset_of(end_id) + 1;

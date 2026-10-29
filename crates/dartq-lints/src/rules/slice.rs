@@ -1139,7 +1139,16 @@ pub(crate) mod parameter_assignments {
                 continue;
             }
             seen.push(name);
-            c.report(c.utf16_span(pattern_row), &[name]);
+            // `reportAtNode(node.pattern)` (parameter_assignments.dart:63,
+            // :116) — the outer pattern's span, from its head token to the
+            // token before the `=` (the record-pattern row's span ends at
+            // its last child under flat tiling, one closer short).
+            let head = c.head_token(pattern_row);
+            if let Some(range) =
+                crate::rules::declarations::utf16_token_run_span(c, head..equals)
+            {
+                c.report(range, &[name]);
+            }
         }
     }
 
@@ -1523,11 +1532,19 @@ pub(crate) mod parameter_assignments {
             assert!(f.run(&one_rule("parameter_assignments")).is_empty());
         }
 
-        /// Pattern-assignment variable targets write the parameter.
+        /// Pattern-assignment variable targets write the parameter; the
+        /// report covers the whole outer pattern (`(a, b)` — the official
+        /// `reportAtNode(node.pattern)`, parameter_assignments.dart:63).
         #[test]
         fn reports_a_pattern_assignment_target() {
             let f = Fixture::parse("void f(int a) { (a, _) = (1, 2); }");
             assert_eq!(f.run(&one_rule("parameter_assignments")).len(), 1);
+
+            let f = Fixture::parse("void f(int a) {\n  var b = 0;\n  (a, b) = (1, 2);\n}");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("(a, b)").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 6);
         }
 
         /// `test_assignment_wildcard` — a `_` formal binds nothing under

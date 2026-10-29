@@ -159,9 +159,10 @@ impl<'a> Engine<'a> {
         // declaration face OFF: the primary formal binds the representation
         // field for the redirect target. `DeclKind::Constructor` sites are
         // generative ctor declarations only (factories register none).
-        let has_generative_ctor = self.decl_sites.iter().any(
-            |site| matches!(site.kind, DeclKind::Constructor { container: c } if c == container),
-        );
+        let has_generative_ctor = self.decl_sites.iter().any(|site| {
+            !site.is_augment
+                && matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
+        });
         // `member_duplicate_definition_verifier.dart`'s constructor pass:
         // per container, constructor names dedupe by selector — the unnamed
         // spelling keys as `new` (`member.name?.lexeme ?? 'new'`), a named
@@ -189,10 +190,15 @@ impl<'a> Engine<'a> {
                 .iter()
                 .enumerate()
                 .filter(|(_, site)| {
-                    matches!(
-                        site.kind,
-                        DeclKind::Constructor { container: c } if c == container
-                    )
+                    // An augment constructor merges into the introductory
+                    // element's fragment chain (upstream
+                    // `member.name?.lexeme ?? 'new'` keys per element) —
+                    // never a second declaration of the selector.
+                    !site.is_augment
+                        && matches!(
+                            site.kind,
+                            DeclKind::Constructor { container: c } if c == container
+                        )
                 })
                 .filter(|(_, site)| decl_start.is_none_or(|start| site.range.offset >= start))
                 .map(|(index, site)| {
@@ -548,7 +554,7 @@ impl<'a> Engine<'a> {
         is_extension_type: bool,
     ) {
         if let Some(id) = name.and_then(|token| self.name_of(token)) {
-            self.bounds.open_header(id);
+            self.bounds.open_header(id, is_extension_type, is_enum);
             // The #612 capture opens with the header (params adopt below,
             // clause trees capture from here to the body) — unconditionally:
             // the legacy superinterface face answers in the default posture

@@ -147,6 +147,18 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn finalize_bounds(&mut self) {
         let strings = self.strings;
+        // The clause-site face (`checkNamedType` at every supertype
+        // annotation; `_shouldAllowSuperBoundedTypes` denies the super pass
+        // on the clause contexts, so every violation reports plain).
+        for issue in self.bounds.check_clause_sites(strings) {
+            self.emit3(
+                SemanticCode::TypeArgumentNotMatchingBounds,
+                issue.range,
+                &issue.argument,
+                &issue.parameter,
+                &issue.bound,
+            );
+        }
         for check in std::mem::take(&mut self.pending_bounded_checks) {
             match check {
                 PendingBoundedCheck::Site {
@@ -2248,6 +2260,10 @@ impl<'a> Engine<'a> {
             // `begin_factory` set it before any site of theirs exists).
             const_ctor: self.in_const_ctor,
             is_factory: false,
+            // The site-consumed augment latch (constructor heads only):
+            // taken here so a later non-constructor site can never see a
+            // stale bit.
+            is_augment: std::mem::take(&mut self.ctor_augment_pending),
         });
         let site = self.decl_sites.len() - 1;
         // The FFI-named annotations latch onto the declaration they

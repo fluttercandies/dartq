@@ -1809,8 +1809,11 @@ fn extract_directives(
 /// raw/cooked body (ast.dart:195-200), and any interpolation segment makes
 /// the whole literal shapeless (`StringInterpolationImpl._appendStringValue`
 /// throws → `null`, ast.dart:51023). Returns the uri text, its UTF-16 span
-/// (the whole adjacent region; zero when shapeless), and the index just past
-/// the literal region.
+/// (the whole literal region, interpolation pieces included — the shapeless
+/// face still anchors there, the oracle reporting
+/// `uriWithInterpolation.at(directive.uri)`, the URI node's
+/// beginToken..endToken, library_analyzer.dart:732/:993/:1031), and the index
+/// just past the literal region.
 fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, SourceRange, usize) {
     let interpolated = |kind: Option<TokenKind>| {
         matches!(
@@ -1850,22 +1853,43 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
         j += 1;
     }
     if interpolated(kind_at(tokens, j)) {
-        // Skip the whole segment chain: `String` pieces and `${ … }` groups
-        // (group-aware, so a `;` inside the interpolation cannot mislead).
+        // Skip the whole segment chain: `String` pieces, `${ … }` groups
+        // (group-aware, so a `;` inside the interpolation cannot mislead),
+        // and the `$id` form's identifier — the identifier is only part of
+        // the literal directly after its `$` token, never a follower.
+        let mut after_dollar = false;
         loop {
             match kind_at(tokens, j) {
-                Some(TokenKind::String | TokenKind::StringInterpolationIdentifier) => j += 1,
+                Some(TokenKind::String) => {
+                    after_dollar = false;
+                    j += 1;
+                }
+                Some(TokenKind::StringInterpolationIdentifier) => {
+                    after_dollar = true;
+                    j += 1;
+                }
                 Some(TokenKind::StringInterpolationExpression) => {
+                    after_dollar = false;
                     j = tokens.matching_end(j).map_or(j + 1, |end| end + 1);
+                }
+                Some(TokenKind::Identifier | TokenKind::Keyword(_)) if after_dollar => {
+                    after_dollar = false;
+                    j += 1;
                 }
                 _ => break,
             }
         }
+        // Shapeless, but still the whole literal: the chain's last token
+        // (a `String` tail, or the identifier form's tail) ends the URI
+        // node's span.
+        let last = j - 1;
+        let token = tokens.get(last).expect("the loop advanced past a token");
+        let tail_end = token.utf16_offset + utf16_len_of(tokens.lexeme(text, last));
         return (
             None,
             SourceRange {
-                offset: 0,
-                length: 0,
+                offset: span_offset,
+                length: tail_end - span_offset,
             },
             j,
         );

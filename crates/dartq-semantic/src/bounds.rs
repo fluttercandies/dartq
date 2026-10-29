@@ -114,13 +114,13 @@ pub(crate) enum Clause {
 
 impl HeaderSink {
     /// Claims the roots since the cursor for the completing clause;
-    /// returns the claimed supertypes (`On` answers empty).
+    /// returns the claimed trees (`On` clauses keep theirs too — the
+    /// bounds face checks constraint annotations; the supertype set
+    /// excludes them at the caller).
     fn clause(&mut self, clause: Clause) -> Vec<TypeTree> {
-        let (expected, keep) = match clause {
-            Clause::Extends(count) | Clause::Implements(count) | Clause::On(count) => {
-                (Some(count), !matches!(clause, Clause::On(_)))
-            }
-            Clause::With => (None, true),
+        let expected = match clause {
+            Clause::Extends(count) | Clause::Implements(count) | Clause::On(count) => Some(count),
+            Clause::With => None,
         };
         let since = self.sink.unclaimed(self.claimed);
         if let Some(expected) = expected
@@ -130,7 +130,7 @@ impl HeaderSink {
         }
         let claimed = since.to_vec();
         self.claimed = self.sink.done.len();
-        if keep { claimed } else { Vec::new() }
+        claimed
     }
 
     /// Body time: a root no clause claimed means the capture is not the
@@ -153,6 +153,12 @@ struct ContainerCapture {
     bounds: Vec<(Option<TypeTree>, bool)>,
     /// Captured supertype trees (extends/with/implements).
     supers: Vec<TypeTree>,
+    /// Every clause tree the header wrote, `on` clauses included — the
+    /// bounds face checks each written supertype/constraint annotation
+    /// independently (`checkNamedType` runs at every `NamedType`;
+    /// `_shouldAllowSuperBoundedTypes` denies the super pass on all the
+    /// clause contexts, `type_arguments_verifier.dart:737-748`).
+    bound_sites: Vec<TypeTree>,
     /// The supertype capture is unfaithful.
     open: bool,
     /// `extension type` elements forbid the super pass
@@ -537,28 +543,53 @@ impl<'a> Bounds<'a> {
         let Some(window) = self.pending.take() else {
             return;
         };
-        let Some(name) = name else {
-            return;
-        };
         if name_offset >= window_end {
             return;
         }
+        let Some(name) = name else {
+            return;
+        };
+        let capture = self.index.containers.entry(name).or_insert_with(|| {
+            ContainerCapture {
+                params: Vec::new(),
+                bounds: Vec::new(),
+                supers: Vec::new(),
+                bound_sites: Vec::new(),
+                open: false,
+                is_extension_type,
+                is_enum,
+            }
+        });
+        // The kind flags were stated at the header open (keep-first: a
+        // same-named duplicate's second header never re-registers).
+        capture.params = window.iter().map(|(n, _, _)| *n).collect();
+        capture.bounds = window.iter().map(|(_, b, p)| (b.clone(), *p)).collect();
+    }
+
+    /// The container's header window opened (its supertype clauses are
+    /// captured from here to the body). The container registers here with
+    /// its declaration's kind flags — a windowless container (no type
+    /// variables, the common `class C extends G<B> {}` shape) never
+    /// reaches [`Self::note_container`], whose window latch is its
+    /// precondition, and its clause trees would drop.
+    pub(crate) fn open_header(
+        &mut self,
+        name: StringId,
+        is_extension_type: bool,
+        is_enum: bool,
+    ) {
         self.index
             .containers
             .entry(name)
             .or_insert_with(|| ContainerCapture {
-                params: window.iter().map(|(n, _, _)| *n).collect(),
-                bounds: window.iter().map(|(_, b, p)| (b.clone(), *p)).collect(),
+                params: Vec::new(),
+                bounds: Vec::new(),
                 supers: Vec::new(),
+                bound_sites: Vec::new(),
                 open: false,
                 is_extension_type,
                 is_enum,
             });
-    }
-
-    /// The container's header window opened (its supertype clauses are
-    /// captured from here to the body).
-    pub(crate) fn open_header(&mut self, name: StringId) {
         self.header = Some((
             name,
             HeaderSink {
@@ -607,7 +638,7 @@ impl<'a> Bounds<'a> {
     }
 
     /// A header clause completed; its trees join the supertype set
-    /// (`On` trees are discarded — constraints, not supertypes).
+    /// (`On` trees are constraints, not supertypes).
     pub(crate) fn header_clause(&mut self, clause: Clause) {
         let Some((name, header)) = self.header.as_mut() else {
             return;
@@ -627,7 +658,10 @@ impl<'a> Bounds<'a> {
             return;
         }
         if let Some(capture) = self.index.containers.get_mut(name) {
-            capture.supers.extend(trees);
+            if !matches!(clause, Clause::On(_)) {
+                capture.supers.extend(trees.iter().cloned());
+            }
+            capture.bound_sites.extend(trees);
         }
     }
 
@@ -1025,6 +1059,65 @@ impl<'a> Bounds<'a> {
         args: &[TypeTree],
         in_scope_params: &[StringId],
     ) -> Vec<BoundedIssue> {
+        // The annotation-site posture: the super-bounded pass is forbidden
+        // only at extension-type elements (`_shouldAllowSuperBoundedTypes`,
+        // :750-752).
+        let allow_super = self
+            .index
+            .containers
+            .get(&head)
+            .is_some_and(|capture| !capture.is_extension_type);
+        self.check_site_inner(strings, head, args, in_scope_params, allow_super)
+    }
+
+    /// The clause-site face: every written supertype/constraint annotation
+    /// of every captured container checks its arguments against the
+    /// written head's bounds (`checkNamedType` runs at every `NamedType`;
+    /// `_shouldAllowSuperBoundedTypes` denies the super pass on the
+    /// clause contexts — `ClassTypeAlias`/`ExtendsClause`/
+    /// `ImplementsClause`/`MixinOnClause`/`WithClause`,
+    /// `type_arguments_verifier.dart:737-748` — so a regular violation
+    /// reports with no inverted-type context row). Declaration order
+    /// (the sites' own offsets) decides the report order.
+    pub(crate) fn check_clause_sites(&mut self, strings: &'a StringTable) -> Vec<BoundedIssue> {
+        let mut sites: Vec<(u32, StringId, Vec<TypeTree>, Vec<StringId>)> = self
+            .index
+            .containers
+            .iter()
+            .flat_map(|(_, capture)| {
+                capture
+                    .bound_sites
+                    .iter()
+                    .filter(|tree| !tree.args.is_empty() && !tree.poisoned)
+                    .map(move |tree| {
+                        (
+                            tree.range.offset,
+                            tree.head,
+                            tree.args.clone(),
+                            capture.params.clone(),
+                        )
+                    })
+            })
+            .collect();
+        sites.sort_by_key(|(offset, _, _, _)| *offset);
+        let mut issues = Vec::new();
+        for (_, head, args, params) in sites {
+            issues.extend(self.check_site_inner(strings, head, &args, &params, false));
+        }
+        issues
+    }
+
+    /// The shared verdict: `head`'s captured parameters' substituted
+    /// bounds against `args`; `allow_super` picks the regular face or the
+    /// inverted re-check (`is_well_bounded`).
+    fn check_site_inner(
+        &mut self,
+        strings: &'a StringTable,
+        head: StringId,
+        args: &[TypeTree],
+        in_scope_params: &[StringId],
+        allow_super: bool,
+    ) -> Vec<BoundedIssue> {
         // A type parameter shadows any container of the same name, and
         // `dynamic` is not a container: neither takes bounded arguments.
         if in_scope_params.contains(&head) {
@@ -1041,7 +1134,6 @@ impl<'a> Bounds<'a> {
         // (the official test succeeds through the parameter's own bound;
         // the M1 face would answer a false positive).
         let arity_ok = args.len() == capture.params.len();
-        let allow_super = !capture.is_extension_type;
         let bounds_decidable = !capture.bounds.iter().any(|(_, poisoned)| *poisoned);
         if !arity_ok
             || !bounds_decidable
@@ -2222,7 +2314,7 @@ mod tests {
         // `class IntBox<X> extends Box<int> {}`
         unbounded_variable(&mut bounds, x);
         bounds.note_container(Some(int_box), 18, 19, false, false);
-        bounds.open_header(int_box);
+        bounds.open_header(int_box, false, false);
         parameterized(&mut bounds, box_, int, 32);
         bounds.header_clause(Clause::Extends(1));
         bounds.finish_header();

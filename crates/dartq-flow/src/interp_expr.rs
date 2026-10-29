@@ -805,7 +805,20 @@ impl Interp<'_> {
                 // events.
                 self.flush_null_shorts_above(self.consumer_base(1));
             }
-            Ev::IsOperator { is_not } => {
+            Ev::IsOperator { is_not, type_head } => {
+                // The is-continuation dead poll (official
+                // `analyzeExpression`'s bottom-type `handleExit`,
+                // type_analyzer.dart:817-819, then the dead-code walk's
+                // first unreachable node — the is-expression's TYPE
+                // annotation, `dead_code_verifier.dart`'s `_visitNode` at
+                // its `beginToken`): a Never-typed operand's exit lands
+                // between the operand's events and the type spelling, so
+                // `neverFn() is int` anchors its `DEAD_CODE` row at the
+                // tested type and runs to the covering body's end —
+                // `test() => neverFn() is int;` reports `int;`, exactly
+                // the as-cast tail's own posture ([`Ev::AsBegin`]'s poll).
+                // A reachable state makes this a no-op.
+                self.dead_code(*type_head);
                 // The tested type arrived through Type events (before the
                 // operator event); its written arguments latch beside it.
                 let tested = self.tested_ty.take().unwrap_or(Ty::UNKNOWN);
@@ -1580,9 +1593,22 @@ impl Interp<'_> {
                     .last()
                     .map(|e| (e.reference, e.ty, e.args))
                     .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
-                self.null_short_begin(receiver);
+                let recv_offset = self
+                    .exprs
+                    .last()
+                    .and_then(|e| e.read_span)
+                    .map(|span| span.range.offset)
+                    .unwrap_or(0);
+                self.null_short_begin(receiver, recv_offset);
             }
-            Ev::IndexAccess { null_aware } => {
+            Ev::IndexAccess {
+                null_aware,
+                close_end,
+            } => {
+                // The `]` closer is the null-shorted chain's row end face
+                // (`c1?[0]` ends after `]`) — same contract as the send's
+                // `)` face below.
+                self.chain_face_end(*close_end);
                 let _operand = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 if *null_aware {
@@ -1630,7 +1656,11 @@ impl Interp<'_> {
                 }
                 self.exprs.push(expr);
             }
-            Ev::DotAccess { null_aware, member } => {
+            Ev::DotAccess {
+                null_aware,
+                member,
+                ident,
+            } => {
                 // The member-access node poll (official `checkUnreachableNode`
                 // of the invocation node before its target is visited,
                 // type_analyzer.dart:2082): a Never receiver's junction exit
@@ -1665,12 +1695,14 @@ impl Interp<'_> {
                     // A `?.` whose access path was dead at open (a
                     // null-or-equivalent receiver) anchors at the member
                     // name — the official polls the property/method name
-                    // node; `member` is the send's tiled end there.
-                    let anchor = if *null_aware {
-                        self.exprs.last().and_then(|e| e.read_span).unwrap_or(*member)
-                    } else {
-                        *member
-                    };
+                    // node. `member` is the send's tiled end there (the
+                    // #585 follower), so the anchor reads the member's own
+                    // identifier token.
+                    let anchor = self
+                        .exprs
+                        .last()
+                        .and_then(|e| e.read_span)
+                        .unwrap_or(*ident);
                     self.dead_code(anchor);
                 }
                 // The member identifier's own entry sits on top (every
@@ -1693,7 +1725,7 @@ impl Interp<'_> {
                 // whose callee adopted a staged return keeps it as the
                 // chain's value.
                 let post_send_tile = match events.get(i.wrapping_sub(1)) {
-                    Some(Ev::Send { .. } | Ev::SendNoArgs) => !matches!(
+                    Some(Ev::Send { .. } | Ev::SendNoArgs { .. }) => !matches!(
                         // A bare leaf's own send (`c` of `c._b`) fires
                         // between the leaf and the chain's next selector —
                         // an Ident directly under the send marks the
@@ -1704,6 +1736,15 @@ impl Interp<'_> {
                     ),
                     _ => false,
                 };
+                // The member identifier is the null-shorted chain's row end
+                // face for a plain (send-less) selector (`x?.y.z` ends
+                // after `z`). The `member` param tiles one token past the
+                // access (#585 follower) even for a bare leaf, so the face
+                // reads the recorded `ident`; a completed send's tile is
+                // skipped — the send's own `)` face already covered it.
+                if !post_send_tile {
+                    self.chain_face_end(ident.range.end());
+                }
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 // The member's own token rides the access row as its
                 // callee role (#2567 R18): a following send keys the
@@ -1896,7 +1937,16 @@ impl Interp<'_> {
                 }
                 self.exprs.push(expr);
             }
-            ev @ (Ev::Send { .. } | Ev::SendNoArgs) => {
+            ev @ (Ev::Send { .. } | Ev::SendNoArgs { .. }) => {
+                // The invocation's own closer is the null-shorted chain's
+                // row end face (official `handleNullShortingFinished`'s
+                // `flowEnd(expression)` extent): a dead chain's window
+                // grows to the `)`/head end while the chain runs, and the
+                // short's pop below reports `anchor .. chain end` — the
+                // statement's `;` never folds in.
+                if let Ev::Send { end, .. } | Ev::SendNoArgs { end } = ev {
+                    self.chain_face_end(*end);
+                }
                 // The callee flows through as the send's result: a bare
                 // identifier keeps its variable reference and promoted type
                 // (a plain assignment's target is exactly such a reference).
@@ -1927,7 +1977,7 @@ impl Interp<'_> {
                         && callee.prop.is_some()
                         && let Some(name) = callee.name
                     {
-                        let Ev::Send { args } = ev else {
+                        let Ev::Send { args, .. } = ev else {
                             unreachable!("gated on Ev::Send above")
                         };
                         if self.is_class_head(name) {
@@ -2150,7 +2200,19 @@ impl Interp<'_> {
                 }
             }
             Ev::CascadeBegin { null_aware } => {
-                if *null_aware {
+                // A section that follows another section of the SAME
+                // cascade inherits the head's open `?..` context: the
+                // official `cascadeExpression_afterTarget` opens ONE
+                // `_nullAwareAccess_rightBegin` for the whole cascade and
+                // `nullAwareAccess_end` closes it after the LAST section
+                // (flow_analysis.dart:6561-6603), so the continuation
+                // sections ride the same head short (an out-of-order `?..`
+                // the parser reports still belongs to the one context).
+                // [`Interp::cascade_head_open`] carries the fact — the
+                // open-short count alone cannot tell the head short from
+                // an enclosing chain's short (`y?.m(x..a())`).
+                let inherited_head = self.cascade_head_open;
+                if *null_aware && !inherited_head {
                     // `?..`: official `cascadeExpression_afterTarget` runs
                     // `_nullAwareAccess_rightBegin` before the first
                     // section — the target sits on top of the expression
@@ -2160,8 +2222,15 @@ impl Interp<'_> {
                         .last()
                         .map(|e| (e.reference, e.ty, e.args))
                         .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
-                    self.null_short_begin(receiver);
+                    let recv_offset = self
+                        .exprs
+                        .last()
+                        .and_then(|e| e.read_span)
+                        .map(|span| span.range.offset)
+                        .unwrap_or(0);
+                    self.null_short_begin(receiver, recv_offset);
                 }
+                self.cascade_head_open = *null_aware || inherited_head;
                 let target = self
                     .exprs
                     .last()
@@ -2173,9 +2242,9 @@ impl Interp<'_> {
                     // Count AFTER the `?..` push: section-end flushes keep
                     // the head's short open (`null_shorts.len() > base`
                     // pops only what a SECTION opened); `CascadeEnd` joins
-                    // it via `own_short`.
+                    // it via `own_short` — inherited heads included.
                     null_shorts_base: self.null_shorts.len(),
-                    own_short: *null_aware,
+                    own_short: self.cascade_head_open,
                     target,
                 });
             }
@@ -2183,17 +2252,103 @@ impl Interp<'_> {
                 // The section's value is consumed by the cascade; any
                 // null-shorting the SECTION opened (`x..a?.b`) ends with
                 // it — the cascade head's own `?..` context (below
-                // `null_shorts_base`) stays open to `CascadeEnd`.
-                let base = match self.stack.last() {
+                // null_shorts_base) stays open to `CascadeEnd`.
+                let (base, exprs_base) = match self.stack.last() {
                     Some(Frame::Cascade {
-                        null_shorts_base, ..
-                    }) => *null_shorts_base,
-                    _ => 0,
+                        null_shorts_base,
+                        exprs_base,
+                        ..
+                    }) => (*null_shorts_base, *exprs_base),
+                    _ => (0, self.exprs.len()),
                 };
                 while self.null_shorts.len() > base {
                     self.null_short_end();
                 }
-                self.exprs.pop();
+                // The section head's own property read (official
+                // `propertyGet` over the cascade target's temporary
+                // reference — the first selector of every section chains
+                // on the target, and its promotion slot must exist exactly
+                // like a plain `x._field` read's): the head selector rides
+                // no DotAccess event (the `..` carries it), so the slot
+                // over the target builds here from the head value's own
+                // name and read anchor — a later section's same-named head
+                // then reads the slot a `!` or null test promoted.
+                let head_face = self
+                    .exprs
+                    .last()
+                    .and_then(|e| e.name.zip(e.read_span));
+                let target_recv = exprs_base
+                    .checked_sub(1)
+                    .and_then(|idx| self.exprs.get(idx))
+                    .and_then(|e| e.prop_receiver());
+                if let (Some((field, span)), Some(receiver)) = (head_face, target_recv) {
+                    let slot = self.prop_slot(receiver, field);
+                    let promoted = self.prop_promoted(receiver, slot);
+                    if self.reachable() {
+                        if promoted {
+                            self.emit(FlowFact::PromotedPropertyRead { span });
+                        } else {
+                            // The non-promoted mirror ([`Ev::DotAccess`]'s
+                            // own arm): the slot's cleared promoted types
+                            // stand as evidence; a slot never tested or
+                            // promoted carries no history and no row.
+                            let history = self.current.prop(slot).history;
+                            if history != crate::model::NIL {
+                                let entries = self.intern_non_promotion(None, history);
+                                let prop_receiver = if receiver == THIS_RECEIVER {
+                                    PropReceiver::This
+                                } else {
+                                    PropReceiver::Local(
+                                        self.vars[receiver as usize]
+                                            .decl_span
+                                            .expect("receiver local carries its declaration span"),
+                                    )
+                                };
+                                self.emit(FlowFact::NonPromotedPropertyRead {
+                                    span,
+                                    name: field,
+                                    receiver: prop_receiver,
+                                    entries,
+                                });
+                            }
+                        }
+                    }
+                    // The read's flow type at this layer: the marker pair
+                    // (unpromoted = potentially-nullable unknown, promoted
+                    // = its non-null face) — the same faces DotAccess's
+                    // prop arm writes.
+                    if let Some(head) = self.exprs.last_mut() {
+                        head.ty = if promoted {
+                            Ty::UNKNOWN
+                        } else {
+                            Ty::UNKNOWN_NULLABLE
+                        };
+                        head.prop = Some(slot);
+                    }
+                }
+                // The head selector's value stays on the stack when the
+                // section continues (`..d?.f()`, `..d[0]`, `..d!`): the
+                // continuation selectors chain over the HEAD'S RESULT
+                // (the official section is one selector chain —
+                // `cascadeExpression`'s sections each start at the target
+                // and link through every following selector), so the
+                // `?.`/`.`/index receiver is that result, never the
+                // cascade target. A section that ends here (the next
+                // event is the next section's begin, the cascade's end,
+                // or the statement's close) consumes the value as before.
+                let section_continues = matches!(
+                    events.get(i + 1),
+                    Some(
+                        Ev::NullAwareMemberBegin
+                            | Ev::NullAwareIndexOperandBegin
+                            | Ev::NonNullAssert
+                            | Ev::IndexAccess { .. }
+                            | Ev::Ident { .. }
+                    )
+                );
+                if !section_continues {
+                    self.exprs.pop();
+                }
             }
             Ev::CascadeEnd => {
                 let (base, owns_short) = match self.stack.last() {
@@ -2204,6 +2359,14 @@ impl Interp<'_> {
                     }) => (*null_shorts_base, *own_short),
                     _ => (self.null_shorts.len(), false),
                 };
+                // Another section of the same cascade follows: the head's
+                // `?..` context spans it too — only the section-local
+                // shorts close here, the head short joins after the LAST
+                // section.
+                let next_is_section = matches!(events.get(i + 1), Some(Ev::CascadeBegin { .. }));
+                if owns_short && !next_is_section {
+                    self.cascade_head_open = false;
+                }
                 match self.stack.pop() {
                     Some(Frame::Cascade {
                         exprs_base, target, ..
@@ -2212,8 +2375,10 @@ impl Interp<'_> {
                         // official `nullAwareAccess_end` after the last
                         // section (type_analyzer.dart:2358-2360), so a
                         // section-side `throw`/Never (`x?..[throw '']`)
-                        // cannot kill the receiver-was-null path.
-                        let end_base = base - usize::from(owns_short);
+                        // cannot kill the receiver-was-null path. A
+                        // following section keeps the head short open
+                        // (the one head context spans the whole cascade).
+                        let end_base = base - usize::from(owns_short && !next_is_section);
                         while self.null_shorts.len() > end_base {
                             self.null_short_end();
                         }
