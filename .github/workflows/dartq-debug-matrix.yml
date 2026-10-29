@@ -70,7 +70,6 @@ jobs:
     env:
       VERSION: ${{ matrix.version }}
       DARTQ: ${{ github.workspace }}/target/debug/dartq
-      SMOKE: ${{ runner.temp }}/debug-smoke
     steps:
       - uses: actions/checkout@v4
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
@@ -102,6 +101,9 @@ jobs:
           ln -s "$sdk_root" "$HOME/fvm/default/bin/cache/dart-sdk"
           echo "sdk root: $sdk_root"
           echo "DART_SDK=$sdk_root" >> "$GITHUB_ENV"
+          # SMOKE stages outside the workspace; job-level env lacks the
+          # runner context, so it is materialized here for later steps.
+          echo "SMOKE=$RUNNER_TEMP/debug-smoke" >> "$GITHUB_ENV"
       - name: Build dartq (debug profile)
         run: cargo build -p dartq-cli
       - name: Unit suite (dartq-test)
