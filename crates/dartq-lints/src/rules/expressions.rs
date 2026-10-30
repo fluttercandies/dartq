@@ -236,3 +236,8 @@ mod w2_expr_pins;
 mod w3_pins;
 #[cfg(test)]
 mod w4_pins;
+/// The #2970 cluster pins: `null_check_on_nullable_type_parameter`,
+/// `unnecessary_null_checks`, and `avoid_futureor_void` oracle shapes
+/// through the production bridge.
+#[cfg(test)]
+mod t2970_pins;

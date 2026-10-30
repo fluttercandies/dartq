@@ -1590,7 +1590,7 @@ impl GapPass {
             Ev::OtherExpr { span } | Ev::Int { span } | Ev::Double { span } => {
                 self.push_val(Kind::Other, *span, NO_GUARD)
             }
-            Ev::Bool { value } => {
+            Ev::Bool { value, .. } => {
                 // A constant condition checks nothing: both polarities
                 // carry side-tagged guards only so the branch maps apply.
                 let g = if *value {

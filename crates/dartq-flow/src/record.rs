@@ -2533,7 +2533,7 @@ impl ParserListener for Flow<'_> {
             == Some(dartq_scanner::TokenKind::Keyword(
                 dartq_scanner::Keyword::True,
             ));
-        self.record(Ev::Bool { value });
+        self.record(Ev::Bool { value, span: token });
     }
 
     fn handle_literal_null(&mut self, _token: Token) {

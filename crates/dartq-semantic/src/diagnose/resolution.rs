@@ -134,11 +134,16 @@ impl<'a> Engine<'a> {
                 _ => break,
             }
         }
-        Ty::Named {
+        // A bare alias head surviving the fold carries the same resolved
+        // `staticType` a written one does — the oracle's
+        // `instantiateTypeFormalsToBounds` face (`G` reads `G<A<dynamic>>`,
+        // never the raw head; #2926 rider, the fourth fill point of the
+        // #2925 adoption — the `Named { _, EMPTY }` shape decided here).
+        self.instantiated_head_ty(Ty::Named {
             name: head,
             nullable: head_nullable,
             args: ArgListId::EMPTY,
-        }
+        })
     }
 
     /// The parameterized-alias use-site substitution face (#2410): the
@@ -1882,13 +1887,28 @@ impl<'a> Engine<'a> {
                     Walk::Missing => false,
                 },
             };
+            // The `this`-lookup accessibility gate (upstream
+            // `element.isAccessibleIn(_definingLibrary)` —
+            // property_element_resolver.dart:463-465): a `_`-prefixed
+            // member the climb found on ANOTHER library's file is invisible
+            // to this unit's `this` — the oracle leaves the reference
+            // unresolved and reports `undefined_identifier`, never the
+            // member. `walk_members`'s `found_origin` latched the declaring
+            // file; a miss or a same-library hit keeps the member face.
             if member_found {
-                return (
-                    BareInfo::Plain {
-                        ty: self.member_declared_ty(container, name),
-                    },
-                    RefTarget::Member { container },
-                );
+                let inaccessible = self.is_private_name(name)
+                    && self
+                        .member_faces
+                        .last_found_file()
+                        .is_some_and(|owner| self.graph.library_of_file(owner) != Some(self.lib));
+                if !inaccessible {
+                    return (
+                        BareInfo::Plain {
+                            ty: self.member_declared_ty(container, name),
+                        },
+                        RefTarget::Member { container },
+                    );
+                }
             }
             // The `on`-face member scope (#2186 S2): inside a mixin or an
             // extension body a bare name also resolves through the
@@ -2644,6 +2664,54 @@ impl<'a> Engine<'a> {
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn push_bare(&mut self, name: StringId, range: SourceRange) {
         let (info, target) = self.resolve_bare(name);
+        // The nullable implicit-`this` member face (#2926 F2): a bare send
+        // inside `extension E on A?` resolving through the `on` face (the
+        // `RefTarget::Member` naming the `on` head — `walk_members`'s
+        // climb reached `A`'s member map) rides the nullable `this`
+        // receiver upstream's `type_property_resolver` guards before the
+        // member lookup (its `isNullable` tail: the Object and extension
+        // consults run first — `toString` and E's own members never reach
+        // it, and only the resolvable-`on` `this` qualifies, the
+        // `InvalidType` arm's silence).
+        //
+        // The `Missing` twin latches the WRITE side independently of
+        // nullability: a bare `name = v` resolves the `name=` spelling —
+        // the extension's own member map first (the lexical
+        // `ExtensionMemberScope` — `set bar` inside `extension E on A?`
+        // resolves without ever consulting `this`), then the `on` face's
+        // member scope (`set foo` on `A`, resolved against `this`). Pass 2
+        // cannot re-walk either (the frames are gone) and
+        // `bare_write_target_exists` answers through the scope lookup
+        // alone, so both verdicts snapshot here — the `Missing` write arm
+        // reads the union for `undefined_identifier`, and the nullable-`on`
+        // arm reads the `on`-face disjunction for the unchecked variant
+        // (a lexical `E` hit means the `this` lookup never ran — silent).
+        if let Some((container, kind)) = self.container_context()
+            && kind == ContainerKind::Extension
+        {
+            let nullable_this = self.nullable_this_receiver(&Receiver::This { container, kind });
+            let on_member = match target {
+                RefTarget::Member { container: on } => {
+                    nullable_this
+                        && self.enclosing_extension_on_type(container) == Some(on)
+                        && !self.members.object_members.contains(&name)
+                }
+                RefTarget::Missing => {
+                    let setter = self.setter_spelling(name);
+                    let own = matches!(self.walk_members(container, setter), Walk::Found(_));
+                    let on_face =
+                        matches!(self.on_face_walk(container, kind, setter), Walk::Found(_));
+                    if own || on_face {
+                        self.ext_write_target_rows.insert(range.offset);
+                    }
+                    nullable_this && on_face && !own
+                }
+                _ => false,
+            };
+            if on_member {
+                self.ext_nullable_member_rows.insert(range.offset);
+            }
+        }
         if matches!(
             target,
             RefTarget::Local | RefTarget::TypeParam | RefTarget::Member { .. }
@@ -3066,7 +3134,7 @@ impl<'a> Engine<'a> {
     /// body expression's type — no `dynamic` stand-in answers for it), a
     /// generic literal, a named-formal section, or a brace inside the
     /// formal group refuses.
-    fn closure_init_ty(&self, bytes: &[u8], paren_open: usize) -> Ty {
+    pub(crate) fn closure_init_ty(&self, bytes: &[u8], paren_open: usize) -> Ty {
         let Some(paren_close) = matching_bracket_fwd(bytes, paren_open) else {
             return Ty::UNKNOWN;
         };
@@ -3074,7 +3142,16 @@ impl<'a> Engine<'a> {
         while bytes.get(after).is_some_and(|b| b.is_ascii_whitespace()) {
             after += 1;
         }
-        if bytes.get(after) != Some(&b'{') {
+        // The body's kind: a `{` block keeps the `dynamic` return column
+        // (the flow face the row model does not carry); an `=>` arrow
+        // types its return as the body expression's own static type —
+        // the literal's interior rows drained into `deferred_miss_rows`
+        // at the close, so the body's row is the newest one the literal's
+        // span covers (`var g = () => 0` binds `int Function()`, the
+        // oracle's `FunctionExpressionImpl.staticType`). Anything else is
+        // no literal this face reads.
+        let arrow = bytes.get(after) == Some(&b'=') && bytes.get(after + 1) == Some(&b'>');
+        if !arrow && bytes.get(after) != Some(&b'{') {
             return Ty::UNKNOWN;
         }
         // A `<...>` group head before the `(` is a generic literal: its
@@ -3170,8 +3247,27 @@ impl<'a> Engine<'a> {
             .into_iter()
             .map(|ty| self.fold_alias_ty(ty))
             .collect();
+        let return_ty = if arrow {
+            // The arrow body's static type: the literal's interior rows
+            // drained into `deferred_miss_rows` at the close and the body's
+            // own expression row is the newest one inside the literal's
+            // span (`f(g())` drains `f`, `g`, `g()`, `f(...)` — the last is
+            // the body's). `operand_static_ty` answers the send's result /
+            // the read's face; a body the row model cannot type keeps the
+            // `dynamic` column (the under-report direction — the verdict
+            // stays informative exactly like the block body's).
+            let lit_start = self.utf16_of(paren_open);
+            self.deferred_miss_rows
+                .iter()
+                .rfind(|row| row.range.offset >= lit_start)
+                .map(|row| self.operand_static_ty(row))
+                .filter(|ty| *ty != Ty::UNKNOWN)
+                .unwrap_or(Ty::Dynamic)
+        } else {
+            Ty::Dynamic
+        };
         self.boundary
-            .intern_function_ty(0, Ty::Dynamic, &positional, &[], false)
+            .intern_function_ty(0, return_ty, &positional, &[], false)
     }
 
     /// An identifier after a dot, awaiting the merge at the dot event.
@@ -3507,7 +3603,18 @@ impl<'a> Engine<'a> {
     /// resolve pass's `Missing` arm; their offsets stay in
     /// `type_arg_miss_rows` — the resolve-pass gate makes the leftovers
     /// unreachable.
-    pub(crate) fn emit_operand_type_miss(&mut self, mark: Option<usize>, code: SemanticCode) {
+    /// `code` reports the operand's unresolved head; `non_type_code` reports
+    /// a resolved non-type head (`as` collapses both to `cast_to_non_type`,
+    /// `is` splits `type_test_with_undefined_name`/`type_test_with_non_type`
+    /// — named_type_resolver.dart's `_isTypeInAsExpression` /
+    /// `_isTypeInIsExpression` arms run before the `element != null`
+    /// `not_a_type` tail, :621-647).
+    pub(crate) fn emit_operand_type_miss(
+        &mut self,
+        mark: Option<usize>,
+        code: SemanticCode,
+        non_type_code: Option<SemanticCode>,
+    ) {
         let Some(start) = mark else {
             return;
         };
@@ -3515,14 +3622,33 @@ impl<'a> Engine<'a> {
             return;
         }
         let mut head_hit: Option<(StringId, SourceRange)> = None;
+        let mut non_type_head: Option<(StringId, SourceRange)> = None;
         let mut arg_hits: Vec<(StringId, SourceRange)> = Vec::new();
-        for row in &self.rows[start..] {
-            if let RowShape::TypeUse(TypeVerdict::Missing, true) = row.shape {
-                if self.type_arg_miss_rows.contains(&row.range.offset) {
-                    arg_hits.push((row.name, row.range));
-                } else if head_hit.is_none() {
-                    head_hit = Some((row.name, row.range));
+        let mut silence: Vec<usize> = Vec::new();
+        for (index, row) in self.rows.iter().enumerate().skip(start) {
+            match row.shape {
+                RowShape::TypeUse(TypeVerdict::Missing, true) => {
+                    if self.type_arg_miss_rows.contains(&row.range.offset) {
+                        arg_hits.push((row.name, row.range));
+                    } else if head_hit.is_none() {
+                        head_hit = Some((row.name, row.range));
+                    }
                 }
+                // A resolved non-type element inside the operand reports the
+                // operand's code, never `not_a_type` — the pass-2 `NonType`
+                // arm does not honor the suppression flag, so the row is
+                // consumed here (a qualified `p.C` head keeps `not_a_type`:
+                // upstream's `_rewriteToConstructorName` outranks the
+                // operand context, named_type_resolver.dart:105-113/:373-457).
+                RowShape::TypeUse(TypeVerdict::NonType, _) if !row.qualified => {
+                    if self.type_arg_miss_rows.contains(&row.range.offset) {
+                        arg_hits.push((row.name, row.range));
+                    } else if non_type_head.is_none() {
+                        non_type_head = Some((row.name, row.range));
+                    }
+                    silence.push(index);
+                }
+                _ => {}
             }
         }
         for (name, range) in arg_hits {
@@ -3537,16 +3663,33 @@ impl<'a> Engine<'a> {
                 self.emit(code, range, &name_text, "");
             }
         }
+        if let Some((name, range)) = non_type_head
+            && let Some(non_type_code) = non_type_code
+            && !self.guard.ignore(None, name)
+        {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(non_type_code, range, &name_text, "");
+        }
+        for index in silence {
+            self.rows[index].shape = RowShape::Value;
+        }
     }
 
     pub(crate) fn emit_is_type_miss(&mut self) {
         let mark = self.is_type_mark.take();
-        self.emit_operand_type_miss(mark, SemanticCode::TypeTestWithUndefinedName);
+        // `type_test_with_non_type` is outside this engine's code set — a
+        // resolved non-type element in an `is` operand stays silent rather
+        // than mis-coding as `type_test_with_undefined_name`.
+        self.emit_operand_type_miss(mark, SemanticCode::TypeTestWithUndefinedName, None);
     }
 
     pub(crate) fn emit_as_type_miss(&mut self) {
         let mark = self.as_type_mark.take();
-        self.emit_operand_type_miss(mark, SemanticCode::CastToNonType);
+        self.emit_operand_type_miss(
+            mark,
+            SemanticCode::CastToNonType,
+            Some(SemanticCode::CastToNonType),
+        );
     }
 
     /// `this`/`super` in expression position: a typed receiver when a
@@ -3694,6 +3837,99 @@ impl<'a> Engine<'a> {
                     && let Some(hit) = self.resolve_local(name)
                 {
                     self.locals[hit as usize].uses += 1;
+                }
+                // An `is`/`as` operand admits a local element as a non-type
+                // element: upstream's `_isTypeInAsExpression` /
+                // `_isTypeInIsExpression` arms run before the
+                // `LocalVariableElement`/`LocalFunctionElement` fall-through
+                // (named_type_resolver.dart:621-647/:682-691), so `1 as
+                // localVar` reports `cast_to_non_type`, never the silent
+                // `Type` answer `type_resolution` gives the same local in a
+                // declaration. The `NonType` row joins the operand window —
+                // `emit_operand_type_miss` owns its report.
+                if self.non_type_pos > 0 && self.resolve_local(name).is_some() {
+                    if self.type_arg_depth > 0 {
+                        self.type_arg_miss_rows.push(range.offset);
+                    }
+                    self.push_row(Row {
+                        name,
+                        range,
+                        qualified: false,
+                        shape: RowShape::TypeUse(TypeVerdict::NonType, suppressed),
+                        intent: Intent::Read,
+                        write_op: None,
+                        ty: Ty::UNKNOWN,
+                    });
+                    return;
+                }
+                // A keyworded creation head followed by `.` is a prefixed
+                // NamedType's importPrefix — upstream `resolve()`'s
+                // importPrefix arm (named_type_resolver.dart:85-128) reports
+                // `prefix_shadowed_by_local_declaration` at the head token
+                // for a resolved non-type non-prefix element and resolves
+                // the whole `X.Y` to `InvalidType`: the `.Class`
+                // continuation and constructor-selector faces never run.
+                // Implicit creations take the method-invocation parse
+                // instead (`nonPrefix.Class.named()`'s `undefined_getter`
+                // face), so only explicit `new`/`const` heads ask the
+                // question. A real prefix keeps its `ctor_prefix_heads`
+                // dispatch; a class head rewrites to `C.named`; a miss
+                // keeps the `undefined_identifier`-over-`p.C` requalify.
+                if self.ctor_pos > 0
+                    && self.type_arg_depth == 0
+                    && self.redirect_target_depth == 0
+                    && self.implicit_creation_depth == 0
+                    && self.followed_by_period(range.end())
+                {
+                    let (_head_info, head_target) = self.resolve_bare(name);
+                    if self.is_shadowed_prefix(name, head_target) {
+                        let name_text = self.strings.resolve(name).to_string();
+                        self.emit(
+                            SemanticCode::PrefixShadowedByLocalDeclaration,
+                            range,
+                            &name_text,
+                            "",
+                        );
+                        self.push_row(Row {
+                            name,
+                            range,
+                            qualified: true,
+                            shape: RowShape::Value,
+                            intent: Intent::Read,
+                            write_op: None,
+                            ty: Ty::UNKNOWN,
+                        });
+                        return;
+                    }
+                    // An INHERITED member head (`new field.Class()` in a
+                    // subclass — `field` declared on the supertype): the
+                    // upstream member fallback is declared-only, so the
+                    // importPrefix arm's element answers `null` — the same
+                    // answer a plain miss gives — and
+                    // `reportNewWithNonType` reports `undefined_identifier`
+                    // over the whole `field.Class` span
+                    // (named_type_resolver.dart:566-590). The plain-miss
+                    // requalification in `end_constructor_reference` gates
+                    // on `resolve_bare(head)` answering `Missing`, which a
+                    // member never does — so the `PrefixHead` verdict over
+                    // the written `p.C` span is latched directly (pass-2
+                    // reports `undefined_identifier` naming the head).
+                    if matches!(head_target, RefTarget::Member { .. }) {
+                        let (_, leaf_range) = self.prefixed_leaf(range);
+                        self.push_row(Row {
+                            name,
+                            range: SourceRange {
+                                offset: range.offset,
+                                length: leaf_range.end() - range.offset,
+                            },
+                            qualified: false,
+                            shape: RowShape::TypeUse(TypeVerdict::PrefixHead, false),
+                            intent: Intent::Read,
+                            write_op: None,
+                            ty: Ty::UNKNOWN,
+                        });
+                        return;
+                    }
                 }
                 // #1595/#1596: the plain resolver path's three answers
                 // (named_type_resolver.dart:190-330 + reportNullOrNonTypeElement
@@ -3856,15 +4092,49 @@ impl<'a> Engine<'a> {
                     // the frame stack answering that question exists only at
                     // push time.
                     let local = self.frames.iter().rev().any(|f| f.locals.contains(&prefix));
-                    self.push_row(Row {
-                        name,
-                        range,
-                        qualified: true,
-                        shape: RowShape::TypeUse(TypeVerdict::Prefixed { prefix, local }, false),
-                        intent: Intent::Read,
-                        write_op: None,
-                        ty: Ty::UNKNOWN,
-                    });
+                    // A `p.C` whose head resolved to a type-bearing element
+                    // (a class, enum, mixin, or alias spelled `C` —
+                    // `type_resolution` answers `Type` for them and `NonType`
+                    // for a real `PrefixElement`) is upstream's
+                    // `_rewriteToConstructorName` non-creation arm: the
+                    // named-type face reports `not_a_type` over the whole
+                    // written `p.C` naming the pair (named_type_resolver.dart
+                    // :105-113 + :373-457 — the `element is InstanceElement`
+                    // member consult and the notAType tail). A REAL import
+                    // prefix keeps the `Prefixed` miss's `undefined_class`.
+                    if !local && self.type_resolution(prefix).0 == TypeResolution::Type {
+                        let prefix_text = self.strings.resolve(prefix);
+                        let name_text = self.strings.resolve(name);
+                        let joined = format!("{prefix_text}.{name_text}");
+                        let joined = self.strings.intern(&joined);
+                        let head_range =
+                            self.pending_prefixed.map(|(head, _)| head).unwrap_or(range);
+                        self.push_row(Row {
+                            name: joined,
+                            range: SourceRange {
+                                offset: head_range.offset,
+                                length: range.end() - head_range.offset,
+                            },
+                            qualified: true,
+                            shape: RowShape::TypeUse(TypeVerdict::NonType, suppressed),
+                            intent: Intent::Read,
+                            write_op: None,
+                            ty: Ty::UNKNOWN,
+                        });
+                    } else {
+                        self.push_row(Row {
+                            name,
+                            range,
+                            qualified: true,
+                            shape: RowShape::TypeUse(
+                                TypeVerdict::Prefixed { prefix, local },
+                                false,
+                            ),
+                            intent: Intent::Read,
+                            write_op: None,
+                            ty: Ty::UNKNOWN,
+                        });
+                    }
                 } else {
                     // The prefixed type resolved: the prefix scope lookup
                     // credits the import (`ImportsTracking` — the `is`
@@ -4042,47 +4312,149 @@ impl<'a> Engine<'a> {
         (resolution, anchor)
     }
 
-    /// Arms the type-prefix slot for a `PrefixedTypeReference` head; a miss
-    /// also pushes the head's own report row. A live prefix head counts as
-    /// a prefix use (the `unused_import` prefix face).
+    /// The `p` of `p.C`: whether the resolved element shadows the prefix
+    /// slot — the oracle's `resolve()` importPrefix arm reports
+    /// `prefixShadowedByLocalDeclaration` for ANY element that is neither a
+    /// class-ish (`InterfaceElement`/`TypeAliasElement`, the
+    /// `_rewriteToConstructorName` face), nor a `PrefixElement`, nor `null`
+    /// (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart:85-128):
+    /// locals and parameters, in-scope type parameters, members DECLARED on
+    /// the enclosing container (the `enclosingClass.getMethod/getGetter/
+    /// getSetter` fallback — declared only, no supertype climb), top-level
+    /// functions and variables, `dynamic`, and extension names. An
+    /// inherited member answers `null` there (the fallback never climbs)
+    /// and reads as a miss instead.
+    fn is_shadowed_prefix(&self, name: StringId, target: RefTarget) -> bool {
+        // `dynamic` resolves through the built-in table — a
+        // `DynamicElementImpl` upstream, never a prefix.
+        if self.members.builtin_types.contains(&name) {
+            return true;
+        }
+        match target {
+            RefTarget::Local | RefTarget::TypeParam => true,
+            RefTarget::Member { container } => {
+                // Own-declared members only (statics included): the
+                // container's declared member table answers the upstream
+                // `enclosingClass` member fallback, whose getters stop at
+                // the declaring container.
+                self.container_context().is_some_and(|(enclosing, _)| {
+                    enclosing == container
+                        && self
+                            .index
+                            .get(self.file)
+                            .and_then(|f| f.container(container))
+                            .is_some_and(|c| c.members.get(&name).is_some())
+                })
+            }
+            RefTarget::Prefix | RefTarget::Missing | RefTarget::This => false,
+            _ => self.type_resolution(name).0 == TypeResolution::NonType,
+        }
+    }
+
+    /// The continuation token of a `p.C` prefixed reference: the head's own
+    /// token table successor is the period, and the token after it is `C`.
+    /// `(name, span)` of `C`; `name` is `None` for a parser-inserted
+    /// synthetic (an empty lexeme upstream's `isSynthetic` guard drops).
+    fn prefixed_leaf(&self, head: SourceRange) -> (Option<StringId>, SourceRange) {
+        let toks = self.tokens.as_slice();
+        let at = toks.partition_point(|t| t.utf16_offset < head.end());
+        let Some(cont) = toks.get(at + 1) else {
+            return (None, head);
+        };
+        let text = &self.source[cont.byte_range()];
+        let name = (!text.is_empty()).then(|| self.strings.intern(text));
+        let range = SourceRange {
+            offset: cont.utf16_offset,
+            length: self.utf16_of(cont.byte_range().end) - cont.utf16_offset,
+        };
+        (name, range)
+    }
+
+    /// Whether the next real token after `end` is a period — the `p.` of a
+    /// prefixed type or constructor reference (comments never occupy token
+    /// slots, so the successor is direct).
+    fn followed_by_period(&self, end: u32) -> bool {
+        let toks = self.tokens.as_slice();
+        let at = toks.partition_point(|t| t.utf16_offset < end);
+        matches!(
+            toks.get(at).map(|t| &t.kind),
+            Some(dartq_scanner::TokenKind::Period)
+        )
+    }
+
+    /// Arms the type-prefix slot for a `PrefixedTypeReference` head; a
+    /// shadowed head reports `prefix_shadowed_by_local_declaration` at the
+    /// head itself, and a miss resolves the whole `p.C` to `InvalidType` —
+    /// the context-chain report lands over the written `p.C` span naming
+    /// `C` (`reportNullOrNonTypeElement`, named_type_resolver.dart:596-728:
+    /// `undefined_class`, `type_test_with_undefined_name`,
+    /// `cast_to_non_type`, `non_type_as_type_argument`, or
+    /// `non_type_in_catch_clause` — all routed by the pass-2 `Missing`
+    /// arm's context rows). A live prefix head counts as a prefix use (the
+    /// `unused_import` prefix face).
     pub(crate) fn arm_type_prefix(&mut self, name: StringId, range: SourceRange) {
         let (info, target) = self.resolve_bare(name);
-        // The importPrefix gate's fall-through: a head naming a local scope
-        // element (local, parameter, in-scope type parameter) is not an
-        // import prefix — the oracle reports `prefixShadowedByLocalDeclaration
-        // ` at the prefix token and marks the NamedType invalid (upstream
-        // Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
-        // named_type_resolver.dart:86-120 — the scope lookup's non-prefix,
-        // non-class answer). Such a use never counts as a use of the
-        // shadowing element (the oracle's `var p = 1; p.T q;` still
-        // reports `p` unused).
-        let shadowed = matches!(target, RefTarget::Local | RefTarget::TypeParam);
-        let live = !matches!(info, BareInfo::Missing { .. }) && !shadowed;
+        // A shadowed head never counts as a use of the shadowing element
+        // (the oracle's `var p = 1; p.T q;` still reports `p` unused).
+        let shadowed = self.is_shadowed_prefix(name, target);
+        let missing = matches!(info, BareInfo::Missing { .. });
+        let live = !missing && !shadowed;
         if live {
             self.used_names.insert(name);
         }
         self.type_prefix = Some(TypePrefix { prefix: name, live });
-        if !live {
-            if shadowed {
-                let name_text = self.strings.resolve(name).to_string();
-                self.emit(
-                    SemanticCode::PrefixShadowedByLocalDeclaration,
-                    range,
-                    &name_text,
-                    "",
-                );
-            } else {
-                self.push_row(Row {
-                    name,
-                    range,
-                    qualified: false,
-                    shape: RowShape::TypeUse(TypeVerdict::PrefixHead, false),
-                    intent: Intent::Read,
-                    write_op: None,
-                    ty: Ty::UNKNOWN,
-                });
-            }
+        if live {
+            return;
         }
+        if shadowed {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(
+                SemanticCode::PrefixShadowedByLocalDeclaration,
+                range,
+                &name_text,
+                "",
+            );
+            return;
+        }
+        // Missing head: the whole `p.C` resolves to `InvalidType` upstream —
+        // one context-chain report lands over `p.C` naming `C` (the element
+        // is `null`, so `reportNullOrNonTypeElement`'s argument is the
+        // node's own name — the continuation — while `_getErrorRange`
+        // spans prefix-token through name-end). The `Missing` verdict rides
+        // the same suppressed/context marks a bare head does, so `is`/`as`
+        // operands, type-argument groups, and `catch` `on` types code
+        // through the pass-2 context chain unchanged. A synthetic
+        // continuation is the recovery face — no report (`isSynthetic`,
+        // named_type_resolver.dart:597).
+        let (leaf_name, leaf_range) = self.prefixed_leaf(range);
+        let Some(leaf_name) = leaf_name else {
+            return;
+        };
+        let suppressed = self.non_type_pos > 0;
+        if self.type_arg_depth > 0 {
+            self.type_arg_miss_rows.push(range.offset);
+        }
+        if self.record_type_depth == 0
+            && self.catch_clause_start.is_some()
+            && self.catch_params == 0
+            && self.catch_on_type.is_none()
+        {
+            self.catch_on_type = Some(leaf_name);
+            self.catch_on_miss_rows.push(range.offset);
+        }
+        self.push_row(Row {
+            name: leaf_name,
+            range: SourceRange {
+                offset: range.offset,
+                length: leaf_range.end() - range.offset,
+            },
+            qualified: true,
+            shape: RowShape::TypeUse(TypeVerdict::Missing, suppressed),
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        });
     }
 
     /// Rewrites a qualified creation head's miss (`prefix.C` of `new
@@ -4094,7 +4466,20 @@ impl<'a> Engine<'a> {
     /// creation-head context entry it armed is consumed (a dead prefix
     /// never asks the type-miss question).
     pub(crate) fn requalify_creation_head(&mut self, start: Token, period: Token) {
-        let end = period.range.offset;
+        // The three-segment `unresolved.Class<int>.new` spans the head's
+        // miss through the class segment's own end (the `?` generic tail is
+        // not part of the resolved type name — the oracle reports
+        // `unresolved.Class` at |16, never through `<int>` at |21). The
+        // latched `creation_ref` selector IS that class token for the
+        // three-segment shape; a two-segment `Missing.new` latched `new`
+        // instead, and its `.new` rode the qualified rest so the period
+        // remains the end. The importPrefix arm upstream reports
+        // `prefix.C` through the class-name token (named_type_resolver.dart's
+        // `diagnostic.at(node.name)` — the `name` is the class segment).
+        let end = match self.creation_ref {
+            Some((_, Some((_, class_range)))) => class_range.end(),
+            _ => period.range.offset,
+        };
         self.requalify_creation_head_to(start, end);
     }
 

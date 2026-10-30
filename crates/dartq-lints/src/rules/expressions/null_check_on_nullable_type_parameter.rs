@@ -85,7 +85,31 @@ fn check(c: &mut Check<'_>) {
             let Some(pos) = kids.iter().position(|&kid| kid == c.node()) else {
                 return;
             };
-            kids[..pos].to_vec()
+            // The arrow posture roots the body rows flat in the
+            // declaration's own window (the childless `ExpressionBody`
+            // handle trails them): the operand read tiles as its own
+            // bare-send group ending just before the leaf, and the
+            // name row is the group's head (`send_parts`) — the whole
+            // window would drown the read in declaration-header rows.
+            if kids.len() >= 2 && c.kind(kids[kids.len() - 1]) == NodeKind::ExpressionBody {
+                // The arrow posture roots the body rows flat in the
+                // declaration's own window (the childless
+                // `ExpressionBody` handle trails them): the operand read
+                // tiles as its own bare-send group ending just before
+                // the leaf, and the name row is the group's head
+                // (`send_parts`) — the whole window would drown the read
+                // in declaration-header rows.
+                match pos
+                    .checked_sub(1)
+                    .filter(|&send| c.kind(kids[send]) == NodeKind::Send)
+                    .and_then(|send| slice::send_parts(c, &kids, send))
+                {
+                    Some((head, _)) => kids[head..head + 1].to_vec(),
+                    None => Vec::new(),
+                }
+            } else {
+                kids[..pos].to_vec()
+            }
         }
         None => return,
     };
@@ -376,7 +400,9 @@ fn expected_type_type_parameter<'a>(
     c: &'a Check<'_>,
     operand: (&str, bool),
 ) -> Option<(&'a str, bool)> {
-    for &ancestor in c.path.iter().rev().skip(1) {
+    for pair in c.path.windows(2).rev() {
+        let ancestor = pair[0];
+        let child = pair[1];
         match c.kind(ancestor) {
             NodeKind::VariableInitializer => {
                 // `T? x = <e>!;` — the declaration's written type.
@@ -389,6 +415,24 @@ fn expected_type_type_parameter<'a>(
                 // `ExpressionFunctionBody` faces share the lookup).
                 let function = enclosing_function(c, ancestor)?;
                 return written_return_type(c, function);
+            }
+            NodeKind::TopLevelMethod
+            | NodeKind::LocalFunctionDeclaration
+            | NodeKind::FunctionExpression
+            | NodeKind::NamedFunctionExpression => {
+                // The arrow posture: the expression rows tile as the
+                // declaration's own tail children before the childless
+                // `ExpressionBody` handle, so `=> <e>!` roots at the
+                // function row itself (the `unnecessary_null_checks`
+                // arrow face). Block bodies fall through — their
+                // returns were caught at the `ReturnStatement` arm.
+                let kids = c.collect_direct(ancestor);
+                if kids.len() >= 2
+                    && c.kind(kids[kids.len() - 1]) == NodeKind::ExpressionBody
+                    && kids[kids.len() - 2] == child
+                {
+                    return written_return_type(c, ancestor);
+                }
             }
             NodeKind::Assignment => {
                 // `x = <e>!;` — the target's written type (the

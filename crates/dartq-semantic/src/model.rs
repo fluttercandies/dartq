@@ -1340,6 +1340,15 @@ impl<V> Default for NameMapBuilder<V> {
 }
 
 impl<V> NameMapBuilder<V> {
+    /// The value under `name`, if present — the read-only probe a
+    /// keep-first builder needs beside [`NameMapBuilder::entry`].
+    pub(crate) fn get(&self, name: &StringId) -> Option<&V> {
+        self.rows
+            .binary_search_by_key(name, |(key, _)| *key)
+            .ok()
+            .map(|at| &self.rows[at].1)
+    }
+
     /// The entry under `name`: [`Entry::Occupied`] carries the existing
     /// value (the duplicate checks read it), [`Entry::Vacant`] inserts at
     /// the sorted position.
@@ -1475,6 +1484,15 @@ pub struct ExtensionFace {
     /// The extension's members under their lookup spellings (setters under
     /// `name=`), static bit preserved.
     pub members: NameMap<MemberEntry>,
+    /// The declaration's metadata star, in written order — the
+    /// application-use reporter's target face for `E(0).member` shapes
+    /// (upstream anchors the use on the extension element itself,
+    /// `element_usage_detector.dart`'s `ExtensionElement` arm: the
+    /// override's `extension` member access reports when the EXTENSION
+    /// carries the tag). A named extension carries the same star on its
+    /// [`Container::annotations`] row; the face keeps its own copy so an
+    /// unnamed or lookup-shaped query answers without the container join.
+    pub annotations: Box<[Annotation]>,
 }
 
 /// One class member: kind, static/instance bit, and its executable facts.
@@ -1660,6 +1678,12 @@ pub struct Container {
 /// meta-getter faces the recognition helper reads ([`crate::annotation`])
 /// need presence and name only; the argument text rides the API signature,
 /// so an argument-only edit flips the L2 gate.
+///
+/// The `deprecated_member_use` face's frontier walk also reads the star as
+/// a name-level list (the declaration-site annotations of the analyzed
+/// unit): the oracle's `ElementUsageFrontierDetector` keys its sticky
+/// per-tag stacks off the element's metadata (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/error/element_usage_frontier_detector.dart:44-75).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
     /// The name as written: the head identifier for a bare `@sealed`, the
@@ -1703,6 +1727,15 @@ pub struct TopDecl {
     pub return_ty: Ty,
     /// The formal-parameter table; `None` for non-executables.
     pub formals: Option<Box<Formals>>,
+    /// The declaration's metadata star, in written order — the
+    /// `deprecated_member_use` / `experimental_member_use` reporter's
+    /// target face for top-level functions, variables, and type aliases
+    /// (upstream checks the resolved element's own metadata,
+    /// element_usage_detector.dart:64-138). Empty for every capture shape
+    /// that never latches a star (containers ride their
+    /// [`Container::annotations`], prefixes and type parameters carry
+    /// none).
+    pub annotations: Box<[Annotation]>,
 }
 
 impl TopDecl {
@@ -1717,6 +1750,7 @@ impl TopDecl {
             var_ty: Ty::UNKNOWN,
             return_ty: Ty::UNKNOWN,
             formals: None,
+            annotations: Box::new([]),
         }
     }
 }
@@ -2076,6 +2110,12 @@ pub struct FileElements {
     pub(crate) container_order: Box<[StringId]>,
     pub(crate) extension_faces: Box<[ExtensionFace]>,
     pub(crate) duplicates: Box<[DuplicateDecl]>,
+    /// The wildcard-`_` duplicate rows: a second `_` declaration is a real
+    /// duplicate only pre-wildcards, so these log separately from
+    /// [`FileElements::duplicates`] and the diagnose pass emits them when
+    /// the feature is off (upstream `isWildcardVariable` short-circuit —
+    /// a wildcard declares no name).
+    pub(crate) wildcard_duplicates: Box<[DuplicateDecl]>,
     pub(crate) arity_violations: Box<[ArityDecl]>,
     /// Every `augment` declaration of the unit, in source order (the
     /// augmentation verifier's capture face).
@@ -2093,6 +2133,37 @@ pub struct FileElements {
     /// creation, by name (the cross-library instance-equality face,
     /// [`ConstCreationFace`]).
     pub(crate) const_creations: NameMap<ConstCreationFace>,
+    /// The formal-parameter metadata stars of the unit's executables, keyed
+    /// by an owner join (see [`FileElements::formal_annotations`]): the
+    /// `deprecated_member_use` face's parameter arm reads them — upstream
+    /// anchors a use of a deprecated parameter on the call site's
+    /// NamedExpression label, so the model needs the star keyed off the
+    /// declaration's own table (`element_usage_detector.dart`'s
+    /// `_visitParametersAndArguments`, :381-413).
+    ///
+    /// A side map, not a [`Formal`] column: the formal shape is `Copy` and
+    /// field-frozen by foreign literal constructions.
+    pub(crate) formal_annotations: NameMap<NameMap<Box<[Annotation]>>>,
+    /// The constructor and factory metadata stars of the unit's containers,
+    /// keyed by `ctor_formals`'s own lookup spelling (the selector for
+    /// `A.named`, the container's name for `A()` / `A.new`) — upstream
+    /// anchors a deprecated named-constructor use on the creation's
+    /// selector (`element_usage_detector.dart` `visitConstructorName` /
+    /// the creation's `constructorName` arm).
+    ///
+    /// Constructors are not [`MemberEntry`] rows, so their star joins the
+    /// container beside — not inside — [`Container::annotations`] (which
+    /// keeps the class star only).
+    pub(crate) ctor_annotations: NameMap<NameMap<Box<[Annotation]>>>,
+    /// The `library` directive's own metadata star (`@deprecated library
+    /// lib;`), in written order. Upstream's element-usage frontier detector
+    /// pushes the LIBRARY element's tags onto the same sticky stacks as
+    /// every declaration's (`element_usage_frontier_detector.dart`
+    /// `pushElement(_currentLibrary)` — called from
+    /// `best_practices_verifier.dart:166`), so a deprecated library
+    /// silences the tag across its whole unit: the reporter reads this as
+    /// a whole-file extent frontier.
+    pub(crate) library_annotations: Box<[Annotation]>,
     /// The unit's canonical argument pool: every [`Ty::Named`] slot of
     /// this model indexes into it. One pool per model universe — ids from
     /// another unit's pool are meaningless here.
@@ -2119,6 +2190,51 @@ impl FileElements {
     #[must_use]
     pub fn const_creation(&self, name: StringId) -> Option<&ConstCreationFace> {
         self.const_creations.get(&name)
+    }
+
+    /// The metadata star of one formal parameter, addressed by the
+    /// executable's owner key and the formal's own name (upstream
+    /// `element_usage_detector.dart`'s `parameterElement.metadata` read —
+    /// the `deprecated_member_use` row anchors on the call site's
+    /// NamedExpression label, so the face is keyed by the declaration's
+    /// own spelling, never by an index). `None` when the owner carries no
+    /// table or the formal none (the tag-absent direction).
+    ///
+    /// `owner` is the collector's dot-joined one-head spelling of the
+    /// executable that declared the parameter: a top-level `f` keys under
+    /// its name; a member `m` of container `C` under `C.m`; a constructor
+    /// or factory under `C.<key>` where `<key>` is the
+    /// [`Container::ctor_formals`]/`factory_formals` lookup spelling (the
+    /// selector for `A.named`, the class name for the unnamed face). The
+    /// caller resolves the join text into the interned id.
+    #[must_use]
+    pub fn formal_annotations(&self, owner: StringId, formal: StringId) -> Option<&[Annotation]> {
+        self.formal_annotations
+            .get(&owner)
+            .and_then(|formals| formals.get(&formal))
+            .map(Box::as_ref)
+    }
+
+    /// The metadata star of one declared constructor (or factory) of
+    /// `container`, keyed by the same lookup spelling the model's
+    /// `ctor_formals`/`factory_formals` maps use. `None` when the
+    /// container declares no annotated constructor under the key (the
+    /// tag-absent direction).
+    #[must_use]
+    pub fn ctor_annotations(&self, container: StringId, key: StringId) -> Option<&[Annotation]> {
+        self.ctor_annotations
+            .get(&container)
+            .and_then(|ctors| ctors.get(&key))
+            .map(Box::as_ref)
+    }
+
+    /// The `library` directive's own metadata star, in written order —
+    /// the whole-file frontier (`element_usage_frontier_detector.dart`'s
+    /// `pushElement(_currentLibrary)`). Empty when the unit's directive is
+    /// unannotated or absent.
+    #[must_use]
+    pub fn library_annotations(&self) -> &[Annotation] {
+        &self.library_annotations
     }
 
     /// The container names in declaration order (`containers` itself is a
@@ -2170,6 +2286,14 @@ impl FileElements {
     #[must_use]
     pub fn duplicates(&self) -> &[DuplicateDecl] {
         &self.duplicates
+    }
+
+    /// Every wildcard-`_` duplicate captured in this unit, in source order;
+    /// emitted as `duplicate_definition` only when the wildcards feature is
+    /// off — under the feature a `_` declares nothing.
+    #[must_use]
+    pub fn wildcard_duplicates(&self) -> &[DuplicateDecl] {
+        &self.wildcard_duplicates
     }
 
     /// Every declaration-arity violation captured in this unit, in source

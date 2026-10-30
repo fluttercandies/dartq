@@ -1048,6 +1048,27 @@ pub enum SemanticCode {
     /// recovered extends-after-implements tail reports its unresolvable
     /// heads here.
     ExtendsNonClass,
+    // —— #2972: the non-subtypable supertype faces (one code name,
+    //    `subtype_of_disallowed_type`, four problem/correction texts split
+    //    by clause kind — messages.yaml :17292-17376's four shared-name
+    //    rows) ———————————————————————————————————————————————————————————
+    /// `Classes can't extend '{0}'.` — the `extends` head resolves to a
+    /// non-subtypable SDK class (`bool`/`double`/`Enum`/`int`/`Null`/`num`/
+    /// `Record`/`String`, `FutureOr`, the `dart:typed_data` family;
+    /// `_checkForExtendsDisallowedClass`, error_verifier.dart:4692-4697).
+    SubtypeOfDisallowedTypeInExtends,
+    /// `Classes can't mixin '{0}'.` — the `with` entry face
+    /// (`_checkForAllMixinErrorCodes`, error_verifier.dart:2461-2463; the
+    /// core `Enum` itself is exempt there — `!mixinType.isDartCoreEnum`).
+    SubtypeOfDisallowedTypeInWith,
+    /// `Classes and mixins can't implement '{0}'.` — the `implements`
+    /// entry face (`_checkForImplementsClauseErrorCodes`,
+    /// error_verifier.dart:5365-5381).
+    SubtypeOfDisallowedTypeInImplements,
+    /// `'{0}' can't be used as a superclass constraint.` — the mixin `on`
+    /// entry face (`_checkForOnClauseErrorCodes`,
+    /// error_verifier.dart:6724-6745).
+    SubtypeOfDisallowedTypeInOn,
     // —— #1314 FAM18: the uninitialized-non-nullable faces (both
     //    `COMPILE_TIME_ERROR`, diagnostic.g.dart :13503/:13540) ——————————
     /// `The non-nullable variable '{0}' must be initialized.` — a
@@ -1138,6 +1159,12 @@ pub enum SemanticCode {
     /// member_duplicate_definition_verifier.dart:195-230/:430-470; emitted
     /// at the static member's name, `values` exempt).
     ConflictingStaticAndInstance,
+    /// `An extension can't define static member '{0}' and an instance member
+    /// with the same name.` — the extension face of the static-vs-instance
+    /// collision (`extension_conflicting_static_and_instance`,
+    /// member_duplicate_definition_verifier.dart:487-522 — a single-argument
+    /// message; the extension's own name never renders).
+    ExtensionConflictingStaticAndInstance,
     /// `Only static fields can be declared as const.` — an instance field
     /// group carrying `const` (`const_instance_field`,
     /// error_verifier.dart:1260-1268, one row per group at the `const`
@@ -1164,6 +1191,17 @@ pub enum SemanticCode {
     /// (`non_bool_negation_expression`, error_verifier.dart:6374-6386,
     /// anchored from the operator's end to the operand's end).
     NonBoolNegationExpression,
+    /// `The operands of the operator '{0}' must be assignable to 'bool'.` —
+    /// a `&&`/`||` operand whose static type is known and not assignable to
+    /// `bool` (`non_bool_operand`, binary_expression_resolver.dart:81-92
+    /// `_checkNonBoolOperand`, fired at :294-295 for `&&` and :340-341 for
+    /// `||`; `{0}` is the operator lexeme, the anchor is the operand).
+    NonBoolOperand,
+    /// `The expression in an assert must be of type 'bool'.` — an `assert`
+    /// condition whose static type is known and not `bool`
+    /// (`non_bool_expression`, resolver.dart:2136/:2163 — AssertInitializer
+    /// and AssertStatement share the face).
+    NonBoolExpression,
     /// `An expression whose value is always 'null' can't be dereferenced.`
     /// — an invocation whose callee expression statically evaluates to
     /// `null` (`invalid_use_of_null_value`,
@@ -1609,6 +1647,55 @@ pub enum SemanticCode {
     /// `augmentationInducedSetterAlreadyComplete`) ride one analyzer name
     /// (`sharedName`); the shape enum picks the message.
     AugmentationAlreadyComplete(AlreadyCompleteShape),
+    // —— #2993: the whole-face-missing emitters (one contiguous append
+    //    block; every row's tier and verbatim text pinned against the
+    //    3.13.7 registry, diagnostic.g.dart) —————————————————————————————
+    /// `The annotation '{0}' can only be used on {1}.` — an annotation
+    /// whose resolved element's `@Target({TargetKind.…})` allow-list
+    /// forbids the declaration kind it annotates
+    /// (`AnnotationVerifier._checkKinds`, annotation_verifier.dart:373-401;
+    /// STATIC_WARNING, diagnostic.g.dart:8306-8314). `{1}` is the sorted
+    /// kind display list joined with the Oxford-comma `or` chain.
+    InvalidAnnotationTarget,
+    /// `Braces unnecessarily wrap this expression in a set literal.` — an
+    /// arrow body whose set literal feeds a void-return context
+    /// (`BestPracticesVerifier._checkForUnnecessarySetLiteral`,
+    /// best_practices_verifier.dart:1353-1391; STATIC_WARNING,
+    /// diagnostic.g.dart:17389-17400).
+    UnnecessarySetLiteral,
+    /// `The keyword 'final' isn't necessary because the parameter is
+    /// implicitly 'final'.` — `final` on a formal parameter
+    /// (`BestPracticesVerifier._checkFinalParameter`,
+    /// best_practices_verifier.dart:932-940; STATIC_WARNING,
+    /// diagnostic.g.dart:17202-17214).
+    UnnecessaryFinal,
+    /// `The import of '{0}' is unnecessary because all of the used
+    /// elements are also provided by the import of '{1}'.` — one import of
+    /// a prefix group whose used-element set is a proper subset of
+    /// another same-prefix import's (`ImportsVerifier.
+    /// generateUnnecessaryImportHints`, imports_verifier.dart:194-249;
+    /// HINT, diagnostic.g.dart:17225-17235).
+    UnnecessaryImport,
+    /// `The parameter '{0}' is required.` — an optional named formal
+    /// carrying package:meta's `@required`/`@Required` whose call site
+    /// supplies no matching named argument
+    /// (`RequiredParametersVerifier._check`, required_parameters_verifier.
+    /// dart:153-196; STATIC_WARNING, diagnostic.g.dart:10933-10960 — the
+    /// shape enum picks the plain vs with-reason text; both print the
+    /// shared `missing_required_param` name).
+    MissingRequiredParam(MissingRequiredParamShape),
+}
+
+/// The message shape of [`SemanticCode::MissingRequiredParam`]: the
+/// optional-named `@required` WARNING face's two upstream texts (the
+/// `@Required('reason')` argument rides the details tail;
+/// `missingRequiredParamWithDetails`'s uniqueName split never prints).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MissingRequiredParamShape {
+    /// `The parameter '{0}' is required.`
+    Plain,
+    /// `The parameter '{0}' is required. {1}.`
+    WithDetails,
 }
 
 /// The message shapes of the shared `augmentation_without_declaration` code
@@ -2489,6 +2576,16 @@ impl SemanticCode {
                 "MIXIN_WITH_NON_CLASS_SUPERCLASS",
             ),
             Self::ExtendsNonClass => ("extends_non_class", "EXTENDS_NON_CLASS"),
+            // The #2972 non-subtypable supertype faces: one registry name
+            // across the four clause kinds (the `sharedName` split,
+            // messages.yaml :17296/:17357/:17365/:17373).
+            Self::SubtypeOfDisallowedTypeInExtends
+            | Self::SubtypeOfDisallowedTypeInWith
+            | Self::SubtypeOfDisallowedTypeInImplements
+            | Self::SubtypeOfDisallowedTypeInOn => (
+                "subtype_of_disallowed_type",
+                "SUBTYPE_OF_DISALLOWED_TYPE",
+            ),
             // The #1314 FAM18 uninitialized-non-nullable faces.
             Self::NotInitializedNonNullableVariable => (
                 "not_initialized_non_nullable_variable",
@@ -2537,6 +2634,10 @@ impl SemanticCode {
                 "conflicting_static_and_instance",
                 "CONFLICTING_STATIC_AND_INSTANCE",
             ),
+            Self::ExtensionConflictingStaticAndInstance => (
+                "extension_conflicting_static_and_instance",
+                "EXTENSION_CONFLICTING_STATIC_AND_INSTANCE",
+            ),
             Self::ConstInstanceField => ("const_instance_field", "CONST_INSTANCE_FIELD"),
             Self::NonVoidReturnForSetter => {
                 ("non_void_return_for_setter", "NON_VOID_RETURN_FOR_SETTER")
@@ -2547,6 +2648,8 @@ impl SemanticCode {
                 "non_bool_negation_expression",
                 "NON_BOOL_NEGATION_EXPRESSION",
             ),
+            Self::NonBoolOperand => ("non_bool_operand", "NON_BOOL_OPERAND"),
+            Self::NonBoolExpression => ("non_bool_expression", "NON_BOOL_EXPRESSION"),
             Self::InvalidUseOfNullValue => {
                 ("invalid_use_of_null_value", "INVALID_USE_OF_NULL_VALUE")
             }
@@ -2631,6 +2734,19 @@ impl SemanticCode {
                 "ambiguous_set_or_map_literal_both",
                 "AMBIGUOUS_SET_OR_MAP_LITERAL_BOTH",
             ),
+            // The #2993 whole-face-missing rows (both required-param
+            // shapes print the shared analyzer name).
+            Self::InvalidAnnotationTarget => {
+                ("invalid_annotation_target", "INVALID_ANNOTATION_TARGET")
+            }
+            Self::UnnecessarySetLiteral => {
+                ("unnecessary_set_literal", "UNNECESSARY_SET_LITERAL")
+            }
+            Self::UnnecessaryFinal => ("unnecessary_final", "UNNECESSARY_FINAL"),
+            Self::UnnecessaryImport => ("unnecessary_import", "UNNECESSARY_IMPORT"),
+            Self::MissingRequiredParam(_) => {
+                ("missing_required_param", "MISSING_REQUIRED_PARAM")
+            }
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -2777,6 +2893,15 @@ impl SemanticCode {
             // DiagnosticType.STATIC_WARNING`, diagnostic.g.dart:9815).
             | Self::InvalidUseOfVisibleForTemplateMember
             | Self::UnusedFieldFromPrimaryConstructor => DiagnosticType::StaticWarning,
+            // The #2993 whole-face-missing rows: four STATIC_WARNING faces
+            // (diagnostic.g.dart:8306-8314/:17202-17214/:17389-17400/
+            // :10933-10941) and the INFO-tier unnecessary_import
+            // (:17225-17235, DiagnosticType.HINT).
+            Self::InvalidAnnotationTarget
+            | Self::UnnecessarySetLiteral
+            | Self::UnnecessaryFinal
+            | Self::MissingRequiredParam(_) => DiagnosticType::StaticWarning,
+            Self::UnnecessaryImport => DiagnosticType::Hint,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -3565,6 +3690,20 @@ impl SemanticCode {
             }
             Self::MixinWithNonClassSuperclass => "Mixin can only be applied to class.".to_string(),
             Self::ExtendsNonClass => "Classes can only extend other classes.".to_string(),
+            // The #2972 non-subtypable supertype faces (messages.yaml
+            // :17297/:17358/:17374/:17366 — `{0}` is the written type).
+            Self::SubtypeOfDisallowedTypeInExtends => {
+                format!("Classes can't extend '{a0}'.")
+            }
+            Self::SubtypeOfDisallowedTypeInWith => {
+                format!("Classes can't mixin '{a0}'.")
+            }
+            Self::SubtypeOfDisallowedTypeInImplements => {
+                format!("Classes and mixins can't implement '{a0}'.")
+            }
+            Self::SubtypeOfDisallowedTypeInOn => {
+                format!("'{a0}' can't be used as a superclass constraint.")
+            }
             // The #1314 FAM18 uninitialized-non-nullable faces
             // (diagnostic.g.dart :13505/:13542).
             Self::NotInitializedNonNullableVariable => {
@@ -3619,6 +3758,9 @@ impl SemanticCode {
                 "Class '{a0}' can't define static member '{a1}' and have instance member \
                  '{a0}.{a1}' with the same name."
             ),
+            Self::ExtensionConflictingStaticAndInstance => format!(
+                "An extension can't define static member '{a0}' and an instance member with the same name."
+            ),
             Self::ConstInstanceField => "Only static fields can be declared as const.".to_string(),
             Self::NonVoidReturnForSetter => {
                 "The return type of the setter must be 'void' or absent.".to_string()
@@ -3627,6 +3769,12 @@ impl SemanticCode {
             Self::NonBoolCondition => "Conditions must have a static type of 'bool'.".to_string(),
             Self::NonBoolNegationExpression => {
                 "A negation operand must have a static type of 'bool'.".to_string()
+            }
+            Self::NonBoolOperand => {
+                format!("The operands of the operator '{a0}' must be assignable to 'bool'.")
+            }
+            Self::NonBoolExpression => {
+                "The expression in an assert must be of type 'bool'.".to_string()
             }
             Self::InvalidUseOfNullValue => {
                 "An expression whose value is always 'null' can't be dereferenced.".to_string()
@@ -3782,6 +3930,29 @@ impl SemanticCode {
             // immediately-negated operand (messages.yaml:9355).
             Self::IntegerLiteralImpreciseAsDouble => {
                 format!("The integer literal is being used as a double, but can't be represented as a 64-bit double without overflow or loss of precision: '{a0}'.")
+            }
+            // The #2993 whole-face-missing rows (verbatim 3.13.7 registry
+            // texts; the with-details shape is the registry's
+            // `missingRequiredParamWithDetails` template with its literal
+            // terminal period).
+            Self::InvalidAnnotationTarget => {
+                format!("The annotation '{a0}' can only be used on {a1}.")
+            }
+            Self::UnnecessarySetLiteral => {
+                "Braces unnecessarily wrap this expression in a set literal.".to_string()
+            }
+            Self::UnnecessaryFinal => {
+                "The keyword 'final' isn't necessary because the parameter is implicitly 'final'."
+                    .to_string()
+            }
+            Self::UnnecessaryImport => format!(
+                "The import of '{a0}' is unnecessary because all of the used elements are also provided by the import of '{a1}'."
+            ),
+            Self::MissingRequiredParam(MissingRequiredParamShape::Plain) => {
+                format!("The parameter '{a0}' is required.")
+            }
+            Self::MissingRequiredParam(MissingRequiredParamShape::WithDetails) => {
+                format!("The parameter '{a0}' is required. {a1}.")
             }
         }
     }
@@ -4018,6 +4189,14 @@ impl SemanticCode {
                 "Dead code: Catch clauses after a 'catch (e)' or an 'on Object catch (e)' are never reached."
                     .to_string()
             }
+            // The inherited face: `{a2}` carries the conflicting owner's
+            // name (`conflicting_static_and_instance`'s
+            // `getInherited`/`getMember` arm — the own-name face the
+            // two-argument `message` renders is a2==a0).
+            Self::ConflictingStaticAndInstance => format!(
+                "Class '{a0}' can't define static member '{a1}' and have instance member \
+                 '{a2}.{a1}' with the same name."
+            ),
             // One- and two-placeholder rows: the extra placeholder is
             // ignored (the descriptor stays total over the frozen set).
             _ => self.message(a0, a1),
@@ -4316,6 +4495,24 @@ impl SemanticCode {
                 "Try specifying a different superclass, or removing the extends clause."
                     .to_string(),
             ),
+            // The #2972 non-subtypable supertype corrections (messages.yaml
+            // :17298/:17359/:17375/:17367).
+            Self::SubtypeOfDisallowedTypeInExtends => Some(
+                "Try specifying a different superclass, or removing the extends clause."
+                    .to_string(),
+            ),
+            Self::SubtypeOfDisallowedTypeInWith => Some(
+                "Try specifying a different class or mixin, or remove the class or mixin from the list."
+                    .to_string(),
+            ),
+            Self::SubtypeOfDisallowedTypeInImplements => Some(
+                "Try specifying a different interface, or remove the class from the list."
+                    .to_string(),
+            ),
+            Self::SubtypeOfDisallowedTypeInOn => Some(
+                "Try specifying a different super-class constraint, or remove the 'on' clause."
+                    .to_string(),
+            ),
             // The #1314 FAM18 uninitialized-non-nullable corrections
             // (diagnostic.g.dart :13506-13507/:13542).
             Self::NotInitializedNonNullableVariable => {
@@ -4476,6 +4673,19 @@ impl SemanticCode {
                 "Try removing the parameter type, or make it a supertype of the receiver type."
                     .to_string(),
             ),
+            // The assert-condition face's verbatim oracle correctionMessage
+            // (diagnostic.g.dart:12348); `non_bool_operand` carries none.
+            Self::NonBoolExpression => Some("Try changing the expression.".to_string()),
+            // The #2993 whole-face-missing corrections (diagnostic.g.dart
+            // :17210/:17395/:17231 — the annotation-target and
+            // required-param rows carry none).
+            Self::UnnecessaryFinal => Some("Try removing the 'final'.".to_string()),
+            Self::UnnecessarySetLiteral => {
+                Some("Try removing the set literal around the expression.".to_string())
+            }
+            Self::UnnecessaryImport => {
+                Some("Try removing the import directive.".to_string())
+            }
             _ => None,
         }
     }
@@ -5528,6 +5738,13 @@ mod tests {
             | SemanticCode::ReceiverOfTypeNever
             | SemanticCode::RecursiveCompileTimeConstant
             | SemanticCode::StrictRawType
+            // The #2972 non-subtypable supertype faces (not registry-backed:
+            // the analyzer-tier table carries one representative template and
+            // the four clause texts stay local, like the struct-class trio).
+            | SemanticCode::SubtypeOfDisallowedTypeInExtends
+            | SemanticCode::SubtypeOfDisallowedTypeInWith
+            | SemanticCode::SubtypeOfDisallowedTypeInImplements
+            | SemanticCode::SubtypeOfDisallowedTypeInOn
             | SemanticCode::SubtypeOfSealedClass
             | SemanticCode::TypeArgumentNotMatchingBounds
             | SemanticCode::TypeCheckWithNotNull
@@ -5597,11 +5814,14 @@ mod tests {
             | SemanticCode::ReturnOfInvalidType(_)
             | SemanticCode::NotEnoughPositionalArguments(_)
             | SemanticCode::ConflictingStaticAndInstance
+            | SemanticCode::ExtensionConflictingStaticAndInstance
             | SemanticCode::ConstInstanceField
             | SemanticCode::NonVoidReturnForSetter
             | SemanticCode::NotAType
             | SemanticCode::NonBoolCondition
             | SemanticCode::NonBoolNegationExpression
+            | SemanticCode::NonBoolOperand
+            | SemanticCode::NonBoolExpression
             | SemanticCode::InvalidUseOfNullValue
             | SemanticCode::InvocationOfNonFunctionExpression
             | SemanticCode::InvocationOfNonFunction
@@ -5677,6 +5897,15 @@ mod tests {
             | SemanticCode::NativeFunctionMissingType
             | SemanticCode::NonConstantTypeArgument
             | SemanticCode::NonNativeFunctionTypeArgumentToPointer
+            // The #2993 whole-face-missing rows: none registry-backed (the
+            // inline `message` arms are the sole template source, like the
+            // #2784 augmentation faces).
+            | SemanticCode::InvalidAnnotationTarget
+            | SemanticCode::UnnecessarySetLiteral
+            | SemanticCode::UnnecessaryFinal
+            | SemanticCode::UnnecessaryImport
+            | SemanticCode::MissingRequiredParam(MissingRequiredParamShape::Plain)
+            | SemanticCode::MissingRequiredParam(MissingRequiredParamShape::WithDetails)
             => code.code_info(),
         }
     }
@@ -5826,6 +6055,10 @@ mod tests {
             SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
             SemanticCode::ReturnOfInvalidType(ExecKind::Closure),
             SemanticCode::StrictRawType,
+            SemanticCode::SubtypeOfDisallowedTypeInExtends,
+            SemanticCode::SubtypeOfDisallowedTypeInWith,
+            SemanticCode::SubtypeOfDisallowedTypeInImplements,
+            SemanticCode::SubtypeOfDisallowedTypeInOn,
             SemanticCode::SubtypeOfSealedClass,
             SemanticCode::TypeArgumentNotMatchingBounds,
             SemanticCode::TypeCheckWithNotNull,
@@ -5951,6 +6184,15 @@ mod tests {
             SemanticCode::NativeFunctionMissingType,
             SemanticCode::NonConstantTypeArgument,
             SemanticCode::NonNativeFunctionTypeArgumentToPointer,
+            // The #2993 whole-face-missing rows (registry coverage gate:
+            // none carry a generated-table template; both required-param
+            // shapes walk).
+            SemanticCode::InvalidAnnotationTarget,
+            SemanticCode::UnnecessarySetLiteral,
+            SemanticCode::UnnecessaryFinal,
+            SemanticCode::UnnecessaryImport,
+            SemanticCode::MissingRequiredParam(MissingRequiredParamShape::Plain),
+            SemanticCode::MissingRequiredParam(MissingRequiredParamShape::WithDetails),
         ]
     }
 

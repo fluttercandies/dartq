@@ -813,6 +813,24 @@ impl<'a> Engine<'a> {
         if cursor == 0 {
             return None;
         }
+        // A single nullable `?` suffix rides the type (`Pointer? p`): the
+        // oracle's `fieldType.toSource()` keeps it, so the span must reach
+        // past the `?` while the head/`>` detection reads before it
+        // (upstream ffi_verifier.dart:1566-1570 reports `Pointer?` itself).
+        let type_end = cursor;
+        if bytes.get(cursor - 1) == Some(&b'?') {
+            cursor -= 1;
+            while cursor > 0
+                && bytes
+                    .get(cursor - 1)
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                cursor -= 1;
+            }
+            if cursor == 0 {
+                return None;
+            }
+        }
         // A closed `<...>` group directly before the name (or before the
         // type head).
         if bytes.get(cursor - 1) == Some(&b'>') {
@@ -858,7 +876,7 @@ impl<'a> Engine<'a> {
                 return None;
             }
             let head16 = byte_offset_to_utf16(self.source, head_start);
-            let close16 = byte_offset_to_utf16(self.source, cursor);
+            let close16 = byte_offset_to_utf16(self.source, type_end);
             return Some(SourceRange {
                 offset: head16,
                 length: close16 - head16,
@@ -881,7 +899,7 @@ impl<'a> Engine<'a> {
             return None;
         }
         let start16 = byte_offset_to_utf16(self.source, word_start);
-        let end16 = byte_offset_to_utf16(self.source, cursor);
+        let end16 = byte_offset_to_utf16(self.source, type_end);
         Some(SourceRange {
             offset: start16,
             length: end16 - start16,

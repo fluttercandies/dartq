@@ -259,18 +259,21 @@ fn unannotated_closure_reports_against_function() {
     );
 }
 
-/// An arrow initializer stays under-reported: the return column is the
-/// body expression's type, no `dynamic` stand-in answers for it.
+/// An arrow initializer's return column IS the body expression's type
+/// (#2966 — `var f = () => 1` binds `int Function()` whole): the `is`
+/// ask against the same spelling decides and reports the oracle's
+/// `unnecessary_type_check` verdict.
 #[test]
-fn arrow_initializer_stays_live() {
+fn arrow_initializer_reports_the_decided_check() {
     let report = report_ops(
         "void main() {\n\
          \x20  var f = () => 1;\n\
          \x20  if (f is int Function()) {}\n\
          \x20}",
     );
-    assert!(
-        type_check_rows(&report).is_empty(),
+    assert_eq!(
+        type_check_rows(&report).len(),
+        1,
         "rows: {:#?}",
         report.diagnostics
     );

@@ -4974,28 +4974,38 @@ pub(crate) mod avoid_futureor_void {
         if c.lexeme(head) != "FutureOr" {
             return;
         }
-        let Some(parent) = c.unit.ast.parent(node) else {
-            return;
+        // The `<void>` argument run tiles as a row of the enclosing
+        // statement's flat window — inside the pattern row's own span,
+        // but not under the pattern row (`ParenthesizedCondition` holds
+        // the pattern alone), so the search ascends until a window
+        // carries a `TypeArguments` row contained in the pattern span.
+        let pattern_span = c.byte_span(node);
+        let is_single_void_args = |c: &Check<'_>, kid: u32| {
+            c.kind(kid) == NodeKind::TypeArguments
+                && matches!(
+                    type_argument_rows(c, kid).as_slice(),
+                    [only] if c.kind(*only) == NodeKind::VoidType
+                )
         };
-        let siblings = c.collect_direct(parent);
-        let Some(pos) = siblings.iter().position(|&kid| kid == node) else {
-            return;
+        let args = {
+            let mut owner = c.unit.ast.parent(node);
+            loop {
+                let Some(parent) = owner else { return };
+                let found = c.collect_direct(parent).into_iter().find(|&kid| {
+                    let span = c.byte_span(kid);
+                    span.start >= pattern_span.start
+                        && span.end <= pattern_span.end
+                        && is_single_void_args(c, kid)
+                });
+                if let Some(args) = found {
+                    break args;
+                }
+                owner = c.unit.ast.parent(parent);
+            }
         };
-        let Some(args) = siblings[..pos]
-            .iter()
-            .rev()
-            .copied()
-            .find(|&kid| {
-                c.kind(kid) == NodeKind::TypeArguments
-                    && matches!(
-                        type_argument_rows(c, kid).as_slice(),
-                        [only] if c.kind(*only) == NodeKind::VoidType
-                    )
-            })
-            .filter(|_| future_or_in_scope(c))
-        else {
+        if !future_or_in_scope(c) {
             return;
-        };
+        }
         let start = utf16_token_span(c, head).start;
         let end = c.utf16_span(args).end;
         c.report(start..end, &[]);
@@ -5099,8 +5109,33 @@ pub(crate) mod avoid_futureor_void {
     /// `class FutureOr` without an import stays silent the same way. With
     /// no semantic face (plain-run posture) the syntax predicate stands.
     fn future_or_in_scope(c: &Check<'_>) -> bool {
-        c.semantics().is_none_or(|analysis| {
-            analysis.import_shadows(analysis.strings().intern("FutureOr"))
+        if let Some(analysis) = c.semantics() {
+            return analysis.import_shadows(analysis.strings().intern("FutureOr"));
+        }
+        // The syntax-tier posture (the production lint tier runs this rule
+        // without the resolution face): the unit's own import directives
+        // answer — an unprefixed `dart:async` import puts the name in
+        // scope, a prefixed one does not (its target stays outside the
+        // unit scope). The file-local `FutureOr` declaration and
+        // re-exporting-package faces ride the semantic path only.
+        let is_async_import = |c: &Check<'_>, row: u32| {
+            c.kind(row) == NodeKind::Import
+                && c.field(row, PayloadField::AsKeyword).unwrap_or(NONE_TOKEN) == NONE_TOKEN
+                && c
+                    .unit
+                    .ast
+                    .token_range(row)
+                    .any(|token| c.lexeme(token).contains("dart:async"))
+        };
+        let Some(root) = c.unit.ast.root() else {
+            return false;
+        };
+        // The directive tiles one level down: each unit declaration —
+        // the import included — wraps in its own `TopLevelDeclaration`
+        // row.
+        c.collect_direct(root).iter().any(|&row| {
+            is_async_import(c, row)
+                || c.collect_direct(row).iter().any(|&kid| is_async_import(c, kid))
         })
     }
 }
@@ -6608,10 +6643,11 @@ mod wave1_types_tests {
     // —— avoid_futureor_void ——————————————————————————————————————————————
 
     /// A `FutureOr<void>` return type and a top-level variable report at
-    /// the annotation.
+    /// the annotation (the `dart:async` import puts the name in scope —
+    /// the resolution gate, `doc_bad_1`).
     #[test]
     fn futureor_void_result_positions_report() {
-        let f = Fixture::parse("FutureOr<void> f() => throw 0;\n");
+        let f = Fixture::parse("import 'dart:async';\n\nFutureOr<void> f() => throw 0;\n");
         let lints = f.run(&one_rule("avoid_futureor_void"));
         assert_eq!(lints.len(), 1, "{lints:?}");
         assert_eq!(lints[0].message, "Don't use the type 'FutureOr<void>'.");
@@ -6622,10 +6658,10 @@ mod wave1_types_tests {
         let futureor = tok(&f.source, &f.tokens, "FutureOr", 0);
         assert_eq!(lints[0].range.start, utf16_at(&f, futureor));
 
-        let f = Fixture::parse("FutureOr<void> x = throw 0;\n");
+        let f = Fixture::parse("import 'dart:async';\n\nFutureOr<void> x = throw 0;\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("class C {\n  FutureOr<void> m() => throw 0;\n}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nclass C {\n  FutureOr<void> m() => throw 0;\n}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
     }
 
@@ -6633,16 +6669,17 @@ mod wave1_types_tests {
     /// covariant-core argument, and a function-type formal's return.
     #[test]
     fn futureor_void_contravariant_positions_stay_silent() {
-        let f = Fixture::parse("void f(FutureOr<void> x) {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nvoid f(FutureOr<void> x) {}\n");
         assert!(f.run(&one_rule("avoid_futureor_void")).is_empty());
 
-        let f = Fixture::parse("void f(List<FutureOr<void>> x) {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nvoid f(List<FutureOr<void>> x) {}\n");
         assert!(f.run(&one_rule("avoid_futureor_void")).is_empty());
 
-        let f = Fixture::parse("void f(FutureOr<void> Function() g) {}\n");
+        let f =
+            Fixture::parse("import 'dart:async';\n\nvoid f(FutureOr<void> Function() g) {}\n");
         assert!(f.run(&one_rule("avoid_futureor_void")).is_empty());
 
-        let f = Fixture::parse("class C {\n  C(FutureOr<void> x);\n}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nclass C {\n  C(FutureOr<void> x);\n}\n");
         assert!(f.run(&one_rule("avoid_futureor_void")).is_empty());
     }
 
@@ -6651,13 +6688,13 @@ mod wave1_types_tests {
     /// function-typed formal's own parameters invert back to reporting.
     #[test]
     fn futureor_void_variance_continuation() {
-        let f = Fixture::parse("List<FutureOr<void>> f() => throw 0;\n");
+        let f = Fixture::parse("import 'dart:async';\n\nList<FutureOr<void>> f() => throw 0;\n");
         let lints = f.run(&one_rule("avoid_futureor_void"));
         assert_eq!(lints.len(), 1, "{lints:?}");
         let futureor = tok(&f.source, &f.tokens, "FutureOr", 0);
         assert_eq!(lints[0].range.start, utf16_at(&f, futureor));
 
-        let f = Fixture::parse("void f(void g(FutureOr<void> x)) {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nvoid f(void g(FutureOr<void> x)) {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
     }
 
@@ -6665,16 +6702,17 @@ mod wave1_types_tests {
     /// bounds report; the mixin on-clause and extension on-clause report.
     #[test]
     fn futureor_void_clause_faces() {
-        let f = Fixture::parse("class C implements FutureOr<void> {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nclass C implements FutureOr<void> {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("class C<T extends FutureOr<void>> {}\n");
+        let f =
+            Fixture::parse("import 'dart:async';\n\nclass C<T extends FutureOr<void>> {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("mixin M on FutureOr<void> {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nmixin M on FutureOr<void> {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("extension E on FutureOr<void> {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nextension E on FutureOr<void> {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
     }
 
@@ -6682,13 +6720,17 @@ mod wave1_types_tests {
     /// variables report through the return type.
     #[test]
     fn futureor_void_expression_faces() {
-        let f = Fixture::parse("void f(Object o) {\n  if (o is FutureOr<void>) {}\n}\n");
+        let f = Fixture::parse(
+            "import 'dart:async';\n\nvoid f(Object o) {\n  if (o is FutureOr<void>) {}\n}\n",
+        );
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("void f(Object o) {\n  o as FutureOr<void>;\n}\n");
+        let f =
+            Fixture::parse("import 'dart:async';\n\nvoid f(Object o) {\n  o as FutureOr<void>;\n}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("FutureOr<void> Function() f = throw 0;\n");
+        let f =
+            Fixture::parse("import 'dart:async';\n\nFutureOr<void> Function() f = throw 0;\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
     }
 

@@ -2814,7 +2814,10 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::PatternEnd { paren: false },
         Ev::SwitchExprCasePattern { begin: span(3) },
         Ev::GuardBegin,
-        Ev::Bool { value: true },
+        Ev::Bool {
+            value: true,
+            span: span(4),
+        },
         Ev::GuardEnd,
         Ev::OtherExpr { span: span(4) },
         Ev::SwitchExprCaseEnd {
@@ -3009,7 +3012,10 @@ fn assert_join_with_message_invariants() {
     let events = vec![
         Ev::AssertBegin { span: span(1) },
         Ev::OtherExpr { span: span(2) },
-        Ev::Bool { value: true },
+        Ev::Bool {
+            value: true,
+            span: span(2),
+        },
         Ev::AssertEnd,
     ];
     let mut interp = Interp::new(&NameTypeOps, &[], &[]);

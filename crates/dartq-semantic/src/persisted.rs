@@ -15,8 +15,8 @@ use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::{
     Annotation, ArgPool, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
-    ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal,
-    TopDecl, Ty,
+    ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, NameMap,
+    RepFormal, TopDecl, Ty,
 };
 
 /// A span projection: `SourceRange`'s two public columns (`SourceRange`
@@ -84,6 +84,31 @@ pub struct PersistedElements {
     /// decode with no rows.
     #[serde(default)]
     pub anon_methods: Vec<PersistedAnonMethod>,
+    /// The wildcard `_` duplicate log — rows a pre-`wildcard-variables`
+    /// library reports and a ≥3.7 library skips (the capture is
+    /// feature-agnostic; the diagnose drain reads the library posture).
+    /// Additive like `augmentations`: pre-face payloads decode with no
+    /// rows.
+    #[serde(default)]
+    pub wildcard_duplicates: Vec<PersistedDuplicate>,
+    /// The formal-parameter metadata stars of the unit's executables,
+    /// keyed by the owner's dot-joined spelling to each formal's star
+    /// (the `deprecated_member_use` parameter face). Additive after the
+    /// format shipped: `default` so pre-face payloads decode with no
+    /// parameter metadata (the #539 additive-field discipline).
+    #[serde(default)]
+    pub formal_annotations: Vec<(u32, Vec<(u32, Vec<PersistedAnnotation>)>)>,
+    /// The constructor and factory metadata stars of the unit's
+    /// containers, keyed by container name to `ctor_formals`'s lookup
+    /// spelling to the star (the deprecated named-constructor face).
+    /// Additive like `formal_annotations`.
+    #[serde(default)]
+    pub ctor_annotations: Vec<(u32, Vec<(u32, Vec<PersistedAnnotation>)>)>,
+    /// The `library` directive's own metadata star — the whole-file
+    /// frontier of `element_usage_frontier_detector.dart`'s
+    /// `pushElement(_currentLibrary)`. Additive like `formal_annotations`.
+    #[serde(default)]
+    pub library_annotations: Vec<PersistedAnnotation>,
 }
 
 /// One [`crate::model::AnonMethodInvocation`] in payload form.
@@ -374,6 +399,12 @@ pub struct PersistedExtensionFace {
     #[serde(default)]
     pub type_param_bounds: Vec<PersistedTy>,
     pub members: Vec<(u32, PersistedMemberEntry)>,
+    /// The declaration's metadata star, in written order (the
+    /// extension-application member-use face). Additive after the format
+    /// shipped: `default` so pre-field payloads decode star-less (the
+    /// #539 additive-field discipline).
+    #[serde(default)]
+    pub annotations: Vec<PersistedAnnotation>,
 }
 
 /// One extension-type representation formal in payload form.
@@ -409,6 +440,12 @@ pub struct PersistedTopDecl {
     pub var_ty: PersistedTy,
     pub return_ty: PersistedTy,
     pub formals: Option<Box<PersistedFormals>>,
+    /// The declaration's metadata star, in written order. Additive after
+    /// the format shipped: `default` so payloads persisted before the
+    /// field existed decode with no metadata (the #539 additive-field
+    /// discipline; the top-level member-use reporter face).
+    #[serde(default)]
+    pub annotations: Vec<PersistedAnnotation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +860,7 @@ impl PersistedElements {
                     .iter()
                     .map(|(name, entry)| (s.id(*name), s.member(entry)))
                     .collect(),
+                annotations: s.annotations(&face.annotations),
             })
             .collect();
         let duplicates = elements
@@ -957,6 +995,40 @@ impl PersistedElements {
                 }),
             })
             .collect();
+        let wildcard_duplicates = elements
+            .wildcard_duplicates
+            .iter()
+            .map(|duplicate| PersistedDuplicate {
+                name: s.id(duplicate.name),
+                range: PersistedRange::of(duplicate.range),
+            })
+            .collect();
+        let formal_annotations = elements
+            .formal_annotations
+            .iter()
+            .map(|(owner, formals)| {
+                (
+                    s.id(*owner),
+                    formals
+                        .iter()
+                        .map(|(formal, star)| (s.id(*formal), s.annotations(star)))
+                        .collect(),
+                )
+            })
+            .collect();
+        let ctor_annotations = elements
+            .ctor_annotations
+            .iter()
+            .map(|(container, keys)| {
+                (
+                    s.id(*container),
+                    keys.iter()
+                        .map(|(key, star)| (s.id(*key), s.annotations(star)))
+                        .collect(),
+                )
+            })
+            .collect();
+        let library_annotations = s.annotations(&elements.library_annotations);
         Self {
             strings: s.values,
             decls,
@@ -969,6 +1041,10 @@ impl PersistedElements {
             augmentations,
             decl_kinds,
             anon_methods,
+            wildcard_duplicates,
+            formal_annotations,
+            ctor_annotations,
+            library_annotations,
         }
     }
 
@@ -1036,6 +1112,11 @@ impl PersistedElements {
                         .map(|(at, entry)| {
                             (at_name(at), entry.into_member_entry(&ids, &mut type_args))
                         })
+                        .collect(),
+                    annotations: face
+                        .annotations
+                        .into_iter()
+                        .map(|annotation| into_annotation(annotation, &ids))
                         .collect(),
                 })
                 .collect(),
@@ -1159,6 +1240,61 @@ impl PersistedElements {
                     }),
                 })
                 .collect(),
+            wildcard_duplicates: self
+                .wildcard_duplicates
+                .iter()
+                .map(|duplicate| DuplicateDecl {
+                    name: at_name(duplicate.name),
+                    range: duplicate.range.source_range(),
+                })
+                .collect(),
+            formal_annotations: self
+                .formal_annotations
+                .into_iter()
+                .map(|(owner, formals)| {
+                    (
+                        at_name(owner),
+                        formals
+                            .into_iter()
+                            .map(|(formal, star)| {
+                                (
+                                    at_name(formal),
+                                    star.into_iter()
+                                        .map(|annotation| into_annotation(annotation, &ids))
+                                        .collect::<Vec<_>>()
+                                        .into_boxed_slice(),
+                                )
+                            })
+                            .collect::<NameMap<Box<[Annotation]>>>(),
+                    )
+                })
+                .collect(),
+            ctor_annotations: self
+                .ctor_annotations
+                .into_iter()
+                .map(|(container, keys)| {
+                    (
+                        at_name(container),
+                        keys.into_iter()
+                            .map(|(key, star)| {
+                                (
+                                    at_name(key),
+                                    star.into_iter()
+                                        .map(|annotation| into_annotation(annotation, &ids))
+                                        .collect::<Vec<_>>()
+                                        .into_boxed_slice(),
+                                )
+                            })
+                            .collect::<NameMap<Box<[Annotation]>>>(),
+                    )
+                })
+                .collect(),
+            library_annotations: self
+                .library_annotations
+                .into_iter()
+                .map(|annotation| into_annotation(annotation, &ids))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             type_args,
         }
     }
@@ -1190,6 +1326,7 @@ impl PersistedTopDecl {
                 .formals
                 .as_ref()
                 .map(|formals| Box::new(s.formals(formals))),
+            annotations: s.annotations(&decl.annotations),
         }
     }
 
@@ -1217,6 +1354,11 @@ impl PersistedTopDecl {
             formals: self
                 .formals
                 .map(|formals| Box::new(into_formals(*formals, ids, pool))),
+            annotations: self
+                .annotations
+                .into_iter()
+                .map(|annotation| into_annotation(annotation, ids))
+                .collect(),
         }
     }
 }
@@ -1385,16 +1527,23 @@ impl PersistedContainer {
             annotations: self
                 .annotations
                 .into_iter()
-                .map(|annotation| Annotation {
-                    name: ids[annotation.name as usize],
-                    range: SourceRange {
-                        offset: annotation.offset,
-                        length: annotation.length,
-                    },
-                    args_text: annotation.args_text.map(|at| ids[at as usize]),
-                })
+                .map(|annotation| into_annotation(annotation, ids))
                 .collect(),
         }
+    }
+}
+
+/// Restores one [`PersistedAnnotation`] to its model row (the decode side
+/// shared by every annotation column — container, member, top-level,
+/// extension face, and the side-map stars).
+fn into_annotation(annotation: PersistedAnnotation, ids: &[StringId]) -> Annotation {
+    Annotation {
+        name: ids[annotation.name as usize],
+        range: SourceRange {
+            offset: annotation.offset,
+            length: annotation.length,
+        },
+        args_text: annotation.args_text.map(|at| ids[at as usize]),
     }
 }
 
@@ -1430,14 +1579,7 @@ impl PersistedMemberEntry {
             annotations: self
                 .annotations
                 .into_iter()
-                .map(|annotation| Annotation {
-                    name: ids[annotation.name as usize],
-                    range: SourceRange {
-                        offset: annotation.offset,
-                        length: annotation.length,
-                    },
-                    args_text: annotation.args_text.map(|at| ids[at as usize]),
-                })
+                .map(|annotation| into_annotation(annotation, ids))
                 .collect(),
             name_range: self
                 .name_range
@@ -1598,6 +1740,7 @@ mod tests {
                 var_ty: Ty::Unknown,
                 return_ty: Ty::Void,
                 formals: None,
+                annotations: Box::new([]),
             },
         )]
         .into_iter()
@@ -1669,6 +1812,7 @@ mod tests {
             type_param_names: Box::new([]),
             type_param_bounds: Box::new([]),
             members: [(name("e"), member("e"))].into_iter().collect(),
+            annotations: Box::new([]),
         }]);
         elements.duplicates = Box::new([DuplicateDecl {
             name: name("d"),

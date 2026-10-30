@@ -84,8 +84,8 @@ use crate::model::{
     MemberEntry, MemberKind, MicroKind, NameMap, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
-    DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures,
-    ParserListener, TokenId,
+    ConstructorReferenceContext, DeclarationKind, FormalParameterKind, IdentifierContext, Parser,
+    ParserFeatures, ParserListener, TokenId,
 };
 use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
@@ -647,6 +647,15 @@ struct Builder<'src, 'tab> {
     /// armed at the `TypeReference` identifier and consumed at
     /// `begin_type_arguments` or the head's own completion.
     pending_type_head: Option<(StringId, SourceRange)>,
+    /// An enum element's implicit constructor reference is open
+    /// (`handle_no_type_name_in_constructor_reference` arms it — the event
+    /// only fires inside enum elements — `end_constructor_reference`
+    /// disarms): while set, the element's written type-argument group
+    /// builds the constant's declared instantiation `E<args>` for
+    /// [`MemberEntry::var_ty`] (upstream `enumField.type`,
+    /// `AnalyzerEnumOperations.getEnumElementType`), the fact the
+    /// generic-enum exhaustiveness split filters on.
+    enum_const_ref: bool,
     /// The prefixed annotation head awaiting its completing `handle_type`
     /// (`ast` and `AstNode` of `ast.AstNode?`): the prefix latches at the
     /// `PrefixedTypeReference` identifier, the continuation fills in at
@@ -782,6 +791,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             capture: None,
             record_entry_mark: 0,
             pending_type_head: None,
+            enum_const_ref: false,
             pending_qualified: None,
             field_group_ty: None,
             field_group_ty_range: None,
@@ -2858,6 +2868,121 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         self.builder.end_header_window();
     }
 
+    /// Enum-element entry into the implicit constructor reference
+    /// (`b<String>` of `enum E<T> { b<String>('x'); }` — the event only
+    /// fires there, `parseEnumElement`'s own arm): the constant's written
+    /// type-argument group instantiates the enum head, so the enclosing
+    /// enum's own name is latched as the pending type head — the shared
+    /// #610 capture then builds `E<args>` for
+    /// `end_constructor_reference` to seal into the constant's
+    /// [`MemberEntry::var_ty`] (upstream `enumField.type`,
+    /// `AnalyzerEnumOperations.getEnumElementType`).
+    fn handle_no_type_name_in_constructor_reference(&mut self, token: Token) {
+        let builder = &mut self.builder;
+        let Some(open) = builder.containers.last() else {
+            return;
+        };
+        if open.kind != ContainerKind::Enum
+            || builder.pending_member.is_some()
+            || builder.ctor_open.is_some()
+            || builder.pending_top.is_some()
+            || builder.pending_typedef.is_some()
+            || builder.formal_depth != 0
+        {
+            return;
+        }
+        let Some((enum_name, _)) = open.name else {
+            return;
+        };
+        builder.enum_const_ref = true;
+        builder.pending_type_head = Some((enum_name, builder.span_of(token)));
+    }
+
+    /// Enum-element exit: the constant's declared instantiation seals into
+    /// its member row — a written argument group's captured tree
+    /// (`b<String>` → `E<String>`), an argument-less constant on a
+    /// generic enum instantiates to the declared bounds like any raw
+    /// receiver (`b` of `enum E<T extends num>` → `E<num>` — the
+    /// `instantiateToBounds` face the oracle's `enumField.type`
+    /// substitutes: `isSubtypeOf(E<T>, X)` reduces to the bound's own
+    /// ask), and a non-generic enum keeps the bare head. A
+    /// non-enum-context reference (every `end_constructor_reference`
+    /// outside the element window) disarms without touching the row.
+    fn end_constructor_reference(
+        &mut self,
+        _start: Token,
+        _period_before_name: Option<Token>,
+        _end: Token,
+        _context: ConstructorReferenceContext,
+    ) {
+        let builder = &mut self.builder;
+        if !builder.enum_const_ref {
+            return;
+        }
+        builder.enum_const_ref = false;
+        // A written group left the `E<args>` root in the capture; anything
+        // else (no group, a poisoned site) takes the bounds/bare fallback.
+        let enum_head = builder
+            .containers
+            .last()
+            .and_then(|open| open.name.map(|(name, _)| name));
+        let tree = builder
+            .capture
+            .as_mut()
+            .and_then(|site| site.take_done().into_iter().next());
+        let declared = match (enum_head, tree) {
+            (Some(name), Some(tree)) => Some(builder.named_from_tree(name, false, tree)),
+            (Some(name), None) => {
+                let open = builder.containers.last().expect("enum_head read it");
+                if open.type_param_names.is_empty() {
+                    Some(Ty::named(name))
+                } else {
+                    // Raw-receiver `instantiateToBounds`: `Ty::Dynamic` for
+                    // an absent bound (the bounds buffer's placeholder).
+                    let args: Vec<Ty> = open
+                        .type_param_bounds
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat(Ty::Dynamic))
+                        .take(open.type_param_names.len())
+                        .collect();
+                    Some(builder.type_args.named(name, false, &args))
+                }
+            }
+            _ => None,
+        };
+        // The constant's member row was inserted at `EnumValueDeclaration`
+        // (the element's last registered constant is this one — the
+        // constants parse in declaration order, members after).
+        if let Some(ty) = declared
+            && let Some(open) = builder.containers.last_mut()
+            && let Some(&constant) = open.enum_constants.last()
+        {
+            let entry = open.members.or_insert_with(constant, || MemberEntry {
+                kind: MemberKind::Field,
+                is_static: true,
+                is_abstract: false,
+                is_external: false,
+                is_final: false,
+                type_params: 0,
+                type_param_names: Box::default(),
+                type_param_bounds: Box::default(),
+                var_ty: Ty::UNKNOWN,
+                return_ty: Ty::UNKNOWN,
+                formals: None,
+                annotations: Box::default(),
+                name_range: MemberEntry::MISSING_NAME_RANGE,
+            });
+            entry.var_ty = ty;
+        }
+        // Any still-armed pair or leftover head is element noise: the
+        // constant consumed its window.
+        builder.pending_type_head = None;
+        builder.armed_ty = None;
+        builder.armed_ty_range = None;
+        builder.armed_tree = None;
+    }
+
     fn handle_mixin_header(&mut self, _mixin: Token) {
         self.builder.end_header_window();
     }
@@ -4603,8 +4728,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     .or_insert_with(container, NameMapBuilder::default)
                     .insert(
                         key,
-                        std::mem::take(&mut builder.pending_ctor_annotations)
-                            .into_boxed_slice(),
+                        std::mem::take(&mut builder.pending_ctor_annotations).into_boxed_slice(),
                     );
             }
         }
@@ -4862,8 +4986,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     .or_insert_with(container, NameMapBuilder::default)
                     .insert(
                         key,
-                        std::mem::take(&mut builder.pending_ctor_annotations)
-                            .into_boxed_slice(),
+                        std::mem::take(&mut builder.pending_ctor_annotations).into_boxed_slice(),
                     );
             }
         }
@@ -4899,23 +5022,32 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     ) {
         let builder = &mut self.builder;
         let selector = name.and_then(|token| builder.capture_name(token).map(|(key, _)| key));
+        // A `.new` head names the UNNAMED constructor (`class C.new()`
+        // keeps `C()` callable — `note_constructor_continuation`'s rule for
+        // the body-constructor face applies to the primary head too): it
+        // registers no named selector, and the formal table keeps the
+        // class-name key its `C(...)` creations look up under.
+        let named_selector = selector.filter(|s| builder.strings.resolve(*s) != "new");
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
             open.ctor_const |= const_keyword.is_some();
-            match selector {
+            match named_selector {
                 Some(selector) => {
                     if !open.ctor_named.contains(&selector) {
                         open.ctor_named.push(selector);
                     }
                 }
                 // The selector-less header IS the unnamed constructor
-                // (`class C(int x);` answers `C(...)` creations).
+                // (`class C(int x);` answers `C(...)` creations) — the
+                // `.new` head lands here through the `named_selector`
+                // filter above.
                 None => open.ctor_has_unnamed = true,
             }
             if let Some((key, formals)) = builder.pending_ctor_formals.take()
                 && let Some(formals) = formals
             {
-                open.ctor_formals.insert(selector.unwrap_or(key), formals);
+                open.ctor_formals
+                    .insert(named_selector.unwrap_or(key), formals);
             }
         }
     }
@@ -5590,8 +5722,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 .or_insert_with(owner, NameMapBuilder::default)
                 .insert(
                     name,
-                    std::mem::take(&mut builder.formal_param_annotations)
-                        .into_boxed_slice(),
+                    std::mem::take(&mut builder.formal_param_annotations).into_boxed_slice(),
                 );
         }
         builder.formal_param_annotations.clear();

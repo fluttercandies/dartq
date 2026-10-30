@@ -131,7 +131,7 @@ fn return_face(c: &mut Check<'_>) {
     if !face_is_function_typed(c, &face) {
         return;
     }
-    let rows = c.collect_direct(node);
+    let rows = value_rows(c, node);
     let [first, ..] = rows.as_slice() else {
         return; // `return;` carries no value
     };
@@ -139,8 +139,69 @@ fn return_face(c: &mut Check<'_>) {
         return;
     }
     let start = c.utf16_span(*first).start;
-    let end = value_run_end(c, &rows, node);
+    // The container rows seal past the expression's last token, so
+    // the span end reads the operand rows only.
+    let operands: Vec<u32> = rows
+        .iter()
+        .copied()
+        .filter(|&row| {
+            !matches!(
+                c.kind(row),
+                NodeKind::BinaryExpression | NodeKind::Conditional
+            )
+        })
+        .collect();
+    let end = value_run_end(c, &operands, node);
     c.report(start..end, &[]);
+}
+
+/// The returned expression's rows: the direct children plus the owner
+/// window's rows inside the row's own extent (the tiling splits the
+/// value across both — `=> c` keeps the body beside the row,
+/// `return c1 ?? c2;` leaves the trailing operand and the container as
+/// owner siblings), in source order.
+fn value_rows(c: &Check<'_>, node: u32) -> Vec<u32> {
+    let mut rows = c.collect_direct(node);
+    if let Some(parent) = c.unit.ast.parent(node) {
+        let kids = c.collect_direct(parent);
+        if kids.contains(&node) {
+            let extent = c.byte_span(node);
+            for kid in kids {
+                if kid == node || rows.contains(&kid) {
+                    continue;
+                }
+                let span = c.byte_span(kid);
+                if span.start >= extent.start && span.end <= extent.end {
+                    rows.push(kid);
+                }
+            }
+        }
+    }
+    // The container's own operands ride its child window.
+    let containers: Vec<u32> = rows
+        .iter()
+        .copied()
+        .filter(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::BinaryExpression | NodeKind::Conditional
+            )
+        })
+        .collect();
+    for &row in &containers {
+        for kid in c.collect_direct(row) {
+            if !rows.contains(&kid) {
+                rows.push(kid);
+            }
+        }
+    }
+    if rows.len() > 1 {
+        rows.sort_by_key(|&row| {
+            let span = c.byte_span(row);
+            (span.start, span.end)
+        });
+    }
+    rows
 }
 
 /// The argument face for a same-file top-level callee: the written
@@ -302,6 +363,33 @@ fn top_level_function_row(c: &Check<'_>, name: &str) -> Option<u32> {
 /// raw rows' leading `Identifier` stands in when the access run
 /// empties.
 fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
+    // A binary container riding the run (`return c1 ?? c2;`): the
+    // operand pieces tile beside it — either side's verdict answers
+    // (the official face reports the whole expression when the
+    // resolver builds the implicit reference inside it).
+    if let Some(&container) = rows
+        .iter()
+        .find(|&row| c.kind(*row) == NodeKind::BinaryExpression)
+    {
+        let Some(op) = c.field(container, PayloadField::Operator) else {
+            return false;
+        };
+        let Some(token) = c.unit.tokens.get(op as usize) else {
+            return false;
+        };
+        let op_start = token.byte_offset as usize;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for row in rows.iter().copied().filter(|&row| row != container) {
+            if c.byte_span(row).end <= op_start {
+                left.push(row);
+            } else {
+                right.push(row);
+            }
+        }
+        return operand_rows_have_call(c, use_node, &left)
+            || operand_rows_have_call(c, use_node, &right);
+    }
     let run = slice::access_run(c, rows);
     if let [single] = run.as_slice()
         && c.kind(*single) == NodeKind::Identifier

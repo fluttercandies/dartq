@@ -3280,13 +3280,18 @@ impl ConstCapture {
         }
     }
 
-    /// `is` — not a constant expression (the spec's list omits it; the
-    /// oracle anchors the reporting site's default at the operator).
+    /// `is` — a valid constant of unknown value: the oracle evaluates the
+    /// type test like any other constant operation and reports only what
+    /// the operands report (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart:1106,
+    /// `visitIsExpression` — no invalid arm of its own; the corpus has
+    /// zero oracle rows anchored at the operator). The fold defers
+    /// through it, so the operand below becomes inert debris.
     pub fn not_constant(&mut self, span: SourceRange) {
         if self.open() {
             self.push(
                 Node {
-                    expr: Expr::Other,
+                    expr: Expr::Opaque,
                     span,
                 },
                 true,

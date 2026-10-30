@@ -2,6 +2,27 @@ use super::engine_core::flatten_ty;
 use super::*;
 
 impl<'a> Engine<'a> {
+    /// A literal `<…>` group's argument leaf as a [`Ty`]: `dynamic`/`Null`
+    /// intern their dedicated faces — the same mapping the type
+    /// completion applies (`handle_type`) — since the oracle's
+    /// `DynamicType`/`NullType` are never interface heads and a
+    /// `Named{dynamic}` leaf answers every subtype question `Ty::Dynamic`
+    /// decides (the covariant element rule's `dynamic <: int` rejection).
+    /// Every other written head keeps its named shape. `void` never
+    /// reaches here (its type-use resolves Missing and the group stays
+    /// opaque), exactly like the completion table's.
+    fn literal_arg_leaf(&self, name: StringId, nullable: bool) -> Ty {
+        match self.strings.resolve(name) {
+            "dynamic" => Ty::Dynamic,
+            "Null" => Ty::Null,
+            _ => Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            },
+        }
+    }
+
     pub(crate) fn typed_list_literal_ty(&mut self, left: Token) -> Option<Ty> {
         let bytes = self.source.as_bytes();
         // `left.range.offset` is a UTF-16 offset: convert before walking
@@ -45,13 +66,12 @@ impl<'a> Engine<'a> {
         // The written element's own nullability (`<String?>[…]`): the
         // type-use row names `String` but the `?` rides the suffix, so the
         // element type is `String?` — without it every element reads as a
-        // `String? → String` assignability break (#2161).
+        // `String? → String` assignability break (#2161). `dynamic`/`Null`
+        // intern their dedicated faces — `List<dynamic>` against
+        // `List<int>` is the covariant rejection the oracle reports, which
+        // a `Named{dynamic}` leaf never reaches.
         let nullable = self.written_nullable_suffix(name_range.end());
-        let elem = Ty::Named {
-            name,
-            nullable,
-            args: crate::model::ArgListId::EMPTY,
-        };
+        let elem = self.literal_arg_leaf(name, nullable);
         let list = self.intern("List");
         let ty = self.boundary.args.borrow_mut().named(list, false, &[elem]);
         Some(ty)
@@ -152,11 +172,10 @@ impl<'a> Engine<'a> {
                 if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
                     return None;
                 }
-                Some(Ty::Named {
+                Some(self.literal_arg_leaf(
                     name,
-                    nullable: self.written_nullable_suffix(name_range.end()),
-                    args: crate::model::ArgListId::EMPTY,
-                })
+                    self.written_nullable_suffix(name_range.end()),
+                ))
             })
             .collect::<Option<Vec<_>>>()?;
         let (set, map) = (self.collection_heads[1], self.collection_heads[2]);
@@ -2137,6 +2156,297 @@ impl<'a> Engine<'a> {
             .any(|arg| matches!(arg, Ty::Named { .. }) && self.written_ty_invalid(*arg))
     }
 
+    /// The whole-expression span of a staged assignability check (the
+    /// oracle's `.at(right)` / `.at(expression)` anchor — upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/resolver/
+    /// assignment_expression_resolver.dart:167-178, return_type_verifier.dart
+    /// `:150-206`): the staged row's range covers the operand's own row —
+    /// a callee, a bare read, a merged member — while the official node is
+    /// the full `Expression` (an `await e`, a `new C()`, a `x as T`, a
+    /// collection literal's brackets, a record literal's parens, a unary
+    /// or parenthesized prefix, a dot-shorthand's leading `.`).
+    ///
+    /// The base is the widest recorded sub-span (invocation, then property
+    /// access, then the row itself); the left walk swallows the
+    /// expression-forming prefix tokens (`await`/`new`/`const`/`throw`,
+    /// unary `-`/`!`/`~`/`++`/`--`, a shorthand `.`, an enclosing `(`);
+    /// the right walk swallows the suffix forms (postfix `!`, `is`/`as`
+    /// type-test continuations through the tested type's end, a closing
+    /// `[]`/`{}`/`>` after a type-argument head) and a degenerate
+    /// single-byte closer row re-anchors through its matching opener.
+    /// Every arm is token-table driven; an unrecognized neighbor leaves
+    /// the span untouched — the row's own anchor is the fallback, never a
+    /// widened guess.
+    pub(crate) fn staged_expression_span(&self, range: SourceRange) -> SourceRange {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let mut span = self
+            .invocation_span(range)
+            .or_else(|| self.property_access_span(range))
+            .unwrap_or(range);
+        let toks = self.tokens.as_slice();
+        if toks.is_empty() {
+            return span;
+        }
+        // Whether a token can END an expression — the prefix walk's guard:
+        // a `-`/`.`/`(` neighbor after such a token is an infix/member/call
+        // arm, never an expression prefix of the staged operand.
+        let ends_expression = |kind: TK| -> bool {
+            matches!(
+                kind,
+                TK::Identifier
+                    | TK::Int
+                    | TK::Double
+                    | TK::Hexadecimal
+                    | TK::String
+                    | TK::CloseParen
+                    | TK::CloseSquare
+                    | TK::CloseCurly
+                    | TK::Gt
+                    | TK::Bang
+                    | TK::PlusPlus
+                    | TK::MinusMinus
+                    | TK::Index
+                    | TK::Keyword(Kw::This | Kw::Super | Kw::True | Kw::False | Kw::Null)
+            )
+        };
+        // A degenerate row re-anchors through the group it closes: a
+        // single-byte `)`/`]`/`}` range (the record/set fold's merged tail
+        // — `(a: 1, b: 2)`'s row sits ON the `)`) spans the whole group,
+        // the same `.at(expression)` answer the oracle's RecordLiteral /
+        // collection node gives. The balance walk finds the opener the
+        // close pairs with.
+        if span.length == 1 {
+            let close_idx = toks.partition_point(|t| t.utf16_offset < span.offset);
+            if let Some(&close) = toks.get(close_idx)
+                && close.utf16_offset == span.offset
+                && matches!(
+                    close.kind,
+                    TK::CloseParen | TK::CloseSquare | TK::CloseCurly
+                )
+            {
+                let mut depth = 0u32;
+                for index in (0..=close_idx).rev() {
+                    match toks[index].kind {
+                        kind if kind == close.kind => depth += 1,
+                        TK::OpenParen if close.kind == TK::CloseParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                span = SourceRange {
+                                    offset: toks[index].utf16_offset,
+                                    length: close.utf16_offset + close.byte_len
+                                        - toks[index].utf16_offset,
+                                };
+                                break;
+                            }
+                        }
+                        TK::OpenSquare if close.kind == TK::CloseSquare => {
+                            depth -= 1;
+                            if depth == 0 {
+                                span = SourceRange {
+                                    offset: toks[index].utf16_offset,
+                                    length: close.utf16_offset + close.byte_len
+                                        - toks[index].utf16_offset,
+                                };
+                                break;
+                            }
+                        }
+                        kind if close.kind == TK::CloseCurly
+                            && matches!(
+                                kind,
+                                TK::OpenCurly | TK::StringInterpolationExpression
+                            ) =>
+                        {
+                            depth -= 1;
+                            if depth == 0 {
+                                span = SourceRange {
+                                    offset: toks[index].utf16_offset,
+                                    length: close.utf16_offset + close.byte_len
+                                        - toks[index].utf16_offset,
+                                };
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // The suffix walk: `cast_rewrites` already carries every `as`-cast's
+        // whole span (the expression end the type-checker recorded), so a
+        // staged row inside one takes the cast's own extent outright. The
+        // token walk then covers what the rewrite table does not: postfix
+        // `!`, `is`/`as` type-test continuations through the tested type's
+        // end, and a literal bracket group after a type-argument head.
+        if let Some((cast_span, _)) = self
+            .cast_rewrites
+            .iter()
+            .find(|(cast, _)| cast.offset <= range.offset && range.end() <= cast.end())
+        {
+            if span.end() <= cast_span.end() {
+                span = SourceRange {
+                    offset: span.offset.min(cast_span.offset),
+                    length: cast_span.end() - span.offset.min(cast_span.offset),
+                };
+            }
+        }
+        loop {
+            let at = toks.partition_point(|t| t.utf16_offset < span.end());
+            let Some(&next) = toks.get(at) else { break };
+            match next.kind {
+                // `x as T` / `x is T` / `x is! T`: the tested type runs to
+                // the depth-0 statement boundary — a `,` `;` `:` `=` `=>`
+                // `&&` `||` `?` (the conditional's own `?` — a `?` INSIDE
+                // the type is consumed, one at the boundary is not), a
+                // closing bracket at the current depth, or EOF. Begin
+                // groups jump whole through the precomputed pairing, so
+                // `List<int>`, `void Function(int)`, and `Map<K, V>` never
+                // stop the walk early.
+                TK::Keyword(Kw::As) | TK::Keyword(Kw::Is) => {
+                    let mut end = at + 1;
+                    if toks.get(end).is_some_and(|t| t.kind == TK::Bang) {
+                        end += 1;
+                    }
+                    let mut last = end;
+                    while let Some(t) = toks.get(end) {
+                        if let Some(close) = self.tokens.matching_end(end) {
+                            last = close;
+                            end = close + 1;
+                            continue;
+                        }
+                        match t.kind {
+                            TK::Identifier
+                            | TK::Keyword(_)
+                            | TK::Period
+                            | TK::Lt
+                            | TK::Gt
+                            | TK::GtGt
+                            | TK::GtGtGt
+                            | TK::Function
+                            | TK::QuestionQuestion => {
+                                last = end;
+                                end += 1;
+                            }
+                            // `T?` stays inside only when what follows is
+                            // still type syntax (another `?`, or `>`/`)`/
+                            // `]`/`}`/`,` closing the type's own context);
+                            // `e is T ? a : b`'s `?` opens the conditional.
+                            TK::Question
+                                if matches!(
+                                    toks.get(end + 1).map(|n| n.kind),
+                                    Some(
+                                        TK::Question
+                                            | TK::Gt
+                                            | TK::GtGt
+                                            | TK::GtGtGt
+                                            | TK::Comma
+                                            | TK::CloseParen
+                                            | TK::CloseSquare
+                                            | TK::CloseCurly
+                                            | TK::Semicolon
+                                            | TK::Eof
+                                    )
+                                ) =>
+                            {
+                                last = end;
+                                end += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if last >= at + 1 {
+                        let last_tok = toks[last];
+                        span = SourceRange {
+                            offset: span.offset,
+                            length: last_tok.utf16_offset + last_tok.byte_len - span.offset,
+                        };
+                    } else {
+                        break;
+                    }
+                }
+                // `x!`: the null-assert postfix rides the operand's span.
+                TK::Bang if next.utf16_offset == span.end() => {
+                    span = SourceRange {
+                        offset: span.offset,
+                        length: next.utf16_offset + next.byte_len - span.offset,
+                    };
+                }
+                // A type-argument head's literal tail: `<num>[]` and
+                // `<k, v>{}` spell the collection through the bracket
+                // group's close, not the `>` it starts with.
+                TK::OpenSquare | TK::OpenCurly if next.utf16_offset == span.end() => {
+                    let Some(close) = self.tokens.matching_end(at) else {
+                        break;
+                    };
+                    let close_tok = toks[close];
+                    span = SourceRange {
+                        offset: span.offset,
+                        length: close_tok.utf16_offset + close_tok.byte_len - span.offset,
+                    };
+                }
+                _ => break,
+            }
+        }
+        // The prefix walk: expression-forming tokens directly before the
+        // current start — `await`/`new`/`const`/`throw`, the unary heads, a
+        // dot-shorthand's `.`, an enclosing `(`. Each accepted token extends
+        // the start and re-arms the walk (nested prefixes: `await new C()`,
+        // `!x`, `-(a + b)`). The `before` guard reads the candidate's own
+        // left neighbor: a `-`/`.`/`(` right after an expression-ending
+        // token is infix/member/call syntax, not a prefix.
+        loop {
+            let at = toks.partition_point(|t| t.utf16_offset < span.offset);
+            let Some(&prev) = at.checked_sub(1).and_then(|i| toks.get(i)) else {
+                break;
+            };
+            let before_expr = |i: usize| {
+                i.checked_sub(2)
+                    .and_then(|j| toks.get(j))
+                    .is_some_and(|t| ends_expression(t.kind))
+            };
+            match prev.kind {
+                TK::Keyword(Kw::Await | Kw::New | Kw::Const | Kw::Throw) => {
+                    span = SourceRange {
+                        offset: prev.utf16_offset,
+                        length: span.end() - prev.utf16_offset,
+                    };
+                }
+                TK::Bang | TK::Minus | TK::Tilde | TK::PlusPlus | TK::MinusMinus
+                    if !before_expr(at) =>
+                {
+                    span = SourceRange {
+                        offset: prev.utf16_offset,
+                        length: span.end() - prev.utf16_offset,
+                    };
+                }
+                TK::Period if !before_expr(at) => {
+                    span = SourceRange {
+                        offset: prev.utf16_offset,
+                        length: span.end() - prev.utf16_offset,
+                    };
+                }
+                // `(e)`: a parenthesized operand's node includes the parens
+                // — extend only when this `(` pairs with a `)` at the
+                // current end AND its own left neighbor cannot end an
+                // expression (in `f((e))`, the inner `(e)` wraps `e` but the
+                // outer `(` is the call's argument list, not a prefix).
+                TK::OpenParen if !before_expr(at) => {
+                    let Some(close) = self.tokens.matching_end(at - 1) else {
+                        break;
+                    };
+                    if toks[close].utf16_offset != span.end() {
+                        break;
+                    }
+                    span = SourceRange {
+                        offset: prev.utf16_offset,
+                        length: toks[close].utf16_offset + toks[close].byte_len - prev.utf16_offset,
+                    };
+                }
+                _ => break,
+            }
+        }
+        span
+    }
+
     /// The assignment check (`invalid_assignment`,
     /// `assignment_expression_resolver.dart:795`): a single-row right-hand
     /// side whose type the M1 facts know (`Null` or a captured declared
@@ -2210,6 +2520,15 @@ impl<'a> Engine<'a> {
             && let Some(promoted) = self.read_type_at(range)
         {
             from = promoted;
+        }
+        // The initializer's tear-off twin: a bare function-name right
+        // side reads the declaration's own `FunctionType`
+        // ([`Self::tear_off_sig`]'s element face), so the assignment ask
+        // runs on the signature instead of the `Unknown` row.
+        if from == Ty::Unknown
+            && let Some(sig) = self.tear_off_sig(&rhs_row)
+        {
+            from = self.fn_sig_ty(&sig);
         }
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
@@ -2370,16 +2689,64 @@ impl<'a> Engine<'a> {
         if matches!(read_ty, Ty::Unknown | Ty::Void) || matches!(to, Ty::Unknown | Ty::Void) {
             return;
         }
-        let Some((_, declared)) = self.binary_operator_sig(op, &target_row) else {
+        let Some((param, declared)) = self.binary_operator_sig(op, &target_row) else {
             return;
         };
         let right_ty = self.equality_operand_ty(&rhs_row);
+        // An `await e` operand's augmented-operator read resolves against
+        // the expression's own face — the flattened `flatten(T)` of the
+        // operand's `Future<T>` capture (`x += await f()` asks the operator
+        // `int`'s result, not `Future<int>`'s; the row's `ty` field keeps
+        // the parse-time operand face while the await extent carries the
+        // window the flatten re-applies over). Upstream flattens the
+        // AwaitExpression's staticType at endAwaitExpression — the same
+        // `operand_static_ty` + `flatten` the listener's row rewrite runs.
+        let in_await = self
+            .await_operand_extents
+            .iter()
+            .any(|&(start, end)| start <= rhs_row.range.offset && rhs_row.range.end() <= end);
+        let right_ty = if in_await {
+            self.flatten(right_ty)
+        } else {
+            right_ty
+        };
         let face = self.operand_face(&rhs_row, right_ty);
         let from = self.refine_numeric_binary(op, read_ty, face, declared);
         if matches!(from, Ty::Unknown | Ty::Void | Ty::Dynamic) || self.written_ty_invalid(from) {
             return;
         }
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
+        // The operator invocation's own argument row (upstream
+        // `checkForArgumentTypeNotAssignableForArgument(rightHandSide)` —
+        // assignment_expression_resolver.dart:368-372, every compound
+        // operator except `=`/`??=`): the right side's static type asks the
+        // operator's declared parameter (`int.+` takes `num`, `String.+`
+        // takes `String`) independently of the write-back verdict —
+        // `t += 1` reports ATNA alone (the `String` result writes back
+        // clean), `i += "x"` reports ATNA beside the write-back refusal.
+        // An invalid right-side head asks no question (the shared
+        // invalid-source gate, upstream `InvalidType` recovery). The
+        // promoted-read twin re-derives an unpromoted dynamic/unknown
+        // right side at its span — the oracle checks the flow-promoted
+        // static type.
+        let arg_ty = if matches!(right_ty, Ty::Unknown | Ty::Dynamic)
+            && let Some(promoted) = self.read_type_at(rhs_row.range)
+        {
+            promoted
+        } else {
+            right_ty
+        };
+        if !self.written_ty_invalid(arg_ty)
+            && self.argument_verdict(arg_ty, param, literal) == Some(false)
+        {
+            let message = SemanticCode::ArgumentTypeNotAssignable
+                .message3(&self.ty_display(arg_ty), &self.ty_display(param), "");
+            self.emit_message_with_correction(
+                SemanticCode::ArgumentTypeNotAssignable,
+                rhs_row.range,
+                message,
+            );
+        }
         if self.assignable(from, to, literal) == Some(false) {
             // The oracle anchors at the whole right-hand expression
             // (`.at(right)`).
@@ -2416,6 +2783,17 @@ impl<'a> Engine<'a> {
             && let Some(promoted) = self.read_type_at(row.range)
         {
             from = promoted;
+        }
+        // A bare function-name initializer IS the tear-off: the read's
+        // own static type is the declaration's `FunctionType` (the
+        // element face `tear_off_sig` composes — locals first, then the
+        // top-level declaration tables), so `int x = f;` asks the
+        // function-against-int question the oracle reports and the
+        // `Unknown` row alone never could.
+        if from == Ty::Unknown
+            && let Some(sig) = self.tear_off_sig(&row)
+        {
+            from = self.fn_sig_ty(&sig);
         }
         // The invalid-source gate: a written head that resolves to no type
         // poisons the whole spelling (upstream `InvalidType`) — probed
@@ -2603,6 +2981,21 @@ impl<'a> Engine<'a> {
         {
             return;
         }
+        // An `as` expression's static type is its resolved target — the
+        // same cast-face substitution the teardown applies
+        // (`filter_staged`'s `cast_rewrites` join): `return null as T`
+        // inside a `void` host would otherwise ask the `Null → void`
+        // question (always true, never staged) and miss the `T → void`
+        // verdict the oracle's `.at(expression)` reports. The parse-time
+        // operand type is the cast operand's face; the expression's own
+        // face is the rewritten target, so it substitutes BEFORE the
+        // invalid-source gate and the verdict below.
+        let from = self
+            .cast_rewrites
+            .iter()
+            .find(|(cast, _)| cast.offset <= range.offset && range.end() <= cast.end())
+            .map(|(_, ty)| *ty)
+            .unwrap_or(from);
         // The invalid-source twin: a written value type whose head resolves
         // to no type is `InvalidType` — assignable to everything, so the
         // return matrix never asks (probed 3.47.1: `return parent;` with
@@ -2866,28 +3259,40 @@ impl<'a> Engine<'a> {
         from_literal: bool,
         is_async: bool,
     ) -> Option<bool> {
-        if is_async {
-            return self.async_return_verdict(from, to, from_literal);
-        }
-        match to {
-            Ty::Void => match from {
-                // `Never <: void` holds (Right Bottom — `return throw e;`).
-                Ty::Void | Ty::Dynamic | Ty::Null | Ty::Never => Some(true),
+        let verdict = if is_async {
+            self.async_return_verdict(from, to, from_literal)
+        } else {
+            match to {
+                Ty::Void => match from {
+                    // `Never <: void` holds (Right Bottom — `return throw e;`).
+                    Ty::Void | Ty::Dynamic | Ty::Null | Ty::Never => Some(true),
+                    Ty::Unknown => None,
+                    Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
+                },
                 Ty::Unknown => None,
-                Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
-            },
-            Ty::Unknown => None,
-            _ => match from {
-                Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
-                // A `dynamic` return expression is a subtype only of the
-                // top-type hosts; the strict-casts mode rejects the rest
-                // (the same overlay [`Engine::assignable`] applies — the
-                // oracle's return verifier consults the identical
-                // `isAssignableTo` gate).
-                Ty::Dynamic => Some(matches!(to, Ty::Dynamic | Ty::Void) || !self.strict.casts),
-                _ => self.assignable(from, to, from_literal),
-            },
-        }
+                _ => match from {
+                    Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
+                    // A `dynamic` return expression is a subtype only of the
+                    // top-type hosts; the strict-casts mode rejects the rest
+                    // (the same overlay [`Engine::assignable`] applies — the
+                    // oracle's return verifier consults the identical
+                    // `isAssignableTo` gate).
+                    Ty::Dynamic => Some(matches!(to, Ty::Dynamic | Ty::Void) || !self.strict.casts),
+                    _ => self.assignable(from, to, from_literal),
+                },
+            }
+        };
+        // The declared-subtype negative closes the nominal blind spot for
+        // EVERY return host, not only constructors (rtv.dart asks the one
+        // `isAssignableTo` over the resolved pair whatever the declaring
+        // element): two declared container heads with no supertype path
+        // between them — a `Future<int>` expression against an `int` host
+        // — is the oracle's report, and the matrix alone suppresses the
+        // distinct-head pair. The negative decides only on a complete
+        // hierarchy walk (a primitive source against a declared target,
+        // or a closed closure that never names the target), so the
+        // under-report direction survives on every open question.
+        verdict.or_else(|| self.declared_subtype_negative(&from, &to))
     }
 
     /// The `async` body's return verdict matrix (`rtv.dart:258-289`): the
@@ -2973,6 +3378,23 @@ impl<'a> Engine<'a> {
             // stays silent), so the Created-name read below must not
             // resurrect the operand's type.
             Ty::Never
+        } else if let Some(result) = self.invoked_callee_result(row) {
+            // The send's own static type — the `expression_row_ty` mirror
+            // for the body/return window: an invocation row keeps the
+            // callee's DECLARED type (or nothing), never the send's
+            // result, so `int f() { return g(); }` asks `String` against
+            // `int` exactly like the initializer position does
+            // (send_result.rs's own contract).
+            result
+        } else if row.intent == Intent::Invoke && row.ty == Ty::UNKNOWN {
+            self.callee_return_ty(row)
+        } else if row.ty == Ty::UNKNOWN
+            && let Some(sig) = self.tear_off_sig(row)
+        {
+            // A bare function-name expression is the tear-off: the
+            // return/arrow-body ask reads the declaration's own
+            // `FunctionType` ([`Self::tear_off_sig`]'s element face).
+            self.fn_sig_ty(&sig)
         } else {
             match &row.shape {
                 RowShape::Receiver(Receiver::Created { name, kind })
@@ -2985,7 +3407,7 @@ impl<'a> Engine<'a> {
                     // its to-bounds defaults, which reports a written
                     // creation against its own instantiation).
                     self.creation_row_ty(*name, false, row.range.offset)
-                        .unwrap_or_else(|| Ty::named(*name))
+                        .unwrap_or(row.ty)
                 }
                 _ => row.ty,
             }
@@ -3305,6 +3727,25 @@ impl<'a> Engine<'a> {
         if verdict == Some(false) || from_literal {
             return verdict;
         }
+        // A subtype PROOF against a non-nullable target is final (#2873):
+        // the declared-closure negative exists for the nullability Right-Top
+        // true (every value assigns into `T?` — the base-type question the
+        // projection below re-asks) and for the undecided pairs, never to
+        // overturn a proven relation — the `FutureOr<T>` union's value leg
+        // proves `Future<Object?> <: FutureOr<Object>` through `Object`, a
+        // supertype question the Future→FutureOr declared-head closure
+        // cannot see.
+        let target_nullable = matches!(
+            to,
+            Ty::Named { nullable: true, .. }
+                | Ty::Record { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+                | Ty::Dynamic
+                | Ty::Void
+        );
+        if verdict == Some(true) && !target_nullable {
+            return verdict;
+        }
         let negative = match (from, to) {
             (
                 Ty::Named {
@@ -3319,6 +3760,12 @@ impl<'a> Engine<'a> {
                 },
             ) if from_name != to_name
                 && to_name != self.intern("Object")
+                // A `Never` source is Left Bottom (subtype.dart:74-77):
+                // `Never <: T1` is proven outright, and the declared walk
+                // below — which reads `Never` as an unrelated head with an
+                // empty supertype closure — must not overturn the proof
+                // (`int? x = neverVal;` is the oracle's clean row).
+                && !self.is_never_ty(from)
                 // An in-scope type parameter's relation to the target is
                 // decided only at the instantiation — the parse-time `T`
                 // capture stays under-report (`operator []=`'s `T v`
@@ -3837,8 +4284,18 @@ impl<'a> Engine<'a> {
         ty.render(self.strings, &self.boundary.pool())
     }
 
+    /// The diagnostic-message face of `ty` — the oracle's
+    /// `DartType.getDisplayString`, whose resolved `staticType` for a bare
+    /// parameterized head is always the instantiate-to-bounds
+    /// instantiation (`G` renders `G<A<dynamic>>`, never `G`; upstream
+    /// Dart SDK source, `type.dart` `instantiateTypeFormalsToBounds`).
+    /// The bind sites (`bind_declared_type`/`bind_parameter_type`) already
+    /// store the instantiated face, so this fill is the catch-all belt for
+    /// a raw `Named{_, EMPTY}` arriving through a channel no bind site
+    /// owns — display-only: the judgment `Ty` the verdict compared keeps
+    /// its own face.
     pub(crate) fn ty_display(&self, ty: Ty) -> String {
-        self.render_ty(ty)
+        self.render_ty(self.instantiated_head_ty(ty))
     }
 
     /// The function-subtype decision (`_isFunctionSubtypeOf`,
@@ -4118,6 +4575,99 @@ impl<'a> Engine<'a> {
         text
     }
 
+    /// The verdict-side alias fold, memoized per written `Ty`: subtype
+    /// questions re-ask the same destination face across a file's staged
+    /// checks (and the covariant element walk re-enters per argument),
+    /// while [`Engine::fold_alias_ty`]'s miss path — the scoped lookup,
+    /// the declaring-libraries probe, the to-bounds fill on a surviving
+    /// bare head — is the cost to amortize. Non-named shapes return
+    /// untouched (their inner faces never carry an alias head the verdict
+    /// surface sees).
+    pub(crate) fn fold_alias_verdict(&self, ty: Ty) -> Ty {
+        if !matches!(ty, Ty::Named { .. }) {
+            return ty;
+        }
+        if let Some(folded) = self.alias_fold_memo.borrow().get(&ty) {
+            return *folded;
+        }
+        let mut folded = self.fold_alias_ty(ty);
+        if folded == ty {
+            // A parameterized-alias use (`StrMap<int>` over
+            // `typedef StrMap<V> = Map<String, V>`): the chain fold's
+            // hop lands on the substituted RHS head and misreads it as
+            // another alias to instantiate — the substituted RHS IS the
+            // resolved type the oracle carries (named_type_resolver.dart
+            // `_instantiateElement`). Substitute the captured RHS
+            // directly, chasing while the rewritten head stays a
+            // parameterized alias (`B<int>` over `typedef B<X> = A<X>`
+            // still lands on `A<int>`).
+            for _ in 0..8 {
+                let Ty::Named {
+                    name,
+                    nullable,
+                    args,
+                } = folded
+                else {
+                    break;
+                };
+                if args == ArgListId::EMPTY {
+                    break;
+                }
+                let Some(substituted) = self.parameterized_alias_fold(name, args) else {
+                    break;
+                };
+                folded = Self::join_nullable(substituted, nullable);
+            }
+        }
+        self.alias_fold_memo.borrow_mut().insert(ty, folded);
+        folded
+    }
+
+    /// A parameterized-alias use's substituted right-hand type
+    /// (`StrMap<int>` reads `Map<String, int>` — the oracle's
+    /// `_instantiateElement` face, named_type_resolver.dart): the
+    /// declaration's parameter spellings zip against the written
+    /// arguments and substitute through the captured RHS. `None` when
+    /// the head resolves to no parameterized alias, the declaration
+    /// records no parameter spellings, or the written arity disagrees —
+    /// the written use stands (the under-report direction).
+    fn parameterized_alias_fold(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        let param_names: Vec<StringId> = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => {
+                if decl.kind != MicroKind::TypeAlias {
+                    return None;
+                }
+                decl.type_param_names.to_vec()
+            }
+            ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
+                let decl = self.index.get(owner)?.decl(name)?;
+                if decl.kind != MicroKind::TypeAlias {
+                    return None;
+                }
+                decl.type_param_names.to_vec()
+            }
+            _ => return None,
+        };
+        if param_names.is_empty() {
+            return None;
+        }
+        let written: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+        if written.len() != param_names.len() {
+            return None;
+        }
+        let rhs = self.alias_rhs_any(name)?;
+        let map: FxHashMap<StringId, Ty> =
+            param_names.iter().copied().zip(written).collect();
+        Some(self.subst_ty(rhs, &map))
+    }
+
     /// The M1 assignability decision ([`Ty::assignable_from`] plus the
     /// final-primitive table): a value typed by one final primitive never
     /// fits another — the types cannot be extended, implemented, or mixed
@@ -4135,6 +4685,59 @@ impl<'a> Engine<'a> {
     /// through the boundary pool ([`Engine::covariant_args`]). `None`
     /// suppresses (under-report).
     pub(crate) fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        // The function-shape read runs on the WRITTEN pair first
+        // (`subtype.dart` unfolds the alias before `_isFunctionSubtypeOf`,
+        // but the alias faces keep the parameterized alias's signature
+        // capture — `instantiated_alias_sig`'s use-site bounds — which the
+        // pooled `Ty::Function` shape of a full fold drops). Both sides
+        // function-shaped decides by the function rule and never reaches
+        // the nominal fold below.
+        let from_fn = self.function_shape_sig(from);
+        let to_fn = self.function_shape_sig(to);
+        if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
+            return self.fn_sig_subtype(from_fn, to_fn);
+        }
+        // The alias unfold: the element model never carries a type-alias
+        // head into a type question — a `TypeAliasElement` use resolves
+        // through its aliased type at annotation resolution (upstream
+        // Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+        // named_type_resolver.dart `_instantiateElement` →
+        // `TypeAliasElementImpl.instantiateImpl`), so `subtype.dart`
+        // decides over the expanded pair. The written `Ty` keeps the
+        // alias spelling, so the verdict folds both sides first:
+        // `List<dynamic>` against `IntList` asks `List<dynamic>` against
+        // `List<int>`, exactly the oracle's resolved `staticType` pair —
+        // while the diagnostic's display keeps the written `check.to`.
+        // The bare `Never` head fold (#2921 B2) lands on the expanded
+        // face: an alias to `Never` reads the canonical bottom, and a
+        // written `Never` annotation still meets it (the same face
+        // [`Engine::is_never_ty`] answers — [`Engine::normalized_never`]
+        // folds deep; the entry fold here covers the verdict surface's
+        // own pair, and the deep legs re-enter `assignable` per argument
+        // and meet the same shallow face).
+        let shallow_never = |ty: Ty| if self.is_never_ty(ty) { Ty::Never } else { ty };
+        let from = shallow_never(self.fold_alias_verdict(from));
+        let to = shallow_never(self.fold_alias_verdict(to));
+        // Right Bottom: no subtyping rule ever holds INTO `Never` but
+        // reflexivity (upstream Dart SDK source, pkg/analyzer/lib/src/
+        // dart/element/subtype.dart:74-77 answers the `Never` SOURCE; a
+        // `Never` target simply falls through every arm to the trailing
+        // `false`), so `T0 <: Never` is decidable for every concrete
+        // `T0`. The `isAssignableTo` relaxations survive
+        // (type_system.dart:860-891): `InvalidType` accepts (the
+        // `Unknown` sentinel keeps its `None`), and a `dynamic` source
+        // passes only in the non-strict default (`return fromType is
+        // DynamicType`, :930) — `strict-casts` keeps the subtype
+        // refusal. A `void` source stays the `use_of_void_result`
+        // face's own business (`None`).
+        if to == Ty::Never {
+            return match from {
+                Ty::Never => Some(true),
+                Ty::Unknown | Ty::Void => None,
+                Ty::Dynamic if !self.strict.casts => Some(true),
+                _ => Some(false),
+            };
+        }
         // Left FutureOr (`subtype.dart:371-385`, ahead of Right FutureOr):
         // `FutureOr<S0> <: T1` iff `S0 <: T1` and `Future<S0> <: T1`; a
         // `FutureOr<S0>?` source is Left Nullable over it (`Null <: T1` as
@@ -4218,21 +4821,64 @@ impl<'a> Engine<'a> {
                 _ => None,
             };
         }
-        // The function-shape face: when both sides carry a written function
-        // shape — directly, or through a function-typed alias, which is
-        // transparent at the subtype question (`subtype.dart` unfolds the
-        // alias before `_isFunctionSubtypeOf`) — the function rule decides
-        // (formal contravariance, return covariance). The invariant
-        // same-head argument rule would misread a `bool Function(String?)`
-        // alias instantiation against `bool Function(String)`, and the
-        // interface walk cannot relate two alias heads at all. Non-function
-        // pairs (and pairs where one side alone unfolds) keep the ordinary
-        // paths below, byte-identical.
-        let from_fn = self.function_shape_sig(from);
-        let to_fn = self.function_shape_sig(to);
-        if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
-            return self.fn_sig_subtype(from_fn, to_fn);
+        // Right Nullable (subtype.dart:224-246): `T0 <: S1?` iff
+        // `T0 <: S1` or `T0 <: Null` — a `?` suffix is not a top type
+        // (only the top bases `Object?`/`dynamic` accept everything, and
+        // they reach the same answer through their own non-null legs),
+        // so `int? x = "s"` is the oracle's report, not a silent pass.
+        // Left Nullable (subtype.dart:389-392) runs ahead of it: a `S0?`
+        // source decomposes on the source side first — `int? <: int?`
+        // asks `int <: int?` (this arm's base leg) and `Null <: int?`,
+        // never the matrix's own left-nullable refusal (which answers
+        // only non-`?` targets).
+        let nullable_base = |ty: Ty| match ty {
+            Ty::Named {
+                name,
+                nullable: true,
+                args,
+            } => Some(Ty::Named {
+                name,
+                nullable: false,
+                args,
+            }),
+            Ty::Record {
+                shape,
+                nullable: true,
+            } => Some(Ty::Record {
+                shape,
+                nullable: false,
+            }),
+            Ty::Function {
+                shape,
+                nullable: true,
+            } => Some(Ty::Function {
+                shape,
+                nullable: false,
+            }),
+            _ => None,
+        };
+        if let Some(base) = nullable_base(to) {
+            if let Some(s0) = nullable_base(from) {
+                return match (
+                    self.assignable(s0, to, from_literal),
+                    self.assignable(Ty::Null, to, from_literal),
+                ) {
+                    (Some(true), Some(true)) => Some(true),
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    _ => None,
+                };
+            }
+            return match (
+                self.assignable(from, base, from_literal),
+                self.assignable(from, Ty::Null, from_literal),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
         }
+        // The cross-family arms below read `from_fn`/`to_fn` computed at
+        // entry (the written pair — the alias faces' signature capture).
         if let Some(verdict) = to.assignable_from(from) {
             // The strict-casts overlay (`type_system.dart:891-930`: with
             // `strict-casts: true`, "the option disables all downcasts,
@@ -4385,6 +5031,47 @@ impl<'a> Engine<'a> {
                 } => Some(false),
                 _ => None,
             };
+        }
+        // The bare `Function` supertype's implicit-call face (#2921 B5 —
+        // `isAssignableTo`'s callable-class acceptance,
+        // type_system.dart:875-884 + `acceptsFunctionType`,
+        // type_system.dart:121-126): the `Function` head accepts every
+        // function type (`subtype.dart`'s `T1.isDartCoreFunction` arm
+        // answers the tear-off), so a non-nullable interface source with a
+        // `call` member assigns through the member's own type — and
+        // `isAssignableTo(callMethodType, Function)` is unconditional
+        // (`call` is a function-typed member, `Function` its supertype):
+        // a resolvable `call` means the pair accepts outright, whatever
+        // its signature. The final primitives reject — their member
+        // surface is compiler-known and carries no `call`; every other
+        // interface source keeps the under-report `None` (the slot also
+        // receives derived asks the oracle never makes — the covariant
+        // element walk's slot pairs — so a bare rejection there would
+        // report inference residue, the same posture
+        // [`Self::call_method_assignable`] documents for the shaped
+        // face).
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args: ArgListId::EMPTY,
+        } = to
+            && name == self.intern("Function")
+            && let Ty::Named {
+                name: from_name,
+                nullable: false,
+                args: from_args,
+            } = from
+        {
+            if self.members.primitive_ids.contains(&from_name) {
+                return Some(false);
+            }
+            return self
+                .implicit_call_face(Ty::Named {
+                    name: from_name,
+                    nullable: false,
+                    args: from_args,
+                })
+                .map(|_| true);
         }
         let (
             Ty::Named {
@@ -4595,8 +5282,29 @@ impl<'a> Engine<'a> {
         if from.len() != to.len() {
             return None;
         }
+        // The head's declared-variance facts (this file's capture; a
+        // foreign head reads all-covariant — the legacy default,
+        // element.dart:11560-11562). The interface-argument relation runs
+        // per parameter (subtype.dart:44-83 `_interfaceArguments`): a
+        // legacy/`out` parameter asks left→right, an `in` parameter
+        // right→left (`C<A>` <: `C<B>` iff `B <: A`), an `inout` parameter
+        // both ways. The `in` inversion composes with the function-shape
+        // face's own formal contravariance — the two flips multiply into
+        // the oracle's override posture (an `in`-parameter formal accepts
+        // the argument whose head argument sits BELOW the target's).
+        let variances: Vec<Option<Variance>> = self
+            .var_containers
+            .iter()
+            .find(|container| container.name == head)
+            .map_or_else(Vec::new, |container| {
+                container
+                    .params
+                    .iter()
+                    .map(|(_, declared, _)| *declared)
+                    .collect()
+            });
         let mut unknown = false;
-        for (&f, &t) in from.iter().zip(to.iter()) {
+        for (index, (&f, &t)) in from.iter().zip(to.iter()).enumerate() {
             // The generic-method inference face: a `dynamic` argument into
             // an unsolved formal's own type-variable slot never reaches the
             // subtype question — the call-site inference binds the variable
@@ -4632,8 +5340,21 @@ impl<'a> Engine<'a> {
             // The covariant-interface element rule is the subtype question
             // (`Ctrl<dynamic>` does not fit `Ctrl<int>`: `dynamic <: int`
             // is false — the expression-position downcast leniency never
-            // enters a type's argument shape).
-            match self.slot_subtype(f, t) {
+            // enters a type's argument shape), asked in the parameter's
+            // declared direction.
+            let declared = variances.get(index).copied().flatten();
+            let verdict = match declared {
+                Some(Variance::Contravariant) => self.slot_subtype(t, f),
+                Some(Variance::Invariant) => {
+                    match (self.slot_subtype(f, t), self.slot_subtype(t, f)) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    }
+                }
+                _ => self.slot_subtype(f, t),
+            };
+            match verdict {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => unknown = true,
@@ -5968,16 +6689,20 @@ mod alias_function_subtyping_tests {
 
     /// The triage repro (typeprobe 113), rig head: `Pred2<Cat?>` fits
     /// `Pred2<Cat>` — the alias unfolds, the formal slot is contravariant
-    /// (`Cat <: Cat?`), the returns coincide. The fixture avoids core head
-    /// spellings (the rig rejects a redeclared core name as
-    /// `undefined_class`).
+    /// (`Cat <: Cat?`), the returns coincide. The `pick2` source spells
+    /// the Cat?-accepting shape itself (`Cat Function(Cat?)`); the raw
+    /// `pick` tear-off would be the INVALID direction (a Cat-only
+    /// handler cannot stand where a Cat?-handler is required — oracle
+    /// 3.13.7 reports it). The fixture avoids core head spellings (the
+    /// rig rejects a redeclared core name as `undefined_class`).
     #[test]
     fn instantiated_alias_contravariant_formals_fit() {
         let report = report(
             "class Cat {}\n\
              typedef Pred2<T> = Cat Function(T);\n\
              Cat pick(Cat c) => c;\n\
-             Pred2<Cat?> p = pick;\nPred2<Cat> q = p;",
+             Cat pick2(Cat? c) => c as Cat;\n\
+             Pred2<Cat> x = pick;\nPred2<Cat?> ps = pick2;\nPred2<Cat> q = ps;",
         );
         assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
@@ -6030,3 +6755,17 @@ mod alias_function_subtyping_tests {
 #[cfg(test)]
 #[path = "ticket_2870_tests.rs"]
 mod ticket_2870_tests;
+
+// The #2946 pins (C1 — the alias-unfold + literal-leaf verdict faces).
+// Same `#[path]` registration as the #2870 pins above: the module stays
+// inside the `diagnose` subtree so the shared rig items remain visible.
+#[cfg(test)]
+#[path = "ticket_2946_tests.rs"]
+mod ticket_2946_tests;
+
+// The #2967 pins (the assignability verdict's residual families: the
+// `Never`-target refusal, the Right-Nullable decomposition, the bare
+// tear-off read, and the return window's send-result resolution).
+#[cfg(test)]
+#[path = "ticket_2967_tests.rs"]
+mod ticket_2967_tests;

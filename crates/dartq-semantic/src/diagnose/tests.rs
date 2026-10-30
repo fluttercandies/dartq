@@ -13060,8 +13060,8 @@ fn missing_default_value_reports() {
 
 /// The default-value cluster's silence faces: an explicit default, a
 /// nullable written type, `dynamic`, a required positional, an untyped
-/// formal, an in-scope type parameter's head (the bound decides the
-/// resolved nullability the name-level model does not keep), an
+/// formal, a `?`-suffixed type parameter's head (a BARE `T` reports —
+/// `isNullable` never consults `bound`, type_system.dart:1216-1233), an
 /// abstract method's `;` body, and a function-typed context all stay
 /// silent (error_verifier.dart:8327-8372 + type_system.dart:1257).
 #[test]
@@ -13069,7 +13069,7 @@ fn missing_default_value_silence_faces() {
     let r = report(
         "void a([int b = 1]) {} void c([int? d]) {} void e([dynamic f]) {} \
              void g(int h) {} void i([j]) {} \
-             void k<T>([T l]) {} \
+             void k<T>([T? l]) {} \
              class C { void m([int n]); } \
              typedef F = void Function([int o]);",
     );
@@ -16151,11 +16151,11 @@ fn uninitialized_field_reports_per_generative_constructor() {
         anchors(source, &r),
         vec![
             ("not_initialized_non_nullable_instance_field", "C"),
-            ("not_initialized_non_nullable_instance_field", "C"),
-            ("implicit_super_initializer_missing_arguments", "D"),
-            ("not_initialized_non_nullable_instance_field", "D"),
-            ("implicit_super_initializer_missing_arguments", "D"),
-            ("not_initialized_non_nullable_instance_field", "D"),
+            ("not_initialized_non_nullable_instance_field", "C.named"),
+            ("implicit_super_initializer_missing_arguments", "D.wild"),
+            ("not_initialized_non_nullable_instance_field", "D.wild"),
+            ("implicit_super_initializer_missing_arguments", "D.deprecated"),
+            ("not_initialized_non_nullable_instance_field", "D.deprecated"),
         ],
         "{:?}",
         anchors(source, &r)

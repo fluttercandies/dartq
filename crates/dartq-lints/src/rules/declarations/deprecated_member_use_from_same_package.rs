@@ -59,10 +59,13 @@ const WITHOUT_MESSAGE: &str = "'{0}' is deprecated and shouldn't be used.";
 const CORRECTION: &str = "Try replacing the use of the deprecated member with the replacement, \
          if a replacement is specified.";
 
-/// One same-file deprecated declaration: the name lexeme and the
-/// normalized message (`None` = the bare `@deprecated` shape).
+/// One same-file deprecated declaration: the name lexeme (the use-site
+/// match key), the named-constructor selector (`C.named` — `None` for a
+/// plain name), and the normalized message (`None` = the bare
+/// `@deprecated` shape).
 struct DeprecatedDecl<'a> {
     name: &'a str,
+    selector: Option<&'a str>,
     message: Option<String>,
 }
 
@@ -88,7 +91,7 @@ fn check(c: &mut Check<'_>) {
     // a use inside any deprecated declaration's span never reports.
     let len = narrow_u32(c.unit.ast.len());
     let mut suppressed: Vec<core::ops::Range<usize>> = Vec::new();
-    let mut hits: Vec<(u32, Option<String>)> = Vec::new();
+    let mut hits: Vec<(u32, &DeprecatedDecl<'_>)> = Vec::new();
     for row in 0..len {
         if c.kind(row) == NodeKind::Identifier {
             let Some(context) = c.field(row, PayloadField::Context) else {
@@ -101,12 +104,12 @@ fn check(c: &mut Check<'_>) {
             let Some(hit) = decls.iter().find(|decl| decl.name == name) else {
                 continue;
             };
-            hits.push((row, hit.message.clone()));
+            hits.push((row, hit));
         } else if is_frontier_declaration(c.kind(row)) && frontier_deprecated(c, row) {
             suppressed.push(frontier_span(c, row));
         }
     }
-    for (row, message) in hits {
+    for (row, hit) in hits {
         let byte = c.byte_span(row);
         if suppressed
             .iter()
@@ -114,15 +117,100 @@ fn check(c: &mut Check<'_>) {
         {
             continue;
         }
-        let name = c.lexeme(c.head_token(row));
-        let range = c.utf16_span(row);
-        match message {
+        // A named constructor's use carries the selector: `C.named()`
+        // continues the type reference with `.named` — the official
+        // display name is `C.named` and the report spans the whole
+        // selector; a bare `C()` does not use the named constructor.
+        // The increment faces (`++a.f`, `a.f++`) report the whole
+        // operand, not the bare selector.
+        let (display_buf, range) = match hit.selector {
+            Some(suffix) => {
+                let Some((combined, extended)) = selector_use(c, row, suffix) else {
+                    continue;
+                };
+                (Some(combined), extended)
+            }
+            None => {
+                let base = c.utf16_span(row);
+                (None, increment_operand_span(c, row).unwrap_or(base))
+            }
+        };
+        let name: &str = display_buf.as_deref().unwrap_or(hit.name);
+        match &hit.message {
             Some(message) => {
-                c.report_texts(range, WITH_MESSAGE, CORRECTION, &[name, &message]);
+                c.report_texts(range, WITH_MESSAGE, CORRECTION, &[name, message]);
             }
             None => c.report_texts(range, WITHOUT_MESSAGE, CORRECTION, &[name]),
         }
     }
+}
+
+/// The named-constructor use at `row`: when the use continues with the
+/// `.suffix` selector, the display name is `name.suffix` and the span
+/// covers the whole selector. The selector tiles beside the identifier
+/// (a `DotAccess` row hugging its right edge), so the extension reads
+/// the sibling row.
+fn selector_use(c: &Check<'_>, row: u32, suffix: &str) -> Option<(String, core::ops::Range<u32>)> {
+    let parent = c.unit.ast.parent(row)?;
+    let kids = c.collect_direct(parent);
+    let pos = kids.iter().position(|&kid| kid == row)?;
+    let marker = kids.get(pos.checked_sub(1)?)?;
+    if c.kind(*marker) != NodeKind::DotAccess {
+        return None;
+    }
+    let span = c.byte_span(*marker);
+    let ident = c.byte_span(row);
+    if span.start < ident.end {
+        return None;
+    }
+    if c.lexeme(c.head_token(*marker)) != suffix {
+        return None;
+    }
+    let mut display = c.lexeme(c.head_token(row)).to_owned();
+    display.push('.');
+    display.push_str(suffix);
+    let start = c.utf16_span(row).start;
+    let end = crate::rules::utf16_token_span(c, c.head_token(*marker)).end;
+    Some((display, start..end.max(c.utf16_span(row).end)))
+}
+
+/// The increment face's operand span (`++a.f` / `a.f++` report at
+/// `a.f`): an increment operator row hugging the selector chain —
+/// prefix stamps before the receiver, postfix after the name —
+/// widens the report to the whole operand. A plain read (no
+/// increment row) keeps the bare selector span.
+fn increment_operand_span(c: &Check<'_>, row: u32) -> Option<core::ops::Range<u32>> {
+    let parent = c.unit.ast.parent(row)?;
+    let kids = c.collect_direct(parent);
+    let pos = kids.iter().position(|&kid| kid == row)?;
+    let marker = *kids.get(pos.checked_sub(1)?)?;
+    if c.kind(marker) != NodeKind::DotAccess {
+        return None;
+    }
+    if c.byte_span(marker).start < c.byte_span(row).start.saturating_sub(1) {
+        return None;
+    }
+    // The receiver: the nearest identifier left of the marker, past
+    // the access chain's marker tiles.
+    let mut back = pos;
+    let recv = loop {
+        back = back.checked_sub(1)?;
+        let row = kids[back];
+        match c.kind(row) {
+            NodeKind::Identifier => break row,
+            NodeKind::DotAccess
+            | NodeKind::Send
+            | NodeKind::NoArguments
+            | NodeKind::NoTypeArguments => continue,
+            _ => return None,
+        }
+    };
+    kids.iter().copied().find(|&kid| match c.kind(kid) {
+        NodeKind::UnaryPrefix => c.byte_span(kid).end == c.byte_span(recv).start,
+        NodeKind::UnaryPostfix => c.byte_span(kid).start == c.byte_span(row).end,
+        _ => false,
+    })?;
+    Some(c.utf16_span(recv).start..c.utf16_span(row).end)
 }
 
 /// The declaration shapes the upstream frontier visitor pushes while
@@ -596,7 +684,14 @@ fn collect_deprecated<'a>(c: &Check<'a>, root: u32) -> Vec<DeprecatedDecl<'a>> {
             | NodeKind::EnumDeclaration => {
                 let (_, members) = container_members(c, row);
                 collect_row(c, name_row, row, &mut out);
-                collect_members(c, &members, &mut out);
+                // The unnamed-constructor face keys on the container's
+                // own name (`@deprecated new();` reports at `C()`).
+                let class_name = c
+                    .collect_direct(name_row)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                    .map(|kid| c.lexeme(c.head_token(kid)));
+                collect_members(c, &members, class_name, &mut out);
             }
             NodeKind::NamedMixinApplication
             | NodeKind::Typedef
@@ -613,12 +708,19 @@ fn collect_deprecated<'a>(c: &Check<'a>, root: u32) -> Vec<DeprecatedDecl<'a>> {
 /// (the name hoists), the row itself for hand-built tables.
 fn collect_row<'a>(c: &Check<'a>, name_row: u32, row: u32, out: &mut Vec<DeprecatedDecl<'a>>) {
     let metas = top_level_annotations(c, row);
-    push_decl(c, name_row, row, &metas, out);
+    push_decl(c, name_row, row, &metas, None, out);
 }
 
 /// The container member rows: each member's `MetadataStar` is its left
-/// sibling (the `member_annotations` idiom, walked in one pass).
-fn collect_members<'a>(c: &Check<'a>, members: &[u32], out: &mut Vec<DeprecatedDecl<'a>>) {
+/// sibling (the `member_annotations` idiom, walked in one pass). Enum
+/// constants whose star sits outside the member list read the row's
+/// own left sibling in the container window.
+fn collect_members<'a>(
+    c: &Check<'a>,
+    members: &[u32],
+    class_name: Option<&'a str>,
+    out: &mut Vec<DeprecatedDecl<'a>>,
+) {
     for (index, &member) in members.iter().enumerate() {
         if !matches!(
             c.kind(member),
@@ -630,19 +732,33 @@ fn collect_members<'a>(c: &Check<'a>, members: &[u32], out: &mut Vec<DeprecatedD
         ) {
             continue;
         }
-        let Some(&star) = index.checked_sub(1).and_then(|i| members.get(i)) else {
+        let star = index
+            .checked_sub(1)
+            .and_then(|i| members.get(i))
+            .copied()
+            .filter(|&star| c.kind(star) == NodeKind::MetadataStar)
+            .or_else(|| left_sibling_metadata(c, member));
+        let Some(star) = star else {
             continue;
         };
-        if c.kind(star) != NodeKind::MetadataStar {
-            continue;
-        }
         let metas: Vec<u32> = c
             .collect_direct(star)
             .into_iter()
             .filter(|&meta| c.kind(meta) == NodeKind::Metadata)
             .collect();
-        push_decl(c, member, member, &metas, out);
+        push_decl(c, member, member, &metas, class_name, out);
     }
+}
+
+/// The `MetadataStar` immediately left of `row` in its parent window
+/// (the enum-constant shape: `one, @deprecated two;` — the star rides
+/// the container's kid list, outside the filtered member list).
+fn left_sibling_metadata(c: &Check<'_>, row: u32) -> Option<u32> {
+    let parent = c.unit.ast.parent(row)?;
+    let kids = c.collect_direct(parent);
+    let pos = kids.iter().position(|&kid| kid == row)?;
+    let star = *kids.get(pos.checked_sub(1)?)?;
+    (c.kind(star) == NodeKind::MetadataStar).then_some(star)
 }
 
 /// The declaration's name faces and one `DeprecatedDecl` per deprecated
@@ -656,11 +772,13 @@ fn collect_members<'a>(c: &Check<'a>, members: &[u32], out: &mut Vec<DeprecatedD
 /// their context-stamped `Identifier` children — a named constructor keys
 /// on its type name (the `.name` side is an invocation selector, reported
 /// at the type name).
+#[allow(clippy::too_many_arguments)]
 fn push_decl<'a>(
     c: &Check<'a>,
     name_row: u32,
     row: u32,
     metas: &[u32],
+    class_name: Option<&'a str>,
     out: &mut Vec<DeprecatedDecl<'a>>,
 ) {
     if metas.is_empty() {
@@ -674,46 +792,75 @@ fn push_decl<'a>(
     if deprecated.is_empty() {
         return;
     }
-    let names: Vec<&str> = match c.kind(row) {
+    let method_ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
+    let mut entries: Vec<(&'a str, Option<&'a str>)> = Vec::new();
+    match c.kind(row) {
         NodeKind::Fields | NodeKind::TopLevelFields => {
-            let mut names = Vec::new();
             for decl in c.collect_direct(row) {
                 if c.kind(decl) != NodeKind::VariablesDeclaration {
                     continue;
                 }
                 for var in c.collect_direct(decl) {
                     if let Some(token) = initialized_identifier_name(c, var) {
-                        names.push(c.lexeme(token));
+                        entries.push((c.lexeme(token), None));
                     }
                 }
             }
-            names
         }
-        NodeKind::Method => c
-            .collect_direct(name_row)
-            .into_iter()
-            .filter(|&kid| {
-                c.kind(kid) == NodeKind::Identifier
+        NodeKind::Method => {
+            for kid in c.collect_direct(name_row) {
+                if c.kind(kid) == NodeKind::Identifier
+                    && c.field(kid, PayloadField::Context) == Some(method_ctx)
+                {
+                    entries.push((c.lexeme(c.head_token(kid)), None));
+                }
+            }
+        }
+        NodeKind::TopLevelMethod => {
+            for kid in c.collect_direct(name_row) {
+                if c.kind(kid) == NodeKind::Identifier
                     && c.field(kid, PayloadField::Context)
-                        == Some(dartq_parser::IdentifierContext::MethodDeclaration as u32)
-            })
-            .map(|kid| c.lexeme(c.head_token(kid)))
-            .collect(),
-        NodeKind::TopLevelMethod => c
-            .collect_direct(name_row)
-            .into_iter()
-            .filter(|&kid| {
+                        == Some(
+                            dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32,
+                        )
+                {
+                    entries.push((c.lexeme(c.head_token(kid)), None));
+                }
+            }
+        }
+        // Constructors: the type name is the match key (`C()`), a named
+        // constructor's own name is the selector (`C.named()` — the
+        // display name carries it, a bare `C()` does not use it). The
+        // unnamed shape (`new()`) has no own name and keys on the
+        // container's type name.
+        NodeKind::Constructor | NodeKind::Factory => {
+            let own = c.collect_direct(name_row).into_iter().find(|&kid| {
                 c.kind(kid) == NodeKind::Identifier
-                    && c.field(kid, PayloadField::Context)
-                        == Some(dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32)
-            })
-            .map(|kid| c.lexeme(c.head_token(kid)))
-            .collect(),
-        // Class-likes, typedefs, enum constants, constructors (the type
-        // name): the first `Identifier` child of the name row — except
-        // the mixin application, whose alias name rides the wrapper as
-        // the declaration-context identifier (its row's own identifier
-        // children start at the `=` supertype).
+                    && c.field(kid, PayloadField::Context) == Some(method_ctx)
+            });
+            let selector = own
+                .map(|kid| c.lexeme(c.head_token(kid)))
+                .filter(|&lexeme| lexeme != "new");
+            let type_name = c
+                .collect_direct(name_row)
+                .into_iter()
+                .find(|&kid| {
+                    c.kind(kid) == NodeKind::Identifier
+                        && c.field(kid, PayloadField::Context) != Some(method_ctx)
+                })
+                .map(|kid| c.lexeme(c.head_token(kid)))
+                .or(class_name);
+            if let Some(type_name) = type_name {
+                entries.push((type_name, selector));
+            }
+        }
+        // Class-likes, typedefs, enum constants (the first `Identifier`
+        // child of the name row) — except the mixin application, whose
+        // alias name rides the wrapper as the declaration-context
+        // identifier (its row's own identifier children start at the
+        // `=` supertype). A name row without a hoisted identifier (the
+        // extension-type shape) falls back to the declaration row's
+        // own first identifier.
         NodeKind::NamedMixinApplication => {
             let name = c
                 .unit
@@ -731,25 +878,34 @@ fn push_decl<'a>(
                                 )
                     })
                 });
-            match name {
-                Some(kid) => vec![c.lexeme(c.head_token(kid))],
-                None => return,
+            if let Some(kid) = name {
+                entries.push((c.lexeme(c.head_token(kid)), None));
             }
         }
-        _ => match c
-            .collect_direct(name_row)
-            .into_iter()
-            .find(|&kid| c.kind(kid) == NodeKind::Identifier)
-        {
-            Some(kid) => vec![c.lexeme(c.head_token(kid))],
-            None => return,
-        },
-    };
+        _ => {
+            let name = c
+                .collect_direct(name_row)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                .or_else(|| {
+                    if name_row == row {
+                        return None;
+                    }
+                    c.collect_direct(row).into_iter().find(|&kid| {
+                        c.kind(kid) == NodeKind::Identifier
+                    })
+                });
+            if let Some(kid) = name {
+                entries.push((c.lexeme(c.head_token(kid)), None));
+            }
+        }
+    }
     for meta in deprecated {
         let message = deprecation_message(c, meta);
-        for &name in &names {
+        for &(name, selector) in &entries {
             out.push(DeprecatedDecl {
                 name,
+                selector,
                 message: message.clone(),
             });
         }

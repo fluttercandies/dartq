@@ -31,10 +31,12 @@ use crate::rules::utf16_token_span;
 /// selector's flow type, and the function-expression-invocation face
 /// reads the piece before the argument list. Index, cascade, and the
 /// prefix/postfix faces read the operand run's static type.
-/// Approximations (documented, under-report): multi-piece receivers
-/// beyond the head row stay silent (the documented chain under-report),
-/// and a compound operand's read-type fallback reports whole only for
-/// `++`/`--` (the census-compound shape). Message: `diagnostic.g.dart`
+/// Approximations (documented, under-report): a compound operand's
+/// read-type fallback reports whole only for `++`/`--` (the
+/// census-compound shape), and a cascade-section `.call()` over a
+/// bare-`Function` target reads the section target's type from the run
+/// before the first section dots (the per-section receiver face is the
+/// same `.call` special case). Message: `diagnostic.g.dart`
 /// `avoidDynamicCalls`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "avoid_dynamic_calls",
@@ -69,16 +71,19 @@ fn check(c: &mut Check<'_>) {
     }
 }
 
-/// The receiver expression row directly before the selector's dot: the
-/// last non-marker piece — an identifier, a `!` row, or another
-/// expression root (the upstream `realTarget`) — within a one-or-two
-/// token gap of the selector (`.x`, `?.x`, `!.x`, `..x`).
-fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<u32> {
-    let run = slice::access_run(c, run);
+/// The receiver extent directly before the selector's dot: `(first,
+/// end)` piece pair over the upstream `realTarget`. A single-piece
+/// receiver — an identifier, a `!` row, a parenthesized expression —
+/// must sit within a one-or-two token gap of the selector (`.x`,
+/// `?.x`, `!.x`, `..x`). A multi-piece member chain (`c.a` — the
+/// preceding access tiles as its own `DotAccess` marker) extends the
+/// receiver to the whole access run, the upstream `realTarget` extent
+/// (`visitPropertyAccess` reports `c.a` whole, not its last selector).
+fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32)> {
     let sel_span = utf16_token_span(c, selector);
     // Drop the selector's own tail: the selector identifier rides its
     // send group, whose pieces all open at the selector token.
-    let mut stripped = &run[..];
+    let mut stripped = run;
     while let Some(&last) = stripped.last() {
         if c.unit.ast.token_range(last).start >= selector {
             stripped = &stripped[..stripped.len() - 1];
@@ -86,9 +91,40 @@ fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<u32> {
         }
         break;
     }
-    let receiver = *stripped.last()?;
+    let mut end_idx = stripped.len() - 1;
+    // A bare tear-off group's tail rows (`[Id, wrappers, args, Send]`)
+    // ride the head leaf: the receiver extent is the group's head
+    // (`d` in `d.foo()` — an invocation group reduces the same way),
+    // the upstream `realTarget` leaf.
+    while matches!(
+        c.kind(stripped[end_idx]),
+        NodeKind::Send
+            | NodeKind::Arguments
+            | NodeKind::NoArguments
+            | NodeKind::NoTypeArguments
+            | NodeKind::TypeArguments
+    ) && end_idx > 0
+        && is_chain_piece(c, stripped[end_idx - 1])
+        && abuts(c, stripped[end_idx - 1], c.utf16_span(stripped[end_idx]).start)
+    {
+        end_idx -= 1;
+    }
+    let end = stripped[end_idx];
+    if c.kind(end) == NodeKind::DotAccess {
+        // The member-chain tail: the receiver extent is the run of
+        // chain pieces ending at the marker (an identifier-led access
+        // group — `c`, `.a`), the whole `realTarget`.
+        let mut first = end_idx;
+        while first > 0
+            && is_chain_piece(c, stripped[first - 1])
+            && abuts(c, stripped[first - 1], c.utf16_span(stripped[first]).start)
+        {
+            first -= 1;
+        }
+        return Some((stripped[first], end));
+    }
     if matches!(
-        c.kind(receiver),
+        c.kind(end),
         NodeKind::Send
             | NodeKind::NoArguments
             | NodeKind::Arguments
@@ -97,9 +133,65 @@ fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<u32> {
     ) {
         return None;
     }
-    let span = c.utf16_span(receiver);
+    let span = c.utf16_span(end);
     let gap = sel_span.start.checked_sub(span.end)?;
-    (gap == 1 || gap == 2).then_some(receiver)
+    (gap == 1 || gap == 2).then_some((end, end))
+}
+
+/// The receiver extent's report end: an access marker's own span
+/// adopts its statement window, so the marker tail ends at its member
+/// name token (the `b` of `a.b` — the upstream `realTarget` extent).
+fn receiver_end_utf16(c: &Check<'_>, end: u32) -> u32 {
+    if c.kind(end) == NodeKind::DotAccess
+        && let Some(name) = c.field(end, PayloadField::Operator).map(|op| op + 1)
+    {
+        return utf16_token_span(c, name).end;
+    }
+    c.utf16_span(end).end
+}
+
+/// The receiver extent's static type. A marker tail reads through the
+/// member face — the last marker's name over the extent head's site
+/// (the two-hop `realTarget`, `c.a` of `c.a.foo`; deeper chains stay
+/// the documented under-report). A bare leaf reads at its own flow
+/// row.
+fn receiver_ty(
+    c: &Check<'_>,
+    analysis: &dartq_semantic::Analysis<'_>,
+    run: &[u32],
+    first: u32,
+    end: u32,
+) -> Option<Ty> {
+    let start = run.iter().position(|&row| row == first)?;
+    let stop = run.iter().position(|&row| row == end)?;
+    if c.kind(end) == NodeKind::DotAccess {
+        let name = c.field(end, PayloadField::Operator)? + 1;
+        let name = analysis.strings().intern(c.lexeme(name));
+        return analysis.member_type(query_site(c, run[start]), name);
+    }
+    faces::expr_type(c, analysis, &run[start..=stop])
+}
+
+/// Whether `piece` abuts the extent opening at `start` — the chain
+/// walk is byte-contiguity bounded (the raw prefix carries the
+/// enclosing declarations' leaked rows, and an unbounded walk lands
+/// the extent on them).
+fn abuts(c: &Check<'_>, piece: u32, start: u32) -> bool {
+    c.utf16_span(piece).end >= start
+}
+
+/// Whether `piece` belongs to a member-access chain: the receiver
+/// group pieces (a bare tear-off group or any send group), the access
+/// marker itself, a null-assertion operand, or a parenthesized
+/// receiver.
+fn is_chain_piece(c: &Check<'_>, piece: u32) -> bool {
+    matches!(
+        c.kind(piece),
+        NodeKind::Identifier
+            | NodeKind::DotAccess
+            | NodeKind::UnaryPostfix
+            | NodeKind::ParenthesizedExpression
+    ) || slice::is_send_group_piece(c, piece)
 }
 
 /// The invocation faces (:91-132): a member receiver's `dynamic` read
@@ -171,14 +263,27 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let receiver = member
         .then(|| chain_receiver(c, before, selector))
         .flatten();
-    if let Some(receiver) = receiver
-        && analysis.type_of(query_site(c, receiver)) == Some(Ty::Dynamic)
+    let receiver_ty = receiver
+        .as_ref()
+        .and_then(|(first, end)| receiver_ty(c, analysis, before, *first, *end));
+    // An inner chained access (a middle hop — its group seals in the
+    // follower's dot) carries no face of its own: the outer dispatch's
+    // receiver is this whole extent, and the inner read would consult
+    // the fold row colliding at the receiver's own start.
+    if let Some(last) = c.unit.ast.token_range(kids[pos]).next_back()
+        && c.lexeme(last) == "."
+    {
+        return;
+    }
+    if let Some((receiver_start, receiver_end)) = receiver
+        && receiver_ty == Some(Ty::Dynamic)
     {
         // The explicit-cast bail (:115).
         if faces::is_explicit_cast(c, before) {
             return;
         }
-        c.report(c.utf16_span(receiver), &[]);
+        let start = c.utf16_span(receiver_start).start;
+        c.report(start..receiver_end_utf16(c, receiver_end), &[]);
         return;
     }
     // The `.call` special case (:119-129): `a.call()` is `a()` — the
@@ -186,14 +291,9 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     // the `call` selector.
     if member
         && c.lexeme(selector) == "call"
-        && let Some(receiver) = receiver
+        && receiver.is_some()
         && !faces::is_explicit_cast(c, before)
-        && faces::is_dynamic_or_function(
-            analysis,
-            analysis
-                .type_of(query_site(c, receiver))
-                .unwrap_or(Ty::Unknown),
-        )
+        && faces::is_dynamic_or_function(analysis, receiver_ty.unwrap_or(Ty::Unknown))
     {
         c.report(utf16_token_span(c, selector), &[]);
         return;
@@ -252,11 +352,16 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     if faces::is_explicit_cast(c, &before) {
         return;
     }
-    let Some(receiver) = chain_receiver(c, &before, selector) else {
+    // The receiver walk rides the raw prefix — `statement_run` strips
+    // the childless access markers the chain extent ends at — bounded
+    // by the walk's own abutment check.
+    let raw = &kids[..pos];
+    let Some((receiver_start, receiver_end)) = chain_receiver(c, raw, selector) else {
         return;
     };
-    if analysis.type_of(query_site(c, receiver)) == Some(Ty::Dynamic) {
-        c.report(c.utf16_span(receiver), &[]);
+    if receiver_ty(c, analysis, raw, receiver_start, receiver_end) == Some(Ty::Dynamic) {
+        let start = c.utf16_span(receiver_start).start;
+        c.report(start..receiver_end_utf16(c, receiver_end), &[]);
     }
 }
 
@@ -463,5 +568,36 @@ fn cascade_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         let start = c.utf16_span(run[0]).start;
         let end = value_run_end(c, &run, *run.last().unwrap());
         c.report(start..end, &[]);
+        return;
     }
+    // The section invocations ride the method-invocation face upstream
+    // (a cascade section IS a `MethodInvocation` over the same target):
+    // a `..call()` section over a BARE-`Function` target is the `.call`
+    // special case (:119-129 — `p..call()` reports at `call`; a
+    // concrete function type does not). The section's pieces tile flat
+    // into the cascade window (`rules::slice`), so the section selector
+    // is a child `Identifier` row whose tokens carry the `..`/`?..`
+    // section dots before it and an argument group after it.
+    let target = faces::expr_type(c, analysis, &run);
+    if !target.is_some_and(|ty| is_bare_function(analysis, ty)) {
+        return;
+    }
+    let last = c.unit.tokens.len() as u32;
+    for row in c.children(node) {
+        if c.kind(row) != NodeKind::Identifier || c.lexeme(c.head_token(row)) != "call" {
+            continue;
+        }
+        let selector = c.head_token(row);
+        let prev = selector.checked_sub(1).map(|token| c.lexeme(token));
+        let next = (selector + 1 < last).then(|| c.lexeme(selector + 1));
+        if matches!(prev, Some("..") | Some("?..")) && next == Some("(") {
+            c.report(utf16_token_span(c, selector), &[]);
+        }
+    }
+}
+
+/// Whether `ty` is the bare `Function` type (`isDartCoreFunction` — a
+/// concrete function type is not).
+fn is_bare_function(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
+    matches!(ty, Ty::Named { name, .. } if analysis.strings().resolve(name) == "Function")
 }

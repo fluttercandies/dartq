@@ -33,6 +33,53 @@ fn const_var_ref(part: &crate::const_eval::Node) -> Option<(Option<StringId>, St
     }
 }
 
+/// Consumes one balanced same-kind group starting at `bytes[i]` — the
+/// byte at `i` must equal `open` (`<` for type arguments, `(` for an
+/// argument list); strings are skipped so their brackets never skew the
+/// depth. Returns the index past the matching close, or `i` unchanged
+/// when the byte is not `open` or the group never closes.
+fn skip_balanced(bytes: &[u8], i: usize, open: u8) -> usize {
+    if bytes.get(i) != Some(&open) {
+        return i;
+    }
+    let start = i;
+    let close = if open == b'<' { b'>' } else { b')' };
+    let mut depth = 0usize;
+    let mut i = i;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b if b == quote => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b if b == open => {
+                depth += 1;
+                i += 1;
+            }
+            b if b == close => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // Unbalanced — leave the caller's position untouched.
+    start
+}
+
 impl ConstLookup for CtorScope<'_, '_> {
     fn ident(&self, name: StringId) -> IdentVerdict {
         match self.env.get(&name) {
@@ -377,6 +424,64 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Widens a `new`-keyword-anchored non-constancy to the whole
+    /// `InstanceCreationExpression`. Upstream rejects a non-`const`
+    /// creation with `InvalidConstant.genericError(node: node)` where
+    /// `node` is the creation itself — `new` through the argument list's
+    /// closing paren (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart:1035,
+    /// `visitInstanceCreationExpression`; every corpus oracle row for
+    /// this shape spans `new C()` / `new Object()` whole, none anchors
+    /// at the bare keyword). The capture folds a `new` expression to its
+    /// keyword token (listener `end_new_expression`), so this emit site
+    /// re-reads the creation's extent: the type head, optional balanced
+    /// type arguments, `.selector` repeats, and one balanced argument
+    /// list. Any span that is not exactly a `new` keyword followed by a
+    /// type name stays untouched.
+    fn new_creation_extent(&self, span: SourceRange) -> SourceRange {
+        if span.length != 3 {
+            return span;
+        }
+        let bytes = self.source.as_bytes();
+        let start = self.byte_of(span.offset);
+        if self.source.get(start..start + 3) != Some("new") {
+            return span;
+        }
+        let mut i = start + 3;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if !bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$') {
+            return span;
+        }
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+        {
+            i += 1;
+        }
+        // Type arguments (`new C<int>()`), then `.selector` repeats
+        // (`new p.C()`, `new C.named()`), then one argument list.
+        i = skip_balanced(bytes, i, b'<');
+        while bytes.get(i) == Some(&b'.')
+            && bytes
+                .get(i + 1)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+        {
+            i += 2;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
+                i += 1;
+            }
+            i = skip_balanced(bytes, i, b'<');
+        }
+        i = skip_balanced(bytes, i, b'(');
+        SourceRange {
+            offset: span.offset,
+            length: self.utf16_of(i).saturating_sub(span.offset),
+        }
+    }
+
     /// Reports one const verdict at its site mapping: a fault carries its
     /// own `constEval*` code (the oracle's allow-list override), a
     /// generic non-constancy takes the site default
@@ -385,9 +490,10 @@ impl<'a> Engine<'a> {
         match verdict {
             Verdict::Value(_) | Verdict::Constant => {}
             Verdict::NotConstant(span) => {
+                let span = self.new_creation_extent(*span);
                 self.emit(
                     SemanticCode::ConstInitializedWithNonConstantValue,
-                    *span,
+                    span,
                     "",
                     "",
                 );
@@ -1396,7 +1502,7 @@ impl<'a> Engine<'a> {
         // drops the level unreported — the drain takes it here, ahead of
         // the capture's own `end_arguments`, while the engine's argument
         // level still holds the labels.
-        self.check_annotation_arguments(end);
+        self.check_annotation_const_arguments(end);
         let Some(arm) = self.literal_ctor_arms.pop().flatten() else {
             return;
         };
@@ -2499,7 +2605,7 @@ impl<'a> Engine<'a> {
     /// whose label names no formal never pairs with the creation's
     /// argument check — the official's evaluation reports the leaf
     /// directly there, `invalid_constant` at the value).
-    fn check_annotation_arguments(&mut self, close: SourceRange) {
+    fn check_annotation_const_arguments(&mut self, close: SourceRange) {
         let Some((args, named)) = self.const_capture.take_annotation_args() else {
             return;
         };
@@ -3001,6 +3107,106 @@ mod face_tests {
             "{:?}",
             code_names(&rep)
         );
+    }
+
+    /// The `ConstantVerifier` validity set at the initializer site (brief
+    /// #2969): the shapes the oracle accepts stay silent — `identical`
+    /// (a constant call, evaluation.dart `visitStaticMethodInvocation`),
+    /// string interpolation of constants, unary `-` on a const, and `is`
+    /// type tests (evaluation.dart:1106 `visitIsExpression` — no invalid
+    /// arm of its own; zero oracle rows anchor at the operator). A
+    /// locally declared `identical` stands in for the dart:core function
+    /// the one-library rig does not import (the fold keys on the name).
+    #[test]
+    fn const_initializer_validity_pins() {
+        // The silence asserts below pin THIS ticket's faces (the const
+        // initializer/element codes) only — an unrelated operator-
+        // resolution row on the same source belongs to another lane's
+        // deliverable and must not fail this pin.
+        let const_init = |rep: &FileReport| -> Vec<&str> {
+            code_names(rep)
+                .into_iter()
+                .filter(|c| {
+                    c.starts_with("const_") || c.starts_with("non_constant")
+                })
+                .collect()
+        };
+        let rep = unit_report("bool identical(a, b) { return true; }\nconst x = identical(1, 1);\n");
+        assert!(const_init(&rep).is_empty(), "identical: {:?}", const_init(&rep));
+        let rep = unit_report("const y = 'a${2}';\n");
+        assert!(const_init(&rep).is_empty(), "interp: {:?}", const_init(&rep));
+        // Unary `-` on a constant: valid (ConstantVerifier prefix arm).
+        let rep = unit_report("const k = 1;\nconst z = -k;\n");
+        assert!(const_init(&rep).is_empty(), "neg: {:?}", const_init(&rep));
+        // `is` type tests defer as valid constants (both operands
+        // constant): the capture folds the operator to an opaque leaf.
+        let rep = unit_report(
+            "class A { const A(); }\n\
+             const k = 1;\n\
+             const w = k is String;\n\
+             const v = const A() is int;\n",
+        );
+        let rows: Vec<&str> = code_names(&rep)
+            .into_iter()
+            .filter(|c| c.starts_with("const_") || c.starts_with("non_constant"))
+            .collect();
+        assert!(rows.is_empty(), "{:?}", rows);
+        // A non-const variable reference reports at the variable.
+        let rep = unit_report("var v = 1;\nconst x = v;\n");
+        let rows: Vec<(u32, u32)> = rep
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "const_initialized_with_non_constant_value")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(rows, [(21, 1)], "{:?}", code_names(&rep));
+        // A const-literal spread of a non-constant reports through the
+        // element face at the spread operand, NOT through this ticket's
+        // initializer code (oracle shape: `non_constant_map_element`
+        // only — corpus case NonConstantMapElementTest/
+        // test_spreadElement_notConst expects that single row). The
+        // element faces' own red zone (non_constant_list/set/map_
+        // element, 80 pipeline fails) belongs to the element-face lane;
+        // this pin holds the const-init code out of it.
+        let rep = unit_report(
+            "void main() {\n\
+             var notConst = {};\n\
+             const {1: null, ...notConst};\n\
+             }\n",
+        );
+        assert!(
+            const_init(&rep).is_empty(),
+            "spread: {:?}",
+            const_init(&rep)
+        );
+    }
+
+    /// A `new` creation in a const initializer reports at the whole
+    /// `InstanceCreationExpression` — `new` through the argument list's
+    /// closing paren (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart:1035,
+    /// `visitInstanceCreationExpression`: `InvalidConstant.genericError(
+    /// node: node)` on the creation node; corpus rows span `new C()` /
+    /// `new Object()` whole). The capture folds the creation to its
+    /// keyword token, so the emit site re-reads the extent — also for a
+    /// dead conditional arm (`false ? 1 : new A()`) and an eager `??`
+    /// right operand (the corpus `lazy_*` and `questionQuestion_null_
+    /// invalid` shapes).
+    #[test]
+    fn new_creation_reports_whole_span() {
+        let rep = unit_report(
+            "class A { const A(); }\n\
+             const a = new A();\n\
+             const b = false ? 1 : new A();\n\
+             const c = null ?? new A();\n",
+        );
+        let rows: Vec<(u32, u32)> = rep
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "const_initialized_with_non_constant_value")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(rows, [(33, 7), (64, 7), (91, 7)], "{:?}", code_names(&rep));
     }
 
     /// `constantContext2` (ast.dart:17927-17983) returns `null` inside a

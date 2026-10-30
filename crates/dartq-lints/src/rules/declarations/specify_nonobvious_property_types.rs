@@ -15,7 +15,10 @@ use crate::rules::{
 /// same-file ancestor chain — when any written supertype name leaves
 /// the file the whole instance face under-reports (the resolved
 /// `allSupertypes` walk is unavailable); static and top-level
-/// variables carry no such face. Message: `diagnostic.g.dart`
+/// variables carry no such face. A bare-identifier initializer is never
+/// obvious (the rule-local `initializer_obvious` — upstream
+/// `obvious_types.dart`:166-179 admits only locals and formals, which
+/// cannot occur at these sites). Message: `diagnostic.g.dart`
 /// `specifyNonobviousPropertyTypes`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "specify_nonobvious_property_types",
@@ -77,7 +80,7 @@ fn check(c: &mut Check<'_>) {
             .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer);
         let obvious = initializer
             .and_then(|init| last_child(c, init))
-            .is_some_and(|value| obvious_spelling(c, value).is_some());
+            .is_some_and(|value| initializer_obvious(c, value));
         if !obvious {
             needs.push(var);
         }
@@ -91,6 +94,27 @@ fn check(c: &mut Check<'_>) {
         for var in needs {
             c.report(c.utf16_span(var), &[]);
         }
+    }
+}
+
+/// The rule-local obviousness face over the shared spelling helper: the
+/// upstream `SimpleIdentifier` arm (`obvious_types.dart`:166-179) makes a
+/// bare identifier obvious only when it names a local variable or formal
+/// parameter — and neither binder exists at a top-level or field
+/// declaration site, so a bare identifier is never obvious here (the
+/// shared helper, built for the local-variable family, answers obvious
+/// for every bare identifier). The unwrap faces recurse exactly as the
+/// shared helper does: `ParenthesizedExpression` (:218-220) and
+/// `CascadeExpression` (:215-217, the target).
+fn initializer_obvious(c: &Check<'_>, value: u32) -> bool {
+    match c.kind(value) {
+        NodeKind::Identifier => false,
+        NodeKind::ParenthesizedExpression | NodeKind::Cascade => c
+            .collect_direct(value)
+            .into_iter()
+            .next()
+            .is_some_and(|inner| initializer_obvious(c, inner)),
+        _ => obvious_spelling(c, value).is_some(),
     }
 }
 

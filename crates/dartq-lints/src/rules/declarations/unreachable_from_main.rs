@@ -3,8 +3,8 @@ use rustc_hash::FxHashSet;
 use super::{Check, PayloadField, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
 use crate::rules::{
-    MemberQuery, initialized_identifier_name, member_matches, member_name, rows_with_parent,
-    same_file_ancestors, utf16_token_span,
+    MemberQuery, SupertypeClause, initialized_identifier_name, member_matches, member_name,
+    rows_with_parent, same_file_ancestors, supertypes, utf16_token_span,
 };
 use dartq_ast::NodeKind;
 
@@ -52,18 +52,36 @@ use dartq_ast::NodeKind;
 /// propagation graph is workspace-global where the official walk is
 /// per-library, the entry seeds admit every declaration kind where the
 /// official seeds only functions, and type-annotation references carry
-/// no `NamedType` filter. Annotation reads (`@visibleForTesting`,
+/// no `NamedType` filter (a type used only in an ordinary annotation
+/// over-reachable — the oracle's `visitNamedType` counts aliases,
+/// extension types, type literals, type arguments, and external
+/// declaration types only). Annotation reads (`@visibleForTesting`,
 /// `@Preview`) are by spelling — a same-file annotation class of either
 /// name over-suppresses (the flutter-family approximation register). An
 /// unnamed extension has no name token to key a face flag with: it
 /// never reports, and its members judge on their own flags.
+///
+/// Constructor verdicts: the face universe is the capture's declaration
+/// rows and constructors are not declaration rows (`dartq-index`
+/// capture, the constructor exclusion), so a real-pipeline constructor
+/// rides its class's offset (the unnamed echo) or answers no verdict
+/// (the named face). Where the face gives a constructor no dead verdict,
+/// the constructor's own reference face decides (`ctor_self_reachable`):
+/// the counting positions (`C()`, `C.named`, `: this.x()`, `= C.x`,
+/// `super.x()`) plus the marking arms the counting index cannot spell —
+/// `@reflectiveTest` (:220-231), the subclass default-constructor walk
+/// (:199-215, :454-465), the walked explicit constructor without a
+/// super-initializer (:247-259), and the unnamed `super()` invocation
+/// (:400-406). Residual: a constructor referenced only from another
+/// unit of the library keeps no counted position here and over-reports
+/// where the official's all-units declaration map marks it.
 pub(crate) static SPEC: RuleSpec =
     crate::spec!("unreachable_from_main", &[NodeKind::CompilationUnit], check,);
 
 /// The candidate class the widget-preview suppression reads (upstream
 /// `hasWidgetPreview`: constructors, top-level functions, and static
 /// executables are the suppressible shapes).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
     /// A top-level function, getter, or setter
     /// (`TopLevelFunctionElement`).
@@ -85,6 +103,9 @@ fn check(c: &mut Check<'_>) {
     if !face.has_entry {
         return;
     }
+    // The constructor marking arms (the subclass walk the constructor
+    // verdict fallback consults) — built once per unit.
+    let arms = ctor_arms(c);
     // The lexical-use supplement: the name → counting-position index
     // the doc-reference and anti-reach arms consult. Built once per
     // unit — `Identifier` rows in a reference context (expression,
@@ -114,10 +135,12 @@ fn check(c: &mut Check<'_>) {
                         c,
                         &face,
                         &uses,
+                        &arms,
                         top,
                         row,
                         Shape::TopLevelFunction,
                         name,
+                        "",
                         c.lexeme(name),
                         c.lexeme(name),
                         c.lexeme(name),
@@ -139,10 +162,12 @@ fn check(c: &mut Check<'_>) {
                                 c,
                                 &face,
                                 &uses,
+                                &arms,
                                 top,
                                 row,
                                 Shape::Other,
                                 name,
+                                "",
                                 c.lexeme(name),
                                 c.lexeme(name),
                                 c.lexeme(name),
@@ -155,7 +180,7 @@ fn check(c: &mut Check<'_>) {
                 | NodeKind::ExtensionDeclaration
                 | NodeKind::ExtensionTypeDeclaration
                 | NodeKind::EnumDeclaration => {
-                    judge_container(c, &face, &uses, top, row, &mut dead);
+                    judge_container(c, &face, &uses, &arms, top, row, &mut dead);
                 }
                 NodeKind::Typedef => {
                     let Some(name) = name_token_of(c, top, row) else {
@@ -165,10 +190,12 @@ fn check(c: &mut Check<'_>) {
                         c,
                         &face,
                         &uses,
+                        &arms,
                         top,
                         row,
                         Shape::Other,
                         name,
+                        "",
                         c.lexeme(name),
                         c.lexeme(name),
                         c.lexeme(name),
@@ -186,6 +213,7 @@ fn judge_container(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
     uses: &rustc_hash::FxHashMap<String, u32>,
+    arms: &CtorArms,
     wrapper: u32,
     row: u32,
     dead: &mut FxHashSet<u32>,
@@ -208,10 +236,12 @@ fn judge_container(
             c,
             face,
             uses,
+            arms,
             wrapper,
             row,
             Shape::Other,
             name,
+            "",
             c.lexeme(name),
             c.lexeme(name),
             c.lexeme(name),
@@ -237,7 +267,7 @@ fn judge_container(
                 if is_enum {
                     continue;
                 }
-                judge_constructor(c, face, uses, member, &container);
+                judge_constructor(c, face, uses, arms, member, &container);
             }
             NodeKind::Fields => {
                 for variable in c.collect_direct(member) {
@@ -264,10 +294,12 @@ fn judge_container(
                             c,
                             face,
                             uses,
+                            arms,
                             member,
                             member,
                             Shape::Other,
                             name,
+                            "",
                             c.lexeme(name),
                             c.lexeme(name),
                             c.lexeme(name),
@@ -309,10 +341,12 @@ fn judge_container(
                     c,
                     face,
                     uses,
+                    arms,
                     member,
                     member,
                     Shape::Method(is_static),
                     name,
+                    "",
                     lexeme,
                     lexeme,
                     lexeme,
@@ -340,6 +374,7 @@ fn judge_constructor(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
     uses: &rustc_hash::FxHashMap<String, u32>,
+    arms: &CtorArms,
     row: u32,
     container: &str,
 ) {
@@ -362,10 +397,12 @@ fn judge_constructor(
         c,
         face,
         uses,
+        arms,
         row,
         row,
         Shape::Constructor,
         name_token,
+        container,
         member,
         &display,
         &display,
@@ -386,10 +423,12 @@ fn judge(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
     uses: &rustc_hash::FxHashMap<String, u32>,
+    arms: &CtorArms,
     wrapper: u32,
     annotation_row: u32,
     shape: Shape,
     name_token: u32,
+    container: &str,
     public: &str,
     counted: &str,
     display: &str,
@@ -397,9 +436,6 @@ fn judge(
     // 1. Unreachable (the face's flag; `None` — outside the face's
     // universe — never reports).
     let offset = utf16_token_span(c, name_token).start;
-    if face.is_reachable(offset) != Some(false) {
-        return;
-    }
     // 1.5. Counted use (the anti-reach arm): a candidate the face's
     // under-reach flagged unreachable but whose name has a same-file
     // counting position reads as reachable — a plain type reference or
@@ -413,8 +449,30 @@ fn judge(
         } else {
             uses.get(public).copied().unwrap_or(0)
         };
-    if counted_count > 0 {
-        return;
+    match face.is_reachable(offset) {
+        Some(false) => {
+            if counted_count > 0 {
+                return;
+            }
+        }
+        // The face's universe is the capture's declaration rows, and
+        // constructors are not declaration rows (`dartq-index` capture,
+        // the constructor exclusion): a real-pipeline constructor rides
+        // its class's offset (the unnamed echo) or answers no verdict
+        // (the named face) — never its own. The constructor's own
+        // reference face decides instead (upstream
+        // `unreachable_from_main.dart` marks a constructor exactly when
+        // a reference or a marking arm reaches it): a counting position
+        // (`C()`, `C.named`, `: this.x()`, `= C.x`, `super.x()`) or one
+        // of the marking arms the counting index cannot spell keeps it
+        // silent; otherwise it reports.
+        _ => {
+            if shape != Shape::Constructor
+                || ctor_self_reachable(c, face, uses, arms, container, public)
+            {
+                return;
+            }
+        }
     }
     // 2. Public (`element.isPublic` — the written declaration name; a
     // constructor's display carries the `Type.` prefix, so the public
@@ -440,6 +498,234 @@ fn judge(
         return;
     }
     c.report(utf16_token_span(c, name_token), &[display]);
+}
+
+/// The same-file class table the constructor marking arms walk. The
+/// capture universe carries no constructor rows, so the real face never
+/// gives a constructor its own verdict — this table supplies the
+/// upstream marking arms (`unreachable_from_main.dart`) the counting
+/// index cannot spell.
+struct CtorArms {
+    classes: Vec<CtorClass>,
+}
+
+/// One same-file class's constructor-arm facts.
+struct CtorClass {
+    /// The class row (annotation and member lookups).
+    row: u32,
+    /// The written class name.
+    name: String,
+    /// The `extends` clause's supertype name, when written (the upstream
+    /// `supertype` — the arms walk `extends` only: `with`/`on` have no
+    /// super constructor, an `implements` name is no supertype).
+    extends: Option<String>,
+    /// Whether the class declares any explicit constructor/factory (the
+    /// default-constructor arm's gate).
+    has_explicit_ctor: bool,
+    /// `@reflectiveTest` (the test-harness instantiation arm
+    /// `unreachable_from_main.dart` :220-231 — marks the unnamed
+    /// constructor).
+    reflective_test: bool,
+    /// The explicit constructors: `(member name, unnamed, super shape)`.
+    ctors: Vec<(String, bool, Option<SuperInit>)>,
+}
+
+/// The super-invocation shape of one explicit constructor's initializer
+/// list (`unreachable_from_main.dart` :250-253 — `hasSuperInitializer`
+/// keys the implicit-super arm; :400-406 — an unnamed `super()` marks
+/// the supertype's unnamed constructor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuperInit {
+    /// `super.name(...)` — marks the supertype's NAMED constructor (the
+    /// counting index covers it through the `name` continuation).
+    Named,
+    /// `super(...)` — marks the supertype's UNNAMED constructor.
+    Unnamed,
+}
+
+/// Builds the same-file class table: one pass over the unit's class
+/// declarations. Enum/mixin/extension containers carry no constructor
+/// arms (the official gatherer adds an enum's constructors never, and
+/// mixins/extensions have no super constructor).
+fn ctor_arms(c: &Check<'_>) -> CtorArms {
+    let mut classes = Vec::new();
+    let Some(root) = c.unit.ast.root() else {
+        return CtorArms { classes };
+    };
+    for wrapper in c.children(root) {
+        if c.kind(wrapper) != NodeKind::TopLevelDeclaration {
+            continue;
+        }
+        for row in declaration_rows(c, wrapper) {
+            if c.kind(row) != NodeKind::ClassDeclaration {
+                continue;
+            }
+            let Some(name_token) = container_name_token(c, row) else {
+                continue;
+            };
+            let extends = supertypes(c, row)
+                .into_iter()
+                .find(|&(_, clause)| clause == SupertypeClause::Extends)
+                .map(|(name, _)| name.to_owned());
+            let mut ctors = Vec::new();
+            for member in member_rows(c, row) {
+                if !matches!(c.kind(member), NodeKind::Constructor | NodeKind::Factory) {
+                    continue;
+                }
+                let written = constructor_name_node(c, member);
+                let (member_name, unnamed) = match written {
+                    Some(node) => {
+                        let lexeme = c.lexeme(c.head_token(node));
+                        (lexeme.to_owned(), lexeme == c.lexeme(name_token))
+                    }
+                    None => ("new".to_owned(), true),
+                };
+                ctors.push((member_name, unnamed, super_init_shape(c, member)));
+            }
+            classes.push(CtorClass {
+                row,
+                name: c.lexeme(name_token).to_owned(),
+                extends,
+                has_explicit_ctor: !ctors.is_empty(),
+                reflective_test: carries_annotation(c, wrapper, row, "reflectiveTest"),
+                ctors,
+            });
+        }
+    }
+    CtorArms { classes }
+}
+
+/// The super-invocation shape of a constructor's initializer list: the
+/// row-less `super` token whose follower is `(` names the unnamed face,
+/// `.` the named one. The scan rides the `Initializers` row when the
+/// declaration carries one — a body's `super.foo()` member read is not
+/// an initializer (`unreachable_from_main.dart` :251-253 reads
+/// `node.initializers`).
+fn super_init_shape(c: &Check<'_>, ctor: u32) -> Option<SuperInit> {
+    let initializers = c
+        .collect_direct(ctor)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::Initializers)?;
+    let last = c.unit.tokens.len().saturating_sub(1) as u32;
+    let mut named = false;
+    for token in c.unit.ast.token_range(initializers) {
+        if c.lexeme(token) == "super" {
+            match c.lexeme((token + 1).min(last)) {
+                "(" => return Some(SuperInit::Unnamed),
+                "." => named = true,
+                _ => {}
+            }
+        }
+    }
+    named.then_some(SuperInit::Named)
+}
+
+/// Whether the constructor `{container}.{member}` has its own reach
+/// beyond the face verdict — a counting position (`C()`, `C.named`, a
+/// `: this.x()` redirect, an `= C.x` factory redirect, a `super.x()`
+/// call — the judge's counted keys), the `@reflectiveTest` unnamed
+/// arm, or the subclass walk (`marked_unnamed`).
+fn ctor_self_reachable(
+    c: &Check<'_>,
+    face: &ReachabilityFace<'_>,
+    uses: &rustc_hash::FxHashMap<String, u32>,
+    arms: &CtorArms,
+    container: &str,
+    member: &str,
+) -> bool {
+    if ctor_counted(uses, container, member) {
+        return true;
+    }
+    let Some(class) = arms.classes.iter().find(|class| class.name == container) else {
+        return false;
+    };
+    // The reflectiveTest arm marks the UNNAMED constructor; the
+    // implicit-super arms mark the unnamed face only (upstream seeds
+    // `firstWhereOrNull((e) => e.name == 'new')`). A named constructor
+    // has no arm beyond its references.
+    if member != "new" {
+        return false;
+    }
+    if class.reflective_test {
+        return true;
+    }
+    marked_unnamed(c, face, uses, arms, container, &mut Vec::new())
+}
+
+/// Whether the UNNAMED constructor of `name` is walked by the upstream
+/// traversal: a direct reference (`C()`, `C.new`), the reflectiveTest
+/// instantiation, or a same-file `extends` subclass whose walked
+/// constructor carries an implicit or unnamed-super initial super
+/// step (`unreachable_from_main.dart` :199-215 default-constructor
+/// arm, :247-259 implicit-super arm, :400-406 unnamed-super arm). The
+/// recursion covers default-constructor chains (a subclass walked
+/// through its own subclass marks upward), bounded by the same-file
+/// class count with a visiting guard (an `extends` cycle is a compile
+/// error, the guard is the termination invariant).
+fn marked_unnamed(
+    c: &Check<'_>,
+    face: &ReachabilityFace<'_>,
+    uses: &rustc_hash::FxHashMap<String, u32>,
+    arms: &CtorArms,
+    name: &str,
+    visiting: &mut Vec<String>,
+) -> bool {
+    if ctor_counted(uses, name, "new") {
+        return true;
+    }
+    if visiting.iter().any(|seen| seen == name) {
+        return false;
+    }
+    let Some(class) = arms.classes.iter().find(|class| class.name == name) else {
+        return false;
+    };
+    if class.reflective_test {
+        return true;
+    }
+    visiting.push(name.to_owned());
+    let walked = arms.classes.iter().any(|subclass| {
+        subclass.extends.as_deref() == Some(name)
+            && subclass_walks_super(c, face, uses, arms, subclass, visiting)
+    });
+    visiting.pop();
+    walked
+}
+
+/// Whether some constructor walk of `subclass` marks its supertype's
+/// unnamed constructor: the class itself walked with no explicit
+/// constructor (the default constructor's implicit super-initializer),
+/// or a walked explicit constructor carrying no super-initializer (the
+/// implicit face) or an unnamed `super()` (the explicit unnamed face).
+fn subclass_walks_super(
+    c: &Check<'_>,
+    face: &ReachabilityFace<'_>,
+    uses: &rustc_hash::FxHashMap<String, u32>,
+    arms: &CtorArms,
+    subclass: &CtorClass,
+    visiting: &mut Vec<String>,
+) -> bool {
+    if !subclass.has_explicit_ctor {
+        // The default constructor walks when the class declaration
+        // walks: the engine's class flag (any reference marks it — a
+        // supertype clause or an instantiation alike), or a counted
+        // use.
+        let walked_by_flag = container_name_token(c, subclass.row)
+            .map(|token| face.is_reachable(utf16_token_span(c, token).start) == Some(true))
+            .unwrap_or(false);
+        return walked_by_flag || uses.get(&subclass.name).copied().unwrap_or(0) > 0;
+    }
+    subclass.ctors.iter().any(|(member, unnamed, super_init)| {
+        let walked = ctor_counted(uses, &subclass.name, member)
+            || (*unnamed && marked_unnamed(c, face, uses, arms, &subclass.name, visiting));
+        walked && *super_init != Some(SuperInit::Named)
+    })
+}
+
+/// The counted positions of one constructor: the qualified
+/// `{container}.{member}` key and the bare member key.
+fn ctor_counted(uses: &rustc_hash::FxHashMap<String, u32>, container: &str, member: &str) -> bool {
+    uses.get(&format!("{container}.{member}")).copied().unwrap_or(0) > 0
+        || uses.get(member).copied().unwrap_or(0) > 0
 }
 
 /// The declaration rows of one top-level wrapper (the name and
@@ -607,7 +893,25 @@ fn counting_uses(c: &Check<'_>) -> rustc_hash::FxHashMap<String, u32> {
             continue;
         }
         if ctx == EXPRESSION || ctx == EXPRESSION_CONT || ctx == PATTERN_FIELD {
-            count(&mut uses, c.lexeme(c.head_token(row)).to_owned());
+            let lexeme = c.lexeme(c.head_token(row)).to_owned();
+            count(&mut uses, lexeme.clone());
+            // An invocation head (`C()`) resolves to the constructor it
+            // invokes upstream (`visitMethodInvocation`'s element
+            // read): an immediate `(` counts the unnamed constructor,
+            // a `.` the written member — the same keys the
+            // constructor-reference head counts. No angle scan (a
+            // comparison's `<` would run it; `C<T>()` keeps the
+            // bare-name count only).
+            if ctx == EXPRESSION {
+                let next = c.unit.ast.token_range(row).end;
+                if next + 1 < c.unit.tokens.len() as u32 {
+                    match c.lexeme(next) {
+                        "(" => count(&mut uses, format!("{lexeme}.new")),
+                        "." => count(&mut uses, format!("{lexeme}.{}", c.lexeme(next + 1))),
+                        _ => {}
+                    }
+                }
+            }
             continue;
         }
         // A `ConstructorReferenceContinuation` counts its written

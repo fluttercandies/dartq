@@ -1073,6 +1073,20 @@ pub(crate) mod msg {
         )
     }
 
+    /// A built-in identifier consumed as a type name
+    /// (`builtInIdentifierAsType`, analyzer code `built_in_identifier_as_type`
+    /// per the pseudoSharedCode re-render, error_converter.dart:53-59;
+    /// registry text with correction per the analyzer's
+    /// `diag.builtInIdentifierAsType`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart:1621-1630).
+    pub(crate) fn built_in_identifier_as_type(lexeme: &str) -> Message {
+        Message::with_correction(
+            BUILT_IN_IDENTIFIER_AS_TYPE,
+            format!("The built-in identifier '{lexeme}' can't be used as a type."),
+            "Try correcting the name to match an existing type.",
+        )
+    }
+
     /// `<T>` on a constructor declaration.
     pub(crate) fn type_parameter_on_constructor() -> Message {
         Message::new(
@@ -1520,6 +1534,13 @@ pub(crate) mod msg {
     const FINAL_NOT_INITIALIZED: CodeInfo = CodeInfo::new(
         "final_not_initialized",
         "FINAL_NOT_INITIALIZED",
+        DiagnosticType::CompileTimeError,
+        true,
+    );
+
+    const BUILT_IN_IDENTIFIER_AS_TYPE: CodeInfo = CodeInfo::new(
+        "built_in_identifier_as_type",
+        "BUILT_IN_IDENTIFIER_AS_TYPE",
         DiagnosticType::CompileTimeError,
         true,
     );

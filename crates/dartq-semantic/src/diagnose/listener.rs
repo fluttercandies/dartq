@@ -5217,6 +5217,113 @@ impl ParserListener for DiagnoseListener<'_> {
                 args,
             });
         }
+        // The operand faces `type_check_operand_ty`'s walk cannot reach —
+        // its `callee_return_ty` answers callables (the declaration
+        // table's `return_ty`) and its untyped arms receiver shapes, never
+        // a bare container head. Upstream's `leftNode.typeOrThrow` reads
+        // the operand node's own `staticType`: a bare container name in
+        // value position is a `TypeLiteral` (`C is T` — `TypeLiteralImpl.
+        // staticType` = `Type`, and `p.C` the same through the prefixed
+        // lookup), while an unnamed-constructor send (`D()`, `D(1)`,
+        // `p.C()`) types the created instance (`InstanceCreationExpression.
+        // staticType` — the bare `D` callee resolves the default
+        // constructor, a `C.new`/`D.named` selector already resolves
+        // through `Receiver::Created`'s own face). The verdict reads
+        // `operand.ty` first, so re-typing the row here reaches it without
+        // touching the engine's operand walk; a genuinely-undecidable
+        // operand (an unresolvable head, a generic ctor's raw name) keeps
+        // the unknown suppress — the under-report direction.
+        if keyword_operand.is_none()
+            && let Some(index) = engine
+                .rows
+                .iter()
+                .rposition(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            && engine.rows[index].ty == Ty::UNKNOWN
+        {
+            // The `Member{Prefix}` prefixed-container test (`prefixed_
+            // decl_is_container`'s contract): a scoped declaration that is
+            // no variable, function, prefix, or type parameter is a
+            // container spelling — `p.C` reads `Type`, `p.C(...)` the
+            // created instance; a prefixed call (`p.f()`) is neither and
+            // keeps `callee_return_ty`'s declared-return answer.
+            let prefixed_container = |prefix: StringId, name: StringId| -> bool {
+                let Lookup::Found(NamespaceEntry::Decl(file)) =
+                    engine.namespaces.lookup_prefixed(engine.graph, engine.lib, prefix, name)
+                else {
+                    return false;
+                };
+                engine.index.get(file).and_then(|f| f.decl(name)).is_some_and(
+                    |decl| {
+                        !matches!(
+                            decl.kind,
+                            MicroKind::TopLevelVar
+                                | MicroKind::TopLevelFn
+                                | MicroKind::Prefix
+                                | MicroKind::TypeParam
+                        )
+                    },
+                )
+            };
+            let row = &engine.rows[index];
+            // `MicroKind::Extension` collapses `extension E` and
+            // `extension type Ext` into one row kind (`Bare(Container.
+            // Extension)`); only the extension-type spelling is a creation
+            // — a plain `extension`'s `E(1)` is an invalid call upstream
+            // whose operand types `InvalidType` (the oracle stays silent
+            // on `Ex(1) is Ex`), so it keeps the unknown suppress. The
+            // read face (`C is Type`) is a `TypeLiteral` either way.
+            let retyped = match &row.shape {
+                RowShape::Bare(BareInfo::Container { name, kind }) => {
+                    if row.intent == Intent::Invoke {
+                        if *kind != ContainerKind::Extension
+                            || engine.container_kind_of(*name)
+                                == Some(ContainerKind::ExtensionType)
+                        {
+                            Some(Ty::named(row.name))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(Ty::named(engine.intern("Type")))
+                    }
+                }
+                RowShape::Member {
+                    recv: Receiver::Prefix { name: prefix },
+                } if prefixed_container(*prefix, row.name) => {
+                    if row.intent == Intent::Invoke {
+                        Some(Ty::named(row.name))
+                    } else {
+                        Some(Ty::named(engine.intern("Type")))
+                    }
+                }
+                // The unnamed-creation fold's own row (`D()`, `p.C()`,
+                // `Ext(1)`) — its `ty` stays open while the send-close
+                // inference solves the written arguments, but the
+                // `InstanceCreationExpression` reads `D`/`Ext` regardless
+                // (`end_parenthesized_expression`'s same arm): the
+                // container head is the created type. The `Extension` kind
+                // carries both `extension E` and `extension type Ext`
+                // (`MicroKind::Extension` collapses them); only the
+                // extension-type spelling is a creation, so the same
+                // `container_kind_of` discrimination the bare arm reads
+                // decides it — a plain `extension`'s `(` keeps the unknown
+                // suppress (`Ex(1) is Ex` stays silent upstream).
+                RowShape::Receiver(Receiver::Created { name, kind }) => {
+                    if *kind != ContainerKind::Extension
+                        || engine.container_kind_of(*name)
+                            == Some(ContainerKind::ExtensionType)
+                    {
+                        Some(Ty::named(*name))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(ty) = retyped {
+                engine.rows[index].ty = ty;
+            }
+        }
         engine.check_type_check(verdict_at, keyword_operand, not.is_some());
         engine.armed_ty = checked_saved;
         engine.const_capture.not_constant(is_operator.range);
@@ -8354,6 +8461,59 @@ impl ParserListener for DiagnoseListener<'_> {
             {
                 ty
             }
+            // The group's static type is the inner expression's own —
+            // `ParenthesizedExpressionImpl.staticType` forwards
+            // `expression.staticType` — so the operand-static face the
+            // is-check's `leftNode.typeOrThrow` reads answers here too: a
+            // `TypeLiteral` (`(C)`, `(p.C)`) types `Type`, a completed send
+            // `(f())` its declared return, a `this`/`super` group the
+            // container's `thisType`, a member chain the accessor face.
+            // Without it every `(expr).member` merge saw an Unknown
+            // receiver — `(C).toString() is String`,
+            // `(C()).toString() is String` and their nested forms never
+            // reached `check_type_check` (the operand row's verdict
+            // suppresses on Unknown).
+            //
+            // The widening is gated on the last row BEING the group's whole
+            // inner expression: its operand head (`operand_expr_head`'s
+            // backward walk — bracket closers jump to their openers, a
+            // `new`/`const` keyword and a receiver head join) reaches the
+            // first significant byte after the `(`. A composite's tail row
+            // (the `C` of `(a + C)` — a binary pushes no result row) heads
+            // at its own operand, answers only that operand's face, and the
+            // opaque face stands.
+            Some(row)
+                if open_offset != u32::MAX && {
+                    let bytes = engine.source.as_bytes();
+                    let from = engine.byte_of(open_offset + 1).min(bytes.len());
+                    let head_byte = trim_ws(bytes, from, bytes.len());
+                    head_byte < bytes.len()
+                        && operand_expr_head(engine, row.range.offset)
+                            == engine.utf16_of(head_byte)
+                } =>
+            {
+                let ty = engine.operand_static_ty(row);
+                if ty != Ty::UNKNOWN {
+                    ty
+                } else {
+                    // An unsolved creation's row keeps no `ty` (the
+                    // generic head's inference stays open), but the
+                    // parenthesized `InstanceCreationExpression` still
+                    // types as its container — `(C())` reads `C`
+                    // regardless of the argument slots.
+                    match &row.shape {
+                        RowShape::Receiver(Receiver::Created { name, kind })
+                            if *kind != ContainerKind::Extension =>
+                        {
+                            Ty::named(*name)
+                        }
+                        _ => Ty::UNKNOWN,
+                    }
+                }
+            }
+            // The tail row of a composite (or any inner face the widened
+            // arm does not claim): the push-time `ty` stands — the
+            // pre-widening behavior.
             Some(row) => row.ty,
             None => Ty::UNKNOWN,
         };

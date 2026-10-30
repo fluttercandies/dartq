@@ -965,6 +965,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         Some((kind, _)) => *kind,
                         None => self.kind_at(end + 1),
                     }
+                } else if let Some(kind) = type_param.shared_remainder(self.kind_at(end)) {
+                    // The group closed on a compound's *last* `>`: the
+                    // official successor is the remainder after that last
+                    // unit (`=` for a `...Eq` tail — the new-style-typedef
+                    // discriminator, `parser_impl.dart:1497`), never the real
+                    // next token.
+                    kind
                 } else {
                     self.kind_at(end + 1)
                 }

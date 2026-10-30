@@ -17,8 +17,8 @@ use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
 use dartq_pub::PackageConfig;
 use dartq_resolution::{
-    Combinators, Configuration, PackageTable as UriPackageTable, ResolutionCode, ResolvedTarget,
-    UriResolver,
+    Combinators, Configuration, FileRole, PackageTable as UriPackageTable, ResolutionCode,
+    ResolvedTarget, SdkFileKinds, UriResolver,
 };
 use dartq_scanner::TokenTable;
 use dartq_sdk::{AllowedExperiments, SdkSnapshot};
@@ -372,6 +372,16 @@ pub struct DirectiveFacts {
     /// branch's own literal — the oracle reports `state.selectedUri`
     /// (library_analyzer.dart:698-717), never the primary's span.
     pub configuration_spans: Box<[SourceRange]>,
+    /// Indices into [`DirectiveFacts::configurations`] whose clause URI is a
+    /// string interpolation — upstream's `DirectiveUriWithoutString`
+    /// (`file_state.dart:118`, `_buildDirectiveUri` over a `null`
+    /// `stringValue`, :759-764). The clause still participates in selection
+    /// (first matching clause wins regardless of its URI's shape), so the
+    /// entry rides `configurations` with an empty `uri` placeholder and this
+    /// column marks it: a selected interpolated branch reports
+    /// `uri_with_interpolation` at the branch literal, never resolves. Empty
+    /// for almost every directive.
+    pub interpolated_configurations: Box<[u32]>,
 }
 
 /// Everything one compilation unit contributes, keyed by its content
@@ -455,11 +465,44 @@ impl UnitFacts {
     /// (`_updateKind`, file_state.dart:937-939).
     #[must_use]
     pub fn is_part(&self) -> bool {
-        !self
-            .directives
-            .iter()
-            .any(|directive| directive.kind == DirectiveKind::Library)
-            && self.part_of().is_some()
+        self.file_role().is_part()
+    }
+
+    /// The unit's file-kind classification — the four-way
+    /// `FileState._updateKind` role (file_state.dart:928-949) as the
+    /// dartq-resolution single source defines it: a `library` directive
+    /// classifies outright, the name-form `part of` binds by library name,
+    /// the URI form by target identity (external `dart:` targets included,
+    /// unresolvable ones never attaching). This is the classification the
+    /// part-family emitters feed `dartq_resolution::part_of_row` — the
+    /// pure include-side role matrix. Per-form last-wins mirrors the
+    /// oracle's serialization (two directives of one form overwrite the
+    /// unlinked slot; the parser reports `part_of_twice` separately).
+    #[must_use]
+    pub fn file_role(&self) -> FileRole<'_> {
+        let mut library_directive = false;
+        let mut library_name: Option<&str> = None;
+        let mut part_of_name: Option<&str> = None;
+        let mut part_of_target: Option<ResolvedTarget> = None;
+        for directive in &self.directives {
+            match directive.kind {
+                DirectiveKind::Library => {
+                    library_directive = true;
+                    library_name = directive.name.as_deref();
+                }
+                DirectiveKind::PartOf => match directive.name.as_deref() {
+                    Some(name) => part_of_name = Some(name),
+                    None => part_of_target = Some(directive.target),
+                },
+                _ => {}
+            }
+        }
+        FileRole::of(
+            library_directive,
+            library_name,
+            part_of_name,
+            part_of_target,
+        )
     }
 }
 
@@ -1499,6 +1542,16 @@ pub(crate) struct EngineState {
     pub uri_packages: UriPackageTable,
     /// SDK snapshot; `dart:` targets resolve against [`Self::target`].
     pub sdk: SdkSnapshot,
+    /// The external file-kind probe cache (dartq-resolution
+    /// `SdkFileKinds`): the part-of form of `dart:` target files, read
+    /// from SDK content on first ask and session-stable afterwards — the
+    /// classification the part-family emitters need for external includes
+    /// (`part 'dart:async/future.dart'` and kin), which no workspace facts
+    /// carry. `Mutex`-guarded because the analyze fan-out's workers probe
+    /// through `&EngineState`; the cache makes the held section one map hit
+    /// per SDK file per session. Never persisted: a probe is a pure
+    /// function of SDK content.
+    pub sdk_file_kinds: Mutex<SdkFileKinds>,
     /// Memoized per-file experiment grants (audit #708 P2-1): the
     /// allowed-experiments authorization merged into every file's derived
     /// feature set. See [`FeatureGrants`].
@@ -1887,6 +1940,7 @@ impl EngineState {
         Ok(Self {
             packages,
             uri_packages,
+            sdk_file_kinds: Mutex::new(SdkFileKinds::default()),
             sdk,
             feature_grants,
             target,

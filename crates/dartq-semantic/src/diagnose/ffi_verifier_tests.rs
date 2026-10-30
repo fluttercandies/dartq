@@ -346,6 +346,18 @@ fn invalid_field_type_in_struct() {
     assert_row(&report(f), "invalid_field_type_in_struct", at(f, 4, 12), 6);
 }
 
+/// A nullable-suffix field type is still a *written* type: `Pointer?`
+/// reports `invalid_field_type_in_struct` (upstream ffi_verifier.dart
+/// `:1566-1570` — `declaredType.nullabilitySuffix ==
+/// NullabilitySuffix.question` → `fieldType.toSource()` keeps the `?`),
+/// never `missing_field_type_in_struct`. The span reaches past the `?`
+/// (`Pointer?` = 8 chars).
+#[test]
+fn invalid_field_type_in_struct_nullable_pointer() {
+    let f = "\nfinal class C extends Struct {\n  external Pointer? p;\n}\n";
+    assert_row(&report(f), "invalid_field_type_in_struct", at(f, 3, 12), 8);
+}
+
 #[test]
 fn leaf_call_must_not_return_handle() {
     let f = "\nvoid f(Pointer<NativeFunction<Handle Function()>> p) {\n\

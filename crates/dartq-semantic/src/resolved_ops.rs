@@ -3302,8 +3302,28 @@ impl<'a> ResolvedTypeOps<'a> {
             args: on_args,
         } = table.get(on).kind()
         else {
-            // A non-interface `on` type has no parameter positions to
-            // bind — the subtype answer stands on it as written.
+            // A bare `on T` (the extension's own type parameter) is
+            // `constrainArgument`'s parameter leaf: it binds the receiver
+            // wholesale — `extension E<T> on T` over a `String?` receiver
+            // instantiates `T := String` (the nullable absorption of
+            // [`Self::bind_face_params`]: a nullable leaf strips the
+            // receiver's own `?`, a non-null leaf binds verbatim). Without
+            // the binding the instantiated `on` stays `T`, the
+            // `is_subtype(receiver, T)` gate fails, and the extension never
+            // applies — the `expectStaticType` unchecked-use extras.
+            if let TypeKind::TypeParameter { parameter } = table.get(on).kind()
+                && face_params.contains(&parameter)
+            {
+                let binding = if table.get(on).is_nullable() {
+                    non_nullable_of(table, receiver)
+                } else {
+                    receiver
+                };
+                let map = vec![(parameter, binding)];
+                return Some((table.substitute(on, &map), map));
+            }
+            // Any other non-interface `on` shape has no parameter positions
+            // to bind — the subtype answer stands on it as written.
             return Some((on, Vec::new()));
         };
         let TypeKind::Interface {

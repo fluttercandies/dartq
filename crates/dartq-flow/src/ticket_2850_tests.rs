@@ -235,11 +235,14 @@ fn dead_for_element_anchors_at_updaters() {
     // A constant-false C-for condition kills the iteration before it
     // begins. The updaters precede the element in source order, so they
     // are the first dead nodes and their own official row spans them
-    // (`for_updaterBegin`, dead_code_verifier.dart:357-375 — oracle-probed
-    // on 3.13.7: `var y = [for (var i = 0; false; i++) 1]; print(y);`
-    // reports `i++` first).
+    // (`for_updaterBegin`, dead_code_verifier.dart:357-375). The dead
+    // ELEMENT gets its own row too (first dead node after the fold;
+    // #3042's spanned-literal fix): its covering close is the enclosing
+    // block's last statement end — here the var-decl's own `;`.
+    // Oracle-probed on 3.13.7 (machine format): rows at `i++` (3 chars)
+    // and `1];`.
     let src = "void f() {\n  var x = [for (var i = 0; false; i++) 1];\n}";
-    assert_eq!(dead_of(src), vec!["i++".to_string()]);
+    assert_eq!(dead_of(src), vec!["i++".to_string(), "1];".to_string()]);
 }
 
 #[test]

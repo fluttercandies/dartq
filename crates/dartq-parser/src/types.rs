@@ -68,6 +68,24 @@ impl TypeInfo {
             _ => false,
         }
     }
+
+    /// Whether the shape could stand alone as an expression (official
+    /// `TypeInfo.couldBeExpression`, `type_info_impl.dart`): bare names and
+    /// prefixed names qualify; `void` and argument-carrying or
+    /// `Function`-structured shapes do not. A record type `(...)` qualifies
+    /// (no type args, no `Function` starters — `type_info_impl.dart:591-592`)
+    /// even when its interior is not really field-shaped, because the
+    /// `(...)` token run itself is a valid expression (a parenthesized
+    /// expression or a record literal).
+    pub(crate) fn could_be_expression(&self) -> bool {
+        match self {
+            TypeInfo::Simple | TypeInfo::SimpleNullable | TypeInfo::Prefixed => true,
+            TypeInfo::Complex(c) => {
+                matches!(c.type_args, TypeParamOrArg::None) && c.type_variable_starters.is_empty()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// `ComplexTypeInfo` (`type_info_impl.dart:526`). Ids are captured at compute

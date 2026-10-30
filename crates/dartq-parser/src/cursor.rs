@@ -83,6 +83,7 @@ pub(crate) struct CursorMark {
     pos: usize,
     head: usize,
     inserted_len: usize,
+    adopted_len: usize,
     last_consumed: Option<TokenId>,
 }
 
@@ -97,6 +98,12 @@ pub struct TokenCursor<'s, 't> {
     /// Inserted tokens not yet consumed start at `head`.
     inserted: Vec<InsertedToken>,
     head: usize,
+    /// Scanner-parked synthetic closers adopted by `moveSynthetic`
+    /// (recovery.rs): the official rewriter relinks the token out of its
+    /// parked slot, so nothing downstream ever sees it; the flat table
+    /// cannot unlink, so `advance` skips these ids instead (the official
+    /// equivalent of the relocated token no longer sitting at EOF).
+    adopted: Vec<u32>,
     /// The id consumed by the latest [`Self::advance`] — the official
     /// `token` variable (the anchor `reportRecoverableError(token, ...)`
     /// sites report on).
@@ -114,6 +121,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
             pos: 0,
             inserted: Vec::new(),
             head: QUEUE_EMPTY,
+            adopted: Vec::new(),
             last_consumed: None,
         }
     }
@@ -136,6 +144,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
             pos: self.pos,
             head: self.head,
             inserted_len: self.inserted.len(),
+            adopted_len: self.adopted.len(),
             last_consumed: self.last_consumed,
         }
     }
@@ -152,6 +161,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
             pos: self.pos,
             inserted: self.inserted.clone(),
             head: self.head,
+            adopted: self.adopted.clone(),
             last_consumed: self.last_consumed,
         }
     }
@@ -163,6 +173,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
         self.pos = mark.pos;
         self.head = mark.head;
         self.inserted.truncate(mark.inserted_len);
+        self.adopted.truncate(mark.adopted_len);
         self.last_consumed = mark.last_consumed;
     }
 
@@ -497,8 +508,35 @@ impl<'s, 't> TokenCursor<'s, 't> {
             }
         } else if self.pos + 1 < self.table.len() {
             self.pos += 1;
+            self.skip_adopted();
         }
         id
+    }
+
+    /// Parks a scanner-synthesized group closer out of the stream (official
+    /// `moveSynthetic` unlinks the adopted token from its parked slot). Ids
+    /// land here only through `move_synthetic_close`, which already reported
+    /// the group's unmatched row — the hidden token must never re-surface
+    /// to a `peek`/`advance`/loop head (an adopted `)` parked at EOF would
+    /// otherwise re-enter the class-member loop and mint a spurious
+    /// `expected_class_member` on the 0-width synthetic).
+    pub(crate) fn hide(&mut self, id: TokenId) {
+        debug_assert!(id as usize >= self.pos);
+        self.adopted.push(id as u32);
+        self.skip_adopted();
+    }
+
+    /// Advances `pos` past adopted tokens (the [`Self::hide`] contract:
+    /// adopted ids are skipped the moment `pos` would land on them).
+    /// `peek`-family methods take `&self`, so the skip lives at the single
+    /// `pos` mutation point — `pos` is only ever moved here (increment),
+    /// `jump_to`/`rewind_to` (speculation, queue-asserted paths that never
+    /// cross adopted ids), and `reset` (which truncates `adopted` back in
+    /// lockstep, restoring the token's visibility).
+    fn skip_adopted(&mut self) {
+        while self.pos < self.table.len() && self.adopted.contains(&(self.pos as u32)) {
+            self.pos += 1;
+        }
     }
 
     #[inline]

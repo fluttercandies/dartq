@@ -393,7 +393,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if !is_id_or_question_id {
             return false;
         }
+        // `compute_type` probes from the cursor, so walk it to the `(` head
+        // first and restore — the probe itself is read-only; the mark/reset
+        // only re-seats the cursor for the caller's dispatch.
+        let mark = self.cursor.mark();
+        self.cursor.advance();
         let type_info = self.compute_type(false, false);
+        self.cursor.reset(mark);
         matches!(&type_info, TypeInfo::Complex(c) if c.is_record_type)
     }
 
@@ -758,6 +764,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // token (+2). The garbage-recovery recompute below re-anchors at the
         // cursor for the missing-name shape (`typedef <T> = ...`).
         let mut new_style = false;
+        // Official `newStyleParseAsRecovered` (parser_impl.dart:1466): `true`
+        // only for the `name <typeVars>? =` shape — the `=` after the group
+        // forces the head into the name slot under the recovered face. The
+        // `skip is EQ` (missing-name `typedef <T> =`) and `<`-recheck arms
+        // keep `false` (official :1491/:1513-1518).
+        let mut name_recovered = false;
         let head_end = type_info.skip_type(self);
         let head_offset = self.offset_of(head_end) + 2 - self.cursor.real_pos();
         let mut type_param = self.compute_type_param_or_arg_at(head_offset, true);
@@ -775,7 +787,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // sees the remainder `>` and stays old-style.
             let next_kind =
                 self.type_arg_follower(&type_param, self.cursor.real_pos() + head_offset);
-            if next_kind == TokenKind::Eq || self.kind_at(self.offset_of(skip)) == TokenKind::Eq {
+            if next_kind == TokenKind::Eq {
+                new_style = true;
+                name_recovered = true;
+            } else if self.kind_at(self.offset_of(skip)) == TokenKind::Eq {
                 new_style = true;
             } else if self.kind_at(self.offset_of(skip)) == TokenKind::Lt
                 && let Some(end) = self
@@ -805,10 +820,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // precedes the verifier-derived built-in row in the oracle
             // output.
             let builtin_row = self.builtin_typedef_name_row();
-            let name = if self.peek_is_identifier() {
-                self.ensure_identifier(IdentifierContext::TypedefDeclaration)
-            } else {
+            let name = if name_recovered {
                 self.ensure_identifier_recovered(IdentifierContext::TypedefDeclaration)
+            } else {
+                self.ensure_identifier(IdentifierContext::TypedefDeclaration)
             };
             if let Some((at, kind)) = builtin_row {
                 self.report_builtin_typedef_name_at(at, kind);
@@ -977,17 +992,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // oracle's silent synthetic-name face on
             // keyword_named_typedefs.dart 132.
             let builtin_row = self.builtin_typedef_name_row();
-            if self.peek_is_identifier() || self.peek_kind_ahead_is_paren_after_type() {
-                let _ = self.ensure_identifier(IdentifierContext::TypedefDeclaration);
-            } else {
-                // No name at all (`typedef void = ...;`): the 3.13 oracle
-                // recovers through the top-level-member message anchored on
-                // the offending token before inserting the synthetic name.
-                // EOF has no offending token — only the synthetic name.
-                if !matches!(self.peek_kind(), TokenKind::Keyword(_) | TokenKind::Eof) {
-                    self.report(msg::expected_executable(), self.peek_span());
-                }
+            // Official `isIdentifierRecovered` (parser_impl.dart:1590-1594):
+            // a non-identifier head is treated as the name when the token
+            // after the type-parameter group is `(` (`typedef void assert();`).
+            // Anything else takes the context's normal `ensureIdentifier`
+            // template — a reserved word heading a top-level declaration
+            // splices a synthetic name and stays for the declaration loop
+            // (oracle `typedef var a;`: `missing_identifier` at `var`,
+            // `expected_token ';'` anchored on `typedef`).
+            let is_recovered = !self.peek_is_identifier()
+                && self.kind_at(self.offset_of(type_param.skip(self.peek_id())) + 1)
+                    == TokenKind::OpenParen;
+            if is_recovered {
                 let _ = self.ensure_identifier_recovered(IdentifierContext::TypedefDeclaration);
+            } else {
+                let _ = self.ensure_identifier(IdentifierContext::TypedefDeclaration);
             }
             if let Some((at, kind)) = builtin_row {
                 self.report_builtin_typedef_name_at(at, kind);
@@ -1049,10 +1068,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 at,
             );
         }
-    }
-
-    fn peek_kind_ahead_is_paren_after_type(&self) -> bool {
-        self.cursor.look_kind(0) == TokenKind::OpenParen
     }
 
     // ------------------------------------------------------------------
@@ -2010,10 +2025,42 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 break;
             }
             let before = self.cursor.progress();
-            // on
+            // skipUnexpectedTokenOpt (:3475, junk list `on`/`implements`/`{`):
+            // a non-keyword token directly before a clause keyword or the
+            // body `{` is reported and skipped — the identical() follower
+            // check only hits keyword stringValues and the `{` token type,
+            // same lexeme-face reasoning as the class recovery's :3187 list.
+            let next = self.peek_kind();
+            if !matches!(next, TokenKind::Keyword(_)) {
+                let follower = self.cursor.look_kind(1);
+                if matches!(follower, TokenKind::Keyword(Keyword::On | Keyword::Implements))
+                    || follower == TokenKind::OpenCurly
+                {
+                    self.report(
+                        msg::unexpected_token(self.cursor.lexeme(self.peek_id())),
+                        self.peek_span(),
+                    );
+                    self.cursor.advance();
+                }
+            }
+            // on — both the plain `on` arm and the misspelled
+            // `extend`/`extends` arm (:3519 — lexeme-based gate, `extend` is
+            // an identifier) feed `parseMixinOn` (:3555) and share the
+            // duplicate/order checks below; the misspelled token itself is
+            // the clause's `onKeyword` anchor (the `token.next!` read at
+            // :3558).
+            let mut on_keyword: Option<TokenSpan> = None;
             if self.peek_kind() == TokenKind::Keyword(Keyword::On) {
-                let on = self.peek_span();
+                on_keyword = Some(self.peek_span());
                 self.cursor.advance();
+            } else if is_keyword_or_identifier(self.peek_kind())
+                && matches!(self.cursor.lexeme(self.peek_id()), "extend" | "extends")
+            {
+                on_keyword = Some(self.peek_span());
+                self.report(msg::expected_instead("on"), self.peek_span());
+                self.cursor.advance();
+            }
+            if let Some(on) = on_keyword {
                 let mut count = 1usize;
                 self.parse_single_type_required();
                 while self.peek_kind() == TokenKind::Comma {
@@ -2030,21 +2077,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     }
                     clauses.extends = true;
                 }
-            } else if is_keyword_or_identifier(self.peek_kind())
-                && matches!(self.cursor.lexeme(self.peek_id()), "extend" | "extends")
-            {
-                // Official :3519 — same lexeme-based gate as the class
-                // recovery; `extend` is an identifier, not a keyword.
-                self.report(msg::expected_instead("on"), self.peek_span());
-                self.cursor.advance();
-                let mut count = 1usize;
-                self.parse_single_type_required();
-                while self.peek_kind() == TokenKind::Comma {
-                    self.cursor.advance();
-                    self.parse_single_type_required();
-                    count += 1;
-                }
-                self.listener.handle_mixin_on(Some(self.peek_span()), count);
             }
             // implements
             if self.peek_kind() == TokenKind::Keyword(Keyword::Implements) {

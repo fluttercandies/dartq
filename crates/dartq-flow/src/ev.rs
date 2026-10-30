@@ -333,6 +333,13 @@ pub enum Ev {
     },
     Bool {
         value: bool,
+        /// The literal's own token: the header partition anchor
+        /// ([`crate::interp::ForBounds::build`]'s offset scan keys on
+        /// spanned events — a bare `for (; false;)` condition has no
+        /// other spanned event between the separators, so without this
+        /// span the condition region reads empty and the loop folds as
+        /// `for (;;)`). Same contract as [`Ev::Int`]'s span.
+        span: TokenSpan,
     },
     Null,
     /// An integer literal: distinguished from [`Ev::OtherExpr`] so the
@@ -815,6 +822,7 @@ impl Ev {
             | Ev::OtherExpr { span }
             | Ev::Int { span }
             | Ev::Double { span }
+            | Ev::Bool { span, .. }
             | Ev::PatternBegin { span, .. }
             | Ev::This { span } => Some(*span),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),

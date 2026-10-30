@@ -858,15 +858,17 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.report(msg::field_initializer_outside_constructor(), kw);
         }
 
-        // Inline function-typed parameter detection (official :2221-2264):
-        // the token after the type is the tentative name; its `<...>(` or
-        // direct `(` follower makes this an inline function-typed parameter
-        // (a committed type never reaches the bare-`(` arm, so record-type
-        // parameters like `((Enum, Enum) r)` parse as type + name). The type
-        // region was already consumed above, so the probe reads the
-        // post-type token directly (a `this` receiver formal never probes —
-        // the walk owns it; a `super` receiver probes its name exactly as
-        // the post-walk probe did).
+        // Inline function-typed parameter detection (official :2197-2240):
+        // the tentative name is the post-walk token — for a `this`/`super`
+        // receiver the walk already consumed the head, leaving the cursor on
+        // the same tentative-name position (`this.f` leaves `f` current, so
+        // the official `token = next` step lands identically). Its `<...>(`
+        // or direct `(` follower makes this an inline function-typed
+        // parameter (a committed type never reaches the bare-`(` arm, so
+        // record-type parameters like `((Enum, Enum) r)` parse as type +
+        // name). The receiver head only changes the re-walk: the parse-back
+        // steps `this`/`super` + `.` again before the name (`step_receiver
+        // _head`), exactly as the pre-typed walk did.
         let mut before_inline_function_type: Option<TokenSpan> = None;
         let mut inline_name: Option<TokenSpan> = None;
         // The token opening the parameter's own suffix (`<`/`(`) — upstream's
@@ -875,15 +877,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let mut inline_anchor: Option<TokenSpan> = None;
         let mut type_param = TypeParamOrArg::None;
         // The name-less `(`-suffix face (official OPEN_PAREN arm,
-        // parser_impl.dart:2233): a formal whose parameter list follows with
-        // no name in between — `void (int x)`, `(int x)` — reports
+        // parser_impl.dart:2223-2240): a formal whose parameter list follows
+        // with no name in between — `void (int x)`, `(int x)` — reports
         // `missing_identifier` at the `(` (the formalParameterDeclaration
         // keep-set branch) and carries a synthetic name; a this/super
         // receiver (`this.field(int value)`) carries the receiver's name.
         let mut phantom_name: Option<TokenSpan> = None;
         let mut step_receiver_head = false;
+        let has_receiver_head = period_after_this_or_super.is_some();
         let before_probe = self.cursor.mark();
-        if this_keyword.is_none() {
+        {
             let tentative_name = is_identifier(self.peek_kind());
             let mut shape_matched = false;
             if tentative_name {
@@ -894,11 +897,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // The suffix opener doubles as the upstream report
                     // anchor (`beforeInlineFunctionType.next!`).
                     inline_anchor = Some(self.peek_span());
+                    // Official `computeTypeParamOrArg(token)` (:2204) —
+                    // `token` is the tentative name, so the `<` is one ahead,
+                    // which is the on-`<` variant's entry contract.
                     type_param = self.compute_type_param_or_arg_on_lt(false);
                     // The shape follower is read after the group (official
-                    // `closer.next!`), computed from the `<` offset so a
-                    // raw-compound closer (`>>`/`>=`) reads its split
-                    // remainder.
+                    // `closer.next!.isA(OPEN_PAREN)`, :2208), computed from
+                    // the `<` offset so a raw-compound closer (`>>`/`>=`)
+                    // reads its split remainder.
                     if self.type_arg_follower(&type_param, self.cursor.real_pos())
                         == TokenKind::OpenParen
                     {
@@ -912,35 +918,42 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     if let Some(t) = var_final_or_const
                         && member_kind != MemberKind::PrimaryConstructor
                     {
-                        // Official :2239-2247 — the shape-matched probe
-                        // reports `function_typed_parameter_var` on the
-                        // modifier; the `extraneous_modifier` half of the
-                        // probed pair (`void g(var g()) {}` → both rows on
-                        // the keyword) comes from the var/final walk-end
-                        // gate below.
+                        // Official :2210-2220/:2226-2236 — the shape-matched
+                        // probe reports `function_typed_parameter_var` on the
+                        // modifier (receivers included: `var this.h()`
+                        // carries the pair); the `extraneous_modifier` half
+                        // comes from the var/final walk-end gate below.
                         self.report(msg::function_typed_parameter_var(), t);
                     }
                     inline_name = Some(name);
+                    // `beforeInlineFunctionType = token` — the tentative
+                    // name (`f`), never the suffix opener.
                     before_inline_function_type = Some(name);
+                    step_receiver_head = has_receiver_head;
                 }
             } else if self.peek_kind() == TokenKind::OpenParen {
                 if let Some(t) = var_final_or_const
                     && member_kind != MemberKind::PrimaryConstructor
                 {
-                    // Same probed pair as the type-led shape above; the
+                    // Same probed pair as the name-led shape above; the
                     // walk-end gate owns the `extraneous_modifier` half.
                     self.report(msg::function_typed_parameter_var(), t);
                 }
                 // `before` is the `(` itself, which is also the upstream
-                // anchor (`beforeType.next!`).
+                // anchor (`beforeInlineFunctionType.next!` — for a receiver
+                // the official `token` is the `this.`/`super.` period, whose
+                // `next` is the same `(`).
                 let at = self.peek_span();
                 before_inline_function_type = Some(at);
                 inline_anchor = Some(at);
+                step_receiver_head = has_receiver_head;
                 // A parameter-list boundary behind the suffix means there is
                 // no name slot at all — the name-less face: the row anchors
                 // on the `(` with a synthetic name (oracle
                 // `void f(void (int x)) {}` / `void f((int x)) {}`: one
-                // `missing_identifier` at the `(`). An identifier means the
+                // `missing_identifier` at the `(`; a receiver face
+                // `this.(int x)` reports at the same `(` through the
+                // field-initializer ensure). An identifier means the
                 // record-type parameter reading (`((int, int) r)`), whose
                 // name the tail ensure consumes; a GFT member keeps the
                 // tail-ensure face (its handleNoName gate is
@@ -972,19 +985,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             } else {
                 self.cursor.reset(before_probe);
             }
-        } else if self.peek_kind() == TokenKind::OpenParen
-            || (is_identifier(self.peek_kind()) && self.cursor.look_kind(1) == TokenKind::OpenParen)
-        {
-            // Function-typed field formal `String this.field(int value)`:
-            // the official OPEN_PAREN arm consumes the suffix with the
-            // receiver's name as the tentative name (`beforeInlineFunction
-            // Type` = the name token, parser_impl.dart:2229/:2233). The
-            // receiver walk leaves the cursor on the name.
-            let name = self.peek_span();
-            inline_name = Some(name);
-            before_inline_function_type = Some(name);
-            inline_anchor = Some(self.look_span_at(1));
-            step_receiver_head = true;
         }
 
         let mut var_or_final = None;
@@ -1129,7 +1129,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             // and a synthetic name spliced in front of the already-parsed
             // suffix (official ensureIdentifier's keep-set branch — the
             // insert-without-consuming posture — reached at :2349 after the
-            // suffix parse).
+            // suffix parse). The name context is the caller's — a receiver
+            // head (`this.(int x)`) names its synthetic through
+            // `fieldInitializer`, exactly like the official
+            // `ensureIdentifier(token, nameContext)`.
             self.report(msg::missing_identifier(), at);
             let id = self
                 .cursor
@@ -1138,8 +1141,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             // idiom), leaving the cursor on the post-group token.
             self.cursor.drain_to(id);
             let span = self.span_of(id);
-            self.listener
-                .handle_identifier(span, IdentifierContext::FormalParameterDeclaration);
+            self.listener.handle_identifier(span, name_context);
             span
         } else if let Some(n) = inline_name {
             if step_receiver_head {

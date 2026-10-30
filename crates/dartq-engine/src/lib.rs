@@ -2426,7 +2426,7 @@ impl DartIgnoreEntry {
 /// and block-comment states, so an `ignore:` spelling inside a literal or
 /// a block comment never cites.
 #[derive(Default)]
-struct DartIgnores {
+pub(crate) struct DartIgnores {
     /// 1-based line -> citations (`ignore:` heads).
     on_line: FxHashMap<u32, Vec<DartIgnoreEntry>>,
     /// `ignore_for_file:` citations.
@@ -2446,7 +2446,7 @@ impl DartIgnores {
     /// Whether a row named `name` (the lowercase code name) of family
     /// `dtype` reported on 1-based `line` is suppressed (`_ignoredAt`,
     /// :186-212).
-    fn ignored(&self, line: u32, name: &str, dtype: DiagnosticType) -> bool {
+    pub(crate) fn ignored(&self, line: u32, name: &str, dtype: DiagnosticType) -> bool {
         self.for_file.iter().any(|entry| entry.matches(name, dtype))
             || self
                 .on_line
@@ -2457,7 +2457,7 @@ impl DartIgnores {
     /// Parses one Dart file's ignore comments: a single byte walk holding
     /// the scanner's string/comment states, feeding every line comment's
     /// lexeme to the head classifiers.
-    fn parse(text: &str) -> Self {
+    pub(crate) fn parse(text: &str) -> Self {
         let mut info = Self::default();
         let bytes = text.as_bytes();
         let mut i = 0usize;
@@ -2737,6 +2737,12 @@ fn citations(rest: &str) -> Vec<DartIgnoreEntry> {
         i += 1;
     }
 }
+
+/// #3045 pins: the part/part-of family and non-library import/export
+/// emitters, locked to the `dart analyze` 3.13.7 oracle rows.
+#[cfg(test)]
+#[path = "ticket_3045_tests.rs"]
+mod ticket_3045_tests;
 
 #[cfg(test)]
 mod tests {

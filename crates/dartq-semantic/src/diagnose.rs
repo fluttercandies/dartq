@@ -431,6 +431,13 @@ mod tests;
 #[cfg(test)]
 mod ticket_2904_tests;
 
+/// The #2972 `subtype_of_disallowed_type` pins: the four clause faces
+/// (`extends`/`with`/`implements`/`on`) over the non-subtypable SDK
+/// spellings, the shadow test (an in-file declaration wins), the core
+/// `Enum`-in-`with` exemption, and the bare-alias chase.
+#[cfg(test)]
+mod ticket_2972_tests;
+
 /// The #2878 display-retention pins: the function type's own
 /// type-parameter group and the named type's arguments surviving into
 /// the message slots, plus the redirect face's instantiated forms.
@@ -478,6 +485,13 @@ mod ticket_2313_tests;
 /// Kept as a standalone module so the shared `tests` rig stays untouched.
 #[cfg(test)]
 mod ticket_2316_tests;
+
+/// The UNDEF-WAVE scope-walk pins: getter/setter asymmetry (a setter-only
+/// name reports `undefined_identifier` on reads/compounds but resolves the
+/// write) and cross-library private-member accessibility — the two oracle
+/// rules `resolve_bare`/`bare_write_target_exists` under-modeled.
+#[cfg(test)]
+mod undefined_scope_pins;
 
 /// The `dart:ffi` verifier's `/1` trigger pins (48 codes + the F4 noise
 /// gate) — one test per oracle row.
@@ -1543,8 +1557,10 @@ pub fn fold_unit_with_ops<'t>(
         ));
     }
     // The staged null-aware faces (`_checkForUnnecessaryNullAware`), keyed
-    // on the receiver reads the promotions are now complete for.
-    engine.flush_null_aware_staged(&promotions);
+    // on the receiver reads the promotions are now complete for — locals
+    // through the local table, member/property receivers through the
+    // promoted-property rows (#2975's `_g?.abs()` arm).
+    engine.flush_null_aware_staged(&promotions, &prop_promotions);
     // The parser held the only other strong reference and is gone, so the
     // unwrap cannot fail.
     // The promoted-receiver re-decision (#1465) reads the joined read
@@ -1584,6 +1600,9 @@ pub fn fold_unit_with_ops<'t>(
     engine.finalize_ext_faces();
     engine.finalize_pattern_getters();
     engine.finalize_mixin_uses();
+    // The #2972 non-subtypable supertype faces: after the mixin-use
+    // teardown so both walk the settled whole-unit container set.
+    engine.finalize_disallowed_subtypes();
     // The `dart:ffi` verifier's post-parse pass: the compound/`@Native`
     // declaration shapes, the captured invocation faces, and the
     // `.address` reads (upstream ffi_verifier.dart, run after the parse so
@@ -5049,6 +5068,13 @@ mod ticket_2570_tests;
 #[cfg(test)]
 mod ticket_2618_tests;
 
+/// The #2945 pins: the constructor-use `member_refs` edge is annotation-
+/// gated — a bare `Host()` call on an unannotated constructor mints no
+/// index-visible row, while an annotated ctor still publishes the edge the
+/// verifier drains.
+#[cfg(test)]
+mod ticket_2945_tests;
+
 /// The #2687 pins: the creation-inference stack — an unresolved
 /// superclass leaves a generic creation's slots unconstrainable (the
 /// unsolved fill is the exact instantiation), the assignment write
@@ -5188,6 +5214,15 @@ mod ticket_2860_tests;
 /// pairs stay informative.
 #[cfg(test)]
 mod ticket_2854_tests;
+
+/// The #2948 compound-receiver operand pins: the parenthesized group's
+/// static type is the inner expression's own
+/// (`ParenthesizedExpressionImpl.staticType`), so `(C)`, `(C())`,
+/// `(f())`, `(x).m()`, and their nested forms carry a real receiver to
+/// the `is`/`is!` verdict — the group row's push-time `Unknown` no
+/// longer suppresses `check_type_check`.
+#[cfg(test)]
+mod ticket_2948_tests;
 
 /// The #2843 R4 pins: the relational-pattern gate at the operator token,
 /// the object-pattern nullable-matched head at the type name, and the
@@ -5534,3 +5569,125 @@ mod ticket_2928_tests;
 /// raw-constructor inference face emits.
 #[cfg(test)]
 mod ticket_2936_tests;
+/// The #2947 pins (census C2): the expression/call-site
+/// `type_argument_not_matching_bounds` faces — the invocation path's
+/// declared-bounds verdict over method sends, implicit-`call`
+/// invocations, instance/extension-type creations, generic function
+/// literals, metadata annotations, and bare type literals (the four
+/// upstream `_checkInvocationTypeArguments`/`checkNamedType` visitor
+/// seams, `type_arguments_verifier.dart`).
+#[cfg(test)]
+mod ticket_2947_tests;
+
+/// The #2966 pins (UNDEF-2): the shape-receiver member verdict —
+/// function-typed (`var f = () => 0; f.bar`) and record-typed
+/// (`r.foo` over `(int, String)`) receivers, typedef-to-shape heads
+/// (`fn.bar` over `typedef F = void Function()`), and `call` on the
+/// bare `Function` head — the `type_property_resolver.dart` non-interface
+/// arms the `undefined_getter`/`_method`/`_setter` trio reads.
+#[cfg(test)]
+mod ticket_2966_tests;
+
+/// The #2963 pins (dupdef): the `duplicate_definition` statement-list
+/// faces — `var`/`final`/destructuring repeats inside block bodies and
+/// `for` heads, statement-list local function repeats, the case-header /
+/// if-case binder exemptions — plus the own-scope
+/// `conflicting_static_and_instance` arms reasserted alongside.
+#[cfg(test)]
+mod dupdef_pins;
+
+/// The #2975 pins (NULLCHK follow-up): `invalid_null_aware_operator` on
+/// member/property `?.`/`?..` receivers — the promoted-field arm the
+/// `local_hits`-gated `null_aware_staged` path cannot reach, re-decided
+/// through the `PromotedPropertyRead` rows.
+#[cfg(test)]
+mod ticket_2975_tests;
+
+/// The #2982 pins: the always-`Null` code substitution at the
+/// `unchecked_use_of_nullable_value` operand faces — `Ty::Null` swaps to
+/// `invalid_use_of_null_value` at the for-in iterable and the non-null-aware
+/// spread operand (the verifier's `report()` substitution).
+#[cfg(test)]
+mod ticket_2982_tests;
+
+/// The #2992 pins: a function type's `is`-operand tear-off must never
+/// panic — `tear_off_fn_ty` held the shared `args` `borrow_mut` across the
+/// `fold_alias_ty` return fold, whose `instantiated_head_ty` tail
+/// re-entered the same RefCell (`RefCell already borrowed`, ~111
+/// crashers over the `function_type*` corpus). The fold now resolves
+/// before the borrow is taken.
+#[cfg(test)]
+mod ticket_2992_tests;
+
+/// The #3002 `unnecessary_type_check` pins: the `is`/`is!` verdict's
+/// constant-true/false polarity rows, the undecidable/dynamic silences,
+/// the promoted operand, and the function-typed operand faces.
+#[cfg(test)]
+mod ticket_3002_tests;
+
+/// The #3000 `undefined_operator` pins: the non-`Named` receiver faces —
+/// `dynamic`/`Null`/`void`/`Never`/record/function operands and the
+/// `T`-bound, shape-extension, and ambiguous-extension verdicts the
+/// shared operator face and the compound/increment twin answer.
+#[cfg(test)]
+mod ticket_3000_tests;
+
+/// The #3003 pins: the `p.C` prefix-head faces — `prefix_shadowed_by_
+/// local_declaration` on non-type heads (creation, annotation, `is`/`as`
+/// operands, redirect), the context-chain miss codes over the written
+/// `p.C` span, the `not_a_type` Type-head rewrite, and the `as`/`is`
+/// operand's resolved non-type answers.
+#[cfg(test)]
+mod ticket_3003_tests;
+
+/// The #3004 pins: the constructor report's `errorRange` (type name
+/// through selector, primary heads included), the `external`/factory
+/// generative-set faces, the implicit-super required-named count, and the
+/// `FutureOr<nullable>` required-initialization silence.
+#[cfg(test)]
+mod ticket_3004_tests;
+
+/// The #3006 pins: the `missing_default_value_for_parameter` residuals —
+/// the `;`-bodied generative-constructor and non-redirecting-factory
+/// verdicts (`defaultValuesAreExpected`'s ConstructorDeclaration arm), the
+/// stale-ctor-site sibling-method guard, and the bare-`T`/`T?`/`FutureOr`
+/// faces of `isPotentiallyNonNullable`.
+#[cfg(test)]
+mod ticket_3006_tests;
+
+/// The #3007 pins: the extension-type erasure face of the name-level
+/// exhaustiveness world (`getExtensionTypeErasure` inside upstream
+/// `getStaticType`) — `non_exhaustive_switch_expression`/`_statement`
+/// witnesses name the representation type's spaces, exhaustive
+/// representation coverage stays silent, and the always-exhaustive enum
+/// face reaches statement switches over `implements`-clause extension
+/// types; plus the definite-assignment gate's baseline faces
+/// (`int x;` reports, `int?`/`int x = f()` silent).
+#[cfg(test)]
+mod ticket_3007_tests;
+
+/// The #3016 pins — the `unused_element_parameter` tear-off and
+/// redirect-factory correspondence faces: a method/constructor/top-level
+/// executable read in a non-call position (a tear-off, or a
+/// `super.x()`/`this.x()` initializer the AST never shapes as an
+/// `InstanceCreationExpression`) credits every formal it declares
+/// (upstream Dart SDK source, pkg/analyzer/lib/src/error/
+/// unused_local_elements_verifier.dart:318-326), while a redirecting
+/// factory supplies only the parameters its own written list declares
+/// (`_matchParameters`, :458-498).
+#[cfg(test)]
+mod ticket_3016_tests;
+#[cfg(test)]
+mod ticket_3026_tests;
+#[cfg(test)]
+mod ticket_3035_tests;
+
+/// The #3040 pins — the unnamed-extension member edge's "no container"
+/// sentinel (`StringId::NONE`): the reference latch mints the edge with the
+/// sentinel as its declaring container (an unnamed extension has no name),
+/// and every container-scoped join downstream must decline the row instead
+/// of resolving the sentinel against the string table (a resolve of an id
+/// the table never issued panics). Pinned on the crasher's shape — an
+/// implicit application invoked through a cascade on a fresh receiver.
+#[cfg(test)]
+mod ticket_3040_tests;

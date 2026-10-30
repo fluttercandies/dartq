@@ -125,11 +125,14 @@ class Apple {
 ";
 
 /// The census's declaration.dart hashCode shape: the creation's members
-/// resolve on `Equality<Apple>`, so `code` exists and the oracle is
-/// silent. The pre-fix model folded no creation row (the head is separated
-/// from the paren by the type-argument group), and the member merge popped
-/// the sibling argument's row — the census reported `hash` against the
-/// sibling argument's type.
+/// resolve on `Equality<Apple>`, so `code` exists and the creation fold
+/// stays silent. The pre-fix model folded no creation row (the head is
+/// separated from the paren by the type-argument group), and the member
+/// merge popped the sibling argument's row — the census reported `hash`
+/// against the sibling argument's type. The one oracle-visible row is
+/// unrelated to the creation: `Ev.hashCode` overrides the frozen
+/// `Object.hashCode` (`int`) getter with the custom `Num`, which is not
+/// `int`'s subtype — the override face reports exactly that row.
 #[test]
 fn const_creation_hash_in_hashcode_resolves_on_ctor_type() {
     let source = format!(
@@ -150,7 +153,12 @@ class Ev {{
 "
     );
     let report = report(&source);
-    assert!(report.diagnostics.is_empty(), "{:?}", messages(&report));
+    let rows = messages(&report);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].starts_with("invalid_override: 'Ev.hashCode'"),
+        "{rows:?}"
+    );
 }
 
 /// The census's declaration.dart operator== shape: the creation sits in
@@ -210,7 +218,15 @@ Flag nonConst(Apple a, Apple b) => Equality<Apple>().same(a, b);
 "
     );
     let report = report(&source);
-    assert!(report.diagnostics.is_empty(), "{:?}", messages(&report));
+    // Every creation arm stays silent; the single oracle-visible row is
+    // `Bin.hashCode` overriding the frozen `Object.hashCode` (`int`)
+    // getter with the custom `Num` — the override face, not the creation.
+    let rows = messages(&report);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].starts_with("invalid_override: 'Bin.hashCode'"),
+        "{rows:?}"
+    );
 }
 
 /// The keep-honest face: a genuinely absent member on the created type

@@ -288,12 +288,15 @@ void f() {
 }
 
 /// The function-read guard: a top-level *function* referenced as a value
-/// is a tear-off whose static type is the signature the name-level model
-/// does not render — it must not borrow the callee's return type
-/// (`fn.missingA()` must not report on `void`; oracle `p6_fn` types it as
-/// `Function`, a face this layer keeps under-reporting).
+/// is a tear-off whose static type is the signature — never the callee's
+/// return type (`fn.missingA()` must not report on `void`). The oracle
+/// types it `Function` and reports `undefined_method` on that face
+/// (`error - The method 'missingA' isn't defined for the type
+/// 'Function'` — dart analyze 3.13.1 over this exact fixture): the #2966
+/// `receiver_decl_shape` Decl arm recovers that face and the verdict
+/// lands against it.
 #[test]
-fn top_level_function_read_does_not_borrow_return_type() {
+fn top_level_function_read_reports_against_the_function_face() {
     let source = "\
 class Plain {
   void real() {}
@@ -308,8 +311,8 @@ void test() {
     let report = report(source);
     assert_eq!(
         count_code(&report, "undefined_method"),
-        0,
-        "a function tear-off keeps the unknown face: {:?}",
+        1,
+        "the tear-off face reports the oracle's undefined_method: {:?}",
         codes(&report)
     );
 }

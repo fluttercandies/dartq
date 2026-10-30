@@ -162,6 +162,78 @@ struct HeaderClause {
     supers: Vec<(StringId, Vec<Ty>)>,
 }
 
+/// One inherited-member candidate the override faces resolved: the entry
+/// itself (a same-file shared or cross-file projected model row, or a
+/// synthesized entry — an induced setter, a frozen top-face member), the
+/// file whose container declared it, the hop spelling that answered (the
+/// oracle's `overriddenInterfaceName`), and the full hop chain (the
+/// substitution walk's edges).
+struct FaceHit<'a> {
+    entry: HitEntry<'a>,
+    origin: FileId,
+    face_name: StringId,
+    chain: Vec<(StringId, FileId)>,
+}
+
+/// The entry half of a [`FaceHit`]: a model row behind the boundary
+/// projection (its pointer is the dedup identity, stable across faces), or
+/// an owned synthesized entry (no stable address — it never joins the
+/// dedup set, reporting per face like the oracle's per-superinterface
+/// iteration).
+enum HitEntry<'a> {
+    Projected(Projected<'a, MemberEntry>),
+    Frozen(MemberEntry),
+}
+
+impl<'a> HitEntry<'a> {
+    fn get(&self) -> &MemberEntry {
+        match self {
+            HitEntry::Projected(entry) => entry,
+            HitEntry::Frozen(entry) => entry,
+        }
+    }
+}
+
+impl<'a> FaceHit<'a> {
+    fn entry(&self) -> &MemberEntry {
+        self.entry.get()
+    }
+
+    /// The dedup identity: `None` for a synthesized entry — it dedups
+    /// never, staying per-face.
+    fn identity(&self) -> Option<*const MemberEntry> {
+        match &self.entry {
+            HitEntry::Projected(entry) => Some(entry.ptr()),
+            HitEntry::Frozen(_) => None,
+        }
+    }
+}
+
+/// Whether the declared member carries an implicit type slot — the oracle's
+/// `hasImplicitType` face (`instance_member_inferrer.dart`): the model
+/// records an unwritten column as [`Ty::Unknown`], so the field's type, the
+/// getter/method's return type, or the setter's parameter type reading
+/// `Unknown` is the inference trigger.
+fn has_implicit_slot(entry: &MemberEntry) -> bool {
+    match entry.kind {
+        MemberKind::Field => entry.var_ty == Ty::UNKNOWN,
+        MemberKind::Getter | MemberKind::Method => {
+            entry.return_ty == Ty::UNKNOWN
+                || entry.formals.as_deref().is_some_and(|f| {
+                    f.positional
+                        .iter()
+                        .chain(f.named.iter())
+                        .any(|p| p.ty == Ty::UNKNOWN)
+                })
+        }
+        MemberKind::Setter => entry
+            .formals
+            .as_deref()
+            .and_then(|f| f.positional.first())
+            .is_some_and(|p| p.ty == Ty::UNKNOWN),
+    }
+}
+
 impl<'a> Engine<'a> {
     /// Walks `container`'s member face through the linearized supertype
     /// chain: the container's own members, then its `with` mixins in reverse
@@ -668,17 +740,54 @@ impl<'a> Engine<'a> {
         // The direct super-faces, in the oracle's order: the supertype, the
         // `with` mixins in application order, the `implements` interfaces,
         // and the `on` constraints (mixins only — the model leaves the clause
-        // empty for every other kind).
+        // empty for every other kind). The implicit superinterfaces join the
+        // supertype slot exactly as the analyzer's `element.supertype` does:
+        // a `class C {}` supertype is `Object` (upstream
+        // `element.supertype` is never null for a class), an enum's is
+        // `Enum` — both names-only faces here, so their members resolve
+        // through the frozen object/enum signatures
+        // ([`Engine::override_face_member`]'s third arm).
         let mut faces = Vec::with_capacity(
             usize::from(decl.superclass.is_some())
                 + decl.with_clause.len()
                 + decl.implements_clause.len()
                 + decl.on_clause.len(),
         );
-        faces.extend(decl.superclass);
+        match decl.superclass {
+            Some(superclass) => faces.push(superclass),
+            None => {
+                match kind {
+                    ContainerKind::Class => faces.push(self.intern("Object")),
+                    ContainerKind::Enum => faces.push(self.intern("Enum")),
+                    // An `on`-less mixin constrains `Object` (the analyzer's
+                    // `superclassConstraints` default).
+                    ContainerKind::Mixin if decl.on_clause.is_empty() => {
+                        faces.push(self.intern("Object"))
+                    }
+                    _ => {}
+                }
+            }
+        }
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
+        // The written clause facts, built on first need — an inherited
+        // signature carrying free type parameters — and shared across the
+        // face loop and the combined-signature inference (one token walk
+        // per check).
+        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
+        // The combined-signature inference (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/summary2/instance_member_inferrer.dart`
+        // `_inferAccessorOrField`/`_inferExecutable`): an implicit type slot
+        // on the declared member infers from the combined superinterface
+        // signature — the member type the oracle compares — rather than
+        // staying `dynamic`. The covariant-propagation flag rides with it
+        // (an overridden covariant setter marks the induced
+        // one).
+        let setter_name = self.setter_spelling(spelling);
+        let (effective, inferred_setter_covariant) =
+            self.effective_declared(container, entry, spelling, setter_name, &faces, &mut facts);
+        let entry = &effective;
         // The declared faces the oracle checks (upstream Dart SDK source,
         // `pkg/analyzer/lib/src/error/inheritance_override.dart`
         // `_checkDeclaredField` → `_checkDeclaredMember(name, field.getter)`
@@ -702,7 +811,7 @@ impl<'a> Engine<'a> {
                             name: spelling,
                             ty: entry.var_ty,
                             required: true,
-                            covariant: false,
+                            covariant: inferred_setter_covariant,
                             default_value: None,
                         }]),
                         named: Box::new([]),
@@ -718,10 +827,6 @@ impl<'a> Engine<'a> {
         // judged broken, keyed by pointer — one diagnostic per inherited
         // member.
         let mut broken_seen: Vec<(bool, *const MemberEntry)> = Vec::new();
-        // The written clause facts, built on first need — an inherited
-        // signature carrying free type parameters — and shared across the
-        // face loop (one token walk per check).
-        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
         for face in faces {
             for (face_kind, face_entry) in &declared_faces {
                 let setter_face = *face_kind == MemberKind::Setter;
@@ -733,8 +838,7 @@ impl<'a> Engine<'a> {
                 } else {
                     spelling
                 };
-                let Some((inherited, face_name, origin, chain)) =
-                    self.face_member_tracked(container, face, lookup)
+                let Some(hit) = self.override_face_member(container, face, lookup, &mut facts)
                 else {
                     // Unresolvable or cyclic face chain: suppression
                     // territory (recovery residue in a clause lands here
@@ -746,12 +850,15 @@ impl<'a> Engine<'a> {
                 // `field.getter`/`field.setter` split — `A { int x }` answers
                 // the getter face exactly like a written `int get x`), while
                 // the setter face resolves under `name=` where fields never
-                // live, so only a written `Setter` answers it.
+                // live — a non-final field answers it through the induced
+                // setter the lookup synthesized, a written `Setter` as
+                // itself.
                 let kind_matches = match *face_kind {
                     MemberKind::Getter => {
-                        inherited.kind == MemberKind::Getter || inherited.kind == MemberKind::Field
+                        hit.entry().kind == MemberKind::Getter
+                            || hit.entry().kind == MemberKind::Field
                     }
-                    _ => inherited.kind == *face_kind,
+                    _ => hit.entry().kind == *face_kind,
                 };
                 if !kind_matches {
                     continue;
@@ -761,12 +868,17 @@ impl<'a> Engine<'a> {
                 // and the `M2` face both answer M2's member); the oracle's
                 // verdict per inherited member is one diagnostic. The
                 // boundary's memo keeps a projected entry's identity stable
-                // across faces.
-                if broken_seen
-                    .iter()
-                    .any(|(tag, ptr)| *tag == setter_face && *ptr == inherited.ptr())
-                {
-                    continue;
+                // across faces; synthesized hits (a field's induced setter
+                // face, an `Object` member) identity by their underlying
+                // entry where one exists and stay per-face where the oracle
+                // reports per superinterface.
+                if let Some(ptr) = hit.identity() {
+                    if broken_seen
+                        .iter()
+                        .any(|(tag, p)| *tag == setter_face && *p == ptr)
+                    {
+                        continue;
+                    }
                 }
                 // The super-face type-argument substitution
                 // (`Substitution.fromInterfaceType`): the inherited signature
@@ -779,28 +891,34 @@ impl<'a> Engine<'a> {
                 // edges live in this file), suppresses the face where they do
                 // not (the under-report direction).
                 let substituted;
-                let inherited_ref: &MemberEntry =
-                    match self.instantiate_inherited(&chain, &inherited, container, &mut facts) {
-                        Instantiated::Unchanged => &inherited,
-                        Instantiated::Applied(env) => {
-                            substituted = self.substitute_entry(&inherited, &env);
-                            &substituted
-                        }
-                        Instantiated::Undecidable => continue,
-                    };
+                let inherited_ref: &MemberEntry = match self.instantiate_inherited(
+                    &hit.chain,
+                    hit.entry(),
+                    container,
+                    &mut facts,
+                ) {
+                    Instantiated::Unchanged => hit.entry(),
+                    Instantiated::Applied(env) => {
+                        substituted = self.substitute_entry(hit.entry(), &env);
+                        &substituted
+                    }
+                    Instantiated::Undecidable => continue,
+                };
                 let declared_cmp = face_entry.as_ref().unwrap_or(entry);
                 if self.override_broken(
                     declared_cmp,
                     (self.file, container),
                     inherited_ref,
-                    (origin, face_name),
+                    (hit.origin, hit.face_name),
                 ) {
-                    broken_seen.push((setter_face, inherited.ptr()));
+                    if let Some(ptr) = hit.identity() {
+                        broken_seen.push((setter_face, ptr));
+                    }
                     let display = self.strings.resolve(spelling);
                     let display = display.strip_suffix('=').unwrap_or(display);
                     let container_text = self.strings.resolve(container);
                     let declared_text = self.override_signature_text(declared_cmp);
-                    let face_text = self.strings.resolve(face_name);
+                    let face_text = self.strings.resolve(hit.face_name);
                     let inherited_text = self.override_signature_text(inherited_ref);
                     let code = if setter_face {
                         SemanticCode::InvalidOverrideSetter
@@ -815,7 +933,7 @@ impl<'a> Engine<'a> {
                         &declared_text,
                         face_text,
                         &inherited_text,
-                        overridden_member_context(inherited_ref, origin, setter_face),
+                        overridden_member_context(inherited_ref, hit.origin, setter_face),
                     );
                 }
             }
@@ -875,8 +993,17 @@ impl<'a> Engine<'a> {
         // `element.interfaces`/`on` join only after the mixin loop, so they
         // never enter this face set.
         let mut accumulated: Vec<StringId> = Vec::with_capacity(with_count + 1);
-        if let Some(superclass) = decl.superclass {
-            accumulated.push(superclass);
+        match decl.superclass {
+            Some(superclass) => accumulated.push(superclass),
+            // A `class C with M` supertype is still `Object` upstream
+            // (`element.supertype` is never null for a class), an `enum E
+            // with M`'s is `Enum` — the names-only faces join the
+            // accumulation, their members the frozen signatures.
+            None => match decl.kind {
+                ContainerKind::Class => accumulated.push(self.intern("Object")),
+                ContainerKind::Enum => accumulated.push(self.intern("Enum")),
+                _ => {}
+            },
         }
         // The written clause facts, built on first need — a mixin's own
         // signature carrying free type parameters — and shared across the
@@ -999,27 +1126,44 @@ impl<'a> Engine<'a> {
                     *spelling
                 };
                 for &face in &accumulated {
-                    let Some((inherited, face_name, origin, chain)) =
-                        self.face_member_tracked(container, face, lookup)
+                    let Some(hit) = self.override_face_member(container, face, lookup, &mut facts)
                     else {
                         continue;
                     };
-                    if inherited.kind != *face_kind {
+                    // The inherited entry's element kind against the
+                    // declared face: a stored `Field` answers the getter
+                    // face through its implicit getter (the same
+                    // `field.getter` split `check_override` applies); the
+                    // setter face resolves the induced setter the lookup
+                    // synthesized.
+                    let kind_matches = match *face_kind {
+                        MemberKind::Getter => {
+                            hit.entry().kind == MemberKind::Getter
+                                || hit.entry().kind == MemberKind::Field
+                        }
+                        _ => hit.entry().kind == *face_kind,
+                    };
+                    if !kind_matches {
                         continue;
                     }
-                    if broken_seen
-                        .iter()
-                        .any(|(tag, ptr)| *tag == setter_face && *ptr == inherited.ptr())
-                    {
-                        continue;
+                    if let Some(ptr) = hit.identity() {
+                        if broken_seen
+                            .iter()
+                            .any(|(tag, p)| *tag == setter_face && *p == ptr)
+                        {
+                            continue;
+                        }
                     }
                     let substituted;
-                    let inherited_ref: &MemberEntry = match self
-                        .instantiate_inherited(&chain, &inherited, container, &mut facts)
-                    {
-                        Instantiated::Unchanged => &inherited,
+                    let inherited_ref: &MemberEntry = match self.instantiate_inherited(
+                        &hit.chain,
+                        hit.entry(),
+                        container,
+                        &mut facts,
+                    ) {
+                        Instantiated::Unchanged => hit.entry(),
                         Instantiated::Applied(env) => {
-                            substituted = self.substitute_entry(&inherited, &env);
+                            substituted = self.substitute_entry(hit.entry(), &env);
                             &substituted
                         }
                         Instantiated::Undecidable => continue,
@@ -1028,14 +1172,16 @@ impl<'a> Engine<'a> {
                         declared_cmp,
                         (mixin_owner, mixin),
                         inherited_ref,
-                        (origin, face_name),
+                        (hit.origin, hit.face_name),
                     ) {
-                        broken_seen.push((setter_face, inherited.ptr()));
+                        if let Some(ptr) = hit.identity() {
+                            broken_seen.push((setter_face, ptr));
+                        }
                         let display = self.strings.resolve(*spelling);
                         let display = display.strip_suffix('=').unwrap_or(display);
                         let container_text = self.strings.resolve(mixin);
                         let declared_text = self.override_signature_text(declared_cmp);
-                        let face_text = self.strings.resolve(face_name);
+                        let face_text = self.strings.resolve(hit.face_name);
                         let inherited_text = self.override_signature_text(inherited_ref);
                         let code = if setter_face {
                             SemanticCode::InvalidOverrideSetter
@@ -1050,7 +1196,7 @@ impl<'a> Engine<'a> {
                             &declared_text,
                             face_text,
                             &inherited_text,
-                            overridden_member_context(inherited_ref, origin, setter_face),
+                            overridden_member_context(inherited_ref, hit.origin, setter_face),
                         );
                     }
                 }
@@ -1604,19 +1750,55 @@ impl<'a> Engine<'a> {
     // —— #1314 FAM7: the optional-parameter default-value cluster ————————
 
     /// The written type is potentially non-nullable
-    /// (`isPotentiallyNonNullable`, type_system.dart:1257): a bare written
-    /// named type is, `?`-suffixed and `dynamic`/`void` are not. An
-    /// in-scope type parameter's head suppresses — its resolved
-    /// nullability rests on the bound the name-level model does not keep
-    /// (the under-report posture).
+    /// (`isPotentiallyNonNullable` = `!isNullable`,
+    /// type_system.dart:1257/1216-1233): `?`-suffixed,
+    /// `dynamic`/`void`/`Null`/`Unknown` (the `InvalidType` splice) are
+    /// nullable; `FutureOr<T>` recurses its argument (a bare `FutureOr`
+    /// reads `FutureOr<dynamic>` — nullable); a bare in-scope type
+    /// parameter `T` is NOT — the declared element carries no
+    /// `promotedBound` and `isNullable` never consults `bound`, so `T`
+    /// answers non-nullable and `T?` answers nullable (:1223-1226).
+    /// `Record`/`Function` heads decide on their own `?`; `Never` is the
+    /// non-nullable bottom.
     pub(crate) fn written_potentially_non_nullable(&self, ty: Ty) -> bool {
+        !self.written_nullable_pnn(ty, 0)
+    }
+
+    /// The name-level `isNullable` (type_system.dart:1216-1233) — the
+    /// `written_potentially_non_nullable` negation over the declared-type
+    /// lattice. `FutureOr`'s argument recursion is name-matched (a user
+    /// `FutureOr` shadowing the dart:async spelling takes the generic arm —
+    /// the under-report direction), depth-capped at the engine's
+    /// normalization bound.
+    fn written_nullable_pnn(&self, ty: Ty, depth: u32) -> bool {
+        if depth > 16 {
+            return false;
+        }
         match ty {
-            Ty::Named { name, nullable, .. } => {
-                !nullable
-                    && !self.type_params.contains(&name)
-                    && !self.pending_type_params.contains(&name)
+            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
+            Ty::Named {
+                name, nullable, ..
+            } if nullable
+                || self.strings.resolve(name) != "FutureOr" =>
+            {
+                nullable
             }
-            _ => false,
+            Ty::Named {
+                args: crate::model::ArgListId::EMPTY,
+                ..
+            } => {
+                // `FutureOr` bare is `FutureOr<dynamic>` — nullable.
+                true
+            }
+            Ty::Named { args, .. } => {
+                let arg = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).first().copied()
+                };
+                arg.is_none_or(|arg| self.written_nullable_pnn(arg, depth + 1))
+            }
+            Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => nullable,
+            Ty::Never => false,
         }
     }
 
@@ -1632,30 +1814,50 @@ impl<'a> Engine<'a> {
     }
 
     /// Emits the staged optional-parameter rows per the body verdict
-    /// (`defaultValuesAreExpected`, error_verifier.dart:8327-8372): a
-    /// block/arrow body expects defaults for every executable face, an
-    /// empty `;` body only for top-level functions (methods answer
-    /// `isAbstract` false there, top-level functions only exclude
-    /// augment/external/native).
+    /// (`defaultValuesAreExpected`, error_verifier.dart:8328-8381): a
+    /// block/arrow body expects defaults for every executable face. An
+    /// empty `;` body answers by the parent's arm — a
+    /// `ConstructorDeclaration` expects them outright (generative heads
+    /// and non-redirecting factories alike; `isFactory && isRedirecting`
+    /// is the only ctor exclusion, and an `= G;` redirect never reaches
+    /// the empty-body event, :8330-8343), the
+    /// `FunctionExpression`/`TopLevelGetter` arms expect them too (local
+    /// functions and anonymous faces join through the same arm,
+    /// :8344-8356/:8368-8376), while a `;`-bodied `MethodDeclaration` is
+    /// `isAbstract` and answers false (:8357-8367). `ctor_pending` is the
+    /// live-window marker — `open_ctor_site` outlives its constructor
+    /// (`end_constructor` never clears it), so a sibling `;`-method after
+    /// a `;` ctor would false-positive off the stale site.
     pub(crate) fn flush_default_checks(&mut self, body_present: bool) {
         if self.open_exec_augment {
             self.pending_default_checks.clear();
             return;
         }
+        let ctor_open = self.ctor_pending.is_some();
         let checks = std::mem::take(&mut self.pending_default_checks);
         for check in checks {
-            let top_level = check.member_kind == dartq_parser::MemberKind::TopLevelMethod;
-            if !(body_present || top_level) {
+            let expects = body_present
+                || ctor_open
+                || !matches!(
+                    check.member_kind,
+                    dartq_parser::MemberKind::NonStaticMethod
+                        | dartq_parser::MemberKind::StaticMethod
+                        | dartq_parser::MemberKind::ExtensionNonStaticMethod
+                        | dartq_parser::MemberKind::ExtensionStaticMethod
+                        | dartq_parser::MemberKind::ExtensionTypeNonStaticMethod
+                        | dartq_parser::MemberKind::ExtensionTypeStaticMethod
+                );
+            if !expects {
                 continue;
             }
-            // The empty-`>`-body top-level arm still excludes an `external`
-            // header (`defaultValuesAreExpected`'s augment/external/native
-            // exclusions, error_verifier.dart:8327-8372) —
-            // `@JS('fetch') external JSPromise<Response> _fetch(...)` in the
-            // http corpus takes defaults in its JS embedding, never from
-            // Dart. The listener's own external bit is owned elsewhere
-            // (#2286), so this face reads the header tokens directly.
-            if top_level && self.header_is_external(check.name_range) {
+            // Every arm still excludes an `external` header
+            // (`defaultValuesAreExpected`'s augment/external/native
+            // exclusions, error_verifier.dart:8337/8350/8362/8371) —
+            // `external C([int x]);` takes defaults in its embedding,
+            // never from Dart. The listener's own external bit is owned
+            // elsewhere (#2286), so this face reads the header tokens
+            // directly.
+            if self.header_is_external(check.name_range) {
                 continue;
             }
             let code = if check.named {
@@ -1698,9 +1900,13 @@ impl<'a> Engine<'a> {
     }
 
     /// Drops the staged rows (the native/skipped-body arms of
-    /// `defaultValuesAreExpected`).
+    /// `defaultValuesAreExpected`). Also drains the wildcard-`_` duplicate
+    /// log — every executable end event reaches here, so a unit whose only
+    /// wildcard rows sit inside a body still emits them before the walk
+    /// ends.
     pub(crate) fn drop_default_checks(&mut self) {
         self.pending_default_checks.clear();
+        self.emit_wildcard_dups();
     }
 
     /// Breaks the `noSuchMethod` shape: any structural expression event
@@ -2124,6 +2330,7 @@ impl<'a> Engine<'a> {
             }
         }
         self.deferred_modifier = Some(deferred);
+        self.emit_wildcard_dups();
     }
 
     /// The `@sealed` half, drained at the declaration's end event: the
@@ -2132,16 +2339,57 @@ impl<'a> Engine<'a> {
     /// declaration's closing token (`}`/`;`); the recovery paths that
     /// complete the declaration without a body close fall back to the end
     /// event's token start.
-    /// The `conflicting_static_and_instance` face: each static member whose
-    /// base name collides with an instance member of the same container
-    /// reports at the static member's own name, in declaration order, one
-    /// row per site (member_duplicate_definition_verifier.dart:194-232 for
-    /// enums, the ErrorVerifier's separated class face :430-470; `values`
-    /// is exempt on both).
-    pub(crate) fn check_conflicting_static_and_instance(&mut self) {
-        let Some((container, _)) = self.container_context() else {
+    /// The wildcard-`_` duplicate rows, drained in source order behind
+    /// [`Engine::wildcard_dups_emitted`]: a pre-feature unit reports each
+    /// second `_` declaration as `duplicate_definition`; the feature's
+    /// units emit nothing (upstream `isWildcardVariable` — `_` declares
+    /// no name). Called from the drain hooks so the whole log emits
+    /// exactly once per unit, at whichever boundary the walk reaches
+    /// first (the cursor makes later calls no-ops).
+    pub(crate) fn emit_wildcard_dups(&mut self) {
+        if self.is_wildcard(self.intern("_")) {
+            self.wildcard_dups_emitted = usize::MAX;
+            return;
+        }
+        let Some(elements) = self.index.get(self.file) else {
             return;
         };
+        let rows: Vec<SourceRange> = elements
+            .wildcard_duplicates()
+            .iter()
+            .skip(self.wildcard_dups_emitted)
+            .map(|dup| dup.range)
+            .collect();
+        self.wildcard_dups_emitted = usize::MAX;
+        for range in rows {
+            self.emit(SemanticCode::DuplicateDefinition, range, "_", "");
+        }
+    }
+
+    /// The `conflicting_static_and_instance` face (three upstream arms):
+    /// 1. The OWN-scope arm — a static member whose bare name collides
+    ///    with an instance member of the same container reports at the
+    ///    static member's own name (`_checkClassStatic`/`_checkEnumStatic`/
+    ///    `_checkExtensionStatic`, member_duplicate_definition_verifier.dart
+    ///    :179-234/:423-522). Extensions report the dedicated one-argument
+    ///    `extension_conflicting_static_and_instance`; `values` is exempt
+    ///    on ACCESSORS only (a `values` METHOD still collides).
+    /// 2. The ENUM getMember arm — an enum's static member that collides
+    ///    with an interface member (its own constants, an inherited
+    ///    `index`/`hashCode`/`toString`, the implicit `Enum`/`Object`
+    ///    faces) reports `conflictingClassName` = the enum's own name.
+    /// 3. The INHERITED arm (`ErrorVerifier._checkForConflictingClassMembers`,
+    ///    error_verifier.dart:3548-3642) — each static member probes
+    ///    `getInherited(name)` then `getInherited(name=)`; a non-static hit
+    ///    reports `conflictingClassName` = the found owner (`Object`/
+    ///    `Enum`/superclass/constraint included). Both an own row and an
+    ///    inherited row can fire for one member (upstream emits each
+    ///    independently).
+    pub(crate) fn check_conflicting_static_and_instance(&mut self) {
+        let Some((container, container_kind)) = self.container_context() else {
+            return;
+        };
+        // The instance-scope bare names of this container's own members.
         let instance_names: FxHashSet<StringId> = self
             .decl_sites
             .iter()
@@ -2157,11 +2405,36 @@ impl<'a> Engine<'a> {
             })
             .map(|site| self.bare_name(site.name))
             .collect();
-        if instance_names.is_empty() {
-            return;
-        }
+        // The implicit `Enum`/`Object` instance members an enum's static
+        // member can collide with through `_getInterfaceMember` — the
+        // walk has no model rows for them (they live on dart:core's
+        // `Enum`/`Object`), so the own-name arm and the inherited probe
+        // both fall back to this fixed set.
+        const IMPLICIT_OBJECT_ENUM: [&str; 6] = [
+            "index",
+            "hashCode",
+            "toString",
+            "noSuchMethod",
+            "runtimeType",
+            "==",
+        ];
         let values = self.intern("values");
-        let reports: Vec<(SourceRange, StringId)> = self
+        let is_enum = container_kind == ContainerKind::Enum;
+        // The enum's own constants also answer `_getInterfaceMember`'s
+        // instance-member probe (a constant IS a static field whose
+        // induced getter joins the enum's instance surface upstream) —
+        // captured here so the inherited probe can consult them.
+        let enum_constants: FxHashSet<StringId> = if is_enum {
+            self.index
+                .get(self.file)
+                .and_then(|elements| elements.container(container))
+                .map(|decl| decl.enum_constants.iter().copied().collect())
+                .unwrap_or_default()
+        } else {
+            FxHashSet::default()
+        };
+        // The static member sites, in declaration order.
+        let sites: Vec<(SourceRange, StringId, bool)> = self
             .decl_sites
             .iter()
             .filter(|site| {
@@ -2174,22 +2447,149 @@ impl<'a> Engine<'a> {
                     } if *c == container
                 )
             })
-            .map(|site| (site.range, self.bare_name(site.name)))
-            .filter(|(_, base)| *base != values && instance_names.contains(base))
+            .map(|site| {
+                let bare = self.bare_name(site.name);
+                // `values` is exempt only for accessors — a field/getter/
+                // setter carries the `values` exemption upstream, a
+                // method does not (member_duplicate_definition_verifier
+                // .dart:445-458 reads the accessor face). The `kind` flag
+                // marks accessor sites for the exemption gate.
+                let accessor = matches!(
+                    &site.kind,
+                    DeclKind::Member {
+                        kind: MemberKind::Getter | MemberKind::Setter | MemberKind::Field,
+                        ..
+                    }
+                );
+                (site.range, bare, accessor)
+            })
             .collect();
-        if reports.is_empty() {
+        if sites.is_empty() {
             return;
         }
         let container_text = self.strings.resolve(container).to_string();
-        for (range, base) in reports {
+        let is_extension = container_kind == ContainerKind::Extension;
+        for (range, base, accessor) in sites {
             let base_text = self.strings.resolve(base).to_string();
-            self.emit(
-                SemanticCode::ConflictingStaticAndInstance,
-                range,
-                &container_text,
-                &base_text,
-            );
+            if is_extension {
+                // The extension arm reports the one-argument dedicated
+                // code — own-face only (extensions never inherit).
+                if base != values || !accessor {
+                    if instance_names.contains(&base) {
+                        self.emit(
+                            SemanticCode::ExtensionConflictingStaticAndInstance,
+                            range,
+                            &base_text,
+                            "",
+                        );
+                    }
+                }
+                continue;
+            }
+            // Arm 1 — own-scope. `values` accessors are exempt; every
+            // other bare name in the instance scope collides.
+            if base != values || !accessor {
+                if instance_names.contains(&base) {
+                    self.emit(
+                        SemanticCode::ConflictingStaticAndInstance,
+                        range,
+                        &container_text,
+                        &base_text,
+                    );
+                }
+            }
+            // Arms 2+3 — the interface/inherited probe. Enums read the
+            // whole member surface (own + inherited); every other kind
+            // reads strictly above the container (`skip_own`).
+            let inherited = if is_enum {
+                self.walk_members(container, base)
+            } else {
+                self.walk_from(container, base, true)
+            };
+            let found = match inherited {
+                Walk::Found(entry) => Some(entry),
+                _ => None,
+            };
+            // The getter probe landed a non-static inherited member: its
+            // declaring container is the conflicting owner.
+            if let Some(entry) = &found
+                && !entry.is_static
+            {
+                let owner = self
+                    .member_faces
+                    .last_origin()
+                    .map(|name| self.strings.resolve(name).to_string())
+                    .unwrap_or_else(|| container_text.clone());
+                self.emit3(
+                    SemanticCode::ConflictingStaticAndInstance,
+                    range,
+                    &container_text,
+                    &base_text,
+                    &owner,
+                );
+                continue;
+            }
+            // The implicit `Enum`/`Object` faces and the enum's own
+            // constants answer the same probe without model rows.
+            let implicit_hit = IMPLICIT_OBJECT_ENUM
+                .iter()
+                .any(|member| self.intern(member) == base)
+                || enum_constants.contains(&base);
+            if implicit_hit {
+                let owner = if is_enum {
+                    container_text.clone()
+                } else {
+                    // The implicit member's owner (`Object`/`Enum`), not
+                    // the declaring container — the `Enum.index`/
+                    // `Object.toString` faces render the supertype name.
+                    if IMPLICIT_OBJECT_ENUM
+                        .iter()
+                        .any(|member| self.intern(member) == base)
+                    {
+                        if self
+                            .index
+                            .get(self.file)
+                            .and_then(|elements| elements.container(container))
+                            .is_some_and(|decl| decl.kind == ContainerKind::Enum)
+                        {
+                            "Enum".to_string()
+                        } else {
+                            "Object".to_string()
+                        }
+                    } else {
+                        container_text.clone()
+                    }
+                };
+                self.emit3(
+                    SemanticCode::ConflictingStaticAndInstance,
+                    range,
+                    &container_text,
+                    &base_text,
+                    &owner,
+                );
+                continue;
+            }
+            // The setter probe (`getInherited(name=)`): a written setter's
+            // `name=` spelling answers where the bare getter probe missed.
+            let setter_spelling = self.setter_spelling(base);
+            if let Walk::Found(entry) = self.walk_from(container, setter_spelling, true)
+                && !entry.is_static
+            {
+                let owner = self
+                    .member_faces
+                    .last_origin()
+                    .map(|name| self.strings.resolve(name).to_string())
+                    .unwrap_or_else(|| container_text.clone());
+                self.emit3(
+                    SemanticCode::ConflictingStaticAndInstance,
+                    range,
+                    &container_text,
+                    &base_text,
+                    &owner,
+                );
+            }
         }
+        self.emit_wildcard_dups();
     }
 
     pub(crate) fn run_sealed_contract(&mut self, end: SourceRange) {
@@ -2203,6 +2603,7 @@ impl<'a> Engine<'a> {
             };
             self.check_sealed_supertype_contract(container, span);
         }
+        self.emit_wildcard_dups();
     }
 
     /// The use-site restriction families, driven with the written clause
@@ -3920,6 +4321,639 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The override faces' resolution: [`Self::face_member_tracked`]'s
+    /// climb reshaped to answer the oracle's per-face merged witness
+    /// (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart` —
+    /// a face's interface map carries ONE most-specific signature per
+    /// name, built by `_findMostSpecificFromNamedCandidates` over the
+    /// candidates every direct super face contributes).
+    ///
+    /// The climb collects every branch's first hit instead of stopping at
+    /// the first one: the linear `extends`/`with` spine's hit plus each
+    /// pending `implements`/`on` face's hit. The collection then mirrors
+    /// `_getValidOverrides` + `_topMerge`'s decision order — the candidate
+    /// whose substituted signature is a valid override of every other
+    /// candidate's becomes the witness; when several qualify, the first in
+    /// visit order (`topMerge`'s equal-type early return; the multi-type
+    /// `topMerge` fold collapses to the same witness on every shape the
+    /// corpus carries); when none does, the candidates conflict and the
+    /// interface map carries no name — `getMember3` answers null and the
+    /// face reports nothing (test_33's `I: int`/`J: num` setter pair: the
+    /// `num` setter is the subtype, so the diagnostic anchors at `J`, not
+    /// at the first-declared `I`).
+    ///
+    /// Two synthesis arms the climb owns beside the model lookup:
+    /// - a setter spelling resolves an inherited non-final FIELD through
+    ///   the field's induced setter (one required positional of the
+    ///   field's type — the oracle's `field.setter` element; `A { int x }`
+    ///   answers `x=` exactly like a written `set x(int)`), and
+    /// - an `Object`/`Enum` hop — the implicit supertype a class, enum, or
+    ///   `on`-less mixin carries (`element.supertype` /
+    ///   `superclassConstraints`) — answers from the frozen top-face
+    ///   signatures ([`Engine::frozen_top_member`]).
+    fn override_face_member(
+        &self,
+        container: StringId,
+        face: StringId,
+        spelling: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<FaceHit<'a>> {
+        let mut name = face;
+        let mut hop_writer = container;
+        let mut owner = self.file;
+        let mut scope_lib = self.lib;
+        let mut seen = FxHashSet::default();
+        let mut chain: Vec<(StringId, FileId)> = Vec::new();
+        let mut pending: VecDeque<(StringId, FileId, LibraryId, StringId)> = VecDeque::new();
+        let mut collected: Vec<FaceHit<'a>> = Vec::new();
+        loop {
+            if !seen.insert(name) {
+                // A clause cycle: the branches collected so far stand (a
+                // cycle discovered before any hit leaves nothing — the
+                // same suppression [`Self::face_member_tracked`] keeps).
+                break;
+            }
+            if let Some((witness, entry)) = self.frozen_top_member(name, spelling) {
+                chain.push((name, self.file));
+                collected.push(FaceHit {
+                    entry: HitEntry::Frozen(entry),
+                    origin: self.file,
+                    face_name: witness,
+                    chain,
+                });
+                break;
+            }
+            let (found, found_owner) =
+                match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
+                    Some(pair) => pair,
+                    None => {
+                        let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                        else {
+                            break;
+                        };
+                        name = next;
+                        owner = next_owner;
+                        scope_lib = next_lib;
+                        hop_writer = next_writer;
+                        continue;
+                    }
+                };
+            chain.push((name, found_owner));
+            if let Some(hit) = self.face_own_hit(found_owner, name, found, spelling, chain.clone())
+            {
+                collected.push(hit);
+                // A hit hop's own clauses never join — a spine hop's
+                // declared face takes precedence over its
+                // `implements`/`on` faces, and a drained interface branch
+                // is done. The next candidate comes from the pending
+                // queue.
+                match pending.pop_front() {
+                    Some((next, next_owner, next_lib, next_writer)) => {
+                        name = next;
+                        owner = next_owner;
+                        scope_lib = next_lib;
+                        hop_writer = next_writer;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let owner_lib = self
+                .owner_library_of(found_owner, name)
+                .unwrap_or(scope_lib);
+            let mut mixin_hit = false;
+            for mixin in found.with_clause.iter().rev() {
+                if !seen.insert(*mixin) {
+                    break;
+                }
+                if let Some((mixin_container, mixin_owner)) =
+                    self.resolve_clause_face(name, owner, owner_lib, *mixin)
+                {
+                    chain.push((*mixin, mixin_owner));
+                    let hit = self.face_own_hit(
+                        mixin_owner,
+                        *mixin,
+                        mixin_container,
+                        spelling,
+                        chain.clone(),
+                    );
+                    chain.pop();
+                    if let Some(hit) = hit {
+                        collected.push(hit);
+                        mixin_hit = true;
+                        break;
+                    }
+                }
+            }
+            if mixin_hit {
+                // The applied mixin's member replaces the super-face
+                // candidate (the namedCandidates replace arm) — the deeper
+                // spine drops out, but this hop's own `implements`/`on`
+                // faces still join the candidate set.
+                for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
+                    pending.push_back((*super_face, found_owner, owner_lib, name));
+                }
+                match pending.pop_front() {
+                    Some((next, next_owner, next_lib, next_writer)) => {
+                        name = next;
+                        owner = next_owner;
+                        scope_lib = next_lib;
+                        hop_writer = next_writer;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
+                pending.push_back((*super_face, found_owner, owner_lib, name));
+            }
+            match found.superclass {
+                Some(superclass) => {
+                    scope_lib = owner_lib;
+                    hop_writer = name;
+                    name = superclass;
+                    owner = found_owner;
+                }
+                None => {
+                    let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                    else {
+                        break;
+                    };
+                    name = next;
+                    owner = next_owner;
+                    scope_lib = next_lib;
+                    hop_writer = next_writer;
+                }
+            }
+        }
+        self.merge_face_candidates(collected, container, facts)
+    }
+
+    /// One hop's own member face: the stored entry under the lookup
+    /// spelling (projected through the boundary, its pointer the dedup
+    /// identity), or — for a setter spelling — the non-final field's
+    /// induced setter (the oracle's `field.setter` element, synthesized:
+    /// one required positional of the field's type).
+    fn face_own_hit(
+        &self,
+        owner_file: FileId,
+        hop: StringId,
+        found: &'a Container,
+        spelling: StringId,
+        chain: Vec<(StringId, FileId)>,
+    ) -> Option<FaceHit<'a>> {
+        if let Some(entry) = found.members.get(&spelling)
+            && !entry.is_static
+        {
+            return Some(FaceHit {
+                entry: HitEntry::Projected(self.boundary.member(owner_file, hop, spelling, entry)),
+                origin: owner_file,
+                face_name: hop,
+                chain,
+            });
+        }
+        let stripped = self.strings.resolve(spelling).strip_suffix('=')?;
+        let plain = self.intern(stripped);
+        let field = found.members.get(&plain)?;
+        if field.is_static || field.kind != MemberKind::Field || field.is_final {
+            return None;
+        }
+        let setter = MemberEntry {
+            kind: MemberKind::Setter,
+            formals: Some(Box::new(Formals {
+                positional: Box::new([Formal {
+                    name: plain,
+                    ty: field.var_ty,
+                    required: true,
+                    covariant: false,
+                    default_value: None,
+                }]),
+                named: Box::new([]),
+            })),
+            ..field.clone()
+        };
+        Some(FaceHit {
+            entry: HitEntry::Frozen(setter),
+            origin: owner_file,
+            face_name: hop,
+            chain,
+        })
+    }
+
+    /// The frozen `dart:core` top-face signature for `member` on the
+    /// `Object`/`Enum` hop `face` — the inherited signatures the oracle
+    /// compares against when no supertype is written (`class C {}` extends
+    /// `Object`, an enum's supertype is `Enum`, an `on`-less mixin
+    /// constrains `Object`; the `Enum` face falls through to `Object`'s
+    /// members — `Enum` redeclares only `index`). The signatures pin the
+    /// oracle's inherited-slot renders (`Object.noSuchMethod` is `dynamic
+    /// Function(Invocation)`, `Enum.index` is `int Function()`); an
+    /// `Enum` face miss falls through to the `Object` table. Answers
+    /// `(witness face, entry)` — the witness names `Object`/`Enum` in the
+    /// diagnostic's inherited slot.
+    fn frozen_top_member(
+        &self,
+        face: StringId,
+        spelling: StringId,
+    ) -> Option<(StringId, MemberEntry)> {
+        let face_text = self.strings.resolve(face);
+        let object = face_text == "Object";
+        if !object && face_text != "Enum" {
+            return None;
+        }
+        let member = self.strings.resolve(spelling);
+        let witness = |entry: Option<MemberEntry>| {
+            entry.map(|entry| (self.intern(if object { "Object" } else { "Enum" }), entry))
+        };
+        let entry = |kind, ret: &str, params: &[&str]| MemberEntry {
+            kind,
+            is_static: false,
+            is_abstract: false,
+            is_external: false,
+            is_final: false,
+            type_params: 0,
+            type_param_names: Box::default(),
+            type_param_bounds: Box::default(),
+            var_ty: Ty::UNKNOWN,
+            return_ty: Ty::named(self.intern(ret)),
+            // A getter declares no parameter list — `None`, the same
+            // definite "none" a written getter's entry carries (a `Some`
+            // empty list would read as the parameter-list mix arm's
+            // recovery residue and suppress the comparison).
+            formals: if kind == MemberKind::Getter {
+                None
+            } else {
+                Some(Box::new(Formals {
+                    positional: params
+                        .iter()
+                        .map(|p| Formal {
+                            name: self.intern("parameter"),
+                            ty: Ty::named(self.intern(p)),
+                            required: true,
+                            covariant: false,
+                            default_value: None,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    named: Box::new([]),
+                }))
+            },
+            annotations: Box::default(),
+            name_range: MemberEntry::MISSING_NAME_RANGE,
+        };
+        if object {
+            witness(match member {
+                "hashCode" => Some(entry(MemberKind::Getter, "int", &[])),
+                "runtimeType" => Some(entry(MemberKind::Getter, "Type", &[])),
+                "toString" => Some(entry(MemberKind::Method, "String", &[])),
+                "noSuchMethod" => Some(entry(MemberKind::Method, "dynamic", &["Invocation"])),
+                "==" => Some(entry(MemberKind::Method, "bool", &["Object"])),
+                _ => None,
+            })
+        } else {
+            witness(match member {
+                "index" => Some(entry(MemberKind::Getter, "int", &[])),
+                _ => None,
+            })
+            .or_else(|| {
+                let object_face = self.intern("Object");
+                self.frozen_top_member(object_face, spelling)
+                    .map(|(_, entry)| (object_face, entry))
+            })
+        }
+    }
+
+    /// The collected candidates' merge
+    /// (`inheritance_manager3.dart`'s `_getValidOverrides` + `_topMerge`
+    /// decision order, run on each candidate's substituted signature).
+    /// Zero candidates or a candidates conflict answer `None` — the
+    /// interface map carries no name and the face reports nothing; the
+    /// single candidate passes through; the walk's first candidate stands
+    /// when any candidate's substitution is undecidable (the under-report
+    /// posture [`Engine::face_member_tracked`]'s single hit kept).
+    fn merge_face_candidates(
+        &self,
+        collected: Vec<FaceHit<'a>>,
+        container: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<FaceHit<'a>> {
+        if collected.len() <= 1 {
+            return collected.into_iter().next();
+        }
+        let mut substituted: Vec<MemberEntry> = Vec::with_capacity(collected.len());
+        for hit in &collected {
+            match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
+                Instantiated::Unchanged => substituted.push(hit.entry().clone()),
+                Instantiated::Applied(env) => {
+                    substituted.push(self.substitute_entry(hit.entry(), &env))
+                }
+                Instantiated::Undecidable => {
+                    let first = collected
+                        .first()
+                        .map(|hit| {
+                            matches!(
+                                self.instantiate_inherited(
+                                    &hit.chain,
+                                    hit.entry(),
+                                    container,
+                                    facts
+                                ),
+                                Instantiated::Unchanged | Instantiated::Applied(_)
+                            )
+                        })
+                        .unwrap_or(false);
+                    return if first {
+                        collected.into_iter().next()
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+        let mut valid: Vec<usize> = Vec::new();
+        'outer: for i in 0..substituted.len() {
+            for j in 0..substituted.len() {
+                if i != j
+                    && self.override_broken(
+                        &substituted[i],
+                        (collected[i].origin, collected[i].face_name),
+                        &substituted[j],
+                        (collected[j].origin, collected[j].face_name),
+                    )
+                {
+                    continue 'outer;
+                }
+            }
+            valid.push(i);
+        }
+        let witness = *valid.first()?;
+        collected.into_iter().nth(witness)
+    }
+
+    /// The declared member's effective signature — the oracle's
+    /// instance-member inference (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/summary2/instance_member_inferrer.dart`
+    /// `_inferAccessorOrField` / `_inferExecutable`): every implicit type
+    /// slot infers from the combined superinterface signature the override
+    /// faces compare, instead of reading `dynamic`-vs-`Unknown`. The
+    /// decision order per member shape:
+    /// - field: getter candidates non-empty and setter candidates empty →
+    ///   the combined getter type; the reverse → the combined setter
+    ///   parameter type; both non-empty → the getter type for a `final`
+    ///   field, the getter type only when it equals the setter type for a
+    ///   non-final one; both empty or a combined-signature conflict →
+    ///   `dynamic` (`combineSignatureTypes`' null → `DynamicType`).
+    /// - getter: the combined getter type, or the combined setter
+    ///   parameter type when only setters override.
+    /// - setter: the combined setter parameter type, or the combined
+    ///   getter type when only getters override; an overridden covariant
+    ///   setter marks the declared one covariant (the propagation runs
+    ///   before the implicit-type gate, like upstream).
+    /// - method: the combined signature fills the implicit return and each
+    ///   implicit parameter (positional by index, named by name); a
+    ///   kind-mismatched or conflicting candidate set leaves `dynamic`.
+    ///
+    /// A member with no implicit slot returns unchanged — the common fully
+    /// -annotated face pays one slot check. The `bool` rides the field's
+    /// induced setter face: the propagated `covariant` mark the declared
+    /// setter entry itself carries for written setters.
+    fn effective_declared(
+        &self,
+        container: StringId,
+        entry: &MemberEntry,
+        spelling: StringId,
+        setter_name: StringId,
+        faces: &[StringId],
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> (MemberEntry, bool) {
+        if !has_implicit_slot(entry) {
+            return (entry.clone(), false);
+        }
+        let getter_candidates = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>| {
+            let mut hits: Vec<FaceHit<'a>> = Vec::new();
+            for face in faces {
+                if let Some(hit) = self.override_face_member(container, *face, spelling, facts)
+                    && matches!(hit.entry().kind, MemberKind::Getter | MemberKind::Field)
+                {
+                    hits.push(hit);
+                }
+            }
+            hits
+        };
+        let setter_candidates = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>| {
+            let mut hits: Vec<FaceHit<'a>> = Vec::new();
+            for face in faces {
+                if let Some(hit) = self.override_face_member(container, *face, setter_name, facts)
+                    && hit.entry().kind == MemberKind::Setter
+                {
+                    hits.push(hit);
+                }
+            }
+            hits
+        };
+        let getter_ty = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+                         hits: &mut Vec<FaceHit<'a>>| {
+            let combined = hits.len();
+            let witness = self.combined_inherited(container, std::mem::take(hits), facts);
+            match witness {
+                Some(entry) => Some(if entry.kind == MemberKind::Field {
+                    entry.var_ty
+                } else {
+                    entry.return_ty
+                }),
+                None if combined == 0 => None,
+                // A non-empty candidate set with no combined signature is
+                // the conflict arm: `dynamic` (upstream
+                // `combineSignatureTypes`' null → `DynamicTypeImpl`).
+                None => Some(Ty::Dynamic),
+            }
+        };
+        let setter_ty = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+                         hits: &mut Vec<FaceHit<'a>>| {
+            let combined = hits.len();
+            let witness = self.combined_inherited(container, std::mem::take(hits), facts);
+            match witness {
+                Some(entry) => entry
+                    .formals
+                    .as_deref()
+                    .and_then(|f| f.positional.first())
+                    .map(|p| p.ty)
+                    .or(Some(Ty::Dynamic)),
+                None if combined == 0 => None,
+                None => Some(Ty::Dynamic),
+            }
+        };
+        let dynamic = Ty::Dynamic;
+        match entry.kind {
+            MemberKind::Field => {
+                let mut getters = getter_candidates(facts);
+                let mut setters = setter_candidates(facts);
+                let covariant = setters.iter().any(|hit| {
+                    hit.entry()
+                        .formals
+                        .as_deref()
+                        .and_then(|f| f.positional.first())
+                        .is_some_and(|p| p.covariant)
+                });
+                let mut effective = entry.clone();
+                effective.var_ty = match (getters.is_empty(), setters.is_empty(), entry.is_final) {
+                    (false, true, _) | (false, false, true) => {
+                        getter_ty(facts, &mut getters).unwrap_or(dynamic)
+                    }
+                    (true, false, _) => setter_ty(facts, &mut setters).unwrap_or(dynamic),
+                    // A non-final field overriding both: the getter type
+                    // only when it equals the setter type, `dynamic`
+                    // otherwise (upstream's equality gate).
+                    (false, false, false) => {
+                        let getter = getter_ty(facts, &mut getters);
+                        let setter = setter_ty(facts, &mut setters);
+                        match (getter, setter) {
+                            (Some(gt), Some(st)) if gt == st => gt,
+                            _ => dynamic,
+                        }
+                    }
+                    (true, true, _) => dynamic,
+                };
+                (effective, covariant)
+            }
+            MemberKind::Getter => {
+                let mut getters = getter_candidates(facts);
+                let mut setters = setter_candidates(facts);
+                let mut effective = entry.clone();
+                effective.return_ty = if !getters.is_empty() {
+                    getter_ty(facts, &mut getters).unwrap_or(dynamic)
+                } else if !setters.is_empty() {
+                    setter_ty(facts, &mut setters).unwrap_or(dynamic)
+                } else {
+                    dynamic
+                };
+                (effective, false)
+            }
+            MemberKind::Setter => {
+                let mut setters = setter_candidates(facts);
+                let mut getters = getter_candidates(facts);
+                let covariant = setters.iter().any(|hit| {
+                    hit.entry()
+                        .formals
+                        .as_deref()
+                        .and_then(|f| f.positional.first())
+                        .is_some_and(|p| p.covariant)
+                });
+                let mut effective = entry.clone();
+                if covariant
+                    && let Some(formals) = effective.formals.as_deref_mut()
+                    && let Some(param) = formals.positional.first_mut()
+                {
+                    param.covariant = true;
+                }
+                let ty = if !setters.is_empty() {
+                    setter_ty(facts, &mut setters).unwrap_or(dynamic)
+                } else if !getters.is_empty() {
+                    getter_ty(facts, &mut getters).unwrap_or(dynamic)
+                } else {
+                    dynamic
+                };
+                if let Some(formals) = effective.formals.as_deref_mut()
+                    && let Some(param) = formals.positional.first_mut()
+                    && param.ty == Ty::UNKNOWN
+                {
+                    param.ty = ty;
+                }
+                (effective, false)
+            }
+            MemberKind::Method => {
+                let mut candidates: Vec<FaceHit<'a>> = Vec::new();
+                for face in faces {
+                    if let Some(hit) = self.override_face_member(container, *face, spelling, facts)
+                        && hit.entry().kind == MemberKind::Method
+                    {
+                        candidates.push(hit);
+                    }
+                }
+                // A kind-mismatched candidate set (or none) skips the
+                // inference entirely (`_allSameElementKind`'s gate).
+                if candidates.is_empty() {
+                    return (entry.clone(), false);
+                }
+                let combined = self.combined_inherited(container, candidates, facts);
+                let mut effective = entry.clone();
+                if effective.return_ty == Ty::UNKNOWN {
+                    effective.return_ty = combined.as_ref().map(|c| c.return_ty).unwrap_or(dynamic);
+                }
+                if let Some(formals) = effective.formals.as_deref_mut() {
+                    let slots = combined.as_ref().and_then(|c| c.formals.as_deref());
+                    for (index, param) in formals.positional.iter_mut().enumerate() {
+                        if param.ty != Ty::UNKNOWN {
+                            continue;
+                        }
+                        param.ty = slots
+                            .and_then(|f| f.positional.get(index))
+                            .map(|p| p.ty)
+                            .unwrap_or(dynamic);
+                    }
+                    for param in formals.named.iter_mut() {
+                        if param.ty != Ty::UNKNOWN {
+                            continue;
+                        }
+                        param.ty = slots
+                            .and_then(|f| f.named.iter().find(|p| p.name == param.name))
+                            .map(|p| p.ty)
+                            .unwrap_or(dynamic);
+                    }
+                }
+                (effective, false)
+            }
+        }
+    }
+
+    /// The combined most-specific signature over the candidate set
+    /// (`inheritance_manager3.dart`'s `combineSignatureTypes`): the single
+    /// candidate passes; the candidates are filtered to those whose
+    /// substituted signature is a valid override of every other's
+    /// (`_getValidOverrides`), and the first survivor stands. An empty
+    /// survivor set — the conflict arm — answers `None`, the caller's
+    /// `dynamic`.
+    fn combined_inherited(
+        &self,
+        container: StringId,
+        candidates: Vec<FaceHit<'a>>,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<MemberEntry> {
+        if candidates.len() <= 1 {
+            return candidates.first().map(|hit| hit.entry().clone());
+        }
+        let mut substituted: Vec<MemberEntry> = Vec::with_capacity(candidates.len());
+        for hit in &candidates {
+            match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
+                Instantiated::Unchanged => substituted.push(hit.entry().clone()),
+                Instantiated::Applied(env) => {
+                    substituted.push(self.substitute_entry(hit.entry(), &env))
+                }
+                Instantiated::Undecidable => return None,
+            }
+        }
+        let mut valid: Vec<usize> = Vec::new();
+        'outer: for i in 0..substituted.len() {
+            for j in 0..substituted.len() {
+                if i != j
+                    && self.override_broken(
+                        &substituted[i],
+                        (candidates[i].origin, candidates[i].face_name),
+                        &substituted[j],
+                        (candidates[j].origin, candidates[j].face_name),
+                    )
+                {
+                    continue 'outer;
+                }
+            }
+            valid.push(i);
+        }
+        let witness = *valid.first()?;
+        // The vec ends here — the swap is invisible.
+        Some(substituted.swap_remove(witness))
+    }
+
     /// The super-face type-argument substitution
     /// (`inheritance_manager3.dart`'s instantiated member map — the
     /// inherited signature the oracle's `isCorrectOverrideOf` reads is the
@@ -4165,6 +5199,14 @@ impl<'a> Engine<'a> {
         let mut copy = entry.clone();
         copy.var_ty = self.substitute_ty(copy.var_ty, keys);
         copy.return_ty = self.substitute_ty(copy.return_ty, keys);
+        // A member's own type-parameter bounds substitute like every other
+        // signature slot: a bound can spell the container's parameter
+        // (`S extends List<T>` under `C<int>`), and the override face's
+        // name unification renames the member's own parameters inside the
+        // bound (`f<A, B extends A>` → `f<T, S extends T>`).
+        for bound in copy.type_param_bounds.iter_mut() {
+            *bound = self.substitute_ty(*bound, keys);
+        }
         if let Some(formals) = &mut copy.formals {
             for formal in formals
                 .positional
@@ -4828,6 +5870,21 @@ impl<'a> Engine<'a> {
         } else {
             declared
         };
+        // The generic-function gate (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/dart/element/subtype.dart:338-345`
+        // `_isFunctionSubtypeOf` → `type_system.dart:1581-1635`
+        // `relateTypeParameters`): the two signatures must declare the same
+        // number of type parameters AND each pair of bounds must be equal
+        // under the unified spellings, else the subtype question fails
+        // outright — `void f<T, S>(T)` over `void f<T>(T)` and
+        // `f<T extends int>` over `f<T extends num>` are broken overrides
+        // whatever the parameter and return faces say. A bounds list that
+        // does not line up with the name list (a payload decoded before the
+        // field shipped) suppresses the comparison — the under-report
+        // direction.
+        if declared.type_params != inherited.type_params {
+            return true;
+        }
         let world = self.name_world();
         // The single type-decision point for every face below: the M1
         // assignability first, the name lattice on its `None`. No consumer
@@ -4853,6 +5910,26 @@ impl<'a> Engine<'a> {
             if let Ty::Named { name, .. } = to_ty
                 && self.named_head_is_invalid(name, to_scope, to_entry)
             {
+                return Some(true);
+            }
+            // The override faces read the SUBTYPE matrix, not the
+            // dynamic-dispatch assignment face (`subtype.dart`'s top rules):
+            // `dynamic` is a top type here, so `dynamic Function()` is no
+            // subtype of `int Function()` even though an expression of type
+            // `dynamic` assigns anywhere — the inferred/written `dynamic`
+            // override rows decide on this arm.
+            if matches!(from_ty, Ty::Dynamic) {
+                return Some(match to_ty {
+                    Ty::Dynamic => true,
+                    Ty::Named {
+                        name,
+                        nullable: true,
+                        ..
+                    } => name == self.intern("Object"),
+                    _ => false,
+                });
+            }
+            if matches!(to_ty, Ty::Dynamic) {
                 return Some(true);
             }
             self.assignable(from_ty, to_ty, false).or_else(|| {
@@ -4892,6 +5969,30 @@ impl<'a> Engine<'a> {
                 e.return_ty
             }
         };
+        // The bound pairs, equal under the unified spellings
+        // (`type_system.dart:1612-1624`: `isEqualTo` per pair after both
+        // sides instantiate onto the fresh parameters — the declared side
+        // already rides the inherited spellings through `unified`, so the
+        // two bound lists compare pairwise). Equality is the mutual
+        // subtype question: `num` over `num?` fails one leg, `int` over
+        // `num` fails the other. An undecidable pair (`None` — a
+        // type-parameter or unresolvable head in a bound, the lattice's
+        // blind spot) suppresses, the under-report direction.
+        if declared.type_param_bounds.len() == declared.type_param_names.len()
+            && inherited.type_param_bounds.len() == inherited.type_param_names.len()
+        {
+            for (d_bound, i_bound) in declared
+                .type_param_bounds
+                .iter()
+                .zip(inherited.type_param_bounds.iter())
+            {
+                let forward = decide(declared_at(*d_bound), inherited_at(*i_bound));
+                let backward = decide(inherited_at(*i_bound), declared_at(*d_bound));
+                if matches!(forward, Some(false)) || matches!(backward, Some(false)) {
+                    return true;
+                }
+            }
+        }
         match (declared.formals.as_deref(), inherited.formals.as_deref()) {
             (Some(a), Some(b)) => {
                 // The function-subtype arity rule, not an equality: the
@@ -5061,11 +6162,27 @@ impl<'a> Engine<'a> {
             MemberKind::Method => {
                 let params = match entry.formals.as_deref() {
                     Some(formals) => {
-                        let mut parts: Vec<String> = formals
+                        // The required positionals lead the list (the
+                        // collector's invariant); the optional tail renders
+                        // in brackets — the oracle's inherited-signature
+                        // slot spells `void Function([int])`.
+                        let split = formals
                             .positional
+                            .iter()
+                            .position(|f| !f.required)
+                            .unwrap_or(formals.positional.len());
+                        let mut parts: Vec<String> = formals.positional[..split]
                             .iter()
                             .map(|f| self.declared_ty_text(f.ty))
                             .collect();
+                        if split < formals.positional.len() {
+                            let optional = formals.positional[split..]
+                                .iter()
+                                .map(|f| self.declared_ty_text(f.ty))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            parts.push(format!("[{optional}]"));
+                        }
                         if !formals.named.is_empty() {
                             let named = formals
                                 .named
@@ -6124,3 +7241,12 @@ mod field_face_and_set_base_tests {
         );
     }
 }
+
+/// The #3001 `invalid_override` type-parameter pins: the generic-function
+/// gate's count and bound-equality arms (upstream `relateTypeParameters`,
+/// `type_system.dart:1581-1635`) — narrowed / dropped / added bounds,
+/// count mismatches, and the renamed-spelling equality that must stay
+/// silent.
+#[cfg(test)]
+#[path = "ticket_3001_tests.rs"]
+mod ticket_3001_tests;

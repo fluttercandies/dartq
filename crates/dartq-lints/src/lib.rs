@@ -228,6 +228,16 @@ mod ignore;
 mod registry;
 mod rules;
 
+/// The #3028 lint residual-wave pins (cfg(test): one green pin per
+/// fixed shape across the five residual rules).
+#[cfg(test)]
+mod ticket_3028_tests;
+
+/// The #3043 lint pins (cfg(test): one green pin per fixed shape
+/// across the four residual rules).
+#[cfg(test)]
+mod ticket_3043_tests;
+
 /// The production test bridge: the in-crate rule tests (its pre-existing
 /// `cfg(test)` posture) and, with the `test-support` feature, the
 /// out-of-crate behavioral harnesses (the dartq-fixture crate's upstream

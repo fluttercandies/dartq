@@ -394,7 +394,14 @@ impl Interp<'_> {
                 },
                 crate::ty::EMPTY_ARGS,
             ),
-            Ev::Bool { value } => {
+            Ev::Bool { value, span } => {
+                // The header-part leaf's dead poll — the same
+                // `checkUnreachableNode` face [`Ev::Int`] carries for the
+                // init/updater slices (`for (;; true, throw 1, false)`'s
+                // trailing `false`); see that arm for the official basis.
+                if self.for_header_depth > self.header_cond_depth {
+                    self.dead_code(*span);
+                }
                 // The literal's static type is `bool` (official
                 // `literalBool`'s recorded type — the `matchedType` an
                 // initializer or assignment write promotes through:

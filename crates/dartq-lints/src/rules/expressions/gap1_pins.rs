@@ -385,15 +385,28 @@ fn unnecessary_null_checks_nullable_context_faces() {
         "void f(int? n) {\n  var y = n!;\n}\n",
         // The `!` is not in a direct context position.
         "void f(int? n) {\n  int? y = n!.foo();\n}\n",
-        // An argument position carries the callee's parameter type,
-        // not the declaration's (:132-159).
-        "void f(int? n, int g(int? x)) {\n  int? y = g(n!);\n}\n",
     ] {
         assert!(
             run_semantic(source, "unnecessary_null_checks").is_empty(),
             "{source}"
         );
     }
+
+    // An argument position carries the callee's parameter type, not the
+    // declaration's (:132-159) — a nullable formal of a resolvable
+    // callee admits null (`conformance/expected.tsv`
+    // `test_functionCall_positionalArgument#0`). A function-typed
+    // FORMAL callee carries no bridge signature
+    // (`function_signature_of` covers declarations and members), so
+    // that shape under-reports until the formal-signature face lands.
+    assert_eq!(
+        run_semantic(
+            "void f(int? n, int g(int? x)) {\n  int? y = g(n!);\n}\n",
+            "unnecessary_null_checks",
+        )
+        .len(),
+        0
+    );
 }
 
 /// The `unawaited` face: a bare core-`unawaited` wrapper over a

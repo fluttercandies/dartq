@@ -109,7 +109,7 @@ impl<'a> Engine<'a> {
                 Some(kind @ (ContainerKind::Class | ContainerKind::Enum)) => kind,
                 _ => continue,
             };
-            if !matches!(self.walk_members(head, getter), Walk::Missing)
+            let resolved = !matches!(self.walk_members(head, getter), Walk::Missing)
                 || getter == self.intern("==")
                 || self.members.object_members.contains(&getter)
                 || (kind == ContainerKind::Enum
@@ -117,8 +117,20 @@ impl<'a> Engine<'a> {
                 || !matches!(
                     self.extension_application(head, Ty::UNKNOWN, getter, false, false),
                     ExtensionApp::None
-                )
-            {
+                );
+            if resolved {
+                // `visitPatternField` (unused_local_elements_verifier.dart:
+                // 673-678): a resolved object-pattern field read joins the
+                // oracle's `members` ∪ `readMembers` — the getter's element
+                // is used AND read. Credit both faces at name level here;
+                // the element-level `member_read_owners` gets its handle
+                // from the head container (the same owner `member_found`
+                // resolved).
+                self.read_names.insert(getter);
+                self.member_read_owners
+                    .entry(getter)
+                    .or_default()
+                    .insert((self.file, head));
                 continue;
             }
             let name_text = self.strings.resolve(getter).to_string();
@@ -469,7 +481,7 @@ impl<'a> Engine<'a> {
     /// unresolvable head (a prefix segment, a dead name) credits nothing —
     /// the under-report direction every unmodelable corner keeps.
     pub(crate) fn credit_constructor_selector(&mut self, head: StringId, selector: StringId) {
-        let Some((container, _)) = resolve_container(
+        let Some((container, owner)) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -481,6 +493,20 @@ impl<'a> Engine<'a> {
         };
         if container.constructors.contains(&selector) {
             self.used_names.insert(selector);
+            // The element-level edge (#2618's `member_refs` face): a
+            // resolved `C.sel` creation credits the exact constructor
+            // element — `D.sel` never shares the credit. The
+            // `member_used_elements` set in `finalize_usage` reads it.
+            self.report.member_refs.push(MemberRef {
+                range: SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+                kind: MemberRefKind::Invoked,
+                target_file: owner,
+                target_name: selector,
+                target_container: head,
+            });
         }
     }
 
@@ -992,6 +1018,33 @@ impl<'a> Engine<'a> {
             .filter(|name| !unresolved_member_only.contains(*name))
             .copied()
             .collect();
+        // The oracle's `usedElements.members` element set at (file,
+        // container, spelling) granularity (#2618's `member_refs` edge):
+        // a resolved member access credits the exact element it bound,
+        // never a same-spelling member of a sibling class. The Member arm's
+        // `_isUsedMember` check reads this set — `element_used`'s name-level
+        // set would spare `A._m` from `B._m`'s use.
+        let member_used_elements: FxHashSet<(FileId, StringId, StringId)> = self
+            .report
+            .member_refs
+            .iter()
+            .map(|r| (r.target_file, r.target_container, r.target_name))
+            .collect();
+        // `element_used`'s Member-arm view: names that resolved ONLY through
+        // a `.member` access (no bare `Decl`/`Member`/`TypeParam` ref, no
+        // type-use) are the `member_refs` set's domain — a `_B._m` use must
+        // not spare `_A._m`. `element_used` minus that subset keeps the
+        // non-member paths (a bare `_foo = 0` inside `_A`, a type-use) so
+        // the arm's fallback credits only same-class non-`.`-member uses.
+        let member_only_resolved: FxHashSet<StringId> = member_accessed
+            .intersection(&resolved)
+            .filter(|name| !non_member_resolved.contains(name))
+            .copied()
+            .collect();
+        let member_element_used: FxHashSet<StringId> = element_used
+            .difference(&member_only_resolved)
+            .copied()
+            .collect();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
             let bare = self.bare_name(site.name);
@@ -1208,7 +1261,20 @@ impl<'a> Engine<'a> {
                                     .extension_member_used
                                     .contains(&(self.file, index, bare))
                         }),
-                        _ => element_used.contains(&bare),
+                        // `_isUsedMember`'s element-level `members` ∪
+                        // `elements` join (unused_local_elements_verifier
+                        // .dart:977-992): a resolved member access credits
+                        // the exact element it bound — never a same-spelling
+                        // member of a sibling class. The `member_refs` edge
+                        // is that set: a `B._m` use spares `B._m` alone.
+                        // `member_element_used` keeps the non-`.`-member
+                        // paths (a bare `_foo = 0` inside `_A` resolves
+                        // `this._foo` with no `.` token — no `member_reads`/
+                        // `member_refs` record; a `RefTarget::Decl`/`Member`
+                        // ref credits the spelling).
+                        _ => member_used_elements
+                            .contains(&(self.file, container, site.name))
+                            || member_element_used.contains(&bare),
                     };
                     let spared = site.annotated
                         || (!self.is_nameless(site.name)
@@ -1236,23 +1302,33 @@ impl<'a> Engine<'a> {
                         // single constructor may serve to prevent extension.
                         // The upstream count is
                         // `enclosingElement.constructors.length` — every
-                        // declared constructor, named and unnamed alike; the
-                        // written constructor sites carry exactly that set
-                        // (one site per head, the selector's rewrite updating
-                        // the provisional in place), so the declaration walk
-                        // counts them rather than reading the element model's
-                        // flags.
+                        // declared constructor, named and unnamed alike.
+                        // The element model's `constructors` +
+                        // `has_unnamed_constructor` carries exactly that set
+                        // (extension-type primaries land there without a
+                        // `decl_sites` entry — the listener gates
+                        // `ContainerKind::Class | Enum` for the site).
                         let multi = self
-                            .decl_sites
-                            .iter()
-                            .filter(|s| {
-                                matches!(
-                                    s.kind,
-                                    DeclKind::Constructor { container: c } if c == container
-                                )
-                            })
-                            .count()
-                            > 1;
+                            .index
+                            .get(self.file)
+                            .and_then(|f| f.container(container))
+                            .is_some_and(|c| {
+                                c.constructors.len() + usize::from(c.has_unnamed_constructor) > 1
+                            });
+                        // `_isUsedElement`'s element check for ctors: the
+                        // `member_refs` edge `credit_constructor_selector`
+                        // pushes carries the resolved `(file, container,
+                        // selector)` tuple — a `D._named` use never spares
+                        // `C._named`. No `element_used` fallback: the
+                        // name-level set credits every same-spelling ctor
+                        // across classes (the over-credit the element set
+                        // exists to prevent). `super.named()` initializers
+                        // ride `note_ctor_use_in`'s annotated-only edge —
+                        // an unannotated super-target's credit is a known
+                        // under-report face (upstream spares it via
+                        // `usedElements.elements`).
+                        let ctor_used = member_used_elements
+                            .contains(&(self.file, container, site.name));
                         let spared = !multi
                             || site.annotated
                             || (!self.is_nameless(site.name)
@@ -1261,7 +1337,7 @@ impl<'a> Engine<'a> {
                                     site.kind,
                                     site.is_factory,
                                 ))
-                            || element_used.contains(&bare)
+                            || ctor_used
                             || matches!(self.walk_super(container, site.name), Walk::Found(_));
                         if !spared {
                             // The element's displayName qualifies the selector
@@ -2470,6 +2546,147 @@ impl<'a> Engine<'a> {
         self.source.get(start..end).unwrap_or("")
     }
 
+    /// The selector a named primary constructor's declaration site points
+    /// at (`class C.named(...)` — `C._n(...)` alike): the site anchors on
+    /// the `.` token its `begin` event latched, so the selector is the
+    /// identifier immediately following it. `None` for every other site
+    /// shape — secondary constructor sites already carry the selector as
+    /// their name (the continuation rewrote it), unnamed primary sites
+    /// anchor on `(`, and a `.new` primary head names the unnamed face its
+    /// `ctor_formals` key already spells (the class name). The
+    /// `unused_element_parameter` arm reads it to join the named primary's
+    /// site with its formal table and its call-site givens.
+    fn primary_ctor_selector(&self, site: &DeclSite) -> Option<StringId> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens.partition_point(|t| t.utf16_offset < site.range.offset);
+        let dot = tokens.get(index)?;
+        if dot.utf16_offset != site.range.offset
+            || dot.kind != dartq_scanner::TokenKind::Period
+        {
+            return None;
+        }
+        let selector = tokens.get(index + 1)?;
+        if selector.kind != dartq_scanner::TokenKind::Identifier {
+            return None;
+        }
+        Some(self.intern(self.token_text(selector)))
+    }
+
+    /// The formal lists of the redirecting factories that target one
+    /// constructor — `_matchParameters`' `firstList` face
+    /// (unused_local_elements_verifier.dart:102-114): for each factory
+    /// constructor site of this file, the `= C.sel` / `= C` tail of its
+    /// declaration resolves to a `(container, selector)` pair; when that
+    /// pair names the constructor under report, the factory's own written
+    /// formals (`factory_formals`) are the correspondence source. The
+    /// token walk is local to the declaration's `;`-terminated head —
+    /// the only positions a `=` can precede the target are the factory
+    /// redirect's own (a default value's `=`/`:` sits inside the formal
+    /// group's parens, balanced below the depth the scan reads).
+    fn redirect_formals_into(
+        &self,
+        container: StringId,
+        ctor_spelling: StringId,
+    ) -> Vec<Formals> {
+        let tokens = self.tokens.as_slice();
+        let mut out: Vec<Formals> = Vec::new();
+        for site in &self.decl_sites {
+            let DeclKind::Constructor {
+                container: factory_container,
+            } = site.kind
+            else {
+                continue;
+            };
+            if !site.is_factory {
+                continue;
+            }
+            // The head's forward walk: `= C` or `= C.sel` before the
+            // declaration's `;`/`{` terminator.
+            let mut index = tokens.partition_point(|t| t.utf16_offset < site.range.end());
+            let mut depth = 0u32;
+            let target = loop {
+                let Some(t) = tokens.get(index) else {
+                    break None;
+                };
+                match t.kind {
+                    dartq_scanner::TokenKind::OpenParen
+                    | dartq_scanner::TokenKind::OpenSquare => depth += 1,
+                    dartq_scanner::TokenKind::OpenCurly => {
+                        if depth == 0 {
+                            // The factory's own body opened — no redirect.
+                            break None;
+                        }
+                        depth += 1;
+                    }
+                    dartq_scanner::TokenKind::CloseParen
+                    | dartq_scanner::TokenKind::CloseSquare => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    dartq_scanner::TokenKind::CloseCurly => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    dartq_scanner::TokenKind::Semicolon if depth == 0 => break None,
+                    dartq_scanner::TokenKind::Eq if depth == 0 => {
+                        // `= C` or `= C.sel` — a `new` selector spells the
+                        // unnamed face (the class-name key).
+                        let Some(head) = tokens.get(index + 1) else {
+                            break None;
+                        };
+                        if head.kind != dartq_scanner::TokenKind::Identifier {
+                            break None;
+                        }
+                        let class = self.intern(self.token_text(head));
+                        let selector = match tokens.get(index + 2).map(|t| t.kind) {
+                            Some(dartq_scanner::TokenKind::Period) => tokens
+                                .get(index + 3)
+                                .filter(|t| {
+                                    t.kind == dartq_scanner::TokenKind::Identifier
+                                        || (t.kind == dartq_scanner::TokenKind::Keyword(
+                                            dartq_scanner::Keyword::New,
+                                        ))
+                                })
+                                .map(|t| self.token_text(t)),
+                            _ => None,
+                        };
+                        break Some((class, selector));
+                    }
+                    _ => {}
+                }
+                index += 1;
+            };
+            let Some((class, selector)) = target else {
+                continue;
+            };
+            let key = selector
+                .filter(|s| *s != "new")
+                .map(|s| self.intern(s))
+                .unwrap_or(class);
+            if class != container || key != ctor_spelling {
+                continue;
+            }
+            // The factory's own formal list (`factory_formals`) keyed by
+            // its written selector — `factory A()` and the `factory
+            // A.new()` head spell the unnamed face under the declaring
+            // class's name, matching the `ctor_formals` key convention.
+            let Some(decl) = self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(factory_container))
+            else {
+                continue;
+            };
+            let factory_sel = if self.strings.resolve(site.name) == "new" {
+                factory_container
+            } else {
+                site.name
+            };
+            if let Some(formals) = decl.factory_formals.get(&factory_sel) {
+                out.push((**formals).clone());
+            }
+        }
+        out
+    }
+
     /// The overridden instance members behind one member declaration
     /// (`_overriddenElements`, inheritance_manager3.dart `getOverridden`):
     /// the nearest same-named non-static member of each direct super face —
@@ -2598,6 +2815,63 @@ impl<'a> Engine<'a> {
         if matches!(member_kind, Some(MemberKind::Field | MemberKind::Setter)) {
             return;
         }
+        // A named PRIMARY constructor's site keeps the container spelling —
+        // its `begin` token anchors on the `.` (never rewritten by a
+        // method-continuation, which secondary heads get) — while the
+        // formal table and the call-site givens key on the selector
+        // (`class _A._n(...)` files under `_n`). Derive that selector from
+        // the site's own `.`+identifier pair; body-constructor sites already
+        // carry the selector as their name, and unnamed primary sites anchor
+        // on `(` so both fall through unchanged.
+        let ctor_spelling = if matches!(site.kind, DeclKind::Constructor { .. }) {
+            self.primary_ctor_selector(site).unwrap_or(site.name)
+        } else {
+            site.name
+        };
+        let augment_ctor_formals = |engine: &Self, c: StringId| -> Option<Formals> {
+            // An `augment` constructor's written list never joins
+            // `ctor_formals` (the collector keeps the introductory
+            // declaration's table intact) — its own `augmentations` row is
+            // the table upstream's `visitFormalParameterList` walks (the
+            // fragment's `parameterFragments` list). The conversion reads
+            // `required_kw` for the named face's required bit and skips
+            // unnamed recovery formals.
+            engine
+                .index
+                .get(engine.file)
+                .and_then(|f| {
+                    f.augmentations().iter().find(|a| {
+                        a.kind == crate::model::AugKind::Constructor
+                            && a.container == Some(c)
+                            && a.name == ctor_spelling
+                    })
+                })
+                .map(|a| {
+                    let to_formal = |f: &crate::model::AugmentFormal| -> Option<Formal> {
+                        Some(Formal {
+                            name: f.name?,
+                            ty: f.ty.unwrap_or(Ty::UNKNOWN),
+                            required: f.required_positional || f.required_kw.is_some(),
+                            covariant: f.covariant_kw.is_some(),
+                            default_value: None,
+                        })
+                    };
+                    Formals {
+                        positional: a
+                            .formals
+                            .iter()
+                            .filter(|f| !f.named)
+                            .filter_map(to_formal)
+                            .collect(),
+                        named: a
+                            .formals
+                            .iter()
+                            .filter(|f| f.named)
+                            .filter_map(to_formal)
+                            .collect(),
+                    }
+                })
+        };
         let formals = match container {
             Some(c) => self
                 .index
@@ -2605,16 +2879,31 @@ impl<'a> Engine<'a> {
                 .and_then(|f| f.container(c))
                 .and_then(|x| {
                     if matches!(site.kind, DeclKind::Constructor { .. }) {
-                        x.ctor_formals.get(&site.name).map(Box::as_ref)
+                        // A factory's written list lives in the separate
+                        // `factory_formals` lane — a private named factory's
+                        // optional formals report exactly like a generative
+                        // constructor's upstream (the enclosing element is a
+                        // ConstructorElement either way).
+                        if site.is_factory {
+                            x.factory_formals.get(&ctor_spelling).map(Box::as_ref)
+                        } else {
+                            x.ctor_formals.get(&ctor_spelling).map(Box::as_ref)
+                        }
                     } else {
                         x.members.get(&site.name).and_then(|m| m.formals.as_deref())
                     }
+                })
+                .map(Formals::clone)
+                .or_else(|| {
+                    (site.is_augment && matches!(site.kind, DeclKind::Constructor { .. }))
+                        .then(|| augment_ctor_formals(self, c))
+                        .flatten()
                 }),
             None => self
                 .index
                 .get(self.file)
                 .and_then(|f| f.decl(site.name))
-                .and_then(|d| d.formals.as_deref()),
+                .and_then(|d| d.formals.as_deref().cloned()),
         };
         let Some(formals) = formals else {
             return;
@@ -2641,8 +2930,12 @@ impl<'a> Engine<'a> {
         // blanket super-name pardon (the walk cannot see per-parameter
         // correspondence — the under-report direction) plus the
         // super-initialization corresponding face below; methods run the
-        // official per-parameter override gate in the loops.
-        if self.is_publicly_accessible(site.name, site.kind, site.is_factory) {
+        // official per-parameter override gate in the loops. The
+        // accessibility face keys on the executable's own spelling — a
+        // public class's private-selector constructor (`A._n`) is NOT
+        // publicly accessible upstream, so the derived `ctor_spelling`
+        // answers where the container-keyed site name could not.
+        if self.is_publicly_accessible(ctor_spelling, site.kind, site.is_factory) {
             return;
         }
         let overridden = match site.kind {
@@ -2652,7 +2945,7 @@ impl<'a> Engine<'a> {
         if overridden.is_empty()
             && matches!(site.kind, DeclKind::Constructor { .. })
             && let Some(c) = container
-            && matches!(self.walk_super(c, site.name), Walk::Found(_))
+            && matches!(self.walk_super(c, ctor_spelling), Walk::Found(_))
         {
             return;
         }
@@ -2670,7 +2963,7 @@ impl<'a> Engine<'a> {
                     .and_then(|f| f.container(c))
                     .and_then(|d| d.superclass)?;
                 let target = super_ctor_targets
-                    .get(&(c, site.name))
+                    .get(&(c, ctor_spelling))
                     .or_else(|| super_ctor_targets.get(&(c, c)))
                     .copied()
                     .flatten();
@@ -2690,24 +2983,82 @@ impl<'a> Engine<'a> {
             }),
             _ => None,
         };
-        // A redirecting factory's target receives every parameter the
-        // factory forwards — its optional formals are all supplied.
-        if let (DeclKind::Constructor { container }, Some(_)) = (site.kind, container) {
-            let unnamed = site.name == container
-                || self.is_bare_new_head(site.name)
-                || site.name == self.intern("new");
-            if self
-                .factory_redirect_targets
-                .contains(&(container, site.name))
-                || (unnamed
-                    && self
-                        .factory_redirect_targets
-                        .contains(&(container, container)))
-            {
-                return;
+        // A redirecting factory's target receives only the parameters the
+        // factory's own formal list declares — `_matchParameters` pairs
+        // them positionally and by name against the target's list and
+        // credits the matched target formals alone
+        // (unused_local_elements_verifier.dart:102-114/:458-498): a
+        // `factory T.named() = T` forwards nothing, so `T`'s optional
+        // formals still report.
+        let redirect_sources: Vec<Formals> = if let DeclKind::Constructor { container } = site.kind
+        {
+            self.redirect_formals_into(container, ctor_spelling)
+        } else {
+            Vec::new()
+        };
+        // Upstream `visitSimpleIdentifier`'s tear-off arm
+        // (unused_local_elements_verifier.dart:318-326): an executable
+        // element read in a NON-call position — a method/function/
+        // constructor tear-off, or a `super.x()`/`this.x()` initializer
+        // the AST never shapes as an `InstanceCreationExpression` —
+        // credits every formal it declares. A real invocation credits
+        // only the supplied arguments (`_addParametersForArguments`),
+        // which the `positional_given`/`named_given` sets already carry.
+        // The call shape is the `(` immediately following the reference's
+        // name span; every other follower is a non-call read.
+        let invocation_after = |engine: &Self, range: SourceRange| -> bool {
+            let tokens = engine.tokens.as_slice();
+            let index = tokens.partition_point(|t| t.utf16_offset < range.end());
+            matches!(
+                tokens.get(index).map(|t| t.kind),
+                Some(dartq_scanner::TokenKind::OpenParen)
+            )
+        };
+        let all_params_used = match site.kind {
+            DeclKind::Member { container, .. } => self.report.member_refs.iter().any(|r| {
+                r.kind == MemberRefKind::Invoked
+                    && r.target_file == self.file
+                    && r.target_container == container
+                    && r.target_name == site.name
+                    && !invocation_after(self, r.range)
+            }),
+            DeclKind::Constructor { container } => {
+                // `credit_constructor_selector`'s zero-span edge (the
+                // `super.x()`/`this.x()`/metadata/selector-reference faces —
+                // every non-`InstanceCreationExpression` read) credits all
+                // formals; the `super_ctor_targets` map joins the
+                // initializer invocations whose selector names this
+                // constructor directly.
+                let noncall_ref = self.report.member_refs.iter().any(|r| {
+                    r.kind == MemberRefKind::Invoked
+                        && r.target_file == self.file
+                        && r.target_container == container
+                        && (r.target_name == site.name || r.target_name == ctor_spelling)
+                        && !invocation_after(self, r.range)
+                });
+                noncall_ref
+                    || super_ctor_targets.iter().any(|((sub, _sub_key), sel)| {
+                        sel.is_some_and(|sel| {
+                            sel == ctor_spelling
+                                && self
+                                    .index
+                                    .get(self.file)
+                                    .and_then(|f| f.container(*sub))
+                                    .and_then(|d| d.superclass)
+                                    == Some(container)
+                        })
+                    })
             }
+            _ => self.refs.iter().any(|r| {
+                r.name == site.name
+                    && matches!(r.target, RefTarget::Decl { .. })
+                    && !invocation_after(self, r.range)
+            }),
+        };
+        if all_params_used {
+            return;
         }
-        let bare = self.bare_name(site.name);
+        let bare = self.bare_name(ctor_spelling);
         // Cloned: the emit below mutates the report while the set is read.
         let body_uses = self.site_param_uses.get(&site_index).cloned();
         let given_positional = self.positional_given.get(&bare).copied().unwrap_or(0);
@@ -2732,7 +3083,13 @@ impl<'a> Engine<'a> {
                 .as_ref()
                 .and_then(|f| f.positional.get(index))
                 .is_some_and(|f| f.required);
+            // `_matchParameters`' positional leg: a redirecting factory
+            // carrying a formal at this index supplies the target's.
+            let spared_by_redirect = redirect_sources
+                .iter()
+                .any(|f| f.positional.len() > index);
             if spared_by_super
+                || spared_by_redirect
                 || self.override_parameter_spared(&overridden, bare, Some(index), formal.name)
             {
                 continue;
@@ -2754,7 +3111,13 @@ impl<'a> Engine<'a> {
                     .or_else(|| f.named_formal(self.formal_public_name(formal.name)))
                     .is_some_and(|f| f.required)
             });
+            // `_matchParameters`' named leg: a redirecting factory formal
+            // of the same name supplies the target's.
+            let spared_by_redirect = redirect_sources
+                .iter()
+                .any(|f| f.named_formal(formal.name).is_some());
             if spared_by_super
+                || spared_by_redirect
                 || self.override_parameter_spared(&overridden, bare, None, formal.name)
             {
                 continue;
@@ -2847,6 +3210,53 @@ impl<'a> Engine<'a> {
             .filter_map(|&file| self.index.get(file))
             .flat_map(|elements| elements.declarations().map(|(name, _)| name))
             .collect();
+        // Names attributed to a prefixed access (`p.A`, `one.A()`) credit
+        // the prefix's edge alone — upstream's `PrefixScope.lookup` records
+        // the element on the prefixed import, never on a sibling unprefixed
+        // edge. `resolve_member_row`/`push_type_use` flatten both paths
+        // into `used_names`, so the unprefixed arm must check whether a
+        // `used` spelling resolved through THIS edge — the resolved
+        // declaration's file must sit in the edge's target library
+        // (`RefTarget::Decl.file`), not a sibling's (`lib1`'s `File` never
+        // credits `dart:io`'s edge).
+        let prefix_recv_offsets: FxHashSet<u32> = self
+            .member_reads
+            .iter()
+            .filter(|read| matches!(read.recv, Receiver::Prefix { .. }))
+            .map(|read| read.offset)
+            .collect();
+        // `bare_decls`: each spelling → the files its bare accesses resolved
+        // to. `refs` carries the `Decl{file}` directly for member-row and
+        // bare-ref resolutions; `type_uses` resolve through the top-level
+        // namespace — a `namespaces.lookup` re-ask gives the same file the
+        // push-time walk found (the bare arm, never `PrefixScope`).
+        let mut bare_decls: FxHashMap<StringId, FxHashSet<FileId>> = FxHashMap::default();
+        for r in &self.refs {
+            let RefTarget::Decl { file } = r.target else {
+                continue;
+            };
+            if prefix_recv_offsets.contains(&r.range.offset) {
+                continue;
+            }
+            bare_decls.entry(r.name).or_default().insert(file);
+        }
+        for &(range, name) in &self.type_uses {
+            if self
+                .prefix_head_before(range.offset)
+                .or_else(|| self.prefix_head_at(range.offset))
+                .is_some()
+            {
+                continue;
+            }
+            // A bare type-use resolves through the top-level namespace —
+            // the same `namespaces.lookup` the push-time `type_resolution`
+            // walked answers the declaring file here.
+            if let Lookup::Found(NamespaceEntry::Decl(file)) =
+                self.namespaces.lookup(self.graph, self.lib, name)
+            {
+                bare_decls.entry(name).or_default().insert(file);
+            }
+        }
         for (index, edge) in edges.iter().enumerate() {
             // Copied first: the emit below mutates the report.
             let (uri_text, uri_range, prefix, shown) = {
@@ -2890,10 +3300,33 @@ impl<'a> Engine<'a> {
                     None => self.used_names.contains(&prefix) || self.import_used.contains(&prefix),
                 },
                 None => {
+                    // The element-attributed hit: the resolved declaration's
+                    // file must sit in this edge's target library — a bare
+                    // `File` resolving to `lib1.dart`'s element never
+                    // credits `dart:io`'s edge (upstream's `PrefixScope`/
+                    // `ImportScope` records the lookup on the resolving
+                    // edge alone, scope.dart:638-655).
                     let hit = used.iter().find(|&&n| {
                         edge.combinators.allows(n)
                             && !local_names.contains(&n)
                             && self.graph.exported(target, n).is_some()
+                            && bare_decls.get(&n).is_some_and(|files| {
+                                // The resolved declaration's file must be
+                                // the file this edge's target library
+                                // declares the spelling in — a bare `File`
+                                // resolving to `lib1.dart`'s element never
+                                // credits `dart:io`'s edge. `graph.local`
+                                // reads the target's own declaration slot
+                                // (`LocalSlot::Decl(file)`) — `library_of_
+                                // file`'s units map cannot see aux files
+                                // that never registered a unit.
+                                matches!(
+                                    self.graph.local(target, n),
+                                    dartq_resolution::LocalLookup::Found(
+                                        decl_file
+                                    ) if files.contains(&decl_file)
+                                )
+                            })
                     });
                     let credited = self.import_credits_extension_member(edge, target, &credit);
                     hit.is_some() || credited
@@ -3178,7 +3611,26 @@ impl<'a> Engine<'a> {
     /// The staged null-aware faces re-decide against the flow's promoted
     /// receiver types (`_checkForUnnecessaryNullAware` reads the
     /// flow-augmented static type, which the walk-time row cannot see).
-    pub(crate) fn flush_null_aware_staged(&mut self, promotions: &PromotionStaging) {
+    ///
+    /// `props` carries the promoted-PROPERTY rows
+    /// ([`FlowFact::PromotedPropertyRead`]) the `null_aware_staged` staging
+    /// gate cannot see: a member/property receiver (`_g?.abs()`,
+    /// `this._f?.x`, `obj._f?.x`) never lands in `local_hits` — only bare
+    /// local reads do — so it is never pushed onto `null_aware_staged` and
+    /// the local-receiver loop below cannot re-decide it. The member
+    /// receiver rides `null_aware_members`/`member_reads` instead: every
+    /// `?.`/`?..` merge latches its member offset there, and the staged
+    /// `MemberRead` keeps the receiver span and classification. The
+    /// promoted-property re-decision below asks the same
+    /// `promotable_field_substitution` verdict the condition-face join asks
+    /// (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/generated/error_verifier.dart`
+    /// `_checkForUnnecessaryNullAware`'s promoted-property arm).
+    pub(crate) fn flush_null_aware_staged(
+        &mut self,
+        promotions: &PromotionStaging,
+        props: &PropPromotionStaging,
+    ) {
         let accesses = std::mem::take(&mut self.null_aware_staged);
         for (read, op_range, kind) in accesses {
             if promotions
@@ -3194,6 +3646,91 @@ impl<'a> Engine<'a> {
                     "",
                 );
             }
+        }
+        // The member/property `?.`/`?..` receivers the staging gate skipped:
+        // re-decide each against the promoted-property rows. A bare local
+        // receiver stays with `null_aware_staged` (its promotion rides the
+        // local table); a member receiver resolves through
+        // `member_read_resolution`/`promotable_field_substitution`, which
+        // gate the promotion on the official `isPropertyPromotable` verdict
+        // (private, final, non-external, unit-unconflicted). The operator
+        // span is the `?.`/`?..` token that follows the receiver — the merge
+        // does not record it on `member_reads`, but the receiver end anchors
+        // it directly.
+        let members: Vec<u32> = self.null_aware_members.iter().copied().collect();
+        for member_offset in members {
+            let Ok(index) = self
+                .member_reads
+                .binary_search_by(|row| row.offset.cmp(&member_offset))
+            else {
+                continue;
+            };
+            let member = self.member_reads[index];
+            let recv_span = member.recv_span;
+            // The promoted-property anchor is the receiver's own MEMBER
+            // token: `_g` carries it at the bare read's span; `this._f` /
+            // `obj._f` carry it at the trailing member token (the receiver
+            // read's end — `member_read_ends` hops that end to the receiver's
+            // own member row). A bare LOCAL receiver (`obj?.x`) resolves to
+            // `RefTarget::Local` below, not a member — `member_read_resolution`
+            // returns `None` and the row stays with `null_aware_staged`'s
+            // local arm, so there is no double report. An unresolved receiver
+            // cannot be a promoted field.
+            let anchor = self
+                .member_read_ends
+                .get(&recv_span.end())
+                .and_then(|&i| self.member_reads.get(i as usize))
+                .map_or(recv_span.offset, |row| row.offset);
+            let Some((entry, _, _)) = self.member_read_resolution(anchor) else {
+                continue;
+            };
+            let from = entry.var_ty;
+            let anchor_range = SourceRange {
+                offset: anchor,
+                length: 0,
+            };
+            let Some(promoted) =
+                self.promotable_field_substitution(props, anchor_range, from)
+            else {
+                continue;
+            };
+            if !promoted.is_strictly_non_nullable() {
+                continue;
+            }
+            // The `?.`/`?..` operator sits at the receiver's end (modulo
+            // whitespace). Anything but a `.`-led `?` is outside this face —
+            // `?[`/`?..[` index sections stage elsewhere and are not the
+            // promoted-PROPERTY receiver this pass re-decides.
+            let question = self.skip_whitespace(recv_span.end());
+            if self.byte_at(question) != Some(b'?') || self.byte_at(question + 1) != Some(b'.')
+            {
+                continue;
+            }
+            let (op_range, kind) = if self.byte_at(question + 2) == Some(b'.') {
+                (
+                    SourceRange {
+                        offset: question,
+                        length: 3,
+                    },
+                    NullAwareKind::Cascade,
+                )
+            } else {
+                (
+                    SourceRange {
+                        offset: question,
+                        length: 2,
+                    },
+                    NullAwareKind::Access,
+                )
+            };
+            let (op, replacement) = kind.lexemes();
+            self.emit3(
+                SemanticCode::InvalidNullAwareOperator,
+                op_range,
+                op,
+                replacement,
+                "",
+            );
         }
         let asserts = std::mem::take(&mut self.null_assert_staged);
         for (read, bang, nullable_params) in asserts {
@@ -5530,6 +6067,286 @@ mod pins {
                 offset,
                 "The declaration '_dead' isn't referenced.".to_string()
             )],
+            "{source:?}"
+        );
+    }
+
+    /// Element-level member credit (`member_refs` edge): a resolved member
+    /// access on `B._m` spares `B._m` alone — `A._m` still reports. The
+    /// name-level `element_used` pool would spare both.
+    #[test]
+    fn same_name_member_of_sibling_class_does_not_share_credit() {
+        let source = "class _A {\n\
+                      \x20 void _m() {}\n\
+                      }\n\
+                      class _B {\n\
+                      \x20 void _m() {}\n\
+                      \x20 void use() { _m(); }\n\
+                      }\n\
+                      void f(_B b) { b.use(); }\n";
+        let a_offset = source.find("class _A").unwrap() as u32;
+        let m_offset = source.find("_m").unwrap() as u32;
+        // `_A` reports (unused class), `_A._m` reports (never called —
+        // `_B._m`'s call is element-scoped). `_B`, `_B._m`, `_B.use` are
+        // all used through `f`'s access chain.
+        let rows = unused_element_rows(source);
+        assert!(
+            rows.iter().any(|(o, _)| *o == m_offset),
+            "expected _A._m unused_element at {m_offset}: {rows:?} in {source:?}"
+        );
+    }
+
+    /// Element-level ctor credit (`member_refs` edge via
+    /// `credit_constructor_selector`): a resolved `D._named()` creation
+    /// spares `D._named` alone — `C._named` still reports.
+    #[test]
+    fn same_name_ctor_of_sibling_class_does_not_share_credit() {
+        let source = "class _C {\n\
+                      \x20 _C._named();\n\
+                      \x20 _C._other();\n\
+                      }\n\
+                      class _D {\n\
+                      \x20 _D._named();\n\
+                      \x20 _D._other();\n\
+                      }\n\
+                      void f() {\n\
+                      \x20 _D._named();\n\
+                      \x20 _D._other();\n\
+                      }\n";
+        let c_named = source.find("_C._named").unwrap() as u32 + 3;
+        // `_C._named` reports (never called — `_D._named()`'s creation is
+        // element-scoped). `_C` itself reports as an unused class too.
+        let rows = unused_element_rows(source);
+        assert!(
+            rows.iter().any(|(_, text)| text.contains("_C._named")),
+            "expected _C._named unused_element: {rows:?} in {source:?}"
+        );
+    }
+
+    /// Object-pattern getter read credit: `Box(:var e)` reads the `e`
+    /// getter on `Box`'s instance face — the getter's element is used
+    /// AND read. A private field matching the getter's spelling is spared
+    /// by `member_was_read`'s owner join.
+    #[test]
+    fn object_pattern_field_credits_getter_read() {
+        let source = "class _Box {\n\
+                      \x20 int? e;\n\
+                      }\n\
+                      void t(_Box b) {\n\
+                      \x20 if (b case _Box(:var e)) { print(e); }\n\
+                      }\n";
+        let field_offset = source.find("int? e").unwrap() as u32 + 5;
+        // `_Box` is used via `t`'s parameter. `e` is read by the object
+        // pattern — `visitPatternField` credits `addMember` + `addReadMember`
+        // (unused_local_elements_verifier.dart:673-678), so `unused_field`
+        // stays silent.
+        assert!(
+            !report(source)
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "unused_field" && d.range.offset == field_offset),
+            "unused_field reported on e: {source:?}"
+        );
+    }
+
+    /// `unused_import` element attribution: `one.A` resolves through the
+    /// `one`-prefixed edge alone — the sibling unprefixed `import 'a0.dart'`
+    /// reports unused (upstream `PrefixScope.lookup` records the element
+    /// on the prefixed import, never the bare edge).
+    #[test]
+    fn prefixed_use_never_credits_unprefixed_sibling() {
+        let source = "import 'a0.dart';\n\
+                      import 'a0.dart' as one;\n\
+                      one.A a = one.A();\n";
+        let r = report_with_imports(
+            source,
+            &[
+                Aux {
+                    prefix: None,
+                    deferred: false,
+                    body: "class A {}\n",
+                },
+                Aux {
+                    prefix: Some("one"),
+                    deferred: false,
+                    body: "class A {}\n",
+                },
+            ],
+        );
+        let unused_offset = source.find("'a0.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(unused_offset, 9)], "{source:?}");
+    }
+
+    /// `unused_import` element attribution: `A` resolves through `a0.dart`
+    /// alone — `a1.dart` contributes no accessed element, so its edge
+    /// reports (the `bare_decls` file→library join keeps the resolution
+    /// path's attribution rather than the spelling's export-scope match).
+    #[test]
+    fn unaccessed_target_reports_unused_import() {
+        let source = "import 'a0.dart';\n\
+                      import 'a1.dart';\n\
+                      A? a;\n";
+        let r = report_with_imports(
+            source,
+            &[
+                Aux {
+                    prefix: None,
+                    deferred: false,
+                    body: "class A {}\n",
+                },
+                Aux {
+                    prefix: None,
+                    deferred: false,
+                    body: "class B {}\n",
+                },
+            ],
+        );
+        let a1_offset = source.find("'a1.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(a1_offset, 9)], "{source:?}");
+    }
+
+    // —— #2977 pins: the primary-constructor parameter faces ————————
+
+    /// `note_parameter`'s site fallback: a primary-constructor header arms
+    /// `open_ctor_site` (never `open_exec_site` — no method-declaration
+    /// name event runs), so its formals must join the site under the ctor
+    /// lane. `class _A([this.f])` reports `unused_element_parameter` at the
+    /// parameter name — not the site's `(` anchor the empty `site_params`
+    /// window fell back to (oracle: `test_classPrivate_primaryConstructor_
+    /// unnamed_fieldFormal_optionalPositional_notUsed`, 2:23).
+    #[test]
+    fn primary_ctor_field_formal_reports_at_the_parameter_name() {
+        let source = "class _A([this.f]) {\n\
+                      \x20 final int? f;\n\
+                      }\n\
+                      f() => _A();\n";
+        let f_at = source.find("this.f").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(f_at, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// The unnamed primary's named formal: the same site-join through
+    /// `open_ctor_site` supplies both the anchor and the (unused) verdict.
+    #[test]
+    fn primary_ctor_named_formal_reports_at_the_parameter_name() {
+        let source = "class _A({int? a}) {}\n\
+                      f() => _A();\n";
+        let a_at = source.find("int? a").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(a_at, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// A named primary constructor's site keeps the container spelling —
+    /// its `ctor_formals` key is the `.` selector the
+    /// `primary_ctor_selector` arm derives. `class _A._n({this.f})` joins
+    /// its table and reports at `f` (oracle: `test_classPrivate_
+    /// primaryConstructor_namedPrivate_fieldFormal_optionalNamed_notUsed`).
+    #[test]
+    fn named_primary_ctor_reports_against_the_selector_key() {
+        let source = "class _A._n({this.f}) {\n\
+                      \x20 final int? f;\n\
+                      }\n\
+                      f() => _A._n();\n";
+        let f_at = source.find("this.f").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(f_at, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// A private secondary constructor's `super.a` formal associates
+    /// against the super constructor's OPTIONAL `a` — no required
+    /// corresponding parameter spares it, so it reports (oracle:
+    /// `test_classPrivate_secondaryConstructor_unnamed_superFormal_
+    /// optionalNamed_notUsed`, 3:24).
+    #[test]
+    fn secondary_ctor_super_formal_still_reports() {
+        let source = "class _A {\n\
+                      \x20 _A({int? a});\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 _B({super.a});\n\
+                      }\n\
+                      \n\
+                      var b = _B();\n";
+        let a_at = source.find("super.a").unwrap() as u32 + 6;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(a_at, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// The used-direction twin: a `this.f` primary formal the creation
+    /// supplies stays silent — `_A(f: 1)` keys `named_given` on the
+    /// container spelling, the unnamed face's own key.
+    #[test]
+    fn primary_ctor_field_formal_supplied_at_call_stays_silent() {
+        let source = "class _A({this.f}) {\n\
+                      \x20 final int? f;\n\
+                      }\n\
+                      f() => _A(f: 1);\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// A primary formal read inside the `this : ...` body binds the
+    /// parameter — `site_param_uses` credits through the same
+    /// `open_ctor_site` join, so `x`'s read in the `assert` spares it.
+    /// The formal must be OPTIONAL to reach the verdict at all
+    /// (`_isUsedElement`'s `!isOptional` arm spares required positionals
+    /// unconditionally).
+    #[test]
+    fn primary_ctor_body_read_spares_the_formal() {
+        let source = "class _A([int? x]) {\n\
+                      \x20 this : assert((x ?? 0) > 0);\n\
+                      }\n\
+                      f() => _A();\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// The `.new` primary head is the UNNAMED face — its formals key on
+    /// the class name (the `note_constructor_continuation` rule applied to
+    /// `end_primary_constructor`), so `class _A.new({int? a})` reports at
+    /// `a` and `_A()` creations still resolve the face.
+    #[test]
+    fn new_primary_head_keeps_the_unnamed_formal_key() {
+        let source = "class _A.new({int? a}) {}\n\
+                      f() => _A();\n";
+        let a_at = source.find("int? a").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(a_at, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// The ordinary lanes keep their shape: a required positional formal
+    /// is never reported upstream (`_isUsedElement`'s `!isOptional` arm),
+    /// and a private method's body-read optional formal stays silent.
+    #[test]
+    fn required_and_body_read_formals_stay_silent() {
+        let source = "void _f(int x, {int? y}) {\n\
+                      \x20 print(y);\n\
+                      }\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
             "{source:?}"
         );
     }

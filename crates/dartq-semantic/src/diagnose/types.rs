@@ -560,6 +560,13 @@ pub(crate) enum FrameKind {
     Executable {
         instance: bool,
         ret: Option<ExecReturn>,
+        /// A function literal's completion context return — the official
+        /// `imposedType` (the context function type's return with the
+        /// dynamic/unknown heads dropped,
+        /// function_expression_resolver.dart:44-53); declared shapes
+        /// carry `None` (their return rides `ret`). The completion
+        /// staging's closure face reads it, anchored at the body brace.
+        ctx_ret: Option<Ty>,
         super_invoked: bool,
         body_brace: Option<SourceRange>,
         is_async: bool,
@@ -1474,6 +1481,26 @@ pub(crate) enum LocalKind {
 pub(crate) enum UnlessArg {
     Literal(StringId),
     Reference(StringId),
+}
+
+/// One folded index expression awaiting its argument check (#2937): the
+/// operand's static type and span, plus the receiver's named head the
+/// `[]`/`[]=` first formals resolve through at emission time. The write
+/// form is decided by the `OpWrite` an assignment/compound mark lands on
+/// the operator row; a `None` at drain is a pure read (`[]` face only).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexArgFace {
+    /// The index argument's static type at the fold.
+    pub(crate) index_ty: Ty,
+    /// The index argument's span — the report anchor.
+    pub(crate) index_range: SourceRange,
+    /// The index operand was a literal (the `argument_verdict` `literal`
+    /// flag — `1` against `double` stays silent).
+    pub(crate) literal: bool,
+    /// The receiver's named head (`a` of `a[i]`); `None` when the
+    /// receiver resolves to no named container (dynamic/unknown — the
+    /// check suppresses).
+    pub(crate) recv: Option<StringId>,
 }
 
 /// One annotation in flight: the written name plus, when captured, the
@@ -2478,6 +2505,33 @@ pub(crate) struct Engine<'a> {
     /// `RedirectingConstructorInvocation` visits) and never reports the
     /// member trio or `undefined_identifier` there.
     pub(crate) init_rows: FxHashMap<u32, StringId>,
+    /// The offsets of bare rows pushed inside an `extension` body whose
+    /// `on` type is a resolvable nullable named type (`extension E on
+    /// A?`) AND whose name resolved through the `on` face's member scope
+    /// — the `RefTarget::Member { container }` the `on_face_walk` arm
+    /// published, or a `Missing` row whose WRITE side (`name=` spelling)
+    /// the `on` face declares. Pass 2 runs after the container frames
+    /// tear down, so the implicit-`this`-on-nullable receiver fact rides
+    /// this latch: the bare-send arms of `resolve_bare_row` emit the
+    /// shared `unchecked_use_of_nullable_value` at the name before the
+    /// member bookkeeping (#2926 F2 — upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/type_property_resolver.dart:
+    /// 96-148, the `isNullable` tail preceding every member resolution
+    /// on the extended type; `ThisLookup`'s bare-name arm).
+    pub(crate) ext_nullable_member_rows: FxHashSet<u32>,
+    /// The offsets of bare rows pushed inside an `extension` body whose
+    /// WRITE side (`name=` spelling) resolved on the extension's own
+    /// member map or the `on` face's member scope at push time — the
+    /// lexical `ExtensionMemberScope` hit or the implicit-`this`
+    /// `ThisLookup` hit upstream's `resolveSimpleIdentifier` records.
+    /// Pass 2 cannot re-walk either scope (the frames are gone), so the
+    /// `Missing` write arm reads the union for `undefined_identifier`
+    /// suppression, and the nullable-`on` unchecked emit stands down when
+    /// the hit was the extension's own member (a lexical resolution never
+    /// consults `this` — `bar = 0` inside `extension E on A?` where `E`
+    /// declares `set bar` is silent, not the nullable receiver's
+    /// question).
+    pub(crate) ext_write_target_rows: FxHashSet<u32>,
     /// The offsets of bare rows pushed inside an instance field's
     /// declaration initializer whose name resolved to an INSTANCE member
     /// of the enclosing container (the rows that ride `this`) — statics
@@ -3366,6 +3420,18 @@ pub(crate) struct Engine<'a> {
     /// through it — the official resolver's chain for every one of these
     /// heads.
     pub(crate) member_recv_tys: FxHashMap<u32, Ty>,
+    /// The folded index expression's argument-check staging (#2937): each
+    /// `a[i]`/`a[i] op= v`/`++a[i]` folds its operand rows away at
+    /// `handle_indexed_expression`, so the index argument's static type and
+    /// span ride this latch — keyed by the bracket's open `[` offset —
+    /// until the write form finalizes (`write_op` lands on the operator
+    /// row only when an assignment/compound mark follows). The read and
+    /// write `[]`/`[]=` first formals resolve at stage time (upstream Dart
+    /// SDK source, `checkIndexExpressionIndex`,
+    /// error_detection_helpers.dart:260-289); the emission then applies the
+    /// write form's element pair at the argument's span — read-only for a
+    /// pure `a[i]`, `[]=` for `=`, both for `+=`/`++`.
+    pub(crate) index_arg_faces: FxHashMap<u32, IndexArgFace>,
     /// The folded index reads (`a[i]`, `c.l[i]`): the result row's offset
     /// (the closing `]`) keyed to the indexed receiver's own span and
     /// whether the access was null-aware (`?[`). Pass 2 re-derives the
@@ -3529,6 +3595,12 @@ pub(crate) struct Engine<'a> {
     /// declaration (`DeadCodeVerifier`'s visitFunctionDeclaration,
     /// dead_code_verifier.dart:72-82).
     pub(crate) local_fn_wildcard: Vec<(u32, bool)>,
+    /// Emission cursor over [`crate::model::FileElements::wildcard_duplicates`]:
+    /// the wildcard-dup rows drain incrementally as the walk reaches the
+    /// drain hooks (a pre-feature unit's `_` duplicates report at their
+    /// source order), each hook emitting the rows past this index so the
+    /// whole log emits exactly once per unit.
+    pub(crate) wildcard_dups_emitted: usize,
     /// Formal-parameter name spans per declaration site (the
     /// `unused_element_parameter` anchors).
     pub(crate) site_params: FxHashMap<usize, Vec<(StringId, SourceRange)>>,
@@ -3652,6 +3724,13 @@ pub(crate) struct Engine<'a> {
     /// so the teardown re-decides each against the promoted-read staging
     /// before the row emits.
     pub(crate) staged_checks: Vec<StagedCheck>,
+    /// The verdict-side alias fold's memo ([`Engine::fold_alias_verdict`]):
+    /// one interned `Ty` folds once per unit — the subtype ask re-enters
+    /// per staged check and per covariant element, and the fold's miss
+    /// path (scoped lookup, declaring-libraries probe, the to-bounds fill)
+    /// is the cost to amortize. Entries never go stale: the alias table is
+    /// final before the walk runs.
+    pub(crate) alias_fold_memo: std::cell::RefCell<FxHashMap<Ty, Ty>>,
     /// The #746 `cast_from_nullable_always_fails` candidates, offset-sorted
     /// by the read's identifier span: the cast junction's four decidable
     /// conditions held (simple local read, declared type spelled nullable,
@@ -5250,19 +5329,30 @@ impl<'a> Engine<'a> {
         false
     }
 
-    /// [`Engine::param_bound_of`] restricted to executable-owned windows:
+    /// [`Engine::param_bound_of`] restricted to executable-owned windows,
+    /// with the container-owned windows as the outer fallback (#2926 F4):
     /// a window whose owning name declares a CONTAINER in this unit is the
     /// container header's own capture (a class, mixin, or extension
     /// declaration latches `pending_exec_name` the same way a function
-    /// does) and stays out — its parameter spellings are the callee-schema
-    /// face the closure-formal solver keeps `dynamic` under a raw
-    /// receiver, never a scope-parameter verdict this predicate answers.
+    /// does). It answers AFTER every executable window missed — the
+    /// innermost scope's parameter wins (`class C<T> { void f<T>(T t) }`'s
+    /// `f`-window `T` shadows the header's). The container fallback feeds
+    /// the receiver nullability question (`(t).foo` where `t` is a
+    /// method's `T`-spelled formal and `T` is the class's own parameter —
+    /// an unbounded `T` reads its implicit `Object?` bound, the
+    /// potentially-nullable verdict upstream's `isNonNullable` gives
+    /// through the `TypeParameterType` bound). The callee-schema caveat
+    /// the exclusion documented stands only where a leaked formal could
+    /// spell `T` without a written `T` annotation — that face binds
+    /// `dynamic`, never `Named { T }`, so the window answer stays honest
+    /// wherever this predicate actually asks it.
     fn exec_param_bound(&self, name: StringId) -> Option<Ty> {
         let implicit_object = || Ty::Named {
             name: self.intern("Object"),
             nullable: true,
             args: ArgListId::EMPTY,
         };
+        let mut container_owned = None;
         for (owner, window) in self
             .exec_bounds
             .iter()
@@ -5274,12 +5364,13 @@ impl<'a> Engine<'a> {
                     .get(self.file)
                     .is_some_and(|elements| elements.container(*owner).is_some())
                 {
+                    container_owned.get_or_insert_with(|| bound.unwrap_or_else(implicit_object));
                     continue;
                 }
                 return Some(bound.unwrap_or_else(implicit_object));
             }
         }
-        None
+        container_owned
     }
 
     /// A `?`-suffixed named type joined onto an `e!` junction is its

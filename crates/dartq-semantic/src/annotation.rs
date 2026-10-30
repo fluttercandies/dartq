@@ -54,7 +54,7 @@
 //! target's uri must itself be `package:meta/…`, not merely transitively
 //! export it.
 
-use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup};
+use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, Namespaces};
 use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::Annotation;
@@ -271,6 +271,166 @@ fn imports_meta(
 /// (`pkg/linter` `prefer_const_constructors.dart` gates the lint on it).
 fn is_meta_library(graph: &LibraryGraph, target: LibraryId) -> bool {
     graph.name(target) == "meta"
+}
+
+// —— the dart:core deprecation tag (#2910) ————————————————————————————————
+//
+// The `deprecated_member_use` face's element test: upstream
+// `DeprecatedElementUsageSet.getTagInfo` (deprecated_member_use_verifier.dart
+// :73-95) scans the used element's metadata for an annotation the oracle
+// resolved to dart:core's `deprecated` getter or `Deprecated` class, and
+// reads the message argument. The name-level mirror answers the same
+// question from the declaring library's scope faces: dart:core rides every
+// library as the lowest-priority implicit import, so a BARE `deprecated` /
+// `Deprecated` spelling the declaring library can resolve to nothing else
+// (no local declaration, no explicit-import hit — either shadows it) IS the
+// dart:core tag; every other spelling stays untagged.
+
+/// Whether `annotation`'s spelling is a bare dart:core deprecation tag
+/// (`deprecated` getter or `Deprecated` class) that resolves to dart:core
+/// in `lib`'s scope — the declaring library the annotation is written in.
+pub fn is_core_deprecated(
+    annotation: &Annotation,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    lib: LibraryId,
+) -> bool {
+    is_core_deprecated_spelling(
+        strings.resolve(annotation.name),
+        strings,
+        graph,
+        namespaces,
+        lib,
+    )
+}
+
+/// [`is_core_deprecated`] over an already-resolved spelling — the
+/// declaration-site frontier's form (the unit's [`crate::model::DeclSite`]
+/// annotation names carry no [`Annotation`] face).
+pub fn is_core_deprecated_spelling(
+    spelling: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    lib: LibraryId,
+) -> bool {
+    // The prefixed face (`@core.deprecated` under `import 'dart:core' as
+    // core;`): the segment after the dot names the tag and the written
+    // prefix rides an import edge whose target is dart:core — the same
+    // resolution the oracle's element walk answers (a `p.deprecated`
+    // under any other prefix never resolves to the core tag).
+    if let Some((prefix, name)) = spelling.split_once('.') {
+        if name != "deprecated" && name != "Deprecated" {
+            return false;
+        }
+        let prefix_id = strings.intern(prefix);
+        let name_id = strings.intern(name);
+        return graph.import_edges(lib).iter().any(|edge| {
+            edge.prefix == Some(prefix_id)
+                && edge
+                    .target
+                    .is_some_and(|target| graph.uri(target) == "dart:core")
+                && edge.combinators.allows(name_id)
+        });
+    }
+    if spelling != "deprecated" && spelling != "Deprecated" {
+        return false;
+    }
+    let id = strings.intern(spelling);
+    // A local declaration shadows the implicit dart:core import (the
+    // annotation would resolve to it, never to the tag).
+    if !matches!(graph.local(lib, id), LocalLookup::Absent) {
+        return false;
+    }
+    // So does an explicit-import hit (dart:core is the lowest-priority
+    // import; the unprefixed namespace carries explicit hits only —
+    // `dart:` targets resolve to no analysis-set library).
+    matches!(namespaces.lookup(graph, lib, id), Lookup::NotFound)
+}
+
+/// The message face of a `@Deprecated` annotation: the cooked string of the
+/// first positional / `message:`-labeled (then `expires:`-labeled) string
+/// argument, normalized the way the oracle presents it
+/// (`normalizeDeprecationMessage`, deprecated_member_use_verifier.dart:18-29
+/// — trimmed; empty or a lone `.` means no message; a missing terminal
+/// `.`/`?`/`!` gains one). `None` when the annotation carries no readable
+/// message — the plain `deprecated_member_use` row.
+#[must_use]
+pub fn deprecation_message(args_text: Option<StringId>, strings: &StringTable) -> Option<String> {
+    let args = strings.resolve(args_text?);
+    let raw = deprecation_arg_string(args)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return None;
+    }
+    Some(match trimmed.as_bytes()[trimmed.len() - 1] {
+        b'.' | b'?' | b'!' => trimmed.to_owned(),
+        _ => format!("{trimmed}."),
+    })
+}
+
+/// The first readable string-literal argument of a `@Deprecated` argument
+/// group, cooked (`('Use x')` / `(message: 'Use x')` / `(expires: '2024')`):
+/// the official read is `getField('message') ?? getField('expires')` over
+/// the computed constant, so a labeled pair prefers `message`. `None` when
+/// the group carries no string literal (a `@Deprecated()` or a
+/// non-literal argument stays plain).
+fn deprecation_arg_string(args: &str) -> Option<String> {
+    let body = args.strip_prefix('(')?.strip_suffix(')')?;
+    let mut positional = None;
+    let mut expires = None;
+    let mut rest = body;
+    while let Some(start) = rest.find('\'').or_else(|| rest.find('"')) {
+        let quote = rest.as_bytes()[start];
+        // The label before the literal, when the literal sits under one:
+        // the last identifier run between the previous delimiter and the
+        // literal (a `message:`/`expires:` label reads back one token).
+        let head = rest[..start].trim_end();
+        let label = head
+            .strip_suffix(':')
+            .map_or("", |head| head.trim_start())
+            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .next()
+            .unwrap_or("");
+        let cooked = cook_string_literal(&rest[start..], quote)?;
+        let advance = start + cooked.len() + 2;
+        match label {
+            "message" => return Some(cooked),
+            "expires" => expires = expires.or(Some(cooked)),
+            _ => {
+                if positional.is_none() && (head.is_empty() || head.ends_with(',')) {
+                    positional = Some(cooked);
+                }
+            }
+        }
+        rest = &rest[advance..];
+    }
+    positional.or(expires)
+}
+
+/// Cooks the string literal at the head of `text` (whose first byte is the
+/// opening `quote`): the raw content between the quotes with the common
+/// escapes processed. `None` when the literal never closes.
+fn cook_string_literal(text: &str, quote: u8) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = text[1..].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let esc = chars.next()?;
+                out.push(match esc {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+            }
+            c if c as u32 == u32::from(quote) => return Some(out),
+            c => out.push(c),
+        }
+    }
+    None
 }
 
 #[cfg(test)]

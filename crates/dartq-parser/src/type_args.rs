@@ -42,6 +42,14 @@ pub struct ComplexTypeParamOrArg {
     /// with enclosing groups (its *last* `>` closes this group, so the
     /// real successor follows).
     pub end_raw_compound: bool,
+    /// `end` names a `...Eq` compound closer (`>=`/`>>=`/`>>>=`) shared with
+    /// enclosing groups: this group's own `>` is the compound's *last* `>`
+    /// unit, so the official successor is the `=` remainder after it
+    /// (`splitGtFromGtGt*`/`splitCloser`, `util.dart:140-234`) — never the
+    /// real next token. Mutually exclusive with `end_raw_compound`; both
+    /// `false` for a plain `>` end or a pure-`>` shared tail (whose `>`
+    /// remainder the shared-continuation check reads, not this flag).
+    pub end_eq_shared: bool,
     /// The official `inDeclaration` field: it gates the missing-comma
     /// continuations (`looksLikeTypeParamOrArg`,
     /// `type_info_impl.dart:512-521`) in both the scan and the parse.
@@ -57,16 +65,34 @@ impl TypeParamOrArg {
         }
     }
 
-    /// Whether [`TypeParamOrArg::skip`] lands on a raw compound closer whose
-    /// leading `>` closes the group (see [`ComplexTypeParamOrArg`]).
+    /// Whether [`TypeParamOrArg::skip`] lands on a compound closer whose
+    /// successor is a *non-`>`* split remainder — a raw compound (the leading
+    /// `>` closes the group, remainder `=`/`>`/`>>`) or a shared `...Eq`
+    /// tail (the last `>` closes the group, leaving `=`). In both cases the
+    /// successor can never be a name, `?`, or `Function` intro, so callers
+    /// may short-circuit the follower probes. A *pure-`>`* shared tail
+    /// (`>>`/`>>>` closing several groups) is NOT covered: its remainder is
+    /// a `>`-closer read by the shared-compound continuation check
+    /// (`compute_rest`), not by this raw-compound short-circuit.
     pub(crate) fn ends_on_raw_compound(&self) -> bool {
         match self {
             // A compound closer on the fast shape is always raw: the official
             // `skipEndGroup` returns the split leading `>` (the compound's
             // position) and the remainder follows it.
             TypeParamOrArg::Simple1 { closer } => *closer != SimpleCloser::Gt,
-            TypeParamOrArg::Complex(g) => g.end_raw_compound,
+                    TypeParamOrArg::Complex(g) => g.end_raw_compound || g.end_eq_shared,
             TypeParamOrArg::None => false,
+        }
+    }
+
+    /// The token the official stream delivers as the group's successor when
+    /// the group closed on a `...Eq` compound's *last* `>` (`end_eq_shared`):
+    /// the `=` remainder after that last unit (`splitGtFromGtGt*`/
+    /// `splitCloser`, `util.dart:140-234`). `None` for any other end.
+    pub(crate) fn shared_remainder(&self, end_kind: TokenKind) -> Option<TokenKind> {
+        match self {
+            TypeParamOrArg::Complex(g) if g.end_eq_shared => last_unit_remainder(end_kind),
+            _ => None,
         }
     }
 
@@ -249,13 +275,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             }
         }
         let start = self.real_id(self.cursor.real_pos() + n);
-        match self.scan_type_group(start, in_declaration) {
-            Some((end, recovered, end_raw_compound)) => {
+        match self.scan_type_group(start, in_declaration, 0) {
+            Some((end, recovered, end_raw_compound, end_eq_shared)) => {
                 TypeParamOrArg::Complex(ComplexTypeParamOrArg {
                     start,
                     end,
                     recovered,
                     end_raw_compound,
+                    end_eq_shared,
                     in_declaration,
                 })
             }
@@ -285,7 +312,11 @@ pub(crate) fn simple1_closer(
 }
 
 /// `>`-family closer count carried by one token (the unit mapping of
-/// [`Parser::gt_group_len`]).
+/// [`Parser::gt_group_len`]). A `...Eq` tail counts its `=` as one unit —
+/// `>=`/`>>=`/`>>>=` stand in for a `>`-closer plus the `=` remainder in the
+/// balance math (the `=` "closes" the leftover position in the
+/// `opens - closed` comparison the same way the last `>` would), so the
+/// group-boundary and backed-up computations see the full compound weight.
 pub(crate) fn closer_units(kind: TokenKind) -> usize {
     match kind {
         TokenKind::Gt => 1,
@@ -293,6 +324,23 @@ pub(crate) fn closer_units(kind: TokenKind) -> usize {
         TokenKind::GtGtEq | TokenKind::GtGtGt => 3,
         TokenKind::GtGtGtEq => 4,
         _ => 0,
+    }
+}
+
+/// The token left over when a compound closer's *last* `>` unit is consumed
+/// as a group's own closer (`end_shared`, `splitGtFromGtGt*`/`splitCloser`,
+/// `util.dart:140-234`). For a `...Eq` tail this is `=`; for a pure-`>` tail
+/// it is the remaining `>`-family token. `Gt`/`GtEq` never reach this state:
+/// `Gt` is a single unit and `GtEq`'s single `>` is the compound's first —
+/// a shared `GtEq` is only produced as the remainder of `GtGtEq`, not as a
+/// scanned end token.
+pub(crate) fn last_unit_remainder(kind: TokenKind) -> Option<TokenKind> {
+    match kind {
+        TokenKind::GtGt => Some(TokenKind::Gt),
+        TokenKind::GtGtEq => Some(TokenKind::Eq),
+        TokenKind::GtGtGt => Some(TokenKind::GtGt),
+        TokenKind::GtGtGtEq => Some(TokenKind::Eq),
+        _ => None,
     }
 }
 
@@ -530,15 +578,39 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.span_of(id)
     }
 
+    /// Length (in tokens) of the `<...>` group at `lt_offset` when it
+    /// VALIDATES as a type-parameter/argument group — the skip-length face of
+    /// `computeTypeParamOrArg` (`type_info.dart:420`): the `SimpleTypeArgument1`
+    /// fast shape (`<` name closer-unit, `_computeTypeParamOrArgImpl`
+    /// :440-452) spans three tokens, otherwise the full
+    /// `ComplexTypeParamOrArgInfo.compute` scan decides, and a rejected group
+    /// (`None`) leaves the caller with no group at all. This is the boundary
+    /// the official `typeArguments.skip(start)` reports; a raw `<>`-balance
+    /// count (`gt_group_len`) over-extends across content the validated scan
+    /// rejects (`<C()>`: `C` followed by `(`), misplacing every subsequent
+    /// decision.
+    fn group_skip_len(&self, lt_offset: usize, in_declaration: bool, depth: u32) -> Option<usize> {
+        if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
+            return None;
+        }
+        if simple1_closer(self, lt_offset).is_some() {
+            return Some(3);
+        }
+        let (end, ..) = self.scan_type_group(self.real_id(lt_offset), in_declaration, depth)?;
+        Some(self.offset_of(end) - lt_offset + 1)
+    }
+
     /// Scans a `<...>` group without consuming (official
     /// `ComplexTypeParamOrArgInfo.compute`). Returns
-    /// `(closer id, recovered, closer is a raw compound)`. `scan` walks the
-    /// real stream: it always names the next token to inspect.
+    /// `(closer id, recovered, closer is a raw compound, closer is a shared
+    /// compound)`. `scan` walks the real stream: it always names the next
+    /// token to inspect.
     fn scan_type_group(
         &self,
         lt_id: TokenId,
         in_declaration: bool,
-    ) -> Option<(TokenId, bool, bool)> {
+        depth: u32,
+    ) -> Option<(TokenId, bool, bool, bool)> {
         let lt_offset = self.offset_of(lt_id);
         let mut recovered = false;
         let mut scan = lt_offset + 1;
@@ -550,7 +622,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 scan += metadata_len;
             }
-            let len = self.skip_type_len(scan);
+            let len = self.skip_type_len_in(scan, in_declaration, depth + 1);
             if len == 0 {
                 let here = self.kind_at(scan);
                 if here == TokenKind::Comma {
@@ -559,8 +631,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 if is_closer(here) {
                     // Stopped at the closer directly: a compound closer's
-                    // leading `>` is this group's own (raw).
-                    return Some((self.real_id(scan), recovered, is_compound_closer(here)));
+                    // leading `>` is this group's own (raw); it is never
+                    // shared with enclosing groups.
+                    return Some((self.real_id(scan), recovered, is_compound_closer(here), false));
                 }
                 // Official computeType(required) recovery: `var` as a type
                 // entry, accepted before `<`/`,`/`>` (type_info.dart:210-217,
@@ -579,13 +652,19 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 if scan == lt_offset + 1 && !in_declaration {
                     return None;
                 }
-                return Some(self.recovered_group_end(scan));
+                // Non-type junk INSIDE the group (`< extends int>`): the
+                // official break consumes the junk as the member (`token =
+                // next; next = token.next`, type_info_impl.dart:1395-1397),
+                // so the closer probes start one token later — `< extends
+                // int>` ends on the real `>` instead of degenerating to
+                // `<` alone (which resurfaces as a missing-comma cascade).
+                return Some(self.recovered_group_end(scan, true));
             }
             let (end, mut backed_up) = self.step_over_type(scan, len);
             scan = end;
             if self.kind_at(scan) == TokenKind::Keyword(Keyword::Extends) {
                 scan += 1;
-                let super_len = self.skip_type_len(scan);
+                let super_len = self.skip_type_len_in(scan, in_declaration, depth + 1);
                 let (end, super_backed) = self.step_over_type(scan, super_len);
                 scan = end;
                 backed_up = super_backed;
@@ -593,13 +672,26 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             match self.kind_at(scan) {
                 TokenKind::Comma => scan += 1,
                 kind if is_closer(kind) => {
-                    // A stop on a shared (backed-up-onto) compound closer is
-                    // not raw: its last closer closes this group and the
-                    // real successor follows.
+                    // A stop on a compound closer whose units over-close the
+                    // enclosing groups (backed-up) makes this group's own `>`
+                    // the compound's *last* unit. When that compound ends in
+                    // `=` (`>=`/`>>=`/`>>>=`) the `=` is the official
+                    // successor (`end_eq_shared`) — never the real next
+                    // token — while a pure-`>` tail's remainder is a `>`
+                    // handled by the shared-continuation check. The fast
+                    // path stays `end_raw_compound` (peel-the-first-`>`,
+                    // false when backed-up); the `=` successor is read
+                    // through `shared_remainder`.
+                    let end_eq_shared = backed_up
+                        && matches!(
+                            kind,
+                            TokenKind::GtEq | TokenKind::GtGtEq | TokenKind::GtGtGtEq
+                        );
                     return Some((
                         self.real_id(scan),
                         recovered,
                         is_compound_closer(kind) && !backed_up,
+                        end_eq_shared,
                     ));
                 }
                 _ => {
@@ -625,29 +717,46 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             TokenKind::Identifier | TokenKind::Comma
                         ) || is_closer(self.kind_at(scan + 1)))
                     {
-                        let len = self.skip_type_len(scan);
+                        let len = self.skip_type_len_in(scan, in_declaration, depth + 1);
                         if len > 0 {
                             scan += len;
                             continue;
                         }
                     }
                     // Recovery: declaration-style content missing commas —
-                    // stop at the first non-member shape.
-                    return Some(self.recovered_group_end(scan));
+                    // stop at the first non-member shape. `scan` here is
+                    // the token that FAILED the member test (the `(` after
+                    // `int m0`), not consumed junk — the official break
+                    // leaves `next` on it, so the `(`-step and closer probes
+                    // start right there.
+                    return Some(self.recovered_group_end(scan, false));
                 }
             }
         }
     }
 
     /// The recovery tail of `ComplexTypeParamOrArgInfo.compute`
-    /// (type_info_impl.dart:1408-1423) at the junk offset `next`: a `(`
-    /// group is stepped over, then a closer at the follower or one token
-    /// further ends the group (`splitCloser`), else the group ends on a
-    /// synthetic `>` in front of the follower (`syntheticGt`) — encoded as
-    /// the token before the follower being the group's last token, so the
-    /// type ends there and the follower (a declaration's name) stays out of
-    /// the type.
-    fn recovered_group_end(&self, mut next: usize) -> (TokenId, bool, bool) {
+    /// (type_info_impl.dart:1408-1423) at offset `next`: a `(` group is
+    /// stepped over, then a closer at the follower or one token further
+    /// ends the group (`splitCloser`), else the group ends on a synthetic
+    /// `>` in front of the follower (`syntheticGt`) — encoded as the token
+    /// before the follower being the group's last token, so the type ends
+    /// there and the follower (a declaration's name) stays out of the type.
+    ///
+    /// `junk_is_member` selects between the two official break shapes:
+    /// non-type junk inside the group (`< extends int>`, the :1395-1397
+    /// break) is consumed as the member itself, so probing starts one
+    /// token later; a failed member test (the `(` after `int m0`, the
+    /// :1404 `looksLikeTypeParamOrArg` break) leaves `next` ON the failed
+    /// token, so probing starts at `next` unchanged.
+    fn recovered_group_end(
+        &self,
+        mut next: usize,
+        junk_is_member: bool,
+    ) -> (TokenId, bool, bool, bool) {
+        if junk_is_member {
+            next += 1;
+        }
         if self.kind_at(next) == TokenKind::OpenParen
             && let Some(end) = self.cursor.table_matching_end(self.real_id(next))
         {
@@ -656,10 +765,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         for at in [next, next + 1] {
             let kind = self.kind_at(at);
             if is_closer(kind) {
-                return (self.real_id(at), true, is_compound_closer(kind));
+                return (self.real_id(at), true, is_compound_closer(kind), false);
             }
         }
-        (self.real_id(next - 1), true, false)
+        (self.real_id(next - 1), true, false, false)
     }
 
     /// Advance from a type's first token past its `skipType` length. When the
@@ -738,7 +847,83 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// `offset`; `0` when nothing type-shaped is there. Read-only; used by
     /// group scans and record-type checks. Exact for valid input; recovery
     /// input may yield 0 where the official recovers (see module docs).
+    ///
+    /// The official `skipType` walks `computeType` with
+    /// `inDeclaration = false` (the default argument), so nested type-argument
+    /// groups validate strictly; use [`Self::skip_type_len_in`] where the
+    /// caller's declaration context must thread through.
     pub(crate) fn skip_type_len(&self, offset: usize) -> usize {
+        self.skip_type_len_in(offset, false, 0)
+    }
+
+    /// [`Self::skip_type_len`] with the official `inDeclaration` threading:
+    /// `computeType(next, required, inDeclaration)` passes its flag into
+    /// `computeTypeParamOrArg(next, inDeclaration)` for the `<...>` group
+    /// after an identifier (type_info.dart:264-278), so a nested group's
+    /// acceptance — and therefore the type's end — follows the caller's
+    /// declaration context. The `depth` counter is the scan-path share of the
+    /// [`TYPE_DEPTH_CRASH_GUARD`] stack discipline: the group probe recurses
+    /// once per type-nesting level, mirroring the official unguarded
+    /// `computeType` descent.
+    /// `computeRest`'s GFT chain (type_info_impl.dart:1094-1133) anchored at
+    /// the `Function` at `offset`: each `Function [<typeVarGroup>]` suffix
+    /// counts only when `(` follows — `end` (and therefore `skipType`) updates
+    /// only after the formal-parameter group, so a broken chain leaves
+    /// `gftHasReturnType` null and the caller falls back to the bare head
+    /// (`computeNoTypeGFT` :744 → `simpleType`; `computeVoidGFT` :949-959 →
+    /// `voidType`). The type-variable groups scan with
+    /// `inDeclaration: true` (:1099). `None` = no complete GFT.
+    fn gft_suffix_len(&self, offset: usize, depth: u32) -> Option<usize> {
+        if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
+            return None;
+        }
+        let mut n = 1;
+        if self.kind_at(offset + 1) == TokenKind::Lt {
+            n += self.group_skip_len(offset + 1, true, depth + 1)?;
+        }
+        if self.kind_at(offset + n) != TokenKind::OpenParen {
+            return None;
+        }
+        let close = self.cursor.table_matching_end(self.real_id(offset + n))?;
+        n = self.offset_of(close) - offset + 1;
+        if self.kind_at(offset + n) == TokenKind::Question {
+            n += 1;
+        }
+        while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
+            let mut probe = n + 1;
+            if self.kind_at(offset + probe) == TokenKind::Lt {
+                match self.group_skip_len(offset + probe, true, depth + 1) {
+                    Some(len) => probe += len,
+                    None => break,
+                }
+            }
+            if self.kind_at(offset + probe) != TokenKind::OpenParen {
+                break;
+            }
+            let Some(close) = self.cursor.table_matching_end(self.real_id(offset + probe)) else {
+                break;
+            };
+            n = self.offset_of(close) - offset + 1;
+            if self.kind_at(offset + n) == TokenKind::Question {
+                n += 1;
+            }
+        }
+        Some(n)
+    }
+
+    /// [`Self::skip_type_len`] with the official `inDeclaration` threading:
+    /// `computeType(next, required, inDeclaration)` passes its flag into
+    /// `computeTypeParamOrArg(next, inDeclaration)` for the `<...>` group
+    /// after an identifier (type_info.dart:264-278), so a nested group's
+    /// acceptance — and therefore the type's end — follows the caller's
+    /// declaration context. The `depth` counter is the scan-path share of the
+    /// [`TYPE_DEPTH_CRASH_GUARD`] stack discipline: the group probe recurses
+    /// once per type-nesting level, mirroring the official unguarded
+    /// `computeType` descent.
+    pub(crate) fn skip_type_len_in(&self, offset: usize, in_declaration: bool, depth: u32) -> usize {
+        if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
+            return 0;
+        }
         match self.kind_at(offset) {
             TokenKind::Keyword(Keyword::Void) => {
                 let mut n = 1;
@@ -752,10 +937,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 // `void Function(...)` — a generalized function type with a
                 // `void` return type (the official group scan walks this via
-                // the full `computeType`, `type_info_impl.dart:1356`).
+                // the full `computeType`, `type_info_impl.dart:1356`). The
+                // chain counts only when complete: `computeVoidGFT`
+                // (:949-959) falls back to plain `voidType` when
+                // `gftHasReturnType` stays null (a broken
+                // `Function [<...>]` without the formal-parameter group).
                 if self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
-                    let fn_len = self.skip_type_len(offset + n);
-                    if fn_len > 0 {
+                    if let Some(fn_len) = self.gft_suffix_len(offset + n, depth + 1) {
                         n += fn_len;
                     }
                 }
@@ -778,7 +966,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
                             let mut probe = n + 1;
                             if self.kind_at(offset + probe) == TokenKind::Lt {
-                                match self.gt_group_len(offset + probe) {
+                                // Type-variable group: `computeRest` scans it
+                                // with `inDeclaration: true`
+                                // (type_info_impl.dart:1097).
+                                match self.group_skip_len(offset + probe, true, depth + 1) {
                                     Some(len) => probe += len,
                                     None => break,
                                 }
@@ -802,22 +993,17 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
             }
             TokenKind::Keyword(Keyword::Function) => {
-                let mut n = 1;
-                if self.kind_at(offset + 1) == TokenKind::Lt {
-                    let Some(len) = self.gt_group_len(offset + 1) else {
-                        return 0;
-                    };
-                    n += len;
-                }
-                if self.kind_at(offset + n) == TokenKind::OpenParen {
-                    let Some(end) = self.cursor.table_matching_end(self.real_id(offset + n)) else {
-                        return 0;
-                    };
-                    n = self.offset_of(end) - offset + 1;
-                    if self.kind_at(offset + n) == TokenKind::Question {
-                        n += 1;
-                    }
-                } else {
+                // `computeNoTypeGFT` (type_info_impl.dart:1061-1071) via
+                // `computeRest`: the `Function [<typeVarGroup>] (...)` chain
+                // updates `end` only AFTER the formal-parameter group, so a
+                // broken chain (`Function<T 5 6>`, `Function<T> x`) leaves
+                // `gftHasReturnType` null and required computeType falls back
+                // to `simpleType` — the bare `Function` head. A complete chain
+                // skips to its end (`computeRest` loops the whole
+                // `Function <...>? (...) ?` suffix series,
+                // type_info_impl.dart:1094-1133).
+                match self.gft_suffix_len(offset, depth) {
+                    Some(n) => n,
                     // Bare `Function` head — not a GFT intro: the official
                     // computeType(required) reads it as `simpleType` /
                     // `simpleNullableType` (type_info.dart:305-330), so the
@@ -826,35 +1012,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // scanned as length 0, the whole `<...>` group was
                     // rejected, and the `?` fell to the expression layer as
                     // a conditional (the expected-token ':' cascade).
-                    if self.kind_at(offset + n) == TokenKind::Question {
-                        n += 1;
-                    }
-                }
-                // computeRest loops the whole `Function <...>? (...) ?`
-                // suffix chain (`Function() Function()` is ONE type,
-                // type_info_impl.dart:1094-1133); the identifier and record
-                // arms below mirror the same loop.
-                while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
-                    let mut probe = n + 1;
-                    if self.kind_at(offset + probe) == TokenKind::Lt {
-                        match self.gt_group_len(offset + probe) {
-                            Some(len) => probe += len,
-                            None => break,
+                    None => {
+                        if self.kind_at(offset + 1) == TokenKind::Question {
+                            2
+                        } else {
+                            1
                         }
                     }
-                    if self.kind_at(offset + probe) != TokenKind::OpenParen {
-                        break;
-                    }
-                    let Some(close) = self.cursor.table_matching_end(self.real_id(offset + probe))
-                    else {
-                        break;
-                    };
-                    n = self.offset_of(close) - offset + 1;
-                    if self.kind_at(offset + n) == TokenKind::Question {
-                        n += 1;
-                    }
                 }
-                n
             }
             k if is_valid_non_record_type_reference(k, self.kind_at(offset + 1)) => {
                 let mut n = 1;
@@ -867,7 +1032,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     n = 3;
                 }
                 if self.kind_at(offset + n) == TokenKind::Lt {
-                    match self.gt_group_len(offset + n) {
+                    // The type-argument group after the identifier:
+                    // `computeType` hands the caller's `inDeclaration` to
+                    // `computeTypeParamOrArg` (type_info.dart:264-268), so the
+                    // group must validate the same way — a rejected group
+                    // (`A<B<C()>>`'s inner `<C()>`: after `C` the `(` is
+                    // neither `,` nor a closer, so the compute returns
+                    // noTypeParamOrArg) leaves the type as the bare identifier
+                    // and the `<...>` outside it.
+                    match self.group_skip_len(offset + n, in_declaration, depth + 1) {
                         Some(len) => {
                             // The group length covers only the `<...>` tail;
                             // the identifier (or `id.id`) prefix stays.
@@ -900,7 +1073,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                                 n += 1;
                             }
                         }
-                        None => return 0,
+                        // Rejected group: the type stays the bare identifier
+                        // (`computeSimpleWithTypeArguments` never runs; the
+                        // plain-identifier dispatch returns `simpleType`,
+                        // type_info.dart:380-384) — the `<...>` tail remains
+                        // outside the type for the enclosing scan to judge.
+                        None => {}
                     }
                 } else if self.kind_at(offset + n) == TokenKind::Question {
                     n += 1;
@@ -915,7 +1093,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
                     let mut probe = n + 1;
                     if self.kind_at(offset + probe) == TokenKind::Lt {
-                        match self.gt_group_len(offset + probe) {
+                        // Type-variable group: validated with `inDeclaration:
+                        // true` (computeRest, type_info_impl.dart:1097).
+                        match self.group_skip_len(offset + probe, true, depth + 1) {
                             Some(len) => probe += len,
                             None => break,
                         }
@@ -1004,7 +1184,7 @@ impl ComplexTypeParamOrArg {
                 parser.leave_type_depth();
                 return end;
             }
-            let mut type_info = parser.compute_type(true, false);
+            let mut type_info = parser.compute_type(true, self.in_declaration);
             // Recovery: annotations over type arguments are reported and
             // skipped without events (official skipMetadata probe; the
             // cursor sits on the `@` — official `skipMetadata(next)`
@@ -1016,7 +1196,7 @@ impl ComplexTypeParamOrArg {
             {
                 let at = parser.peek_span();
                 parser.skip_metadata_silent();
-                type_info = parser.compute_type(true, false);
+                type_info = parser.compute_type(true, self.in_declaration);
                 let end_span = parser.peek_span();
                 parser.report_with_end(msg::annotation_on_type_argument(), at, end_span);
             }
@@ -1157,7 +1337,10 @@ impl ComplexTypeParamOrArg {
             if parser.peek_kind() == TokenKind::Keyword(Keyword::Extends) {
                 let extends_span = parser.peek_span();
                 parser.cursor.advance();
-                let info = parser.compute_type(true, false);
+                // Official bound compute threads the group's flag
+                // (`computeType(next, required: true, inDeclaration)`,
+                // type_info_impl.dart:1526-1531).
+                let info = parser.compute_type(true, self.in_declaration);
                 // Official `token = typeInfo.skipType(next)`
                 // (type_info_impl.dart:1530): the scan position moves to the
                 // supertype's last token. `NoType` keeps the official
@@ -1259,8 +1442,12 @@ impl ComplexTypeParamOrArg {
             let id = parser.cursor.consume_closer();
             parser.span_of(id)
         } else {
-            parser.report(msg::expected_after_but_got(">"), parser.peek_span());
-            parser.type_arg_group_end_or_synthetic(begin)
+            // Official `parseUnexpectedEnd(token3, isArguments: false)`
+            // (type_info_impl.dart:1583-1585): the missing-closer cascade
+            // anchors on token3 (the last completed variable's end), walks
+            // the extends/type/nested-group/`(` recovery arms in order, and
+            // returns the group end (a consumed closer or a synthetic `>`).
+            parser.parse_type_args_unexpected_end(self.in_declaration, false, begin)
         };
         parser.listener.end_type_variables(begin, end);
         parser.leave_type_depth();
@@ -1275,20 +1462,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     fn peek_ahead_is_name(&self, n: usize) -> bool {
         let kind = self.cursor.look_kind(n);
         is_identifier(kind)
-    }
-
-    /// Recovery exit for a type-variable list whose closer is missing: jump
-    /// to the scanner-paired `>` or synthesize one.
-    pub(crate) fn type_arg_group_end_or_synthetic(&mut self, begin: TokenSpan) -> TokenSpan {
-        if let Some(end) = self.cursor.table_matching_end(begin.id) {
-            self.skip_to_token(end);
-            return {
-                let id = self.cursor.advance();
-                self.span_of(id)
-            };
-        }
-        let at = self.peek_span();
-        self.synthetic(TokenKind::Gt, at.range.offset)
     }
 
     /// Consuming `skipMetadata` (util.dart:96): skips `@`-annotation-shaped

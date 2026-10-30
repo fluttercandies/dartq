@@ -214,3 +214,71 @@ fn plain_extends_positive_reports() {
         report.diagnostics
     );
 }
+
+/// —— the interface-cycle operand ——
+
+/// `a is B` over the mutual `extends` cycle (`class A extends B`,
+/// `class B extends A`): upstream clears both participants' supertypes
+/// (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/summary2/interface_cycles.dart, the
+/// `_markCircular` arm — the cycle element's `supertype` becomes
+/// `objectType`), so `A <: B` reads `Object` and stays silent — the
+/// cycle face dartq must not prove.
+#[test]
+fn mutual_extends_cycle_stays_informative() {
+    let report = report_ops(
+        "class A extends B {}\n\
+         class B extends A {}\n\
+         void main() {\n\
+         \x20  var a = new A();\n\
+         \x20  if (a is B) {}\n\
+         }",
+    );
+    assert!(
+        type_check_rows(&report).is_empty(),
+        "rows: {:#?}",
+        report.diagnostics
+    );
+}
+
+/// `a is B` where only the FORWARD edge is the cycle member's cleared
+/// supertype — a three-class triangle `A extends B`, `B extends C`,
+/// `C extends A`: every element's supertype collapses to `Object`, so
+/// `A <: B` is no fit.
+#[test]
+fn triangle_extends_cycle_stays_informative() {
+    let report = report_ops(
+        "class A extends B {}\n\
+         class B extends C {}\n\
+         class C extends A {}\n\
+         void main() {\n\
+         \x20  var a = new A();\n\
+         \x20  if (a is B) {}\n\
+         }",
+    );
+    assert!(
+        type_check_rows(&report).is_empty(),
+        "rows: {:#?}",
+        report.diagnostics
+    );
+}
+
+/// `c2 is SomeBase` where `C2 = S with C2` self-cycles and the tested
+/// face is `S`: upstream resets `C2.supertype = Object` (its mixin
+/// clause dropped), so `C2 <: S` is silent — the cleared-mixin face.
+#[test]
+fn self_mixin_cycle_to_super_stays_informative() {
+    let report = report_ops(
+        "class S {}\n\
+         class C2 = S with C2;\n\
+         void main() {\n\
+         \x20  var c2 = new C2();\n\
+         \x20  if (c2 is S) {}\n\
+         }",
+    );
+    assert!(
+        type_check_rows(&report).is_empty(),
+        "rows: {:#?}",
+        report.diagnostics
+    );
+}

@@ -110,6 +110,17 @@ pub(crate) enum FrozenFace {
     Unknown,
 }
 
+/// The compound/prefix/postfix operator verdict
+/// ([`Engine::adjacent_operator_defined_in`]): the operand's static type
+/// defines the spelling, two applicable extensions make it ambiguous
+/// (the oracle reports `ambiguous_extension_member_access` at the
+/// operator, never `undefined_operator`), or nothing defines it.
+enum AdjacentOp {
+    Defined,
+    Ambiguous(Vec<(String, String)>),
+    Missing,
+}
+
 /// The static type a cascade target receiver classifies to (#2459②③): the
 /// named faces answer the `..[` section's operator question directly, a
 /// prefix or unresolvable receiver has no type the model can walk.
@@ -1393,7 +1404,7 @@ impl<'a> Engine<'a> {
                 // selector-anchored read face's own row (the member sites'
                 // gate) — this face fires only when the receiver reads clean
                 // and the member's result is the nullable operand.
-                if let Some((op_text, op_range, kind)) = self.adjacent_operator(row)
+                if let Some((op_text, op_range, kind, _)) = self.adjacent_operator(row)
                     && matches!(recv, Receiver::Typed { ty, .. } if !self.potentially_nullable(ty))
                     && let Ok(index) = self
                         .member_reads
@@ -2212,9 +2223,25 @@ impl<'a> Engine<'a> {
                                 );
                             }
                         } else {
-                            self.check_operator_expr(ty, row);
+                            // A bare name resolving to an enclosing
+                            // container's member (`field = T` reads `a` of
+                            // `class C<T extends num> { T a; m() { a += 1 } }`)
+                            // carries the declaring container — the bound
+                            // consult needs it to find `T`'s declared bound.
+                            let member_container = self
+                                .refs
+                                .binary_search_by(|published| {
+                                    published.range.offset.cmp(&row.range.offset)
+                                })
+                                .ok()
+                                .filter(|&at| self.refs[at].range == row.range)
+                                .and_then(|at| match self.refs[at].target {
+                                    RefTarget::Member { container } => Some(container),
+                                    _ => None,
+                                });
+                            self.check_operator_expr_in(ty, row, member_container);
                         }
-                    } else if let Some((op_text, op_range, kind)) = adjacent {
+                    } else if let Some((op_text, op_range, kind, compound)) = adjacent {
                         // The compound/prefix/postfix face (#2815 R2 —
                         // assignment_expression_resolver.dart:232-278, the
                         // increment twins): the application reads its operand
@@ -2222,36 +2249,82 @@ impl<'a> Engine<'a> {
                         // reports the shared unchecked code at the operator
                         // token naming the BASE operator (`x += 1` reports
                         // the method '+', `x++` the method '+').
-                        if self.potentially_nullable(ty)
+                        if matches!(ty, Ty::Null) {
+                            // The `NullType` dereference swaps the code to
+                            // `invalid_use_of_null_value` at the operand
+                            // (nullable_dereference_verifier.dart:47-49) —
+                            // `n++`, `n += 1`, `-n` all report there.
+                            self.emit(SemanticCode::InvalidUseOfNullValue, row.range, "", "");
+                        } else if matches!(ty, Ty::Void) {
+                            // `void` is potentially nullable upstream: the
+                            // increment and unary twins report the shared
+                            // unchecked code at the operator. A compound
+                            // `v op= x` reports `use_of_void_result` alone
+                            // (the assignment resolver's read consult never
+                            // reaches the nullable tail for a void write
+                            // target) — that family owns the row.
+                            if !compound {
+                                self.emit_unchecked_nullable(op_range, op_text, kind);
+                            }
+                        } else if self.potentially_nullable(ty)
                             && !self.null_aware_members.contains(&row.range.offset)
                             && !self.operator_face_extension_resolved(ty, row)
                         {
                             self.emit_unchecked_nullable(op_range, op_text, kind);
-                        } else if !self.adjacent_operator_defined(ty, op_text) {
-                            // The undefined-operator face (the increment/
-                            // compound consults — postfix_expression_resolver
-                            // .dart:159 and the assignment resolver's
-                            // operator twin): the operand's static type
-                            // answers the base operator's definedness, a
-                            // miss reports at the operator token with the
-                            // operand's display name (dynamic/void/unknown
-                            // dispatch dynamically — silent).
-                            let type_text = match self.fold_alias_ty(ty) {
-                                face @ (Ty::Record { .. } | Ty::Function { .. }) => {
-                                    Some(face.render(&self.strings, &self.boundary.pool()))
+                        } else {
+                            // The same member-container hint the direct
+                            // operator arm derives (`a += 1` on a `T a`
+                            // field consults `C`'s captured bound for `T`).
+                            let member_container = self
+                                .refs
+                                .binary_search_by(|published| {
+                                    published.range.offset.cmp(&row.range.offset)
+                                })
+                                .ok()
+                                .filter(|&at| self.refs[at].range == row.range)
+                                .and_then(|at| match self.refs[at].target {
+                                    RefTarget::Member { container } => Some(container),
+                                    _ => None,
+                                });
+                            match self.adjacent_operator_defined_in(ty, op_text, member_container) {
+                                AdjacentOp::Defined => {}
+                                // The ambiguous application replaces the
+                                // operator miss (the oracle reports the
+                                // ambiguity at the operator token, never
+                                // `undefined_operator`).
+                                AdjacentOp::Ambiguous(displays) => {
+                                    let member = self.intern(op_text);
+                                    self.emit_extension_ambiguity(member, op_range, displays);
                                 }
-                                Ty::Named { name, .. } => {
-                                    Some(self.strings.resolve(name).to_owned())
+                                AdjacentOp::Missing => {
+                                    // The undefined-operator face (the
+                                    // increment/compound consults —
+                                    // postfix_expression_resolver.dart:159
+                                    // and the assignment resolver's
+                                    // operator twin): the operand's static
+                                    // type answers the base operator's
+                                    // definedness, a miss reports at the
+                                    // operator token with the operand's
+                                    // display name (dynamic/unknown
+                                    // dispatch dynamically — silent).
+                                    let type_text = match self.fold_alias_ty(ty) {
+                                        face @ (Ty::Record { .. } | Ty::Function { .. }) => Some(
+                                            face.render(&self.strings, &self.boundary.pool()),
+                                        ),
+                                        Ty::Named { name, .. } => {
+                                            Some(self.strings.resolve(name).to_owned())
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(type_text) = type_text {
+                                        self.emit(
+                                            SemanticCode::UndefinedOperator,
+                                            op_range,
+                                            op_text,
+                                            &type_text,
+                                        );
+                                    }
                                 }
-                                _ => None,
-                            };
-                            if let Some(type_text) = type_text {
-                                self.emit(
-                                    SemanticCode::UndefinedOperator,
-                                    op_range,
-                                    op_text,
-                                    &type_text,
-                                );
                             }
                         }
                     } else if row.intent == Intent::Invoke
@@ -2484,18 +2557,7 @@ impl<'a> Engine<'a> {
                             && !self.keyword_bare_reference(row.range)
                             && !self.guard.ignore(None, row.name)
                             && (initializer_container.is_some()
-                                || (!self.bare_write_target_exists(row.name, this_type)
-                                    // The write side the pass cannot
-                                    // re-walk (#2926 F2): `foo = 0` inside
-                                    // an extension body resolves `foo=` on
-                                    // the extension's own map or the `on`
-                                    // face — `bare_write_target_exists`'s
-                                    // pass-2 scope lookup sees neither
-                                    // (the frames are gone), so the
-                                    // push-time latch answers instead.
-                                    && !self
-                                        .ext_write_target_rows
-                                        .contains(&row.range.offset)))
+                                || !self.write_target_rescues(&row, this_type))
                         {
                             self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
                         }
@@ -2516,10 +2578,15 @@ impl<'a> Engine<'a> {
                         // invalid operand's dynamic face swallows the
                         // operator lookup (probed: `missing + 1` reports the
                         // identifier alone, `missing[0]` likewise).
+                        // A setter-only name does not rescue the operand
+                        // read — the operator consults the getter namespace
+                        // upstream (a `name=` hit is recovery, never the
+                        // requested element, lexical_lookup.dart:22-35), so
+                        // the `bare_write_target_exists` second chance does
+                        // not apply here the way it does to `Intent::Write`.
                         if !Self::synthetic_reference(row.range)
                             && !self.keyword_bare_reference(row.range)
                             && !self.guard.ignore(None, row.name)
-                            && !self.bare_write_target_exists(row.name, this_type)
                         {
                             self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
                         }
@@ -2549,7 +2616,7 @@ impl<'a> Engine<'a> {
     fn adjacent_operator(
         &self,
         row: &Row,
-    ) -> Option<(&'static str, SourceRange, UncheckedNullableKind)> {
+    ) -> Option<(&'static str, SourceRange, UncheckedNullableKind, bool)> {
         let tokens = self.tokens.as_slice();
         let span = |token: &dartq_scanner::Token| SourceRange {
             offset: token.utf16_offset,
@@ -2559,26 +2626,32 @@ impl<'a> Engine<'a> {
         };
         let at = tokens.partition_point(|t| t.utf16_offset < row.range.end());
         let suffix = tokens.get(at).and_then(|token| {
-            let (text, kind) = match token.kind {
-                dartq_scanner::TokenKind::PlusPlus | dartq_scanner::TokenKind::PlusEq => {
-                    ("+", UncheckedNullableKind::Method)
+            let (text, kind, compound) = match token.kind {
+                dartq_scanner::TokenKind::PlusPlus => ("+", UncheckedNullableKind::Method, false),
+                dartq_scanner::TokenKind::PlusEq => ("+", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::MinusMinus => {
+                    ("-", UncheckedNullableKind::Method, false)
                 }
-                dartq_scanner::TokenKind::MinusMinus | dartq_scanner::TokenKind::MinusEq => {
-                    ("-", UncheckedNullableKind::Method)
+                dartq_scanner::TokenKind::MinusEq => ("-", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::StarEq => ("*", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::SlashEq => ("/", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::PercentEq => ("%", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::TildeSlashEq => {
+                    ("~/", UncheckedNullableKind::Method, true)
                 }
-                dartq_scanner::TokenKind::StarEq => ("*", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::SlashEq => ("/", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::PercentEq => ("%", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::TildeSlashEq => ("~/", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::LtLtEq => ("<<", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::GtGtEq => (">>", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::GtGtGtEq => (">>>", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::AmpersandEq => ("&", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::BarEq => ("|", UncheckedNullableKind::Method),
-                dartq_scanner::TokenKind::CaretEq => ("^", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::LtLtEq => ("<<", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::GtGtEq => (">>", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::GtGtGtEq => {
+                    (">>>", UncheckedNullableKind::Method, true)
+                }
+                dartq_scanner::TokenKind::AmpersandEq => {
+                    ("&", UncheckedNullableKind::Method, true)
+                }
+                dartq_scanner::TokenKind::BarEq => ("|", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::CaretEq => ("^", UncheckedNullableKind::Method, true),
                 _ => return None,
             };
-            Some((text, span(token), kind))
+            Some((text, span(token), kind, compound))
         });
         if suffix.is_some() {
             return suffix;
@@ -2607,7 +2680,7 @@ impl<'a> Engine<'a> {
             dartq_scanner::TokenKind::Tilde => "~",
             _ => "-",
         };
-        Some((text, span(token), UncheckedNullableKind::Method))
+        Some((text, span(token), UncheckedNullableKind::Method, false))
     }
 
     /// Whether the token kind can END an operand (the unary-minus
@@ -2641,10 +2714,31 @@ impl<'a> Engine<'a> {
     /// `resolveToBound(leftType)` before the property consult
     /// (binary_expression_resolver.dart:461), so `T extends num` resolves
     /// `+` on `num`'s face. The captured windows survive the pass-2 frame
-    /// teardown ([`Self::param_bound_of`]); a class-generic parameter stays
-    /// unmodeled (`None` — the under-report direction).
-    fn bound_defines_operator(&self, head: StringId, spelling: StringId) -> bool {
-        let Some(bound) = self.param_bound(head).or_else(|| self.param_bound_of(head)) else {
+    /// teardown ([`Self::param_bound_of`]); a class-generic parameter
+    /// resolves through its DECLARING container's captured bounds —
+    /// `hint` carries the receiver/member's owning container when the
+    /// verdict site knows it (a member read's walk container, the `refs`
+    /// publication's `Member` target for a bare field row); `None` keeps
+    /// the scope-window probes alone.
+    fn bound_defines_operator_in(
+        &self,
+        head: StringId,
+        spelling: StringId,
+        hint: Option<StringId>,
+    ) -> bool {
+        let bound = self
+            .param_bound(head)
+            .or_else(|| self.param_bound_of(head))
+            .or_else(|| {
+                let container = hint?;
+                self.bounds
+                    .container_params(container)?
+                    .into_iter()
+                    .find(|(param, ..)| *param == head)
+                    .and_then(|(_, tree, _)| tree)
+                    .map(|tree| self.tree_ty(&tree))
+            });
+        let Some(bound) = bound else {
             return false;
         };
         let Ty::Named { name, .. } = self.fold_alias_ty(bound) else {
@@ -2659,24 +2753,48 @@ impl<'a> Engine<'a> {
     /// the same property consult — `extension E on A { A operator+(int) }`
     /// keeps `a++` and `a += 1` silent). The message spelling probes its
     /// method spelling (`unary-` reports as such but answers on `-`). A
-    /// record or function operand declares no operator; a dynamic/void/
-    /// unknown face dispatches dynamically and stays silent.
-    fn adjacent_operator_defined(&mut self, ty: Ty, op_text: &str) -> bool {
+    /// dynamic/void/unknown face dispatches dynamically and stays silent; a
+    /// record or function operand consults the shape-extension faces the
+    /// same `_lookupExtension` run answers (an extension over `(int,
+    /// String)` or `Function` defines the spelling on its shape).
+    /// [`Self::adjacent_operator_defined_in`] with the declaring-container
+    /// hint for the scope-parameter bound consult — see
+    /// [`Self::bound_defines_operator_in`].
+    fn adjacent_operator_defined_in(
+        &mut self,
+        ty: Ty,
+        op_text: &str,
+        hint: Option<StringId>,
+    ) -> AdjacentOp {
         let probe = self.intern(if op_text == "unary-" { "-" } else { op_text });
         if probe == self.intern("==") {
-            return true;
+            return AdjacentOp::Defined;
         }
         match self.fold_alias_ty(ty) {
             Ty::Named { name, .. } => {
-                matches!(self.walk_members(name, probe), Walk::Found(_))
-                    || self.bound_defines_operator(name, probe)
-                    || matches!(
-                        self.extension_application(name, ty, probe, false, false),
-                        ExtensionApp::Single | ExtensionApp::UnsafeSingle
-                    )
+                if matches!(self.walk_members(name, probe), Walk::Found(_))
+                    || self.bound_defines_operator_in(name, probe, hint)
+                {
+                    return AdjacentOp::Defined;
+                }
+                match self.extension_application(name, ty, probe, false, false) {
+                    // The ambiguous application replaces the operator miss
+                    // (the oracle reports the ambiguity at the operator
+                    // token, never `undefined_operator` —
+                    // `a += 0` over two `operator +` extensions).
+                    ExtensionApp::Ambiguous(displays) => AdjacentOp::Ambiguous(displays),
+                    ExtensionApp::Single | ExtensionApp::UnsafeSingle => AdjacentOp::Defined,
+                    ExtensionApp::None => AdjacentOp::Missing,
+                }
             }
-            Ty::Record { .. } | Ty::Function { .. } => false,
-            _ => true,
+            Ty::Record { .. } | Ty::Function { .. } => {
+                if self.record_extension_face(ty, probe).is_some() {
+                    AdjacentOp::Defined
+                } else {
+                    AdjacentOp::Missing
+                }
+            }
+            _ => AdjacentOp::Defined,
         }
     }
 
@@ -3243,6 +3361,166 @@ impl<'a> Engine<'a> {
         (read.offset >= read_span.offset).then_some(read)
     }
 
+    /// The `Receiver::Unknown` arm's declaration-shape leg: the bare read's
+    /// own resolution (the `refs` publication — the push-time decision
+    /// survives every fold) names the declaration whose STATIC type the
+    /// receiver carries, and the flow/derived faces above cannot spell the
+    /// shapes that name no container. A method read is a tear-off — its
+    /// static type is the member's signature (`MethodElement.type`,
+    /// upstream `method_invocation_resolver.dart`'s receiver-type
+    /// computation), a bare top-level function the same, a local function
+    /// its own declaration. `None` keeps the under-report: a plain local's
+    /// own `var` face either arrived through the `BareInfo` payload (the
+    /// push-time `closure_init_ty` re-derivation) or stays unsolvable here
+    /// (the flow layer's declared slot staged `Unknown` and nothing else
+    /// recorded the literal's type).
+    fn receiver_decl_shape(&self, read_span: SourceRange, member_offset: u32) -> Option<Ty> {
+        let reference = self
+            .refs
+            .iter()
+            .find(|reference| reference.range.offset == read_span.offset)?;
+        match reference.target {
+            RefTarget::Member { container } => {
+                match self.walk_members(container, reference.name) {
+                    Walk::Found(entry) => self.member_entry_shape_ty(&entry),
+                    _ => None,
+                }
+            }
+            RefTarget::Decl { .. } => {
+                let decl = self.top_level_decl(reference.name)?;
+                if !matches!(decl.kind, MicroKind::TopLevelFn) {
+                    return None;
+                }
+                let formals = decl.formals.as_deref()?;
+                let sig = FnVarSig {
+                    params: Box::default(),
+                    required_positional: u16::try_from(
+                        formals.positional.iter().filter(|f| f.required).count(),
+                    )
+                    .unwrap_or(u16::MAX),
+                    positional: formals
+                        .positional
+                        .iter()
+                        .map(|f| f.ty)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    named: formals
+                        .named
+                        .iter()
+                        .map(|f| (f.name, f.ty, f.required))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    return_ty: decl.return_ty,
+                };
+                Some(self.fn_sig_ty(&sig))
+            }
+            RefTarget::Local => {
+                // The declaring local's entry keys `local_hits` at the
+                // member row's offset (the merge moved the read's own
+                // hit there); its kind and name-token range drive the
+                // same source walk `initializer_literal_ty` runs at push
+                // time — a `var`-inferred declarator's initializer face,
+                // or a local function's written signature.
+                let hit = *self.local_hits.get(&member_offset)? as usize;
+                let local = self.locals.get(hit)?;
+                let bytes = self.source.as_bytes();
+                let mut at = self.byte_of(local.range.end());
+                while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                    at += 1;
+                }
+                match bytes.get(at) {
+                    // A local function: `ret name(` — the group's written
+                    // formals ride `closure_init_ty`'s positional walk; the
+                    // return column is the annotation ending at the name
+                    // (absent → `dynamic`, the oracle's inferred face).
+                    Some(b'(') if matches!(local.kind, LocalKind::LocalFunction) => {
+                        let sig_ty = self.closure_init_ty(bytes, at);
+                        let Ty::Function { shape, .. } = sig_ty else {
+                            return None;
+                        };
+                        let (type_params, positional, named) = {
+                            let pool = self.boundary.pool();
+                            let shape = pool.function_shape(shape);
+                            (
+                                shape.type_params,
+                                shape.positional.to_vec(),
+                                shape.named.to_vec(),
+                            )
+                        };
+                        // The written return annotation ends at the name's
+                        // own offset — the type-use row the group spelled.
+                        // Its absence keeps the face `closure_init_ty`
+                        // derived (the arrow body's own expression type,
+                        // `dynamic` for a block — the oracle's
+                        // uninferred-return posture).
+                        let Some(ret) = self
+                            .type_uses
+                            .iter()
+                            .find(|(range, _)| range.end() == local.range.offset)
+                            .map(|(_, name)| Ty::named(*name))
+                        else {
+                            return Some(sig_ty);
+                        };
+                        Some(self.boundary.intern_function_ty(
+                            type_params,
+                            ret,
+                            &positional,
+                            &named,
+                            false,
+                        ))
+                    }
+                    Some(b'=') => {
+                        let mut at = at + 1;
+                        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                            at += 1;
+                        }
+                        (bytes.get(at) == Some(&b'('))
+                            .then(|| self.closure_init_ty(bytes, at))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The member entry's tear-off face as an interned type — the pass-2
+    /// twin of [`Self::member_entry_tear_off_ty`]'s conversion (a method's
+    /// signature as a function type, a getter its return, a field its
+    /// declared type), kept local so the declaration-shape leg answers the
+    /// receiver's static type without reopening the operand face.
+    fn member_entry_shape_ty(&self, entry: &MemberEntry) -> Option<Ty> {
+        match entry.kind {
+            MemberKind::Method => {
+                let formals = entry.formals.as_deref()?;
+                let named: Vec<(StringId, Ty)> = formals
+                    .named
+                    .iter()
+                    .map(|formal| (formal.name, self.fold_alias_ty(formal.ty)))
+                    .collect();
+                let positional: Vec<Ty> = formals
+                    .positional
+                    .iter()
+                    .map(|formal| self.fold_alias_ty(formal.ty))
+                    .collect();
+                Some(self.boundary.intern_function_ty(
+                    0,
+                    self.fold_alias_ty(entry.return_ty),
+                    &positional,
+                    &named,
+                    false,
+                ))
+            }
+            MemberKind::Getter if entry.return_ty != Ty::Unknown => {
+                Some(self.fold_alias_ty(entry.return_ty))
+            }
+            MemberKind::Field if entry.var_ty != Ty::Unknown => {
+                Some(self.fold_alias_ty(entry.var_ty))
+            }
+            _ => None,
+        }
+    }
+
     /// A member token's UTF-16 length (the token-end arithmetic
     /// [`Engine::chain_node_read`] and the staged-join key share).
     pub(crate) fn member_name_units(&self, name: StringId) -> u32 {
@@ -3627,6 +3905,7 @@ impl<'a> Engine<'a> {
                     match self
                         .rebound_local_receiver(row.range.offset, &recv)
                         .or_else(|| self.recv_expression_ty(read_span))
+                        .or_else(|| self.receiver_decl_shape(read_span, row.range.offset))
                     {
                         Some(
                             face @ Ty::Named {
@@ -3643,37 +3922,35 @@ impl<'a> Engine<'a> {
                             );
                             return;
                         }
-                        // A record face has no container head for the
-                        // instance-member walk: the extension application
-                        // over the record's shape IS the whole resolution
-                        // (the parse-time `record_recv_tys` credit's pass-2
-                        // twin — a getter-chained receiver whose face only
-                        // this arm re-derives, `prev._value?.copyWith()`).
-                        // A NULLABLE record face dereferences
-                        // unconditionally first (#2815 R1c — a record
-                        // typedef's `?`-suffixed instance reports the
+                        // A shape face has no container head for the
+                        // instance-member walk: the member verdict runs
+                        // upstream's non-interface arm whole — `call` and a
+                        // record's own fields resolve first, the extension
+                        // application then the `Object` interface, a clean
+                        // miss reporting the access-intent trio
+                        // (`type_property_resolver.dart:202-234`). A
+                        // NULLABLE face dereferences unconditionally first
+                        // (#2815 R1c — a `?`-suffixed shape reports the
                         // shared unchecked code at the selector; an
                         // `Object` member stays exempt).
-                        Some(face @ Ty::Record { .. }) => {
-                            if matches!(face, Ty::Record { nullable: true, .. })
-                                && !self.null_aware_members.contains(&row.range.offset)
-                                && !self.members.object_members.contains(&row.name)
-                            {
-                                let name_text = self.strings.resolve(row.name);
-                                self.emit_unchecked_nullable(
-                                    row.range,
-                                    name_text,
-                                    access_kind(&row.intent),
-                                );
-                                self.record_miss(
-                                    row.name,
-                                    row.range,
-                                    true,
-                                    use_kind_of(&row.intent),
-                                );
-                                return;
-                            }
-                            self.credit_record_extension_use(face, row.name, row.range.offset);
+                        Some(face @ (Ty::Record { .. } | Ty::Function { .. })) => {
+                            let receiver_nullable = match face {
+                                Ty::Record { nullable, .. }
+                                | Ty::Function { nullable, .. } => {
+                                    nullable
+                                        && !self
+                                            .null_aware_members
+                                            .contains(&row.range.offset)
+                                }
+                                _ => false,
+                            };
+                            let display = self.render_ty(face);
+                            self.check_shape_receiver(
+                                row,
+                                face,
+                                &display,
+                                receiver_nullable,
+                            );
                             return;
                         }
                         _ => {}
@@ -3696,27 +3973,25 @@ impl<'a> Engine<'a> {
                 if !self_named
                     && matches!(
                         row.intent,
-                        Intent::Invoke | Intent::Read | Intent::ReadWrite
+                        Intent::Invoke | Intent::Read | Intent::Write | Intent::ReadWrite
                     )
                     && let Some(&(_, record)) = self
                         .record_recv_tys
                         .iter()
                         .find(|(offset, _)| *offset == row.range.offset)
                 {
-                    if matches!(record, Ty::Record { nullable: true, .. })
-                        && !self.null_aware_members.contains(&row.range.offset)
-                        && !self.members.object_members.contains(&row.name)
-                    {
-                        let name_text = self.strings.resolve(row.name);
-                        self.emit_unchecked_nullable(
-                            row.range,
-                            name_text,
-                            access_kind(&row.intent),
-                        );
-                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-                        return;
-                    }
-                    self.credit_record_extension_use(record, row.name, row.range.offset);
+                    // The side-table shape face (records AND function
+                    // types, invocation.rs:857-867) runs the same member
+                    // verdict as the flow-derived one — a miss reports the
+                    // access-intent trio, never the silent credit alone.
+                    let receiver_nullable = match record {
+                        Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
+                            nullable && !self.null_aware_members.contains(&row.range.offset)
+                        }
+                        _ => false,
+                    };
+                    let display = self.render_ty(record);
+                    self.check_shape_receiver(row, record, &display, receiver_nullable);
                     return;
                 }
             }
@@ -4115,34 +4390,53 @@ impl<'a> Engine<'a> {
             }
             return;
         }
-        // A typedef-to-record receiver (`previous._value?.copyWith(..)`
-        // over `_DataRecord<ValueT>`): the alias folds to the record the
-        // shape application resolves through — no container exists to
-        // walk, and the record-extension face owns the access (silent,
-        // the oracle's resolved send). A NULLABLE folded record dereferences
+        // A typedef-to-shape receiver (`previous._value?.copyWith(..)`
+        // over `_DataRecord<ValueT>`, `fn.bar` over `typedef F = void
+        // Function()`): the alias folds to the record/function shape the
+        // member verdict answers — no container exists to walk, and the
+        // shape arm owns the access (the field/`call` resolves, the
+        // extension application, the `Object` interface, then the
+        // access-intent trio). A NULLABLE folded shape dereferences
         // unconditionally instead (#2815 R1c — `typedef R = (int, String)?;`
         // `r.foo(0)` reports the shared unchecked code at the selector
-        // before any extension consult: a non-nullable `on (int, String)`
-        // face never applies to the nullable spelling, the same split the
-        // member sites' `receiver_nullable` gate encodes).
+        // before any extension consult: a non-nullable `on` face never
+        // applies to the nullable spelling, the same split the member
+        // sites' `receiver_nullable` gate encodes).
         if let Receiver::Typed { ty, .. } = recv
             && matches!(
                 row.intent,
-                Intent::Invoke | Intent::Read | Intent::ReadWrite
+                Intent::Invoke | Intent::Read | Intent::Write | Intent::ReadWrite
             )
-            && matches!(self.fold_alias_ty(ty), Ty::Record { .. })
+            && matches!(
+                self.fold_alias_ty(ty),
+                Ty::Record { .. } | Ty::Function { .. }
+            )
         {
             let folded = self.fold_alias_ty(ty);
-            if matches!(folded, Ty::Record { nullable: true, .. })
-                && !self.null_aware_members.contains(&row.range.offset)
-                && !self.members.object_members.contains(&row.name)
+            let mut receiver_nullable = match folded {
+                Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
+                    nullable && !self.null_aware_members.contains(&row.range.offset)
+                }
+                _ => false,
+            };
+            // The promoted-variable stand-down (`fn != null` in the guard,
+            // `fn!`'s assert): a promoted receiver read stands non-null —
+            // the same face the general arm below re-decides through
+            // `promoted_recv_reads`.
+            if receiver_nullable
+                && let Some(read_span) = self
+                    .promoted_recv_reads
+                    .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
+                    .ok()
+                    .map(|index| self.promoted_recv_reads[index].1)
+                && !self.read_offset_is_member(read_span.offset)
+                && let Some(promoted) = promotions.promoted(read_span)
+                && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
             {
-                let name_text = self.strings.resolve(row.name);
-                self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
-                self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-                return;
+                receiver_nullable = false;
             }
-            self.credit_record_extension_use(folded, row.name, row.range.offset);
+            let display = self.render_ty(ty);
+            self.check_shape_receiver(row, folded, &display, receiver_nullable);
             return;
         }
         // The extension-application faces read the receiver's nullability
@@ -4382,7 +4676,7 @@ impl<'a> Engine<'a> {
                         landing.map(|(file, origin)| (file, row.name, origin)),
                     );
                     let ty = Self::member_result_ty(&entry);
-                    self.check_operator_expr(ty, row);
+                    self.check_operator_expr_in(ty, row, Some(container));
                     return;
                 }
                 // The frozen interface faces decide a break at the root or
@@ -4531,6 +4825,25 @@ impl<'a> Engine<'a> {
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
+        }
+        // `call` on a bare `Function` receiver (`f.call`, `f.call()` over
+        // `Function f`): the interface lookup answers nothing for the name
+        // — the core `Function` type carries no `call` member — and the
+        // oracle's `isDartCoreFunction` arm resolves it to the receiver's
+        // own signature before the `undefined_*` verdict ever runs
+        // (`type_property_resolver.dart:194-198`). A merely-nullable
+        // receiver reaches `call` only through the extension/`Object`
+        // path, where the name declares nothing — the `isNullable` tail's
+        // unchecked access keeps the miss.
+        if !receiver_nullable
+            && row.name == self.intern("call")
+            && matches!(
+                self.fold_alias_ty(receiver_ty),
+                Ty::Named { name, .. } if name == self.intern("Function")
+            )
+        {
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            return;
         }
         if self.member_defined(container, receiver_ty, row, false, receiver_nullable) {
             // No implicit-this face here: every caller hands a QUALIFIED
@@ -4892,7 +5205,7 @@ impl<'a> Engine<'a> {
                         landing.map(|(file, origin)| (file, row.name, origin)),
                     );
                     let ty = Self::member_result_ty(&entry);
-                    self.check_operator_expr(ty, row);
+                    self.check_operator_expr_in(ty, row, Some(container));
                 }
                 // The frozen faces decide a break on an unindexed SDK
                 // supertype (`class C extends Match { f() { super.m + 1 } }`)
@@ -5442,11 +5755,22 @@ impl<'a> Engine<'a> {
         // symbols.dart) and the class declares none of the user selectors.
         const SYMBOL_MEMBERS: [&str; 0] = [];
         let symbol_face = container_text == "Symbol";
+        // The `Function` interface's own instance surface: `call` is the
+        // one selector the core `Function` type resolves (the
+        // `isDartCoreFunction` arm, type_property_resolver.dart:194-198 —
+        // every `Object` member joins through the arm below). A miss on the
+        // head is DECIDABLE — the oracle reports the access-intent trio
+        // against `Function`, so the face rides the same table the
+        // primitives do rather than the undecidable under-report.
+        const FUNCTION_MEMBERS: [&str; 1] = ["call"];
+        let function_face = container_text == "Function";
         let core = CORE_TYPE_MEMBERS
             .iter()
             .find(|(name, _)| container_text == *name)
             .map(|(name, members)| (*name, *members));
-        let Some((_, members)) = core.or_else(|| symbol_face.then_some(("", &SYMBOL_MEMBERS[..])))
+        let Some((_, members)) = core
+            .or_else(|| symbol_face.then_some(("", &SYMBOL_MEMBERS[..])))
+            .or_else(|| function_face.then_some(("", &FUNCTION_MEMBERS[..])))
         else {
             // Not a known primitive — an UNDECIDABLE receiver head (`Never`
             // through the names-only stub, a `?`-less type-parameter
@@ -5595,6 +5919,137 @@ impl<'a> Engine<'a> {
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 
+    /// The member verdict on a shape-typed receiver — a FUNCTION type
+    /// (`f.bar` over `var f = () => 0`, a method tear-off `m.bar`, a
+    /// `int Function()` formal, a typedef-to-function head) or a RECORD
+    /// type (`r.foo` over `var r = (1, "a")`) — upstream's non-interface
+    /// arms of the property resolver (`type_property_resolver.dart:202-234`,
+    /// `property_element_resolver.dart:540-544`): `call` resolves a
+    /// function receiver's own signature, a record's `fieldByName` resolves
+    /// its `$n`/named slots, the extension pool answers next, and the
+    /// `Object` interface closes the lookup. A clean miss reports the
+    /// access-intent trio — `undefined_getter`/`_setter` name the
+    /// receiver's own type display (`display`, the `targetType` argument of
+    /// property_element_resolver.dart:619-625 — the alias spelling when the
+    /// receiver spelled one, the shape otherwise), `undefined_method` the
+    /// invocation resolver's `receiverClassName` for the shape
+    /// (`method_invocation_resolver.dart:1190-1199`: `Function` for a
+    /// `FunctionType`, `<unknown>` for a record). A merely-nullable
+    /// receiver never reaches the `undefined_*` family — the `isNullable`
+    /// branch resolves `Object` members and nullable-`on` extensions
+    /// silently, then reports the shared unchecked code
+    /// (`type_property_resolver.dart:96-148`).
+    pub(crate) fn check_shape_receiver(
+        &mut self,
+        row: &Row,
+        shape_ty: Ty,
+        display: &str,
+        receiver_nullable: bool,
+    ) {
+        let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        // `call` resolves a non-nullable function receiver's own signature
+        // (`callFunctionType`, type_property_resolver.dart:202-209) — a
+        // nullable receiver reaches it only through the extension/`Object`
+        // path, where `call` declares nothing. A record's own fields
+        // resolve the access whole (`fieldByName`,
+        // type_property_resolver.dart:218-225). A write resolves through
+        // the `name=` extension spelling like every member face (the
+        // oracle's `writeElement` lookup).
+        let resolved_spelling = if (!receiver_nullable
+            && matches!(shape_ty, Ty::Function { .. })
+            && row.name == self.intern("call"))
+            || matches!(shape_ty, Ty::Record { .. })
+                && self
+                    .record_field_ty(
+                        shape_ty,
+                        row.name,
+                        self.null_aware_members.contains(&row.range.offset),
+                    )
+                    .is_some()
+            || self.members.object_members.contains(&row.name)
+            || row.name == self.intern("==")
+        {
+            None
+        } else if self.record_extension_face(shape_ty, row.name).is_some() {
+            Some(row.name)
+        } else {
+            let setter = self.setter_spelling(row.name);
+            if write && self.record_extension_face(shape_ty, setter).is_some() {
+                Some(setter)
+            } else {
+                // `receiverClassName` for the invocation face: `Function`
+                // for a `FunctionType` receiver, `<unknown>` for a record
+                // (method_invocation_resolver.dart:1190-1199 — only an
+                // `InterfaceTypeImpl` or a `FunctionType` escapes the
+                // default).
+                let method_face = if matches!(shape_ty, Ty::Function { .. }) {
+                    "Function"
+                } else {
+                    "<unknown>"
+                };
+                self.shape_receiver_miss(row, display, method_face, receiver_nullable);
+                return;
+            }
+        };
+        if let Some(spelling) = resolved_spelling {
+            self.credit_record_extension_use(shape_ty, spelling, row.range.offset);
+        }
+        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
+    /// [`Self::check_shape_receiver`]'s miss tail: a merely-nullable
+    /// receiver reports the shared unchecked code (`isNullable`'s tail
+    /// precedes the `undefined_*` family); a non-nullable one reports the
+    /// access-intent trio.
+    fn shape_receiver_miss(
+        &mut self,
+        row: &Row,
+        display: &str,
+        method_face: &str,
+        receiver_nullable: bool,
+    ) {
+        let name_text = self.strings.resolve(row.name);
+        if receiver_nullable {
+            self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            return;
+        }
+        match row.intent {
+            Intent::Invoke => {
+                self.emit(
+                    SemanticCode::UndefinedMethod,
+                    row.range,
+                    name_text,
+                    method_face,
+                );
+            }
+            Intent::Read => {
+                self.emit(SemanticCode::UndefinedGetter, row.range, name_text, display);
+            }
+            Intent::Write => {
+                self.emit(SemanticCode::UndefinedSetter, row.range, name_text, display);
+            }
+            Intent::ReadWrite => {
+                // The oracle resolves the read before the write — a
+                // compound access reports both faces in that order.
+                self.emit(SemanticCode::UndefinedGetter, row.range, name_text, display);
+                self.emit(SemanticCode::UndefinedSetter, row.range, name_text, display);
+            }
+            // The operator application on a shape receiver is a member
+            // miss the same property consult answers (`f < g`, `(1,'x')
+            // + r`): the `==`/`call`/own-field/extension spellings
+            // resolved above, so a clean miss reports `undefined_operator`
+            // at the operator token naming the receiver's own shape
+            // display (binary_expression_resolver.dart's
+            // `instanceReceiverType` — the composite type, never the
+            // method's `receiverClassName`).
+            Intent::Operator(_, op_range) => {
+                self.emit(SemanticCode::UndefinedOperator, op_range, name_text, display);
+            }
+        }
+        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
     /// The read and write operator spellings an access needs (`[]` / `[]=`
     /// for index rows by their write form; the plain spelling for binary
     /// operators); `(None, None)` for non-operator rows.
@@ -5611,6 +6066,22 @@ impl<'a> Engine<'a> {
         } else {
             (Some(*op), None)
         }
+    }
+
+    /// Whether a bare-miss row's write side rescues it from
+    /// `undefined_identifier`. Only a pure `Intent::Write` (`name = v`)
+    /// consults the setter namespace upstream (`preferSetter`): a `name=`
+    /// hit resolves the write silently. Every other intent — a bare read,
+    /// a compound `name++`/`name += v`, a prefix `++name` — still reads the
+    /// GETTER namespace, where a setter-only name is recovery, never the
+    /// requested element (lexical_lookup.dart:22-35), so it reports. The
+    /// write side the pass cannot re-walk (#2926 F2's extension-body
+    /// `foo = 0`) rides the push-time `ext_write_target_rows` latch under
+    /// the same gate.
+    fn write_target_rescues(&mut self, row: &Row, this_type: Option<StringId>) -> bool {
+        row.intent == Intent::Write
+            && (self.ext_write_target_rows.contains(&row.range.offset)
+                || self.bare_write_target_exists(row.name, this_type))
     }
 
     /// The `name=` lookup spelling of a write target. Cached: the `format!`
@@ -5650,8 +6121,24 @@ impl<'a> Engine<'a> {
                 self.file,
                 container,
             )
-            .is_some_and(|(decl, _)| decl.members.contains_key(&setter))
+            .is_some_and(|(decl, owner)| {
+                decl.members.contains_key(&setter)
+                    && self.member_accessible_in(name, owner)
+            })
         })
+    }
+
+    /// The implicit-`this` member's accessibility gate (upstream
+    /// `element.isAccessibleIn(_definingLibrary)` —
+    /// property_element_resolver.dart:463-465): a `_`-prefixed member
+    /// declared in another library is invisible to this unit's `this`
+    /// lookup even when the name resolves on the face — it answers
+    /// `undefined_identifier`, never the member. `owner` is the file the
+    /// member was found on; a same-file or same-library hit is always
+    /// accessible, and a public member is accessible from anywhere.
+    fn member_accessible_in(&self, name: StringId, owner: FileId) -> bool {
+        !self.is_private_name(name)
+            || self.graph.library_of_file(owner) == Some(self.lib)
     }
 
     /// A member's result type as far as M1 knows it: the declared field type
@@ -6019,29 +6506,93 @@ impl<'a> Engine<'a> {
     /// write needs both. Unresolved or external types (`Unknown`, broken
     /// chains) suppress — an invalid receiver type never cascades.
     pub(crate) fn check_operator_expr(&mut self, ty: Ty, row: &Row) {
+        self.check_operator_expr_in(ty, row, None);
+    }
+
+    /// [`Self::check_operator_expr`] with the receiver's declaring container
+    /// as the type-parameter bound hint (`Some(container)` when a member
+    /// walk produced `ty` — `c.a + 1` over `class C<T> { T a }` resolves
+    /// `+` through `T`'s bound on `C`).
+    pub(crate) fn check_operator_expr_in(
+        &mut self,
+        ty: Ty,
+        row: &Row,
+        param_hint: Option<StringId>,
+    ) {
         let Intent::Operator(_, op_range) = row.intent else {
             return;
         };
         let (read, write) = self.operator_spellings(row);
         let Ty::Named { name, .. } = ty else {
-            // A record or function face declares no user operator and the
-            // shape-extension face is not modeled for operators — every
-            // applied spelling but `==` (`Object`'s face) reports, the type
-            // display riding the full render (`(String,) + 0`, a generic
-            // function tear-off's `f < g`; upstream `instanceReceiverType`
-            // answers the composite type and the property consult misses).
-            let type_text = ty.render(&self.strings, &self.boundary.pool());
-            for spelling in [read, write].into_iter().flatten() {
-                if spelling == self.intern("==") {
-                    continue;
+            match ty {
+                Ty::Record { .. } | Ty::Function { .. } => {
+                    // A record or function face declares no user operator —
+                    // every applied spelling but `==` (`Object`'s face)
+                    // reports, the type display riding the full render
+                    // (`(String,) + 0`, a generic function tear-off's
+                    // `f < g`; upstream `instanceReceiverType` answers the
+                    // composite type and the property consult misses) —
+                    // unless a shape extension declares the spelling
+                    // (type_property_resolver.dart:227's `_lookupExtension`
+                    // runs for shape receivers too: `(1, 'x') + r` resolves
+                    // through `extension on (int, String)`, a function
+                    // operand through `extension on Function`).
+                    let type_text = ty.render(&self.strings, &self.boundary.pool());
+                    for spelling in [read, write].into_iter().flatten() {
+                        if spelling == self.intern("==")
+                            || self.record_extension_face(ty, spelling).is_some()
+                        {
+                            continue;
+                        }
+                        let op_text = self.strings.resolve(spelling).to_string();
+                        self.emit(
+                            SemanticCode::UndefinedOperator,
+                            op_range,
+                            &op_text,
+                            &type_text,
+                        );
+                    }
                 }
-                let op_text = self.strings.resolve(spelling).to_string();
-                self.emit(
-                    SemanticCode::UndefinedOperator,
-                    op_range,
-                    &op_text,
-                    &type_text,
-                );
+                // A `Null`-typed operand dereferences unconditionally and
+                // the verifier's `NullType` arm swaps the reported code to
+                // `invalid_use_of_null_value` at the receiver expression —
+                // one row per application, anchored on the operand
+                // (nullable_dereference_verifier.dart:47-49, reached through
+                // the isNullable tail: `Null` is potentially nullable).
+                Ty::Null => {
+                    self.emit(SemanticCode::InvalidUseOfNullValue, row.range, "", "");
+                }
+                // A `void` operand is potentially nullable upstream
+                // (`isPotentiallyNullable`'s VoidType arm → the isNullable
+                // tail): a binary application reports the shared unchecked
+                // code at the operator token. The `[]`/`[]=` index
+                // spellings report `use_of_void_result` upstream
+                // (property_element_resolver.dart:183-186 precedes the
+                // member consult) — that family owns the index row, so the
+                // bracket stays silent here.
+                Ty::Void => {
+                    if [read, write].into_iter().flatten().any(|spelling| {
+                        spelling != self.intern("[]") && spelling != self.intern("[]=")
+                    }) {
+                        let Intent::Operator(op, _) = row.intent else {
+                            return;
+                        };
+                        let op_text = self.strings.resolve(op).to_string();
+                        self.emit_unchecked_nullable(
+                            op_range,
+                            &op_text,
+                            UncheckedNullableKind::Operator,
+                        );
+                    }
+                }
+                // `dynamic`/`InvalidType` (`Ty::Unknown`)/`Never` receivers
+                // never reach `undefined_operator` upstream: the
+                // `isDynamicBounded`/`isInvalidBounded` short-circuit
+                // answers with `needsGetterError` cleared
+                // (type_property_resolver.dart:88-94), and the `NeverType`
+                // arm clears the same flags (:211-216) — the dynamic
+                // dispatch and the never-receiver family own those rows.
+                _ => {}
             }
             return;
         };
@@ -6072,7 +6623,7 @@ impl<'a> Engine<'a> {
             // A scope-parameter receiver answers on its bound (the
             // upstream `resolveToBound` consult) — `T extends num`
             // resolves `+` through `num`'s face.
-            if walk_missing && self.bound_defines_operator(name, spelling) {
+            if walk_missing && self.bound_defines_operator_in(name, spelling, param_hint) {
                 walk_missing = false;
             }
             if walk_missing {
@@ -7087,16 +7638,6 @@ impl<'a> Engine<'a> {
             }
         }
 
-        for (i, (face, on_ty, face_file)) in applicable.iter().enumerate() {
-            let on_desc = match on_ty {
-                Ty::Named { name, nullable, .. } => format!(
-                    "{}{}",
-                    self.strings.resolve(*name),
-                    if *nullable { "?" } else { "" }
-                ),
-                other => format!("{:?}", other),
-            };
-        }
         // `_isMoreSpecific` steps 3-4 at the name level: a face whose
         // instantiated `on` type is a strict subtype of another applicable
         // face's dominates it (`extension_member_resolver.dart:467-491`).
@@ -7438,8 +7979,6 @@ impl<'a> Engine<'a> {
         }
         // On a nullable receiver a nullable `on` face is the safe match;
         // only when none applies does the unsafe non-nullable set answer.
-        let specific_n = specific.len();
-        let nullable_n = nullable.len();
         let (candidates, unsafe_match) = if receiver_nullable {
             if nullable.is_empty() {
                 (specific, true)
@@ -7567,12 +8106,16 @@ impl<'a> Engine<'a> {
     /// The function-receiver twin of [`Self::record_extension_face`]: a
     /// receiver whose static type is a FUNCTION type (`extension on
     /// PostMessage` over `typedef PostMessage = void Function(..)`) names
-    /// no container either. Only the exact face applies at the shape
-    /// level — both sides fold through aliases and the function types must
-    /// be identical (a nullable `on` also accepts the non-null receiver);
-    /// a face whose `on` type spells its own type parameters is left
-    /// undecided (no credit, the under-report direction). Single hit only,
-    /// like the record face.
+    /// no container either. Both sides fold through aliases; a folded
+    /// function `on` shape must match the receiver's exactly (a nullable
+    /// `on` also accepts the non-null receiver), while a NAMED `on` head
+    /// spells one of the shape's named supertypes — every function type is
+    /// a `Function`, and a non-nullable one is an `Object`
+    /// (`applicableTo`'s subtype ask, `applicable_extensions.dart:157-171`)
+    /// — so `on Function`/`on Object` faces apply by head alone. A face
+    /// whose `on` type spells its own type parameters is left undecided
+    /// (no credit, the under-report direction). Single hit only, like the
+    /// record face.
     fn function_extension_face(
         &mut self,
         receiver: Ty,
@@ -7585,6 +8128,8 @@ impl<'a> Engine<'a> {
         else {
             return None;
         };
+        let function_head = self.intern("Function");
+        let object_head = self.intern("Object");
         self.accessible_extension_faces();
         let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
         let mut hits: Vec<(&'a ExtensionFace, FileId)> = Vec::new();
@@ -7593,14 +8138,28 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let on_ty = self.boundary.ty(face_file, face.on_ty);
-            let Ty::Function {
-                shape: on_shape,
-                nullable: on_nullable,
-            } = self.fold_alias_ty(on_ty)
-            else {
-                continue;
+            let applies = match self.fold_alias_ty(on_ty) {
+                Ty::Function {
+                    shape: on_shape,
+                    nullable: on_nullable,
+                } => on_shape == recv_shape && (on_nullable || !recv_nullable),
+                // A named `on` head spells one of the shape's named
+                // supertypes: every function type is a `Function`, and
+                // every one is an `Object` — the subtype ask
+                // (`applicableTo`) reduces to the two heads plus the
+                // nullability pair (`int Function()? <: Object` fails,
+                // `<: Object?` holds — the `on`'s own `?` decides).
+                Ty::Named {
+                    name,
+                    nullable: on_nullable,
+                    ..
+                } => {
+                    (name == function_head || name == object_head)
+                        && (on_nullable || !recv_nullable)
+                }
+                _ => false,
             };
-            if on_shape == recv_shape && (on_nullable || !recv_nullable) {
+            if applies {
                 hits.push((face, face_file));
             }
         }

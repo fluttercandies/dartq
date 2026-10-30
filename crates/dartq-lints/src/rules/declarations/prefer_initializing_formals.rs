@@ -30,9 +30,12 @@ use dartq_semantic::model::Ty;
 /// inside a nested binder of that lexeme (a block local, catch
 /// parameter, nested function, loop variable, case or if-case pattern
 /// variable) resolves to the binder, not the parameter. Private fields
-/// skip — the `private_named_parameters` face is feature-gated off.
-/// Primary constructors are outside the substrate. Message:
-/// `diagnostic.g.dart` `preferInitializingFormals`.
+/// lint under the shipped `private-named-parameters` feature
+/// (`enabledIn: '3.12.0'`): a private field converts from a NAMED
+/// parameter whose name matches modulo the privacy prefix (`_x` from
+/// `x`, upstream :167-182); below 3.12 and for positional parameters
+/// the private face stays silent. Primary constructors are outside the
+/// substrate. Message: `diagnostic.g.dart` `preferInitializingFormals`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "prefer_initializing_formals",
     &[NodeKind::Constructor],
@@ -80,32 +83,47 @@ fn check(c: &mut Check<'_>) {
     finish(c, &params, &fields, &ref_roots, &candidates);
 }
 
-/// The constructor's convertible parameters: `(name, written type)` for
-/// plain formals only — receiver formals (`this.`/`super.`) are already
-/// initializing/super formals, function-typed formals have no comparable
-/// written type.
-fn constructor_params<'a>(c: &Check<'a>, params_node: u32) -> Vec<(&'a str, Option<u32>)> {
-    let mut params: Vec<(&str, Option<u32>)> = Vec::new();
-    for param in c.collect_direct(params_node) {
-        if c.kind(param) != NodeKind::FormalParameter {
-            continue;
+/// The constructor's convertible parameters: `(name, written type,
+/// named)` for plain formals only — receiver formals
+/// (`this.`/`super.`) are already initializing/super formals,
+/// function-typed formals have no comparable written type. The
+/// `{named}`/`[optional]` sections tile as an `OptionalFormalParameters`
+/// row under the parameter list (declarations.rs:877-891); the section
+/// head lexeme decides the `isPositional` face (`{` names).
+fn constructor_params<'a>(c: &Check<'a>, params_node: u32) -> Vec<(&'a str, Option<u32>, bool)> {
+    let mut params: Vec<(&str, Option<u32>, bool)> = Vec::new();
+    // The direct `FormalParameters` children are the positional
+    // section — named parameters always live in the `{...}` optional
+    // section on the production tiling.
+    let mut sections = vec![(params_node, false)];
+    sections.extend(
+        c.collect_direct(params_node)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::OptionalFormalParameters)
+            .map(|section| (section, c.lexeme(c.head_token(section)) == "{")),
+    );
+    for (section, named) in sections {
+        for param in c.collect_direct(section) {
+            if c.kind(param) != NodeKind::FormalParameter {
+                continue;
+            }
+            if c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN) != NONE_TOKEN {
+                continue; // this.x / super.x formal
+            }
+            let Some(name) = c.field(param, PayloadField::Name) else {
+                continue;
+            };
+            if name == NONE_TOKEN {
+                continue;
+            }
+            let written = c.collect_direct(param).into_iter().find(|&kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
+                )
+            });
+            params.push((c.lexeme(name), written, named));
         }
-        if c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN) != NONE_TOKEN {
-            continue; // this.x / super.x formal
-        }
-        let Some(name) = c.field(param, PayloadField::Name) else {
-            continue;
-        };
-        if name == NONE_TOKEN {
-            continue;
-        }
-        let written = c.collect_direct(param).into_iter().find(|&kid| {
-            matches!(
-                c.kind(kid),
-                NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
-            )
-        });
-        params.push((c.lexeme(name), written));
     }
     params
 }
@@ -455,7 +473,7 @@ fn constructor_selector(c: &Check<'_>, ctor: u32) -> Option<String> {
 /// reference to the parameter.
 fn finish(
     c: &mut Check<'_>,
-    params: &[(&str, Option<u32>)],
+    params: &[(&str, Option<u32>, bool)],
     fields: &[(&str, Option<u32>)],
     ref_roots: &[(u32, bool)],
     candidates: &[(&str, &str, u32, u32)],
@@ -471,17 +489,30 @@ fn finish(
         {
             continue;
         }
+        // The name gate (upstream :167-182): a public field needs the
+        // exactly-named parameter; a private field lints only under the
+        // shipped `private-named-parameters` feature
+        // (`experimental_features.yaml` `enabledIn: '3.12.0'`), only
+        // from a NAMED parameter (`parameter.isPositional` returns),
+        // and only when the names match modulo the privacy prefix.
         if field_name.starts_with('_') {
-            continue; // private_named_parameters is off
-        }
-        // Must be assigning from the same-named parameter (upstream
-        // `_checkInitializer`: `field.name != parameter.name` returns —
-        // `C(int b) : p = b;` names a different parameter and the
-        // conversion to `this.p` is not semantics-preserving).
-        if field_name != param_name {
+            if !private_named_parameters_enabled(c) {
+                continue;
+            }
+            let Some(&(_, _, named)) = params.iter().find(|(name, ..)| *name == param_name) else {
+                continue;
+            };
+            if !named {
+                continue;
+            }
+            if field_name != param_name && field_name != format!("_{param_name}") {
+                continue;
+            }
+        } else if field_name != param_name {
             continue;
         }
-        let Some(&(_, param_written)) = params.iter().find(|(name, _)| *name == param_name) else {
+        let Some(&(_, param_written, _)) = params.iter().find(|(name, ..)| *name == param_name)
+        else {
             continue;
         };
         let Some(&(_, field_written)) = fields.iter().find(|(name, _)| *name == field_name) else {
@@ -518,6 +549,17 @@ fn finish(
         let end = c.utf16_span(range_end).end;
         c.report(start..end, &[field_name]);
     }
+}
+
+/// Whether the `private-named-parameters` feature is enabled for the
+/// library (`experimental_features.yaml`: shipped, `enabledIn:
+/// '3.12.0'`; the official `_context.isFeatureEnabled(
+/// Feature.private_named_parameters)`). No settled version applies the
+/// shipped default — on.
+fn private_named_parameters_enabled(c: &Check<'_>) -> bool {
+    c.unit
+        .version
+        .is_none_or(|version| version.major > 3 || (version.major == 3 && version.minor >= 12))
 }
 
 /// The expression-position references to `name` within one constructor

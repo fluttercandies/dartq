@@ -167,6 +167,198 @@ fn keyword_named_typedef_faces() {
     );
 }
 
+/// A reserved word heading a top-level declaration in the typedef-name slot
+/// is NOT the recovered-name shape (upstream `isIdentifierRecovered` requires
+/// the group successor to be `(`/`=`, parser_impl.dart:1590-1594): the normal
+/// `ensureIdentifier` template splices a synthetic name and keeps `var` for
+/// the declaration loop (`TypedefDeclarationIdentifierContext` branch 2,
+/// identifier_context_impl.dart:1417-1424). Oracle rows for `typedef var a;`
+/// (offsets are utf16):
+///
+/// * `expected_token ';'` @0|7 — `ensureSemicolon`'s
+///   `findPreviousNonZeroLengthToken` walks back over the synthetic `()` and
+///   the synthetic name to `typedef`;
+/// * `missing_identifier` @8|11 — the `var` token;
+/// * `missing_typedef_parameters` @8|11 — the same token.
+///
+/// The `name (`/`name <T>(` and `name =` shapes keep the recovered face
+/// (`expectedIdentifierButGotKeyword`, oracle `typedef var();` /
+/// `typedef void assert();`), and junk heads consume in doubt
+/// (`typedef void 5();` — a single `missing_identifier` at `5`,
+/// `insertSyntheticIdentifier(identifier)` branch 3, :1433-1439).
+#[test]
+fn typedef_name_reserved_word_heading_declaration_inserts_synthetic() {
+    assert_eq!(
+        rows_with("typedef var a;\n", super::collector::latest_features()),
+        vec![
+            ("missing_identifier".to_string(), 8, 11),
+            ("missing_typedef_parameters".to_string(), 8, 11),
+            ("expected_token".to_string(), 0, 7),
+        ],
+        "typedef var a; must take the synthetic-name reparse face"
+    );
+    // Recovered routes unchanged: `(` after the head forces keyword-as-name.
+    assert_codes(
+        "typedef var();\n",
+        &[
+            "built_in_identifier_in_declaration",
+            "expected_identifier_but_got_keyword",
+        ],
+        "typedef var(); stays keyword-as-name",
+    );
+    assert_codes(
+        "typedef void assert();\n",
+        &[
+            "built_in_identifier_in_declaration",
+            "expected_identifier_but_got_keyword",
+        ],
+        "typedef void assert(); stays keyword-as-name",
+    );
+    assert_codes(
+        "typedef var = int;\n",
+        &[
+            "built_in_identifier_in_declaration",
+            "expected_identifier_but_got_keyword",
+        ],
+        "typedef var = int; stays keyword-as-name",
+    );
+    // Non-keyword junk head consumes in doubt: the single missing_identifier
+    // row, no expected_executable and no cascade (oracle `typedef void 5();`).
+    assert_eq!(
+        rows_with("typedef void 5();\n", super::collector::latest_features()),
+        vec![("missing_identifier".to_string(), 13, 14)],
+        "typedef void 5(); consumes the junk in doubt"
+    );
+    // The `(`/`<`/`=`/`;`/EOF heads stay leave-posture (branch 2 keep set).
+    assert_eq!(
+        rows_with("typedef void ();\n", super::collector::latest_features()),
+        vec![("missing_identifier".to_string(), 13, 14)],
+        "typedef void (); keeps ( for the parameter list"
+    );
+    // Well-formed typedefs stay row-free.
+    assert_codes("typedef void F(int x);\n", &[], "clean old-style typedef");
+    assert_codes(
+        "typedef F = void Function();\n",
+        &[],
+        "clean new-style typedef",
+    );
+}
+
+// —— C6c: record-type typedef return faces —————————————————————————————
+
+/// `typedef <recordType> <name>(<formals>);` — the `(` right after `typedef`
+/// is the RETURN TYPE's record literal, not a function's parameter list. The
+/// dispatch gate (`typedef_looks_like_record`, declarations.rs) must probe
+/// `compute_type` AT the `(` — probing from `typedef` itself yields `NoType`
+/// (the keyword is not a type reference), which fell through to the
+/// top-level-member path and minted `missing_function_body` + a
+/// `duplicate_definition 'typedef'` cascade per record typedef. Oracle:
+/// `record_type_annotations_A01_t04` lines 25-29, parser-fe `record_typedef`
+/// — all row-free (upstream `parseTypedef` → `computeType(typedefKeyword)`,
+/// `parser_impl.dart:1457`, reads `token.next` = the `(`).
+#[test]
+fn typedef_record_return_type_parses_as_typedef() {
+    // Exact corpus shape: record-typed return + record-typed parameter.
+    assert!(
+        rows_with(
+            "typedef (int, String name, bool) R1((int, String name, bool) r);\n",
+            super::collector::latest_features()
+        )
+        .is_empty(),
+        "record-typedef head must parse clean"
+    );
+    // Positional record return + empty formals.
+    assert!(
+        rows_with("typedef (int, String) R2();\n", super::collector::latest_features())
+            .is_empty()
+    );
+    // Named-field record return.
+    assert!(
+        rows_with(
+            "typedef (int, {String s}) baz();\n",
+            super::collector::latest_features()
+        )
+        .is_empty()
+    );
+    // Empty record `()` return type stays a typedef too.
+    assert!(
+        rows_with("typedef () foo();\n", super::collector::latest_features()).is_empty()
+    );
+    // Sibling: single-field record without trailing comma keeps its own row
+    // (parseRecordType's `recordTypeOnePositionalNoTrailingComma`,
+    // parser_impl.dart:1849-1855) — the typedef head is not the owner. (dartq
+    // anchors on the `)`; the oracle anchors on the `(` — a documented
+    // anchor-drift residual outside this face.)
+    assert_eq!(
+        rows_with(
+            "typedef (int) bar(int x);\n",
+            super::collector::latest_features()
+        ),
+        vec![("record_type_one_positional_no_trailing_comma".to_string(), 12, 13)],
+    );
+    // Sibling: `typedef` followed by a non-record `(` shape still takes the
+    // member path unchanged (`typedef` usable as a plain identifier).
+    // (assert via a clean non-record function pair)
+    assert!(
+        rows_with("typedef void R4();\n", super::collector::latest_features()).is_empty()
+    );
+}
+
+// —— C6b: class-member tail recovery + adopted-closer faces —————————————
+
+/// `recoverFromInvalidMember`'s tail (upstream `parser_impl.dart:11350-11368`):
+/// ANY progress since the member head routes to `parseFields` — a `}`/`EOF`
+/// follower included — so `class C { var }` surfaces the field's own
+/// `missing_identifier` + `expected_token ';'`, never `expected_class_member`
+/// (the Oracle face for `MethodTest` `*_noName` shapes). Zero progress still
+/// reports `expected_class_member` on the junk token (`5`, `;`).
+#[test]
+fn class_member_tail_routes_progress_to_parse_fields() {
+    // `var` consumed the member-head walk: `class C { var }` parses as an
+    // unnamed `var` field — `;` reported on `var` (10..13, the walk-back
+    // anchor over the synthetic name) and `missing_identifier` on `}`
+    // (14..15). Oracle `partial_code/class.dart` MethodTest shapes.
+    assert_eq!(
+        rows_with("class C { var }\n", super::collector::latest_features()),
+        vec![
+            ("missing_identifier".to_string(), 14, 15),
+            ("expected_token".to_string(), 10, 13),
+        ],
+    );
+    // Zero progress on a literal/`;` head keeps `expected_class_member`.
+    for src in ["class C { 5 }\n", "class C { ; }\n"] {
+        assert_eq!(
+            rows_with(src, super::collector::latest_features()),
+            vec![("expected_class_member".to_string(), 10, 11)],
+            "{src:?}",
+        );
+    }
+    // Clean field stays row-free.
+    assert!(rows_with("class C { var x; }\n", super::collector::latest_features()).is_empty());
+}
+
+/// The `(`-unclosed member shape: `ensureCloseParen`'s `moveSynthetic` arm
+/// (upstream `parser_impl.dart:5035-5037`) relocates the scanner-parked
+/// synthetic `)` out of the stream, so the enclosing member loop never sees
+/// it — `class C { m( void a(b) {} }` emits only `expected_token ')'`
+/// (@the `{` where the group should have closed, length 1 via
+/// `translateErrorToken`'s unmatched arm, `translate_error_token.dart:89-104`),
+/// no trailing `expected_class_member` on a resurrected 0-width `)`.
+#[test]
+fn adopted_paren_closer_never_resurfaces_as_member() {
+    assert_eq!(
+        rows_with(
+            "class C { m( void a(b) {} }\n",
+            super::collector::latest_features()
+        ),
+        vec![("expected_token".to_string(), 23, 24)],
+    );
+    // A well-formed twin stays silent.
+    assert!(
+        rows_with("class C { m() {} }\n", super::collector::latest_features()).is_empty()
+    );
+}
+
 // —— FAM8: primary-constructor feature posture ———————————————————————————
 
 /// `const` ahead of a declaration with no primary constructor reports the
@@ -470,4 +662,141 @@ fn this_new_non_paren_initializer_fires_one_identifier_event() {
         "the synthetic name must fire exactly one expressionContinuation identifier event: {:?}",
         probe.continuation_ids
     );
+}
+
+// —— C6d: pattern-assignment object-pattern gate ————————————————————————
+
+/// `skipOuterPattern`'s object-pattern arm (upstream `parser_impl.dart:12345-
+/// 12352` + `skipObjectPatternRest` :12354): `pos` tracks the LAST type-name
+/// token, so the pattern group's `(` is the next offset — the prior port
+/// checked `kind_at(pos)` (the type name itself) and always returned `None`,
+/// so `TypeName(...) = expr` fell through to expression parsing and emitted
+/// `illegal_assignment_to_non_assignable` + `missing_identifier` on the
+/// `var`/`final`/type/`:`-shorthand field heads. The `<...>` skip already
+/// lands `pos` on the `(`; the identifier-only/`id.id` walks advance `pos+1`.
+#[test]
+fn object_pattern_assignment_enters_pattern_path() {
+    // `Square(areaAsInt: var a) = x` parses as a pattern assignment: the
+    // parser consumes `var a` silently; `pattern_assignment_declares_variable`
+    // is the analyzer-side face dartq's parser mirrors on the name slot.
+    let rows = rows_with(
+        "class Square { final int areaAsInt; Square(this.areaAsInt); }\nmain() {\n  var x = Square(1);\n  Square(areaAsInt: var a) = x;\n}\n",
+        super::collector::latest_features(),
+    );
+    // No `illegal_assignment_to_non_assignable` / `missing_identifier` may
+    // survive — the `(...) =` tail routed to `parse_pattern_assignment`.
+    assert!(
+        !rows
+            .iter()
+            .any(|(c, _, _)| c == "missing_identifier" || c == "illegal_assignment_to_non_assignable"),
+        "object pattern must route to parse_pattern_assignment, got {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(c, _, _)| c == "pattern_assignment_declares_variable"),
+        "the var-field name slot must surface pattern_assignment_declares_variable: {rows:?}"
+    );
+    // A `final`/typed/`const` field value all stay inside the pattern path
+    // (`name: <declaring pattern>` — the field label names the slot).
+    for tail in ["final b", "int c", "const e"] {
+        let src = format!(
+            "class Square {{ final int areaAsInt; Square(this.areaAsInt); }}\nmain() {{\n  var x = Square(1);\n  Square(areaAsInt: {tail}) = x;\n}}\n"
+        );
+        let rows = rows_with(Box::leak(src.into_boxed_str()), super::collector::latest_features());
+        assert!(
+            !rows
+                .iter()
+                .any(|(c, _, _)| c == "missing_identifier" || c == "illegal_assignment_to_non_assignable"),
+            "{tail:?} must stay in the pattern path, got {rows:?}"
+        );
+    }
+    // Shorthand `:var d` (no explicit field name — the name is inferred from
+    // the sub-pattern's variable) is the `kind == Colon` arm of the field
+    // loop; `var d` still routes through `parse_variable_pattern`.
+    let rows = rows_with(
+        "class Square { final int d; Square(this.d); }\nmain() {\n  var x = Square(1);\n  Square(:var d) = x;\n}\n",
+        super::collector::latest_features(),
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(c, _, _)| c == "missing_identifier" || c == "illegal_assignment_to_non_assignable"),
+        "shorthand `:var d` must stay in the pattern path, got {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(c, _, _)| c == "pattern_assignment_declares_variable"),
+        "the shorthand var name slot must surface pattern_assignment_declares_variable: {rows:?}"
+    );
+    // A clean object-pattern assignment keeps the pattern path row-free.
+    assert!(
+        rows_with(
+            "class Square { final int a; Square(this.a); }\nmain() {\n  var x = Square(1);\n  var a = 0;\n  Square(a: a) = x;\n}\n",
+            super::collector::latest_features(),
+        )
+        .iter()
+        .all(|(c, _, _)| c != "missing_identifier" && c != "illegal_assignment_to_non_assignable")
+    );
+}
+
+// —— #2965: record-typedef `...Eq`-tail (shared compound closer) ——————————————
+
+/// The `typedef <name><<typeVars>>=<RHS>` shape whose type-variable bound
+/// ends on a `>=`/`>>=`/`>>>=`/`>>>>=`/`>>>>>=` compound closer shared with
+/// enclosing `<` groups. The bound's group closes on the compound's *last*
+/// `>` unit (`end_shared`), leaving `=` as the successor — the official
+/// stream's `splitGtFromGtGt*`/`splitCloser` remainder
+/// (`util.dart:140-234`), which the new-style-typedef discriminator reads as
+/// `=` (`parser_impl.dart:1497`). The prior port treated the whole `...Eq`
+/// tail as a `>`-closer unit count and forced `end_raw_compound`/`backed_up`
+/// wrong, so the head scanned as a generic `id<...>` type (NoType never
+/// fired) and the follower read `end+1` (the real `T` RHS head) instead of
+/// the `=` remainder — falling to old-style parse and emitting
+/// `missing_typedef_parameters`/`expected_token(';')`/`missing_function_body`
+/// EXTRA rows. Oracle (`dart analyze` 3.47.1) reports zero rows for all
+/// shapes; the `>`-only `closer_units` + `end_shared`/`shared_remainder`
+/// encoding restores parity.
+#[test]
+fn record_typedef_shared_eq_closer_parses_row_free() {
+    for src in [
+        // Baseline record-typedef faces — always row-free.
+        "typedef (int, int) T1();\n",
+        "typedef ({int j}) T2();\n",
+        "typedef (int, int)? T3();\n",
+        "typedef ({int j})? T4();\n",
+        // `>=`-tail single bound (raw compound, first `>` is the group's).
+        "typedef F1<T extends (int, int)>= T Function();\n",
+        // Shared `...Eq` tails: the bound's `>` is the compound's last unit,
+        // `=` is the successor. F2/F3/F5/F6 were the EXTRA cluster; F4 is
+        // the pure-`>` (`>>>>`) sibling that already parsed clean.
+        "typedef F2<T extends List<(int, int)>>= T Function();\n",
+        "typedef F3<T extends List<List<(int, int)>>>= T Function();\n",
+        "typedef F4<T extends List<List<List<(int, int)>>>>= T Function();\n",
+        "typedef F5<T extends List<List<List<List<(int, int)>>>>>= T Function();\n",
+        "typedef F6<T extends List<List<List<List<List<(int, int)>>>>>>= T Function();\n",
+    ] {
+        let rows = rows_with(src, super::collector::latest_features());
+        assert!(
+            rows.is_empty(),
+            "{src:?} must be row-free like the oracle, got {rows:?}"
+        );
+    }
+    // The pure-`>` shared tail (`>>>`/`>>>>`/`>>>>>`/`>>>>>>`) on a *class*
+    // type-parameter bound exercises the same `step_over_type`/`backed_up`
+    // walk with no `=` remainder — the bound's `>` is still the compound's
+    // last unit, but the successor is a real `>`-closer read by the
+    // shared-continuation check (no `end_eq_shared`). Oracle reports zero
+    // rows (unsigned_right_shift_test class `E3`..`E6` shapes).
+    for src in [
+        "class E3<T extends List<List<int>>> {}\n",
+        "class E4<T extends List<List<List<int>>>> {}\n",
+        "class E5<T extends List<List<List<List<int>>>>> {}\n",
+        "class E6<T extends List<List<List<List<List<int>>>>>> {}\n",
+    ] {
+        let rows = rows_with(src, super::collector::latest_features());
+        assert!(
+            rows.is_empty(),
+            "{src:?} must be row-free like the oracle, got {rows:?}"
+        );
+    }
 }

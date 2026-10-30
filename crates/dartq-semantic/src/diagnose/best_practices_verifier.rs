@@ -36,6 +36,7 @@
 use super::*;
 use crate::model::Annotation;
 use dartq_resolution::LocalLookup;
+use dartq_scanner::{Keyword, TokenKind};
 
 /// The #2910 pins (the member-use deprecation/experimental faces). Kept as
 /// a standalone `#[path]` submodule so the shared `tests` rig and this
@@ -55,6 +56,21 @@ mod ticket_2924_tests;
 #[cfg(test)]
 #[path = "ticket_2939_tests.rs"]
 mod ticket_2939_tests;
+
+/// The #2993 `invalid_annotation_target` face (the annotation-target
+/// verifier, annotation_verifier.dart `_checkKinds`).
+#[path = "annotation.rs"]
+mod annotation;
+
+/// The #2993 `unnecessary_final` / `missing_required_param` faces (the
+/// parameter-shape members of the best-practices family).
+#[path = "member_face.rs"]
+mod member_face;
+
+/// The #2993 pins (the four new faces' oracle-verbatim rows).
+#[cfg(test)]
+#[path = "ticket_2993_tests.rs"]
+mod ticket_2993_tests;
 
 impl<'a> Engine<'a> {
     /// The template leg of the official invalid-access family, run at a
@@ -279,6 +295,14 @@ impl Engine<'_> {
             );
         }
         self.type_uses = type_uses;
+        // The #2993 faces ride the same post-pass-2 seam: the whole-unit
+        // annotation-target (which drives the directive pass on its own
+        // tail), parameter-final, and set-literal walks over the final
+        // resolution products.
+        self.check_annotation_targets();
+        self.check_unnecessary_final_parameters();
+        self.check_missing_required_params();
+        self.check_unnecessary_set_literals();
     }
 
     /// The tag faces of one resolved use: the target declaration's model
@@ -330,6 +354,15 @@ impl Engine<'_> {
                     // same normalization (element.dart:838-847: the
                     // class's spelling alone for the unnamed face,
                     // `Class.selector` for a named one).
+                    //
+                    // The "no container" sentinel (`StringId::NONE`, an
+                    // unnamed extension's member edge whose face scan
+                    // missed the spelling) names no constructor owner —
+                    // `ctor_annotations` is keyed by a container name — so
+                    // the arm declines instead of resolving the sentinel.
+                    if target_container == StringId::NONE {
+                        return None;
+                    }
                     let selector = self.strings.resolve(name);
                     let key = if selector == "new" {
                         target_container
@@ -685,4 +718,343 @@ fn package_of_uri(uri: &str) -> Option<&str> {
     uri.strip_prefix("package:")
         .and_then(|rest| rest.split('/').next())
         .filter(|name| !name.is_empty())
+}
+
+// —— the unnecessary_set_literal face (#2993) ———————————————————————————
+//
+// The oracle's `unnecessary_set_literal` warning (upstream Dart SDK source,
+// pkg/analyzer/lib/src/error/best_practices_verifier.dart:1353-1391,
+// `_checkForUnnecessarySetLiteral`, driven from `visitFunctionExpression`
+// :502-509): an expression (`=>`) function body whose expression is a SET
+// literal, under a void-returning function type, reports
+// `unnecessary_set_literal` at the literal. Two faces reach the void
+// verdict:
+//
+//   * the corresponding-parameter face (:1363-1368): the FunctionExpression
+//     is an invocation argument paired with a formal whose declared type
+//     is a `FunctionType` — the verdict reads its return type;
+//   * the declared-return face (:1369-1372): the FunctionExpression's
+//     parent is a `FunctionDeclaration` (a top-level function/getter/
+//     setter or a local function — methods are `MethodDeclaration`s and
+//     never ride this face) with a declared return type.
+//
+// Void-shape (:1375-1386): `void`, or `Future<void>`/`FutureOr<void>`
+// (exactly one type argument, itself `void`). A closure in any other
+// position (an initializer, a return, a collection element) has no
+// corresponding parameter and no `FunctionDeclaration` parent — no report.
+//
+// Name-level mirror: the declared-return face walks this unit's top-level
+// executable declaration sites (local functions are under-reports — the
+// library-level site table is the only declaration inventory the model
+// keeps), and the corresponding-parameter face walks the same three call
+// faces the `missing_required_param` pass rides (bare `refs`,
+// `member_refs` edges, creation `type_uses`), pairing each argument
+// element to its formal and reading the formal's `Ty::Function` shape.
+
+impl Engine<'_> {
+    /// The whole-unit `unnecessary_set_literal` pass: the declared-return
+    /// face over this unit's top-level executables and the
+    /// corresponding-parameter face over every resolved call's closure
+    /// arguments.
+    pub(crate) fn check_unnecessary_set_literals(&mut self) {
+        let findings = self.scan_set_literal_faces();
+        for span in findings {
+            // The correction template carries no placeholder — the
+            // verbatim text through the correction-carrying emit.
+            self.emit_corrected(SemanticCode::UnnecessarySetLiteral, span, "");
+        }
+    }
+
+    /// Both faces' report spans, collected before any emission (one
+    /// immutable walk; `emit` mutates).
+    fn scan_set_literal_faces(&self) -> Vec<SourceRange> {
+        let mut findings = Vec::new();
+        let index = self.index;
+        let Some(elements) = index.get(self.file) else {
+            return findings;
+        };
+        // The declared-return face: a top-level function/getter with a
+        // declared void-shape return and an arrow set-literal body
+        // (`void f() => {1}`, `void get g => {1}`).
+        let pool = elements.type_args();
+        for site in &self.decl_sites {
+            if !matches!(site.kind, DeclKind::TopLevelFn) {
+                continue;
+            }
+            let Some(decl) = elements.decl(site.name) else {
+                continue;
+            };
+            if !self.ty_is_void_return(&decl.return_ty, pool) {
+                continue;
+            }
+            if let Some(span) = self.arrow_set_literal_body(site.range) {
+                findings.push(span);
+            }
+        }
+        // The corresponding-parameter face: every resolved call's
+        // arguments, each closure element paired with its formal.
+        for reference in &self.refs {
+            let RefTarget::Decl { file } = reference.target else {
+                continue;
+            };
+            if let Some((formals, open)) = self
+                .member_or_decl_formals(file, None, reference.name)
+                .and_then(|formals| Some((formals, self.call_open_paren(reference.range)?)))
+                && let Some(decl_elements) = index.get(file)
+            {
+                findings.extend(self.scan_closure_argument_elements(
+                    open,
+                    formals,
+                    decl_elements,
+                ));
+            }
+        }
+        for edge in &self.report.member_refs {
+            if let Some((formals, open)) = self
+                .member_or_decl_formals(
+                    edge.target_file,
+                    Some(edge.target_container),
+                    edge.target_name,
+                )
+                .and_then(|formals| Some((formals, self.call_open_paren(edge.range)?)))
+                && let Some(decl_elements) = index.get(edge.target_file)
+            {
+                findings.extend(self.scan_closure_argument_elements(
+                    open,
+                    formals,
+                    decl_elements,
+                ));
+            }
+        }
+        for (range, name) in &self.type_uses {
+            if let Some((formals, open, file, _)) = self.creation_face(*range, *name)
+                && let Some(decl_elements) = index.get(file)
+            {
+                findings.extend(self.scan_closure_argument_elements(
+                    open,
+                    formals,
+                    decl_elements,
+                ));
+            }
+        }
+        findings
+    }
+
+    /// The void-shape verdict of `_checkForUnnecessarySetLiteral`
+    /// (:1375-1386): `void`, or `Future<void>`/`FutureOr<void>` — exactly
+    /// one type argument, itself `void`. A same-named local declaration
+    /// shadows the dart:async heads (the oracle's `isDartAsyncFuture`
+    /// reads the resolved element, never the spelling alone).
+    fn ty_is_void_return(&self, ty: &Ty, pool: &ArgPool) -> bool {
+        match ty {
+            Ty::Void => true,
+            Ty::Named { name, args, .. } => {
+                let head = self.strings.resolve(*name);
+                if head != "Future" && head != "FutureOr" {
+                    return false;
+                }
+                matches!(self.graph.local(self.lib, *name), LocalLookup::Absent)
+                    && pool.get(*args).len() == 1
+                    && matches!(pool.get(*args)[0], Ty::Void)
+            }
+            _ => false,
+        }
+    }
+
+    /// A declaration-site arrow body that is a set literal: from the name
+    /// token, the optional type arguments, the optional formal group, the
+    /// optional async/sync marker, then `=>` and a `{…}` body — the
+    /// report span when the braces spell a set. `None` for every other
+    /// shape (a block body, a non-literal arrow expression, no arrow).
+    fn arrow_set_literal_body(&self, name_range: SourceRange) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let mut cursor =
+            tokens.partition_point(|t| t.utf16_offset < name_range.offset + name_range.length);
+        if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Lt) {
+            cursor = self.angle_group_end(cursor)? + 1;
+        }
+        if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::OpenParen) {
+            cursor = self.tokens.matching_end(cursor)? + 1;
+        }
+        cursor = self.skip_arrow_marker(cursor);
+        if !tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Function) {
+            return None;
+        }
+        cursor += 1;
+        if !tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::OpenCurly) {
+            return None;
+        }
+        let close = self.tokens.matching_end(cursor)?;
+        self.braces_span_if_set(cursor, close)
+    }
+
+    /// The optional `async`/`async*`/`sync*` marker tokens before an
+    /// arrow, from `cursor`, landing just past the marker.
+    fn skip_arrow_marker(&self, mut cursor: usize) -> usize {
+        let tokens = self.tokens.as_slice();
+        while matches!(
+            tokens.get(cursor).map(|t| t.kind),
+            Some(TokenKind::Keyword(Keyword::Async)) | Some(TokenKind::Keyword(Keyword::Sync))
+        ) {
+            cursor += 1;
+            if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Star) {
+                cursor += 1;
+            }
+        }
+        cursor
+    }
+
+    /// One call's argument elements: each closure element
+    /// (`(…) [async] => {…}`) paired with its formal (a named label join,
+    /// or the positional slot), reporting when the paired formal's
+    /// function type is void-returning and the arrow body is a set
+    /// literal — `correspondingParameter?.type` (:1363-1368) at name
+    /// level.
+    fn scan_closure_argument_elements(
+        &self,
+        open: usize,
+        formals: &Formals,
+        elements: &FileElements,
+    ) -> Vec<SourceRange> {
+        let pool = elements.type_args();
+        let tokens = self.tokens.as_slice();
+        let Some(close) = self.tokens.matching_end(open) else {
+            return Vec::new();
+        };
+        let mut findings = Vec::new();
+        let mut cursor = open + 1;
+        let mut positional = 0usize;
+        while cursor < close {
+            // One top-level element: [start, end), split at depth-0
+            // commas (brackets only — angle groups never open argument
+            // depth).
+            let start = cursor;
+            let mut depth = 0i32;
+            while cursor < close {
+                match tokens[cursor].kind {
+                    TokenKind::OpenParen | TokenKind::OpenCurly | TokenKind::OpenSquare => {
+                        depth += 1;
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseCurly | TokenKind::CloseSquare => {
+                        depth -= 1;
+                    }
+                    TokenKind::Comma if depth == 0 => break,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            // The paired formal: a `name:` head joins the named table,
+            // any other element takes the next positional slot.
+            let (content_start, formal): (usize, Option<&Formal>) =
+                if tokens[start].kind == TokenKind::Identifier
+                    && tokens.get(start + 1).is_some_and(|t| t.kind == TokenKind::Colon)
+                {
+                    let label = self.strings.intern(self.tokens.lexeme(self.source, start));
+                    (start + 2, formals.named_formal(label))
+                } else {
+                    let formal = formals.positional.get(positional);
+                    positional += 1;
+                    (start, formal)
+                };
+            if let Some(formal) = formal
+                && let Some(span) =
+                    self.closure_arrow_set_literal(content_start, formal, pool)
+            {
+                findings.push(span);
+            }
+            cursor += 1;
+        }
+        findings
+    }
+
+    /// A closure argument's arrow set-literal body under a void-returning
+    /// formal type: the element at `start` spells a closure head
+    /// (`(…) [async] =>`), its body braces a set literal, and the formal's
+    /// function shape returns the void shape.
+    fn closure_arrow_set_literal(
+        &self,
+        start: usize,
+        formal: &Formal,
+        pool: &ArgPool,
+    ) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let mut cursor = start;
+        if tokens.get(cursor)?.kind != TokenKind::OpenParen {
+            return None;
+        }
+        cursor = self.tokens.matching_end(cursor)? + 1;
+        cursor = self.skip_arrow_marker(cursor);
+        if tokens.get(cursor)?.kind != TokenKind::Function {
+            return None;
+        }
+        cursor += 1;
+        if tokens.get(cursor)?.kind != TokenKind::OpenCurly {
+            return None;
+        }
+        let close = self.tokens.matching_end(cursor)?;
+        let Ty::Function { shape, .. } = formal.ty else {
+            return None;
+        };
+        if !self.ty_is_void_return(&pool.function_shape(shape).return_ty, pool) {
+            return None;
+        }
+        self.braces_span_if_set(cursor, close)
+    }
+
+    /// The braces' span when they spell a SET literal (`SetOrMapLiteral
+    /// .isSet` at token level): at least one element, and no element
+    /// carries a top-level map-entry colon. A colon behind a conditional
+    /// (`c ? a : b`) belongs to the conditional — its `?` is a top-level
+    /// marker that is neither the element's null-aware prefix (`?k: v`)
+    /// nor a spread's (`...?a ? b : c`) — and a null-aware element start
+    /// stays a map marker (`{?k: v}`).
+    fn braces_span_if_set(&self, open: usize, close: usize) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        if open + 1 >= close {
+            // `{}` resolves as a map (no elements, no context).
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut element_start = true;
+        let mut conditional_open = false;
+        let mut prev = TokenKind::Eof;
+        for index in (open + 1)..close {
+            let token = tokens[index];
+            match token.kind {
+                TokenKind::OpenParen | TokenKind::OpenCurly | TokenKind::OpenSquare => {
+                    depth += 1;
+                }
+                TokenKind::CloseParen | TokenKind::CloseCurly | TokenKind::CloseSquare => {
+                    depth -= 1;
+                }
+                TokenKind::Comma if depth == 0 => {
+                    element_start = true;
+                    conditional_open = false;
+                    prev = TokenKind::Eof;
+                    continue;
+                }
+                TokenKind::Question if depth == 0 => {
+                    if !element_start
+                        && prev != TokenKind::PeriodPeriodPeriod
+                        && prev != TokenKind::PeriodPeriodPeriodQuestion
+                    {
+                        conditional_open = true;
+                    }
+                }
+                TokenKind::Colon if depth == 0 => {
+                    if !conditional_open {
+                        // A map-entry colon.
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            element_start = false;
+            prev = token.kind;
+        }
+        Some(SourceRange {
+            offset: tokens[open].utf16_offset,
+            length: tokens[close].utf16_offset + 1 - tokens[open].utf16_offset,
+        })
+    }
 }

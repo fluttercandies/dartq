@@ -1772,17 +1772,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 new_kw,
                 false,
             );
-        } else if self.cursor.progress() == crate::cursor::TokenCursor::progress_at(member_start)
-            && !matches!(next_kind, TokenKind::CloseCurly)
-        {
+        // Official tail (:11350-11368): `token == beforeStart` — zero progress
+        // since the member head — reports `expectedClassMember` and skips the
+        // junk UNLESS it is `}` (the class closer stays for the body loop);
+        // with ANY progress the member parses as fields unconditionally —
+        // `}` and EOF included (`class C { var }` reports `missing_identifier`
+        // + `expected_token ';'` on the unnamed field, never
+        // `expected_class_member`).
+        } else if self.cursor.progress() == crate::cursor::TokenCursor::progress_at(member_start) {
             self.report(msg::expected_class_member(), next_span);
             self.listener.handle_invalid_member(next_span);
-            self.cursor.advance();
-        } else if !matches!(next_kind, TokenKind::CloseCurly | TokenKind::Eof) {
-            self.parse_fields(kind, before_type, mods, before_type, type_info, None, false);
+            if !matches!(next_kind, TokenKind::CloseCurly) {
+                self.cursor.advance();
+            }
         } else {
-            self.report(msg::expected_class_member(), next_span);
-            self.listener.handle_invalid_member(next_span);
+            self.parse_fields(kind, before_type, mods, before_type, type_info, None, false);
         }
     }
 

@@ -83,6 +83,22 @@ fn check(c: &mut Check<'_>) {
                 return;
             }
             let run = statement_run(c, c.node());
+            if run.is_empty() {
+                // The rowless literal statement (`[];` — the parser
+                // seals the empty list literal away): the statement's
+                // own tokens minus the `;` are the expression, and the
+                // upstream `visitNode` face reports at it.
+                let range = c.unit.ast.token_range(c.node());
+                let content: Vec<u32> = (range.start..range.end)
+                    .filter(|&token| c.lexeme(token) != ";")
+                    .collect();
+                if let (Some(&first), Some(&last)) = (content.first(), content.last()) {
+                    let start = crate::rules::utf16_token_span(c, first).start;
+                    let end = crate::rules::utf16_token_span(c, last).end;
+                    c.report(start..end, &[]);
+                }
+                return;
+            }
             walk(c, analysis, &run);
         }
         NodeKind::ForStatement => check_for(c, analysis),
@@ -284,9 +300,53 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
 /// at the operand head.
 fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
     let start = slice::run_utf16_start(c, run).unwrap_or(c.utf16_span(root).start);
-    let tail = content_end_row(c, root, run);
-    let range = start..c.utf16_span(tail).end;
+    // A function literal's body tiles beside it as owner siblings —
+    // the content runs to the statement follower, so the token scan
+    // bounds it.
+    let mut end = if c.kind(root) == NodeKind::FunctionExpression {
+        token_content_end(c, root, start)
+    } else {
+        let tail = content_end_row(c, root, run);
+        let mut end = c.utf16_span(tail).end;
+        // A member-selector root's own row seals past the follower;
+        // its head token is the member name and bounds the content.
+        if matches!(c.kind(root), NodeKind::DotAccess | NodeKind::Qualified) {
+            end = end.max(crate::rules::utf16_token_span(c, c.head_token(root)).end);
+        }
+        end
+    };
+    // A degenerate seal (the empty `[]` literal row anchors 0-width —
+    // the parser's seal collapses on the empty body) reads the
+    // expression's own tokens: from the root's head token forward
+    // until the statement follower.
+    if end <= start {
+        end = token_content_end(c, root, start);
+    }
+    let range = start..end;
     c.report(range, &[]);
+}
+
+/// The content end of a degenerate row: the token at/just before the
+/// report start opens the scan; every token until a follower (`;`,
+/// `,`, `)`, `}`) is content, and the last one bounds the end.
+fn token_content_end(c: &Check<'_>, root: u32, start: u32) -> u32 {
+    let mut index = c.head_token(root);
+    while index > 0 && crate::rules::utf16_token_span(c, index).start > start {
+        index -= 1;
+    }
+    let mut end = c.utf16_span(root).end;
+    let mut cursor = index;
+    while let Some(token) = c.unit.tokens.get(cursor as usize) {
+        let lexeme = c.lexeme(cursor);
+        if matches!(lexeme, ";" | "," | ")" | "}") || token.kind == dartq_scanner::TokenKind::Eof
+        {
+            break;
+        }
+        let span = crate::rules::utf16_token_span(c, cursor);
+        end = end.max(span.end);
+        cursor += 1;
+    }
+    end
 }
 
 /// The row whose end bounds the expression's true content: the
@@ -419,6 +479,36 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
     // The bare-receiver face: the semantic member walk first — the
     // receiver's resolved type decides across files; the same-file
     // written-type channel answers what the model leaves open.
+    // An invocation receiver (`C().g`, `List.empty().where`) resolves
+    // through the callee head's same-file class first, then the
+    // send-completion site's bridge member walk (a constructor
+    // invocation's static type carries the instance members).
+    if run[..name_index]
+        .iter()
+        .any(|&row| c.kind(row) == NodeKind::Arguments)
+        && let Some(head) = run.iter().find(|&row| c.kind(*row) == NodeKind::Identifier)
+    {
+        let class = c.lexeme(c.head_token(*head));
+        if let Some(class_row) = same_file_declaration(c, class) {
+            match class_member(c, class_row, name) {
+                Some(Member::Getter) | None => {}
+                Some(_) => report(c, root, run),
+            }
+            return;
+        }
+        if let Some(send) = run[..name_index]
+            .iter()
+            .rev()
+            .find(|&row| c.kind(*row) == NodeKind::Send)
+            .copied()
+            && let Some(member) = analysis
+                .member_of(query_site(c, send), analysis.strings().intern(name))
+            && matches!(member.entry.kind, MemberKind::Method | MemberKind::Field)
+        {
+            report(c, root, run);
+        }
+        return;
+    }
     let Some(receiver) = slice::bare_receiver(c, run, name_index) else {
         return;
     };
@@ -777,7 +867,27 @@ fn cascade_section_function_typed(
     {
         return true;
     }
+    // The invocation target (`List.empty()..where`): the callee head's
+    // same-file class decides first, then the send-completion site's
+    // bridge member walk (a constructor invocation's static type
+    // carries the instance members).
     let receiver_name = c.lexeme(c.head_token(receiver));
+    if target.iter().any(|&row| c.kind(row) == NodeKind::Arguments) {
+        if let Some(class_row) = same_file_declaration(c, receiver_name) {
+            return member_function_typed(c, class_row, name);
+        }
+        if let Some(send) = target
+            .iter()
+            .rev()
+            .find(|&row| c.kind(*row) == NodeKind::Send)
+            .copied()
+        {
+            return analysis
+                .member_of(query_site(c, send), analysis.strings().intern(name))
+                .is_some_and(|member| member.entry.kind == MemberKind::Method);
+        }
+        return false;
+    }
     let Some(class_name) = same_file::written_type(c, receiver, receiver_name) else {
         return false;
     };

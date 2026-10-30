@@ -107,6 +107,26 @@ impl<'a> Engine<'a> {
             if check.is_final {
                 self.emit(SemanticCode::FinalNotInitialized, check.range, &name, "");
             } else {
+                // The staged entry's loose nullability gate is re-decided on
+                // the collected declared type (`FutureOr<int?> v` is
+                // nullable — `isNullable` recurses the argument,
+                // type_system.dart:1220-1222).
+                let var_ty = match check.container {
+                    Some(container) => self
+                        .index
+                        .get(self.file)
+                        .and_then(|elements| elements.container(container))
+                        .and_then(|decl| decl.members.get(&check.name))
+                        .map(|entry| entry.var_ty),
+                    None => self
+                        .index
+                        .get(self.file)
+                        .and_then(|elements| elements.decl(check.name))
+                        .map(|decl| decl.var_ty),
+                };
+                if var_ty.is_some_and(|ty| self.future_or_nullable(ty)) {
+                    continue;
+                }
                 self.emit(
                     SemanticCode::NotInitializedNonNullableVariable,
                     check.range,
@@ -117,6 +137,97 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The lexeme of the token starting exactly at `offset` (UTF-16), or
+    /// `None` when no token begins there — a recovered/synthetic anchor
+    /// never lands on a real token boundary.
+    fn lexeme_at(&self, offset: u32) -> Option<&'a str> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < offset);
+        if tokens.get(at).is_some_and(|token| token.utf16_offset == offset) {
+            Some(self.tokens.lexeme(self.source, at))
+        } else {
+            None
+        }
+    }
+
+    /// The token immediately AFTER the one starting at `offset` — the
+    /// `.name` selector of a named primary-constructor head reads it.
+    fn token_after(&self, offset: u32) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset <= offset);
+        tokens.get(at).map(|token| SourceRange {
+            offset: token.utf16_offset,
+            length: self.utf16_of((token.byte_offset + token.byte_len) as usize)
+                - token.utf16_offset,
+        })
+    }
+
+    /// Whether the written type is a `FutureOr<T>` whose `T` is nullable —
+    /// the one nullable shape the staged entries' loose potentially-non-
+    /// nullable gate can carry into the flush (`FutureOr<int?> v`,
+    /// `FutureOr` bare = `FutureOr<dynamic>`). Name-matched only (a user
+    /// `FutureOr` in scope shadows the dart:async spelling — the
+    /// under-report direction).
+    fn future_or_nullable(&self, ty: Ty) -> bool {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return false;
+        };
+        if nullable || self.strings.resolve(name) != "FutureOr" {
+            return false;
+        }
+        if args == crate::model::ArgListId::EMPTY {
+            // `FutureOr` bare is `FutureOr<dynamic>` — nullable.
+            return true;
+        }
+        let pool = self.boundary.args.borrow();
+        pool.get(args)
+            .first()
+            .is_none_or(|arg| self.written_nullable(*arg))
+    }
+
+    /// The name-level `isNullable` (type_system.dart:1208-1224): the
+    /// `?`-suffixed and `dynamic`/`Null`/`void`/`Unknown` faces are
+    /// nullable, `FutureOr<T>` recurses its argument, everything else is
+    /// not.
+    fn written_nullable(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                nullable || self.future_or_nullable(Ty::Named { name, nullable, args })
+            }
+            Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => nullable,
+            Ty::Never => false,
+        }
+    }
+
+    /// Whether the constructor head starting at `head` (its class-name
+    /// token) was declared `external` — the upstream `_addConstructor`
+    /// `externalKeyword` exclusion (constructor_fields_verifier.dart:57).
+    /// `external` precedes `const` (`external const C()`); any other
+    /// modifier or a member boundary stops the walk.
+    fn ctor_head_is_external(&self, head: SourceRange) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < head.offset);
+        let mut index = at as isize - 1;
+        while index >= 0 {
+            match self.tokens.lexeme(self.source, index as usize) {
+                "const" => index -= 1,
+                "external" => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// #1314 FAM18: the container's end — its constructor set is complete,
     /// so the instance-field half decides. With no explicit generative
     /// constructor the declaration loop owns the face (per field in
@@ -124,22 +235,31 @@ impl<'a> Engine<'a> {
     /// the `ConstructorFieldsVerifier` owns it: per generative constructor,
     /// the still-uninitialized finals' aggregated row first, then the
     /// non-final non-nullable rows — all anchored on the constructor's
-    /// type-name-through-name span, the unnamed spelling's class-name
-    /// token. A constructor-initializer assignment (`b = e` / `this.b = e`)
-    /// releases the field's latch (`updateWithInitializers`). Named-selector
-    /// sites and named factories stay out of the drive (the upstream
-    /// visitor walks generative constructors; the site kind carries no
-    /// factory bit, so a named generative constructor under-reports rather
-    /// than a named factory over-reporting), and duplicate-named fields
-    /// join no constructor row (upstream `checkElement`'s already-reported
-    /// guard).
+    /// type-name-through-selector errorRange, the unnamed spelling's
+    /// class-name token. A constructor-initializer assignment (`b = e` /
+    /// `this.b = e`) releases the field's latch (`updateWithInitializers`).
+    /// External and named-factory sites stay out of the drive (upstream
+    /// `_addConstructor` skips external heads and never sees a factory),
+    /// and duplicate-named fields join no constructor row (upstream
+    /// `checkElement`'s already-reported guard).
     pub(crate) fn flush_init_instance_fields(&mut self, container: StringId) {
         // The generative constructor set: every declared constructor rides a
         // `begin_constructor` site; factories register no head anchor (their
         // provisional is `None`) and stay out of the generative walks. The
-        // head anchor is the row span — the class-name token the head starts
-        // at — for named and unnamed heads alike (the oracle's
-        // type-name-through-name anchor).
+        // row span is the oracle's `errorRange` (constructor_fields_
+        // verifier.dart:66/:90 — the ConstructorDeclaration's
+        // type-name-through-selector for a secondary head, the
+        // PrimaryConstructorDeclaration's own errorRange — the class name
+        // through its selector — for a primary): the site's own range is
+        // rewritten to the selector token for a named secondary and stays
+        // the `(`/`.` `begin` token for a primary, so the class-name extent
+        // recomposes from the head anchor + container-name token instead.
+        let container_name = self
+            .decl_sites
+            .iter()
+            .rev()
+            .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
+            .map(|site| site.range);
         let ctor_spans: Vec<(usize, SourceRange)> = self
             .decl_sites
             .iter()
@@ -147,8 +267,42 @@ impl<'a> Engine<'a> {
             .filter(|(_, site)| {
                 matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
             })
-            .filter_map(|(index, _)| {
-                self.ctor_head_anchors.get(&index).map(|span| (index, *span))
+            .filter_map(|(index, site)| {
+                let head = *self.ctor_head_anchors.get(&index)?;
+                // Upstream `_addConstructor` skips `externalKeyword` heads
+                // outright (constructor_fields_verifier.dart:56-59): an
+                // external generative constructor still counts for
+                // `hasGenerativeConstructor` (the declaration face stays
+                // off) but never joins the per-constructor report.
+                if self.ctor_head_is_external(head) {
+                    return None;
+                }
+                let span = match self.lexeme_at(head.offset) {
+                    // A primary constructor's anchor is its `(` token — the
+                    // oracle's errorRange is the class name (unnamed) or
+                    // the class name through the `.name` selector.
+                    Some("(") => container_name.unwrap_or(head),
+                    Some(".") => {
+                        let start = container_name.map_or(head.offset, |n| n.offset);
+                        let end = self
+                            .token_after(head.offset)
+                            .map_or(head.end(), |token| token.end());
+                        SourceRange {
+                            offset: start,
+                            length: end - start,
+                        }
+                    }
+                    // A named secondary's site range was rewritten to its
+                    // selector (`MethodDeclarationContinuation`) — merge
+                    // head through selector; an unnamed head's site range
+                    // IS the head.
+                    _ if site.range.offset > head.offset => SourceRange {
+                        offset: head.offset,
+                        length: site.range.end() - head.offset,
+                    },
+                    _ => site.range,
+                };
+                Some((index, span))
             })
             // A redirecting generative ctor (`C.named(...) : this(...)`)
             // satisfies its finals through the redirect target — the
@@ -160,18 +314,20 @@ impl<'a> Engine<'a> {
             .collect();
         // Upstream `hasGenerativeConstructor` (error_verifier.dart:7114 —
         // `element.constructors.any(isGenerative && isOriginDeclaration)`)
-        // counts EVERY declared generative constructor, redirecting ones
-        // included: their presence routes instance fields to the
-        // `ConstructorFieldsVerifier` face (which then silences each
+        // counts EVERY declared generative constructor, redirecting and
+        // external ones included: their presence routes instance fields to
+        // the `ConstructorFieldsVerifier` face (which then silences each
         // redirecting ctor per-ctor via its own
-        // `hasRedirectingConstructorInvocation` early return). A
-        // redirecting-only set — the extension-type
-        // `extension type S(int v) { S.fwd() : this(0); }` shape — keeps the
-        // declaration face OFF: the primary formal binds the representation
-        // field for the redirect target. `DeclKind::Constructor` sites are
-        // generative ctor declarations only (factories register none).
+        // `hasRedirectingConstructorInvocation` early return, and skips
+        // external ctors in `_addConstructor`). A factory is not
+        // generative — a factory-only class keeps the declaration face
+        // (`isGenerative` on a factory element is false, so
+        // `factory C.named() => throw 0;` reports `final_not_initialized`
+        // at the field). `DeclKind::Constructor` sites with `is_factory`
+        // are the named factories (unnamed ones register no site).
         let has_generative_ctor = self.decl_sites.iter().any(|site| {
             !site.is_augment
+                && !site.is_factory
                 && matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
         });
         // `member_duplicate_definition_verifier.dart`'s constructor pass:
@@ -289,6 +445,20 @@ impl<'a> Engine<'a> {
             if check.is_final {
                 finals.push((name, check.range));
             } else {
+                // The staged entry's loose nullability gate is re-decided on
+                // the collected declared type: `FutureOr<T>` is nullable
+                // when T is (`isNullable`, type_system.dart:1220-1222 —
+                // `FutureOr<int?> v` is no required-initialization face),
+                // a verdict the name-level written-type arm cannot reach.
+                let var_ty = self
+                    .index
+                    .get(self.file)
+                    .and_then(|elements| elements.container(container))
+                    .and_then(|decl| decl.members.get(&check.name))
+                    .map(|entry| entry.var_ty);
+                if var_ty.is_some_and(|ty| self.future_or_nullable(ty)) {
+                    continue;
+                }
                 non_finals.push((name, check.range));
             }
         }
@@ -357,12 +527,17 @@ impl<'a> Engine<'a> {
         non_finals.sort_by(|a, b| a.0.cmp(&b.0));
         for (site, span) in &ctor_spans {
             // The implicit-super face: a generative constructor with no
-            // explicit super satisfaction (a `super(...)` initializer or a
-            // `super.x` formal) whose superclass's unnamed constructor
-            // declares required positional parameters reports at the head
-            // (`implicit_super_initializer_missing_arguments`,
-            // diagnostic.g.dart:9734 — the official walk resolves the
-            // implicit `super()` target's required-ness).
+            // explicit super satisfaction (a `super(...)` initializer — or,
+            // conservatively, any `super.x` formal: the entries' granular
+            // counts are consumed by `check_super_formal` before this flush,
+            // so the mark stays the blanket skip; under-supplied formals
+            // under-report, error_verifier.dart:7246-7254) whose
+            // superclass's unnamed constructor declares required parameters
+            // reports at the head. `required` counts BOTH required-positional
+            // and required-named formals (upstream
+            // `requiredPositionalParameterCount != 0 ||
+            // requiredNamedParameters.isNotEmpty`,
+            // error_verifier.dart:7225-7258).
             if !self.ctor_super_init.contains(site) {
                 let superclass = self
                     .index
@@ -377,6 +552,7 @@ impl<'a> Engine<'a> {
                         .and_then(|decl| decl.ctor_formals.get(&superclass))
                         .is_some_and(|formals| {
                             formals.positional.iter().any(|formal| formal.required)
+                                || formals.named.iter().any(|formal| formal.required)
                         });
                     if super_ctor_required {
                         let super_text = self.strings.resolve(superclass).to_string();
@@ -813,13 +989,26 @@ impl<'a> Engine<'a> {
         // Function(int)`, a local's annotation) — it captures and composes
         // into a real interned shape, so the shape-keyed sentinels
         // (`NameTy::from_semantic`) decide same-signature checks. The rest
-        // of an executable's interior stays out: the return annotation (and
-        // an arrow body, an initializer list) parses with the frame open but
-        // the body brace unlatched, and its shapeless degradation is the
-        // pinned under-report of the assignability context face
-        // (`direct_function_typed_return_spelling_stays_silent`).
+        // of an executable's interior stays out EXCEPT the head region:
+        // the return annotation (and the formal list of a method/
+        // getter/setter) parses after `begin_top_level_method`/`begin_method`
+        // pushed the Executable frame but before the body opens —
+        // `T Function<T>(T, T) get foo` must still capture or the latched
+        // return degrades to `FnShapeId::EMPTY` = `dynamic Function()`
+        // (the `direct_function_typed_return_spelling_stays_silent` pin
+        // covers the BODY-position face only). The head is the window where
+        // an Executable frame is open but no body event has run: no
+        // `body_brace` (the block `{` latch) and no `body_mark` (the
+        // async-modifier latch that opens BOTH the `=>` and `{` body
+        // windows — `handle_async_modifier` fires unconditionally).
+        let head_region = self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Executable { body_brace, .. } => Some(body_brace.is_none()),
+            _ => None,
+        }) == Some(true)
+            && self.body_mark.is_none();
         if self.formal_list_depth == 0
             && !self.in_block_body()
+            && !head_region
             && !self
                 .frames
                 .iter()
@@ -1402,12 +1591,34 @@ impl<'a> Engine<'a> {
 
     /// The explicit type arguments of the callee row, if a call-site
     /// group latched any.
+    ///
+    /// The named-selector creation (`c<T>.m(...)`, `C<T>.named(...)`): the
+    /// headless group's entry keys on the RECEIVER row — `rows[callee - 1]`
+    /// — never on the selector's own offset, so the first lookup misses and
+    /// the second arm re-keys through the container segment. A bare or
+    /// member callee with no container row below keeps the miss (a plain
+    /// `f<T>(x)`'s entry sits at the callee's own offset already; a stale
+    /// receiver row's group grounds nothing).
     pub(crate) fn call_args_for(&mut self, callee: usize) -> Option<CallTypeArgs> {
         let offset = self.rows.get(callee)?.range.offset;
-        let pos = self
+        let mut pos = self
             .call_type_args
             .iter()
-            .rposition(|(at, _)| *at == offset)?;
+            .rposition(|(at, _)| *at == offset);
+        if pos.is_none()
+            && callee >= 1
+            && let Some(container_offset) =
+                self.rows.get(callee - 1).and_then(|row| match &row.shape {
+                    RowShape::Bare(BareInfo::Container { .. }) => Some(row.range.offset),
+                    _ => None,
+                })
+        {
+            pos = self
+                .call_type_args
+                .iter()
+                .rposition(|(at, _)| *at == container_offset);
+        }
+        let pos = pos?;
         Some(self.call_type_args.remove(pos).1)
     }
 
@@ -1503,6 +1714,14 @@ impl<'a> Engine<'a> {
     /// unmodeled; the method-formal/return anchors sit at the member name.
     #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub(crate) fn finalize_variance(&mut self) {
+        // HELD-WIRING SEAM (#2910): the member-use deprecation/experimental
+        // pass runs here because every natural call slot — the fold tail
+        // beside `finalize_usage` (unused_finalization.rs) and the
+        // `member_defined` funnel (row_resolution.rs) — sits in a sibling
+        // lane's file this round. The pass is self-contained (it reads
+        // only post-pass-2 resolution products); when a natural slot
+        // frees, this call moves there verbatim.
+        self.report_member_use_warnings();
         if self.var_containers.is_empty() {
             return;
         }

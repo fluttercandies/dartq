@@ -372,26 +372,103 @@ pub(crate) fn restriction_disjoint_from(
 /// face (`isDartCoreBool`/enum/`isSealed`) and is nullability-agnostic
 /// — `S?` of a sealed `S` stays always-exhaustive, the null half being
 /// the space model's nullable split rather than this gate (`dynamic`
-/// has no element and stays `false`). The official check carries three
-/// arms this name-level port does not model: extension types (erased to
-/// the representation type, then recursed — the candidate belongs to the
-/// extension-type member-model ticket, not this site), `FutureOr<T>`
-/// (recursed into the type argument), and promoted type parameters
-/// (recursed into the promoted bound, then the declared bound). All
-/// three fall to the `false` arm here — under-report, never a false
-/// positive. The declared-bound half of the type-parameter arm is
-/// modelled on the flow side instead (`dartq_flow::Interp`'s
-/// `is_always_exhaustive`, which reads the recorder's bound table): this
-/// level's [`NameWorld`] is built without any bound source (its
-/// constructor takes a resolution snapshot that carries names and
-/// supertypes only), so the parameter is indistinguishable from any other
-/// unresolved named head here.
+/// has no element and stays `false`). The official's extension-type arm
+/// is modelled through [`NameWorld::extension_erasure`]: an extension
+/// type's element face recurses on its representation type
+/// (type_system.dart:862-868), so `ET(E _)` over an enum `E` is
+/// always-exhaustive like `E` itself. The `FutureOr<T>` arm recurses
+/// into the type argument (type_system.dart:869-871) and the
+/// `TypeParameterType` arm into the declared bound (:873-879) — both
+/// read through the parse-time engine's boundary pool and bound tables
+/// (`fold_engine`; outside a window the pre-existing `false` answer
+/// stands, under-report never a false positive). The promoted-bound
+/// half of the parameter arm is not modelled at this level — the
+/// promoted face only exists inside a flow model this world lacks —
+/// matching the flow side's conservative subset
+/// (`dartq_flow::Interp::exhaustive_within` reads the same declared
+/// bound). A recursion budget keeps cyclic bounds (`T extends U,
+/// U extends T` — ill-formed, already reported upstream) terminating.
 pub(crate) fn is_always_exhaustive(world: &NameWorld<'_>, ty: NameTy) -> bool {
-    match ty {
+    always_exhaustive_within(world, ty, 8)
+}
+
+/// [`is_always_exhaustive`] with a recursion budget: `FutureOr` chains
+/// (`FutureOr<FutureOr<S>>`) and bound chains spend one unit each; an
+/// exhausted chain answers `false`, the conservative arm.
+fn always_exhaustive_within(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    match world.extension_erasure(&ty) {
         NameTy::Null => true,
-        NameTy::Named(name, _) => world.is_sealed_name(name),
+        NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
+            if world.is_sealed_name(name) {
+                return true;
+            }
+            let NameTy::NamedArgs(fut_name, _, args) = world.extension_erasure(&ty) else {
+                return always_exhaustive_param(world, ty, budget);
+            };
+            // `FutureOr<T>` recurses into `T` (type_system.dart:869-871):
+            // the union is always-exhaustive exactly when its base is.
+            // A shadowed spelling — a declared container or an in-scope
+            // parameter named `FutureOr` — never takes this arm (the
+            // parameter check `is_scope_param` runs first through the
+            // shadow gate).
+            if world.strings.resolve(fut_name) == "FutureOr"
+                && !always_exhaustive_shadowed(world, fut_name)
+                && let Some(engine) = fold_engine()
+            {
+                let base = engine.boundary.pool().get(args).first().copied();
+                if let Some(base) = base {
+                    return always_exhaustive_within(
+                        world,
+                        NameTy::from_semantic(base),
+                        budget - 1,
+                    );
+                }
+            }
+            always_exhaustive_param(world, ty, budget)
+        }
         _ => false,
     }
+}
+
+/// Whether `name` is shadowed off the dart:async `FutureOr` union: a
+/// declared container (an enum/sealed arm already answered), an
+/// in-scope type parameter (`is_scope_param`), or a declaration-less
+/// spelling that could still be a parameter bound the world cannot see.
+/// Only the third shape defers to the engine's scope table — inside a
+/// window the scope answer is exact; outside one the head is treated
+/// as core's (the sealed/enum checks already filtered the closed
+/// shadows).
+fn always_exhaustive_shadowed(world: &NameWorld<'_>, name: StringId) -> bool {
+    if world.container(name).is_some() {
+        return true;
+    }
+    fold_engine().is_some_and(|engine| engine.is_scope_param(name))
+}
+
+/// The `TypeParameterType` arm (type_system.dart:873-879): an in-scope
+/// type parameter is always-exhaustive when its declared bound is
+/// (`T extends St` over the enum `St` splits completely). The promoted
+/// bound is unmodelled at this level — the conservative subset. Only a
+/// name the scope table declares as a parameter takes the arm; any
+/// other spelling answers `false`.
+fn always_exhaustive_param(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bool {
+    let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = world.extension_erasure(&ty)
+    else {
+        return false;
+    };
+    let Some(engine) = fold_engine() else {
+        return false;
+    };
+    if !engine.is_scope_param(name) {
+        return false;
+    }
+    let Some(bound) = engine.param_bound(name) else {
+        return false;
+    };
+    always_exhaustive_within(world, NameTy::from_semantic(bound), budget - 1)
 }
 
 // —— records/patterns/exhaustiveness (M2 face) ————————————————————————————
@@ -606,18 +683,53 @@ impl Restriction {
     /// operand (`var x`, `_`: the context's full space) is the identity
     /// (official `_createSingleSpaceIntersection`, upstream Dart SDK source,
     /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:975-1009).
-    /// Every other pair keeps [`Self::and`]'s answer.
+    /// Every other pair keeps [`Self::and`]'s answer — save the
+    /// postfix-wrap pair: a `Union` tail ending in `Null` is the
+    /// null-assert leaf's shape (`p!` = the subpattern restricted to
+    /// non-null UNION the whole `Null` space, `createNullAssertSpace`,
+    /// shared.dart:790-797). It is not a `&&` operand to intersect — the
+    /// `!` *replaces* the subpattern's own coverage: `P ∩ scrut-nonNull`
+    /// (the narrowed left side) joined by the preserved `Null` half, so
+    /// `BoolET _!` over `bool?` covers `bool|Null` whole and `true!`
+    /// leaves `false` uncovered. A leaf `Null` inside a union a user
+    /// wrote (`x || null`) cannot reach this arm with a trailing position
+    /// — the `||` collapse owns the in-frame union build and postfix
+    /// wraps are the only sibling-leaf merges that ever see it.
     pub(crate) fn and_in(self, world: &NameWorld<'_>, other: Restriction) -> Restriction {
         let as_ty = |r: &Restriction| match *r {
             Restriction::Named(name, nullable) => Some(NameTy::Named(name, nullable)),
             Restriction::NamedArgs(name, nullable, args) => {
                 Some(NameTy::NamedArgs(name, nullable, args))
             }
+            // The value-precise leaves carry their own `NameTy` (upstream
+            // `_BoolValueStaticType`/`EnumElementStaticType` intersect to
+            // themselves against their head type). `Null` stays a leaf:
+            // the `p!` union-merge owns its coverage whole.
+            Restriction::BoolValue(value) => Some(NameTy::BoolValue(value)),
+            Restriction::EnumValue(enum_name, constant) => {
+                Some(NameTy::EnumValue(enum_name, constant))
+            }
             _ => None,
         };
         match (&self, &other) {
             (Restriction::NamedContext, _) => other,
             (_, Restriction::NamedContext) => self,
+            // `p` then `!` (either order in the leaf list): the union's
+            // non-null half intersects the subpattern, its `Null` half
+            // stays whole — `createNullAssertSpace`'s union verbatim.
+            (Restriction::Union(parts), leaf) | (leaf, Restriction::Union(parts))
+                if matches!(parts.last(), Some(Restriction::Null)) =>
+            {
+                let mut kept = Vec::with_capacity(parts.len());
+                for part in &parts[..parts.len() - 1] {
+                    let narrowed = leaf.clone().and_in(world, part.clone());
+                    if narrowed != Restriction::Unknown {
+                        kept.push(narrowed);
+                    }
+                }
+                kept.push(Restriction::Null);
+                Restriction::Union(kept)
+            }
             _ => match (as_ty(&self), as_ty(&other)) {
                 (Some(a), Some(b)) if world.is_subtype_of(&a, &b) => self,
                 (Some(a), Some(b)) if world.is_subtype_of(&b, &a) => other,
@@ -888,6 +1000,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     // A type lattice: several arms legitimately answer plain `true`.
     #[allow(clippy::match_same_arms)]
     fn is_subtype_of(&self, sub: &NameTy, sup: &NameTy) -> bool {
+        let sub = &self.extension_erasure(&self.fold_written_never(sub));
+        let sup = &self.extension_erasure(&self.fold_written_never(sup));
         if sub == sup {
             return true;
         }
@@ -941,15 +1055,25 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 | NameTy::BoolValue(_),
                 NameTy::TopNonNullable,
             ) => true,
-            // A constant's type is its enum, non-null.
-            (NameTy::EnumValue(en, _), sup) => self.is_subtype_of(&NameTy::Named(*en, false), sup),
+            // A constant's type is its declared instantiation
+            // (`enumField.type`, `EnumElementStaticType._type`): `E.b`
+            // of `enum E<T> { b<String>(…) }` is `E<String>`, not the
+            // bare head — an `E<num>` type-test case cannot cover it.
+            // [`Self::enum_constant_ty`] carries the instantiation;
+            // `UNKNOWN`/foreign rows keep the bare head.
+            (NameTy::EnumValue(en, constant), sup) => {
+                self.is_subtype_of(&self.enum_constant_ty(*en, *constant), sup)
+            }
             // The restricted nullable inherits the value's type edges, but
             // only toward nullable targets (its `null` half never fits a
             // non-nullable type).
             (
-                NameTy::EnumValueOrNull(en, _),
+                NameTy::EnumValueOrNull(en, constant),
                 NameTy::Named(tn, true) | NameTy::NamedArgs(tn, true, _),
-            ) => self.is_subtype_of(&NameTy::Named(*en, false), &NameTy::Named(*tn, true)),
+            ) => {
+                let declared = self.enum_constant_ty(*en, *constant);
+                self.is_subtype_of(&declared, &NameTy::Named(*tn, true))
+            }
             (NameTy::BoolOrNull(_), NameTy::Named(tn, true)) => self.is_subtype_of(
                 &NameTy::Named(self.bool_id, false),
                 &NameTy::Named(*tn, true),
@@ -969,7 +1093,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     }
 
     fn is_sealed(&self, ty: &NameTy) -> bool {
-        match ty {
+        match &self.extension_erasure(ty) {
             // Nullable projections split (static_type.dart:356).
             NameTy::Named(_, true)
             | NameTy::NamedArgs(_, true, _)
@@ -984,7 +1108,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     }
 
     fn subtypes(&self, ty: &NameTy) -> Vec<NameTy> {
-        match ty {
+        let erased = self.extension_erasure(ty);
+        match &erased {
             NameTy::Named(name, true) => vec![NameTy::Named(*name, false), NameTy::Null],
             NameTy::NamedArgs(name, true, args) => {
                 vec![NameTy::NamedArgs(*name, false, *args), NameTy::Null]
@@ -997,7 +1122,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             }
             NameTy::BoolOrNull(value) => vec![NameTy::BoolValue(*value), NameTy::Null],
             NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
-                self.name_subtypes(*name)
+                self.name_subtypes(*name, &erased)
             }
             _ => Vec::new(),
         }
@@ -1008,7 +1133,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     /// know it (the checker's columns then fall back to the nullable
     /// object, exhaustive.dart:396-406).
     fn property_type(&self, ty: &NameTy, key: &Key) -> Option<NameTy> {
-        let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = ty else {
+        let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = &self.extension_erasure(ty)
+        else {
             return None;
         };
         let Key::Name(member) = key else {
@@ -1027,6 +1153,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     }
 
     fn witness_text(&self, ty: &NameTy, fields: &[(Key, String)]) -> String {
+        let ty = &self.extension_erasure(ty);
         if fields.is_empty() {
             // The instance-shape witness always carries the
             // constructor-form parentheses, empty or not
@@ -1057,6 +1184,27 @@ impl ExhaustivenessWorld for NameWorld<'_> {
 }
 
 impl<'a> NameWorld<'a> {
+    /// The name-level `Never` fold: a written `Never` annotation reaches
+    /// the world as `NameTy::Named` — the identifier's own spelling —
+    /// while the canonical bottom the exhaustiveness lattice answers is
+    /// [`NameTy::Never`] (the throw expression's bottom, the
+    /// `object_nullable`/`never` factory). Without the fold a
+    /// `Named(Never, false)` side falls through every bottom arm to a
+    /// plain false, and the argument/operator verdicts that stage on this
+    /// lattice re-report the pair the oracle's own `isSubtypeOf` accepts
+    /// unconditionally (subtype.dart:299-301's `T1 <: T2` when `T1` is
+    /// `Never`). Resolving the interned name keeps the fold honest — a
+    /// user class literally named `Never` in its own file collides, but
+    /// that spelling is already the declared-edge lattice's blind spot
+    /// (a local `Never` shadows dart:core's for every name-level ask,
+    /// not just this one).
+    fn fold_written_never(&self, ty: &NameTy) -> NameTy {
+        match ty {
+            NameTy::Named(name, false) if self.strings.resolve(*name) == "Never" => NameTy::Never,
+            other => *other,
+        }
+    }
+
     /// Whether some runtime value can inhabit both regions:
     /// `canBeSubtypeOf` (type_system.dart:150-330), the verified
     /// `TypeSystem::can_be_subtype_of` port mirrored at name level — the
@@ -1069,6 +1217,8 @@ impl<'a> NameWorld<'a> {
     /// `FutureOr`, and record shapes do not exist at name level and fall
     /// to the same default.
     pub(crate) fn can_be_subtype_of(&self, left: &NameTy, right: &NameTy) -> bool {
+        let left = &self.extension_erasure(left);
+        let right = &self.extension_erasure(right);
         let left_nullable = Self::is_potentially_nullable(left);
         let right_nullable = Self::is_potentially_nullable(right);
         if matches!(right, NameTy::Null) {
@@ -1178,6 +1328,68 @@ impl<'a> NameWorld<'a> {
         out
     }
 
+    /// `getExtensionTypeErasure` (type.dart's `extensionTypeErasure`, fed
+    /// into every `StaticType` the shared exhaustiveness walk builds —
+    /// `getStaticType` erases at entry, shared.dart:195): an extension type
+    /// stands for its representation type at every name-level ask. The
+    /// representation formal's declared `Ty` converts through
+    /// [`NameTy::from_semantic`] and joins the use-site `?` (`ET<num>?`
+    /// erases to `E<num>?`, `extension_type.dart`'s
+    /// `extensionTypeErasure` recursing under the nullability suffix);
+    /// the representation's own written argument list stands verbatim —
+    /// the name level compares heads, never substitutions (the
+    /// exhaustiveness columns pattern-match on heads, matching the
+    /// pre-existing `NamedArgs` posture). A name that resolves to no
+    /// extension-type declaration, or to one whose representation formal
+    /// is absent (a body-less recovery shape), keeps the written face.
+    /// Chained representations (`extension type ET2(ET1 _)`) recurse the
+    /// same way the official erasure does — the loop bound keeps a cyclic
+    /// self-representation from hanging the walk (the element model's own
+    /// `extension_type_representation_depends_on_itself` row already
+    /// reported it; the face here just cannot loop).
+    fn extension_erasure(&self, ty: &NameTy) -> NameTy {
+        let mut current = *ty;
+        for _ in 0..8 {
+            let (name, nullable) = match current {
+                NameTy::Named(name, nullable) | NameTy::NamedArgs(name, nullable, _) => {
+                    (name, nullable)
+                }
+                _ => return current,
+            };
+            let erased = self.container(name).and_then(|container| {
+                (container.kind == ContainerKind::ExtensionType)
+                    .then(|| container.primary_formals.first().map(|rep| rep.formal.ty))
+                    .flatten()
+            });
+            let Some(repr) = erased else {
+                return current;
+            };
+            // An unknown representation (an unresolved annotation the
+            // element model latched `Ty::Unknown` for) is the oracle's
+            // `InvalidType` corner — erasing to the nullable top would
+            // answer every ask `true` and false-positive the covering
+            // gap; the written face keeps the under-report direction.
+            if repr == Ty::Unknown {
+                return current;
+            }
+            let folded = NameTy::from_semantic(repr);
+            current = match folded {
+                // The representation's own nullability joins the use-site
+                // `?` (`typedef`-free chains keep the OR on every hop).
+                NameTy::Named(head, repr_nullable) => NameTy::Named(head, repr_nullable | nullable),
+                NameTy::NamedArgs(head, repr_nullable, args) => {
+                    NameTy::NamedArgs(head, repr_nullable | nullable, args)
+                }
+                // Non-named representation shapes (a record or function
+                // type's name-level sentinel, `dynamic`, `Null`) stand
+                // whole — the use-site `?` rides the projection faces the
+                // way the written-face pair does elsewhere.
+                other => other,
+            };
+        }
+        current
+    }
+
     /// `isPotentiallyNullable` (`type_system.dart:1260`): everything except
     /// the non-nullable shapes.
     fn is_potentially_nullable(ty: &NameTy) -> bool {
@@ -1231,6 +1443,8 @@ impl<'a> NameWorld<'a> {
     /// every other shape answers `true` (the official's type-parameter
     /// and non-interface fallbacks).
     pub(crate) fn can_be_equal(&self, constant: &NameTy, value: &NameTy) -> bool {
+        let constant = &self.extension_erasure(constant);
+        let value = &self.extension_erasure(value);
         if !matches!(
             constant,
             NameTy::Named(..) | NameTy::NamedArgs(..) | NameTy::Null
@@ -1710,9 +1924,156 @@ impl<'a> NameWorld<'a> {
         name == self.enum_id || self.container(name).is_some() || self.is_sealed_name(name)
     }
 
+    /// The constant's declared instantiation as a [`NameTy`]
+    /// (`enumField.type`, `AnalyzerEnumOperations.getEnumElementType`):
+    /// the member row's `var_ty` — `E<String>` for `b<String>`,
+    /// `E<num>` for an argument-less constant on `E<T extends num>`,
+    /// the bare head for a non-generic enum or a pre-field payload —
+    /// projected across the pool boundary through the parse-time
+    /// engine. `UNKNOWN` or a missing window keeps the bare-head answer
+    /// (the pre-#3026 face, never a false verdict).
+    fn enum_constant_ty(&self, enum_name: StringId, constant: StringId) -> NameTy {
+        let Some((container, owner)) = self.locate(enum_name) else {
+            return NameTy::Named(enum_name, false);
+        };
+        let Some(engine) = fold_engine() else {
+            return NameTy::Named(enum_name, false);
+        };
+        let Some(entry) = container.members.get(&constant) else {
+            return NameTy::Named(enum_name, false);
+        };
+        if entry.var_ty == Ty::Unknown {
+            return NameTy::Named(enum_name, false);
+        }
+        NameTy::from_semantic(engine.boundary.ty(owner, entry.var_ty))
+    }
+
+    /// The generic-enum filter of `EnumStaticType._createEnumElements`
+    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+    /// exhaustiveness/types/enum.dart:99-134): a constant only populates
+    /// the enum's closed subtype set when its declared type is a subtype
+    /// of the scrutinee's overapproximation — `E.b` (`E<String>`) can
+    /// never be a value of `E<num>` or of `E<T>` over `T extends num`
+    /// (whose overapproximation is `E<num>`), so an `E.a || E.c` case
+    /// set is already exhaustive and `E.b` is a dead constant. The
+    /// constant's declared type is the member row's `var_ty` the
+    /// collector seals from the element's written instantiation;
+    /// `EMPTY`/foreign slots and any undecidable ask keep the constant
+    /// (the pre-existing under-report direction).
+    fn enum_constant_populates(
+        &self,
+        container: &'a Container,
+        owner: FileId,
+        constant: StringId,
+        scrutinee: &NameTy,
+    ) -> bool {
+        let Some(engine) = fold_engine() else {
+            return true;
+        };
+        let Some(entry) = container.members.get(&constant) else {
+            return true;
+        };
+        if entry.var_ty == Ty::Unknown {
+            return true;
+        }
+        // Project the declared type across the pool boundary (a foreign
+        // enum's slot indexes its own pool), then overapproximate the
+        // scrutinee's written arguments — each in-scope type parameter
+        // substitutes its declared bound (`overapproximate(E<T>)` is
+        // `E<num>` for `T extends num`, shared.dart's
+        // `typeOperations.overapproximate`).
+        let declared = engine.boundary.ty(owner, entry.var_ty);
+        let Some(over) = Self::overapproximate(engine, scrutinee) else {
+            return true;
+        };
+        engine.slot_subtype(declared, over).unwrap_or(true)
+    }
+
+    /// The scrutinee's overapproximation as a semantic `Ty`
+    /// (`typeOperations.overapproximate`, enum.dart:124): the written
+    /// head's argument list with each in-scope type parameter replaced
+    /// by its declared bound, recursively. A bare head, an unknown
+    /// shape, or a list the pool cannot resolve stays `None` — the
+    /// constant keeps its place (under-report).
+    fn overapproximate(engine: &Engine<'_>, ty: &NameTy) -> Option<Ty> {
+        let NameTy::NamedArgs(name, nullable, args) = *ty else {
+            return None;
+        };
+        let args = engine.boundary.pool().get(args).to_vec();
+        let mapped: Vec<Ty> = args
+            .iter()
+            .map(|&arg| Self::overapprox_ty(engine, arg, 8))
+            .collect();
+        Some(
+            engine
+                .boundary
+                .args
+                .borrow_mut()
+                .named(name, nullable, &mapped),
+        )
+    }
+
+    /// One argument's overapproximation (`TypeSystem.overapproximate`'s
+    /// type-parameter arm): an in-scope parameter spelling substitutes
+    /// its declared bound, any other leaf passes through, and a nested
+    /// argument list recurses. The budget keeps a cyclic bound chain
+    /// structurally terminating; an exhausted chain keeps the written
+    /// face (under-report — the unprovable answer).
+    fn overapprox_ty(engine: &Engine<'_>, ty: Ty, budget: u8) -> Ty {
+        if budget == 0 {
+            return ty;
+        }
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if engine.is_scope_param(name)
+                    && let Some(bound) = engine.param_bound(name)
+                {
+                    let bound = Self::overapprox_ty(engine, bound, budget - 1);
+                    return if nullable {
+                        match bound {
+                            Ty::Named {
+                                name,
+                                nullable: _,
+                                args,
+                            } => Ty::Named {
+                                name,
+                                nullable: true,
+                                args,
+                            },
+                            other => other,
+                        }
+                    } else {
+                        bound
+                    };
+                }
+                if args == ArgListId::EMPTY {
+                    return ty;
+                }
+                let inner = engine.boundary.pool().get(args).to_vec();
+                let mapped: Vec<Ty> = inner
+                    .iter()
+                    .map(|&arg| Self::overapprox_ty(engine, arg, budget - 1))
+                    .collect();
+                if mapped == inner {
+                    return ty;
+                }
+                engine
+                    .boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &mapped)
+            }
+            other => other,
+        }
+    }
+
     /// The closed subtype set of a sealed class or enum, in declaration
     /// order (types/sealed.dart, types/enum.dart).
-    fn name_subtypes(&self, name: StringId) -> Vec<NameTy> {
+    fn name_subtypes(&self, name: StringId, scrutinee: &NameTy) -> Vec<NameTy> {
         if name == self.bool_id {
             return vec![NameTy::BoolValue(true), NameTy::BoolValue(false)];
         }
@@ -1726,13 +2087,16 @@ impl<'a> NameWorld<'a> {
             // an enumeration of the visible enum declarations.
             return Vec::new();
         }
-        let Some(container) = self.container(name) else {
+        let Some((container, owner)) = self.locate(name) else {
             return Vec::new();
         };
         if container.kind == ContainerKind::Enum {
             return container
                 .enum_constants
                 .iter()
+                .filter(|constant| {
+                    self.enum_constant_populates(container, owner, **constant, scrutinee)
+                })
                 .map(|constant| NameTy::EnumValue(name, *constant))
                 .collect();
         }

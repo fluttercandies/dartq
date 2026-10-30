@@ -126,6 +126,7 @@ impl<'a> Engine<'a> {
             pending_bounded_checks: Vec::new(),
             raw_type_sites: Vec::new(),
             staged_checks: Vec::new(),
+            alias_fold_memo: std::cell::RefCell::new(FxHashMap::default()),
             cast_nullable: Vec::new(),
             body_completions: Vec::new(),
             armed_ty: None,
@@ -1435,7 +1436,11 @@ impl<'a> Engine<'a> {
     /// read row's own payload) decides. `Ty::Unknown` is the opaque-flow
     /// marker (the lattice could not spell the type) — the nullable
     /// posture of the row still decides, matching the parse-time arms'
-    /// treatment of the marker.
+    /// treatment of the marker. A `Null`-typed operand reports
+    /// `invalid_use_of_null_value` instead — the verifier's `report()`
+    /// swaps the code when `receiverType == typeProvider.nullType`
+    /// (`nullable_dereference_verifier.dart:47-49`, reached through
+    /// `for_resolver.dart:88`/`resolver.dart:4189`).
     fn emit_operand_face_row(
         &self,
         face: UncheckedOperandFace,
@@ -1444,6 +1449,21 @@ impl<'a> Engine<'a> {
         out: &mut Vec<Diagnostic>,
     ) {
         if !self.operand_face_ty_nullable(ty) {
+            return;
+        }
+        if ty == Ty::Null {
+            let code = SemanticCode::InvalidUseOfNullValue;
+            out.push(
+                Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message("", ""),
+                    self.file,
+                    range,
+                    None,
+                )
+                .with_context(self.non_promotion_context_at(range.offset)),
+            );
             return;
         }
         let (message, correction) = face.texts();
@@ -1461,16 +1481,16 @@ impl<'a> Engine<'a> {
     }
 
     /// The `isPotentiallyNullable` posture of an operand's static type:
-    /// nullable named/record/function shapes and `void` report
+    /// nullable named/record/function shapes, `void`, and `Null` report
     /// (`isPotentiallyNullable`'s `type is VoidType` arm — the
-    /// `forIn_iterable_typeVoid` oracle rows carry this code);
-    /// `dynamic` is excluded upstream (`NullableDereferenceVerifier.
-    /// _check`'s `DynamicType` arm), `Null` answers through the separate
-    /// `invalid_use_of_null_value` face (not this ticket's rows), and
+    /// `forIn_iterable_typeVoid` oracle rows carry this code — and the
+    /// `NullType` arm, whose row the verifier's `report()` swaps to
+    /// `invalid_use_of_null_value`); `dynamic` is excluded upstream
+    /// (`NullableDereferenceVerifier._check`'s `DynamicType` arm), and
     /// `Unknown`/`Never` are not potentially nullable.
     fn operand_face_ty_nullable(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Void => true,
+            Ty::Void | Ty::Null => true,
             Ty::Named { nullable, .. }
             | Ty::Record { nullable, .. }
             | Ty::Function { nullable, .. } => nullable,
@@ -2395,7 +2415,7 @@ impl<'a> Engine<'a> {
                 nullable: false,
             } = sub
                 && self.is_scope_param(param)
-                && let Some(bound) = self.param_bound_of(param)
+                && let Some(bound) = self.param_bound(param)
                 && bound != Ty::Dynamic
             {
                 return self.strict_subtype(bound, sup, next);
@@ -2467,7 +2487,7 @@ impl<'a> Engine<'a> {
             } = sub
                 && self.is_scope_param(param)
             {
-                return match self.param_bound_of(param) {
+                return match self.param_bound(param) {
                     Some(bound) if bound != Ty::Dynamic => self.strict_subtype(bound, sup, next),
                     _ => false,
                 };
@@ -2519,7 +2539,7 @@ impl<'a> Engine<'a> {
                 }
                 if sub_args_id == ArgListId::EMPTY
                     && self.is_scope_param(name)
-                    && let Some(bound) = self.param_bound_of(name)
+                    && let Some(bound) = self.param_bound(name)
                 {
                     // An unbounded parameter is bounded by `dynamic` —
                     // `dynamic <: C` is no fit (Left Top above).
@@ -3255,14 +3275,14 @@ impl<'a> Engine<'a> {
         // signature — `FnVarSig::params` feeds the subtype and inference
         // verdicts, which keep their count-only posture; this face is
         // display-only. A `Dynamic` bound is the unbounded face.
+        //
+        // The return fold runs BEFORE the pool borrow: `fold_alias_ty`
+        // descends into `instantiated_head_ty`, which interns through the
+        // same `args` RefCell — holding the borrow across the call
+        // re-enters `borrow_mut` and panics (#2992).
+        let return_ty = self.fold_alias_ty(sig.return_ty);
         let mut args = self.boundary.args.borrow_mut();
-        let ty = args.function_generic(
-            type_params,
-            self.fold_alias_ty(sig.return_ty),
-            &positional,
-            &named,
-            false,
-        );
+        let ty = args.function_generic(type_params, return_ty, &positional, &named, false);
         drop(args);
         ty
     }
@@ -4447,7 +4467,7 @@ impl<'a> Engine<'a> {
                                 non_param_position = true;
                                 continue;
                             }
-                            let bound = match self.param_bound_of(param) {
+                            let bound = match self.param_bound(param) {
                                 Some(Ty::Dynamic) => return,
                                 Some(bound) => bound,
                                 None => return,
@@ -4891,6 +4911,19 @@ impl<'a> Engine<'a> {
             _ => self.operand_static_ty(row),
         };
         if ty != Ty::UNKNOWN {
+            return Some(ty);
+        }
+        // A bare callable read initializer (`var v = fi`, `var t = m`
+        // inside the container): the `is`-operand face
+        // [`Self::operand_tear_off_ty`] already spells — the top-level,
+        // local-function, and enclosing-member signatures as the function
+        // type the read's static type IS (the oracle's
+        // `PropertyAccess`/`Identifier.staticType` resolves the callable
+        // element, whose `type` is the function type). Without it a
+        // `var`-inferred local bound `Unknown`, and every `v is T` verdict
+        // under-reported where the oracle's function-typed operand
+        // decides (`v is Function` is constant-true).
+        if let Some(ty) = self.operand_tear_off_ty(row) {
             return Some(ty);
         }
         // A method tear-off initializer (`var t = C<int>().m`): the member
@@ -7793,6 +7826,65 @@ fn trim_value_ws(bytes: &[u8], start: usize, end: usize) -> usize {
     start
 }
 
+/// The restricted supertype spellings, name+library keyed
+/// (`TypeProviderImpl.isNonSubtypableClass`, upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/element/type_provider.dart:13-76 and :547-555):
+/// every name lives only in its `dart:core`/`dart:async`/`dart:typed_data`
+/// library, so an entry the analysis set resolves to its own declaration is
+/// a user element and never restricted — the spelling is the SDK face
+/// exactly when nothing indexed claims it. #2972.
+const NON_SUBTYPABLE_SDK_NAMES: &[&str] = &[
+    // dart:core (type_provider.dart:27-36).
+    "bool",
+    "double",
+    "Enum",
+    "int",
+    "Null",
+    "num",
+    "Record",
+    "String",
+    // dart:async (type_provider.dart:25).
+    "FutureOr",
+    // dart:typed_data (type_provider.dart:38-76).
+    "ByteBuffer",
+    "ByteData",
+    "Endian",
+    "Float32List",
+    "Float32x4",
+    "Float32x4List",
+    "Float64List",
+    "Float64x2",
+    "Float64x2List",
+    "Int16List",
+    "Int32List",
+    "Int32x4",
+    "Int32x4List",
+    "Int64List",
+    "Int8List",
+    "TypedData",
+    "Uint16List",
+    "Uint32List",
+    "Uint64List",
+    "Uint8ClampedList",
+    "Uint8List",
+    "UnmodifiableByteBufferView",
+    "UnmodifiableByteDataView",
+    "UnmodifiableFloat32ListView",
+    "UnmodifiableFloat32x4ListView",
+    "UnmodifiableFloat64ListView",
+    "UnmodifiableFloat64x2ListView",
+    "UnmodifiableInt16ListView",
+    "UnmodifiableInt32ListView",
+    "UnmodifiableInt32x4ListView",
+    "UnmodifiableInt64ListView",
+    "UnmodifiableInt8ListView",
+    "UnmodifiableUint16ListView",
+    "UnmodifiableUint32ListView",
+    "UnmodifiableUint64ListView",
+    "UnmodifiableUint8ClampedListView",
+    "UnmodifiableUint8ListView",
+];
+
 impl<'a> Engine<'a> {
     /// The `<…>` group of the nearest enclosing generalized function type
     /// whose formal list covers `offset` — the raw byte window of the
@@ -7941,6 +8033,168 @@ impl<'a> Engine<'a> {
             }
         }
         None
+    }
+
+    /// The clause entry's SDK-face head when the entry names a restricted
+    /// supertype (#2972): `None` for everything the analysis set resolves
+    /// (a local or imported element — upstream keys the restriction on the
+    /// RESOLVED element's library), a one-level chase through a non-generic
+    /// bare alias (`typedef A = int`, the written-shape face the element
+    /// model keeps in `var_ty`), then the closed spelling set. Returns the
+    /// head spelling (the chased one for an alias) so the caller can apply
+    /// the `Enum`-in-`with` exemption; the REPORT's `{0}` stays the entry's
+    /// written name (`Classes can't mixin 'T'.`, messages.yaml :17358).
+    fn disallowed_subtype_head(&self, entry: StringId) -> Option<StringId> {
+        // A resolved element is its own declaration — never the SDK face
+        // (`isNonSubtypableClass`, type_provider.dart:547-555).
+        if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            entry,
+        )
+        .is_some()
+        {
+            return None;
+        }
+        let mut head = entry;
+        if let Some(decl) = self.index.get(self.file).and_then(|f| f.decl(entry)) {
+            // Only the bare non-generic alias shape models here; anything
+            // else (generic, argument-bearing, imported alias) keeps the
+            // under-report direction.
+            if decl.kind != MicroKind::TypeAlias || decl.type_params != 0 {
+                return None;
+            }
+            match decl.var_ty {
+                // The bare named head (`typedef T = FutureOr`); a written
+                // argument group stays unmodelled.
+                Ty::Named {
+                    name,
+                    args: ArgListId::EMPTY,
+                    ..
+                } => head = name,
+                // The collector folds the unshadowed `Null` spelling to
+                // the dedicated variant (its annotation fold) — that is
+                // dart:core's restricted `Null` at this model's grade.
+                Ty::Null => head = self.intern("Null"),
+                _ => return None,
+            }
+            if resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                head,
+            )
+            .is_some()
+            {
+                return None;
+            }
+        }
+        NON_SUBTYPABLE_SDK_NAMES
+            .contains(&self.strings.resolve(head))
+            .then_some(head)
+    }
+
+    /// The `subtype_of_disallowed_type` teardown (#2972): every clause face
+    /// of every container in this unit whose target is a restricted SDK
+    /// class reports once, mirroring the upstream per-clause walks —
+    /// `_checkForExtendsDisallowedClass` (error_verifier.dart:4692-4697),
+    /// the `with` face inside `_checkForAllMixinErrorCodes` (:2446-2463,
+    /// the `!mixinType.isDartCoreEnum` conjunct suppressing the core
+    /// `Enum`), `_checkForImplementsClauseErrorCodes` (:5365-5381), and
+    /// `_checkForOnClauseErrorCodes` (:6724-6745). The clause split per
+    /// kind follows the visitors: class and named mixin application carry
+    /// extends+with+implements (`visitClassDeclaration` and
+    /// `visitClassTypeAlias`), enums with+implements (:855-864, a null
+    /// superclass), mixins on+implements (`_checkMixinInheritance`,
+    /// :7808-7817). Runs after the parse like the other finalizers — the
+    /// whole-unit container set is what the shadow test resolves against.
+    /// The dart: current-library exemption is `isScheme('dart')`
+    /// (:4734-4736); rows anchor at the declaring name, the subtype
+    /// family's convention (`HeaderClauseSpans`'s doc).
+    pub(crate) fn finalize_disallowed_subtypes(&mut self) {
+        if self.graph.uri(self.lib).starts_with("dart:") {
+            return;
+        }
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        // The face list collects first — the emit loop needs `&mut self`
+        // while the element index and the classifier read shared state.
+        let mut faces: Vec<(SemanticCode, StringId, SourceRange)> = Vec::new();
+        for (decl_name, container) in elements.containers() {
+            let Some(site) = self
+                .decl_sites
+                .iter()
+                .rev()
+                .find(|site| matches!(site.kind, DeclKind::Container) && site.name == decl_name)
+            else {
+                continue;
+            };
+            let mut entries: Vec<(SemanticCode, StringId)> = Vec::new();
+            match container.kind {
+                ContainerKind::Class => {
+                    if let Some(superclass) = container.superclass {
+                        entries.push((SemanticCode::SubtypeOfDisallowedTypeInExtends, superclass));
+                    }
+                    entries.extend(
+                        container
+                            .with_clause
+                            .iter()
+                            .map(|mixin| (SemanticCode::SubtypeOfDisallowedTypeInWith, *mixin)),
+                    );
+                    entries.extend(container.implements_clause.iter().map(|interface| {
+                        (SemanticCode::SubtypeOfDisallowedTypeInImplements, *interface)
+                    }));
+                }
+                ContainerKind::Enum => {
+                    entries.extend(
+                        container
+                            .with_clause
+                            .iter()
+                            .map(|mixin| (SemanticCode::SubtypeOfDisallowedTypeInWith, *mixin)),
+                    );
+                    entries.extend(container.implements_clause.iter().map(|interface| {
+                        (SemanticCode::SubtypeOfDisallowedTypeInImplements, *interface)
+                    }));
+                }
+                ContainerKind::Mixin => {
+                    entries.extend(
+                        container
+                            .on_clause
+                            .iter()
+                            .map(|constraint| (SemanticCode::SubtypeOfDisallowedTypeInOn, *constraint)),
+                    );
+                    entries.extend(container.implements_clause.iter().map(|interface| {
+                        (SemanticCode::SubtypeOfDisallowedTypeInImplements, *interface)
+                    }));
+                }
+                // Extension types carry their own code
+                // (`extension_type_implements_disallowed_type`,
+                // messages.yaml:6752-6757); extensions declare no
+                // supertype faces.
+                _ => continue,
+            }
+            for (code, entry) in entries {
+                let Some(head) = self.disallowed_subtype_head(entry) else {
+                    continue;
+                };
+                if matches!(code, SemanticCode::SubtypeOfDisallowedTypeInWith)
+                    && self.strings.resolve(head) == "Enum"
+                {
+                    continue;
+                }
+                faces.push((code, entry, site.range));
+            }
+        }
+        for (code, entry, range) in faces {
+            let text = self.strings.resolve(entry).to_string();
+            self.emit_corrected(code, range, &text);
+        }
     }
 }
 

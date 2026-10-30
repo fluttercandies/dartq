@@ -97,29 +97,40 @@ fn check(c: &mut Check<'_>) {
         NodeKind::ListLiteral | NodeKind::SetOrMapLiteral => member_admits(c, 0),
         // `Map<K, V> f() => {…: x!};` — the entry side's argument
         // (:115-129); the colon splits key from value.
-        NodeKind::MapEntry => {
-            let side = c.field(context, PayloadField::Colon).is_some_and(|colon| {
-                c.unit.ast.token_range(real).end <= colon + 1
-            });
-            member_admits(c, if side { 0 } else { 1 })
-        }
+        NodeKind::MapEntry => member_admits(c, entry_side(c, context, real)),
         // `f(x!);` / `A(x!);` — the callee's formal at the `!`'s own
         // slot (:131-159).
         NodeKind::Arguments => argument_admits(c, context),
         // `int? f() => x!;` — the childless `ExpressionBody` handle
         // leaves the arrow expression as the declaration's own tail
         // rows, so the arrow posture reads at the declaration row
-        // (:40-57's ExpressionFunctionBody arm): the `!` is the tail
-        // row before the body handle.
+        // (:40-57's ExpressionFunctionBody arm). The tail row decides
+        // the sub-face: the whole-body expression reads the return
+        // face, a collection literal row reads its member slot (the
+        // literal row completes after its element rows in the flat
+        // window).
         NodeKind::TopLevelMethod
         | NodeKind::LocalFunctionDeclaration
         | NodeKind::FunctionExpression
         | NodeKind::NamedFunctionExpression => {
             let kids = c.collect_direct(context);
-            kids.len() >= 2
-                && c.kind(kids[kids.len() - 1]) == NodeKind::ExpressionBody
-                && kids[kids.len() - 2] == real
-                && return_admits_at(c, context)
+            if kids.len() < 2 || c.kind(kids[kids.len() - 1]) != NodeKind::ExpressionBody {
+                false
+            } else {
+                match c.kind(kids[kids.len() - 2]) {
+                    NodeKind::ListLiteral => member_admits(c, 0),
+                    NodeKind::SetOrMapLiteral => {
+                        let entry = kids[..kids.len() - 2].iter().rev().copied().find(|&row| {
+                            c.kind(row) == NodeKind::MapEntry && span_contains(c, row, real)
+                        });
+                        match entry {
+                            Some(entry) => member_admits(c, entry_side(c, entry, real)),
+                            None => member_admits(c, 0),
+                        }
+                    }
+                    _ => kids[kids.len() - 2] == real && return_admits_at(c, context),
+                }
+            }
         }
         _ => false,
     };
@@ -127,6 +138,27 @@ fn check(c: &mut Check<'_>) {
         let range = utf16_token_span(c, c.head_token(node));
         c.report(range, &[]);
     }
+}
+
+/// The expected-type slot of a map entry member: the colon splits the
+/// key (0) from the value (1) — the value's first token follows the
+/// colon.
+fn entry_side(c: &Check<'_>, entry: u32, real: u32) -> usize {
+    let key_side = c
+        .field(entry, PayloadField::Colon)
+        .is_some_and(|colon| c.unit.ast.token_range(real).end <= colon + 1);
+    if key_side {
+        0
+    } else {
+        1
+    }
+}
+
+/// Whether `inner`'s byte span sits inside `outer`'s.
+fn span_contains(c: &Check<'_>, outer: u32, inner: u32) -> bool {
+    let outer_span = c.byte_span(outer);
+    let inner_span = c.byte_span(inner);
+    outer_span.start <= inner_span.start && inner_span.end <= outer_span.end
 }
 
 /// The written type row of the declaration an initializer belongs to:
@@ -141,6 +173,20 @@ fn declaration_written_type(c: &Check<'_>, decl: u32) -> Option<u32> {
             c.collect_direct(decl)
                 .into_iter()
                 .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::FunctionType))
+        })
+        // The top-level shape tiles the window flat — the written type
+        // sits in the `TopLevelFields` row with the variable's own name
+        // row between it and the declaration (`[Identifier, Type,
+        // Identifier, VariablesDeclaration]`), so the nearest
+        // preceding type row in the window is the written type.
+        .or_else(|| {
+            let members = c.collect_direct(c.unit.ast.parent(decl)?);
+            let index = members.iter().position(|&m| m == decl)?;
+            members[..index]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&m| matches!(c.kind(m), NodeKind::Type | NodeKind::FunctionType))
         })
         .or_else(|| {
             let fields = c.unit.ast.parent(decl)?;
@@ -272,33 +318,51 @@ fn argument_formal_ty(c: &Check<'_>, arguments: u32) -> Option<Ty> {
     let index = ranges
         .iter()
         .position(|range| range.contains(&(node_pos - 1)))?;
-    let named_pair = index
-        .checked_sub(1)
-        .and_then(|prev| ranges.get(prev))
-        .filter(|prev| c.kind(raw[prev.end - 1]) == NodeKind::NamedArgument)
-        .map(|prev| prev.end);
-    if let Some(end) = named_pair {
-        let name_idx = slice::named_arg_name(c, &raw, end - 1)?;
-        let label = c.lexeme(c.head_token(raw[name_idx]));
-        let signature = analysis.function_signature_of(query_site(c, kids[head]))?;
-        return Some(signature.formals.named_formal(analysis.strings().intern(label))?.ty);
+    // A named argument's childless marker tiles inside its own segment
+    // (the merged shape: name, marker, value rows in one range) or as
+    // the previous segment's tail (the pair shape) — the label reads
+    // off the marker either way (`slice::named_arg_name`).
+    let is_named = |range: &std::ops::Range<usize>| {
+        range
+            .clone()
+            .any(|piece| c.kind(raw[piece]) == NodeKind::NamedArgument)
+    };
+    let label = {
+        let segment = if is_named(&ranges[index]) {
+            Some(index)
+        } else {
+            index.checked_sub(1).filter(|&prev| is_named(&ranges[prev]))
+        };
+        segment.and_then(|s| {
+            let marker = ranges[s]
+                .clone()
+                .find(|&piece| c.kind(raw[piece]) == NodeKind::NamedArgument)?;
+            let name_idx = slice::named_arg_name(c, &raw, marker)?;
+            Some(c.lexeme(c.head_token(raw[name_idx])))
+        })
+    };
+    let site = query_site(c, kids[head]);
+    let signature = analysis.function_signature_of(site);
+    // A creation head (`A(x!)`): the constructor formal table at
+    // the unnamed selector when no plain signature answers.
+    let binding = if signature.is_none() {
+        analysis.resolve_constructor(site, None)
+    } else {
+        None
+    };
+    let formals = match (&signature, &binding) {
+        (Some(sig), _) => Some(sig.formals),
+        (None, Some(binding)) if binding.exists => binding.formals,
+        _ => None,
+    };
+    let Some(formals) = formals else {
+        return None;
+    };
+    if let Some(label) = label {
+        return Some(formals.named_formal(analysis.strings().intern(label))?.ty);
     }
-    let slot = ranges[..index]
-        .iter()
-        .filter(|range| c.kind(raw[range.end - 1]) != NodeKind::NamedArgument)
-        .count();
-    match analysis.function_signature_of(query_site(c, kids[head])) {
-        Some(signature) => Some(signature.formals.positional.get(slot)?.ty),
-        // A creation head (`A(x!)`): the constructor formal table at
-        // the unnamed selector.
-        None => {
-            let binding = analysis.resolve_constructor(query_site(c, kids[head]), None)?;
-            if !binding.exists {
-                return None;
-            }
-            Some(binding.formals?.positional.get(slot)?.ty)
-        }
-    }
+    let slot = ranges[..index].iter().filter(|r| !is_named(r)).count();
+    Some(formals.positional.get(slot)?.ty)
 }
 
 /// A same-file typedef's aliased type face (`typedef F = Future<int?>;`

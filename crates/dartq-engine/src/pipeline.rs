@@ -9,17 +9,18 @@
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{CodeInfo, DARTQ_INTERNAL_ERROR, Diagnostic};
 use dartq_index::FileCapture;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{
-    ClassModifiers, Combinators, DUPLICATE_EXPORT, DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT,
-    DUPLICATE_SHOWN_NAME, ExportEdge, ImportEdge, LibraryClassModifiers, LibraryGraph,
-    LibraryGraphBuilder, Namespaces, ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME,
-    UNDEFINED_SHOWN_NAME, compose_canonical_uri,
+    ClassModifiers, Combinators, DEFERRED_IMPORT_OF_EXTENSION, DUPLICATE_EXPORT,
+    DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT, DUPLICATE_SHOWN_NAME, EXPORT_INTERNAL_LIBRARY,
+    ExportEdge, FileRole, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
+    Namespaces, PartOfRow, ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME,
+    UNDEFINED_SHOWN_NAME, canonical_dart_uri, compose_canonical_uri, part_of_row,
 };
 use dartq_semantic::{ElementIndex, MicroKind};
 use dartq_source::{FileId, FileTable, SourceRange, StringId, StringTable, saturate_slot_u32};
@@ -914,6 +915,34 @@ fn diagnose_library(
     for file in &members {
         checkpoint.tick()?;
         let facts = &state.residency[file];
+        // The unit's `// ignore:` / `// ignore_for_file:` suppression applies
+        // to the URI-layer rows baked into `facts.diagnostics` too — the
+        // oracle runs `IgnoreInfo` over every diagnostic the file reports
+        // (`_filterIgnoredDiagnostics`, library_analyzer.dart:539-563),
+        // ungated by severity, subject only to the governing options'
+        // `analyzer.cannot-ignore` set (`is_ignorable`). Computed once per
+        // member and only when the source carries a citation marker.
+        let ignores = facts
+            .diagnostics
+            .first()
+            .and_then(|_| state.store.get(facts.content))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .filter(|text| text.contains("ignore:") || text.contains("ignore_for_file:"))
+            .map(crate::DartIgnores::parse);
+        let suppressed = |row: &Arc<Diagnostic>| {
+            let Some(ignores) = &ignores else { return false };
+            if !gate_ignorable(state, *file, row.code.name) {
+                return false;
+            }
+            let Some(bytes) = state.store.get(facts.content) else {
+                return false;
+            };
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                return false;
+            };
+            let (line, _) = facts.line_index.line_col_utf16(text, row.range.offset);
+            ignores.ignored(line, row.code.name, row.code.dtype)
+        };
         // A part's missing-target row spells the canonical URI form: the
         // oracle's part-include state lands the URI on a `FileState` even
         // when the file is absent, and the non-part-kind arm reports
@@ -922,7 +951,7 @@ fn diagnose_library(
         // library_analyzer.dart:1030-1046). Imports/exports keep the
         // written literal (`selectedUri.relativeUriStr`), so only `part`
         // rows re-spell, and only ones the URI layer coded at a target.
-        out.extend(facts.diagnostics.iter().map(|row| {
+        out.extend(facts.diagnostics.iter().filter(|row| !suppressed(row)).map(|row| {
             if row.code.name != "uri_does_not_exist"
                 && row.code.name != "uri_has_not_been_generated"
             {
@@ -975,6 +1004,7 @@ fn diagnose_library(
             // the uncoded gap is emitted here — never a duplicate.
             if let ResolvedTarget::Resolved(target) = directive.target
                 && directive.code.is_none()
+                && directive.kind != DirectiveKind::PartOf
                 && !state.residency.contains_key(&target)
                 // An indexed dependency target is the analyzed world's
                 // face, not a staleness gap: its load exists exactly so
@@ -1029,6 +1059,8 @@ fn diagnose_library(
         }
     }
     part_family_diagnostics(state, library, &members, &mut out);
+    non_library_import_diagnostics(state, &members, &mut out);
+    export_graph_diagnostics(state, resolved, library, &members, &mut out);
     // The analyze head builds the three fold contexts beside the fold (a
     // configured diagnoser over a non-empty order with a standing graph —
     // `fold_graph` above); a `None` here is that pairing's miss — the
@@ -1313,6 +1345,86 @@ fn part_family_diagnostics(
             if directive.kind != DirectiveKind::Part || directive.code.is_some() {
                 continue;
             }
+            // An external (`dart:`) target: the SDK file's kind is probed
+            // from content (`SdkFileKinds`, session-stable) and classified
+            // by the same `_updateKind` matrix — `FileRole::of_sdk` — then
+            // the include rides `part_of_row`, the single-source include
+            // matrix. An SDK library entry (`dart:math`) is no part at all:
+            // `part_of_non_part` at the canonical `dart:` spelling.
+            if directive.target == ResolvedTarget::External {
+                let Some((sdk_library, sdk_part)) =
+                    sdk_uri_parts(directive, &state.declared_variables)
+                else {
+                    continue;
+                };
+                let kind = state
+                    .sdk_file_kinds
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .probe(&state.sdk, sdk_library, sdk_part);
+                let included = FileRole::of_sdk(&kind);
+                let included_uri = canonical_dart_uri(sdk_library, sdk_part);
+                if let FileRole::Library { .. } = included {
+                    out.push(Arc::new(coded_diagnostic(
+                        ResolutionCode::PartOfNonPart.info(),
+                        &[&included_uri],
+                        directive.uri_span,
+                        *file,
+                    )));
+                    continue;
+                }
+                let includer = state.residency[file].file_role();
+                match part_of_row(
+                    included,
+                    includer,
+                    *file,
+                    library_name,
+                    enhanced_parts,
+                ) {
+                    // The name forms an SDK part can carry (name rows gated
+                    // by the same enhanced-parts horizon); `Attached` means
+                    // a matching `library <name>;` container claimed it —
+                    // silent like the workspace arm.
+                    PartOfRow::Attached | PartOfRow::Silent => {}
+                    PartOfRow::UnnamedLibrary => {
+                        if let FileRole::PartOfName { name } = included {
+                            out.push(Arc::new(coded_diagnostic(
+                                ResolutionCode::PartOfUnnamedLibrary.info(),
+                                &[name],
+                                directive.uri_span,
+                                *file,
+                            )));
+                        }
+                    }
+                    PartOfRow::NameMismatch => {
+                        if let (Some(expected), FileRole::PartOfName { name }) =
+                            (library_name, included)
+                        {
+                            out.push(Arc::new(coded_diagnostic(
+                                ResolutionCode::PartOfDifferentLibrary.info(),
+                                &[expected, name],
+                                directive.uri_span,
+                                *file,
+                            )));
+                        }
+                    }
+                    // `{0}` the including file's canonical URI, `{1}` the
+                    // included SDK file's own `dart:` spelling — upstream
+                    // `enclosingFile.file.uriStr` / `includedFile.uriStr`
+                    // (library_analyzer.dart:1078-1086).
+                    PartOfRow::UriMismatch => {
+                        let enclosing_uri = canonical_uri_spelling(state, *file);
+                        out.push(Arc::new(coded_diagnostic(
+                            ResolutionCode::PartOfDifferentLibrary.info(),
+                            &[&enclosing_uri, &included_uri],
+                            directive.uri_span,
+                            *file,
+                        )));
+                    }
+                    PartOfRow::NonPart => {}
+                }
+                continue;
+            }
             let ResolvedTarget::Resolved(target) = directive.target else {
                 continue;
             };
@@ -1320,8 +1432,21 @@ fn part_family_diagnostics(
                 continue;
             };
             let target_uri = canonical_uri_spelling(state, target);
+            // The include's resolved URI string — `includedFile.uriStr`
+            // upstream: a `file:`/`package:` literal keeps its own absolute
+            // spelling (the FileState is registered under it verbatim), a
+            // relative one resolves to the target's canonical URI. This is
+            // the `{1}` argument of a `part_of_different_library` URI row.
+            let included_uri = match directive.uri.as_deref() {
+                Some(written)
+                    if written.starts_with("file:") || written.starts_with("package:") =>
+                {
+                    written.to_string()
+                }
+                _ => target_uri.clone(),
+            };
             if !target_facts.is_part() {
-                out.push(Arc::new(part_diagnostic(
+                out.push(Arc::new(coded_diagnostic(
                     ResolutionCode::PartOfNonPart.info(),
                     &[&target_uri],
                     directive.uri_span,
@@ -1330,7 +1455,7 @@ fn part_family_diagnostics(
                 continue;
             }
             if attached.contains(&target) {
-                out.push(Arc::new(part_diagnostic(
+                out.push(Arc::new(coded_diagnostic(
                     ResolutionCode::DuplicatePart.info(),
                     &[&target_uri],
                     directive.uri_span,
@@ -1338,7 +1463,43 @@ fn part_family_diagnostics(
                 )));
                 continue;
             }
-            if l1::may_claim(state, defining, library_name, target) {
+            // The claim test runs against the DIRECT includer (`*file`,
+            // upstream `container`) — a part member's own `part` directive
+            // can claim URI-form parts bound to it but never a name-form
+            // part (`isPartOf` requires `container is LibraryFileKind`,
+            // file_state.dart:2217-2219).
+            //
+            // Upstream `isPartOf` is a FileState identity test (`uriFile ==
+            // container.file`, file_state.dart:2248-2250) keyed on the URI a
+            // file was DISCOVERED under, not its path: a `part
+            // 'file:///p2.dart'` literal registers `p2` under a `file:`-uri
+            // FileState, so its `part of 'p1.dart'` resolves a `file:`-uri
+            // FileState for `p1` that is NOT the `package:`-canonical
+            // FileState `p1` was discovered as — `isPartOf` fails and the
+            // include reports `part_of_different_library` instead of
+            // attaching. dartq interns targets by path, so the FileIds
+            // coincide; the URI-identity mismatch surfaces as a scheme
+            // mismatch between the include's resolved URI and the
+            // includer's canonical URI (`file:` literal vs `package:`
+            // canonical). Only then does the include fail the claim.
+            let uri_identity_matches = |directive: &DirectiveFacts| {
+                let include_scheme = match directive.uri.as_deref() {
+                    Some(written)
+                        if written.starts_with("file:") || written.starts_with("package:") =>
+                    {
+                        written.split(':').next().unwrap_or_default()
+                    }
+                    // A relative or scheme-less include resolves under the
+                    // includer's own canonical base — same scheme, always a
+                    // match for URI identity.
+                    _ => return true,
+                };
+                canonical_uri_spelling(state, *file).starts_with(&format!("{include_scheme}:"))
+            };
+            if l1::may_claim(state, *file, library_name, target)
+                && (target_facts.part_of().is_some_and(|p| p.name.is_some())
+                    || uri_identity_matches(directive))
+            {
                 attached.insert(target);
                 continue;
             }
@@ -1357,18 +1518,24 @@ fn part_family_diagnostics(
                 // include neither claims nor knows — the URI include stays
                 // silent (upstream Dart SDK source, library_analyzer.dart
                 // `_resolvePartDirective`, the `Feature.enhanced_parts`
-                // branch). An equal name emits nothing: the oracle's rows
-                // fire only when the include failed to join, and that join
-                // is decided by this same equality (`may_claim`'s
-                // comparison).
-                Some(name) if !enhanced_parts && library_name != Some(name) => match library_name {
-                    Some(expected) => out.push(Arc::new(part_diagnostic(
+                // branch). The row fires whenever the include failed to
+                // attach — the oracle's `partElementUri is!
+                // DirectiveUriWithUnitImpl` arm — which under a part
+                // includer is unconditional: `isPartOf` requires a library
+                // container, so an attached-looking name pair (`{my.lib,
+                // my.lib}`) still reports under a part file.
+                Some(name)
+                    if !enhanced_parts
+                        && !(library_name == Some(name)
+                            && !state.residency[file].is_part()) =>
+                match library_name {
+                    Some(expected) => out.push(Arc::new(coded_diagnostic(
                         ResolutionCode::PartOfDifferentLibrary.info(),
                         &[expected, name],
                         directive.uri_span,
                         *file,
                     ))),
-                    None => out.push(Arc::new(part_diagnostic(
+                    None => out.push(Arc::new(coded_diagnostic(
                         ResolutionCode::PartOfUnnamedLibrary.info(),
                         &[name],
                         directive.uri_span,
@@ -1377,26 +1544,96 @@ fn part_family_diagnostics(
                 },
                 Some(_) => {}
                 None => {
-                    // URI form: the claim binds to the file that directly
-                    // includes this part, not the defining library — a
-                    // depth-2 chain (`root ← mid ← leaf`, leaf's
-                    // `part of 'mid.dart'`) joins through the attached
-                    // middle (upstream Dart SDK source, file_state.dart's
-                    // `LibraryFileKind` part check: `Expected this library
-                    // to be part of '<includer uri>'`).
-                    if part_of.target == ResolvedTarget::Resolved(*file) {
-                        attached.insert(target);
-                        continue;
-                    }
+                    // URI form: `may_claim(*file)` above already asked the
+                    // direct-includer question (`isPartOf` is `uriFile ==
+                    // container.file`), so reaching here means the URI binds
+                    // elsewhere — the mismatch row reports the including
+                    // file's canonical URI against the included file's own
+                    // (upstream `enclosingFile.file.uriStr` /
+                    // `includedFile.uriStr`, library_analyzer.dart:1078-1086).
                     let enclosing_uri = canonical_uri_spelling(state, *file);
-                    out.push(Arc::new(part_diagnostic(
+                    out.push(Arc::new(coded_diagnostic(
                         ResolutionCode::PartOfDifferentLibrary.info(),
-                        &[&enclosing_uri, &target_uri],
+                        &[&enclosing_uri, &included_uri],
                         directive.uri_span,
                         *file,
                     )));
                 }
             }
+        }
+    }
+}
+
+/// The import/export of a non-library (oracle `library_analyzer.dart`
+/// `_reportImportDirectiveErrors` :701-744 / `_reportLibraryExportDirective
+/// Errors` :910-955): a directive whose selected URI resolved to an existing
+/// file whose kind is not `LibraryFileKind` — a part file, decided exactly as
+/// [`UnitFacts::is_part`] does (`_updateKind`, file_state.dart:928-949) —
+/// reports `import_of_non_library`/`export_of_non_library` at the directive's
+/// URI literal with the WRITTEN selected spelling (`selectedUriStr`, the same
+/// string `uri_does_not_exist` carries). The check sits after the
+/// missing-target arms upstream (`importedSource == null` first, :721-727),
+/// so a directive the URI layer already coded (`uri_does_not_exist` and
+/// friends in `DirectiveFacts::code`) never reaches it — only a clean target
+/// on a resident part file does. Ungated by the imports-verification
+/// suppressor (:605-633 — neither code is in that list), reported during
+/// directive resolution like the part family beside it.
+fn non_library_import_diagnostics(
+    state: &EngineState,
+    members: &[FileId],
+    out: &mut Vec<Arc<Diagnostic>>,
+) {
+    for file in members {
+        for directive in &state.residency[file].directives {
+            if !matches!(
+                directive.kind,
+                DirectiveKind::Import | DirectiveKind::Export
+            ) || directive.code.is_some()
+            {
+                continue;
+            }
+            let is_part = match directive.target {
+                ResolvedTarget::Resolved(target) => state
+                    .residency
+                    .get(&target)
+                    .is_some_and(|facts| facts.is_part()),
+                // An external `dart:` target: the oracle resolves the SDK
+                // file's kind exactly like a workspace file's
+                // (`_updateKind` over its own parsed unit), so a `dart:`
+                // part file (`dart:async/future.dart`, `part of
+                // "dart:async";`) is a non-library the same way — the
+                // content probe classifies it (`SdkFileKinds`), a missing
+                // or unreadable file degrading to the inert Library face.
+                ResolvedTarget::External => {
+                    let Some((sdk_library, sdk_part)) =
+                        sdk_uri_parts(directive, &state.declared_variables)
+                    else {
+                        continue;
+                    };
+                    let kind = state
+                        .sdk_file_kinds
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .probe(&state.sdk, sdk_library, sdk_part);
+                    FileRole::of_sdk(&kind).is_part()
+                }
+                ResolvedTarget::Missing => continue,
+            };
+            if !is_part {
+                continue;
+            }
+            let (uri, span) = l1::selected_uri(directive, &state.declared_variables);
+            let code = match directive.kind {
+                DirectiveKind::Import => ResolutionCode::ImportOfNonLibrary,
+                DirectiveKind::Export => ResolutionCode::ExportOfNonLibrary,
+                _ => continue,
+            };
+            out.push(Arc::new(l1::uri_diagnostic(
+                code,
+                uri.unwrap_or_default(),
+                span,
+                *file,
+            )));
         }
     }
 }
@@ -1416,10 +1653,166 @@ fn canonical_uri_spelling(state: &EngineState, file: FileId) -> String {
         .unwrap_or_default()
 }
 
-/// One part-family row: the resolution code's descriptor with its
-/// positional `{N}` arguments filled in order (at most two across the
-/// family), the descriptor deciding type, severity, and correction.
-fn part_diagnostic(
+/// Whether the code `name` may be suppressed by `// ignore:` /
+/// `// ignore_for_file:` citations in `file` — the governing options'
+/// `analyzer.cannot-ignore` gate (`is_ignorable`, library_analyzer.dart
+/// :552-555). A file under no options root (or a root whose set lacks the
+/// code) keeps its rows suppressible. Mirrors the output face's per-file
+/// options resolution: the longest `options`-keyed ancestor directory.
+fn gate_ignorable(state: &EngineState, file: FileId, name: &str) -> bool {
+    state
+        .files
+        .path(file)
+        .and_then(|path| path.ancestors().find_map(|dir| state.options.get(dir)))
+        .is_none_or(|options| options.is_ignorable(name))
+}
+
+/// The `(library, part)` split of a directive's selected `dart:` URI —
+/// `dart:async` → `("async", "")`, `dart:async/future.dart` →
+/// `("async", "future.dart")` — the same first-segment split
+/// `SdkSnapshot::uri_to_path`/`flat_library_to_path` consume. `None` when
+/// the selected URI is absent or not a `dart:` spelling (unreachable for a
+/// target already classified [`ResolvedTarget::External`]; the guard keeps
+/// the face total).
+fn sdk_uri_parts<'a>(
+    directive: &'a DirectiveFacts,
+    declared: &FxHashMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    let (uri, _) = l1::selected_uri(directive, declared);
+    let rest = uri?.strip_prefix("dart:")?;
+    Some(match rest.split_once('/') {
+        Some((library, part)) => (library, part),
+        None => (rest, ""),
+    })
+}
+
+/// The export-graph faces over one library's directives (the landed
+/// dartq-resolution `export_graph` walks), per library — the oracle's
+/// verifier rows (`error_verifier.dart` `_checkForAmbiguousExport` /
+/// `exportInternalLibrary` / `_checkForDeferredImportOfExtensions`), which
+/// run unconditionally beside the part family (none of these codes is an
+/// imports-verification suppression input, `library_analyzer.dart:605-633`).
+///
+/// The graph's `export_edges(lib)`/`import_edges(lib)` vectors are built
+/// from this same member-order directive walk (`build_library_graph`), so
+/// an edge index maps back to the flattened export directive of the same
+/// ordinal — the span the oracle anchors (`at(directive.uri)`). The
+/// `duplicate_export` half of `_duplicates` is intentionally NOT wired
+/// here: the residency-side `duplicate_directives` walk above already
+/// emits it, and it covers the nonexistent-file export the graph edge
+/// (`target: None`) cannot carry (`imports_verifier.dart:75-83` registers
+/// exports against missing files while the graph face skips them — wiring
+/// both would double-report, graph-only would regress that arm).
+fn export_graph_diagnostics(
+    state: &EngineState,
+    resolved: &ResolvedGraph,
+    library: LibraryId,
+    members: &[FileId],
+    out: &mut Vec<Arc<Diagnostic>>,
+) {
+    let graph_lib = resolved.graph_ids[&library];
+    // The flattened export directives in the same order the graph build
+    // registered the edges: member files in `fileKinds` order, directives
+    // in source order.
+    let exports: Vec<(FileId, &DirectiveFacts)> = members
+        .iter()
+        .flat_map(|file| {
+            state.residency[file]
+                .directives
+                .iter()
+                .filter(|d| d.kind == DirectiveKind::Export)
+                .map(move |d| (*file, d))
+        })
+        .collect();
+    // `ambiguous_export` (error_verifier.dart:2593-2621): `{0}` the
+    // conflicting name, `{1}`/`{2}` the two declaring libraries' URIs via
+    // the graph's `library_of_file` — the oracle's `library.uri` spelling.
+    for finding in resolved.graph.ambiguous_exports(graph_lib) {
+        let Some(&(file, directive)) = exports.get(finding.directive) else {
+            continue;
+        };
+        let uri_of = |declaring: FileId| {
+            resolved
+                .graph
+                .library_of_file(declaring)
+                .map(|node| graph_uri_spelling(resolved.graph.uri(node)))
+                .unwrap_or_default()
+        };
+        let first = uri_of(finding.first);
+        let second = uri_of(finding.second);
+        out.push(Arc::new(coded_diagnostic(
+            ResolutionCode::AmbiguousExport.info(),
+            &[state.strings.resolve(finding.name), &first, &second],
+            directive.uri_span,
+            file,
+        )));
+    }
+    // `export_internal_library` (error_verifier.dart:4645-4674): `{0}` is
+    // the directive's written URI string.
+    for index in resolved.graph.export_internal_library_directives(graph_lib) {
+        let Some(&(file, directive)) = exports.get(index) else {
+            continue;
+        };
+        let (uri, span) = l1::selected_uri(directive, &state.declared_variables);
+        out.push(Arc::new(coded_diagnostic(
+            EXPORT_INTERNAL_LIBRARY,
+            &[uri.unwrap_or_default()],
+            span,
+            file,
+        )));
+    }
+    // `deferred_import_of_extension` (error_verifier.dart:1339-1356 +
+    // :4393-4405): each deferred-prefixed import whose namespace reaches an
+    // extension reports once at its URI. The edge the face consumes is the
+    // same payload the graph build registered (the implicit `dart:core`
+    // edge has no directive and `deferred: false` — it can never fire).
+    for file in members {
+        for directive in &state.residency[file].directives {
+            if directive.kind != DirectiveKind::Import {
+                continue;
+            }
+            let sdk_target = (directive.target == ResolvedTarget::External)
+                .then(|| {
+                    directive
+                        .uri
+                        .as_ref()
+                        .and_then(|uri| uri.strip_prefix("dart:"))
+                        .and_then(|name| resolved.sdk_faces.get(name).copied())
+                })
+                .flatten();
+            let edge = ImportEdge {
+                target: sdk_target.or_else(|| {
+                    graph_target(state, &resolved.graph_ids, &resolved.dep_nodes, directive.target)
+                }),
+                prefix: directive.prefix,
+                deferred: directive.deferred,
+                combinators: directive.combinators.clone(),
+            };
+            if resolved.graph.deferred_import_exports_extension(&edge) {
+                out.push(Arc::new(coded_diagnostic(
+                    DEFERRED_IMPORT_OF_EXTENSION,
+                    &[],
+                    directive.uri_span,
+                    *file,
+                )));
+            }
+        }
+    }
+}
+
+/// The graph URI spelled for a diagnostic message: `graph.uri(node)` is the
+/// interned library key, which may carry the context-root `\u{1f}`
+/// qualifier (`library_key`) — the oracle's `library.uri` display is the
+/// bare canonical URI.
+fn graph_uri_spelling(key: &str) -> String {
+    key.rsplit('\u{1f}').next().unwrap_or(key).to_owned()
+}
+
+/// One descriptor-keyed row: the code's [`ResolutionCodeInfo`] with its
+/// positional `{N}` arguments filled in order, the descriptor deciding
+/// type, severity, and correction. Serves every code-family row emitted in
+/// this module (the part family, the export-graph verifier rows).
+fn coded_diagnostic(
     info: dartq_resolution::ResolutionCodeInfo,
     args: &[&str],
     range: SourceRange,
@@ -1596,6 +1989,40 @@ fn class_modifier_facts(
         .map(dartq_semantic::container_modifiers)
 }
 
+/// The `ExtensionElement`-kind verdict for one declaration — the
+/// `deferred_import_of_extension` face's gate (`error_verifier.dart:4850`
+/// `element is ExtensionElement`): a `MicroKind::Extension` decl whose
+/// container kind is a named `extension` (extension types are
+/// `ExtensionTypeElement` upstream — a different class — so they stay
+/// plain declarations).
+fn is_extension_decl(elements: &dartq_semantic::FileElements, name: dartq_source::StringId) -> bool {
+    elements.container(name).is_some_and(|container| {
+        container.kind == dartq_semantic::ContainerKind::Extension
+    })
+}
+
+/// Registers one declaration with the kind faces the graph's consumers
+/// read: the extension-kind mark for named extensions first — the
+/// container-modifiers walk answers them too (`DeclKind::Class` with
+/// all-false flags, `container_modifiers`), so the extension arm must win —
+/// then class-modifier facts for the class family, the plain declaration
+/// otherwise.
+fn declare_element(
+    builder: &mut LibraryGraphBuilder,
+    node: dartq_resolution::LibraryId,
+    elements: &dartq_semantic::FileElements,
+    name: StringId,
+    file: FileId,
+) {
+    if is_extension_decl(elements, name) {
+        builder.declare_extension(node, name, file);
+    } else if let Some(modifiers) = class_modifier_facts(elements, name) {
+        builder.declare_class(node, name, file, modifiers);
+    } else {
+        builder.declare(node, name, file);
+    }
+}
+
 /// One library's graph-build rows, collected off-thread by the parallel pass
 /// of [`build_library_graph`]: owned values read straight out of the
 /// resident facts — pre-interned name ids and cloned edge payloads, no
@@ -1604,10 +2031,15 @@ fn class_modifier_facts(
 /// reproduces the serial walk byte for byte (node registration order,
 /// per-node declaration and edge sequences).
 struct LibraryRows {
-    /// Top-level declarations `(name, file, class-modifier facts)` in the
-    /// serial walk's order — member files, then each unit's declaration
-    /// face — with `TypeParam` entries already skipped.
-    decls: Vec<(StringId, FileId, Option<ClassModifiers>)>,
+    /// Top-level declarations `(name, file, class-modifier facts,
+    /// extension-kind)` in the serial walk's order — member files, then
+    /// each unit's declaration face — with `TypeParam` entries already
+    /// skipped. The extension flag is the `MicroKind::Extension` +
+    /// `ContainerKind::Extension` verdict: named `extension` decls register
+    /// through `declare_extension` (the `deferred_import_of_extension`
+    /// kind face, `error_verifier.dart:4850` `element is ExtensionElement`);
+    /// extension types stay plain declarations, as upstream does.
+    decls: Vec<(StringId, FileId, Option<ClassModifiers>, bool)>,
     /// Resolved import edges in directive source order; the implicit core
     /// import joins at merge time, in front of these.
     imports: Vec<ImportEdge>,
@@ -1684,10 +2116,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                 if declaration.kind == MicroKind::TypeParam {
                     continue;
                 }
-                match class_modifier_facts(&unit.facts.elements, name) {
-                    Some(modifiers) => builder.declare_class(node, name, file, modifiers),
-                    None => builder.declare(node, name, file),
-                }
+                declare_element(builder, node, &unit.facts.elements, name, file);
             }
         }
     };
@@ -1855,10 +2284,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
             if declaration.kind == MicroKind::TypeParam {
                 continue;
             }
-            match class_modifier_facts(&unit.facts.elements, name) {
-                Some(modifiers) => builder.declare_class(node, name, file, modifiers),
-                None => builder.declare(node, name, file),
-            }
+            declare_element(&mut builder, node, &unit.facts.elements, name, file);
         }
         dep_nodes.insert(file, node);
     }
@@ -1869,15 +2295,28 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         let Some(&node) = dep_nodes.get(&file) else {
             continue;
         };
-        builder.import(
-            node,
-            ImportEdge {
-                target: Some(core),
-                prefix: None,
-                deferred: false,
-                combinators: Combinators::unfiltered(),
-            },
-        );
+        // The same `!hasDartCoreImport` gate the live-library merge applies
+        // (file_state.dart:255-270) — the gate fires per library file, and a
+        // dep unit IS its own library file: an explicit `dart:core` import
+        // suppresses the implicit edge so its show/hide combinators govern.
+        // A part file (`part of` carried) is not a `LibraryFileKind` upstream
+        // and never receives the synthetic import at all.
+        let has_core_import = unit
+            .facts
+            .directives
+            .iter()
+            .any(|d| d.kind == DirectiveKind::Import && d.uri.as_deref() == Some("dart:core"));
+        if !unit.facts.is_part() && !has_core_import {
+            builder.import(
+                node,
+                ImportEdge {
+                    target: Some(core),
+                    prefix: None,
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
         for (directive, &target) in unit.facts.directives.iter().zip(unit.targets.iter()) {
             match directive.kind {
                 DirectiveKind::Import => {
@@ -1952,8 +2391,12 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                     if declaration.kind == MicroKind::TypeParam {
                         continue;
                     }
-                    row.decls
-                        .push((name, file, class_modifier_facts(&facts.elements, name)));
+                    row.decls.push((
+                        name,
+                        file,
+                        class_modifier_facts(&facts.elements, name),
+                        is_extension_decl(&facts.elements, name),
+                    ));
                 }
                 for directive in &facts.directives {
                     match directive.kind {
@@ -2018,21 +2461,44 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     // every other shape registers as a plain declaration.
     for (library, row) in live.into_iter().zip(rows) {
         let graph_id = graph_ids[&library];
-        for (name, file, modifiers) in row.decls {
+        for (name, file, modifiers, is_extension) in row.decls {
+            if is_extension {
+                builder.declare_extension(graph_id, name, file);
+                continue;
+            }
             match modifiers {
                 Some(modifiers) => builder.declare_class(graph_id, name, file, modifiers),
                 None => builder.declare(graph_id, name, file),
             }
         }
-        builder.import(
-            graph_id,
-            ImportEdge {
-                target: Some(core),
-                prefix: None,
-                deferred: false,
-                combinators: Combinators::unfiltered(),
-            },
-        );
+        // The implicit `dart:core` edge fires only when the library does NOT
+        // already declare an explicit `dart:core` import — the oracle's
+        // `!unlinked.isDartCore && !unlinked.hasDartCoreImport` gate
+        // (file_state.dart:255-270, `hasDartCoreImport` folded from the
+        // defining unit's written URI literals at file_state.dart:982-992).
+        // Without the gate the unconditional edge bypasses the explicit
+        // edge's show/hide combinators (`import 'dart:core' show String;`
+        // would still resolve `int`). The `isDartCore` arm is unreachable
+        // here: `dart:core` itself is a synthetic SDK face, never a live
+        // library. The check reads the defining file's directives only —
+        // the oracle folds `hasDartCoreImport` from the library file's own
+        // unlinked unit, never from parts.
+        let info = state.libraries.info(library).expect("live library");
+        let has_core_import = state.residency[&info.defining]
+            .directives
+            .iter()
+            .any(|d| d.kind == DirectiveKind::Import && d.uri.as_deref() == Some("dart:core"));
+        if !has_core_import {
+            builder.import(
+                graph_id,
+                ImportEdge {
+                    target: Some(core),
+                    prefix: None,
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
         for edge in row.imports {
             builder.import(graph_id, edge);
         }
@@ -2292,12 +2758,21 @@ fn directive_graph_target(
             &resolved.dep_nodes,
             directive.target,
         ),
-        ResolvedTarget::External => directive
-            .uri
-            .as_deref()?
-            .strip_prefix("dart:")
-            .and_then(|name| resolved.sdk_faces.get(name))
-            .copied(),
+        // The dead-code gate's `!isOriginNotExistingFile` arm for `dart:`
+        // targets: the URI layer codes the miss (`uri_does_not_exist` when
+        // the SDK file the flat table maps is absent on disk), and a coded
+        // directive joins no combinator walk.
+        ResolvedTarget::External => {
+            if directive.code.is_some() {
+                return None;
+            }
+            directive
+                .uri
+                .as_deref()?
+                .strip_prefix("dart:")
+                .and_then(|name| resolved.sdk_faces.get(name))
+                .copied()
+        }
         ResolvedTarget::Missing => None,
     }
 }
@@ -2353,7 +2828,16 @@ fn duplicate_target<'a>(
                 },
             }
         }
-        ResolvedTarget::External => directive.uri.as_deref().map(DuplicateTarget::Uri),
+        // A `dart:` external keys by its URI text — but only when the file
+        // the flat table mapped exists (`!isOriginNotExistingFile` gates
+        // imports' `addImports` registration, `imports_verifier.dart:68-70`;
+        // the export arm registers regardless, `:75-83`).
+        ResolvedTarget::External => {
+            if directive.code.is_some() && directive.kind == DirectiveKind::Import {
+                return None;
+            }
+            directive.uri.as_deref().map(DuplicateTarget::Uri)
+        }
         // No library at all (unknown `dart:` name, unresolvable text) —
         // null `importedLibrary`/`exportedLibrary`, neither family
         // registers (`imports_verifier.dart:63-67`/:75-79).
@@ -2920,6 +3404,7 @@ mod tests {
             name: None,
             configurations: Box::from([]),
             configuration_spans: Box::from([]),
+            interpolated_configurations: Box::default(),
         }
     }
 
@@ -3958,6 +4443,12 @@ mod tests {
         let fixture = crate::l1::tests::Fixture::new();
         let mut state = fixture.state();
         let lib = fixture.root.join("lib");
+        // `dart:math` resolves only when the flat-table path exists on disk
+        // (`internalMapDartUri` + `importedFile.exists`): materialize it so
+        // the shown-name miss is the run's only row.
+        let math = fixture.root.join("sdk/lib/math");
+        std::fs::create_dir_all(&math).expect("sdk math dir");
+        std::fs::write(math.join("math.dart"), "library dart.math;\n").expect("sdk math file");
         crate::l1::tests::set(
             &mut state,
             &lib.join("only.dart"),
@@ -3968,10 +4459,10 @@ mod tests {
         assert_eq!(
             cold.len(),
             1,
-            "the fixture's only row is its dart:math URI miss — the synthetic \
-             SDK table registers no math library, and the function is valid \
-             Dart: {cold:?}"
+            "the fixture's only row is the shown-name miss — `zork` is not \
+             in the math face, and the function is valid Dart: {cold:?}"
         );
+        assert_eq!(cold[0].code.name, "undefined_shown_name", "{cold:?}");
         drop(cold);
         crate::l1::tests::set(
             &mut state,
@@ -3992,6 +4483,9 @@ mod tests {
         let fixture = crate::l1::tests::Fixture::new();
         let mut state = fixture.state();
         let lib = fixture.root.join("lib");
+        let math = fixture.root.join("sdk/lib/math");
+        std::fs::create_dir_all(&math).expect("sdk math dir");
+        std::fs::write(math.join("math.dart"), "library dart.math;\n").expect("sdk math file");
         crate::l1::tests::set(
             &mut state,
             &lib.join("a.dart"),
@@ -4249,15 +4743,25 @@ mod tests {
         let core = sdk_faces["core"];
         for library in state.libraries.live() {
             let graph_id = graph_ids[&library];
-            builder.import(
-                graph_id,
-                ImportEdge {
-                    target: Some(core),
-                    prefix: None,
-                    deferred: false,
-                    combinators: Combinators::unfiltered(),
-                },
-            );
+            // The same `!hasDartCoreImport` gate the parallel merge applies
+            // (file_state.dart:255-270): an explicit `dart:core` import on
+            // the defining unit suppresses the implicit edge.
+            let info = state.libraries.info(library).expect("live library");
+            let has_core_import = state.residency[&info.defining]
+                .directives
+                .iter()
+                .any(|d| d.kind == DirectiveKind::Import && d.uri.as_deref() == Some("dart:core"));
+            if !has_core_import {
+                builder.import(
+                    graph_id,
+                    ImportEdge {
+                        target: Some(core),
+                        prefix: None,
+                        deferred: false,
+                        combinators: Combinators::unfiltered(),
+                    },
+                );
+            }
             for file in member_files(state.libraries.info(library).expect("live library")) {
                 for directive in &state.residency[&file].directives {
                     match directive.kind {
@@ -4487,6 +4991,69 @@ mod tests {
         assert!(
             core.windows(2).all(|pair| pair[0] <= pair[1]),
             "the core face table stays ASCII-sorted"
+        );
+    }
+
+    /// The implicit `dart:core` edge's gate (upstream `file_state.dart:255-270`
+    /// — the synthetic import joins `libraryImports` only when the library
+    /// file's unlinked unit carries no `dart:core` import of its own,
+    /// `hasDartCoreImport` folded at `file_state.dart:982-992`). An explicit
+    /// `import 'dart:core' …` makes its own combinators the only core edge:
+    /// `show String` hides `int` (the oracle reports `undefined_class` on the
+    /// hidden type use), `show String, int` keeps both, and `hide String`
+    /// keeps `int`. With no explicit import the implicit edge still resolves
+    /// `Object`, and `dynamic` — a language builtin, never an import — stays
+    /// resolved under the gated explicit edge.
+    fn core_names_for(source: &str) -> Vec<String> {
+        let root = clause_workspace("core-edge");
+        let mut engine = clause_engine(&root);
+        let file = engine.set_content(&root.join("lib/a.dart"), source.as_bytes());
+        engine.apply_pending(&mut |_| {});
+        engine
+            .analyze(&[file], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze")
+            .iter()
+            .map(|row| row.code.name.to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn explicit_dart_core_import_gates_the_implicit_edge() {
+        // `show String` hides `int` — the gated edge's combinator, not the
+        // unconditional edge, decides the namespace.
+        let names = core_names_for(
+            "import 'dart:core' show String;\nint x = 0;\nString s = '';\n",
+        );
+        assert!(
+            names.iter().any(|name| name == "undefined_class"),
+            "hidden `int` reports undefined_class: {names:?}"
+        );
+        // `show String, int` keeps both faces resolvable.
+        let names =
+            core_names_for("import 'dart:core' show String, int;\nint x = 0;\nString s = '';\n");
+        assert!(
+            !names.iter().any(|name| name == "undefined_class"),
+            "shown names resolve: {names:?}"
+        );
+        // `hide String` keeps `int` resolvable — no undefined_class row at
+        // all when the hidden name is never referenced.
+        let names = core_names_for("import 'dart:core' hide String;\nint x = 0;\n");
+        assert!(
+            !names.iter().any(|name| name == "undefined_class"),
+            "`hide String` keeps `int`: {names:?}"
+        );
+        // No explicit import: the implicit edge resolves `Object`.
+        let names = core_names_for("Object o = 0 as Object;\nint x = 0;\n");
+        assert!(
+            !names.iter().any(|name| name == "undefined_class"),
+            "implicit edge resolves Object/int: {names:?}"
+        );
+        // `dynamic` is a language builtin, not an import — it resolves even
+        // with the gated edge hiding all of dart:core.
+        let names = core_names_for("import 'dart:core' show String;\ndynamic d = 0;\n");
+        assert!(
+            !names.iter().any(|name| name == "undefined_class"),
+            "dynamic never reports undefined_class: {names:?}"
         );
     }
 

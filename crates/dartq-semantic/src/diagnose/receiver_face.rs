@@ -191,4 +191,47 @@ impl Engine<'_> {
             _ => Some(corrected),
         }
     }
+
+    /// Whether `this` spelled inside an `extension`/`extension type` body
+    /// carries a potentially-nullable static type whose member questions the
+    /// oracle answers — the `Receiver::This` arm of the shared
+    /// `receiver_nullable` gate (#2919, upstream
+    /// `type_property_resolver.dart`'s `isNullable` tail precedes every
+    /// member resolution on the extended type: `this.foo` inside
+    /// `extension E on A?` reports the unchecked access at the selector).
+    ///
+    /// The gate mirrors `resolve_bare`'s `ext_nullable_this` latch exactly
+    /// (`ThisLookup`'s nullable-receiver arm): a nullable `Named` `on` type
+    /// qualifies only when its head resolves (a type, an in-scope type
+    /// parameter, or the extension's own declared parameter — `on T?`
+    /// qualifies through `face.type_param_names`); an unresolvable head is
+    /// the oracle's `InvalidType` extended type, whose member questions
+    /// stay silent. A class/mixin `this` and every non-`This` receiver
+    /// answer `false` — a class body's `this` is its named type and never
+    /// nullable.
+    pub(crate) fn nullable_this_receiver(&self, recv: &Receiver) -> bool {
+        let Receiver::This { container, kind } = *recv else {
+            return false;
+        };
+        if kind != ContainerKind::Extension {
+            return false;
+        }
+        let Ty::Named {
+            name,
+            nullable: true,
+            ..
+        } = self.this_static_ty(container, kind)
+        else {
+            return false;
+        };
+        let declared_param = self.index.get(self.file).is_some_and(|f| {
+            f.extension_faces()
+                .iter()
+                .find(|face| face.name == Some(container))
+                .is_some_and(|face| face.type_param_names.contains(&name))
+        });
+        declared_param
+            || self.is_scope_param(name)
+            || self.type_resolution(name).0 == TypeResolution::Type
+    }
 }

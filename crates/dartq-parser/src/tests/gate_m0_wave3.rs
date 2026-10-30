@@ -107,12 +107,18 @@ fn unnamed_extension_with_type_parameters() {
 }
 
 /// `extension<T> X on ...` keeps the member lane, exactly like the official
-/// lookahead (the token after `>` must be `on`).
+/// lookahead (the token after `>` must be `on`). The built-in `extension`
+/// head takes the type-reference face in the member reparse (oracle 1:1
+/// `built_in_identifier_as_type`).
 #[test]
 fn named_extension_with_type_parameters_takes_member_lane() {
     assert_codes(
         "extension<T> X on List<T> {}\n",
-        &["expected_token", "missing_function_parameters"],
+        &[
+            "built_in_identifier_as_type",
+            "expected_token",
+            "missing_function_parameters",
+        ],
         "named extension with type parameters",
     );
 }

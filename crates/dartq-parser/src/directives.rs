@@ -4,15 +4,15 @@
 //! import recovery.
 //!
 //! Anchors (upstream Dart SDK source,
-//! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`, Dart 3.15
-//! main):
-//! `parseLibraryAugmentation` :900, `parseLibraryName` :917,
-//! `parseImportPrefixOpt` :938, `parseImport` :966, `parseImportRecovery`
-//! :995, `parseConditionalUriStar` :1082, `parseConditionalUri` :1095,
-//! `parseDottedName` :1151, `parseExport` :1190, `parseCombinatorStar`
-//! :1207, `parseHide` :1235, `parseShow` :1248, `parseIdentifierList` :1261,
-//! `parsePartOrPartOf` :1304, `parsePart` :1317, `parsePartOf` :1330,
-//! `ensureLiteralString` :5075, `parseQualified` :2545, and the directive
+//! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`, Dart 3.13.7
+//! oracle lock):
+//! `parseLibraryAugmentation` :890, `parseLibraryName` :907,
+//! `parseImportPrefixOpt` :932, `parseImport` :960, `parseImportRecovery`
+//! :982, `parseConditionalUriStar` :1101, `parseConditionalUri` :1117,
+//! `parseDottedName` :1160, `parseExport` :1180, `parseCombinatorStar`
+//! :1197, `parseHide` :1222, `parseShow` :1236, `parseIdentifierList` :1250,
+//! `parsePartOrPartOf` :1284, `parsePart` :1301, `parsePartOf` :1315,
+//! `ensureLiteralString` :5030, `parseQualified` :2525, and the directive
 //! modifier walks (`modifier_context.dart:183/279`). Directive ordering is
 //! the official `DirectiveContext` state machine
 //! (`directive_context.dart:12-118`).
@@ -217,7 +217,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // import
     // ------------------------------------------------------------------
 
-    /// Official `parseImport` :966:
+    /// Official `parseImport` :960:
     /// `import uri (if (test) uri)* importPrefix? combinator* ;`.
     pub(crate) fn parse_import(&mut self) {
         let import_keyword = self.peek_span();
@@ -235,12 +235,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.listener.end_import(import_keyword, Some(semicolon));
             return;
         }
-        // Recovery: out-of-order clauses after the tail (:1004-1007).
+        // Recovery: out-of-order clauses after the tail (:975-980).
         self.listener.end_import(import_keyword, None);
         self.parse_import_recovery(prefix.deferred, prefix.has_prefix(), has_combinator);
     }
 
-    /// Official `parseImportRecovery` :995. `first_deferred`/`has_prefix`/
+    /// Official `parseImportRecovery` :982. `first_deferred`/`has_prefix`/
     /// `has_combinator` carry what the primary parse already saw (see the
     /// module docs for the probe equivalence).
     fn parse_import_recovery(
@@ -255,7 +255,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.skip_unexpected_token();
             self.parse_conditional_uri_star();
             // `deferred` not followed by `as`: emit the prefix event for it
-            // (official :1057-1062). The call routes through the recovery
+            // (official :1036-1040). The call routes through the recovery
             // listener (`recovery_listeners.dart:68` records the deferred
             // keyword on every `handleImportPrefix`), so the bookkeeping
             // below covers this arm too — the deferred-after-prefix and
@@ -279,7 +279,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 recorded_as = prefix.as_kw;
             }
             // Bookkeeping order mirrors the do-loop: the deferred block
-            // (:1055-1070) precedes the `as` block (:1071-1082) in every
+            // (:1041-1056) precedes the `as` block (:1057-1071) in every
             // iteration.
             if let Some(d) = recorded_deferred {
                 if first_deferred.is_some() {
@@ -310,7 +310,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 semicolon = Some(s);
             } else if self.cursor.peek_id() == start {
                 // No progress: insert `;` so the loop exits (official
-                // :1065-1068). EOF pins the cursor, so this is reached
+                // :1079-1081). EOF pins the cursor, so this is reached
                 // finitely.
                 semicolon = Some(self.ensure_semicolon());
             }
@@ -323,8 +323,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
     }
 
-    /// `skipUnexpectedTokenOpt` :5148 with the import recovery boundary set
-    /// (:1022-1025): a stray non-keyword token followed by a clause keyword
+    /// `skipUnexpectedTokenOpt` :5103 with the import recovery boundary set
+    /// (:1008-1017): a stray non-keyword token followed by a clause keyword
     /// (or `;`) is reported and skipped.
     fn skip_unexpected_token(&mut self) {
         if self.cursor.at_eof() {
@@ -348,7 +348,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
     }
 
-    /// Official `parseImportPrefixOpt` :938: `'deferred'? 'as' identifier?`.
+    /// Official `parseImportPrefixOpt` :932: `'deferred'? 'as' identifier?`.
     fn parse_import_prefix_opt(&mut self) -> ImportPrefix {
         let next = self.peek_kind();
         if next == TokenKind::Keyword(Keyword::Deferred)
@@ -387,7 +387,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // conditional URIs and dotted names
     // ------------------------------------------------------------------
 
-    /// Official `parseConditionalUriStar` :1082: `conditionalUri*`.
+    /// Official `parseConditionalUriStar` :1101: `conditionalUri*`.
     pub(crate) fn parse_conditional_uri_star(&mut self) {
         let begin = self.peek_span();
         self.listener.begin_conditional_uris(begin);
@@ -399,7 +399,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener.end_conditional_uris(count);
     }
 
-    /// Official `parseConditionalUri` :1095:
+    /// Official `parseConditionalUri` :1117:
     /// `if ( dottedName (== string)? ) uri`.
     fn parse_conditional_uri(&mut self) {
         let if_kw = self.peek_span();
@@ -441,28 +441,37 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             }
         }
 
-        if self.peek_kind() != TokenKind::CloseParen
+        let _close = if self.peek_kind() != TokenKind::CloseParen
             && let Some(end_id) = close_id
         {
-            // The group closes elsewhere: re-report a real closer's
-            // intervening token and jump (official :1124-1136; a synthetic
-            // closer is adopted silently, `moveSynthetic`).
             let (_, synthetic) = self.cursor.resolve(end_id);
-            if !synthetic {
+            if synthetic {
+                // The scanner parked the closer at the wrong spot: relocate
+                // it to the current token and consume it — the intervening
+                // tokens stay in the stream for the candidate URI and the
+                // directive tail (official `moveSynthetic` :1130-1132; the
+                // unmatched-group row lands at the relocation point, oracle
+                // `import 'a' if (x == class` → ')' at the `class`).
+                self.move_synthetic_close(left_paren, end_id, TokenKind::CloseParen, ")")
+            } else {
+                // A real closer sits elsewhere: report the intervening token
+                // and jump to the real `)` (:1125-1128, :1133-1135).
                 let at = self.peek_span();
                 let lexeme = self.cursor.lexeme(at.id).to_owned();
                 self.report(msg::unexpected_token(&lexeme), at);
+                self.skip_to_token(end_id);
+                self.expect_kind(TokenKind::CloseParen)
             }
-            self.skip_to_token(end_id);
-        }
-        let _close = self.expect_kind(TokenKind::CloseParen);
+        } else {
+            self.expect_kind(TokenKind::CloseParen)
+        };
 
         self.ensure_literal_string();
         self.listener
             .end_conditional_uri(if_kw, left_paren, equal_sign);
     }
 
-    /// Official `parseDottedName` :1151: `identifier ('.' identifier)*`.
+    /// Official `parseDottedName` :1160: `identifier ('.' identifier)*`.
     fn parse_dotted_name(&mut self) {
         let first = self.ensure_identifier(IdentifierContext::DottedName);
         let mut count = 1usize;
@@ -478,7 +487,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // export
     // ------------------------------------------------------------------
 
-    /// Official `parseExport` :1190:
+    /// Official `parseExport` :1180:
     /// `export uri conditionalUri* combinator* ;`.
     pub(crate) fn parse_export(&mut self) {
         let export_keyword = self.peek_span();
@@ -497,7 +506,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // combinators
     // ------------------------------------------------------------------
 
-    /// Official `parseCombinatorStar` :1207: `(hideCombinator |
+    /// Official `parseCombinatorStar` :1197: `(hideCombinator |
     /// showCombinator)*`. Returns whether any combinator was seen. The
     /// `multipleCombinators` report is gated on the official
     /// `single-combinators` experiment, which dartq does not track (the
@@ -518,7 +527,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         count > 0
     }
 
-    /// Official `parseHide` :1235: `hide identifierList`.
+    /// Official `parseHide` :1222: `hide identifierList`.
     fn parse_hide(&mut self) {
         let hide_kw = self.peek_span();
         self.cursor.advance();
@@ -527,7 +536,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener.end_hide(hide_kw);
     }
 
-    /// Official `parseShow` :1248: `show identifierList`.
+    /// Official `parseShow` :1236: `show identifierList`.
     fn parse_show(&mut self) {
         let show_kw = self.peek_span();
         self.cursor.advance();
@@ -536,7 +545,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener.end_show(show_kw);
     }
 
-    /// Official `parseIdentifierList` :1261: `identifier (',' identifier)*`.
+    /// Official `parseIdentifierList` :1250: `identifier (',' identifier)*`.
     fn parse_identifier_list(&mut self) {
         self.ensure_identifier(IdentifierContext::Combinator);
         let mut count = 1usize;
@@ -552,7 +561,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // part / part-of
     // ------------------------------------------------------------------
 
-    /// Official `parsePartOrPartOf` :1304: dispatch on the token after
+    /// Official `parsePartOrPartOf` :1284: dispatch on the token after
     /// `part`, with the ordering checks before each family.
     pub(crate) fn parse_part_or_part_of(&mut self) {
         let part_keyword = self.peek_span();
@@ -567,7 +576,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
     }
 
-    /// Official `parsePart` :1317: `part uri ;`.
+    /// Official `parsePart` :1301: `part uri ;`.
     fn parse_part(&mut self, part_keyword: TokenSpan) {
         self.listener.begin_part(part_keyword);
         self.cursor.advance(); // `part`
@@ -576,7 +585,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener.end_part(part_keyword, semicolon);
     }
 
-    /// Official `parsePartOf` :1330: `part of (qualified | uri) ;`.
+    /// Official `parsePartOf` :1315: `part of (qualified | uri) ;`.
     fn parse_part_of(&mut self, part_keyword: TokenSpan) {
         let of_kw = self.look_span_at(1);
         self.listener.begin_part_of(part_keyword);
@@ -609,7 +618,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // shared clause helpers
     // ------------------------------------------------------------------
 
-    /// Official `parseQualified` :2545: `identifier ('.' identifier)*` with
+    /// Official `parseQualified` :2525: `identifier ('.' identifier)*` with
     /// distinct first/continuation contexts.
     pub(crate) fn parse_qualified(
         &mut self,
@@ -625,7 +634,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
     }
 
-    /// Official `ensureLiteralString` :5075: the next token must be a string
+    /// Official `ensureLiteralString` :5030: the next token must be a string
     /// literal; otherwise report `expectedString` — the ONLY code this
     /// recovery reports (oracle: `import 5;` carries no `unexpectedToken`
     /// from the string read) — and splice a synthetic empty string in BEFORE

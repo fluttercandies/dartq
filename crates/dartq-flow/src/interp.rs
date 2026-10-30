@@ -3603,6 +3603,16 @@ impl Interp<'_> {
             *cond_false = Some(if_false);
         }
         self.current = if_true;
+        // The body begins in the folded condition-true state: refresh the
+        // began-dead snapshot the body-level wrappers read (official
+        // `for_bodyBegin`'s statement boundary) — the mirror of the
+        // `WhileBodyBegin` non-wrapper-arm refresh in `stmt_step`. Without
+        // it a non-block body (`for (; false;) 2;`) anchors nothing: its
+        // ExprStmt wrapper still reads the pre-fold (live) snapshot and the
+        // dead-body row is missed. Block bodies are unaffected — the
+        // `Ev::Block` poll anchors through reachability, not the snapshot.
+        let body_began_dead = !self.reachable();
+        self.stmt_began_dead = body_began_dead;
         // The official `for_conditionEnd` latch (dead_code_verifier.dart
         // :344-354): whether a dead interval was already open when the
         // condition ended. An interval anchored at the `for` itself (or at
@@ -3775,6 +3785,32 @@ impl Interp<'_> {
             window.freeze_end(bounds.upd_end);
         }
         self.exprs.truncate(base);
+        // A collection-for element entered dead (the condition folded
+        // false): the element is the official first dead node — the
+        // verifier walks top-down, so the ELEMENT precedes every child
+        // (`checkUnreachableNode(element)` after `for_bodyBegin`) — but it
+        // carries no statement wrapper to anchor with (the statement
+        // form's body wrappers anchor and `flow_end_body` closes theirs;
+        // the collection frame skips both). Probe y.dart:
+        // `[for (var i = 0; false; i++) 4]` reports the updater row AND
+        // the element row, so the anchor fires AFTER the updater row's
+        // `dead.is_none()` gate (a window the updater row opened would
+        // have suppressed it). First-dead-wins: a window still open here
+        // re-anchors to the element only when its anchor sits inside it
+        // (an inner element poll); an anchor before the loop belongs to
+        // the enclosing one-row fold and keeps ownership.
+        if collection && body_began_dead
+            && let Some(element) =
+                events[bounds.body.clone()].iter().find_map(|ev| ev.span())
+        {
+            if let Some(window) = &mut self.dead {
+                if window.anchor_from(element.range.offset) {
+                    window.reanchor_to(element);
+                }
+            } else {
+                self.dead_code(element);
+            }
+        }
         if !collection {
             // Exit: condition-false joined with breaks (no back-edge join).
             self.pop_loop_and_exit(frame);

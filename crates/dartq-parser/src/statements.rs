@@ -605,7 +605,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // `parseExpressionStatementOrDeclarationAfterModifiers`, gated on
         // `beforeType == start`): with no modifiers and a nullable
         // could-be-expression type, decide between `X? y;` and `a ? b : ...`.
-        if no_modifiers && !for_parts && matches!(type_info, TypeInfo::SimpleNullable) {
+        // The gate is `typeInfo.isNullable && typeInfo.couldBeExpression`
+        // (`parser_impl.dart:9931-9933`) — `SimpleNullable` covers `id?`, and
+        // the `Complex` record-nullable `(...)?` qualifies the same way:
+        // `(a.value == 37) ? a : b` reads `(...)` as a (recovered) record
+        // type, but the `?` + bare-name + `:` sequence then drops the type
+        // and reparses the statement as the conditional it is (oracle
+        // `language/cascade/precedence_test` — dartq's narrower gate read it
+        // as a record-typed declaration and minted `expected_token ')'`,
+        // `unexpected ':'` cascades).
+        if no_modifiers
+            && !for_parts
+            && type_info.is_nullable()
+            && type_info.could_be_expression()
+        {
             if !self.peek_is_identifier() {
                 let next = self.peek_span();
                 self.report(msg::missing_identifier(), next);
@@ -1216,12 +1229,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 let at = self.peek_span();
                 self.report(msg::colon_in_place_of_in(), at);
             } else if await_kw.is_some() {
-                // Official inserts a synthetic `in` ahead of `next`.
+                // Official inserts a synthetic `in` ahead of `next`
+                // (`token.setNext(SyntheticKeywordToken(IN)..setNext(next))`,
+                // parser_impl.dart:10275-10279): the synthetic becomes
+                // `token.next`, so the caller's `in`/`:` dispatch sees it and
+                // `parseForInRest` consumes it — never the tail token, which
+                // stays for the iterable/`)` recovery. Consuming it here
+                // drops the for-in dispatch entirely (the junk then falls to
+                // the C-style `parseForRest` and mints `expected ';'` +
+                // `unexpected <junk>` cascades the oracle never carries).
                 let at = self.peek_span();
                 self.report(msg::expected_but_got("in"), at);
-                let synthetic = self.synthetic(TokenKind::Keyword(Keyword::In), at.range.offset);
-                self.cursor.advance();
-                let _ = synthetic;
+                let _ = self.synthetic(TokenKind::Keyword(Keyword::In), at.range.offset);
             }
         }
     }
@@ -1841,9 +1860,30 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     } else if expression_count > 0 {
                         break;
                     } else {
-                        // Recovery: not a case; skip to the end of the block.
+                        // Recovery (`parser_impl.dart:10933-10944`): not a
+                        // case — report `expected 'case'` at the peeked head,
+                        // then skip the whole junk run to the block's
+                        // scanner-paired `endGroup` (`while (token.next !=
+                        // endGroup) token = token.next!`). The upstream walk
+                        // consumes every non-`case` token silently; dartq's
+                        // previous break-left-them posture reparsed the run
+                        // as statements and minted the `expected ';'` +
+                        // `missing_identifier` + `unexpected ','` cascade the
+                        // oracle never carries (oracle
+                        // `Patterns/switch_expression_A04_t01`: `switch (s)
+                        // { "one" => 1, _ => 0 };` costs exactly one
+                        // `expected 'case'` at `"one"`).
                         let at = self.span_of(self.real_id(peek_pos));
                         self.report(msg::expected_token("case"), at);
+                        if let Some(end_group) = self.cursor.table_matching_end(begin.id) {
+                            while self.cursor.real_pos() < self.offset_of(end_group)
+                                && !self.cursor.at_eof()
+                                && !self.is_bailed()
+                            {
+                                self.cursor.advance();
+                            }
+                        }
+                        peek_pos = self.peek_past_labels_pos(self.cursor.real_pos());
                         break;
                     }
                 }

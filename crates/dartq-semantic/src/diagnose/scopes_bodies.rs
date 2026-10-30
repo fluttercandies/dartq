@@ -49,15 +49,18 @@ impl<'a> Engine<'a> {
     /// A formal parameter of the executable whose name has fired: the
     /// tracked local joins its declaration site for the
     /// `unused_element_parameter` body-reference rule.
+    ///
+    /// The site prefers `open_ctor_site` over `open_exec_site`: the
+    /// constructor's begin event arms the ctor site unconditionally (the
+    /// primary-constructor header — `class C(int x)` — never runs a
+    /// method-declaration name event, so `open_exec_site` stays unset
+    /// there), while the secondary faces arrive at the same site through
+    /// either field and a non-constructor context never arms
+    /// `open_ctor_site`.
     pub(crate) fn note_parameter(&mut self, name: StringId, range: SourceRange) {
-        self.add_tracked_local(
-            name,
-            range,
-            LocalKind::Parameter {
-                site: self.open_exec_site,
-            },
-        );
-        if let Some(site) = self.open_exec_site {
+        let site = self.open_ctor_site.or(self.open_exec_site);
+        self.add_tracked_local(name, range, LocalKind::Parameter { site });
+        if let Some(site) = site {
             self.site_params
                 .entry(site)
                 .or_default()
@@ -1149,12 +1152,25 @@ impl<'a> Engine<'a> {
             } else if self.switch.if_case_window {
                 if_case_site = true;
                 None
-            } else if let Some(group) = self.pattern_group_open {
-                Some(group)
             } else {
-                self.pattern_group_seq += 2;
-                self.pattern_group_open = Some(self.pattern_group_seq);
-                Some(self.pattern_group_seq)
+                // A statement-level pattern-declared variable joins the
+                // open statement-list duplicate scope (`checkStatements`
+                // `PatternVariableDeclarationStatement` arm —
+                // `statement.declaration.elements`' `scope.add`,
+                // duplicate_definition_verifier.dart:99-103): `var a` /
+                // `final a` / `var (a,b)` collide inside the block,
+                // function-body, or for-head scope like any
+                // `VariableDeclarationStatement` name. Case-header
+                // (arm-scoped) and if-case binders above skip — neither
+                // is a `PatternVariableDeclarationStatement` element.
+                self.dup_scope_add(name, range);
+                if let Some(group) = self.pattern_group_open {
+                    Some(group)
+                } else {
+                    self.pattern_group_seq += 2;
+                    self.pattern_group_open = Some(self.pattern_group_seq);
+                    Some(self.pattern_group_seq)
+                }
             }
         } else {
             // A non-pattern declaration closes the window: a group spans
@@ -3032,9 +3048,10 @@ impl<'a> Engine<'a> {
     /// the class name, the same rewrite `note_constructor_continuation`
     /// applies at capture. `range` is the `ConstructorName` span upstream
     /// anchors (the class+selector compound for a named creation, the
-    /// head token for the unnamed face). An unresolvable container or a
-    /// genuinely absent constructor face mints nothing — the oracle's
-    /// `node.element == null` silence.
+    /// head token for the unnamed face). An unresolvable container, a
+    /// genuinely absent constructor face, or a constructor whose
+    /// declaration carries no annotations mints nothing — the oracle's
+    /// `node.element == null` silence, plus #2945's annotation gate.
     pub(crate) fn note_ctor_use(
         &mut self,
         class: StringId,
@@ -3073,6 +3090,22 @@ impl<'a> Engine<'a> {
         } else {
             selector
         };
+        // #2945: the edge exists only to carry the declaration's metadata —
+        // the verifier's `member: Some` arm drains `ctor_annotations` and a
+        // constructor carrying no MemberEntry row has no other annotations a
+        // member-shaped edge could name. An unannotated ctor call is still a
+        // real use upstream (the class/type-use rows mark it), but a
+        // member-shaped index row for it is spurious: #2618's zero-edge
+        // contract, and it stops `RefRow`s for plain `Host()` calls feeding
+        // the reachability/query surfaces.
+        let annotated = self
+            .index
+            .get(file)
+            .and_then(|elements| elements.ctor_annotations(class, key))
+            .is_some_and(|annotations| !annotations.is_empty());
+        if !annotated {
+            return;
+        }
         self.report.member_refs.push(MemberRef {
             range,
             kind: MemberRefKind::Invoked,

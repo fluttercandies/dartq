@@ -1,8 +1,9 @@
 use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
-/// The #2970 cluster pins: `null_check_on_nullable_type_parameter` and
-/// `unnecessary_null_checks` oracle shapes through the production bridge
-/// with the semantic face mounted. Every pin cites the conformance row it
+/// The #2970 cluster pins: `null_check_on_nullable_type_parameter`,
+/// `unnecessary_null_checks`, and `avoid_futureor_void` oracle shapes
+/// through the production bridge (the semantic face mounted where the
+/// rule consults resolution). Every pin cites the conformance row it
 /// mirrors (`conformance/expected.tsv`, extracted from the pinned
 /// `dart analyze` 3.13.7 oracle), so the conformance diff and the pin
 /// assert the same verdict.
@@ -225,4 +226,47 @@ fn unc_top_level_declaration_reports() {
     let f = Fixture::parse("int? j = i!;\nint? i;\n");
     let lints = f.run_semantic(&one_rule("unnecessary_null_checks"));
     assert_eq!(lints.len(), 1, "{lints:?}");
+}
+
+// —— avoid_futureor_void ——————————————————————————————————————————————
+// Upstream Dart SDK source, pkg/linter .../avoid_futureor_void.dart:59-73
+// (checkNamedType): report a `FutureOr` whose single type argument is
+// `void`, at the full type-annotation span; the ObjectPattern face rides
+// the same check (:125 registry).
+
+/// `avoid_futureor_void/doc_bad_0` — `INFO|…|3:1|14` — the report covers
+/// the whole `FutureOr<void>` annotation, not just the head.
+#[test]
+fn afov_span_covers_the_type_arguments() {
+    let f = Fixture::parse("import 'dart:async';\nFutureOr<void> x = throw 0;\n");
+    let lints = f.run(&one_rule("avoid_futureor_void"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "Don't use the type 'FutureOr<void>'.");
+    let head = tok(&f.source, &f.tokens, "FutureOr", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, head));
+    assert_eq!(lints[0].range.end - lints[0].range.start, 14);
+}
+
+/// `AvoidFutureOrVoidTest/test_objectPattern#0` — `INFO|…|5:14|14` — the
+/// object pattern's head name is the checked type annotation.
+#[test]
+fn afov_object_pattern_reports() {
+    let f = Fixture::parse(
+        "import 'dart:async';\nf(Object? x) {\n  if (x case FutureOr<void>()) return;\n}\n",
+    );
+    let lints = f.run(&one_rule("avoid_futureor_void"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let head = tok(&f.source, &f.tokens, "FutureOr", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, head));
+    assert_eq!(lints[0].range.end - lints[0].range.start, 14);
+}
+
+/// `avoid_futureor_void/doc_bad_1` — no lint row (only the semantic
+/// `undefined_class`) — an unresolved `FutureOr` (no `dart:async` in
+/// scope) is not the lint's type.
+#[test]
+fn afov_unresolved_head_stays_silent() {
+    let f = Fixture::parse("FutureOr<void> x = throw 0;\n");
+    let lints = f.run_semantic(&one_rule("avoid_futureor_void"));
+    assert!(lints.is_empty(), "{lints:?}");
 }

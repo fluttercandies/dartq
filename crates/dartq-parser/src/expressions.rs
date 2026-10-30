@@ -59,6 +59,15 @@ use crate::types::TypeInfo;
 pub(crate) const ASSIGNMENT_PRECEDENCE: u8 = 1;
 pub(crate) const CASCADE_PRECEDENCE: u8 = 2;
 pub(crate) const CONDITIONAL_PRECEDENCE: u8 = 3;
+/// `PREFIX_PRECEDENCE` (`token.dart:2280`): `~`'s own level. It is the only
+/// token whose `type.precedence` reaches the loop without a dedicated arm —
+/// `_computePrecedence` falls through to `return type.precedence` for it
+/// (:7744), so infix `~` lands in the plain-binary else arm and parses as a
+/// binary expression (the semantic `not_binary_operator` is the analyzer's
+/// row, never a parser one — `var a = 5 ~ 3;` costs zero parser rows in the
+/// oracle). `!` shares the level upstream but `_computePrecedence` remaps it
+/// to POSTFIX/SELECTOR before it can arrive.
+pub(crate) const PREFIX_PRECEDENCE: u8 = 15;
 pub(crate) const POSTFIX_PRECEDENCE: u8 = 16;
 
 /// The assignment operators of the binary walk (`token.precedence ==
@@ -94,6 +103,7 @@ pub(crate) fn kind_precedence(kind: TokenKind) -> Option<u8> {
         k if is_assignment_kind(k) => ASSIGNMENT_PRECEDENCE,
         TokenKind::PeriodPeriod | TokenKind::QuestionPeriodPeriod => CASCADE_PRECEDENCE,
         TokenKind::Question => CONDITIONAL_PRECEDENCE,
+        TokenKind::Tilde => PREFIX_PRECEDENCE,
         TokenKind::Bang | TokenKind::PlusPlus | TokenKind::MinusMinus => POSTFIX_PRECEDENCE,
         TokenKind::Period | TokenKind::QuestionPeriod => SELECTOR_PRECEDENCE,
         _ => return None,
@@ -137,6 +147,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     CONDITIONAL_PRECEDENCE
                 }
             }
+            // `~` carries PREFIX_PRECEDENCE in the token table
+            // (`token.dart:2276-2283`) and `_computePrecedence` returns it
+            // unmolested (:7744) — it is the only token that reaches the loop
+            // at the prefix tier, and the plain-binary else arm consumes it
+            // exactly like a real binary operator (zero parser rows; the
+            // `not_binary_operator` row is the analyzer's semantic face).
+            TokenKind::Tilde => PREFIX_PRECEDENCE,
             TokenKind::Bang => {
                 // Postfix `!` is a selector when a selector token follows
                 // (:7756-7767), else a plain postfix null assertion.
@@ -1114,26 +1131,45 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     self.may_parse_function_expressions = true;
                     let _ = self.parse_expression();
                     self.may_parse_function_expressions = saved;
-                    if self.peek_kind() != TokenKind::CloseSquare {
-                        // Recovery (:7349-7366): report; the scanner pairs the
-                        // group, so jump to its closer (silently when the
-                        // scanner synthesized it).
-                        if let Some(close) = self.cursor.table_matching_end(open.id) {
-                            let (_, synthetic) = self.cursor.resolve(close);
-                            if !synthetic {
-                                self.report(msg::expected_but_got("]"), self.peek_span());
-                            }
-                            self.skip_to_token(close);
-                        } else {
-                            self.report(msg::expected_but_got("]"), self.peek_span());
-                            let at = self.peek_span();
-                            self.synthetic(TokenKind::CloseSquare, at.range.offset);
-                            self.cursor.advance();
-                        }
-                    }
                 }
-                let close = self.peek_span();
-                self.cursor.advance();
+                // The closer consume is per-face: the empty-operand face
+                // always leaves a `]`-kind token current (real, or the queued
+                // split closer), and the expression face recovers below.
+                let close;
+                if self.peek_kind() == TokenKind::CloseSquare {
+                    close = self.peek_span();
+                    self.cursor.advance();
+                } else if let Some(close_id) = self.cursor.table_matching_end(open.id) {
+                    // Recovery (parser_impl.dart:8017-8032): report at the
+                    // follower (always — the `isSynthetic` check only decides
+                    // HOW the closer is adopted, never whether the row
+                    // fires). A scanner-synthetic closer is relocated onto
+                    // the expression end (`rewriter.moveSynthetic` :8025-8027)
+                    // so the junk run stays current for the enclosing
+                    // recovery layer; a real `]` absorbs the junk run
+                    // (skip-to-endGroup :8028-8030).
+                    let (_, synthetic) = self.cursor.resolve(close_id);
+                    if synthetic {
+                        close = self.move_synthetic_close(
+                            open,
+                            close_id,
+                            TokenKind::CloseSquare,
+                            "]",
+                        );
+                    } else {
+                        self.report(msg::expected_but_got("]"), self.peek_span());
+                        self.skip_to_token(close_id);
+                        close = self.peek_span();
+                        self.cursor.advance();
+                    }
+                } else {
+                    // No scanner pair at all: report and close on a synthetic
+                    // `]` at the follower.
+                    self.report(msg::expected_but_got("]"), self.peek_span());
+                    let at = self.peek_span();
+                    close = self.synthetic(TokenKind::CloseSquare, at.range.offset);
+                    self.cursor.advance();
+                }
                 // The `[]`-token face leaves the synthetic operand current
                 // once the split `]` is consumed; step over it so it cannot
                 // resurface as a phantom operand downstream. One bounded
@@ -2093,7 +2129,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// objectPattern`.
     fn skip_outer_pattern_end(&self) -> Option<TokenId> {
         if is_identifier(self.peek_kind()) {
-            // `id (.id)? typeArguments? '(' ... ')'` (object pattern).
+            // `id (.id)? typeArguments? '(' ... ')'` (object pattern). `pos`
+            // tracks the last type-name token; the pattern group's `(` is the
+            // next offset, except after a `<...>` skip where it lands on `pos`.
             let mut pos = self.cursor.real_pos();
             if self.kind_at(pos + 1) == TokenKind::Period && is_identifier(self.kind_at(pos + 2)) {
                 pos += 2;
@@ -2101,6 +2139,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             if self.kind_at(pos + 1) == TokenKind::Lt {
                 let len = self.gt_group_len(pos + 1)?;
                 pos += len;
+            } else {
+                pos += 1;
             }
             if self.kind_at(pos) != TokenKind::OpenParen {
                 return None;

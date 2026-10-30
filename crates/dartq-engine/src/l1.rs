@@ -1143,8 +1143,18 @@ fn resolve_unit(
                 | DirectiveKind::PartOf
         ) {
             let (uri, _span) = selected_uri(directive, declared);
-            let UriResolution { target, code, .. } =
-                resolver.resolve(file, uri, dartq_resolution::DirectiveKind::ImportExport);
+            // `part of '<uri>'` resolves the same target but never carries a
+            // URI diagnostic — upstream `file_state.dart:938-953` only uses it
+            // to classify the file (`PartOfUriKnownFileKind`/`UnknownFileKind`),
+            // so a missing/unparseable target emits nothing. Import/export/part
+            // keep the `ImportExport` face; `part of` gets the pinned `PartOf`
+            // face (its `code` is forced `None` for every outcome).
+            let kind = if directive.kind == DirectiveKind::PartOf {
+                dartq_resolution::DirectiveKind::PartOf
+            } else {
+                dartq_resolution::DirectiveKind::ImportExport
+            };
+            let UriResolution { target, code, .. } = resolver.resolve(file, uri, kind);
             directive.target = target;
             directive.code = code;
         }
@@ -1196,7 +1206,7 @@ fn resolve_unit(
 /// (library_analyzer.dart:698-717), never the primary's. Unmatched branch
 /// URIs are never resolved here (the oracle never reads them), so a missing
 /// *unselected* target stays silent.
-fn selected_uri<'a>(
+pub(crate) fn selected_uri<'a>(
     directive: &'a DirectiveFacts,
     declared: &FxHashMap<String, String>,
 ) -> (Option<&'a str>, SourceRange) {
@@ -1207,10 +1217,23 @@ fn selected_uri<'a>(
     );
     match resolve_conditional(&directive.configurations, declared) {
         SelectedUri::Primary => (directive.uri.as_deref(), directive.uri_span),
-        SelectedUri::Configuration(index) => (
-            Some(directive.configurations[index].uri.as_ref()),
-            directive.configuration_spans[index],
-        ),
+        SelectedUri::Configuration(index) => {
+            // An interpolated clause URI carries no string upstream
+            // (`DirectiveUriWithoutString`, file_state.dart:118): the
+            // selected branch reports `uri_with_interpolation` at its own
+            // literal — the same face a `None` primary URI resolves to in
+            // `resolve_uri`.
+            if directive
+                .interpolated_configurations
+                .contains(&(index as u32))
+            {
+                return (None, directive.configuration_spans[index]);
+            }
+            (
+                Some(directive.configurations[index].uri.as_ref()),
+                directive.configuration_spans[index],
+            )
+        }
     }
 }
 
@@ -1357,13 +1380,28 @@ impl DiagCollector {
 }
 
 impl ParserListener for DiagCollector {
-    fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, _end: TokenSpan) {
+    fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, end: TokenSpan) {
+        // The whole `start..end` region: `report_with_end` carries a real
+        // end token (`partOfName.at(name)` spans the dotted name's head
+        // through its last identifier, ast_builder.dart:2819-2826 — the
+        // analyzer's diagnostic region is `offset..end.end`), while the
+        // single-token `report` path passes `at, at` and folds back to the
+        // start span. A degenerate end (recovery may report one before the
+        // start) keeps the start span rather than a negative length.
+        let range = if end.range.end() > start.range.end() {
+            SourceRange {
+                offset: start.range.offset,
+                length: end.range.end() - start.range.offset,
+            }
+        } else {
+            start.range
+        };
         self.diags.push(Diagnostic::new(
             Severity::Error,
             message.code,
             message.text,
             self.file,
-            start.range,
+            range,
             message.correction,
         ));
     }
@@ -1815,6 +1853,16 @@ fn extract_directives(
 /// `uriWithInterpolation.at(directive.uri)`, the URI node's
 /// beginToken..endToken, library_analyzer.dart:732/:993/:1031), and the index
 /// just past the literal region.
+///
+/// A literal with no string token at all is NOT the interpolation face: the
+/// official `ensureLiteralString` recovery (parser_impl.dart:5075-5103)
+/// splices a synthetic empty string before the offending token, and the
+/// oracle resolves THAT — `''` composes to the container itself
+/// (`compose_relative`'s empty-path rule), so `part class A {}` reports
+/// `part_of_non_part` on the container's own canonical URI at the offending
+/// token, zero length — never `uri_with_interpolation` (that row belongs to
+/// a literal whose `stringValue` is null: an interpolation, the only shape
+/// upstream treats as stringless, library_analyzer.dart:736-744/:951-955).
 fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, SourceRange, usize) {
     let interpolated = |kind: Option<TokenKind>| {
         matches!(
@@ -1824,15 +1872,30 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
             )
         )
     };
+    // A literal opening straight into an identifier-form interpolation
+    // (`'$x.dart'`) is shapeless from its first token — the same whole-region
+    // span rule as a `${…}` after plain segments.
+    if interpolated(kind_at(tokens, i)) {
+        let end = skip_interpolation_chain(tokens, i);
+        let span = whole_literal_span(text, tokens, i, end);
+        return (None, span, end);
+    }
     if kind_at(tokens, i) != Some(TokenKind::String) {
-        return (
-            None,
+        // The recovery splice: a resolvable empty URI pinned at the offending
+        // token (synthetic, zero length). Advancing is the caller's walk —
+        // the offending token stays for the clause loop, exactly where the
+        // official parser leaves it after the splice.
+        let span = tokens.get(i).map_or(
             SourceRange {
                 offset: 0,
                 length: 0,
             },
-            i,
+            |token| SourceRange {
+                offset: token.utf16_offset,
+                length: 0,
+            },
         );
+        return (Some(String::new().into_boxed_str()), span, i);
     }
     // Concatenate the run of adjacent plain `String` segments. An
     // undecodable segment (malformed escape) leaves the region shapeless —
@@ -1854,46 +1917,9 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
         j += 1;
     }
     if interpolated(kind_at(tokens, j)) {
-        // Skip the whole segment chain: `String` pieces, `${ … }` groups
-        // (group-aware, so a `;` inside the interpolation cannot mislead),
-        // and the `$id` form's identifier — the identifier is only part of
-        // the literal directly after its `$` token, never a follower.
-        let mut after_dollar = false;
-        loop {
-            match kind_at(tokens, j) {
-                Some(TokenKind::String) => {
-                    after_dollar = false;
-                    j += 1;
-                }
-                Some(TokenKind::StringInterpolationIdentifier) => {
-                    after_dollar = true;
-                    j += 1;
-                }
-                Some(TokenKind::StringInterpolationExpression) => {
-                    after_dollar = false;
-                    j = tokens.matching_end(j).map_or(j + 1, |end| end + 1);
-                }
-                Some(TokenKind::Identifier | TokenKind::Keyword(_)) if after_dollar => {
-                    after_dollar = false;
-                    j += 1;
-                }
-                _ => break,
-            }
-        }
-        // Shapeless, but still the whole literal: the chain's last token
-        // (a `String` tail, or the identifier form's tail) ends the URI
-        // node's span.
-        let last = j - 1;
-        let token = tokens.get(last).expect("the loop advanced past a token");
-        let tail_end = token.utf16_offset + utf16_len_of(tokens.lexeme(text, last));
-        return (
-            None,
-            SourceRange {
-                offset: span_offset,
-                length: tail_end - span_offset,
-            },
-            j,
-        );
+        let end = skip_interpolation_chain(tokens, j);
+        let span = whole_literal_span(text, tokens, i, end);
+        return (None, span, end);
     }
     let span = SourceRange {
         offset: span_offset,
@@ -1904,6 +1930,56 @@ fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, Sou
 
 fn kind_at(tokens: &TokenTable, i: usize) -> Option<TokenKind> {
     tokens.get(i).map(|token| token.kind)
+}
+
+/// Skips an interpolation segment chain starting at `j`: `String` pieces,
+/// `${ … }` groups (group-aware, so a `;` inside the interpolation cannot
+/// mislead), and the `$id` form's identifier — the identifier is only part
+/// of the literal directly after its `$` token, never a follower. Returns
+/// the index just past the chain (the caller guarantees `j` opens one, so
+/// the loop advances at least once).
+fn skip_interpolation_chain(tokens: &TokenTable, mut j: usize) -> usize {
+    let mut after_dollar = false;
+    loop {
+        match kind_at(tokens, j) {
+            Some(TokenKind::String) => {
+                after_dollar = false;
+                j += 1;
+            }
+            Some(TokenKind::StringInterpolationIdentifier) => {
+                after_dollar = true;
+                j += 1;
+            }
+            Some(TokenKind::StringInterpolationExpression) => {
+                after_dollar = false;
+                j = tokens.matching_end(j).map_or(j + 1, |end| end + 1);
+            }
+            Some(TokenKind::Identifier | TokenKind::Keyword(_)) if after_dollar => {
+                after_dollar = false;
+                j += 1;
+            }
+            _ => return j,
+        }
+    }
+}
+
+/// The whole-literal UTF-16 span from token `start` through token `end - 1`
+/// — the URI node's beginToken..endToken, the anchor every shapeless
+/// (interpolated) face reports at (library_analyzer.dart:732/:993/:1031).
+fn whole_literal_span(
+    text: &str,
+    tokens: &TokenTable,
+    start: usize,
+    end: usize,
+) -> SourceRange {
+    let head = tokens.get(start).expect("start token exists");
+    let last = end - 1;
+    let tail = tokens.get(last).expect("the chain advanced past a token");
+    let tail_end = tail.utf16_offset + utf16_len_of(tokens.lexeme(text, last));
+    SourceRange {
+        offset: head.utf16_offset,
+        length: tail_end - head.utf16_offset,
+    }
 }
 
 /// Whether `kind` can spell part of an annotation name: identifiers and
@@ -2002,6 +2078,7 @@ fn walk_library(
         name,
         configurations: Box::default(),
         configuration_spans: Box::default(),
+        interpolated_configurations: Box::default(),
     });
     end
 }
@@ -2025,6 +2102,7 @@ fn walk_import_export(
     let mut clauses: Vec<(CombinatorClause, Box<[SourceRange]>)> = Vec::new();
     let mut configurations: Vec<Configuration> = Vec::new();
     let mut configuration_spans: Vec<SourceRange> = Vec::new();
+    let mut interpolated_configurations: Vec<u32> = Vec::new();
     // The combinator list's first clause keyword and last name end: the
     // oracle's `multiple_combinators` span (error_verifier.dart
     // `_reportForMultipleCombinators` — `combinators.beginToken` through
@@ -2049,6 +2127,7 @@ fn walk_import_export(
                     i,
                     &mut configurations,
                     &mut configuration_spans,
+                    &mut interpolated_configurations,
                 );
             }
             Some(TokenKind::Keyword(Keyword::Deferred)) => {
@@ -2122,6 +2201,7 @@ fn walk_import_export(
         name: None,
         configurations: configurations.into(),
         configuration_spans: configuration_spans.into(),
+        interpolated_configurations: interpolated_configurations.into(),
     });
     // `multiple_combinators` (error_verifier.dart:8489-8504): more than one
     // `show`/`hide` clause on one import/export — the warning rides the
@@ -2170,6 +2250,7 @@ fn walk_conditional_uri(
     if_at: usize,
     configurations: &mut Vec<Configuration>,
     configuration_spans: &mut Vec<SourceRange>,
+    interpolated_configurations: &mut Vec<u32>,
 ) -> usize {
     let mut i = if_at + 1; // past `if`
     let mut name = String::new();
@@ -2227,11 +2308,23 @@ fn walk_conditional_uri(
 
     // The candidate URI after the group (official :1155).
     let (uri, span, next) = read_uri(text, tokens, i);
-    if clean
-        && !name.is_empty()
-        && let Some(uri) = uri
-    {
-        configurations.push(Configuration::new(&name, value.as_deref(), &uri));
+    if clean && !name.is_empty() {
+        // An interpolated clause URI still occupies its selection slot
+        // upstream — `_buildConfigurableDirectiveUris` records every clause
+        // (`file_state.dart:738-764`), the interpolated one as
+        // `DirectiveUriWithoutString`, and first-match-wins selects it
+        // like any other, surfacing `uri_with_interpolation` at the
+        // branch literal when the declared map hits it. The placeholder
+        // `uri` is never read: `selected_uri` consults the interpolated
+        // index column first.
+        match uri {
+            Some(uri) => configurations.push(Configuration::new(&name, value.as_deref(), &uri)),
+            None => {
+                interpolated_configurations
+                    .push(u32::try_from(configurations.len()).unwrap_or(u32::MAX));
+                configurations.push(Configuration::new(&name, value.as_deref(), ""));
+            }
+        }
         configuration_spans.push(span);
     }
     next
@@ -2246,7 +2339,12 @@ fn walk_part(
     out: &mut Vec<DirectiveFacts>,
 ) -> usize {
     if kind_at(tokens, start + 1) == Some(TokenKind::Keyword(Keyword::Of)) {
-        if kind_at(tokens, start + 2) == Some(TokenKind::String) {
+        // `hasName = ofKeyword.next!.isIdentifier` (parser_impl.dart:1325):
+        // an identifier-ish token takes the qualified-name form; everything
+        // else is the URI read — a string head, an interpolation, or the
+        // `ensureLiteralString` recovery splice (`part of class A {}` is a
+        // part-of-URI over the synthetic `''`, never a part-of-name).
+        if !kind_at(tokens, start + 2).is_some_and(is_name_token) {
             let (uri, uri_span, mut i) = read_uri(text, tokens, start + 2);
             if kind_at(tokens, i) == Some(TokenKind::Semicolon) {
                 i += 1;
@@ -2263,6 +2361,7 @@ fn walk_part(
                 name: None,
                 configurations: Box::default(),
                 configuration_spans: Box::default(),
+                interpolated_configurations: Box::default(),
             });
             return i;
         }
@@ -2282,6 +2381,7 @@ fn walk_part(
             name,
             configurations: Box::default(),
             configuration_spans: Box::default(),
+            interpolated_configurations: Box::default(),
         });
         return end;
     }
@@ -2301,6 +2401,7 @@ fn walk_part(
         name: None,
         configurations: Box::default(),
         configuration_spans: Box::default(),
+        interpolated_configurations: Box::default(),
     });
     i
 }
@@ -3320,7 +3421,16 @@ fn resolve_claim(state: &EngineState, part: FileId) -> Option<FileId> {
 /// offer row's path-smallest winner (`PartOfNameFileKind.library`),
 /// already resolved above.
 fn climb_includer_chain(state: &EngineState, part: FileId) -> Option<FileId> {
-    let own_part_of = state.residency.get(&part)?.part_of()?;
+    let part_facts = state.residency.get(&part)?;
+    // The climb is a `PartOfUriKnownFileKind.library` lookup — a kind a
+    // `library`-directive file never reaches (`_updateKind`,
+    // file_state.dart:937-939): `library; part of 'x.dart';` stays its own
+    // defining library, and attributing it into x's library would emit its
+    // diagnostics under two runs.
+    if !part_facts.is_part() {
+        return None;
+    }
+    let own_part_of = part_facts.part_of()?;
     if own_part_of.name.is_some() {
         return None;
     }
@@ -3682,10 +3792,33 @@ pub(crate) fn may_claim(
     library_name: Option<&str>,
     target: FileId,
 ) -> bool {
-    state.residency[&target]
+    let target_facts = &state.residency[&target];
+    // `_updateKind` precedence (file_state.dart:937-939): a `library`
+    // directive classifies the file as a LibraryFileKind outright — any
+    // `part of` it also carries is dead weight and `isPartOf` does not
+    // exist on the library kinds at all. Without this gate a
+    // `library; part of 'x.dart';` file claims into x's library as a member
+    // while still forming its own defining library — its diagnostics then
+    // emit once per run (the duplicate-row bug), and the include's
+    // `part_of_non_part` pair gains a phantom member.
+    if !target_facts.is_part() {
+        return false;
+    }
+    target_facts
         .part_of()
         .is_some_and(|part_of| match part_of.name.as_deref() {
-            Some(name) => library_name == Some(name) && same_package(state, defining_file, target),
+            // Name form: the container must be a LIBRARY carrying the same
+            // name — `isPartOf` is `container is LibraryFileKind && name ==
+            // container.name` (file_state.dart:2217-2219), so a part file's
+            // own `part` directive can never claim a name-form part even
+            // when the defining library's name matches. The defining-file
+            // callers (resolve_claim, close, the part-family emitter) always
+            // pass a library container and never feel this arm.
+            Some(name) => {
+                !state.residency[&defining_file].is_part()
+                    && library_name == Some(name)
+                    && same_package(state, defining_file, target)
+            }
             None => part_of.target == ResolvedTarget::Resolved(defining_file),
         })
 }
@@ -3954,6 +4087,14 @@ pub(crate) mod tests {
                 "sdk/lib/libraries.json",
                 r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
             );
+            // `dart:core` exists on disk: the URI layer's flat-table lookup
+            // maps the name, then probes the file (`internalMapDartUri` +
+            // `importedFile.exists`) — an unwritten entry reports
+            // `uri_does_not_exist` just like the oracle's SDK miss.
+            write(
+                "sdk/lib/core/core.dart",
+                "library dart.core;\n",
+            );
             write(
                 "sdk/lib/_internal/allowed_experiments.json",
                 experiments_json,
@@ -4217,14 +4358,15 @@ pub(crate) mod tests {
         assert_eq!(info.parts.as_slice(), &[part]);
     }
 
-    /// Malformed part graphs terminate with the oracle's outcomes (#2883):
-    /// a mutual `part of` cycle no library includes joins no membership
-    /// (upstream climbs the includer chain under an identity visited set and
-    /// answers null, `PartOfUriKnownFileKind.library`), and a name-form
-    /// include back-edge re-reaching a member — whose `may_claim` confirm
-    /// passes at every hop against the root's name — is dropped only by the
-    /// visited set, so the walk stays bounded and membership keeps the
-    /// acyclic prefix. The apply returning is the termination face.
+    /// Malformed part graphs terminate with the oracle's outcomes (#2883,
+    /// container-is-library pin #2998): a mutual `part of` cycle no library
+    /// includes joins no membership (upstream climbs the includer chain
+    /// under an identity visited set and answers null,
+    /// `PartOfUriKnownFileKind.library`), and a name-form include under a
+    /// part container can never attach — `isPartOf` requires
+    /// `container is LibraryFileKind` (file_state.dart:2217-2219) — so the
+    /// back-edge face is unconditional non-membership, not just the visited
+    /// set. The apply returning is the termination face.
     #[test]
     fn malformed_part_cycles_terminate_without_membership() {
         let fixture = Fixture::new();
@@ -4235,8 +4377,10 @@ pub(crate) mod tests {
         let c_a = set(&mut state, &lib.join("c_a.dart"), "part of 'c_b.dart';\n");
         let c_b = set(&mut state, &lib.join("c_b.dart"), "part of 'c_a.dart';\n");
         // The rooted name-form cycle: root → p1 → p2, and p2 includes p1
-        // back — the confirm passes (name form matches the root's name at
-        // every hop), the visited set is what drops the re-entry.
+        // back. p1 attaches (root is a library named `dup`); p2's name-form
+        // part-of can only be claimed by a LIBRARY container — p1 is a
+        // part, so p2 never joins, and p2's back-edge to p1 is
+        // unconditional non-membership (the walk terminates regardless).
         let root = set(
             &mut state,
             &lib.join("root.dart"),
@@ -4247,7 +4391,7 @@ pub(crate) mod tests {
             &lib.join("p1.dart"),
             "part of dup;\npart 'p2.dart';\n",
         );
-        let p2 = set(
+        let _p2 = set(
             &mut state,
             &lib.join("p2.dart"),
             "part of dup;\npart 'p1.dart';\n",
@@ -4258,8 +4402,9 @@ pub(crate) mod tests {
         let info = state.libraries.info(library).expect("live");
         assert_eq!(
             info.parts.as_slice(),
-            &[p1, p2],
-            "the back-edge re-entry is dropped, membership keeps the acyclic prefix"
+            &[p1],
+            "a name-form part under a part includer never attaches — \
+             membership keeps only the library-claimed prefix"
         );
         let cycle_pair = [c_a, c_b];
         for (_, member) in state.libraries.iter_infos() {

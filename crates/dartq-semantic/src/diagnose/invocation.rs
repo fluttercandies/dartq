@@ -2,6 +2,14 @@ use super::ffi::matching_close;
 use super::*;
 use dartq_source::byte_offset_to_utf16;
 
+/// The #2931 pins (the constructor-use `member_refs` publication — the
+/// `ctor_annotations` fallback reaching `check_target_annotations`).
+/// Kept as a standalone `#[path]` submodule so the shared `tests` rig and
+/// this file's own module stay untouched by the registration.
+#[cfg(test)]
+#[path = "ticket_2931_tests.rs"]
+mod ticket_2931_tests;
+
 /// The chain-root static type behind a receiver classification: the
 /// declared type of a `Typed` receiver's head (`data` of `data.address`,
 /// `struct` of `struct.y.address`'s chain), [`Ty::UNKNOWN`] for every
@@ -2625,6 +2633,18 @@ impl<'a> Engine<'a> {
                     length: close.end().saturating_sub(class_offset),
                 };
                 self.ur_register_creation(class_offset, range, class);
+                // The ctor-use edge (#2931): the `ConstructorName` node —
+                // the class+selector compound — resolves the constructor
+                // face, whose annotations the verifier's `member: Some`
+                // arm reads through `ctor_annotations`.
+                self.note_ctor_use(
+                    class,
+                    head,
+                    SourceRange {
+                        offset: class_offset,
+                        length: head_range.end().saturating_sub(class_offset),
+                    },
+                );
                 // The class segment's written group instantiates the created
                 // type (`Future<Never>.error(..)` is `Future<Never>`), the
                 // same face the unnamed fold reads; the group sits right
@@ -2665,6 +2685,7 @@ impl<'a> Engine<'a> {
                     close.end(),
                     head,
                     ContainerKind::Class,
+                    None,
                 );
             }
             // The prefix-resolved creation (`const fb.Reader().vTableGet`,
@@ -2675,10 +2696,12 @@ impl<'a> Engine<'a> {
             // the created type; the member verdicts on the folded row
             // under-report through the bare scope the same way the
             // non-keyword prefixed send already does (the class name sits
-            // behind the prefix table).
+            // behind the prefix table). The ctor-use edge keys on the
+            // resolved owner — the bare namespace walk would read a
+            // same-named container in the wrong scope.
             else if let Some((prefix, prefix_offset)) =
                 self.written_prefix_before(head_range.offset)
-                && let Some((resolved, _)) = prefixed_container(
+                && let Some((resolved, owner)) = prefixed_container(
                     self.graph,
                     self.namespaces,
                     self.index,
@@ -2693,6 +2716,7 @@ impl<'a> Engine<'a> {
                     close.end(),
                     head,
                     resolved.kind,
+                    Some((resolved, owner)),
                 );
             }
         }
@@ -3060,6 +3084,10 @@ impl<'a> Engine<'a> {
     /// stacks the creation's value row over the whole written span, from the
     /// `start` the creation's written spelling begins at (the keyword's head
     /// token, or the prefix identifier of `p.C`) through the group's close.
+    /// `ctor` is the declaring container and owner file a prefix-resolved
+    /// head already carried — the bare namespace walk would read a
+    /// same-named container in the wrong scope (the prefixed member
+    /// verdicts' own posture).
     fn fold_unnamed_creation_row(
         &mut self,
         start: u32,
@@ -3067,6 +3095,7 @@ impl<'a> Engine<'a> {
         close_end: u32,
         head: StringId,
         kind: ContainerKind,
+        ctor: Option<(&'a Container, FileId)>,
     ) {
         let open = self.creation_open_offset(head_range.end());
         let kept = self.rows.partition_point(|row| row.range.offset < open);
@@ -3078,6 +3107,25 @@ impl<'a> Engine<'a> {
             length: close_end.saturating_sub(start),
         };
         self.ur_register_creation(start, range, head);
+        // The ctor-use edge (#2931): the `ConstructorName` node resolves the
+        // unnamed constructor face — the head token is the oracle's anchor
+        // for a bare head; a prefixed head's node covers the `p.C` compound.
+        // Classes alone reach it — an enum's `E(` is no creation upstream.
+        if kind == ContainerKind::Class {
+            match ctor {
+                Some((decl, file)) => self.note_ctor_use_in(
+                    decl,
+                    file,
+                    head,
+                    head,
+                    SourceRange {
+                        offset: start,
+                        length: head_range.end().saturating_sub(start),
+                    },
+                ),
+                None => self.note_ctor_use(head, head, head_range),
+            }
+        }
         // The written type arguments instantiate the created type (upstream
         // Dart SDK source, pkg/analyzer/lib/src/generated/resolver.dart,
         // visitInstanceCreationExpression — the static type is the
@@ -3309,9 +3357,13 @@ impl<'a> Engine<'a> {
     /// be an instance method; a generic container instantiation and every
     /// function-typed alias keep their own faces (`None`). Returns the
     /// call method's formals, its declared return type, and its own
-    /// type-parameter names (the inference parameters a generic
-    /// `R call<R>(R x)` solves at the send).
-    pub(crate) fn implicit_call_face(&self, ty: Ty) -> Option<(Formals, Ty, Box<[StringId]>)> {
+    /// type-parameter names paired with their declared bounds (a `Dynamic`
+    /// entry = absent, matching the executable windows' `Option<Ty>`
+    /// contract the bounds face reads).
+    pub(crate) fn implicit_call_face(
+        &self,
+        ty: Ty,
+    ) -> Option<(Formals, Ty, Box<[(StringId, Option<Ty>)]>)> {
         let Ty::Named {
             name: container,
             args: ArgListId::EMPTY,
@@ -3327,12 +3379,24 @@ impl<'a> Engine<'a> {
                     Projected::Own(e) => (
                         e.formals.as_deref()?.clone(),
                         e.return_ty,
-                        e.type_param_names.clone(),
+                        e.type_param_names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                (*name, e.type_param_bounds.get(index).copied().filter(|b| *b != Ty::Dynamic))
+                            })
+                            .collect(),
                     ),
                     Projected::Foreign(e) => (
                         e.formals.as_deref()?.to_owned(),
                         e.return_ty,
-                        e.type_param_names.clone(),
+                        e.type_param_names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                (*name, e.type_param_bounds.get(index).copied().filter(|b| *b != Ty::Dynamic))
+                            })
+                            .collect(),
                     ),
                 };
                 Some((formals, return_ty, params))
@@ -3448,6 +3512,27 @@ impl<'a> Engine<'a> {
             }));
         }
         None
+    }
+
+    /// A captured [`FnVarSig`] as a pool `Ty::Function` — the inference
+    /// face's argument-type materialization: a tear-off or closure literal
+    /// constrains the call's type parameters through its signature
+    /// (`unify_upward` consumes `Ty::Function` pairs position-by-position,
+    /// return included). The named section drops the `required` bit — the
+    /// shape table records types alone. Also the verdict surface's
+    /// tear-off materialization (the assignment/return positions read the
+    /// same face the argument position does).
+    pub(crate) fn fn_sig_ty(&self, sig: &FnVarSig) -> Ty {
+        let positional: Vec<Ty> = sig.positional.to_vec();
+        let named: Vec<(StringId, Ty)> =
+            sig.named.iter().map(|(name, ty, _)| (*name, *ty)).collect();
+        self.boundary.args.borrow_mut().function_generic(
+            &sig.params,
+            sig.return_ty,
+            &positional,
+            &named,
+            false,
+        )
     }
 
     /// `ty` with every bare occurrence of a mapped type parameter replaced
@@ -3734,18 +3819,50 @@ impl<'a> Engine<'a> {
         (!names.is_empty()).then_some(names)
     }
 
+    /// The member send's inference parameters plus its declared
+    /// bounds facts: `(inference params, receiver seeds, declared
+    /// bounds)`. The bounds element is the method's own
+    /// `type_param_names` paired with `type_param_bounds` — the facts
+    /// `_checkInvocationTypeArguments` decides on, held apart from the
+    /// inference `own_bound` seeds (which deliberately answer `None`
+    /// outside their narrow context-free case and are never a bound
+    /// source).
     fn member_send_params(
         &self,
         recv: &Receiver,
         member: StringId,
-    ) -> Option<(Box<[(StringId, Option<Ty>)]>, Vec<(StringId, Ty)>)> {
+    ) -> Option<(
+        Box<[(StringId, Option<Ty>)]>,
+        Vec<(StringId, Ty)>,
+        Box<[(StringId, Option<Ty>)]>,
+    )> {
+        // The method's declared `(name, bound)` pairs — the bounds
+        // verdict's parameter table; `Dynamic` reads as the absent-bound
+        // `None` the executable windows spell.
+        let decl_bounds = |entry: &crate::model::MemberEntry| -> Box<[(StringId, Option<Ty>)]> {
+            entry
+                .type_param_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        *name,
+                        entry
+                            .type_param_bounds
+                            .get(index)
+                            .copied()
+                            .filter(|b| *b != Ty::Dynamic),
+                    )
+                })
+                .collect()
+        };
         let (container, kind, recv_ty) = match *recv {
             Receiver::Typed { type_name, ty } => (type_name, ContainerKind::Class, Some(ty)),
             Receiver::This { container, kind } => (container, kind, None),
             // A static send (`W.wrap(...)`): the method's own type
             // parameters infer like any generic send's — its formals never
             // spell the caller's same-named in-scope parameters.
-            Receiver::Container { name, kind } | Receiver::Created { name, kind } => {
+            Receiver::Container { name, kind } => {
                 let Walk::Found(entry) = self.bare_member_walk(name, kind, member) else {
                     return None;
                 };
@@ -3760,7 +3877,25 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|name| (*name, None))
                     .collect();
-                return Some((params.into_boxed_slice(), Vec::new()));
+                return Some((
+                    params.into_boxed_slice(),
+                    Vec::new(),
+                    decl_bounds(&entry),
+                ));
+            }
+            // A folded creation's instance send (`new C().m(42)`): the
+            // instance face — the constructor-argument membership check
+            // walks the superclass chain like a declaration-typed receiver,
+            // and the generic method's own parameters solve upward from
+            // the arguments (`m<T>(T x)` binds `T := int`). The created
+            // receiver carries no written instantiation, so the declaring
+            // container's parameters join unseeded — `new Box().get()`
+            // stays unsolved where `box.get()` read `int`
+            // (generic_inferrer.dart's upward constraint arm; a `C<int>()`
+            // creation's explicit arguments live on the callee row, not
+            // this receiver — under-report over a wrong binding).
+            Receiver::Created { name, kind } if kind != ContainerKind::Extension => {
+                (name, kind, None)
             }
             _ => return None,
         };
@@ -3841,6 +3976,12 @@ impl<'a> Engine<'a> {
             });
             (!recursive).then_some(bound)
         };
+        // The bounds verdict's parameter table, held apart from the
+        // inference seeds below: `own_bound` answers `None` outside its
+        // context-free corner deliberately — it is an inference seed,
+        // never a bound source — while the declared bounds are the facts
+        // `check_call_type_arg_bounds` needs.
+        let declared = decl_bounds(&entry);
         let mut params: Vec<(StringId, Option<Ty>)> = entry
             .type_param_names
             .iter()
@@ -3888,7 +4029,7 @@ impl<'a> Engine<'a> {
         if params.is_empty() {
             return None;
         }
-        Some((params.into_boxed_slice(), seeds))
+        Some((params.into_boxed_slice(), seeds, declared))
     }
 
     /// #2831 P1 — the raw-constructor inference face: an unnamed creation
@@ -4088,6 +4229,16 @@ impl<'a> Engine<'a> {
                 name,
                 kind: ContainerKind::Class,
             }) => Some(*name),
+            // An extension-type head carries the conflated `Extension`
+            // tag; only a resolved `ExtensionType` is a constructable
+            // container (a plain extension's `Ext(x)` is the override
+            // face, not a creation).
+            RowShape::Bare(BareInfo::Container {
+                name,
+                kind: ContainerKind::Extension,
+            }) if self.container_kind_of(*name) == Some(ContainerKind::ExtensionType) => {
+                Some(*name)
+            }
             _ => self.bare_creation_head_name(row.range),
         };
         let params = head_name.and_then(|name| {
@@ -4107,6 +4258,31 @@ impl<'a> Engine<'a> {
             Some(params) => params,
             None => match self.exec_bounds.get(&row.name) {
                 Some(window) if !window.is_empty() => window.to_vec(),
+                // The generic function-literal invocation `(<T>() {})
+                // <String>()`: the callee row is the parenthesized
+                // literal's `Bare(Plain)`/`Value` — no declaring name, no
+                // `exec_bounds` window — but its own `<T>` window is the
+                // last closed outermost type-variables group, still
+                // latched in `bounds.pending` (the send's `<String>`
+                // group is a call-site group, never a header's
+                // `begin_type_variables`, so nothing cleared it). This is
+                // the formals-less arm the `(<lit>)<S>()` send reaches
+                // (`checkFunctionExpressionInvocation`,
+                // type_arguments_verifier.dart:193-196). Gated on the
+                // nameless literal fold: a spelled callee `x<S>()` owns
+                // its OWN type's parameters (an unmodeled function type
+                // under-reports), never an enclosing declaration's stale
+                // window — a generic declaration nested in the literal's
+                // body re-latches `pending` the same way.
+                _ if row.name == self.intern("") => match self.bounds.pending_window() {
+                    Some(window) if !window.is_empty() => window
+                        .iter()
+                        .map(|(param, bound, _)| {
+                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                        })
+                        .collect(),
+                    _ => return,
+                },
                 _ => return,
             },
         };
@@ -4578,6 +4754,13 @@ impl<'a> Engine<'a> {
                 self.named_given.insert((key, *given));
             }
         }
+        // The unnamed face over an enum with NO declared constructor
+        // resolves the synthetic `const E()` — a zero-formal table that
+        // still decides the count faces (`v(0)` over a constructor-less
+        // enum reports `extra_positional_arguments` "0 expected, but 1
+        // found"; upstream resolves the element's implicit generative
+        // constructor). A declared-selector miss keeps the under-report
+        // posture — `undefined_enum_constructor` owns that face.
         let Some((formals, const_ctor)) = resolve_container(
             self.graph,
             self.namespaces,
@@ -4587,7 +4770,14 @@ impl<'a> Engine<'a> {
             enum_name,
         )
         .and_then(|(container, owner)| {
-            let mut formals = (**container.ctor_formals.get(&key)?).clone();
+            let mut formals = match container.ctor_formals.get(&key) {
+                Some(formals) => (**formals).clone(),
+                None if key == enum_name => Formals {
+                    positional: Box::default(),
+                    named: Box::default(),
+                },
+                None => return None,
+            };
             // The resolved table lives in `owner`'s pool — re-intern every
             // `formal.ty` into the diagnosing pool before the per-argument
             // assignability walk derefs a slot (a same-file owner is a
@@ -4684,6 +4874,35 @@ impl<'a> Engine<'a> {
             let message = code.message(&capacity.to_string(), &given.to_string());
             self.emit_message_with_correction(code, anchor, message);
         }
+        // The required-named misses emit in formal-declaration order at the
+        // constant's own name — upstream's `visitEnumConstantDeclaration`
+        // checks `constructorElement`'s formals with `errorEntity: node.name`
+        // (required_parameters_verifier.dart:60-66); the enum-constant
+        // invocation carries no callee row, so the constant's name range is
+        // the `enum_const_call` latch's own span.
+        if let Some((name_range, _)) = self.enum_const_call {
+            for formal in formals.named.iter().filter(|f| f.required) {
+                let covered = level.args.iter().any(|(name, ..)| {
+                    name.is_some_and(|n| {
+                        self.named_formal_for(&formals, n)
+                            .is_some_and(|m| m.name == formal.name)
+                    })
+                });
+                if covered {
+                    continue;
+                }
+                let text = self
+                    .strings
+                    .resolve(self.formal_public_name(formal.name))
+                    .to_string();
+                self.emit(
+                    SemanticCode::MissingRequiredArgument,
+                    name_range,
+                    &text,
+                    "",
+                );
+            }
+        }
         // The argument walk pairs positionals by index, named by spelling,
         // reporting each type mismatch's code pair at the argument's span.
         let mut positional_index = 0usize;
@@ -4761,6 +4980,259 @@ impl<'a> Engine<'a> {
                 // `_checkForOutOfRange` double arm reports from).
                 self.check_imprecise_int_literal(flow_ty, formal.ty, *literal, *range);
             }
+        }
+    }
+
+    /// The index expression's argument check (#2937, upstream
+    /// `checkIndexExpressionIndex`, error_detection_helpers.dart:260-289):
+    /// the folded index operand checks against the first formal of EVERY
+    /// `[]`/`[]=` element the access's write form applies — `[]` for a pure
+    /// `a[i]` read, `[]=` for `a[i] = v` (`hasRead: false`, resolver.dart
+    /// :1504 via `resolveForWrite`), both for `a[i] += v`/`++a[i]`/`a[i]++`
+    /// (`hasRead: true`, the compound `resolveForWrite`). The staged
+    /// operand's static type and span ride `index_arg_faces`; the write
+    /// form is the operator row's finalized `write_op`. A receiver naming
+    /// no container, an operator with an empty formal list, or an
+    /// undecidable pair stays silent (the under-report direction — the
+    /// dynamic receiver upstream resolves nothing either).
+    pub(crate) fn check_index_argument(&mut self, bracket_open: u32, write: Option<OpWrite>) {
+        let Some(face) = self.index_arg_faces.remove(&bracket_open) else {
+            return;
+        };
+        let Some(recv) = face.recv else {
+            return;
+        };
+        let (read, write_op) = match write {
+            // `=`: only the write element's formal applies
+            // (`hasRead: false`).
+            Some(OpWrite::Assign) => (None, Some(self.intern("[]="))),
+            // `+=`/`++`/`--`: the read and write elements both apply
+            // (`hasRead: true`).
+            Some(OpWrite::Compound) => (Some(self.intern("[]")), Some(self.intern("[]="))),
+            // A pure read: only the `[]` element's formal.
+            None => (Some(self.intern("[]")), None),
+        };
+        // The flow read's re-bound or promoted face outranks the staged
+        // snapshot — the same override the call-site walk applies (the
+        // oracle checks the argument's static type at the send).
+        let flow_ty = self
+            .rebound_read_face(face.index_range)
+            .or_else(|| self.read_type_at(face.index_range))
+            .unwrap_or(face.index_ty);
+        for spelling in [read, write_op].into_iter().flatten() {
+            let Some(param_ty) = self.resolved_member(recv, spelling).and_then(|entry| {
+                entry
+                    .formals
+                    .as_ref()
+                    .and_then(|formals| formals.positional.first().map(|formal| formal.ty))
+            }) else {
+                continue;
+            };
+            if self.argument_verdict(flow_ty, param_ty, face.literal) == Some(false) {
+                let from_text = self.ty_display(flow_ty);
+                let to_text = self.ty_display(param_ty);
+                let message = SemanticCode::ArgumentTypeNotAssignable
+                    .message3(&from_text, &to_text, "");
+                self.emit_message_with_correction(
+                    SemanticCode::ArgumentTypeNotAssignable,
+                    face.index_range,
+                    message,
+                );
+            }
+        }
+    }
+
+    /// The annotation's argument walk (#2937, upstream Dart SDK source,
+    /// resolver.dart:1887 — `visitAnnotation` runs
+    /// `checkForArgumentTypesNotAssignableInList` on the resolved
+    /// constructor's formals right after `_annotationResolver.resolve`):
+    /// a metadata creation's invoke slot carries no callee link, so the
+    /// generic `close_arguments` walk never fires — the annotation's own
+    /// resolved constructor pairs the argument list instead. `annotation`
+    /// is the pending entry's joined spelling (`A`, `A.named`, `p.A.named`,
+    /// `A<int>.named`): the class segment keys the container's
+    /// `ctor_formals` table (`fromInt` selector or the unnamed face), the
+    /// per-argument check runs `argument_verdict` at each argument's span
+    /// exactly like the call-site walk. The const-annotation pair
+    /// (`const_constructor_param_type_mismatch` + this code, the enum arm's
+    /// dual) precedes the assignability row on a `const` constructor — the
+    /// oracle's constant evaluator runs the invocation's argument check
+    /// before the general assignability verifier reports the same span.
+    pub(crate) fn check_annotation_arguments(
+        &mut self,
+        annotation: StringId,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+    ) {
+        let text = self.strings.resolve(annotation).to_string();
+        // The class segment is everything before the constructor selector's
+        // last `.`; a generic head (`A<int>.named`) keeps its written
+        // arguments, a plain `A.named` splits on the selector dot. The
+        // unnamed face (`@A(arg)`) selects the container's own spelling.
+        let (class_text, selector) = match text.rsplit_once('.') {
+            Some((class, sel)) => (class, Some(sel)),
+            None => (text.as_str(), None),
+        };
+        // The resolution head drops the written type-argument group
+        // (`A<int>` resolves `A`) — the container's formal table keys on
+        // the bare spelling.
+        let head = class_text.split('<').next().unwrap_or(class_text);
+        let head_id = self.intern(head);
+        // The bare spelling resolves through the diagnosing scope; the
+        // dot-joined `p.A` head resolves through its import prefix's table
+        // (the same pair `resolve_receiver_row`'s operator faces consult).
+        let Some((container, owner)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head_id,
+        )
+        .or_else(|| {
+            resolve_joined_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.strings,
+                head_id,
+            )
+        }) else {
+            return;
+        };
+        // `ctor_formals` keys on the selector for a named face and on the
+        // container's own name for the unnamed face (the collector's
+        // `selector.unwrap_or(key)` convention). The unnamed face's key is
+        // the container's LEAF spelling (`A` of `p.A`), never the joined
+        // prefix head — `prefixed_container` resolved through the prefix,
+        // but the table keys on the declaring name itself.
+        let leaf = head.rsplit('.').next().unwrap_or(head);
+        let key = selector.map_or_else(|| self.intern(leaf), |sel| self.intern(sel));
+        let Some(formals) = container.ctor_formals.get(&key) else {
+            return;
+        };
+        let mut formals = (**formals).clone();
+        self.project_formals(owner, &mut formals);
+        let const_ctor = container.has_const_constructor;
+        // The per-argument walk pairs positionals by index, named by
+        // spelling — the same shape `check_enum_const_arguments` runs (no
+        // `undefined_named_parameter` here: the oracle's annotation walk
+        // resolves arguments against the constructor's formals and the
+        // label miss is the metadata arity face's own code).
+        let mut positional_index = 0usize;
+        for (name, ty, literal, range) in args {
+            let formal = if let Some(n) = name {
+                match self.named_formal_for(&formals, *n) {
+                    Some(formal) => formal,
+                    None => continue,
+                }
+            } else {
+                let formal = formals.positional.get(positional_index);
+                positional_index += 1;
+                match formal {
+                    Some(formal) => formal,
+                    None => continue,
+                }
+            };
+            let flow_ty = self
+                .rebound_read_face(*range)
+                .or_else(|| self.read_type_at(*range))
+                .unwrap_or(*ty);
+            if self.argument_verdict(flow_ty, formal.ty, *literal) == Some(false) {
+                let from_text = self.ty_display(flow_ty);
+                let to_text = self.ty_display(formal.ty);
+                if const_ctor {
+                    let message = SemanticCode::ConstConstructorParamTypeMismatch
+                        .message(&from_text, &to_text);
+                    self.emit_message_with_correction(
+                        SemanticCode::ConstConstructorParamTypeMismatch,
+                        *range,
+                        message,
+                    );
+                }
+                let message = SemanticCode::ArgumentTypeNotAssignable
+                    .message3(&from_text, &to_text, "");
+                self.emit_message_with_correction(
+                    SemanticCode::ArgumentTypeNotAssignable,
+                    *range,
+                    message,
+                );
+            }
+        }
+        // The count and required faces mirror `resolveArgumentsToParameters`
+        // (resolver.dart:4978-5009 — the deficit/surplus blocks are
+        // unconditional once a parameter element resolved) and
+        // `_checkRequired` (required_parameters_verifier.dart:134-218 —
+        // `visitAnnotation` runs it with `errorEntity` on the constructor
+        // identifier). A metadata invocation carries no callee row, so the
+        // generic `check_arguments` never saw this argument list; the
+        // resolved formals above are the only verdict source. The anchor is
+        // the first argument's span, or the annotation head's (reconstructed
+        // from the written text's start) when the list is empty — position
+        // is load-bearing only for the (severity, code, file) key.
+        let given = args
+            .iter()
+            .take_while(|(name, ..)| name.is_none())
+            .count();
+        let required = formals.positional.iter().filter(|f| f.required).count();
+        let anchor = args
+            .iter()
+            .map(|(.., range)| *range)
+            .next()
+            .unwrap_or(SourceRange {
+                offset: 0,
+                length: 0,
+            });
+        if given < required {
+            let ctor_text = selector.map_or_else(
+                || head.to_string(),
+                |sel| format!("{head}.{sel}"),
+            );
+            let (shape, a0, a1) = if required == 1 {
+                (
+                    ArgCountShape::NameSingular,
+                    ctor_text.clone(),
+                    String::new(),
+                )
+            } else {
+                (
+                    ArgCountShape::NamePlural,
+                    required.to_string(),
+                    given.to_string(),
+                )
+            };
+            let code = SemanticCode::NotEnoughPositionalArguments(shape);
+            let message = match shape {
+                ArgCountShape::NamePlural => code.message3(&a0, &a1, &ctor_text),
+                _ => code.message(&a0, &a1),
+            };
+            self.emit_message_with_correction(code, anchor, message);
+        } else if given > formals.positional.len() {
+            let capacity = formals.positional.len();
+            let code = SemanticCode::ExtraPositionalArguments;
+            let message = code.message(&capacity.to_string(), &given.to_string());
+            self.emit_message_with_correction(code, anchor, message);
+        }
+        for formal in formals.named.iter().filter(|f| f.required) {
+            let covered = args.iter().any(|(name, ..)| {
+                name.is_some_and(|n| {
+                    self.named_formal_for(&formals, n)
+                        .is_some_and(|m| m.name == formal.name)
+                })
+            });
+            if covered {
+                continue;
+            }
+            let text = self
+                .strings
+                .resolve(self.formal_public_name(formal.name))
+                .to_string();
+            self.emit(
+                SemanticCode::MissingRequiredArgument,
+                anchor,
+                &text,
+                "",
+            );
         }
     }
 
@@ -4881,6 +5353,363 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The redirecting-constructor invocation's callee
+    /// (`this(...)`/`this.named(...)` in an initializer list): the same
+    /// two geometries as [`Engine::super_invocation_callee`] — an unmerged
+    /// member placeholder over the bare `this` keyword receiver for the
+    /// selector shape, or the keyword row the group open latched as
+    /// `callee_row` for the bare shape. Returns `(enclosing container,
+    /// selector, bare)`; `this.new(...)` normalizes to the unnamed face.
+    fn redirecting_invocation_callee(
+        &self,
+        level: &ArgLevel,
+    ) -> Option<(StringId, Option<StringId>, bool)> {
+        let callee = self.invokes.last().and_then(|slot| *slot);
+        if let Some(index) = callee
+            && let Some(row) = self.rows.get(index)
+            && row.qualified
+            && let RowShape::Bare(BareInfo::Plain { .. }) = row.shape
+            && let Some(below) = index.checked_sub(1).and_then(|i| self.rows.get(i))
+            && let RowShape::Receiver(Receiver::This { container, .. }) = below.shape
+            && below.name == self.intern("")
+        {
+            let selector = (row.name != self.intern("new")).then_some(row.name);
+            return Some((container, selector, false));
+        }
+        let index = level.callee_row?;
+        let row = self.rows.get(index)?;
+        match &row.shape {
+            RowShape::Receiver(Receiver::This { container, .. })
+                if row.name == self.intern("") =>
+            {
+                Some((*container, None, true))
+            }
+            _ => None,
+        }
+    }
+
+    /// The redirecting-constructor invocation's argument faces
+    /// (`visitRedirectingConstructorInvocation`, upstream Dart SDK source,
+    /// resolver.dart:4057-4085 — `resolveInvocation` pairs the arguments
+    /// against the resolved same-class constructor's formals, and
+    /// `RequiredParametersVerifier.visitRedirectingConstructorInvocation`
+    //  checks the required-named coverage): the count faces
+    /// (`extra_positional_arguments[_could_be_named]` /
+    /// `not_enough_positional_arguments`), the required-named misses, and
+    /// `undefined_named_parameter` at the label — the same decision order
+    /// as [`Engine::check_super_invocation_arguments`] minus the superclass
+    /// walk (a redirecting target lives in the enclosing container, keyed
+    /// by the selector or the container's own name for the unnamed face).
+    /// An unresolved selector defers to `undefined_constructor_in_initializer`.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    pub(crate) fn check_redirecting_invocation_arguments(
+        &mut self,
+        level: &ArgLevel,
+        positional: u16,
+        close: SourceRange,
+        container: StringId,
+        selector: Option<StringId>,
+    ) {
+        let key = selector
+            .filter(|name| *name != self.intern("new"))
+            .unwrap_or(container);
+        let Some(formals) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+            .and_then(|c| c.ctor_formals.get(&key))
+            .map(|f| (**f).clone())
+        else {
+            // No such same-class constructor — the existence face owns the
+            // report (upstream `undefined_constructor_in_initializer`).
+            return;
+        };
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        let Some(given) = positional.checked_sub(named) else {
+            return;
+        };
+        let given = usize::from(given);
+        let required = formals.positional.iter().filter(|f| f.required).count();
+        let capacity = formals.positional.len();
+        if given < required {
+            let anchor = level
+                .args
+                .iter()
+                .filter(|(name, .., range)| name.is_none() && range.length > 0)
+                .next_back()
+                .map(|(.., range)| SourceRange {
+                    offset: range.offset + range.length,
+                    length: 1,
+                })
+                .or(level.first_label)
+                .unwrap_or(close);
+            // The name face carries the redirecting target's display —
+            // upstream spells `'{returnType}.new'` for the unnamed face and
+            // the selector for the named one (resolver.dart
+            // `_reportNotEnoughPositionalArguments` :5043-5050).
+            let mut ctor_text = self.strings.resolve(container).to_string();
+            if let Some(selector) = selector {
+                ctor_text.push('.');
+                ctor_text.push_str(self.strings.resolve(selector));
+            } else {
+                ctor_text.push_str(".new");
+            }
+            let (shape, a0, a1) = if required == 1 {
+                (
+                    ArgCountShape::NameSingular,
+                    ctor_text.clone(),
+                    String::new(),
+                )
+            } else {
+                (
+                    ArgCountShape::NamePlural,
+                    required.to_string(),
+                    given.to_string(),
+                )
+            };
+            let code = SemanticCode::NotEnoughPositionalArguments(shape);
+            let message = match shape {
+                ArgCountShape::NamePlural => code.message3(&a0, &a1, &ctor_text),
+                _ => code.message(&a0, &a1),
+            };
+            self.emit_message_with_correction(code, anchor, message);
+        } else if given > capacity {
+            let distinct = level
+                .args
+                .iter()
+                .filter_map(|(name, ..)| *name)
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len();
+            let code = if formals.named.len() > distinct {
+                SemanticCode::ExtraPositionalArgumentsCouldBeNamed
+            } else {
+                SemanticCode::ExtraPositionalArguments
+            };
+            let mut seen = 0usize;
+            let mut surplus = None;
+            for (name, .., range) in &level.args {
+                if name.is_some() {
+                    continue;
+                }
+                seen += 1;
+                if seen == capacity + 1 && range.length > 0 {
+                    surplus = Some(*range);
+                }
+            }
+            let anchor = (seen == given)
+                .then_some(surplus)
+                .flatten()
+                .unwrap_or(close);
+            let message = code.message(&capacity.to_string(), &given.to_string());
+            self.emit_message_with_correction(code, anchor, message);
+        }
+        // The required-named misses emit in formal-declaration order at the
+        // invocation node — upstream `errorEntity` is the invocation itself.
+        let required_anchor = level
+            .callee_row
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.range)
+            .unwrap_or(close);
+        for formal in formals.named.iter().filter(|f| f.required) {
+            let covered = level.args.iter().any(|(name, ..)| {
+                name.is_some_and(|n| {
+                    self.named_formal_for(&formals, n)
+                        .is_some_and(|m| m.name == formal.name)
+                })
+            });
+            if covered {
+                continue;
+            }
+            let text = self
+                .strings
+                .resolve(self.formal_public_name(formal.name))
+                .to_string();
+            self.emit(
+                SemanticCode::MissingRequiredArgument,
+                required_anchor,
+                &text,
+                "",
+            );
+        }
+        // The unknown named parameter anchors at its label — the same
+        // geometry the super walk applies (the oracle resolves the named
+        // table at the same `resolveArgumentsToParameters` pass).
+        for (name, .., range) in &level.args {
+            let Some(n) = name else {
+                continue;
+            };
+            if self.named_formal_for(&formals, *n).is_none() {
+                let text = self.strings.resolve(*n).to_string();
+                let label = level
+                    .named_labels
+                    .iter()
+                    .find(|(label, _)| label == n)
+                    .map(|(_, range)| *range)
+                    .unwrap_or(*range);
+                self.emit(SemanticCode::UndefinedNamedParameter, label, &text, "");
+            }
+        }
+    }
+
+    /// The explicit-keyword unnamed creation's argument faces
+    /// (`const A(...)`, `new A(...)`): the `unnamed_head` latch carries the
+    /// resolved class head; its `ctor_formals` unnamed face keys on the
+    /// container's own name. Upstream `visitInstanceCreationExpression` →
+    /// `resolveArgumentsToParameters` (resolver.dart:4978-5009) runs the
+    /// deficit/surplus verdicts and the required-named walk
+    /// (`_checkRequired`, required_parameters_verifier.dart:134-218) on the
+    /// resolved constructor — the same geometry
+    /// [`Engine::check_redirecting_invocation_arguments`] applies, minus
+    /// the redirecting target's `.new` name face.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    pub(crate) fn check_explicit_creation_arguments(
+        &mut self,
+        level: &ArgLevel,
+        positional: u16,
+        close: SourceRange,
+        head: StringId,
+    ) {
+        let Some((container, owner)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        ) else {
+            return;
+        };
+        let Some(formals) = container
+            .ctor_formals
+            .get(&head)
+            .map(|f| (**f).clone())
+        else {
+            return;
+        };
+        let mut formals = formals;
+        self.project_formals(owner, &mut formals);
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        let Some(given) = positional.checked_sub(named) else {
+            return;
+        };
+        let given = usize::from(given);
+        let required = formals.positional.iter().filter(|f| f.required).count();
+        let capacity = formals.positional.len();
+        if given < required {
+            let anchor = level
+                .args
+                .iter()
+                .filter(|(name, .., range)| name.is_none() && range.length > 0)
+                .next_back()
+                .map(|(.., range)| SourceRange {
+                    offset: range.offset + range.length,
+                    length: 1,
+                })
+                .or(level.first_label)
+                .unwrap_or(close);
+            let mut ctor_text = self.strings.resolve(head).to_string();
+            ctor_text.push_str(".new");
+            let (shape, a0, a1) = if required == 1 {
+                (
+                    ArgCountShape::NameSingular,
+                    ctor_text.clone(),
+                    String::new(),
+                )
+            } else {
+                (
+                    ArgCountShape::NamePlural,
+                    required.to_string(),
+                    given.to_string(),
+                )
+            };
+            let code = SemanticCode::NotEnoughPositionalArguments(shape);
+            let message = match shape {
+                ArgCountShape::NamePlural => code.message3(&a0, &a1, &ctor_text),
+                _ => code.message(&a0, &a1),
+            };
+            self.emit_message_with_correction(code, anchor, message);
+        } else if given > capacity {
+            let distinct = level
+                .args
+                .iter()
+                .filter_map(|(name, ..)| *name)
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len();
+            let code = if formals.named.len() > distinct {
+                SemanticCode::ExtraPositionalArgumentsCouldBeNamed
+            } else {
+                SemanticCode::ExtraPositionalArguments
+            };
+            let mut seen = 0usize;
+            let mut surplus = None;
+            for (name, .., range) in &level.args {
+                if name.is_some() {
+                    continue;
+                }
+                seen += 1;
+                if seen == capacity + 1 && range.length > 0 {
+                    surplus = Some(*range);
+                }
+            }
+            let anchor = (seen == given)
+                .then_some(surplus)
+                .flatten()
+                .unwrap_or(close);
+            let message = code.message(&capacity.to_string(), &given.to_string());
+            self.emit_message_with_correction(code, anchor, message);
+        }
+        let required_anchor = level
+            .args
+            .iter()
+            .map(|(.., range)| *range)
+            .next()
+            .unwrap_or(close);
+        for formal in formals.named.iter().filter(|f| f.required) {
+            let covered = level.args.iter().any(|(name, ..)| {
+                name.is_some_and(|n| {
+                    self.named_formal_for(&formals, n)
+                        .is_some_and(|m| m.name == formal.name)
+                })
+            });
+            if covered {
+                continue;
+            }
+            let text = self
+                .strings
+                .resolve(self.formal_public_name(formal.name))
+                .to_string();
+            self.emit(
+                SemanticCode::MissingRequiredArgument,
+                required_anchor,
+                &text,
+                "",
+            );
+        }
+        for (name, .., range) in &level.args {
+            let Some(n) = name else {
+                continue;
+            };
+            if self.named_formal_for(&formals, *n).is_none() {
+                let text = self.strings.resolve(*n).to_string();
+                let label = level
+                    .named_labels
+                    .iter()
+                    .find(|(label, _)| label == n)
+                    .map(|(_, range)| *range)
+                    .unwrap_or(*range);
+                self.emit(SemanticCode::UndefinedNamedParameter, label, &text, "");
+            }
+        }
+    }
+
     /// The explicit super-constructor invocation's argument faces
     /// (`constructor_invocation_resolver.dart` resolves the
     /// `SuperConstructorInvocation`, then `resolveArgumentsToParameters`
@@ -4912,7 +5741,7 @@ impl<'a> Engine<'a> {
             .get(self.file)
             .and_then(|f| f.container(container))
             .and_then(|c| c.superclass);
-        let (mut formals, super_container, resolved_super) = match superclass {
+        let (formals, super_container, resolved_super) = match superclass {
             Some(superclass) => {
                 match resolve_container(
                     self.graph,
@@ -5092,26 +5921,25 @@ impl<'a> Engine<'a> {
                 .count();
         }
         // The enclosing constructor's `super.` formals forward into the
-        // invocation: the surplus count adds the forwarded positionals
-        // (probed: `G(super.x) : super(1, 2, 3)` against `B(int x, int y)`
-        // reports "2 expected, but 4 found"), and the deficit face stays
-        // silent whenever any super formal exists — the coverage question
-        // belongs to the `super_formal_parameter_without_associated_*`
-        // faces (probed: `D(super.x) : super(1)` against `B(int x, int y)`
-        // reports that face alone, and `D({required super.z}) :
-        // super.named()` against `B.named(int x)` no deficit).
+        // invocation: the count adds the forwarded positionals, then the
+        // deficit/surplus verdicts run unconditionally
+        // (`verifySuperFormalParameters` feeds `positionalArgumentCount`,
+        // then `positionalArgumentCount < requiredParameterCount` decides —
+        // upstream Dart SDK source, resolver.dart
+        // `resolveArgumentsToParameters` :4930-4940/:4978-4991; probed:
+        // `G(super.x) : super(1, 2, 3)` against `B(int x, int y)` reports
+        // "2 expected, but 4 found", `D(super.x) : super(1)` reports no
+        // deficit because 1+1 covers 2, and `B(super.p1) : super()`
+        // against `A(int p1, int p2)` reports "2 expected, but 1 found").
         let open_site = self.open_ctor_site;
-        let super_formals_here: Vec<bool> = self
+        let super_formals_here: Vec<(bool, StringId)> = self
             .pending_super_formals
             .iter()
             .filter(|(owner, ..)| open_site.is_some() && *owner == open_site)
-            .map(|(_, _, named, ..)| *named)
+            .map(|(_, _, named, name, ..)| (*named, *name))
             .collect();
-        let has_super_formals = !super_formals_here.is_empty();
-        if has_super_formals {
-            given += super_formals_here.iter().filter(|named| !**named).count();
-        }
-        if given < required && !has_super_formals {
+        given += super_formals_here.iter().filter(|(named, _)| !*named).count();
+        if given < required {
             let anchor = level
                 .args
                 .iter()
@@ -5191,6 +6019,47 @@ impl<'a> Engine<'a> {
                 .unwrap_or(close);
             let message = code.message(&capacity.to_string(), &given.to_string());
             self.emit_message_with_correction(code, anchor, message);
+        }
+        // The required-named misses emit in formal-declaration order at the
+        // invocation's callee entity (`RequiredParametersVerifier._check`,
+        // upstream Dart SDK source, required_parameters_verifier.dart
+        // :122-132/:144-166) — a `required` named formal with no same-named
+        // argument reports `missing_required_argument`. Coverage mirrors
+        // `_containsNamedExpression`'s second walk (:197-218): a named
+        // `super.x` formal of the enclosing constructor stands in for the
+        // same-named argument.
+        let missing_named: Vec<StringId> = formals
+            .named
+            .iter()
+            .filter(|f| f.required)
+            .filter(|f| {
+                !level.args.iter().any(|(name, ..)| {
+                    name.is_some_and(|n| {
+                        self.named_formal_for(&formals, n)
+                            .is_some_and(|m| m.name == f.name)
+                    })
+                })
+            })
+            .filter(|f| {
+                !super_formals_here
+                    .iter()
+                    .any(|(named, name)| *named && *name == f.name)
+            })
+            .map(|f| self.formal_public_name(f.name))
+            .collect();
+        let required_anchor = level
+            .callee_row
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.range)
+            .unwrap_or(close);
+        for name in missing_named {
+            let text = self.strings.resolve(name).to_string();
+            self.emit(
+                SemanticCode::MissingRequiredArgument,
+                required_anchor,
+                &text,
+                "",
+            );
         }
         let mut positional_index = 0usize;
         for (name, ty, literal, range) in &level.args {
@@ -5867,6 +6736,89 @@ impl<'a> Engine<'a> {
         resolve_container(self.graph, self.namespaces, self.index, scope, owner, head).is_none()
     }
 
+    /// The created container's instantiation OF `target`, expressed over the
+    /// container's own parameters — `B<S, T> extends A<T, S>` asks
+    /// `super_instantiation(B, A)` → `[T, S]` (a `B<a, b>` IS an `A<b, a>`).
+    /// The downward inference the official solver runs for an instance
+    /// creation whose context type is a SUPERINTERFACE of the created class
+    /// (`A<int, String> x = new B(3, "hello")` solves `B<String, int>` —
+    /// `_inferConstructors`'s `asInstanceOf` climb, type_analyzer.dart's
+    /// `constructorsToInfer`/`inferrer.constrainArguments`).
+    ///
+    /// The walk threads one substitution hop at a time through
+    /// [`Self::clause_instantiation`]'s recorded clause arguments: the
+    /// current head's own written clause `S<sup_args>` substitutes the
+    /// current instantiation into `sup_args` (the clause arguments spell the
+    /// CURRENT head's parameters — `B`'s own `S`/`T`, not the subclass's),
+    /// yielding `target`'s face over the ORIGINAL container's parameters.
+    /// A missing clause, a non-`Ty::Named` clause argument (the capture
+    /// records only named heads), a cycle, or the 16-hop cap all answer
+    /// `None` — the under-report direction.
+    fn super_instantiation(&self, container: StringId, target: StringId) -> Option<Vec<Ty>> {
+        if container == target {
+            return None;
+        }
+        let file = self.index.get(self.file)?;
+        let params_of = |head: StringId| {
+            self.bounds
+                .container_params(head)
+                .map(|capture| {
+                    capture
+                        .iter()
+                        .map(|(name, _, _)| *name)
+                        .collect::<Vec<StringId>>()
+                })
+                .filter(|names| !names.is_empty())
+        };
+        // The identity instantiation `container<P…>` — each hop rewrites it
+        // through the current head's super-clause.
+        let mut current_head = container;
+        let mut current_args: Vec<Ty> = params_of(container)?
+            .iter()
+            .map(|name| Ty::named(*name))
+            .collect();
+        for _ in 0..16 {
+            let superclass = file.container(current_head)?.superclass?;
+            let clause = self.clause_instantiation(current_head, superclass)?;
+            // The clause capture stores the whole `S<args>` Named as its
+            // single entry (overrides.rs's `scan_clause_type`); a bare
+            // `extends S` stores the unparameterized head.
+            let clause_args = match clause.as_slice() {
+                [Ty::Named { args, .. }] if *args != ArgListId::EMPTY => {
+                    self.boundary.args.borrow().get(*args).to_vec()
+                }
+                _ => Vec::new(),
+            };
+            // Substitute the CURRENT instantiation into the clause
+            // arguments: they spell `current_head`'s parameters, whose
+            // solutions the current map carries.
+            let super_params = params_of(current_head)?;
+            let map: Vec<(StringId, Ty)> = super_params
+                .iter()
+                .copied()
+                .zip(current_args.iter().copied())
+                .collect();
+            let mut next_args = Vec::with_capacity(clause_args.len());
+            for arg in &clause_args {
+                next_args.push(self.subst_params(*arg, &map)?);
+            }
+            current_head = superclass;
+            current_args = next_args;
+            if current_head == target {
+                return Some(current_args);
+            }
+            // A bare `extends S` (no written arguments) instantiates the
+            // super face to its own parameters' greatest closure — the
+            // climb's next hop substitutes nothing useful; keep the
+            // walk honest by refusing to continue on a parameter-ful head
+            // whose clause gave no arguments.
+            if clause_args.is_empty() && params_of(superclass).is_some() {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
     /// the assignability walk (`extra_positional_arguments[_could_be_named]`
@@ -5897,12 +6849,18 @@ impl<'a> Engine<'a> {
         // walk — its argument faces run against the resolved super
         // constructor's formals here, and the generic walk below keeps its
         // existing (silent) posture.
-        if self.initializer_depth > 0
-            && let Some((container, selector, bare)) = self.super_invocation_callee(&level)
-        {
-            self.check_super_invocation_arguments(
-                &level, positional, close, container, selector, bare,
-            );
+        if self.initializer_depth > 0 {
+            if let Some((container, selector, bare)) = self.super_invocation_callee(&level) {
+                self.check_super_invocation_arguments(
+                    &level, positional, close, container, selector, bare,
+                );
+            } else if let Some((container, selector, _bare)) =
+                self.redirecting_invocation_callee(&level)
+            {
+                self.check_redirecting_invocation_arguments(
+                    &level, positional, close, container, selector,
+                );
+            }
         }
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             // A dot-preceded latch head is a named selector (`C.named(`),
@@ -5916,6 +6874,23 @@ impl<'a> Engine<'a> {
             if dot_preceded {
                 self.report_alias_selector_face();
             } else if !self.report_alias_invocation_of_non_function() {
+                // The explicit-keyword unnamed creation (`const A()`,
+                // `new A()`): no callee row, so the generic walk never
+                // saw the argument list — its own count faces run here
+                // before the miss handler (upstream
+                // `visitInstanceCreationExpression` →
+                // `resolveArgumentsToParameters`).
+                if let Some((head, head_range)) = level.unnamed_head
+                    // A `const p.C(...)` head resolves through the import
+                    // prefix — `resolve_container` on the bare spelling
+                    // would read a same-named local class's formals; the
+                    // prefixed fold's own face handles it.
+                    && self
+                        .written_prefix_before(head_range.offset)
+                        .is_none()
+                {
+                    self.check_explicit_creation_arguments(&level, positional, close, head);
+                }
                 self.report_bare_creation_miss();
             }
             return;
@@ -6187,6 +7162,10 @@ impl<'a> Engine<'a> {
         // return type (`predicate(result)` reads the field's callable
         // return, never `Parser<String>`).
         let mut member_owns_callee = false;
+        // The ctor-use edge the named-selector send arms (#2931): latched
+        // inside the `Receiver::Container` arm — the callee-row borrow
+        // ends with the `formals` match, so the edge publishes just after.
+        let mut ctor_use: Option<(StringId, StringId, SourceRange)> = None;
         let formals: Option<Formals> = match &row.shape {
             // A top-level function's declared formals — or the enclosing
             // container's own method under the implicit-this face (#1351):
@@ -6437,6 +7416,28 @@ impl<'a> Engine<'a> {
                             name,
                             kind: ContainerKind::Class,
                         } => {
+                            // The ctor-use edge (#2931) arms only over the
+                            // class-reference receiver (`B.named(`): a
+                            // folded `B()` below the callee spells a member
+                            // call on the created instance, never the
+                            // constructor face — `Created` stays out.
+                            if let Receiver::Container { .. } = recv {
+                                ctor_use = callee.checked_sub(1).and_then(|index| {
+                                    self.rows.get(index).map(|below| {
+                                        (
+                                            name,
+                                            row.name,
+                                            SourceRange {
+                                                offset: below.range.offset,
+                                                length: row
+                                                    .range
+                                                    .end()
+                                                    .saturating_sub(below.range.offset),
+                                            },
+                                        )
+                                    })
+                                });
+                            }
                             // The factory lane joins the plain table's
                             // lookup (a redirecting factory's own written
                             // formals), but never for a closure-carrying
@@ -6467,7 +7468,7 @@ impl<'a> Engine<'a> {
             // every other foreign creation keeps the under-report.
             RowShape::Bare(BareInfo::Container {
                 name,
-                kind: ContainerKind::Class,
+                kind: ContainerKind::Class | ContainerKind::ExtensionType,
             }) if !row.qualified => {
                 let formals = self
                     .index
@@ -6492,6 +7493,13 @@ impl<'a> Engine<'a> {
             }
             _ => None,
         };
+        // The ctor-use edge publishes here (#2931): the callee-row borrow
+        // ended with the `formals` match, and the existence gate inside
+        // `note_ctor_use` keeps a selector that is no constructor silent
+        // (the `undefined_method` family owns that report upstream).
+        if let Some((class, selector, span)) = ctor_use {
+            self.note_ctor_use(class, selector, span);
+        }
         // A nullable receiver whose member a nullable-`on` extension
         // declares resolves through the extension, never the instance
         // member (`extension E on C? { m }` claims `C? x; x.m(a)` — the
@@ -6532,7 +7540,7 @@ impl<'a> Engine<'a> {
         // substitution and the result-type write below (the call method's
         // own type parameters stand in for the element model's, and the
         // call's declared return becomes the send's return face).
-        let mut implicit_call: Option<(Ty, Box<[StringId]>)> = None;
+        let mut implicit_call: Option<(Ty, Box<[(StringId, Option<Ty>)]>)> = None;
         let formals = formals.or_else(|| {
             let row = self.rows.get(callee)?;
             let ty = self.receiver_static_ty(row);
@@ -6727,6 +7735,15 @@ impl<'a> Engine<'a> {
             .get(&callee_spelling)
             .cloned()
             .filter(|params| !params.is_empty());
+        // The invocation-site bounds verdict's parameter table — the
+        // DECLARED bounds the callee's own element carries, held apart
+        // from `exec_params` (the inference seeds, whose `own_bound` arm
+        // answers `None` outside its context-free corner by design). The
+        // `exec_bounds` window and every container/alias/signature arm
+        // below already spell `(name, declared bound)` — those clone
+        // straight in; the member/implicit-call arms fill it from their
+        // own declared facts.
+        let mut decl_bounds: Option<Box<[(StringId, Option<Ty>)]>> = exec_params.clone();
         // #1351: the creation faces' parameters come from the container's
         // bounds capture (its type parameters with their written bounds).
         if exec_params.is_none()
@@ -6734,14 +7751,15 @@ impl<'a> Engine<'a> {
             && let Some(params) = self.bounds.container_params(container)
             && !params.is_empty()
         {
-            exec_params = Some(
-                params
-                    .iter()
-                    .map(|(param, bound, _)| {
-                        (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
-                    })
-                    .collect(),
-            );
+            let pairs: Vec<(StringId, Option<Ty>)> = params
+                .iter()
+                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
+                .collect();
+            // The instance-creation verdict (`checkInstanceCreation`,
+            // type_arguments_verifier.dart:236-240): `C<String>(x)` over
+            // `C<T extends num>` — the class's own bounds.
+            decl_bounds = Some(pairs.iter().copied().collect());
+            exec_params = Some(pairs.into());
         }
         // The bounds capture registers at the container's close, so a
         // creation whose callee is declared LATER in the file (the
@@ -6768,14 +7786,12 @@ impl<'a> Engine<'a> {
             && let Some((params, _)) =
                 creation_container.and_then(|head| self.bounds.alias_named_shape(head))
         {
-            exec_params = Some(
-                params
-                    .iter()
-                    .map(|(param, bound, _)| {
-                        (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
-                    })
-                    .collect(),
-            );
+            let pairs: Vec<(StringId, Option<Ty>)> = params
+                .iter()
+                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
+                .collect();
+            decl_bounds = Some(pairs.iter().copied().collect());
+            exec_params = Some(pairs.into());
         }
         // The function-typed variable's written signature (the captured
         // `T Function<T>(T)` annotation): its declared type parameters
@@ -6786,6 +7802,32 @@ impl<'a> Engine<'a> {
             && !sig.params.is_empty()
         {
             exec_params = Some(sig.params.iter().copied().collect());
+            // The signature's `params` already pair the declared bounds —
+            // `fnVar<String>(x)` over `T Function<T extends num>(T)` is
+            // the function-expression-invocation verdict.
+            decl_bounds = Some(sig.params.iter().copied().collect());
+        }
+        // A function-typed value invoked with explicit type arguments
+        // (`fn<String>(x)` over `fn: T Function<T extends num>(T)`, or a
+        // parenthesized generic literal `(<T>() {})<String>()`): the
+        // callee row's `Ty::Function` shape carries the declared
+        // `type_params_named` — the function-expression-invocation
+        // verdict (`checkFunctionExpressionInvocation`,
+        // type_arguments_verifier.dart:193-196) — which neither the
+        // element model's `exec_bounds` window (no declaration) nor the
+        // inference seeds answer.
+        if decl_bounds.is_none()
+            && let Ty::Function { shape, .. } = row.ty
+        {
+            let named = self
+                .boundary
+                .pool()
+                .function_shape(shape)
+                .type_params_named
+                .clone();
+            if !named.is_empty() {
+                decl_bounds = Some(named);
+            }
         }
         // The implicit-`call` face's parameters (the call method's own
         // type parameters — `R call<R>(R x)` solves `R` like any generic
@@ -6795,7 +7837,13 @@ impl<'a> Engine<'a> {
             && let Some((_, params)) = &implicit_call
             && !params.is_empty()
         {
-            exec_params = Some(params.iter().map(|name| (*name, None)).collect());
+            exec_params = Some(params.iter().map(|(param, _)| (*param, None)).collect());
+            // The call method's declared bounds answer the
+            // function-expression-invocation verdict (`checkFunction-
+            // ExpressionInvocation`, upstream Dart SDK source,
+            // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
+            // :193-196 — `c<int>()` resolves `call`'s own parameters).
+            decl_bounds = Some(params.iter().copied().collect());
         }
         // The member send's inference parameters (`reader.readEnum(...)`,
         // `this.adopt(...)`, `box.get()`): the found method's own
@@ -6807,10 +7855,28 @@ impl<'a> Engine<'a> {
         let mut receiver_seeds: Vec<(StringId, Ty)> = Vec::new();
         if exec_params.is_none()
             && let Some(recv) = send_recv
-            && let Some((params, seeds)) = self.member_send_params(&recv, row.name)
+            && let Some((params, seeds, bounds)) = self.member_send_params(&recv, row.name)
         {
             receiver_seeds = seeds;
             exec_params = Some(params);
+            // The method's declared bounds are the method-invocation
+            // verdict's table (`checkMethodInvocation`,
+            // type_arguments_verifier.dart:236-240): `reader.readEnum<
+            // String>(...)` checks `String` against the method's own
+            // `T extends Enum` bound — the inference seeds' gated
+            // `own_bound` never answers it.
+            decl_bounds = Some(bounds);
+        }
+        // The member send's bounds verdict never rides `exec_bounds`: a
+        // same-spelled top-level `m<T>`'s window is not the method's
+        // table (the `exec_bounds` spelling collides across a send's
+        // receiver). Whenever a receiver drove the send, the method's own
+        // `type_param_bounds` — keyed by the member walk — decides; a
+        // non-generic member yields an empty table (its own silent face).
+        if let Some(recv) = send_recv
+            && let Some((_, _, bounds)) = self.member_send_params(&recv, row.name)
+        {
+            decl_bounds = Some(bounds);
         }
         // The count decisions. The parser's total is exact where the row
         // recovery is not, so the positional supply is the total less the
@@ -6954,15 +8020,19 @@ impl<'a> Engine<'a> {
         {
             self.check_could_not_infer(callee, container, params, &formals, &level, close);
         }
-        // The invocation-site bounds face (#2869): the written type
-        // arguments check against the callee's substituted bounds before
-        // the argument walk (`_checkInvocationTypeArguments`,
-        // upstream Dart SDK source,
+        // The invocation-site bounds face (#2869 + the C2 wiring): the
+        // written type arguments check against the callee's DECLARED
+        // bounds before the argument walk
+        // (`_checkInvocationTypeArguments`, upstream Dart SDK source,
         // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
         // :570-633 — the same `checkMethodInvocation`/
-        // `checkFunctionExpressionInvocation` drive the creations' bare
-        // `C<T>()` spelling).
-        if let (Some(params), Some(args)) = (&exec_params, &explicit_args) {
+        // `checkFunctionExpressionInvocation`/`checkInstanceCreation`
+        // drive it). The verdict reads `decl_bounds` — the member send's
+        // `type_param_bounds`, the implicit-`call` method's bounds, and
+        // the container/alias/signature captures — never the inference
+        // seeds: an `own_bound`-gated `None` is not an absent bound, and
+        // an inference-seeded bound is not the declared one.
+        if let (Some(params), Some(args)) = (&decl_bounds, &explicit_args) {
             self.check_call_type_arg_bounds(params, args);
         }
         // #2890 — the super-send bounds face: `super.m<int>(...)` resolves
@@ -7042,25 +8112,45 @@ impl<'a> Engine<'a> {
             }
             // The creation's downward face (#1351): the context type's
             // written arguments name every parameter (`A<int> a =
-            // A(null);` — the official solver's downward inference).
+            // A(null);` — the official solver's downward inference). A
+            // SUPERINTERFACE context climbs the declared clause chain
+            // (`A<int, String> x = new B(3, "hello")` over
+            // `B<S, T> extends A<T, S>` solves `B<String, int>` —
+            // `asInstanceOf`'s hop substitution), each context argument
+            // unifying against the target face's parameter spelling.
             if let Some(container) = creation_container
-                && let Some(capture) = self.bounds.container_params(container)
                 && let Some(Ty::Named {
                     name: head,
                     args,
                     nullable: false,
                 }) = self.pending_decl_ty
-                && head == container
                 && args != ArgListId::EMPTY
             {
-                let pool = self.boundary.args.borrow();
-                let ctx_args = pool.get(args);
-                if ctx_args.len() == capture.len() {
-                    for ((param, _, _), ty) in capture.iter().zip(ctx_args) {
-                        if let Some(index) = param_index(*param)
-                            && solutions[index].is_none()
-                        {
-                            solutions[index] = Some(*ty);
+                let inst: Option<Vec<Ty>> = if head == container {
+                    self.bounds
+                        .container_params(container)
+                        .map(|capture| capture.iter().map(|(p, _, _)| Ty::named(*p)).collect())
+                } else {
+                    self.super_instantiation(container, head)
+                };
+                if let Some(inst) = inst {
+                    let ctx_args: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                    if ctx_args.len() == inst.len() {
+                        for (formal, actual) in inst.iter().zip(ctx_args.iter()) {
+                            // Unify the target-face argument (a parameter
+                            // spelling or a compound over them) against the
+                            // context argument — `unify_upward`'s own
+                            // recursion (`A<T, S>` vs `A<int, String>`
+                            // binds `T := int`, `S := String`).
+                            let mut candidates = Vec::new();
+                            self.unify_upward(*formal, *actual, params, &mut candidates);
+                            for (param, ty) in candidates {
+                                if let Some(index) = param_index(param)
+                                    && solutions[index].is_none()
+                                {
+                                    solutions[index] = Some(ty);
+                                }
+                            }
                         }
                     }
                 }
@@ -7087,17 +8177,31 @@ impl<'a> Engine<'a> {
                 && let Some(Ty::Named {
                     name: head, args, ..
                 }) = write_ctx
-                && head == container
                 && args != ArgListId::EMPTY
             {
-                let pool = self.boundary.args.borrow();
-                let ctx_args = pool.get(args);
-                if ctx_args.len() == params.len() {
-                    for ((param, _), ty) in params.iter().zip(ctx_args) {
-                        if let Some(index) = param_index(*param)
-                            && solutions[index].is_none()
-                        {
-                            solutions[index] = Some(*ty);
+                // The same superinterface climb the declared-context arm
+                // runs: `x = new B(...)` where `x: A<…>` and
+                // `B extends A<…>` solves through the clause chain.
+                let inst: Option<Vec<Ty>> = if head == container {
+                    self.bounds
+                        .container_params(container)
+                        .map(|capture| capture.iter().map(|(p, _, _)| Ty::named(*p)).collect())
+                } else {
+                    self.super_instantiation(container, head)
+                };
+                if let Some(inst) = inst {
+                    let ctx_args: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                    if ctx_args.len() == inst.len() {
+                        for (formal, actual) in inst.iter().zip(ctx_args.iter()) {
+                            let mut candidates = Vec::new();
+                            self.unify_upward(*formal, *actual, params, &mut candidates);
+                            for (param, ty) in candidates {
+                                if let Some(index) = param_index(param)
+                                    && solutions[index].is_none()
+                                {
+                                    solutions[index] = Some(ty);
+                                }
+                            }
                         }
                     }
                 }
@@ -7117,7 +8221,7 @@ impl<'a> Engine<'a> {
             // under-report beats an invented binding).
             let mut candidates: Vec<(StringId, Ty)> = Vec::new();
             let mut positional_index = 0usize;
-            for (name, ty, _literal, _range) in &level.args {
+            for (name, ty, _literal, range) in &level.args {
                 let formal = if let Some(n) = name {
                     self.named_formal_for(&formals, *n)
                 } else {
@@ -7128,8 +8232,35 @@ impl<'a> Engine<'a> {
                 let Some(formal) = formal else {
                     continue;
                 };
-                if *ty != Ty::Unknown {
-                    self.unify_upward(formal.ty, *ty, params, &mut candidates);
+                // A function-typed argument whose row carries no `Ty` — a
+                // tear-off's signature stashes in `arg_sigs`, a closure
+                // literal's in `level.closures` — still constrains the
+                // call's parameters: upstream binds `T` from the argument's
+                // function type (`test<Function>(foo, bar)` solves
+                // `T := void Function()` — generic_inferrer.dart's
+                // `TypeConstraintFromArgument`). The signature interns to
+                // the pool's `Ty::Function` and unifies like any typed
+                // argument.
+                let arg_ty = if *ty != Ty::Unknown {
+                    *ty
+                } else {
+                    let sig: Option<Box<FnVarSig>> =
+                        self.arg_sigs.get(&range.offset).cloned().or_else(|| {
+                            level
+                                .closures
+                                .iter()
+                                .find(|(start, end, _)| {
+                                    range.offset >= *start && range.offset <= *end
+                                })
+                                .map(|(.., sig)| sig.clone())
+                        });
+                    match sig {
+                        Some(sig) => self.fn_sig_ty(&sig),
+                        None => continue,
+                    }
+                };
+                if arg_ty != Ty::Unknown {
+                    self.unify_upward(formal.ty, arg_ty, params, &mut candidates);
                 }
             }
             // Slots an earlier phase already fixed (explicit arguments,
@@ -7265,7 +8396,24 @@ impl<'a> Engine<'a> {
                     })
                     .cloned(),
             };
-            let arg_sig = self.arg_sigs.remove(&range.offset);
+            // The tear-off half reads the bare-read stash; a closure
+            // LITERAL argument's signature rides `level.closures` instead
+            // (type_capture.rs's `closure_capture_end` — the literal's
+            // own Value row spans only its end token or the context-typed
+            // literal window, so the pairing key is containment, never
+            // the offset key the tear-off table uses). Upstream checks
+            // both faces through the same per-argument
+            // `correspondingParameter` walk (resolver.dart:522,
+            // `checkForArgumentTypesNotAssignableInList`) — a `() => 0`
+            // against `void Function(int)` reports exactly like a
+            // tear-off.
+            let arg_sig = self.arg_sigs.remove(&range.offset).or_else(|| {
+                level
+                    .closures
+                    .iter()
+                    .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
+                    .map(|(.., sig)| sig.clone())
+            });
             if let Some(arg_sig) = arg_sig {
                 if let Some(formal_sig) = formal_sig {
                     match self.fn_sig_subtype(&arg_sig, &formal_sig) {
@@ -7370,8 +8518,19 @@ impl<'a> Engine<'a> {
                 // #1351 pins); only an out-of-scope, unresolvable named
                 // head on a member send suppresses.
                 let creation = unnamed_creation || creation_container.is_some();
+                // A typedef-alias head (`typedef AI = int;`) is not a
+                // `Container`, so `resolve_container` cannot see it — yet the
+                // alias folds to a resolvable type (`int`) whose formal the
+                // verdict must still judge. Fold the unbound head through the
+                // alias RHS before the erasure gate: only a head that is
+                // genuinely NEITHER a container NOR an alias suppresses the
+                // staged argument row (upstream resolves the alias before
+                // the raw-type-erasure question, so the face stays live for
+                // alias-spelled formals). Display keeps the written
+                // `formal_ty`; the latch only decides staging.
+                let folded_formal = self.fold_alias_verdict(formal_ty);
                 let unbound_formal = !creation
-                    && match formal_ty {
+                    && match folded_formal {
                         Ty::Named {
                             name,
                             args: ArgListId::EMPTY,
@@ -8340,6 +9499,12 @@ impl<'a> Engine<'a> {
                 if kind != ContainerKind::Extension {
                     self.type_uses.push((range, name));
                 }
+                // The ctor-use edge (#2931): the bare `A(` head IS the
+                // `ConstructorName` — its class key reaches the verifier's
+                // `ctor_annotations` fallback.
+                if kind == ContainerKind::Class {
+                    self.note_ctor_use(name, name, range);
+                }
                 // The creation fold is an unnamed-constructor invocation
                 // candidate (`checkConstructorInvocation`); extensions have
                 // no constructors. The anchor spans the whole `A()`
@@ -8410,11 +9575,26 @@ impl<'a> Engine<'a> {
         // head reached through the creation syntax (`C.sm<int, String>(...)`,
         // the `id.id<...>(` form) both check as the `_element` invocation.
         // Class and extension heads checked at their type-argument group.
-        if matches!(
-            head.shape,
-            RowShape::Bare(BareInfo::Plain { .. }) | RowShape::Member { .. }
-        ) {
-            self.check_invocation_arity(row, count, range);
+        match &head.shape {
+            RowShape::Bare(BareInfo::Plain { .. }) | RowShape::Member { .. } => {
+                self.check_invocation_arity(row, count, range);
+            }
+            // A container head the implicit creation applies to
+            // (`Map<int>()`, `var c = C<int, int>()`): the group's count
+            // checks against the type's declared type-parameter count — the
+            // same verdict the type-use face runs (the base code, upstream
+            // `named_type_resolver.dart` `_buildTypeArguments`). An
+            // extension head checks its own face instead.
+            RowShape::Bare(BareInfo::Container {
+                name,
+                kind: ContainerKind::Extension,
+            }) if self.container_kind_of(*name) == Some(ContainerKind::Extension) => {
+                self.check_extension_arity(*name, count, range);
+            }
+            RowShape::Bare(BareInfo::Container { name, .. }) => {
+                self.check_annotation_arity(*name, count, range);
+            }
+            _ => {}
         }
     }
 
@@ -8595,25 +9775,65 @@ impl<'a> Engine<'a> {
             // function-typed-expression target (`_function` — the head's
             // static type is the getter's return type), whose display the
             // model cannot render: silent, the under-report direction.
-            RowShape::Bare(BareInfo::Plain { .. }) => self
-                .top_level_decl(name)
-                .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
-                .map(|d| (d.type_params, ExecKind::Function))
-                .or_else(|| {
-                    // The implicit-this member call (`m<int>(1,"s")` inside
-                    // the declaring class): the bare callee is unqualified,
-                    // so it never reaches the `Member`/qualified arms — walk
-                    // the enclosing container's members for the declared
-                    // type-parameter count (#2161).
-                    let (container, _) = self.container_context()?;
-                    match self.walk_members(container, name) {
-                        Walk::Found(entry) if entry.kind == MemberKind::Method => {
-                            Some((entry.type_params, ExecKind::Method))
-                        }
-                        _ => None,
+            RowShape::Bare(BareInfo::Plain { .. }) => {
+                // The unnamed implicit creation's head (`C<int,int>()`):
+                // the selector-less spelling never arms `creation_ref` and
+                // the callee row stays `Bare(Plain)` — the group counts the
+                // CLASS's declared arity, not an executable's (upstream
+                // `resolveTypeArguments` on the `ConstructorName`'s `type`).
+                // A local shadowing the spelling keeps the send's own face
+                // (`resolve_container` answers the library namespace — a
+                // local `C` never cancels the class's arity verdict).
+                if self.resolve_local(name).is_none()
+                    && let Some((container, _)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        name,
+                    )
+                {
+                    let declared = container.type_params;
+                    if declared != count {
+                        let name_text = self.strings.resolve(name).to_string();
+                        self.emit3(
+                            SemanticCode::WrongNumberOfTypeArguments,
+                            range,
+                            &name_text,
+                            &declared.to_string(),
+                            &count.to_string(),
+                        );
                     }
-                }),
+                    return;
+                }
+                self.top_level_decl(name)
+                    .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
+                    .map(|d| (d.type_params, ExecKind::Function))
+                    .or_else(|| {
+                        // The implicit-this member call (`m<int>(1,"s")` inside
+                        // the declaring class): the bare callee is unqualified,
+                        // so it never reaches the `Member`/qualified arms — walk
+                        // the enclosing container's members for the declared
+                        // type-parameter count (#2161).
+                        let (container, _) = self.container_context()?;
+                        match self.walk_members(container, name) {
+                            Walk::Found(entry) if entry.kind == MemberKind::Method => {
+                                Some((entry.type_params, ExecKind::Method))
+                            }
+                            _ => None,
+                        }
+                    })
+            }
             RowShape::Member { recv } => self.member_exec_arity(recv, name),
+            // A container callee reached through the send (`C<int,int>()` —
+            // the unnamed implicit creation keeps its `Bare(Container)`
+            // shape when `resolve_bare` classified the head at push): the
+            // group counts the TYPE's declared arity (the base code,
+            // `_buildTypeArguments`), not an executable's `_element`.
+            RowShape::Bare(BareInfo::Container { name, .. }) => {
+                return self.check_annotation_arity(*name, count, range);
+            }
             _ => None,
         };
         if let Some((declared, kind)) = declared
@@ -8816,6 +10036,21 @@ impl<'a> Engine<'a> {
                         let window: Vec<(StringId, Option<Ty>)> = window.iter().copied().collect();
                         self.check_call_type_arg_bounds(&window, args);
                     }
+                } else if let Some((declared, kind)) = self
+                    .tear_off_element_arity(row_name)
+                {
+                    // An unqualified reference the top-level table missed:
+                    // a declared LOCAL function (`f() { g<int>; }` — its
+                    // own value is the tear-off, the `_function`-kind
+                    // element face names `function`), or the enclosing
+                    // container's own METHOD through implicit `this`
+                    // (`bar() { foo<int>; }` — the element's declared
+                    // type-parameter count, the `method` word). Upstream's
+                    // `InvocationTargetMethod` /
+                    // `InvocationTargetFunction` dispatch decides the kind
+                    // word from the resolved element — the same split
+                    // `check_invocation_arity` applies on the send path.
+                    self.emit_element_arity(row_name, declared, kind, count, range);
                 } else if let Ty::Function { shape, .. } = *ty {
                     let declared = self.boundary.pool().function_shape(shape).type_params;
                     if declared != count {
@@ -8985,6 +10220,34 @@ impl<'a> Engine<'a> {
                 &declared.to_string(),
                 &count.to_string(),
             );
+        }
+    }
+
+    /// The declared type-parameter count of an unqualified tear-off the
+    /// top-level table missed: a declared local function reads its own
+    /// captured signature (`local_fn_sig` — `f() { g<int>; }` reports
+    /// `function`), else the enclosing container's own method through
+    /// implicit `this` (`bar() { foo<int>; }` reports `method`). The
+    /// member face is own-declared only — upstream's lexical scope puts
+    /// `this`'s members ahead of the namespace for an unqualified
+    /// reference, and an inherited member resolves through the member
+    /// walk the same as the invocation face's
+    /// (`check_invocation_arity`'s implicit-this arm).
+    fn tear_off_element_arity(&self, name: StringId) -> Option<(u16, ExecKind)> {
+        if let Some(sig) = self.local_fn_sig(name) {
+            return Some((sig.params.len() as u16, ExecKind::Function));
+        }
+        if self.frames.iter().any(|f| f.locals.contains(&name)) {
+            // A plain local of the same spelling shadows every element
+            // face — the read is the local's value, never a tear-off.
+            return None;
+        }
+        let (container, _) = self.container_context()?;
+        match self.walk_members(container, name) {
+            Walk::Found(entry) if entry.kind == MemberKind::Method => {
+                Some((entry.type_params, ExecKind::Method))
+            }
+            _ => None,
         }
     }
 
@@ -9309,6 +10572,61 @@ impl<'a> Engine<'a> {
             self.check_prefixed_annotation_arity(head, head_range, count, span);
             return;
         }
+        // The metadata annotation's own type-argument group (`@A<int>()`,
+        // `@A<int>.named()`): `begin_metadata` latched `annotation_at` for
+        // this group's enclosing `@`, the headless group closed unanchored
+        // (the annotation's `A` row carries no callee the group abuts), and
+        // the still-open `call_args_capture` holds the written arguments.
+        // The pending annotation's joined spelling (`A`, `A.named`,
+        // `p.A.named`, `A<int>.named`) resolves its class segment — the
+        // text before the constructor selector's last `.` — and the written
+        // arguments check against the container's (or the alias's own)
+        // substituted bounds exactly like the constructor-reference arm
+        // (`checkNamedType` → `_checkForTypeArgumentNotMatchingBounds`,
+        // type_arguments_verifier.dart:243-247/:312-331; the annotation
+        // face's `type_parameter_supertype_of_its_bound`/`_notMatchingBounds`
+        // corpus entries `test_metadata_notMatching`/`_viaTypeAlias`).
+        if head.is_none()
+            && self.arg_levels.is_empty()
+            && self.annotation_at.is_some()
+            && let Some(annotation) = self.pending_annotations.last()
+        {
+            let text = self.strings.resolve(annotation.name).to_string();
+            // The class segment drops the constructor selector (the last
+            // `.`) and any already-written argument group (`A<int>.named`
+            // resolves `A`); a prefix segment (`p.A`) resolves through its
+            // prefix scope the same as the bare head.
+            let class_text = match text.rsplit_once('.') {
+                Some((class, _)) => class,
+                None => text.as_str(),
+            };
+            let head_text = class_text.split('<').next().unwrap_or(class_text);
+            let head_id = self.intern(head_text);
+            // The capture leaves before the bounds borrow: `params` rides
+            // `self.bounds` immutably, so `call_args_capture.take()`'s
+            // `&mut` must complete first.
+            if let Some(capture) = self.call_args_capture.take()
+                && let Some(params) = self
+                    .bounds
+                    .container_params(head_id)
+                    .or_else(|| self.bounds.alias_params(head_id))
+            {
+                let (tys, spans): (Vec<Ty>, Vec<SourceRange>) =
+                    capture.members.into_iter().unzip();
+                let args = CallTypeArgs {
+                    tys: tys.into_boxed_slice(),
+                    spans: spans.into_boxed_slice(),
+                };
+                let params: Vec<(StringId, Option<Ty>)> = params
+                    .iter()
+                    .map(|(param, bound, _)| {
+                        (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                    })
+                    .collect();
+                self.check_call_type_arg_bounds(&params, &args);
+                return;
+            }
+        }
         // An enum constant's constructor type arguments (`a<int>()`,
         // `a.named<int>()`): the group at the constant's own position —
         // before its `(` opens an argument list — checks against the
@@ -9532,6 +10850,35 @@ impl<'a> Engine<'a> {
         let Some(target) = base.checked_sub(1).and_then(|i| self.rows.get(i)) else {
             return;
         };
+        // A container head's group (`C<int,int>()` implicit unnamed creation,
+        // `C<int,int> x` typed declaration): the type's own declared arity
+        // counts — the base code, not the executable `_element` face. Check
+        // here; the deferred path only sees the group when a send's `(`
+        // follows — a type-annotation head's `;` never consumes the slot.
+        if matches!(target.shape, RowShape::Bare(BareInfo::Plain { .. }) | RowShape::TypeUse(..))
+            && self.resolve_local(target.name).is_none()
+            && let Some((container, _)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                target.name,
+            )
+        {
+            let declared = container.type_params;
+            if declared != count {
+                let name_text = self.strings.resolve(target.name).to_string();
+                self.emit3(
+                    SemanticCode::WrongNumberOfTypeArguments,
+                    range,
+                    &name_text,
+                    &declared.to_string(),
+                    &count.to_string(),
+                );
+            }
+            return;
+        }
         if matches!(target.shape, RowShape::Bare(_) | RowShape::Member { .. }) {
             self.deferred_args.push((base - 1, count, range));
         }

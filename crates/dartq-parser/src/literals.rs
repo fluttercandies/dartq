@@ -323,7 +323,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         if synthetic {
                             // The scanner parked `]` at the wrong spot:
                             // `moveSynthetic` (:8537-8540) relocates it here.
-                            end = self.move_synthetic_close(left, TokenKind::CloseSquare, "]");
+                            end = self.move_synthetic_close(
+                                left,
+                                close,
+                                TokenKind::CloseSquare,
+                                "]",
+                            );
                             break;
                         }
                         self.report(msg::expected_but_got("]"), self.peek_span());
