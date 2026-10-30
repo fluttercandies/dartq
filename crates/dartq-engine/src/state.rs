@@ -1041,6 +1041,14 @@ pub(crate) struct LibraryInfo {
     /// formation clones an `Arc` refcount per formed library, never
     /// re-copies the bytes.
     pub uri: Arc<str>,
+    /// The interning key [`LibraryTable::ids_by_uri`] registers — the
+    /// canonical URI qualified by the containing context root when the
+    /// defining file sits inside a nested self-resolved root (the oracle
+    /// gives each context its own URI space: `package:test/a.dart` in two
+    /// sibling contexts is two libraries). Equals [`Self::uri`] — the same
+    /// `Arc`, shared — for every file outside a nested context, which is
+    /// the common shape.
+    pub key: Arc<str>,
     /// The declared `library <name>;` name, `""` when the defining file has
     /// none (the oracle's empty default, `library_builder.dart:750-763`):
     /// fed to the resolution graph at build time, where the semantic layer
@@ -1253,7 +1261,7 @@ impl LibraryTable {
     pub(crate) fn retire(&mut self, id: LibraryId) {
         let index = id.index() as usize;
         if let Some(info) = self.infos[index].take() {
-            self.ids_by_uri.remove(info.uri.as_ref());
+            self.ids_by_uri.remove(info.key.as_ref());
             self.free.push(id);
         }
     }
@@ -2782,10 +2790,13 @@ mod tests {
         assert_eq!(STRING_TABLE_BYTES_PER_ENTRY, 93);
     }
 
-    /// A live info for `uri`, the shape `retire` unregisters through.
+    /// A live info for `uri`, the shape `retire` unregisters through. The
+    /// stub's `key` reuses the uri: the qualifier only exists inside a
+    /// nested context, which no stub library carries.
     fn stub_info(uri: &str) -> LibraryInfo {
         LibraryInfo {
             uri: Arc::from(uri),
+            key: Arc::from(uri),
             name: "".into(),
             defining: FileTable::new().intern(std::path::Path::new("/stub.dart")),
             parts: Vec::new(),

@@ -513,6 +513,7 @@ mod tests {
                 id,
                 LibraryInfo {
                     uri: Arc::from(uri),
+                    key: Arc::from(uri),
                     name: "".into(),
                     defining: defining[id.index() as usize],
                     parts: Vec::new(),
@@ -746,6 +747,7 @@ mod tests {
             fresh,
             LibraryInfo {
                 uri: Arc::from("package:fresh/fresh.dart"),
+                key: Arc::from("package:fresh/fresh.dart"),
                 name: "".into(),
                 defining: FileTable::new().intern(Path::new("/fresh.dart")),
                 parts: Vec::new(),
@@ -785,6 +787,7 @@ mod tests {
             fresh,
             LibraryInfo {
                 uri: Arc::from("package:fresh/fresh.dart"),
+                key: Arc::from("package:fresh/fresh.dart"),
                 name: "".into(),
                 defining: FileTable::new().intern(Path::new("/stub.dart")),
                 parts: Vec::new(),

@@ -11,8 +11,9 @@ use dartq_language::{
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, MultiplexListener, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_resolution::{
-    CombinatorClause, Combinators, CommentLexeme, Configuration, DocComment, ResolvedTarget,
-    SelectedUri, UriResolution, UriResolver, doc_imports, resolve_conditional,
+    CombinatorClause, Combinators, CommentLexeme, Configuration, DocComment,
+    PackageTable as UriPackageTable, ResolvedTarget, SelectedUri, UriResolution, UriResolver,
+    doc_imports, resolve_conditional,
 };
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
 use dartq_sdk::AllowedExperiments;
@@ -3235,6 +3236,24 @@ fn canonical_uri_memo(state: &mut EngineState, file: FileId) -> Arc<str> {
     uri
 }
 
+/// The context-qualified library identity for a canonical spelling: the
+/// oracle gives every nested context root its own URI space, so the same
+/// `package:test/a.dart` in two sibling contexts is two libraries — the
+/// containing root is the qualifier, joined by `\u{1f}` (a character no URI
+/// spelling or path component boundary can produce ambiguously). Outside
+/// every context the spelling IS the identity and the `Arc` passes through
+/// shared — the single-root shape pays nothing.
+pub(crate) fn library_key(
+    packages: &UriPackageTable,
+    path: &std::path::Path,
+    uri: Arc<str>,
+) -> Arc<str> {
+    match packages.context_root(path) {
+        Some(root) => Arc::from(format!("{}\u{1f}{}", root.display(), uri)),
+        None => uri,
+    }
+}
+
 /// Interns the library keyed on `file`'s canonical URI — its defining or
 /// singleton formation key — recording the key file so a freshly formed
 /// arena slot knows its defining file at the recompute.
@@ -3244,7 +3263,11 @@ fn intern_library_key(
     library_keys: &mut FxHashMap<LibraryId, FileId>,
 ) -> LibraryId {
     let uri = canonical_uri_memo(state, file);
-    let id = state.libraries.intern(&uri);
+    let key = match state.files.path(file) {
+        Some(path) => library_key(&state.uri_packages, path, uri),
+        None => uri,
+    };
+    let id = state.libraries.intern(&key);
     library_keys.entry(id).or_insert(file);
     id
 }
@@ -3451,10 +3474,15 @@ fn build_library_info(
     part_targets.dedup();
     // `parts` is membership minus the defining file (`members` carries both).
     let parts: Vec<FileId> = members[1..].to_vec();
+    let key = state.files.path(defining).map_or_else(
+        || Arc::clone(&uri),
+        |path| library_key(&state.uri_packages, path, Arc::clone(&uri)),
+    );
     LibraryInfo {
         // The memo's allocation, shared: a refcount per formed library,
         // never a copy of the URI bytes.
         uri,
+        key,
         name: library_name.unwrap_or_default().into(),
         defining,
         parts,

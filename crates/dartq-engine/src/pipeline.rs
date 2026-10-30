@@ -1638,7 +1638,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     let live: Vec<LibraryId> = state.libraries.live().collect();
     for library in &live {
         let info = state.libraries.info(*library).expect("live library");
-        let graph_id = builder.intern(&info.uri);
+        let graph_id = builder.intern(&info.key);
         builder.library_name(graph_id, &info.name);
         builder.unit(graph_id, info.defining);
         for &file in &info.parts {
@@ -1842,7 +1842,10 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
             continue;
         };
         let uri = compose_canonical_uri(&state.uri_packages, path);
-        let node = builder.intern(&uri);
+        // Same context-qualification the live libraries carry (`l1::
+        // library_key`): a dep file inside a nested root shares neither a
+        // node nor a URI space with a same-spelling sibling's files.
+        let node = builder.intern(&l1::library_key(&state.uri_packages, path, Arc::from(uri)));
         builder.library_name(
             node,
             l1::declared_library_name(&unit.facts).unwrap_or_default(),
@@ -4209,7 +4212,7 @@ mod tests {
         let dep_nodes: FxHashMap<FileId, dartq_resolution::LibraryId> = FxHashMap::default();
         for library in state.libraries.live() {
             let info = state.libraries.info(library).expect("live library");
-            let graph_id = builder.intern(&info.uri);
+            let graph_id = builder.intern(&info.key);
             builder.library_name(graph_id, &info.name);
             builder.unit(graph_id, info.defining);
             for &file in &info.parts {

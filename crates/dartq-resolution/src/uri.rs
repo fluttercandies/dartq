@@ -415,6 +415,20 @@ impl PackageTable {
             .find(|(root, _)| path.strip_prefix(root).is_ok())
             .map(|(_, universe)| universe)
     }
+
+    /// The canonical directory of the deepest nested context root
+    /// containing `path`, or `None` outside every context — the
+    /// context-identity face the engine's library keys consult: the oracle
+    /// gives each context its own URI space, so the same `package:` URI in
+    /// two sibling contexts is two libraries, and the qualifier is the
+    /// containing root.
+    #[must_use]
+    pub fn context_root(&self, path: &Path) -> Option<&Path> {
+        self.contexts
+            .iter()
+            .find(|(root, _)| path.strip_prefix(root).is_ok())
+            .map(|(root, _)| root.as_path())
+    }
 }
 
 /// One analysis context's `package:` universe: the package name → lib-dir

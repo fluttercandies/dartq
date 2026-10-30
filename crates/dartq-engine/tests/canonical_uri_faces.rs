@@ -409,3 +409,76 @@ fn per_context_universes_spell_and_resolve_each_sibling_root() {
 
     let _ = std::fs::remove_dir_all(&chunk);
 }
+
+/// Pin 6 — the file-walk face of the chunk repro (#2882 regression): the
+/// same canonical `package:` URI in two sibling contexts is TWO libraries
+/// (the oracle's per-context URI space), so the floor analyzes BOTH same-
+/// named sibling roots — not just the alphabetically first. Before the
+/// identity was context-qualified, `libraries.intern` merged case 1's
+/// library into case 0's and case 1 reported nothing.
+#[test]
+fn same_named_sibling_roots_each_analyze_their_own_files() {
+    let (chunk, config, config_dir) = two_case_chunk_fixture();
+    let sdk_root = {
+        let sdk = chunk.join("sdk");
+        std::fs::create_dir_all(sdk.join("lib/_internal")).expect("sdk dirs");
+        std::fs::write(sdk.join("version"), "3.13.1\n").expect("sdk version");
+        std::fs::write(
+            sdk.join("lib/libraries.json"),
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        )
+        .expect("sdk libraries");
+        std::fs::write(
+            sdk.join("lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        )
+        .expect("sdk experiments");
+        sdk
+    };
+    // The bare floor's faces: the bare identity table over the analyzed
+    // dir, the merged (first-only `test` entry) resolution config, and BOTH
+    // discovered context roots — the exact `EngineConfig` the CLI assembly
+    // produces for the chunk.
+    let packages = PackageTable::basic(&chunk, None).expect("bare table");
+    let mut engine = Engine::new(EngineConfig {
+        store: memory_store(),
+        sdk: SdkSnapshot::load(&sdk_root, None).expect("synthetic SDK loads"),
+        packages,
+        pub_config: config,
+        config_dir,
+        context_roots: vec![chunk.join("0"), chunk.join("1")],
+        semdiag: Some(dartq_engine::semdiag::diagnoser()),
+        target: dartq_engine::DEFAULT_TARGET.to_owned(),
+        declared_variables: rustc_hash::FxHashMap::default(),
+        experiments: Vec::new(),
+    })
+    .expect("engine");
+    let source = b"void f() { int x = \"s\"; }\n";
+    engine.set_content(&chunk.join("0/lib/a.dart"), source);
+    engine.set_content(&chunk.join("1/lib/a.dart"), source);
+    let diagnostics = engine
+        .analyze(
+            &[],
+            &mut |_| {},
+            &dartq_engine::CancellationToken::default(),
+        )
+        .expect("analyze completes");
+    for index in ["0", "1"] {
+        let path = chunk.join(format!("{index}/lib/a.dart"));
+        let rows: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                engine
+                    .file_table()
+                    .path(d.file)
+                    .is_some_and(|p: &Path| p == path)
+            })
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "case {index} reports its own rows (the URI-collision merge \
+             would attribute only case 0): {diagnostics:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&chunk);
+}
