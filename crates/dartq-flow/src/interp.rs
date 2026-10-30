@@ -31,6 +31,14 @@ pub(crate) struct VarMeta {
     pub is_final: bool,
     /// Span of the declaration's name token, when declared locally.
     pub decl_span: Option<SourceRange>,
+    /// The proven constant boolean value a `final`/`const` local
+    /// initialized from a boolean-folded expression carries — `final b =
+    /// true;` makes `b`'s later reads condition-fold exactly like the
+    /// literal (official `_getConstantValue`/`visitNode`'s constant
+    /// evaluation, resolver_visitor.dart's `bool` local propagation).
+    /// `None` for mutable locals and for a `final`/`const` initialized
+    /// from a non-constant or non-boolean fold; any write clears it.
+    pub const_bool: Option<bool>,
 }
 
 /// One lexical scope frame: name id to variable id.
@@ -78,6 +86,12 @@ pub(crate) struct CollIfFrame {
     /// The then-arm's exit state, saved at `ElseControlFlow` (official
     /// `_IfContext._afterThen`).
     pub(crate) after_then: Option<State>,
+    /// The then-element entered dead (a const-folded condition or a
+    /// dead enclosing state): its close row reports the element's own
+    /// extent and the arm counted one [`Interp::arm_dead_depth`].
+    pub(crate) then_dead_entry: bool,
+    /// Same latch for the else-element, taken at `ElseControlFlow`.
+    pub(crate) else_dead_entry: bool,
 }
 
 /// Effect sets of one construct extent (official `AssignedVariablesNodeInfo`).
@@ -384,6 +398,13 @@ pub(crate) enum Frame {
         /// group's opening consumes it — the chain marks unreachable, and a
         /// case-headed opener reports the default's keyword row.
         dead_default: Option<(TokenSpan, bool)>,
+        /// The open switch-expression arm entered dead (a dead chain the
+        /// unmatched state chained into it — official
+        /// `handleSwitchBeforeAlternative`'s `checkUnreachableNode(case_)`):
+        /// its interior polls fold into the arm's own `SwitchExprCaseEnd`
+        /// row through [`Interp::arm_dead_depth`], and the count drops at
+        /// the arm's close.
+        arm_dead_entry: bool,
         /// The offset of the member keyword whose head-time row last fired
         /// in this switch (a member-anchored report): the next `CaseEnd`
         /// latch reads it so an already-reported default is never
@@ -587,6 +608,16 @@ pub(crate) struct Expr {
     /// `_PropertyReference`, flow_analysis.dart:7772-7800), so an `is`
     /// test on it never takes the non-reference literal folds.
     pub ref_chain: bool,
+    /// The written form can never evaluate to null while carrying no
+    /// real type head the lattice can classify — a non-collection
+    /// literal (`'s'`, `1`, `true`), `this`, or another producer whose
+    /// static type is `Never`-free and non-nullable by construction.
+    /// [`Expr::ty`] stays the opaque unknown face for these, so the
+    /// `??`/`?.` guaranteed-non-null kills that consult
+    /// [`NameTypeOps::classify`] would never fire on them; this flag
+    /// feeds the same verdict through [`Interp::guaranteed_non_null`]
+    /// (official `type.isNonNullable` on the literal's real static type).
+    pub non_null_literal: bool,
 }
 
 impl Expr {
@@ -607,6 +638,7 @@ impl Expr {
             literal: false,
             non_reference_invalid: false,
             ref_chain: false,
+            non_null_literal: false,
         }
     }
 
@@ -627,6 +659,7 @@ impl Expr {
             literal: false,
             non_reference_invalid: false,
             ref_chain: false,
+            non_null_literal: false,
         }
     }
 
@@ -1199,6 +1232,19 @@ pub(crate) struct Interp<'o> {
     /// close, so their intervals run out to the enclosing construct.
     pub(crate) dead: Option<DeadWindow>,
 
+    /// Number of enclosing conditional/if-element/if-statement arms the
+    /// walk entered unreachable (the official's pre-arm `_firstDeadNode`
+    /// posture): while it is positive every interior dead poll folds into
+    /// the arm's own close row instead of anchoring a fresh interval, and
+    /// only the OUTERMOST dead arm's close reports
+    /// (`dead_code_verifier.dart`'s single-row rule — `c ? dead : dead`
+    /// reports once for the arm the verifier's top-down walk entered
+    /// first). Incremented when an arm whose entry state was unreachable
+    /// begins (a `?:` arm's `then_dead_entry`/`else_dead_entry`, a
+    /// collection-if's dead element, a statement `if`'s dead branch),
+    /// decremented at the arm's close.
+    pub(crate) arm_dead_depth: u32,
+
     /// Statement-boundary reachability snapshot: whether the statement now
     /// beginning entered dead. Post-order statement wrappers
     /// (`ExprStmt`/`ReturnBegin`/`YieldBegin`/`PatternVarDeclStmt` fire at
@@ -1350,6 +1396,10 @@ struct Snapshot {
     non_promotions_len: usize,
     props_len: usize,
     dead: Option<DeadWindow>,
+    /// The arm-dead nesting count rolls back with the collect run like
+    /// every other reachability face: a collect walk into a dead arm must
+    /// not leave its suppression on the real walk.
+    arm_dead_depth: u32,
     init_exec_depth: Option<usize>,
     /// Open null-shorting contexts: pushed and joined inside the collect
     /// run's replay, so they roll back with it.
@@ -1472,6 +1522,7 @@ impl<'o> Interp<'o> {
             header_cond_depth: 0,
             anywhere: Effects::default(),
             dead: None,
+            arm_dead_depth: 0,
             stmt_began_dead: false,
             exit_at: None,
             outer_exec_end: 0,
@@ -1720,6 +1771,13 @@ impl<'o> Interp<'o> {
         // A stale id (a collect rollback can strand effect-set entries and
         // scope bindings past their variable) degrades to the unknown
         // declared type; the state write itself is model-bounds-safe.
+        // The write also invalidates any proven-constant the read face
+        // carried — a `final`/`const` local never reaches this (its only
+        // write IS the initializer, which sets the constant after), so a
+        // cleared slot here is the mutable-variable contract.
+        if let Some(meta) = self.vars.get_mut(var as usize) {
+            meta.const_bool = None;
+        }
         let (declared, declared_args) = match self.vars.get(var as usize) {
             Some(meta) => (meta.ty, meta.args),
             None => (Ty::UNKNOWN, crate::ty::EMPTY_ARGS),
@@ -1912,14 +1970,23 @@ impl<'o> Interp<'o> {
     /// access's own event can still feed the condition face
     /// (`Expr::branches`) the pair it reported before this machinery.
     ///
-    /// The caller hands over the receiver's `(reference, ty, args)`
-    /// triple — read off the expression stack — rather than the `Expr`
-    /// itself, so the call holds no borrow into `self`.
-    pub(crate) fn null_short_begin(&mut self, receiver: (Option<u32>, Ty, u32), recv_offset: u32) {
+    /// The caller hands over the receiver's `(reference, ty, args,
+    /// non_null_literal)` quadruple — read off the expression stack —
+    /// rather than the `Expr` itself, so the call holds no borrow into
+    /// `self`. The flag feeds the guaranteed-non-null verdict for
+    /// receivers whose opaque unknown face hides a by-construction
+    /// non-null value (a literal, `this`): `1?.m` and `'s'?.m` kill
+    /// their skip path officially just like `x?.m` over a non-nullable
+    /// `x`.
+    pub(crate) fn null_short_begin(
+        &mut self,
+        receiver: (Option<u32>, Ty, u32, bool),
+        recv_offset: u32,
+    ) {
         self.split_cur();
         let mut shortcut = self.current.clone();
         let mut matched = None;
-        let (reference, ty, args) = receiver;
+        let (reference, ty, args, non_null_literal) = receiver;
         if let Some(var) = reference {
             let (promoted, promoted_args) = self.promote_to_non_null(ty, args);
             let next = self.current.clone().finish_type_test(
@@ -1934,9 +2001,10 @@ impl<'o> Interp<'o> {
             self.current = next;
             matched = Some(self.current.clone());
         }
+        let non_null = non_null_literal || self.classify(ty) == Classification::NonNullable;
         match self.classify(ty) {
             Classification::NullOrEquivalent => self.unreachable_cur(),
-            Classification::NonNullable if self.sound_flow => {
+            _ if non_null && self.sound_flow => {
                 // The skip path dies "assuming sound null safety"
                 // (official `_nullAwareAccess_rightBegin`,
                 // flow_analysis.dart:7694-7698 — the kill rides
@@ -2296,9 +2364,13 @@ impl<'o> Interp<'o> {
     /// furthest statement end so the close can trim the row to the
     /// covering list's last statement, its trailing `;` included
     /// (official `Block.statements.last` + `node.end`). Reachable nodes
-    /// keep the interval open: only a covering close retires it.
+    /// keep the interval open: only a covering close retires it. An
+    /// interior poll inside an arm the walk entered dead
+    /// ([`Interp::arm_dead_depth`]) is likewise folded: the arm's close
+    /// emits the single official row, so opening a window here would only
+    /// produce a nested duplicate.
     pub(crate) fn dead_code(&mut self, span: TokenSpan) {
-        if self.reachable() {
+        if self.reachable() || self.arm_dead_depth > 0 {
             return;
         }
         let end = span.range.end();
@@ -2318,9 +2390,10 @@ impl<'o> Interp<'o> {
     /// do-while's condition is the first dead node and its parent is the
     /// `DoStatement`, so the close splits into the `while` part and the
     /// tail). Only when no interval is open: an earlier anchor continues
-    /// to own the reporting.
+    /// to own the reporting. An arm-dead context folds the poll exactly
+    /// like [`Interp::dead_code`].
     pub(crate) fn dead_do_condition(&mut self) {
-        if self.dead.is_none() && !self.reachable() {
+        if self.dead.is_none() && !self.reachable() && self.arm_dead_depth == 0 {
             self.dead = Some(DeadWindow::awaiting_do(self.stack.len()));
         }
     }
@@ -2334,9 +2407,14 @@ impl<'o> Interp<'o> {
     /// the arm (the event stream is post-order, so an inner poll can sit
     /// later in the arm than the official's top-down first-dead node); an
     /// interval opened BEFORE the arm keeps ownership — the arm only
-    /// extends its end, exactly `dead_expr_arm`'s fold.
+    /// extends its end, exactly `dead_expr_arm`'s fold. A row inside an
+    /// arm the walk entered dead reports nothing: the call sites drop
+    /// their own arm's contribution before calling, so any count still
+    /// standing here is a strictly OUTER dead arm's — the outermost
+    /// arm's close owns the single official row
+    /// ([`Interp::arm_dead_depth`]).
     pub(crate) fn dead_arm_row(&mut self, arm_start: u32, arm_end: u32) {
-        if self.reachable() {
+        if self.reachable() || self.arm_dead_depth >= 1 {
             return;
         }
         if let Some(window) = &mut self.dead {
@@ -2402,8 +2480,15 @@ impl<'o> Interp<'o> {
     /// first dead node, and the row runs to the arm's own end. An
     /// entry-dead arm reports its whole-range row instead
     /// ([`Self::dead_arm_row`]); a live arm without the Never cast parks
-    /// nothing and this is a no-op.
+    /// nothing and this is a no-op. A mid-arm cast-tail death inside an
+    /// arm that an outer dead arm encloses folds into the outer row
+    /// exactly like `dead_arm_row` — the face fires only outside every
+    /// dead arm ([`Interp::arm_dead_depth`] == 0; an entry-dead arm never
+    /// reaches this face — its own close took `dead_arm_row`).
     pub(crate) fn cast_tail_row(&mut self, arm_end: u32) {
+        if self.arm_dead_depth >= 1 {
+            return;
+        }
         let head = match self.stack.last_mut() {
             Some(Frame::Cond {
                 never_cast,
@@ -2697,6 +2782,7 @@ impl<'o> Interp<'o> {
             non_promotions_len: self.non_promotions.len(),
             props_len: self.props.len(),
             dead: self.dead,
+            arm_dead_depth: self.arm_dead_depth,
             init_exec_depth: self.init_exec_depth,
             null_shorts_len: self.null_shorts.len(),
             args_bases_len: self.args_bases.len(),
@@ -2751,6 +2837,7 @@ impl<'o> Interp<'o> {
             .retain(|_, slot| (*slot as usize) < s.props_len);
         self.current = s.current;
         self.dead = s.dead;
+        self.arm_dead_depth = s.arm_dead_depth;
         self.init_exec_depth = s.init_exec_depth;
         self.null_shorts.truncate(s.null_shorts_len);
         self.args_bases.truncate(s.args_bases_len);

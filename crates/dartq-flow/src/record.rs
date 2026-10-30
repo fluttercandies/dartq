@@ -927,7 +927,7 @@ impl<'t> Flow<'t> {
             self.cascade_probe_arm = false;
             if matches!(
                 ev,
-                Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin
+                Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin { .. }
             ) {
                 self.method_block_arm = true;
             }
@@ -2818,8 +2818,8 @@ impl ParserListener for Flow<'_> {
         });
     }
 
-    fn begin_arguments(&mut self, _token: Token) {
-        self.record(Ev::ArgumentsBegin);
+    fn begin_arguments(&mut self, token: Token) {
+        self.record(Ev::ArgumentsBegin { open: token });
     }
 
     fn end_arguments(&mut self, count: usize, _begin: Token, _end: Token) {

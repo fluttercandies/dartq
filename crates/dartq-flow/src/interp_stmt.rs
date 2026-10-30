@@ -695,6 +695,7 @@ impl Interp<'_> {
                     group_combined: None,
                     body_depth: None,
                     dead_default: None,
+                    arm_dead_entry: false,
                     reported_kw: None,
                     block,
                     labeled_effects: None,
@@ -891,6 +892,7 @@ impl Interp<'_> {
                     group_combined: None,
                     body_depth: None,
                     dead_default: None,
+                    arm_dead_entry: false,
                     reported_kw: None,
                     block: i..i,
                     labeled_effects: None,
@@ -927,6 +929,18 @@ impl Interp<'_> {
                 // divergence from the official single-row rule: an or
                 // operand row inside an ALREADY-dead arm reports on its
                 // own instead of folding into the arm's row.
+                let arm_dead_entry = !self.reachable();
+                if let Some(frame_index) = self.switch_frame()
+                    && let Frame::Switch {
+                        arm_dead_entry: slot,
+                        ..
+                    } = &mut self.stack[frame_index]
+                {
+                    *slot = arm_dead_entry;
+                }
+                if arm_dead_entry {
+                    self.arm_dead_depth += 1;
+                }
                 self.dead_code(*begin);
                 // The matched-value query fires at the pattern match: the
                 // chain below is the match-time one (`case_pattern_end_expr`
@@ -980,7 +994,21 @@ impl Interp<'_> {
                 // The dead arm's whole-range row (official
                 // `finishExpressionCase`'s `flowEnd(case_)` — the arm was
                 // the first dead node, so the row spans the arm's own
-                // extent, trimmed to the separator).
+                // extent, trimmed to the separator). The arm's own
+                // dead-arm contribution drops BEFORE the row so the gate
+                // reads the outer arms only.
+                let arm_dead_entry = match self.switch_frame() {
+                    Some(frame_index) => match &mut self.stack[frame_index] {
+                        Frame::Switch { arm_dead_entry, .. } => {
+                            std::mem::replace(arm_dead_entry, false)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if arm_dead_entry {
+                    self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+                }
                 self.dead_arm_row(begin.range.offset, *end);
                 // Official decision order (flow_analysis.dart:1776-1786):
                 // pattern → guard → `switch_endAlternative` → body. The
@@ -1245,6 +1273,10 @@ impl Interp<'_> {
                     late: self.decl.late,
                     is_final: self.decl.is_final,
                     decl_span: Some(token.range),
+                    // The initializer's proven constant lands at
+                    // `InitializerEnd` when the declaration is
+                    // `final`/`const` and the fold carried one.
+                    const_bool: None,
                 };
                 // The declaration's type slot closes with the first variable
                 // it declares. A later `Type` event inside the list belongs
@@ -1342,6 +1374,28 @@ impl Interp<'_> {
                     );
                 }
                 if let (Some(var), Some(rhs)) = (var, rhs) {
+                    // The proven-constant feed (official
+                    // `_getConstantValue` on a `final`/`const` local's
+                    // initializer — the fold's `bool_value` the read
+                    // adopts at `Ev::Ident`): a `final b = true;` (or a
+                    // condition-valuable fold like `final b = a != null;`
+                    // whose own `bool_value` the equality/test arms set)
+                    // makes `b`'s later condition reads fold exactly like
+                    // the literal. Only `final`/`const` carries it — a
+                    // mutable local can be reassigned before the read.
+                    // Stashed now and written after the initialization's
+                    // own `apply_write` below — that call clears
+                    // `const_bool` like any write, and the declaration's
+                    // initialization is the moment the constant lands.
+                    let const_feed = if self
+                        .vars
+                        .get(var as usize)
+                        .is_some_and(|meta| meta.is_final)
+                    {
+                        rhs.bool_value
+                    } else {
+                        None
+                    };
                     // The declared-type slot the written header left unknown
                     // adopts the initializer's inferred face (#2140): the
                     // semantic layer's staged type wins when present.
@@ -1444,6 +1498,11 @@ impl Interp<'_> {
                     // `declare`/`_initialize` carry no
                     // `nonPromotionReason`, `flow_analysis.dart:4914-4916`).
                     self.apply_write(var, rhs.ty, rhs.args, true, None, false);
+                    if let (Some(value), Some(meta)) =
+                        (const_feed, self.vars.get_mut(var as usize))
+                    {
+                        meta.const_bool = Some(value);
+                    }
                 }
             }
             Ev::VarDeclEnd => {
@@ -1493,6 +1552,9 @@ impl Interp<'_> {
                     late: false,
                     is_final: false,
                     decl_span: Some(token.range),
+                    // A parameter carries no proven constant — its value
+                    // arrives from the caller.
+                    const_bool: None,
                 };
                 self.declare_var(*name, meta, true);
             }

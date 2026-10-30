@@ -4237,7 +4237,7 @@ fn never_call_exit_inside_arguments_keeps_the_stack() {
                 args: crate::ty::EMPTY_ARGS,
                 end: 19,
             },
-            crate::ev::Ev::ArgumentsBegin,
+            crate::ev::Ev::ArgumentsBegin { open: tspan(12) },
             crate::ev::Ev::OtherExpr { span: tspan(13) },
             crate::ev::Ev::Exit { end: tspan(19) },
             crate::ev::Ev::ArgumentsEnd { count: 1 },
@@ -4418,17 +4418,49 @@ fn bottom_remainder_marks_the_else_branch_unreachable() {
     );
 }
 
+/// A `TypeOps` stand-in for the resolved back-end (`is_resolved_seam`
+/// true): under it an `Unknown` face is the layer's own resolution gap —
+/// the `InvalidType` stand-in — never a spelling the name-level lattice
+/// chose (a record-type `Ev::Type` reads unspellable, not invalid).
+/// Everything else delegates to the name-level ops unchanged.
+struct ResolvedSeamOps;
+
+impl crate::ty::TypeOps for ResolvedSeamOps {
+    fn is_resolved_seam(&self) -> bool {
+        true
+    }
+    fn is_subtype(&self, left: crate::ty::Ty, right: crate::ty::Ty) -> bool {
+        crate::ty::NameTypeOps.is_subtype(left, right)
+    }
+    fn factor(&self, from: crate::ty::Ty, what: crate::ty::Ty) -> crate::ty::Ty {
+        crate::ty::NameTypeOps.factor(from, what)
+    }
+    fn try_promote_to(&self, to: crate::ty::Ty, from: crate::ty::Ty) -> Option<crate::ty::Ty> {
+        crate::ty::NameTypeOps.try_promote_to(to, from)
+    }
+    fn promote_to_non_null(&self, t: crate::ty::Ty) -> crate::ty::Ty {
+        crate::ty::NameTypeOps.promote_to_non_null(t)
+    }
+    fn classify(&self, t: crate::ty::Ty) -> crate::ty::Classification {
+        crate::ty::NameTypeOps.classify(t)
+    }
+    fn is_bottom(&self, t: crate::ty::Ty) -> bool {
+        crate::ty::NameTypeOps.is_bottom(t)
+    }
+}
+
 /// #2180 face-3 pin: an invalid tested type (the oracle's `InvalidType`,
-/// spelled `Base::Unknown` at this seam — `bound_face` already classifies
-/// it "like the official invalid-type arm") produces the analyzer's
-/// `x is InvalidType` verdict: no promotion (the true arm's
-/// `isValidPromotionStep` is false — `prev <: InvalidType` always holds,
-/// subtype.dart:274-276 making the invalid type a supertype of all), the
-/// tested set still records it on both arms (official `_finishTypeTest`,
-/// flow_analysis.dart:4283-4293), and the else branch is unreachable
-/// (`factor(prev, InvalidType) = Never`, :4154-4166 sound arm). Hand-driven:
-/// the parser pipeline spells a missing name as `Base::Name`, so only the
-/// resolved back-end (or this buffer) can feed the invalid arm.
+/// spelled `Base::Unknown` at the RESOLVED seam — the name-level lattice
+/// now reads `Unknown` as an unspellable spelling and keeps both arms,
+/// #2905) produces the analyzer's `x is InvalidType` verdict: no
+/// promotion (the true arm's `isValidPromotionStep` is false —
+/// `prev <: InvalidType` always holds, subtype.dart:274-276 making the
+/// invalid type a supertype of all), the tested set still records it on
+/// both arms (official `_finishTypeTest`, flow_analysis.dart:4283-4293),
+/// and the else branch is unreachable (`factor(prev, InvalidType) =
+/// Never`, :4154-4166 sound arm). Hand-driven under the resolved-seam
+/// ops: the parser pipeline spells a missing name as `Base::Name`, so
+/// only the resolved back-end (or this buffer) can feed the invalid arm.
 #[test]
 fn invalid_tested_type_never_promotes_and_deads_the_else_branch() {
     use crate::ev::Ev;
@@ -4463,7 +4495,11 @@ fn invalid_tested_type_never_promotes_and_deads_the_else_branch() {
         ],
     ]
     .concat();
-    let interp = interp_of(&events);
+    let interp = {
+        let mut interp = crate::interp::Interp::new(&ResolvedSeamOps, &[], &[]);
+        interp.run(&events);
+        interp
+    };
     let model = interp.current.model(0);
     assert_eq!(model.promoted, crate::model::NIL, "no promotion may stand");
     assert!(

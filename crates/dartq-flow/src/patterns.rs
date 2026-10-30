@@ -501,6 +501,9 @@ impl Interp<'_> {
                     late: false,
                     is_final: *is_final,
                     decl_span: Some(token.range),
+                    // Pattern binders never carry a proven constant: the
+                    // matched value is a runtime extraction, not a fold.
+                    const_bool: None,
                 };
                 let shadowed = self.bound_var(*name);
                 self.declare_var(*name, meta, true);

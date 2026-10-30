@@ -905,7 +905,7 @@ impl GapPass {
             | Ev::GuardBegin
             | Ev::NonNullAssert
             | Ev::BinaryBegin { .. }
-            | Ev::ArgumentsBegin
+            | Ev::ArgumentsBegin { .. }
             | Ev::ParenBegin
             | Ev::ParenEnd => {}
             Ev::ExprStmt { .. }

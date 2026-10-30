@@ -166,7 +166,34 @@ impl Interp<'_> {
                             let mut expr = Expr::of_reference(var, ty, args);
                             expr.read_span = Some(*token);
                             expr.name = Some(*name);
+                            // The proven-constant face (official
+                            // `_getConstantValue` on a `final`/`const`
+                            // local's read): `final b = true;` makes `b`'s
+                            // later condition reads fold exactly like the
+                            // literal — `if (b) { x; } else { y; }` rows
+                            // `y;`. Set at `InitializerEnd` when the
+                            // declaration was final and the fold carried a
+                            // `bool_value`; cleared by any write.
+                            expr.bool_value = self
+                                .vars
+                                .get(var as usize)
+                                .and_then(|meta| meta.const_bool);
                             self.exprs.push(expr);
+                            // The bottom-typed read's own exit (official
+                            // `recordStaticType`'s `handleExit` on
+                            // `type.isBottom`, ast.dart:11146-11153): a
+                            // `Never a` parameter read ends the block's
+                            // flow at the identifier, and the enclosing
+                            // operand's close reports the trailing
+                            // dead region — `f(Never a, int b) { a + b; }`
+                            // rows `+ b`. The continuation sits on the
+                            // stack for the consumer like `Ev::Exit`'s.
+                            if self.ops.is_bottom(ty) {
+                                self.unreachable_cur();
+                                if !self.collecting() {
+                                    self.exit_at = Some(token.range.end());
+                                }
+                            }
                         }
                         Some(Resolved::Top(top)) => {
                             // The unit's own top-level declaration (the
@@ -188,6 +215,15 @@ impl Interp<'_> {
                             expr.read_span = Some(*token);
                             expr.name = Some(*name);
                             self.exprs.push(expr);
+                            // The bottom-typed read's exit — the
+                            // `Resolved::Local` arm's face applied to the
+                            // unit's own top-level `Never` declaration.
+                            if self.ops.is_bottom(top.ty) {
+                                self.unreachable_cur();
+                                if !self.collecting() {
+                                    self.exit_at = Some(token.range.end());
+                                }
+                            }
                         }
                         None => {
                             // The unresolved bare read: the implicit-`this`
@@ -347,10 +383,23 @@ impl Interp<'_> {
             Ev::Bool { value } => {
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 expr.bool_value = Some(*value);
+                // A boolean literal can never evaluate to null — the same
+                // guaranteed-non-null face `type.isNonNullable` gives the
+                // `??`/`?.` kills.
+                expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
             Ev::Null => self.exprs.push(Expr::trivial(Ty::NULL)),
-            Ev::OtherExpr { .. } => self.exprs.push(Expr::trivial(Ty::UNKNOWN)),
+            Ev::OtherExpr { .. } => {
+                // `Ev::OtherExpr`'s producers are the non-collection leaf
+                // literals (integer, double, `super`) — every one evaluates
+                // to a non-null value, so the guaranteed-non-null kills
+                // (`1 ?? x`, `super.field?.m`) apply even though the type
+                // face stays the opaque unknown.
+                let mut expr = Expr::trivial(Ty::UNKNOWN);
+                expr.non_null_literal = true;
+                self.exprs.push(expr);
+            }
             Ev::This { span } => {
                 // The `this` read: a promotable property receiver (official
                 // `thisExpression()`'s `_thisVersion` reference,
@@ -368,6 +417,9 @@ impl Interp<'_> {
                 let mut expr = Expr::trivial(ty);
                 expr.this_recv = true;
                 expr.read_span = Some(*span);
+                // `this` can never be null (official `ThisExpression`'s
+                // non-nullable static type).
+                expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
             Ev::UnaryPrefix { is_not } => {
@@ -379,6 +431,9 @@ impl Interp<'_> {
                     let mut expr = Expr::trivial(Ty::UNKNOWN);
                     expr.bool_value = operand.bool_value.map(|b| !b);
                     expr.branches = operand.branches.map(|(t, f)| (f, t));
+                    // `!x` is a boolean — non-null by construction (the
+                    // `??`/`?.` kills' literal face).
+                    expr.non_null_literal = true;
                     self.exprs.push(expr);
                 } else {
                     self.exprs.push(operand);
@@ -486,6 +541,7 @@ impl Interp<'_> {
                 match op {
                     BinOp::And | BinOp::Or => {
                         // The left operand is on the stack; split on it and run
+                        // The left operand is on the stack; split on it and run
                         // the right operand under the taken branch (official
                         // `logicalBinaryOp_rightBegin`).
                         let left = self.pop_value();
@@ -522,8 +578,11 @@ impl Interp<'_> {
                         // mark rides the operator's end offset — every
                         // emitted row re-anchors to the operator start, so
                         // the anchor only feeds the inside/outside
-                        // comparison.
+                        // comparison. The arm-dead count rides the entry
+                        // too: nested polls inside the operand fold into
+                        // this arm's close row.
                         if rhs_dead_entry {
+                            self.arm_dead_depth += 1;
                             self.dead_code(TokenSpan {
                                 id: span.id,
                                 range: dartq_source::SourceRange {
@@ -570,8 +629,15 @@ impl Interp<'_> {
                         // flow_analysis.dart:5857-5864: the nonNullable
                         // arm's `setUnreachable` rides
                         // `soundFlowAnalysisEnabled`; the nullOrEquivalent
-                        // skip kill above it is ungated).
-                        if self.sound_flow && self.classify(left.ty) == Classification::NonNullable
+                        // skip kill above it is ungated). The verdict reads
+                        // [`Interp::guaranteed_non_null`]: a literal or
+                        // `this` LHS is non-null by construction even
+                        // though its flow face stays the opaque unknown —
+                        // `1 ?? x`, `'s' ?? x`, `this ?? x` all dead
+                        // their right side officially.
+                        if self.sound_flow
+                            && (self.classify(left.ty) == Classification::NonNullable
+                                || left.non_null_literal)
                         {
                             self.unreachable_cur();
                             rhs_dead_entry = true;
@@ -590,6 +656,7 @@ impl Interp<'_> {
                         // `parent is IfNull` re-anchor presumes the first
                         // dead node is the operand itself).
                         if rhs_dead_entry {
+                            self.arm_dead_depth += 1;
                             self.dead_code(TokenSpan {
                                 id: span.id,
                                 range: dartq_source::SourceRange {
@@ -599,7 +666,36 @@ impl Interp<'_> {
                             });
                         }
                     }
-                    _ => {}
+                    BinOp::Other | BinOp::Eq | BinOp::NotEq => {
+                        // A plain or equality binary (`a + b`, `a == b`):
+                        // the right operand still resolves under the left's
+                        // exit state — a Never-typed left (a `throw`, a
+                        // bottom-returning call) leaves the operand dead
+                        // and the official's `flowEnd(rightOperand)`
+                        // re-anchors to the operator (`parent is
+                        // BinaryExpression`, dead_code_verifier.dart:311-313).
+                        // Park the operator span for the close; the
+                        // entry-dead mark rides the same `rhs_dead_entry`
+                        // latch the logical arms carry. The left operand's
+                        // value stays on the stack — `BinaryEnd` pops both.
+                        let rhs_dead_entry = !self.reachable();
+                        if rhs_dead_entry {
+                            self.arm_dead_depth += 1;
+                            self.dead_code(TokenSpan {
+                                id: span.id,
+                                range: dartq_source::SourceRange {
+                                    offset: span.range.end(),
+                                    length: 0,
+                                },
+                            });
+                        }
+                        self.stack.push(Frame::Branch {
+                            branch: self.current.clone(),
+                            ifnull_ty: None,
+                            op_span: *span,
+                            rhs_dead_entry,
+                        });
+                    }
                 }
             }
             Ev::BinaryEnd { op, end } => match op {
@@ -625,7 +721,12 @@ impl Interp<'_> {
                             // this binary, so the row re-anchors to the
                             // operator and spans to the operand's end,
                             // then resets. A region opened before the
-                            // operand keeps ownership (the fold).
+                            // operand keeps ownership (the fold). This
+                            // arm's dead-arm contribution drops BEFORE
+                            // the row: any count still standing is a
+                            // strictly outer arm's, which is exactly the
+                            // fold condition `dead_arm_row` reads.
+                            self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
                             self.dead_arm_row(op_span.range.offset, *end);
                         }
                     }
@@ -661,6 +762,9 @@ impl Interp<'_> {
                     // rejoins both arms, exactly like a bare test's value
                     // context.
                     expr.test_split = true;
+                    // A `&&`/`||` result is a boolean — non-null by
+                    // construction.
+                    expr.non_null_literal = true;
                     self.exprs.push(expr);
                 }
                 BinOp::IfNull => {
@@ -682,7 +786,10 @@ impl Interp<'_> {
                     if rhs_dead_entry && let Some(op_span) = op_span {
                         // The `??` face of the same official re-anchor
                         // (`parent is IfNull` → offset = operator,
-                        // dead_code_verifier.dart:316-318).
+                        // dead_code_verifier.dart:316-318). The arm's own
+                        // dead-arm contribution drops before the row —
+                        // `dead_arm_row` reads the OUTER arms only.
+                        self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
                         self.dead_arm_row(op_span.range.offset, *end);
                     }
                     let right = self.pop_value();
@@ -789,12 +896,51 @@ impl Interp<'_> {
                     self.exprs.push(expr);
                 }
                 BinOp::Eq | BinOp::NotEq => {
+                    // The dead-RHS row precedes the operand pops (official
+                    // `flowEnd(rightOperand)` at the construct's own end).
+                    let (op_span, rhs_dead_entry) = match self.stack.pop() {
+                        Some(Frame::Branch {
+                            op_span,
+                            rhs_dead_entry,
+                            ..
+                        }) => (Some(op_span), rhs_dead_entry),
+                        other => {
+                            if let Some(frame) = other {
+                                self.stack.push(frame);
+                            }
+                            (None, false)
+                        }
+                    };
+                    if rhs_dead_entry && let Some(op_span) = op_span {
+                        self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+                        self.dead_arm_row(op_span.range.offset, *end);
+                    }
                     let right = self.pop_value();
                     let left = self.pop_value();
                     let inverted = matches!(op, BinOp::NotEq);
                     self.equality_check(&left, &right, inverted);
                 }
                 BinOp::Other => {
+                    // Same dead-RHS row face as the equality arms (`parent
+                    // is BinaryExpression` covers every user-definable
+                    // operator the spelling carries).
+                    let (op_span, rhs_dead_entry) = match self.stack.pop() {
+                        Some(Frame::Branch {
+                            op_span,
+                            rhs_dead_entry,
+                            ..
+                        }) => (Some(op_span), rhs_dead_entry),
+                        other => {
+                            if let Some(frame) = other {
+                                self.stack.push(frame);
+                            }
+                            (None, false)
+                        }
+                    };
+                    if rhs_dead_entry && let Some(op_span) = op_span {
+                        self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+                        self.dead_arm_row(op_span.range.offset, *end);
+                    }
                     self.exprs.pop();
                     self.exprs.pop();
                     self.exprs.push(Expr::trivial(Ty::UNKNOWN));
@@ -915,7 +1061,26 @@ impl Interp<'_> {
                         let invalid_tested =
                             self.ops
                                 .is_invalid_typed(tested, tested_args, self.args, self.names);
-                        let promoted = if invalid_tested {
+                        // The UNSPELLABLE-tested face (a record type
+                        // spelling — `r is (int,)`): the name-level
+                        // lattice maps it to `Base::Unknown`, and
+                        // `factor` treats the unknown head as top — its
+                        // remainder bottoms vacuously (`is_subtype(X,
+                        // Unknown) == true`), deading the unmatched arm
+                        // the oracle keeps live. An unspellable tested
+                        // type can neither factor nor promote at this
+                        // level, so the test is a plain split with no
+                        // dead arm. The gate is the NAME-level seam only:
+                        // under the resolved back-end an `Unknown` face
+                        // is the layer's own resolution gap (a dropped
+                        // unresolvable head — the InvalidType stand-in
+                        // `is_invalid_typed` certifies, or the gap the
+                        // factor path must still see), never a spelling
+                        // the lattice chose, so the split keeps the
+                        // reference behavior there.
+                        let unspellable_tested = tested.base == Base::Unknown
+                            && !self.ops.is_resolved_seam();
+                        let promoted = if invalid_tested || unspellable_tested {
                             None
                         } else {
                             self.promotion_candidate(var, tested, tested_args)
@@ -924,6 +1089,11 @@ impl Interp<'_> {
                             (
                                 self.current.clone(),
                                 self.current.clone().set_unreachable(&mut self.reach),
+                            )
+                        } else if unspellable_tested {
+                            (
+                                self.current.clone(),
+                                self.current.clone(),
                             )
                         } else {
                             self.branch_type_test(var, tested, tested_args, promoted)
@@ -1027,6 +1197,9 @@ impl Interp<'_> {
                         expr.branches = Some((cur.clone(), cur));
                     }
                 }
+                // An `is`/`is!` result is a boolean — non-null by
+                // construction.
+                expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
             Ev::AsBegin { span } => {
@@ -1586,6 +1759,12 @@ impl Interp<'_> {
                     cast_tail: None,
                 });
                 self.current = if_true;
+                // The then arm entered dead: interior polls fold into its
+                // own close row (the arm is the official's first dead
+                // node). The count drops at `CondColon`.
+                if then_dead_entry {
+                    self.arm_dead_depth += 1;
+                }
             }
             Ev::CondColon {
                 then_begin,
@@ -1607,7 +1786,10 @@ impl Interp<'_> {
                     // nested dead expression): official `flowEnd` reports
                     // the ARM node's range, the first dead node being the
                     // arm expression itself — the same re-anchor
-                    // `dead_arm_row` gives the collection-if arms.
+                    // `dead_arm_row` gives the collection-if arms. The
+                    // arm's own dead-arm contribution drops BEFORE the
+                    // row so the gate reads the outer arms only.
+                    self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
                     self.dead_arm_row(then_begin.range.offset, *then_end);
                 } else {
                     // A mid-arm death — a Never-operand cast whose type is
@@ -1632,6 +1814,12 @@ impl Interp<'_> {
                     *then_state = Some(self.current.clone());
                     *else_dead_entry = !self.reach.overall_reachable(branch.reach);
                     self.current = branch.clone();
+                    // The else arm entered dead too: its own close row
+                    // reports at `CondEnd` and interior polls fold the
+                    // same way the then arm's did.
+                    if *else_dead_entry {
+                        self.arm_dead_depth += 1;
+                    }
                 }
                 let _ = then_expr;
                 // The then value is replaced by the whole conditional's
@@ -1656,7 +1844,10 @@ impl Interp<'_> {
                     // as-cast's type poll — `c ? a : x as T` on an
                     // always-true test) is the arm's own subspan, and the
                     // official's first dead node is the whole arm
-                    // expression, so the row spans the operand whole.
+                    // expression, so the row spans the operand whole. The
+                    // arm's own dead-arm contribution drops BEFORE the
+                    // row so the gate reads the outer arms only.
+                    self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
                     self.dead_arm_row(else_begin.range.offset, *arm_end);
                 } else {
                     // The else arm's mid-arm cast-tail death (the then arm's
@@ -1691,8 +1882,8 @@ impl Interp<'_> {
                 let receiver = self
                     .exprs
                     .last()
-                    .map(|e| (e.reference, e.ty, e.args))
-                    .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
+                    .map(|e| (e.reference, e.ty, e.args, e.non_null_literal))
+                    .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false));
                 let recv_offset = self
                     .exprs
                     .last()
@@ -1788,6 +1979,15 @@ impl Interp<'_> {
                 {
                     // Interior death — the skip path rejoins at the chain's
                     // boundary and carries the continuation's reachability.
+                } else if !null_aware
+                    && matches!(events.get(i + 1), Some(Ev::ArgumentsBegin { .. }))
+                {
+                    // A non-null-aware invocation's method name is never a
+                    // dead-node candidate upstream (resolver.dart:3619
+                    // polls `node.methodName` only under `isNullAware`):
+                    // `a.m(1, 2)` on a `Never a` reports its first dead
+                    // node at the argument list — `Ev::ArgumentsBegin`
+                    // anchors at `(` below.
                 } else if !self.exit_at.is_some_and(|at| at >= member.range.offset) {
                     // A `?.` whose access path was dead at open (a
                     // null-or-equivalent receiver) anchors at the member
@@ -2148,9 +2348,71 @@ impl Interp<'_> {
                         callee.prop = None;
                     }
                     self.exprs.push(callee);
+                    // The bottom-typed result's exit (official
+                    // `recordStaticType`'s `handleExit` on
+                    // `type.isBottom`, ast.dart:11146-11153): a
+                    // `Never`-returning send ends the enclosing flow at
+                    // the call's own end — `f(Never a) { g(a); x; }` rows
+                    // `x;`. The semantic layer stages the send-level
+                    // `Ev::Exit` for the resolved sends it tracks; this
+                    // face covers the ones only the flow layer re-typed
+                    // (a staged `Never` return adopted above).
+                    if self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                        && let Ev::Send { end, .. } | Ev::SendNoArgs { end } = ev
+                    {
+                        self.unreachable_cur();
+                        if !self.collecting() {
+                            self.exit_at = Some(*end);
+                        }
+                    }
                 }
             }
-            Ev::ArgumentsBegin => {
+            Ev::ArgumentsBegin { open } => {
+                // The argument-list node poll (official
+                // `checkUnreachableNode` on the argument list, the first
+                // candidate a dead receiver's member call reaches — the
+                // non-null-aware method name is never polled,
+                // resolver.dart:3617-3621): `a.m(1, 2)` on a `Never a`
+                // anchors at `(`, and an anonymous invocation on a dead
+                // callee (`f()(x)`) takes the same face (official
+                // `AnonymousMethodInvocation` re-anchor,
+                // dead_code_verifier.dart:317-318). An exit produced at or
+                // after `(` follows the member poll's boundary rule;
+                // `dead_code` itself folds the poll into an open interval
+                // and skips arm-dead contexts. A `?.` whose access path
+                // died at OPEN keeps its own anchoring: the official
+                // polls the member name before the argument list
+                // (resolver.dart:3619), and this event stream's member
+                // poll lands at the post-send `DotAccess` — letting `(`
+                // anchor first would steal `null?.abs()`'s `abs()` row.
+                // The poll itself is gated on the callee's own shape: a
+                // member send (its selector walked as an
+                // `ExpressionContinuation` identifier just before the
+                // list) or an anonymous invocation (a `Send` just closed —
+                // `f()(x)`) reports its argument list, while a BARE call's
+                // own invocation node anchors the interval (`print('2')`
+                // rows at `print`, not at `(` — its callee walked as a
+                // plain `Expression` read).
+                if self
+                    .null_shorts
+                    .last()
+                    .is_some_and(|short| short.dead_at_open)
+                {
+                    // The `?.` face owns the anchor — the member name is
+                    // the first dead node upstream.
+                } else if matches!(
+                    events.get(i.wrapping_sub(1)),
+                    Some(
+                        Ev::Ident {
+                            context: dartq_parser::IdentifierContext::ExpressionContinuation,
+                            ..
+                        } | Ev::Send { .. }
+                            | Ev::SendNoArgs { .. }
+                    )
+                ) && !self.exit_at.is_some_and(|at| at >= open.range.offset)
+                {
+                    self.dead_code(*open);
+                }
                 self.args_bases.push(self.exprs.len());
             }
             Ev::ArgumentEnd => {
@@ -2311,8 +2573,8 @@ impl Interp<'_> {
                     let receiver = self
                         .exprs
                         .last()
-                        .map(|e| (e.reference, e.ty, e.args))
-                        .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
+                        .map(|e| (e.reference, e.ty, e.args, e.non_null_literal))
+                        .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false));
                     let recv_offset = self
                         .exprs
                         .last()
@@ -2501,7 +2763,11 @@ impl Interp<'_> {
                 for _ in 0..*interpolation_count {
                     self.exprs.pop();
                 }
-                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+                // A string literal can never evaluate to null — the same
+                // guaranteed-non-null face the leaf literals carry.
+                let mut expr = Expr::trivial(Ty::UNKNOWN);
+                expr.non_null_literal = true;
+                self.exprs.push(expr);
             }
             Ev::Spread | Ev::NullAwareElement => {
                 // The operand's value is consumed; the element leaves its
@@ -2526,6 +2792,13 @@ impl Interp<'_> {
                 // `handle_ifElement_conditionEnd`, type_analyzer.dart:1161).
                 self.condition_operand(&cond);
                 let (if_true, if_false) = self.cond_split(&cond);
+                // The then-element entered dead: interior polls fold into
+                // the arm's own close row (the element is the official's
+                // first dead node); the count drops at `ElseControlFlow`.
+                let then_dead_entry = !self.reach.overall_reachable(if_true.reach);
+                if then_dead_entry {
+                    self.arm_dead_depth += 1;
+                }
                 self.stack.push(Frame::Branch {
                     branch: if_false,
                     ifnull_ty: None,
@@ -2547,6 +2820,8 @@ impl Interp<'_> {
                     then_start: *arm_start,
                     else_start: None,
                     after_then: None,
+                    then_dead_entry,
+                    else_dead_entry: false,
                 });
             }
             Ev::ElseControlFlow {
@@ -2564,11 +2839,26 @@ impl Interp<'_> {
                 if let Some(frame) = self.coll_if.last_mut() {
                     frame.else_start = Some(*else_start);
                     frame.after_then = Some(self.current.clone());
+                    // The then-element's dead-arm contribution drops at
+                    // its close so the row gate reads the outer arms.
+                    if frame.then_dead_entry {
+                        self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+                    }
                 }
                 if let Some(then_start) = self.coll_if.last().map(|f| f.then_start) {
                     self.dead_arm_row(then_start, *then_end);
                 }
                 if let Some(Frame::Branch { branch, .. }) = self.stack.last() {
+                    // The else-element begins under the condition-false
+                    // branch — its own entry deadness latches the same
+                    // way the then-element's did.
+                    let else_dead_entry = !self.reach.overall_reachable(branch.reach);
+                    if else_dead_entry {
+                        self.arm_dead_depth += 1;
+                    }
+                    if let Some(frame) = self.coll_if.last_mut() {
+                        frame.else_dead_entry = else_dead_entry;
+                    }
                     self.current = branch.clone();
                 }
             }
@@ -2579,15 +2869,25 @@ impl Interp<'_> {
                 // `handle_ifElement_elseEnd`, type_analyzer.dart:1163-1173):
                 // a dead arm reports its own extent, one row per arm.
                 let coll = self.coll_if.pop();
-                if !self.reachable()
-                    && let Some(frame) = &coll
-                {
-                    let anchor = if *has_else {
-                        frame.else_start.unwrap_or(frame.then_start)
+                if let Some(frame) = &coll {
+                    // The closing arm's own dead-arm contribution drops
+                    // before the row: the gate reads the outer arms.
+                    let arm_dead_entry = if *has_else {
+                        frame.else_dead_entry
                     } else {
-                        frame.then_start
+                        frame.then_dead_entry
                     };
-                    self.dead_arm_row(anchor, *arm_end);
+                    if arm_dead_entry {
+                        self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+                    }
+                    if !self.reachable() {
+                        let anchor = if *has_else {
+                            frame.else_start.unwrap_or(frame.then_start)
+                        } else {
+                            frame.then_start
+                        };
+                        self.dead_arm_row(anchor, *arm_end);
+                    }
                 }
                 let Some(Frame::Branch { branch, .. }) = self.stack.pop() else {
                     // A frame-less close (unbalanced recovery buffer): the
@@ -2679,6 +2979,7 @@ impl Interp<'_> {
         }
         if let Some(head) = self.exprs.last_mut() {
             head.literal = true;
+            head.non_null_literal = true;
         }
     }
 
@@ -2691,6 +2992,7 @@ impl Interp<'_> {
         }
         if let Some(head) = self.exprs.last_mut() {
             head.literal = true;
+            head.non_null_literal = true;
             // The literal's own face is the collection, never the
             // element: the collapsed tail row is the last element's
             // value row reused for the LIFO pop, and its (possibly
@@ -3169,6 +3471,8 @@ impl Interp<'_> {
                 expr.branches = Some((cur.clone(), cur));
             }
         }
+        // `==`/`!=` is a boolean — non-null by construction.
+        expr.non_null_literal = true;
         self.exprs.push(expr);
     }
 }

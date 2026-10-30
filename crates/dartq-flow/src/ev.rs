@@ -510,7 +510,15 @@ pub enum Ev {
         // read chain (`a?.foo` ends after `foo`).
         end: u32,
     },
-    ArgumentsBegin,
+    /// The `(` of an invocation's argument list. `open` anchors the dead
+    /// node's poll: the official resolver never polls a non-null-aware
+    /// invocation's method name (resolver.dart:3619 polls
+    /// `node.methodName` only under `isNullAware`), so a member call whose
+    /// receiver killed the flow reports its first dead node at the
+    /// argument list — `a.m(1, 2)` on a `Never a` rows `(1, 2)`.
+    ArgumentsBegin {
+        open: TokenSpan,
+    },
     /// One argument's value expression is complete. Official analyzes an
     /// argument list one expression at a time, and each argument's
     /// null-shorting finishes at ITS own end (`finishNullShorting` at the
