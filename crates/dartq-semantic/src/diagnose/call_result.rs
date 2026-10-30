@@ -58,10 +58,10 @@ impl Engine<'_> {
                 .iter()
                 .position(|probe| probe.range == row.range && probe.name == row.name)
             && let Some(offset) = self.rows.get(index).map(|r| r.range.offset)
-            && let Some((_, explicit)) = self.call_type_args.iter().find(|(r, _)| *r == offset)
-            && explicit.len() == own
+            && let Some((_, entry)) = self.call_type_args.iter().find(|(r, _)| *r == offset)
+            && entry.tys.len() == own
         {
-            for ((param, _), ty) in params.iter().zip(explicit.iter()) {
+            for ((param, _), ty) in params.iter().zip(entry.tys.iter()) {
                 keys.entry(*param).or_insert(*ty);
             }
         }

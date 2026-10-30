@@ -2588,7 +2588,11 @@ fn relink_directives(
 ///    subtract/add per file face, and the affected claim-key set is
 ///    collected: the part files themselves when changed, plus every target a
 ///    changed or removed defining file offered (old AND new faces — a
-///    library-name edit flips `may_claim` while the offer set stands).
+///    library-name edit flips `may_claim` while the offer set stands), plus
+///    the moved `part` targets of changed and removed includers, with their
+///    `part of`-subtrees — offers never carry a part's targets, but every
+///    climb hop reads the includer's directives as its edge facts, and a
+///    removal kills the edge outright (#2887).
 /// 2. Claim resolution runs over the affected keys only, against the final
 ///    offer index. Resolution itself stays deterministic-total (the
 ///    path-smallest qualifying candidate), so restricting WHICH part files
@@ -2695,6 +2699,11 @@ fn maintain_and_close(
     // them); import sources from every file. Both indexes are raw, so the
     // maintenance is a pure face diff.
     let mut affected_parts: FxHashSet<FileId> = FxHashSet::default();
+    // The batch's moved `part`-include targets (#2887): a changed
+    // includer's moved directive list and every removed includer's list
+    // collect here, expanded to their `part of`-subtrees once both face
+    // loops have settled the source index.
+    let mut moved_include_targets: Vec<FileId> = Vec::new();
     for (file, old, new) in &changed_faces {
         let old_defining_offers: &[FileId] = match old {
             Some(face) if !face.part => &face.part_targets,
@@ -2709,6 +2718,20 @@ fn maintain_and_close(
         affected_parts.extend(new_defining_offers.iter().copied());
         if old.as_ref().is_some_and(|face| face.part) || new.part {
             affected_parts.insert(*file);
+        }
+        // The includer's own directive face (#2887): a part makes no
+        // offers, so its `part` targets seed nothing through the offer rows
+        // — yet every claim the includer-chain climb answers reads the
+        // includer's directives as edge facts (`FileKind.hasPart`). A moved
+        // list re-attributes the targets' subtree; an unmoved list costs
+        // one slice compare (the body-edit common case).
+        let old_part_targets: &[FileId] = match old {
+            Some(face) => &face.part_targets,
+            None => NO_TARGETS,
+        };
+        if old_part_targets != new.part_targets {
+            moved_include_targets.extend(old_part_targets.iter().copied());
+            moved_include_targets.extend(new.part_targets.iter().copied());
         }
         reindex(
             &mut state.part_offers,
@@ -2738,8 +2761,12 @@ fn maintain_and_close(
         );
     }
     for (file, face) in &removed_faces {
+        // A removed includer's targets re-resolve with it (#2887): the
+        // removal kills the include edge exactly like a directive-list
+        // move, part or defining alike. The offer-row retraction stays
+        // guarded — only defining files ever held offer rows.
+        moved_include_targets.extend(face.part_targets.iter().copied());
         if !face.part {
-            affected_parts.extend(face.part_targets.iter().copied());
             reindex(
                 &mut state.part_offers,
                 *file,
@@ -2760,6 +2787,27 @@ fn maintain_and_close(
             NO_TARGETS,
         );
     }
+    // A moved `part` target's subtree re-resolves with it (#2887): the
+    // target's own climb hop flipped or vanished with its includer, and so
+    // does every deeper part whose `part of` chain descends through the
+    // target — attribution moves with no face of their own changing
+    // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/analysis/
+    // file_state.dart:2231-2245, the `PartOfUriKnownFileKind.library`
+    // climb each of them re-runs). The walk reads the settled post-batch
+    // `part_of_sources` rows under an identity visited set — the climb's
+    // own cycle bound — and stays bounded by the live directive set;
+    // changed batch members skip the re-resolution below (they resolve
+    // directly) and non-residents fall through its residency read.
+    let mut visited: FxHashSet<FileId> = moved_include_targets.iter().copied().collect();
+    let mut subtree: Vec<FileId> = visited.iter().copied().collect();
+    while let Some(target) = subtree.pop() {
+        for &descendant in state.part_of_sources.row(target) {
+            if visited.insert(descendant) {
+                subtree.push(descendant);
+            }
+        }
+    }
+    affected_parts.extend(visited);
 
     // Phase 2 — ownership decisions. Resolution reads the FINAL offer index,
     // so every offer delta above has landed; owners mint through the arena's
@@ -3217,7 +3265,10 @@ fn path_key(state: &EngineState, file: FileId) -> &[u8] {
 /// path-smallest defining file whose `may_claim` holds against current
 /// facts. Deterministic-total over the candidate set, so restricting which
 /// part files resolve (the affected key set) never forks precedence; two
-/// candidates cannot tie because interned paths are unique per file.
+/// candidates cannot tie because interned paths are unique per file. A
+/// nested URI-form part — whose direct includer is itself a part, so no
+/// defining file ever offers it — falls through to the includer-chain
+/// climb for its root claimant.
 fn resolve_claim(state: &EngineState, part: FileId) -> Option<FileId> {
     let mut winner: Option<FileId> = None;
     for &candidate in state.part_offers.row(part) {
@@ -3228,7 +3279,67 @@ fn resolve_claim(state: &EngineState, part: FileId) -> Option<FileId> {
             winner = Some(candidate);
         }
     }
-    winner
+    winner.or_else(|| climb_includer_chain(state, part))
+}
+
+/// The nested-part climb (`root ← mid ← leaf`): leaf's `part of` URI names
+/// mid, a part file whose offers are never indexed (offers come only from
+/// defining files), so the offer-row walk finds no claimant and the chain
+/// attributes through the includers to the root defining file — hop for
+/// hop the oracle's `PartOfUriKnownFileKind.library` (upstream Dart SDK
+/// source, pkg/analyzer/lib/src/dart/analysis/file_state.dart:2231-2245):
+/// each hop is the current part's `part of` URI target confirmed by that
+/// target's own `part` directive (`FileKind.hasPart`); a defining file ends
+/// the climb as the claimant, a name-form part dead-ends it (the oracle's
+/// `default` arm — name-form parts attribute only against libraries), and
+/// an identity visited set answers null on a malformed include cycle.
+/// Name-form parts never climb here: their multi-library race needs the
+/// offer row's path-smallest winner (`PartOfNameFileKind.library`),
+/// already resolved above.
+fn climb_includer_chain(state: &EngineState, part: FileId) -> Option<FileId> {
+    let own_part_of = state.residency.get(&part)?.part_of()?;
+    if own_part_of.name.is_some() {
+        return None;
+    }
+    let ResolvedTarget::Resolved(mut current) = own_part_of.target else {
+        return None;
+    };
+    if !has_part_edge(state, current, part) {
+        return None;
+    }
+    let mut visited: FxHashSet<FileId> = FxHashSet::default();
+    while visited.insert(current) {
+        let facts = &state.residency[&current];
+        if !facts.is_part() {
+            return Some(current);
+        }
+        let part_of = facts.part_of()?;
+        if part_of.name.is_some() {
+            return None;
+        }
+        let ResolvedTarget::Resolved(next) = part_of.target else {
+            return None;
+        };
+        if !has_part_edge(state, next, current) {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
+/// Whether the resident `includer` carries a `part` directive resolving to
+/// `included` — the oracle's `FileKind.hasPart` directive edge, read from
+/// the same residency directives the membership walk traverses (the climb
+/// must run against part includers too, whose offers the index never
+/// carries).
+fn has_part_edge(state: &EngineState, includer: FileId, included: FileId) -> bool {
+    state.residency.get(&includer).is_some_and(|facts| {
+        facts.directives.iter().any(|directive| {
+            directive.kind == DirectiveKind::Part
+                && directive.target == ResolvedTarget::Resolved(included)
+        })
+    })
 }
 
 /// The one-library formation recomputed from current facts — the affected
@@ -3251,20 +3362,26 @@ fn build_library_info(
     // namespace. The path-smallest `library_of_file` winner stays the
     // attribution owner and is irrelevant here.
     //
-    // The walk is breadth-first over each member's own part directives: a
-    // depth-2 chain (`root ← mid ← leaf`, leaf's part-of binding to mid)
-    // joins the leaf through the attached middle — the oracle's library
-    // builds transitively (a `g()` declared in the leaf resolves bare in
-    // the root), the URI-form claim testing each hop against its DIRECT
-    // includer (`may_claim(state, member, …)`).
+    // The walk is the oracle's unit set, `LibraryFileKind.fileKinds`
+    // (file_state.dart): depth-first pre-order from the defining file over
+    // each member's own part directives in written order — transitive
+    // through nested `part of` chains (`root ← mid ← leaf`, leaf's part-of
+    // binding to mid, joins through the attached mid; a `g()` declared in
+    // the leaf resolves bare in the root, and the leaf's fragment lands
+    // between mid and the next sibling, the order the oracle's augmentation
+    // application reads). Each hop confirms against its DIRECT includer
+    // (`may_claim(state, member, …)` = upstream `PartIncludeWithFile
+    // .includedPart`). The `claimed` set is the cycle guard: a malformed
+    // include cycle re-reaching a member fails the insert and is skipped,
+    // so the walk stays bounded by residency — upstream answers the same
+    // shape null on its climb-side identity visited set
+    // (`PartOfUriKnownFileKind.library`).
     let mut members: Vec<FileId> = Vec::new();
     let mut claimed: FxHashSet<FileId> = FxHashSet::default();
-    members.push(defining);
     claimed.insert(defining);
-    let mut hop = 0;
-    while hop < members.len() {
-        let member = members[hop];
-        hop += 1;
+    let mut pending: Vec<FileId> = vec![defining];
+    while let Some(member) = pending.pop() {
+        members.push(member);
         let mut joined: Vec<FileId> = Vec::new();
         for directive in &state.residency[&member].directives {
             if directive.kind != DirectiveKind::Part {
@@ -3285,8 +3402,10 @@ fn build_library_info(
                 claimed.remove(&target);
             }
         }
-        joined.sort_unstable_by_key(|file| path_key(state, *file));
-        members.extend(joined);
+        // Reverse-push: pops visit the part subtrees in directive order,
+        // completing each part's own subtree before the next sibling — the
+        // pre-order above, not a level-order hull.
+        pending.extend(joined.into_iter().rev());
     }
     let content: Box<[ContentId]> = members
         .iter()
@@ -3859,6 +3978,7 @@ pub(crate) mod tests {
                 self.packages.clone(),
                 &self.config,
                 &self.config_dir,
+                &[],
                 SdkSnapshot::load(&self.root.join("sdk"), None).expect("synthetic SDK loads"),
                 crate::memory_store(),
                 "vm".to_owned(),
@@ -4000,6 +4120,561 @@ pub(crate) mod tests {
                 "every matching library includes the part as a member"
             );
         }
+    }
+
+    /// Nested `part of` chains join transitively in the oracle's unit order
+    /// (#2883, the application_order_A01_t02 corpus shape): the member set is
+    /// the depth-first pre-order over part includes (upstream
+    /// `LibraryFileKind.fileKinds`) — a part's own part subtree lands before
+    /// the next sibling — in written directive order even when path bytes
+    /// sort differently, each hop confirming against its DIRECT includer.
+    /// The resolution graph folds this list verbatim (`builder.unit` per
+    /// member in the graph build), so `unit_files` carries the nested chain
+    /// the augmentation fragment order reads.
+    #[test]
+    fn nested_part_chain_joins_in_depth_first_preorder() {
+        let fixture = Fixture::new_with_grants();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'z_mid.dart';\npart 'a_leaf.dart';\n",
+        );
+        let mid = set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\npart 'm_leaf.dart';\n",
+        );
+        let m_leaf = set(
+            &mut state,
+            &lib.join("m_leaf.dart"),
+            "part of 'z_mid.dart';\n",
+        );
+        let a_leaf = set(
+            &mut state,
+            &lib.join("a_leaf.dart"),
+            "part of 'root.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        let info = state.libraries.info(library).expect("live");
+        assert_eq!(info.defining, root);
+        // Pre-order, distinguishing all three shapes: the old breadth-first
+        // hull would list a_leaf before m_leaf, and path order would list
+        // a_leaf first outright.
+        assert_eq!(info.parts.as_slice(), &[mid, m_leaf, a_leaf]);
+    }
+
+    /// Single-part regression (#2883): one URI-form part joins in directive
+    /// order and the defining file stays out of `parts` (membership minus
+    /// the defining unit).
+    #[test]
+    fn single_uri_form_part_joins_in_directive_order() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'p.dart';\n",
+        );
+        let part = set(&mut state, &lib.join("p.dart"), "part of 'root.dart';\n");
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        let info = state.libraries.info(library).expect("live");
+        assert_eq!(info.defining, root);
+        assert_eq!(info.parts.as_slice(), &[part]);
+    }
+
+    /// Malformed part graphs terminate with the oracle's outcomes (#2883):
+    /// a mutual `part of` cycle no library includes joins no membership
+    /// (upstream climbs the includer chain under an identity visited set and
+    /// answers null, `PartOfUriKnownFileKind.library`), and a name-form
+    /// include back-edge re-reaching a member — whose `may_claim` confirm
+    /// passes at every hop against the root's name — is dropped only by the
+    /// visited set, so the walk stays bounded and membership keeps the
+    /// acyclic prefix. The apply returning is the termination face.
+    #[test]
+    fn malformed_part_cycles_terminate_without_membership() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        // The cycle pair: both are part files offered by no defining file,
+        // so neither joins any library's membership.
+        let c_a = set(&mut state, &lib.join("c_a.dart"), "part of 'c_b.dart';\n");
+        let c_b = set(&mut state, &lib.join("c_b.dart"), "part of 'c_a.dart';\n");
+        // The rooted name-form cycle: root → p1 → p2, and p2 includes p1
+        // back — the confirm passes (name form matches the root's name at
+        // every hop), the visited set is what drops the re-entry.
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'p1.dart';\n",
+        );
+        let p1 = set(
+            &mut state,
+            &lib.join("p1.dart"),
+            "part of dup;\npart 'p2.dart';\n",
+        );
+        let p2 = set(
+            &mut state,
+            &lib.join("p2.dart"),
+            "part of dup;\npart 'p1.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        let info = state.libraries.info(library).expect("live");
+        assert_eq!(
+            info.parts.as_slice(),
+            &[p1, p2],
+            "the back-edge re-entry is dropped, membership keeps the acyclic prefix"
+        );
+        let cycle_pair = [c_a, c_b];
+        for (_, member) in state.libraries.iter_infos() {
+            assert!(
+                member.parts.iter().all(|file| !cycle_pair.contains(file)),
+                "a part-of cycle no library includes never joins membership"
+            );
+        }
+    }
+
+    /// A nested URI-form part — a `part of` naming a part file, so no
+    /// defining file offers it — attributes to its ROOT library through the
+    /// includer chain (#2885), never to itself: the oracle's
+    /// `PartOfUriKnownFileKind.library` climbs the confirmed includers
+    /// (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/analysis/file_state.dart:2231-2245). A
+    /// name-form mid dead-ends the climb (the oracle's `default` arm): the
+    /// leaf under it stays self-attributed even though the membership walk
+    /// — whose per-hop confirm is `isPartOf`, not the climb's kind dispatch
+    /// — still carries it as a member.
+    #[test]
+    fn nested_part_attributes_to_root_library_not_itself() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'z_mid.dart';\n",
+        );
+        let mid = set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\npart 'leaf.dart';\n",
+        );
+        let leaf = set(
+            &mut state,
+            &lib.join("leaf.dart"),
+            "part of 'z_mid.dart';\n",
+        );
+        // The climb's dead-end shape: the URI-form leaf's direct includer is
+        // a NAME-form part, where the oracle's climb answers null.
+        let n_root = set(
+            &mut state,
+            &lib.join("n_root.dart"),
+            "library dup;\npart 'n_mid.dart';\n",
+        );
+        let n_mid = set(
+            &mut state,
+            &lib.join("n_mid.dart"),
+            "part of dup;\npart 'n_leaf.dart';\n",
+        );
+        let n_leaf = set(
+            &mut state,
+            &lib.join("n_leaf.dart"),
+            "part of 'n_mid.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        assert_eq!(
+            state.library_of_file[&mid], library,
+            "the mid part attributes to the root library"
+        );
+        assert_eq!(
+            state.library_of_file[&leaf], library,
+            "the nested leaf climbs through the mid part to the root library"
+        );
+        let owner = state.libraries.info(library).expect("live");
+        assert_eq!(
+            owner.defining, root,
+            "the climb's claimant is the root defining file, never the leaf itself"
+        );
+
+        let n_library = state.library_of_file[&n_root];
+        let n_leaf_owner = state.library_of_file[&n_leaf];
+        assert_ne!(
+            n_leaf_owner, n_library,
+            "a leaf under a name-form mid does not attribute to the root"
+        );
+        assert_eq!(
+            state.libraries.info(n_leaf_owner).expect("live").defining,
+            n_leaf,
+            "the dead-ended climb leaves the leaf self-attributed"
+        );
+        let n_info = state.libraries.info(n_library).expect("live");
+        assert!(
+            n_info.parts.contains(&n_mid) && n_info.parts.contains(&n_leaf),
+            "membership still carries both through the name-form mid"
+        );
+    }
+
+    /// Single-part attribution regression (#2885): the direct URI-form part
+    /// keeps resolving through the offer row — its defining includer — and
+    /// the climb must not disturb it.
+    #[test]
+    fn single_part_attributes_to_its_defining_library() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'p.dart';\n",
+        );
+        let part = set(&mut state, &lib.join("p.dart"), "part of 'root.dart';\n");
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        assert_eq!(state.library_of_file[&part], library);
+        assert_eq!(
+            state.libraries.info(library).expect("live").defining,
+            root,
+            "the part's owner is the defining file's library, never a self-attribute"
+        );
+    }
+
+    /// The climb's cycle guard (#2885): two parts whose `part of` URIs and
+    /// `part` directives reference each other re-reach the visited entry —
+    /// the identity set answers null exactly as the oracle's climb does
+    /// (`PartOfUriKnownFileKind.library`) — so both stay self-attributed,
+    /// and the apply returning is the termination face.
+    #[test]
+    fn climb_include_cycle_terminates_self_attributed() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let c_a = set(
+            &mut state,
+            &lib.join("c_a.dart"),
+            "part of 'c_b.dart';\npart 'c_b.dart';\n",
+        );
+        let c_b = set(
+            &mut state,
+            &lib.join("c_b.dart"),
+            "part of 'c_a.dart';\npart 'c_a.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let a_owner = state.library_of_file[&c_a];
+        let b_owner = state.library_of_file[&c_b];
+        assert_ne!(a_owner, b_owner, "each cycle member stays its own library");
+        assert_eq!(
+            state.libraries.info(a_owner).expect("live").defining,
+            c_a,
+            "the cycle resolves no claimant, so c_a self-attributes"
+        );
+        assert_eq!(
+            state.libraries.info(b_owner).expect("live").defining,
+            c_b,
+            "the cycle resolves no claimant, so c_b self-attributes"
+        );
+    }
+
+    /// A part-includer's directive edit re-attributes its subtree (#2887):
+    /// when the mid part gains `part 'leaf.dart'` in an edit batch, the
+    /// leaf — content-unchanged, offered by no defining file — re-resolves
+    /// through the climb to the root library, the same verdict a full
+    /// rebuild reaches (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/analysis/file_state.dart:2231-2245, the
+    /// `PartOfUriKnownFileKind.library` climb whose first hop
+    /// `includingContainer` re-reads the mid's `hasPart`). Without the
+    /// moved-directive seeding the leaf keeps its stale self-attribution
+    /// for the whole edit batch.
+    #[test]
+    fn mid_part_directive_gain_reattributes_its_leaf() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'z_mid.dart';\n",
+        );
+        let mid = set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\n",
+        );
+        let leaf = set(
+            &mut state,
+            &lib.join("leaf.dart"),
+            "part of 'z_mid.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        assert_ne!(
+            state.library_of_file[&leaf], state.library_of_file[&root],
+            "without the include edge the leaf does not attribute to the root library"
+        );
+        assert_eq!(
+            state
+                .libraries
+                .info(state.library_of_file[&leaf])
+                .expect("live")
+                .defining,
+            leaf,
+            "the climb dead-ends on the missing edge, the leaf is its own library"
+        );
+
+        // The edit batch: the mid's `part` list gains the leaf include.
+        set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\npart 'leaf.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        assert_eq!(
+            state.library_of_file[&leaf], library,
+            "the moved include edge re-seeds the leaf, whose climb now reaches the root library"
+        );
+        let info = state.libraries.info(library).expect("live");
+        assert_eq!(info.defining, root);
+        assert_eq!(
+            info.parts.as_slice(),
+            &[mid, leaf],
+            "membership carries the joined leaf behind its mid, in pre-order"
+        );
+    }
+
+    /// The loss direction of the same face (#2887): the mid part losing
+    /// `part 'leaf.dart'` kills the climb's first hop, and the
+    /// content-unchanged leaf reverts to self-attribution in the same edit
+    /// batch instead of riding the root library's stale membership.
+    #[test]
+    fn mid_part_directive_loss_reverts_its_leaf_to_self_attribution() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'z_mid.dart';\n",
+        );
+        let mid = set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\npart 'leaf.dart';\n",
+        );
+        let leaf = set(
+            &mut state,
+            &lib.join("leaf.dart"),
+            "part of 'z_mid.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        assert_eq!(
+            state.library_of_file[&leaf], state.library_of_file[&root],
+            "the nested leaf starts attributed to the root library"
+        );
+
+        // The edit batch: the mid's `part` list loses the leaf include.
+        set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        assert_ne!(
+            state.library_of_file[&leaf], state.library_of_file[&root],
+            "the severed edge re-seeds the leaf out of the root library"
+        );
+        assert_eq!(
+            state
+                .libraries
+                .info(state.library_of_file[&leaf])
+                .expect("live")
+                .defining,
+            leaf,
+            "the dead climb leaves the leaf self-attributed"
+        );
+        let info = state
+            .libraries
+            .info(state.library_of_file[&root])
+            .expect("live");
+        assert_eq!(
+            info.parts.as_slice(),
+            &[mid],
+            "membership drops the leaf with its include edge"
+        );
+    }
+
+    /// The removal face of the includer-subtree seeding (#2887): removing
+    /// the mid part kills the leaf's climb exactly like a directive-list
+    /// move. The leaf itself relinks regardless (its `part of` names the
+    /// removed file), but the deeper leaf2 — whose `part of` names the
+    /// surviving leaf — has no face of its own in the batch and reverts to
+    /// self-attribution only through the removed includer's seeded subtree.
+    #[test]
+    fn removed_mid_part_reverts_its_leaf_subtree_to_self_attribution() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'z_mid.dart';\n",
+        );
+        let mid = set(
+            &mut state,
+            &lib.join("z_mid.dart"),
+            "part of 'root.dart';\npart 'leaf.dart';\n",
+        );
+        let leaf = set(
+            &mut state,
+            &lib.join("leaf.dart"),
+            "part of 'z_mid.dart';\npart 'leaf2.dart';\n",
+        );
+        let leaf2 = set(
+            &mut state,
+            &lib.join("leaf2.dart"),
+            "part of 'leaf.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        assert_eq!(
+            state.library_of_file[&leaf], library,
+            "the nested leaf starts attributed to the root library"
+        );
+        assert_eq!(
+            state.library_of_file[&leaf2], library,
+            "the leaf's own subtree starts attributed to the root library"
+        );
+
+        // The removal batch: the leaf subtree's root-side includer leaves
+        // residency.
+        remove(&mut state, mid);
+        apply(&mut state, &mut |_| {});
+
+        assert_ne!(
+            state.library_of_file[&leaf], state.library_of_file[&root],
+            "the orphaned leaf leaves the root library"
+        );
+        assert_eq!(
+            state
+                .libraries
+                .info(state.library_of_file[&leaf])
+                .expect("live")
+                .defining,
+            leaf,
+            "the leaf's dead `part of` leaves it self-attributed"
+        );
+        assert_ne!(
+            state.library_of_file[&leaf2], state.library_of_file[&root],
+            "the seeded subtree leaves the root library"
+        );
+        assert_eq!(
+            state
+                .libraries
+                .info(state.library_of_file[&leaf2])
+                .expect("live")
+                .defining,
+            leaf2,
+            "the climb through the orphaned leaf dead-ends, leaf2 self-attributes"
+        );
+        assert!(
+            state
+                .libraries
+                .info(state.library_of_file[&root])
+                .expect("live")
+                .parts
+                .is_empty(),
+            "membership drops the removed mid with its residency"
+        );
+    }
+
+    /// Defining-file directive edits seed as before (#2887 regression):
+    /// the offer-row path — the only seeding a defining file's `part` list
+    /// ever needed — keeps re-attributing its direct parts both ways across
+    /// edit batches while the reworked seeding around it lands.
+    #[test]
+    fn defining_file_directive_edits_still_seed_their_direct_parts() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let root = set(&mut state, &lib.join("root.dart"), "library dup;\n");
+        let part = set(&mut state, &lib.join("p.dart"), "part of 'root.dart';\n");
+        apply(&mut state, &mut |_| {});
+
+        assert_eq!(
+            state
+                .libraries
+                .info(state.library_of_file[&part])
+                .expect("live")
+                .defining,
+            part,
+            "unoffered, the part starts self-attributed"
+        );
+
+        // The defining file gains `part 'p.dart'`: the offer row seeds the
+        // part into the affected key set.
+        set(
+            &mut state,
+            &lib.join("root.dart"),
+            "library dup;\npart 'p.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let library = state.library_of_file[&root];
+        assert_eq!(
+            state.library_of_file[&part], library,
+            "the gained offer re-seeds the part into the defining library"
+        );
+        assert_eq!(
+            state
+                .libraries
+                .info(library)
+                .expect("live")
+                .parts
+                .as_slice(),
+            &[part]
+        );
+
+        // And losing it retracts the claim the same way.
+        set(&mut state, &lib.join("root.dart"), "library dup;\n");
+        apply(&mut state, &mut |_| {});
+
+        assert_ne!(
+            state.library_of_file[&part], state.library_of_file[&root],
+            "the retracted offer re-seeds the part out of the defining library"
+        );
+        assert_eq!(
+            state
+                .libraries
+                .info(state.library_of_file[&part])
+                .expect("live")
+                .defining,
+            part,
+            "the part reverts to self-attribution"
+        );
+        assert!(
+            state
+                .libraries
+                .info(state.library_of_file[&root])
+                .expect("live")
+                .parts
+                .is_empty(),
+            "membership drops the part with its offer"
+        );
     }
 
     /// Conditional imports fork end-to-end (#512): the diet walk captures
@@ -5447,12 +6122,18 @@ pub(crate) mod tests {
         assert_eq!(rows[1].range.length, "show utf8 hide json".len() as u32);
     }
 
-    /// A `part`'s missing target spells the resolved absolute form — the
-    /// oracle reports `includedFile.uriStr` (the `file://` URI) from the
-    /// non-part-kind arm (library_analyzer.dart:1038-1046) — while
-    /// import/export rows keep the written literal.
+    /// A `part`'s missing target spells the canonical URI form — the
+    /// oracle reports `includedFile.uriStr` from the non-part-kind arm
+    /// (library_analyzer.dart:1030-1046): `package:` inside a package,
+    /// `file://` outside. The fixture IS package `t` (pubspec `name: t`),
+    /// so the canonical spelling here is the `package:` face — the same
+    /// face the conformance census caught the oracle spelling
+    /// (`part 'a.dart'` under package `test` reports
+    /// `package:test/a.dart`); the `file://` outside face is pinned in
+    /// `tests/canonical_uri_faces.rs`. Import/export rows keep the
+    /// written literal.
     #[test]
-    fn part_missing_target_spells_absolute_uri() {
+    fn part_missing_target_spells_canonical_uri() {
         let fixture = Fixture::new();
         let mut state = fixture.state();
         let lib = fixture.root.join("lib");
@@ -5462,8 +6143,8 @@ pub(crate) mod tests {
             "part 'sub/gone.dart';\nimport 'nope.dart';\n",
         );
         apply(&mut state, &mut |_| {});
-        // The absolute spelling is the pipeline's report-layer rewrite: the
-        // stored run's rows (not the raw residency facts) carry it.
+        // The canonical spelling is the pipeline's report-layer rewrite:
+        // the stored run's rows (not the raw residency facts) carry it.
         let mut graph: Option<crate::pipeline::ResolvedGraph> = None;
         let cancel = crate::cancel::CancellationToken::new();
         crate::pipeline::analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel)
@@ -5475,12 +6156,11 @@ pub(crate) mod tests {
             .find(|d| d.range.offset == 5)
             .expect("the part row reports");
         assert_eq!(part.code.name, "uri_does_not_exist");
-        let expected = format!(
-            "Target of URI doesn't exist: 'file://{}'.",
-            lib.join("sub").join("gone.dart").display()
-        );
         let spelled: String = part.message.to_string();
-        assert_eq!(spelled, expected, "part spells the absolute form");
+        assert_eq!(
+            spelled, "Target of URI doesn't exist: 'package:t/lib/sub/gone.dart'.",
+            "part spells the canonical form"
+        );
         let import = rows
             .iter()
             .find(|d| d.range.offset == ("part 'sub/gone.dart';\n".len() + "import ".len()) as u32)

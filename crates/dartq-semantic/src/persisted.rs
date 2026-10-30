@@ -79,6 +79,32 @@ pub struct PersistedElements {
     /// `augmentations`.
     #[serde(default)]
     pub decl_kinds: Vec<PersistedAugTarget>,
+    /// The unit's anonymous-method invocations (the anonymous-methods
+    /// experiment's capture face). Additive: `default` so pre-face payloads
+    /// decode with no rows.
+    #[serde(default)]
+    pub anon_methods: Vec<PersistedAnonMethod>,
+}
+
+/// One [`crate::model::AnonMethodInvocation`] in payload form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAnonMethod {
+    pub punctuation: PersistedRange,
+    pub null_aware: bool,
+    pub parens: Option<(PersistedRange, PersistedRange)>,
+    pub param_count: u16,
+    pub first_named: bool,
+    pub first_optional: bool,
+    pub param_ty: Option<PersistedParamType>,
+}
+
+/// The written parameter type and its anchor span (the
+/// `anonymous_method_wrong_parameter_type` row's range), one payload node
+/// so the pair cannot diverge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedParamType {
+    pub ty: PersistedTy,
+    pub range: PersistedRange,
 }
 
 /// One [`crate::model::ConstCreationFace`] in payload form.
@@ -128,6 +154,15 @@ pub enum PersistedTy {
     Function {
         nullable: bool,
         type_params: u16,
+        /// The signature's own type parameters as written (name + bound,
+        /// declaration order; the #2878 display column). Additive after
+        /// the format shipped: `default` so pre-column payloads decode
+        /// count-only — exact, since a pre-column binary could not record
+        /// the names (the #539 additive-field discipline; the count-only
+        /// identity is preserved, the display under-reports the group as
+        /// those binaries rendered it).
+        #[serde(default)]
+        type_params_named: Vec<(u32, Option<PersistedTy>)>,
         return_ty: Box<PersistedTy>,
         positional: Vec<PersistedTy>,
         named: Vec<(u32, PersistedTy)>,
@@ -546,6 +581,9 @@ pub struct PersistedAugment {
     pub group_open: Option<PersistedRange>,
     pub const_kw: Option<PersistedRange>,
     pub factory_kw: Option<PersistedRange>,
+    /// The fragment's completeness bit (`*FragmentImpl.isComplete`) — feeds
+    /// the `declaration_already_complete` chain walk.
+    pub is_complete: bool,
 }
 
 /// One augmentation-target kind row (the verifier's introductory-declaration
@@ -559,6 +597,9 @@ pub struct PersistedAugTarget {
     pub is_mixin_application: bool,
     pub is_const: bool,
     pub is_factory: bool,
+    /// The intro fragment's completeness bit (`*FragmentImpl.isComplete`) —
+    /// the `declaration_already_complete` chain walk.
+    pub is_complete: bool,
 }
 
 /// The per-entry string slice under construction: every referenced
@@ -648,10 +689,15 @@ impl<'a> Slice<'a> {
                 // across producers (intern order varies by run). Decode
                 // re-interns canonically, so identity survives: a differently
                 // ordered payload costs a spurious cache miss, never a wrong hit.
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_params_named, return_ty, positional, named) = {
                     let shape = self.type_args.function_shape(shape);
                     (
                         shape.type_params,
+                        shape
+                            .type_params_named
+                            .iter()
+                            .map(|(n, b)| (*n, *b))
+                            .collect::<Vec<_>>(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape
@@ -664,6 +710,10 @@ impl<'a> Slice<'a> {
                 PersistedTy::Function {
                     nullable,
                     type_params,
+                    type_params_named: type_params_named
+                        .iter()
+                        .map(|(name, bound)| (self.id(*name), bound.map(|b| self.ty(&b))))
+                        .collect(),
                     return_ty: Box::new(self.ty(&return_ty)),
                     positional: positional.iter().map(|ty| self.ty(ty)).collect(),
                     named: named
@@ -872,6 +922,7 @@ impl PersistedElements {
                 group_open: aug.group_open.map(PersistedRange::of),
                 const_kw: aug.const_kw.map(PersistedRange::of),
                 factory_kw: aug.factory_kw.map(PersistedRange::of),
+                is_complete: aug.is_complete,
             })
             .collect();
         let decl_kinds = elements
@@ -885,6 +936,25 @@ impl PersistedElements {
                 is_mixin_application: target.is_mixin_application,
                 is_const: target.is_const,
                 is_factory: target.is_factory,
+                is_complete: target.is_complete,
+            })
+            .collect();
+        let anon_methods = elements
+            .anon_methods
+            .iter()
+            .map(|entry| PersistedAnonMethod {
+                punctuation: PersistedRange::of(entry.punctuation),
+                null_aware: entry.null_aware,
+                parens: entry
+                    .parens
+                    .map(|(open, close)| (PersistedRange::of(open), PersistedRange::of(close))),
+                param_count: entry.param_count,
+                first_named: entry.first_named,
+                first_optional: entry.first_optional,
+                param_ty: entry.param_ty.map(|(ty, range)| PersistedParamType {
+                    ty: s.ty(&ty),
+                    range: PersistedRange::of(range),
+                }),
             })
             .collect();
         Self {
@@ -898,6 +968,7 @@ impl PersistedElements {
             const_creations,
             augmentations,
             decl_kinds,
+            anon_methods,
         }
     }
 
@@ -1051,6 +1122,7 @@ impl PersistedElements {
                     group_open: aug.group_open.map(PersistedRange::source_range),
                     const_kw: aug.const_kw.map(PersistedRange::source_range),
                     factory_kw: aug.factory_kw.map(PersistedRange::source_range),
+                    is_complete: aug.is_complete,
                 })
                 .collect(),
             decl_kinds: self
@@ -1064,6 +1136,27 @@ impl PersistedElements {
                     is_mixin_application: target.is_mixin_application,
                     is_const: target.is_const,
                     is_factory: target.is_factory,
+                    is_complete: target.is_complete,
+                })
+                .collect(),
+            anon_methods: self
+                .anon_methods
+                .iter()
+                .map(|entry| crate::model::AnonMethodInvocation {
+                    punctuation: entry.punctuation.source_range(),
+                    null_aware: entry.null_aware,
+                    parens: entry
+                        .parens
+                        .map(|(open, close)| (open.source_range(), close.source_range())),
+                    param_count: entry.param_count,
+                    first_named: entry.first_named,
+                    first_optional: entry.first_optional,
+                    param_ty: entry.param_ty.as_ref().map(|param| {
+                        (
+                            into_ty(param.ty.clone(), &ids, &mut type_args),
+                            param.range.source_range(),
+                        )
+                    }),
                 })
                 .collect(),
             type_args,
@@ -1391,6 +1484,7 @@ fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
         PersistedTy::Function {
             nullable,
             type_params,
+            type_params_named,
             return_ty,
             positional,
             named,
@@ -1404,7 +1498,17 @@ fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
                 .into_iter()
                 .map(|(name, ty)| (ids[name as usize], into_ty(ty, ids, pool)))
                 .collect();
-            pool.function(type_params, return_ty, &positional, &named, nullable)
+            let names: Vec<(StringId, Option<Ty>)> = type_params_named
+                .into_iter()
+                .map(|(name, bound)| (ids[name as usize], bound.map(|b| into_ty(b, ids, pool))))
+                .collect();
+            if names.is_empty() && type_params > 0 {
+                // A pre-column payload: the count-only identity, exactly
+                // as the writing binary interned it.
+                pool.function(type_params, return_ty, &positional, &named, nullable)
+            } else {
+                pool.function_generic(&names, return_ty, &positional, &named, nullable)
+            }
         }
     }
 }
@@ -1578,6 +1682,28 @@ mod tests {
             },
             range,
         }]);
+        // The anonymous-method capture rides the payload: an implicit entry
+        // (no list) and an explicit one with a written parameter type.
+        elements.anon_methods = Box::new([
+            crate::model::AnonMethodInvocation {
+                punctuation: range,
+                null_aware: true,
+                parens: None,
+                param_count: 0,
+                first_named: false,
+                first_optional: false,
+                param_ty: None,
+            },
+            crate::model::AnonMethodInvocation {
+                punctuation: range,
+                null_aware: false,
+                parens: Some((range, range)),
+                param_count: 1,
+                first_named: false,
+                first_optional: false,
+                param_ty: Some((int, range)),
+            },
+        ]);
 
         let payload = PersistedElements::of(&elements, &strings);
         let bytes = serde_json::to_vec(&payload).expect("serialize");
@@ -1592,6 +1718,7 @@ mod tests {
         assert_eq!(restored.decls, elements.decls);
         assert_eq!(restored.duplicates, elements.duplicates);
         assert_eq!(restored.arity_violations, elements.arity_violations);
+        assert_eq!(restored.anon_methods, elements.anon_methods);
         assert_eq!(restored.container_order, elements.container_order);
         // Members, the extension faces, and the representation formals are
         // inside the hashed face; the signature check above covers them.

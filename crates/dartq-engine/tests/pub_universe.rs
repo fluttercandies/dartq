@@ -118,6 +118,7 @@ fn nested_engine(tag: &str) -> (Engine, PathBuf) {
         packages,
         pub_config: Arc::new(extended),
         config_dir,
+        context_roots: Vec::new(),
         semdiag: Some(dartq_engine::semdiag::diagnoser()),
         target: dartq_engine::DEFAULT_TARGET.to_owned(),
         declared_variables: rustc_hash::FxHashMap::default(),

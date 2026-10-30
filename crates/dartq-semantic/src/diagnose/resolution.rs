@@ -306,11 +306,12 @@ impl<'a> Engine<'a> {
                     .record(&positional, &named, nullable)
             }
             Ty::Function { shape, nullable } => {
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_param_names, return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.type_params_named.clone(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
@@ -327,13 +328,24 @@ impl<'a> Engine<'a> {
                         (formal_name, self.substitute_alias_rhs(formal, subst))
                     })
                     .collect();
-                self.boundary.args.borrow_mut().function(
-                    type_params,
-                    return_ty,
-                    &positional,
-                    &named,
-                    nullable,
-                )
+                // The written bounds substitute with the rest (a bound
+                // naming the aliased parameter reads the rewritten face).
+                let names: Vec<(StringId, Option<Ty>)> = type_param_names
+                    .iter()
+                    .map(|&(name, bound)| {
+                        (name, bound.map(|b| self.substitute_alias_rhs(b, subst)))
+                    })
+                    .collect();
+                // A count-only source (names never recorded) keeps its
+                // count-only identity — the rebuild never demotes it.
+                let mut args = self.boundary.args.borrow_mut();
+                let ty = if names.is_empty() && type_params > 0 {
+                    args.function(type_params, return_ty, &positional, &named, nullable)
+                } else {
+                    args.function_generic(&names, return_ty, &positional, &named, nullable)
+                };
+                drop(args);
+                ty
             }
             _ => ty,
         }
@@ -385,23 +397,32 @@ impl<'a> Engine<'a> {
                 shape,
                 nullable: own,
             } => {
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_param_names, return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.type_params_named.clone(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
                 };
-                self.boundary.args.borrow_mut().function(
-                    type_params,
-                    return_ty,
-                    &positional,
-                    &named,
-                    own || nullable,
-                )
+                // A count-only source keeps its count-only identity.
+                let mut args = self.boundary.args.borrow_mut();
+                let ty = if type_param_names.is_empty() && type_params > 0 {
+                    args.function(type_params, return_ty, &positional, &named, own || nullable)
+                } else {
+                    args.function_generic(
+                        &type_param_names,
+                        return_ty,
+                        &positional,
+                        &named,
+                        own || nullable,
+                    )
+                };
+                drop(args);
+                ty
             }
             other => other,
         }

@@ -372,10 +372,7 @@ fn first_type_row(c: &Check<'_>, row: u32) -> Option<u32> {
     c.collect_direct(row).into_iter().find(|&kid| {
         matches!(
             c.kind(kid),
-            NodeKind::Type
-                | NodeKind::VoidType
-                | NodeKind::FunctionType
-                | NodeKind::RecordType
+            NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType | NodeKind::RecordType
         )
     })
 }
@@ -454,13 +451,12 @@ fn record_pattern_statement(c: &Check<'_>, container: u32) -> Option<u32> {
         return Some(parent);
     }
     let span = c.byte_span(container);
-    (container + 1..c.unit.ast.len() as u32)
-        .find(|&row| {
-            c.kind(row) == NodeKind::PatternVarDeclStatement && {
-                let outer = c.byte_span(row);
-                outer.start <= span.start && outer.end >= span.end
-            }
-        })
+    (container + 1..c.unit.ast.len() as u32).find(|&row| {
+        c.kind(row) == NodeKind::PatternVarDeclStatement && {
+            let outer = c.byte_span(row);
+            outer.start <= span.start && outer.end >= span.end
+        }
+    })
 }
 
 /// The enclosing callable of a statement (method, top-level function,
@@ -496,9 +492,10 @@ fn record_named_field_kind(c: &Check<'_>, record: u32, name: &str) -> Option<&'s
         if c.kind(entry) != NodeKind::RecordTypeEntry {
             continue;
         }
-        if c.collect_direct(entry).into_iter().any(|kid| {
-            c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name
-        }) {
+        if c.collect_direct(entry)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name)
+        {
             return Some("field");
         }
     }
@@ -806,10 +803,10 @@ mod tests {
     /// bail).
     #[test]
     fn misspelled_core_member_is_silent() {
-        assert!(run(
-            "void f(Object o) {\n  if (o case int(isEvenn:var isEvenn) when isEvenn) {}\n}\n",
-        )
-        .is_empty());
+        assert!(
+            run("void f(Object o) {\n  if (o case int(isEvenn:var isEvenn) when isEvenn) {}\n}\n",)
+                .is_empty()
+        );
     }
 
     /// `test_recordDestructuring_unnexistingField` — the matched record's
@@ -817,9 +814,9 @@ mod tests {
     /// field the record type does not declare stays silent.
     #[test]
     fn record_destructuring_missing_field_is_silent() {
-        assert!(run(
-            "void f((int, {String name}) record) {\n  var (x, namee: namee) = record;\n}\n",
-        )
-        .is_empty());
+        assert!(
+            run("void f((int, {String name}) record) {\n  var (x, namee: namee) = record;\n}\n",)
+                .is_empty()
+        );
     }
 }

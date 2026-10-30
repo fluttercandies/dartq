@@ -2193,6 +2193,11 @@ impl<'a> Engine<'a> {
             .as_ref()
             .map(|(verdict, ..)| *verdict)
             .or_else(|| self.assignment_verdict(from, to, literal));
+        // The conversion's own face (#2870): a granted `int → double`
+        // literal ask doubles as the imprecise-value check.
+        if verdict == Some(true) {
+            self.check_imprecise_int_literal(from, to, literal, rhs_row.range);
+        }
         if verdict == Some(false) && stashed.is_some() && !in_initializer {
             // The stashed-signature rejection is final at the check: the
             // from side is a concrete function shape (never a promotable
@@ -2345,11 +2350,14 @@ impl<'a> Engine<'a> {
         if self.rows.len() != mark + 1 {
             return;
         }
-        let row = &self.rows[mark];
-        let literal = Self::primitive_literal(row, &self.members.primitive_ids);
+        // Cloned, not borrowed: the #2870 gate re-enters `&mut self` (the
+        // imprecise-literal emit) while the row's range still feeds the
+        // staging arms below.
+        let row = self.rows[mark].clone();
+        let literal = Self::primitive_literal(&row, &self.members.primitive_ids);
         // A `?.`-merged initializer reads the short-circuit's nullable
         // result (`int x = a?.b` asks `B?` against `int`).
-        let mut from = self.expression_row_ty(row);
+        let mut from = self.expression_row_ty(&row);
         // The promoted read: an unpromoted dynamic/unknown initializer a
         // flow fact promoted (`int x = y` under `y is String`) re-decides —
         // the oracle checks the promoted `valueType`
@@ -2369,11 +2377,17 @@ impl<'a> Engine<'a> {
             self.init_mark = None;
             return;
         }
-        let stashed = self.stashed_fn_pair(row, None, from, to);
+        let stashed = self.stashed_fn_pair(&row, None, from, to);
         let verdict = stashed
             .as_ref()
             .map(|(verdict, ..)| *verdict)
             .or_else(|| self.assignment_verdict(from, to, literal));
+        // The conversion's own face (#2870): a granted `int → double`
+        // literal ask doubles as the imprecise-value check.
+        if verdict == Some(true) {
+            let rhs_range = row.range;
+            self.check_imprecise_int_literal(from, to, literal, rhs_range);
+        }
         if verdict == Some(false) && stashed.is_some() {
             // The stashed-signature rejection is final at the check (see
             // [`Self::check_assignment`]'s direct-emit arm) — the
@@ -4763,11 +4777,12 @@ impl<'a> Engine<'a> {
                     .named(name, nullable, &substituted)
             }
             Ty::Function { shape, nullable } => {
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_param_names, return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.type_params_named.clone(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
@@ -4781,13 +4796,33 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|(name, ty)| (*name, self.subst_ty(*ty, map)))
                     .collect();
-                self.boundary.args.borrow_mut().function(
-                    type_params,
-                    self.subst_ty(return_ty, map),
-                    &positional,
-                    &named,
-                    nullable,
-                )
+                // The written bounds substitute with the rest (a bound
+                // naming the substituted parameter reads the rewritten
+                // face). A count-only source keeps its count-only identity.
+                let names: Vec<(StringId, Option<Ty>)> = type_param_names
+                    .iter()
+                    .map(|&(name, bound)| (name, bound.map(|b| self.subst_ty(b, map))))
+                    .collect();
+                let mut args = self.boundary.args.borrow_mut();
+                let ty = if names.is_empty() && type_params > 0 {
+                    args.function(
+                        type_params,
+                        self.subst_ty(return_ty, map),
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+                } else {
+                    args.function_generic(
+                        &names,
+                        self.subst_ty(return_ty, map),
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+                };
+                drop(args);
+                ty
             }
             Ty::Record { shape, nullable } => {
                 let (positional, named) = {
@@ -4870,6 +4905,86 @@ impl<'a> Engine<'a> {
             return false;
         };
         matches!(row.shape, RowShape::Value) && primitive_ids.contains(&name)
+    }
+
+    /// The `integer_literal_imprecise_as_double` face (`_checkForOutOfRange`'s
+    /// double arm, error_verifier.dart:6789 — the informal spec at
+    /// dart-lang/language#4): an integer literal whose conversion
+    /// ([`Self::assignable`]'s literal arm, `analyzeIntLiteral`'s
+    /// `convertToDouble`) just typed the value `double` must be exactly
+    /// representable as an IEEE 754 double (`IntegerLiteralImpl
+    /// .isValidAsDouble`, ast.dart:19479); an imprecise value reports at
+    /// the literal token with the lexeme (`-`-prefixed under an
+    /// immediately-negated operand) and the nearest representable double
+    /// in the correction slot.
+    ///
+    /// Called only where a conversion ask resolved — the pair `int →
+    /// double` over a primitive-literal row IS the double context
+    /// (upstream keys on the literal's resolved `staticType == double`),
+    /// so the gate re-derives the pair and no-ops everywhere else.
+    pub(crate) fn check_imprecise_int_literal(
+        &mut self,
+        from: Ty,
+        to: Ty,
+        literal: bool,
+        range: SourceRange,
+    ) {
+        if !literal {
+            return;
+        }
+        let (
+            Ty::Named {
+                name: from_name,
+                nullable: false,
+                ..
+            },
+            Ty::Named {
+                name: to_name,
+                nullable: false,
+                ..
+            },
+        ) = (from, to)
+        else {
+            return;
+        };
+        let (int, double) = (self.members.primitive_ids[0], self.members.primitive_ids[1]);
+        if from_name != int || to_name != double {
+            return;
+        }
+        // The lexeme keeps its separators for the message (the oracle's
+        // `{0}` spells them, the withSeparators census row); the predicate
+        // strips them first (upstream `stripSeparators`).
+        let start = self.byte_of(range.offset);
+        let end = self.byte_of(range.end());
+        let Some(lexeme) = self.source.get(start..end) else {
+            return;
+        };
+        let stripped: String = lexeme.chars().filter(|c| *c != '_').collect();
+        if valid_as_double(&stripped) {
+            return;
+        }
+        // `immediatelyNegated` (ast.dart:19437): the literal is the operand
+        // of a unary `-`. The row stack cannot answer the parent shape, but
+        // a primitive-literal row only ever sits under a plain literal or
+        // that negation (a binary `-` folds its operand rows), so the
+        // source walk is exact.
+        let negated = lexeme_negated(self.source.as_bytes(), start);
+        let code = SemanticCode::IntegerLiteralImpreciseAsDouble;
+        let literal_text = if negated {
+            format!("-{lexeme}")
+        } else {
+            lexeme.to_string()
+        };
+        let message = code.message(&literal_text, "");
+        let closest = nearest_valid_double(&stripped);
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            message,
+            self.file,
+            range,
+            code.correction_message(&closest),
+        ));
     }
 
     /// The enum-constant constructor selector (`c.other()` in the
@@ -5198,6 +5313,166 @@ fn object_question(strings: &StringTable) -> Ty {
         nullable: true,
         args: crate::model::ArgListId::EMPTY,
     }
+}
+
+/// Upstream `IntegerLiteralImpl.isValidAsDouble` (ast.dart:19479) on exact
+/// u32-limb arithmetic (the upstream body parses a `BigInt`; the
+/// digit-string forms below decide the same steps without a bignum
+/// dependency):
+///
+/// 1. fewer than 16 characters (separators stripped, the `0x` prefix
+///    kept) is below `9007199254740992` / `0x10000000000000` — both 16
+///    characters, 53 bits;
+/// 2. a bit length ≤ 53 fits the double mantissa exactly;
+/// 3. beyond `double.maxFinite` the exponent overflows; otherwise the low
+///    `bitLength − 53` bits must all be zero (the mantissa's zero
+///    extension is exact).
+fn valid_as_double(stripped: &str) -> bool {
+    if stripped.len() < 16 {
+        return true;
+    }
+    let Some(limbs) = literal_limbs(stripped) else {
+        return false;
+    };
+    let bits = limb_bit_length(&limbs);
+    if bits <= 53 {
+        return true;
+    }
+    if gt_max_finite(&limbs) {
+        return false;
+    }
+    low_bits_zero(&limbs, bits - 53)
+}
+
+/// The literal's unsigned value as little-endian u32 limbs: hex packs
+/// nibbles directly; decimal runs schoolbook long division by 2^32 (each
+/// accumulator is bounded by (2^32 − 1)·10 + 9 < 2^36). `None` mirrors
+/// the upstream `BigInt.tryParse` failure arm.
+fn literal_limbs(stripped: &str) -> Option<Vec<u32>> {
+    if let Some(rest) = stripped
+        .strip_prefix("0x")
+        .or_else(|| stripped.strip_prefix("0X"))
+    {
+        let mut out = vec![0u32; rest.len().div_ceil(8)];
+        for (i, byte) in rest.bytes().rev().enumerate() {
+            let nibble = (byte as char).to_digit(16)?;
+            out[i / 8] |= nibble << (4 * (i % 8) as u32);
+        }
+        return Some(out);
+    }
+    if !stripped.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut cur: Vec<u8> = stripped.bytes().map(|b| b - b'0').collect();
+    let mut out = Vec::new();
+    while cur.iter().any(|&digit| digit != 0) {
+        let mut rem: u64 = 0;
+        for digit in &mut cur {
+            let acc = rem * 10 + u64::from(*digit);
+            *digit = (acc >> 32) as u8;
+            rem = acc & 0xFFFF_FFFF;
+        }
+        out.push(rem as u32);
+    }
+    Some(out)
+}
+
+/// The value's bit length (the highest set bit's position plus one; zero
+/// for the zero value).
+fn limb_bit_length(limbs: &[u32]) -> u32 {
+    let Some(top) = limbs.iter().rposition(|&limb| limb != 0) else {
+        return 0;
+    };
+    32 * top as u32 + (32 - limbs[top].leading_zeros())
+}
+
+/// `value > double.maxFinite` (`2^1024 − 2^971`): the 53-bit run of ones
+/// the exponent cap leaves starts at bit 971 — limb 31 is all ones, limb
+/// 30 carries the run's low 21 bits at positions 11..31, every lower limb
+/// is zero.
+fn gt_max_finite(limbs: &[u32]) -> bool {
+    const TOP: [u32; 2] = [0xFFFF_F800, 0xFFFF_FFFF];
+    for i in (0..32).rev() {
+        let limb = limbs.get(i).copied().unwrap_or(0);
+        let max = if i >= 30 { TOP[i - 30] } else { 0 };
+        if limb != max {
+            return limb > max;
+        }
+    }
+    false
+}
+
+/// Whether the low `k` bits are all zero — the exactness mask: the bits
+/// the 53-bit mantissa drops contributed nothing.
+fn low_bits_zero(limbs: &[u32], k: u32) -> bool {
+    let full = (k / 32) as usize;
+    if limbs.iter().take(full).any(|&limb| limb != 0) {
+        return false;
+    }
+    let rest = k % 32;
+    if rest == 0 {
+        return true;
+    }
+    limbs.get(full).copied().unwrap_or(0) & ((1u32 << rest) - 1) == 0
+}
+
+/// Upstream `IntegerLiteralImpl.nearestValidDouble` (ast.dart:19532):
+/// `min(double.maxFinite, value.toDouble())`, rendered as the exact
+/// integer the double represents (`BigInt.from(...).toString()` — every
+/// digit, never an exponent). The 54-bit mantissa extraction keeps the
+/// oracle's single round-to-nearest-even step.
+fn nearest_valid_double(stripped: &str) -> String {
+    let value = literal_limbs(stripped)
+        .map(|limbs| limbs_to_f64(&limbs))
+        .unwrap_or(0.0);
+    format!("{:.0}", f64::MAX.min(value))
+}
+
+/// The correctly rounded double for the limb value: direct up to 64 bits,
+/// otherwise the top 54 bits (53 mantissa bits plus the round bit) with a
+/// sticky tail, rounded to nearest-even and scaled by the exact power of
+/// two.
+fn limbs_to_f64(limbs: &[u32]) -> f64 {
+    let bits = limb_bit_length(limbs);
+    if bits == 0 {
+        return 0.0;
+    }
+    if bits <= 64 {
+        let mut value: u64 = 0;
+        for limb in limbs.iter().rev() {
+            value = (value << 32) | u64::from(*limb);
+        }
+        return value as f64;
+    }
+    let mut mant = 0u64;
+    for i in 0..54 {
+        mant = (mant << 1) | u64::from(limb_bit(limbs, bits - 1 - i));
+    }
+    let round = mant & 1;
+    let sticky = (0..bits - 54).any(|i| limb_bit(limbs, i) == 1);
+    let mut m = mant >> 1;
+    if round == 1 && (sticky || m & 1 == 1) {
+        // May carry to 2^53 — still exact as a float; the scale below
+        // then overflows to infinity exactly when the value rounds past
+        // the representable range.
+        m += 1;
+    }
+    (m as f64) * 2f64.powi((bits - 53) as i32)
+}
+
+/// The bit at absolute position `index` of the limb value.
+fn limb_bit(limbs: &[u32], index: u32) -> u32 {
+    (limbs[(index / 32) as usize] >> (index % 32)) & 1
+}
+
+/// The `immediatelyNegated` face (ast.dart:19437): the closest
+/// non-whitespace byte before the literal is the minus.
+fn lexeme_negated(bytes: &[u8], start: usize) -> bool {
+    let mut cursor = start;
+    while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+        cursor -= 1;
+    }
+    cursor > 0 && bytes[cursor - 1] == b'-'
 }
 
 /// The `async` return-matrix pins: upstream's own exemplar faces
@@ -5707,3 +5982,13 @@ mod alias_function_subtyping_tests {
         assert_eq!(code_names(&report), ["invalid_assignment"]);
     }
 }
+
+// The #2870 pins (the integer-literal-imprecise-as-double face).
+// Registered here, not in `diagnose.rs` (another lane's file this wave),
+// via `#[path]`: the module stays inside the `diagnose` subtree so the
+// test rig's `pub(super)` items remain visible. Moving the declaration
+// into `diagnose.rs`'s sibling block is a mechanical follow-up for
+// whoever owns that file next.
+#[cfg(test)]
+#[path = "ticket_2870_tests.rs"]
+mod ticket_2870_tests;

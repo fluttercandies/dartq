@@ -78,10 +78,10 @@
 
 use crate::capture::{TreeSink, TypeTree};
 use crate::model::{
-    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, AugKind, AugTarget, AugmentDecl,
-    AugmentFormal, AugmentModifiers, AugmentTypeParam, ConstCreationFace, Container, ContainerKind,
-    DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind,
-    MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
+    Annotation, AnonMethodInvocation, ArgListId, ArgPool, ArityDecl, ArityViolation, AugKind,
+    AugTarget, AugmentDecl, AugmentFormal, AugmentModifiers, AugmentTypeParam, ConstCreationFace,
+    Container, ContainerKind, DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals,
+    MemberEntry, MemberKind, MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures,
@@ -188,6 +188,48 @@ struct OpenContainer {
 struct CtorCapture {
     named: Vec<StringId>,
     has_unnamed: bool,
+    /// The constructor's completeness source (upstream
+    /// `ConstructorFragmentImpl.isComplete` = `nonEmptyBody ||
+    /// initializers.isNotEmpty || initializing formals || redirect ||
+    /// external`): an initializer list, a body, an initializing formal, or
+    /// a redirect latches it. Feeds the constructor's [`AugTarget`] row —
+    /// the `declaration_already_complete` chain walk.
+    completion: bool,
+}
+
+/// One open anonymous-method invocation (the anonymous-methods experiment's
+/// member): the raw facts the [`AnonMethodInvocation`] row seals from at the
+/// end event. The shape/type verdicts re-derive in the diagnose pass — the
+/// capture stays a dumb recorder.
+struct PendingAnonMethod {
+    /// The `.`/`?.`/`..`/`?..` punctuation's span.
+    punctuation: SourceRange,
+    /// The punctuation was null-aware (its source lexeme starts with `?`).
+    null_aware: bool,
+    /// The written parameter list's `(` span, latched at
+    /// `begin_formal_parameters` and completed with the `)` at
+    /// `end_formal_parameters`; `None` = the implicit form.
+    parens: Option<(SourceRange, Option<SourceRange>)>,
+    /// The collector's `formal_depth` INSIDE the captured list (the
+    /// post-increment value at its `begin_formal_parameters`) — the guard
+    /// that keeps nested function-type formal lists out of the count.
+    list_depth: u32,
+    /// The declared parameter count (`end_formal_parameters`).
+    param_count: u16,
+    /// The first formal's shape bits, latched at its `end_formal_parameter`.
+    first_named: bool,
+    first_optional: bool,
+    /// The first formal's written type and the annotation's span, read off
+    /// the armed type before the existing capture consumes it.
+    param_ty: Option<(Ty, SourceRange)>,
+    /// The first formal was seen (`end_formal_parameter` ran at
+    /// [`PendingAnonMethod::list_depth`]).
+    param_seen: bool,
+    /// A function-typed suffix opened on the first formal
+    /// (`begin_function_typed_formal_parameter` at the list depth): the
+    /// written `int` of `int g(String)` is the return type, not the
+    /// parameter's type — upstream skips the type check for those.
+    param_fn_typed: bool,
 }
 
 /// The clause family a buffered header-window name belongs to; the parser's
@@ -301,6 +343,16 @@ struct PendingAug {
     group_open: Option<SourceRange>,
     const_kw: Option<SourceRange>,
     factory_kw: Option<SourceRange>,
+    /// A function body opened (`{ ... }` or `=> ...`): the
+    /// `declaration_already_complete` completeness bit (`isComplete` =
+    /// `external || nonEmptyBody` for executables; the constructor face adds
+    /// initializers/redirects/initializing formals).
+    has_body: bool,
+    /// The `external` modifier was present.
+    is_external: bool,
+    /// Initializer list, redirecting factory body, or initializing
+    /// formal/super formal — the constructor-only completeness sources.
+    ctor_completion: bool,
 }
 
 /// The capture state shared between the listener and [`collect`].
@@ -335,6 +387,13 @@ struct Builder<'src, 'tab> {
     /// [`Builder::finish`].
     duplicates: Vec<DuplicateDecl>,
     arity_violations: Vec<ArityDecl>,
+    /// The anonymous-method invocations, sealed into the model's
+    /// `anon_methods` at [`Builder::finish`] (the
+    /// `anonymous_method_wrong_parameter_*` capture face).
+    anon_methods: Vec<AnonMethodInvocation>,
+    /// The open anonymous-method invocations (the experiment's members nest
+    /// — `1.() { 2.(a) {}; }`); popped at their end events.
+    pending_anon: Vec<PendingAnonMethod>,
     /// Finished `augment` declarations (the augmentation verifier's facts);
     /// sealed into boxed slices at [`Builder::finish`].
     augmentations: Vec<AugmentDecl>,
@@ -560,6 +619,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_faces: Vec::new(),
             duplicates: Vec::new(),
             arity_violations: Vec::new(),
+            anon_methods: Vec::new(),
+            pending_anon: Vec::new(),
             augmentations: Vec::new(),
             decl_kinds: Vec::new(),
             armed_ty_range: None,
@@ -821,7 +882,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// Builds a function `Ty` from a captured function tree: the return
     /// tree converts through [`Self::arg_ty`] (`None` is the bare
     /// `Function(...)` head's implicit `dynamic`), each formal tree the
-    /// same way, then the shape interns canonically.
+    /// same way, the signature's own type-parameter group with it (#2878
+    /// — the written names and bounds intern beside the shape, the same
+    /// column the diagnose-side capture carries), then the shape interns
+    /// canonically.
     fn function_from_tree(&mut self, tree: TypeTree) -> Ty {
         let fn_tree = tree.function.expect("function arm gated");
         let ret = fn_tree.ret.map_or(Ty::Dynamic, |ret| self.arg_ty(*ret));
@@ -835,8 +899,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|(name, formal)| (name, self.arg_ty(formal)))
             .collect();
+        let type_params: Vec<(StringId, Option<Ty>)> = fn_tree
+            .type_params_named
+            .into_iter()
+            .map(|(name, bound)| (name, bound.map(|b| self.arg_ty(b))))
+            .collect();
         self.type_args
-            .function(fn_tree.type_params, ret, &positional, &named, tree.nullable)
+            .function_generic(&type_params, ret, &positional, &named, tree.nullable)
     }
 
     /// One argument subtree. The head canonicalizes exactly like the
@@ -1629,6 +1698,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 group_open: None,
                 const_kw: None,
                 factory_kw: None,
+                // A container augmentation carries no executable body.
+                is_complete: false,
             });
         }
         let members = open.members;
@@ -2001,20 +2072,29 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
         let count = self.type_param_count;
         if let Some(pending) = &mut self.pending_member {
+            // The group attaches only when it closes after the member's own
+            // name — a depth-1 window that closed before the name is the
+            // return type annotation's own group (`void Function<A>() m()`,
+            // #2878): it belongs to the annotation's function shape, never
+            // to the declaration.
             if pending
                 .shape
                 .as_ref()
-                .map_or(true, |(_, _, range)| range.offset < group_end)
+                .map_or(false, |(_, _, range)| range.offset < group_end)
             {
                 pending.type_params = count;
                 pending.type_param_names = std::mem::take(&mut self.type_var_group);
                 pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
             }
         } else if let Some(pending) = &mut self.pending_top {
+            // The same name-first rule (#2878): a generic top-level
+            // function's group follows the name; a window closing before
+            // the name (`Function<A>(List<int> x) f(int x)`) is the return
+            // annotation's own group.
             if pending
                 .name
                 .as_ref()
-                .map_or(true, |(_, range)| range.offset < group_end)
+                .map_or(false, |(_, range)| range.offset < group_end)
             {
                 pending.type_params = count;
                 // A generic top-level function's spellings ride the declaration
@@ -2071,6 +2151,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_faces: self.extension_faces.into_boxed_slice(),
             duplicates: self.duplicates.into_boxed_slice(),
             arity_violations: self.arity_violations.into_boxed_slice(),
+            anon_methods: self.anon_methods.into_boxed_slice(),
             augmentations: self.augmentations.into_boxed_slice(),
             decl_kinds: self.decl_kinds.into_boxed_slice(),
             type_args: self.type_args,
@@ -2293,6 +2374,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_mixin_application: true,
                     is_const: false,
                     is_factory: false,
+                    is_complete: false,
                 });
             }
         }
@@ -2949,6 +3031,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     builder.ctor_open = Some(CtorCapture {
                         named: Vec::new(),
                         has_unnamed: is_unnamed,
+                        completion: false,
                     });
                     builder.factory_ctor_head = (!is_unnamed).then_some(name);
                 }
@@ -3021,6 +3104,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 is_mixin_application: false,
                                 is_const: false,
                                 is_factory: false,
+                                // A top-level variable's induced accessors
+                                // are `external || !abstract` — top-level
+                                // spellings carry neither, so complete.
+                                is_complete: true,
                             });
                         }
                         if let Some(augment_kw) = builder.field_augment {
@@ -3045,6 +3132,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 group_open: None,
                                 const_kw: None,
                                 factory_kw: None,
+                                // The induced accessor's completeness:
+                                // `external || !abstract` (upstream
+                                // `TopLevelVariableFragmentImpl`'s induced
+                                // getter/setter `isComplete`).
+                                is_complete: builder.field_external || !builder.field_abstract,
                             });
                         }
                         builder.declare_top(
@@ -3118,6 +3210,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 group_open: None,
                                 const_kw: None,
                                 factory_kw: None,
+                                // `external || !abstract` (the field's
+                                // induced getter/setter `isComplete`).
+                                is_complete: builder.field_external || !builder.field_abstract,
                             });
                         }
                     }
@@ -3241,7 +3336,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 builder.type_param_count += 1;
             }
             if let Some(site) = builder.capture.as_mut() {
-                site.function_type_variable();
+                site.function_type_variable(name);
             }
         }
     }
@@ -3480,6 +3575,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: None,
                 const_kw: None,
                 factory_kw: None,
+                has_body: false,
+                is_external: external_kw.is_some(),
+                ctor_completion: false,
             });
         }
         builder.executable_header_done = false;
@@ -3494,11 +3592,46 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if let Some(pending) = self.builder.pending_member.as_mut() {
             pending.has_body = true;
         }
+        if let Some(pending) = self.builder.pending_aug.as_mut() {
+            pending.has_body = true;
+        }
+        if let Some(capture) = self.builder.ctor_open.as_mut() {
+            capture.completion = true;
+        }
     }
 
     fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
         if let Some(pending) = self.builder.pending_member.as_mut() {
             pending.has_body = true;
+        }
+        if let Some(pending) = self.builder.pending_aug.as_mut() {
+            pending.has_body = true;
+        }
+        if let Some(capture) = self.builder.ctor_open.as_mut() {
+            capture.completion = true;
+        }
+    }
+
+    /// A constructor initializer list (`: a = 1`) — the constructor-only
+    /// completeness source (upstream `ConstructorFragmentImpl.isComplete`
+    /// counts `initializers.isNotEmpty`).
+    fn begin_initializers(&mut self, _token: Token) {
+        if let Some(pending) = self.builder.pending_aug.as_mut() {
+            pending.ctor_completion = true;
+        }
+        if let Some(capture) = self.builder.ctor_open.as_mut() {
+            capture.completion = true;
+        }
+    }
+
+    /// A redirecting factory body (`= Other;`) — the constructor-only
+    /// completeness source (`isComplete` counts `redirectedConstructor`).
+    fn begin_redirecting_factory_body(&mut self, _equals: Token) {
+        if let Some(pending) = self.builder.pending_aug.as_mut() {
+            pending.ctor_completion = true;
+        }
+        if let Some(capture) = self.builder.ctor_open.as_mut() {
+            capture.completion = true;
         }
     }
 
@@ -3554,6 +3687,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: pending.group_open,
                 const_kw: None,
                 factory_kw: None,
+                // `external || nonEmptyBody` — the executable completeness
+                // bit (`MethodFragmentImpl.isComplete`).
+                is_complete: pending.is_external || pending.has_body,
             });
         }
         if let Some(pending) = builder.pending_member.take()
@@ -3656,6 +3792,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: None,
                 const_kw: None,
                 factory_kw: None,
+                has_body: false,
+                is_external: _external.is_some(),
+                ctor_completion: false,
             });
         }
         builder.executable_header_done = false;
@@ -3717,6 +3856,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_mixin_application: false,
                     is_const: false,
                     is_factory: false,
+                    // A top-level executable is `external || nonEmptyBody`;
+                    // the bodiless non-external spelling never parses, so
+                    // every reachable intro is complete.
+                    is_complete: true,
                 });
             }
             if let Some(mut augment) = builder.pending_aug.take() {
@@ -3762,6 +3905,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     group_open: augment.group_open,
                     const_kw: None,
                     factory_kw: None,
+                    is_complete: augment.is_external || augment.has_body,
                 });
             }
             builder.declare_top(
@@ -3872,6 +4016,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: None,
                 const_kw: const_keyword.map(|t| builder.span_of(t)),
                 factory_kw,
+                has_body: false,
+                is_external: _external_kw.is_some(),
+                ctor_completion: false,
             });
         }
     }
@@ -3884,9 +4031,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let capture = builder.ctor_open.take().or(Some(CtorCapture {
             named: Vec::new(),
             has_unnamed: true,
+            completion: false,
         }));
         let mut capture_named: Vec<StringId> = Vec::new();
         let mut capture_unnamed = false;
+        let mut factory_complete = false;
         if let Some(capture) = capture
             && let Some(open) = builder.containers.last_mut()
         {
@@ -3906,6 +4055,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 }
             }
             capture_unnamed = capture.has_unnamed;
+            factory_complete = capture.completion;
             for name in &named {
                 if !open.ctor_named.contains(name) {
                     open.ctor_named.push(*name);
@@ -3930,6 +4080,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_mixin_application: false,
                     is_const: factory_const,
                     is_factory: true,
+                    is_complete: factory_complete,
                 });
             };
             if capture_named.is_empty() {
@@ -3973,15 +4124,22 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: augment.group_open,
                 const_kw: augment.const_kw,
                 factory_kw: augment.factory_kw,
+                // `external || nonEmptyBody || initializers/redirects/
+                // initializing formals` (`ConstructorFragmentImpl.isComplete`).
+                is_complete: augment.is_external || augment.has_body || augment.ctor_completion,
             });
         }
+        let declaring_augment_factory = builder.declaring_augment;
         builder.declaring_augment = false;
         // The captured formal table joins the container's FACTORY formals
         // (the separate lane: the plain ctor table's other consumers —
         // the closure-formal solver's substitution chains especially —
         // keep the under-report; only the argument-check pairing reads
-        // this one).
-        if let Some((key, formals)) = builder.pending_ctor_formals.take()
+        // this one). An `augment` factory's formals are the augmentation
+        // face's, not the introductory declaration's — same guard as the
+        // generative arm.
+        if !declaring_augment_factory
+            && let Some((key, formals)) = builder.pending_ctor_formals.take()
             && let Some(formals) = formals
             && let Some(open) = builder.containers.last_mut()
         {
@@ -4045,6 +4203,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.ctor_open = Some(CtorCapture {
             named: new_head_selector.into_iter().collect(),
             has_unnamed: declared_unnamed,
+            completion: false,
         });
         builder.pending_ctor_formals = match (head_key, new_kw) {
             (Some(key), Some(_)) if new_head_selector.is_some() => Some((key, None)),
@@ -4103,6 +4262,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: None,
                 const_kw: is_const.then(|| builder.span_of(var_final_or_const.expect("is_const"))),
                 factory_kw: None,
+                has_body: false,
+                is_external: _external_kw.is_some(),
+                ctor_completion: false,
             });
         }
     }
@@ -4120,11 +4282,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let mut ctor_selectors: Vec<StringId> = Vec::new();
         let mut ctor_unnamed = false;
         let mut ctor_const = false;
+        let mut ctor_complete = false;
         if let Some(capture) = builder.ctor_open.take()
             && let Some(open) = builder.containers.last_mut()
         {
             ctor_const = builder.pending_ctor_const.take().unwrap_or(false);
             ctor_unnamed = capture.has_unnamed;
+            ctor_complete = capture.completion;
             for name in &capture.named {
                 if !open.ctor_named.contains(name) {
                     open.ctor_named.push(*name);
@@ -4153,6 +4317,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_mixin_application: false,
                     is_const: ctor_const,
                     is_factory: false,
+                    is_complete: ctor_complete,
                 });
             };
             if ctor_selectors.is_empty() && ctor_unnamed {
@@ -4196,13 +4361,22 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 group_open: augment.group_open,
                 const_kw: augment.const_kw,
                 factory_kw: augment.factory_kw,
+                // `external || nonEmptyBody || initializers/redirects/
+                // initializing formals` (`ConstructorFragmentImpl.isComplete`).
+                is_complete: augment.is_external || augment.has_body || augment.ctor_completion,
             });
         }
+        let declaring_augment_ctor = builder.declaring_augment;
         builder.declaring_augment = false;
         // The captured formal table joins the container's constructor
         // formals under its lookup spelling (a redirecting or body-less
-        // shape with no group simply carries nothing).
-        if let Some((key, formals)) = builder.pending_ctor_formals.take()
+        // shape with no group simply carries nothing). An `augment`
+        // constructor's formals are the augmentation face's, not the
+        // introductory declaration's: inserting them would overwrite the
+        // intro's own table (the argument-check pairing reads the intro's
+        // shape, never the augment's).
+        if !declaring_augment_ctor
+            && let Some((key, formals)) = builder.pending_ctor_formals.take()
             && let Some(formals) = formals
             && let Some(open) = builder.containers.last_mut()
         {
@@ -4332,6 +4506,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_mixin_application: false,
                 is_const: false,
                 is_factory: false,
+                is_complete: false,
             });
             builder.declare_top(
                 name,
@@ -4348,6 +4523,86 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         }
     }
 
+    /// An anonymous-method member opened (`receiver.{ ... }` /
+    /// `receiver.=> e` / `receiver.(p) { ... }`, the anonymous-methods
+    /// experiment): the punctuation token opens the capture entry. The
+    /// null-aware face reads the source lexeme's first byte (`?.`/`?..` are
+    /// one token each).
+    fn begin_anonymous_method_invocation(&mut self, token: Token) {
+        let builder = &mut self.builder;
+        let punctuation = builder.span_of(token);
+        let null_aware = builder
+            .source
+            .as_bytes()
+            .get(dartq_source::utf16_offset_to_byte(
+                builder.source,
+                punctuation.offset,
+            ))
+            == Some(&b'?');
+        builder.pending_anon.push(PendingAnonMethod {
+            punctuation,
+            null_aware,
+            parens: None,
+            list_depth: 0,
+            param_count: 0,
+            first_named: false,
+            first_optional: false,
+            param_ty: None,
+            param_seen: false,
+            param_fn_typed: false,
+        });
+    }
+
+    /// The anonymous-method member carries no explicit parameter list: no
+    /// shape constraint applies (upstream `endAnonymousMethodInvocation`'s
+    /// `formals == null` arm).
+    fn handle_implicit_formal_parameters(&mut self, _token: Token) {}
+
+    /// The anonymous-method member closed: seal the raw facts. The verdicts
+    /// re-derive in the diagnose pass, anchored and ordered exactly like the
+    /// upstream pair — the shape check first
+    /// (`ast_builder.dart:918-929`, the list dropped on failure), then the
+    /// receiver-assignability check on the surviving single required
+    /// positional (`resolver.dart:2063-2079`).
+    fn end_anonymous_method_invocation(
+        &mut self,
+        _begin: Token,
+        _function_definition: Option<Token>,
+        _end: Token,
+        _is_expression: bool,
+    ) {
+        let builder = &mut self.builder;
+        let Some(pending) = builder.pending_anon.pop() else {
+            return;
+        };
+        let (open, close) = match pending.parens {
+            Some((open, Some(close))) => (open, close),
+            // A bail between the list's `(` and `)` leaves the pair
+            // incomplete — the entry carries no list (under-report).
+            _ => {
+                builder.anon_methods.push(AnonMethodInvocation {
+                    punctuation: pending.punctuation,
+                    null_aware: pending.null_aware,
+                    parens: None,
+                    param_count: 0,
+                    first_named: false,
+                    first_optional: false,
+                    param_ty: None,
+                });
+                return;
+            }
+        };
+        builder.anon_methods.push(AnonMethodInvocation {
+            punctuation: pending.punctuation,
+            null_aware: pending.null_aware,
+            parens: Some((open, close)),
+            param_count: pending.param_count,
+            first_named: pending.first_named,
+            first_optional: pending.first_optional,
+            param_ty: pending.param_ty,
+        });
+    }
+
     /// An old-style function-typed formal's shape head fired (`bool f(int)`
     /// — the parser probes the shape, then re-walks it emitting the same
     /// events the modern form uses): the capture opens its own level, and
@@ -4355,6 +4610,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     /// the same `Ty::Function` the modern spelling produces.
     fn begin_function_typed_formal_parameter(&mut self, _token: Token) {
         let builder = &mut self.builder;
+        // The anonymous-method capture: an old-style suffix on the FIRST
+        // formal (`receiver.(int g(String))`) is the arm upstream's
+        // `functionTypedSuffix == null` gate skips — the written head is
+        // the return type, never the checked parameter type.
+        if let Some(pending) = builder.pending_anon.last_mut()
+            && !pending.param_seen
+            && builder.formal_depth == pending.list_depth
+        {
+            pending.param_fn_typed = true;
+        }
         builder
             .capture
             .get_or_insert_with(TreeSink::default)
@@ -4370,6 +4635,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_formal_parameters(&mut self, _token: Token, kind: ParserMemberKind) {
         let builder = &mut self.builder;
+        // The anonymous-method capture's own list: the `(` span latches and
+        // the list's depth records (post-increment), so the per-formal and
+        // close events pair against THIS list, never a nested function-type
+        // group's.
+        let open_span = builder.span_of(_token);
+        if let Some(pending) = builder.pending_anon.last_mut()
+            && pending.parens.is_none()
+        {
+            pending.parens = Some((open_span, None));
+            pending.list_depth = builder.formal_depth + 1;
+        }
         // A formal list under a function-type level is the shape's own
         // formal region: everything before it is the written return type.
         if let Some(site) = builder.capture.as_mut()
@@ -4464,6 +4740,19 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         kind: ParserMemberKind,
     ) {
         let builder = &mut self.builder;
+        // The anonymous-method capture's list closed: the `)` span and the
+        // declared count seal it (the event fires while still inside the
+        // list — the guard reads the pre-decrement depth).
+        let close_span = builder.span_of(end);
+        if let Some(pending) = builder.pending_anon.last_mut()
+            && matches!(pending.parens, Some((_, None)))
+            && builder.formal_depth == pending.list_depth
+        {
+            if let Some((_, slot)) = &mut pending.parens {
+                *slot = Some(close_span);
+            }
+            pending.param_count = u16::try_from(_count).unwrap_or(u16::MAX);
+        }
         // The augment capture's `)` anchor closes with the group.
         if builder.formal_depth == 1 {
             let close_span = builder.span_of(end);
@@ -4527,6 +4816,30 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         kind: FormalParameterKind,
         member_kind: ParserMemberKind,
     ) {
+        // The anonymous-method capture's first formal: the shape bits and
+        // the written annotation (read off the armed type before the
+        // existing capture consumes it — an unannotated formal arms
+        // nothing, the receiver's type flows in upstream). An old-style
+        // function-typed suffix already flagged itself: the armed head is
+        // its return type, not the checked type.
+        let builder = &mut self.builder;
+        if let Some(pending) = builder.pending_anon.last_mut()
+            && !pending.param_seen
+            && builder.formal_depth == pending.list_depth
+        {
+            pending.param_seen = true;
+            pending.first_named = matches!(
+                kind,
+                FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+            );
+            pending.first_optional = !matches!(kind, FormalParameterKind::RequiredPositional);
+            if !pending.param_fn_typed
+                && let (Some(ty), Some(range)) = (builder.armed_ty, builder.armed_ty_range)
+                && ty != Ty::UNKNOWN
+            {
+                pending.param_ty = Some((ty, range));
+            }
+        }
         // A formal inside a function-type shape: an open function level at
         // the capture top (the formal's own type already closed) — depth ≥ 2
         // under an executable, or depth 1 for a top-level `typedef F =
@@ -4571,6 +4884,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.pending_aug.as_mut(),
             builder.aug_formal_start.take(),
         ) {
+            // An initializing `this.x`/`super.x` formal on an augment
+            // constructor is itself a completeness source (upstream
+            // `ConstructorFragmentImpl.isComplete` counts
+            // `initializingFormals`/`superFormalParameters`).
+            if this_keyword.is_some() || super_keyword.is_some() {
+                pending.ctor_completion = true;
+            }
             let explicit_ty = (ty != Ty::UNKNOWN && ty != Ty::Never)
                 .then_some(ty)
                 .zip(builder.armed_ty_range.take());
@@ -4596,6 +4916,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 covariant_kw,
                 required_kw,
             });
+        }
+        // An initializing `this.x`/`super.x` formal on any open constructor
+        // (introductory or augment — `ctor_open` covers both) is a
+        // completeness source for the intro's `AugTarget` row.
+        if (this_keyword.is_some() || super_keyword.is_some())
+            && let Some(capture) = builder.ctor_open.as_mut()
+        {
+            capture.completion = true;
         }
         let required = matches!(
             kind,

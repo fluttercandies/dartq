@@ -20,8 +20,13 @@ impl Engine<'_> {
         nullable: bool,
         offset: u32,
     ) -> Option<Ty> {
-        let (_, tys) = self.call_type_args.iter().find(|(r, _)| *r == offset)?;
-        Some(self.boundary.args.borrow_mut().named(name, nullable, tys))
+        let (_, entry) = self.call_type_args.iter().find(|(r, _)| *r == offset)?;
+        Some(
+            self.boundary
+                .args
+                .borrow_mut()
+                .named(name, nullable, &entry.tys),
+        )
     }
 
     /// `ty` with the creation row's explicit type arguments applied when

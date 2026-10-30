@@ -1000,7 +1000,7 @@ impl<'a> Engine<'a> {
                 // selector-anchored read face's own row (the member sites'
                 // gate) — this face fires only when the receiver reads clean
                 // and the member's result is the nullable operand.
-                if let Some((op_text, op_range, is_method)) = self.adjacent_operator(row)
+                if let Some((op_text, op_range, kind)) = self.adjacent_operator(row)
                     && matches!(recv, Receiver::Typed { ty, .. } if !self.potentially_nullable(ty))
                     && let Ok(index) = self
                         .member_reads
@@ -1008,7 +1008,7 @@ impl<'a> Engine<'a> {
                     && let Some(result) = self.chained_read_static_ty(&self.member_reads[index])
                     && self.potentially_nullable(result)
                 {
-                    self.emit_unchecked_nullable(op_range, op_text, is_method);
+                    self.emit_unchecked_nullable(op_range, op_text, kind);
                 }
                 self.resolve_member_row(promotions, row, recv);
             }
@@ -1703,12 +1703,15 @@ impl<'a> Engine<'a> {
                                 return;
                             };
                             let op_text = self.strings.resolve(op).to_string();
-                            // The index family takes the method text (the
-                            // oracle's exact variant) anchored at the OPENING
-                            // bracket — the row's bracket span covers the
-                            // whole group; the binary family's operator text
-                            // is renderer debt (zero Jaccard effect) and
-                            // stands on the property variant.
+                            // The index family takes the method text with
+                            // the `[]` spelling (the oracle's exact variant)
+                            // anchored at the OPENING bracket — the row's
+                            // bracket span covers the whole group; a binary
+                            // application reports the operator text
+                            // (messages.yaml's
+                            // `uncheckedOperatorInvocationOfNullableValue` —
+                            // the BinaryExpression arm of the node-shape
+                            // dispatch).
                             let is_index = op == self.intern("[]");
                             let anchor = if is_index {
                                 SourceRange {
@@ -1718,7 +1721,12 @@ impl<'a> Engine<'a> {
                             } else {
                                 op_range
                             };
-                            self.emit_unchecked_nullable(anchor, &op_text, is_index);
+                            let kind = if is_index {
+                                UncheckedNullableKind::Method
+                            } else {
+                                UncheckedNullableKind::Operator
+                            };
+                            self.emit_unchecked_nullable(anchor, &op_text, kind);
                         } else if ty == Ty::UNKNOWN && self.sdk_collection_type_literal(row.name)
                             // The type-literal receiver face (`typedef c =
                             // String; c > x`, `A < 1`): a bare name resolving
@@ -1753,7 +1761,7 @@ impl<'a> Engine<'a> {
                         } else {
                             self.check_operator_expr(ty, row);
                         }
-                    } else if let Some((op_text, op_range, is_method)) = adjacent {
+                    } else if let Some((op_text, op_range, kind)) = adjacent {
                         // The compound/prefix/postfix face (#2815 R2 —
                         // assignment_expression_resolver.dart:232-278, the
                         // increment twins): the application reads its operand
@@ -1765,7 +1773,7 @@ impl<'a> Engine<'a> {
                             && !self.null_aware_members.contains(&row.range.offset)
                             && !self.operator_face_extension_resolved(ty, row)
                         {
-                            self.emit_unchecked_nullable(op_range, op_text, is_method);
+                            self.emit_unchecked_nullable(op_range, op_text, kind);
                         }
                     } else if row.intent == Intent::Invoke
                         && (self.local_decl_at_read.contains_key(&row.range.offset)
@@ -1783,10 +1791,16 @@ impl<'a> Engine<'a> {
                         // shared unchecked code at the callee expression.
                         // Only variable reads fire (a local, a parameter, an
                         // implicit-this member) — a top-level function's own
-                        // invocation resolves. The function message variant
-                        // is renderer debt (zero Jaccard effect); the
-                        // property text stands.
-                        self.emit_unchecked_nullable(row.range, name_text, false);
+                        // invocation resolves. The callee expression sits
+                        // under a `FunctionExpressionInvocation`, so the
+                        // oracle spells the function variant
+                        // (messages.yaml's
+                        // `uncheckedInvocationOfNullableValue`).
+                        self.emit_unchecked_nullable(
+                            row.range,
+                            name_text,
+                            UncheckedNullableKind::Function,
+                        );
                     }
                 }
             }
@@ -1813,11 +1827,7 @@ impl<'a> Engine<'a> {
                     && !Self::synthetic_reference(row.range)
                     && !self.keyword_bare_reference(row.range)
                 {
-                    self.emit_unchecked_nullable(
-                        row.range,
-                        name_text,
-                        matches!(row.intent, Intent::Invoke),
-                    );
+                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 }
                 match row.intent {
                     Intent::Invoke => {
@@ -2013,9 +2023,14 @@ impl<'a> Engine<'a> {
     /// `None` for every other adjacency (a plain `=` among them: a plain
     /// assignment reads nothing unconditionally; `??=` guards its write).
     /// The returned triple is the BASE operator's spelling (`+=` reports
-    /// the method '+'), the operator token's span, and the method-text
-    /// pick (every shape in this family takes the method variant).
-    fn adjacent_operator(&self, row: &Row) -> Option<(&'static str, SourceRange, bool)> {
+    /// the method '+'), the operator token's span, and the variant pick
+    /// (every shape in this family takes the method variant —
+    /// messages.yaml's `uncheckedMethodInvocationOfNullableValue`, the
+    /// compound/unary faces' oracle text).
+    fn adjacent_operator(
+        &self,
+        row: &Row,
+    ) -> Option<(&'static str, SourceRange, UncheckedNullableKind)> {
         let tokens = self.tokens.as_slice();
         let span = |token: &dartq_scanner::Token| SourceRange {
             offset: token.utf16_offset,
@@ -2025,26 +2040,26 @@ impl<'a> Engine<'a> {
         };
         let at = tokens.partition_point(|t| t.utf16_offset < row.range.end());
         let suffix = tokens.get(at).and_then(|token| {
-            let (text, is_method) = match token.kind {
+            let (text, kind) = match token.kind {
                 dartq_scanner::TokenKind::PlusPlus | dartq_scanner::TokenKind::PlusEq => {
-                    ("+", true)
+                    ("+", UncheckedNullableKind::Method)
                 }
                 dartq_scanner::TokenKind::MinusMinus | dartq_scanner::TokenKind::MinusEq => {
-                    ("-", true)
+                    ("-", UncheckedNullableKind::Method)
                 }
-                dartq_scanner::TokenKind::StarEq => ("*", true),
-                dartq_scanner::TokenKind::SlashEq => ("/", true),
-                dartq_scanner::TokenKind::PercentEq => ("%", true),
-                dartq_scanner::TokenKind::TildeSlashEq => ("~/", true),
-                dartq_scanner::TokenKind::LtLtEq => ("<<", true),
-                dartq_scanner::TokenKind::GtGtEq => (">>", true),
-                dartq_scanner::TokenKind::GtGtGtEq => (">>>", true),
-                dartq_scanner::TokenKind::AmpersandEq => ("&", true),
-                dartq_scanner::TokenKind::BarEq => ("|", true),
-                dartq_scanner::TokenKind::CaretEq => ("^", true),
+                dartq_scanner::TokenKind::StarEq => ("*", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::SlashEq => ("/", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::PercentEq => ("%", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::TildeSlashEq => ("~/", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::LtLtEq => ("<<", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::GtGtEq => (">>", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::GtGtGtEq => (">>>", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::AmpersandEq => ("&", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::BarEq => ("|", UncheckedNullableKind::Method),
+                dartq_scanner::TokenKind::CaretEq => ("^", UncheckedNullableKind::Method),
                 _ => return None,
             };
-            Some((text, span(token), is_method))
+            Some((text, span(token), kind))
         });
         if suffix.is_some() {
             return suffix;
@@ -2073,7 +2088,7 @@ impl<'a> Engine<'a> {
             dartq_scanner::TokenKind::Tilde => "~",
             _ => "-",
         };
-        Some((text, span(token), true))
+        Some((text, span(token), UncheckedNullableKind::Method))
     }
 
     /// Whether the token kind can END an operand (the unary-minus
@@ -3064,7 +3079,7 @@ impl<'a> Engine<'a> {
                                 self.emit_unchecked_nullable(
                                     row.range,
                                     name_text,
-                                    matches!(row.intent, Intent::Invoke),
+                                    access_kind(&row.intent),
                                 );
                                 self.record_miss(
                                     row.name,
@@ -3112,7 +3127,7 @@ impl<'a> Engine<'a> {
                         self.emit_unchecked_nullable(
                             row.range,
                             name_text,
-                            matches!(row.intent, Intent::Invoke),
+                            access_kind(&row.intent),
                         );
                         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                         return;
@@ -3519,11 +3534,7 @@ impl<'a> Engine<'a> {
                 && !self.members.object_members.contains(&row.name)
             {
                 let name_text = self.strings.resolve(row.name);
-                self.emit_unchecked_nullable(
-                    row.range,
-                    name_text,
-                    matches!(row.intent, Intent::Invoke),
-                );
+                self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
@@ -3728,7 +3739,7 @@ impl<'a> Engine<'a> {
                         self.emit_unchecked_nullable(
                             row.range,
                             name_text,
-                            matches!(row.intent, Intent::Invoke),
+                            access_kind(&row.intent),
                         );
                     }
                     // The operator-merged read resolved (#2618): the member
@@ -3789,7 +3800,7 @@ impl<'a> Engine<'a> {
                                 self.emit_unchecked_nullable(
                                     row.range,
                                     name_text,
-                                    matches!(row.intent, Intent::Invoke),
+                                    access_kind(&row.intent),
                                 );
                             } else {
                                 let type_text = self.strings.resolve(report_on).to_string();
@@ -3812,7 +3823,7 @@ impl<'a> Engine<'a> {
                         self.emit_unchecked_nullable(
                             row.range,
                             name_text,
-                            matches!(row.intent, Intent::Invoke),
+                            access_kind(&row.intent),
                         );
                     } else {
                         let type_text = self.strings.resolve(report_on).to_string();
@@ -3975,11 +3986,7 @@ impl<'a> Engine<'a> {
                 }
                 if receiver_nullable {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_unchecked_nullable(
-                        row.range,
-                        name_text,
-                        matches!(row.intent, Intent::Invoke),
-                    );
+                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 }
                 self.check_member_unused_result(
                     row,
@@ -4006,11 +4013,7 @@ impl<'a> Engine<'a> {
             // answers the getter verdict, the write face the pair.
             let name_text = self.strings.resolve(row.name);
             if receiver_nullable {
-                self.emit_unchecked_nullable(
-                    row.range,
-                    name_text,
-                    matches!(row.intent, Intent::Invoke),
-                );
+                self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
@@ -4185,11 +4188,7 @@ impl<'a> Engine<'a> {
         // reaches the `undefined_*` family, whatever the member face the
         // model decided the miss on.
         if receiver_nullable || future_or_nullable {
-            self.emit_unchecked_nullable(
-                row.range,
-                name_text,
-                matches!(row.intent, Intent::Invoke),
-            );
+            self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
@@ -4858,11 +4857,7 @@ impl<'a> Engine<'a> {
                 && !own_param_armed
             {
                 let name_text = self.strings.resolve(row.name);
-                self.emit_unchecked_nullable(
-                    row.range,
-                    name_text,
-                    matches!(row.intent, Intent::Invoke),
-                );
+                self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             }
             return;
@@ -4910,11 +4905,7 @@ impl<'a> Engine<'a> {
             // answers without a dereference question — so the
             // `==`/Object arm below keeps its under-report.
             if receiver_nullable && !self.members.object_members.contains(&row.name) {
-                self.emit_unchecked_nullable(
-                    row.range,
-                    name_text,
-                    matches!(row.intent, Intent::Invoke),
-                );
+                self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
             }
             return;
         }
@@ -4926,11 +4917,7 @@ impl<'a> Engine<'a> {
         // `unchecked_use_of_nullable_value` code and never reaches the
         // `undefined_*` family.
         if receiver_nullable {
-            self.emit_unchecked_nullable(
-                row.range,
-                name_text,
-                matches!(row.intent, Intent::Invoke),
-            );
+            self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
@@ -5616,11 +5603,7 @@ impl<'a> Engine<'a> {
                 );
                 if !extension_wins {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_unchecked_nullable(
-                        row.range,
-                        name_text,
-                        matches!(row.intent, Intent::Invoke),
-                    );
+                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 } else {
                     // The nullable-`on` extension resolved the access: the
                     // member's result keeps the extension's own nullability
@@ -5667,11 +5650,7 @@ impl<'a> Engine<'a> {
             // receiver non-null, so `receiver_nullable` is false there.
             ExtensionApp::UnsafeSingle if receiver_nullable => {
                 let name_text = self.strings.resolve(row.name);
-                self.emit_unchecked_nullable(
-                    row.range,
-                    name_text,
-                    matches!(row.intent, Intent::Invoke),
-                );
+                self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 self.note_extension_ref(row);
                 true
             }
@@ -5688,11 +5667,7 @@ impl<'a> Engine<'a> {
                 // the shared code).
                 if receiver_nullable {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_unchecked_nullable(
-                        row.range,
-                        name_text,
-                        matches!(row.intent, Intent::Invoke),
-                    );
+                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                 }
                 true
             }
@@ -7274,6 +7249,115 @@ impl<'a> Engine<'a> {
             container,
         )
         .map(|(c, _)| c.kind)
+    }
+
+    /// The anonymous-methods experiment's receiver faces, over the
+    /// collector's captured invocations (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/fasta/ast_builder.dart:918-929` shape check,
+    /// then `pkg/analyzer/lib/src/generated/resolver.dart:1977-1982` and
+    /// `:2063-2079` receiver check): a written parameter list must be
+    /// exactly one required positional parameter
+    /// (`anonymous_method_wrong_parameter_list`, reported at the list's
+    /// parens — the list DROPS on failure upstream, so the type check never
+    /// co-fires), and that parameter's written type must accept the
+    /// receiver's static type (`anonymous_method_wrong_parameter_type`,
+    /// reported at the written annotation; null-aware punctuation promotes
+    /// the receiver to non-null first). Undecidable receiver types
+    /// suppress — the under-report direction.
+    pub(crate) fn finalize_anonymous_methods(&mut self) {
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let entries = elements.anon_methods();
+        if entries.is_empty() {
+            return;
+        }
+        let mut rows = Vec::new();
+        for entry in entries {
+            let Some((open, close)) = entry.parens else {
+                continue;
+            };
+            if entry.param_count != 1 || entry.first_named || entry.first_optional {
+                let code = SemanticCode::AnonymousMethodWrongParameterList;
+                rows.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message("", ""),
+                    self.file,
+                    SourceRange {
+                        offset: open.offset,
+                        length: close.end().saturating_sub(open.offset),
+                    },
+                    code.correction_message(""),
+                ));
+                continue;
+            }
+            let Some((param_ty, anchor)) = entry.param_ty else {
+                continue;
+            };
+            let Some(recv_ty) = self.anon_receiver_ty(entry) else {
+                continue;
+            };
+            let recv_ty = if entry.null_aware {
+                Self::non_null_form(recv_ty)
+            } else {
+                recv_ty
+            };
+            if self.assignable(recv_ty, param_ty, false) == Some(false) {
+                let code = SemanticCode::AnonymousMethodWrongParameterType;
+                let message = code.message(&self.render_ty(recv_ty), &self.render_ty(param_ty));
+                rows.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    message,
+                    self.file,
+                    anchor,
+                    code.correction_message(""),
+                ));
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+        // The capture seals innermost-first (nested members close inside
+        // out); the merge wants source order.
+        rows.sort_by_key(|d| d.range.offset);
+        self.report.diagnostics =
+            merge_source_ordered(std::mem::take(&mut self.report.diagnostics), rows);
+    }
+
+    /// The receiver's static type at one captured invocation: the last
+    /// token before the punctuation carries the expression's type. Literal
+    /// receivers answer from the primitive face (the corpus's `1.()` /
+    /// `"".()` shapes); everything else re-derives through the shared
+    /// receiver walk (the flow read face, then the member-read chain — an
+    /// identifier or `a.b` receiver). A `)`-ended compound receiver finds
+    /// no read record and suppresses.
+    fn anon_receiver_ty(&self, entry: &crate::model::AnonMethodInvocation) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens
+            .partition_point(|t| t.utf16_offset < entry.punctuation.offset)
+            .checked_sub(1)?;
+        let token = tokens.get(at)?;
+        let end = dartq_source::byte_offset_to_utf16(
+            self.source,
+            (token.byte_offset + token.byte_len) as usize,
+        );
+        let span = SourceRange {
+            offset: token.utf16_offset,
+            length: end.saturating_sub(token.utf16_offset),
+        };
+        match token.kind {
+            dartq_scanner::TokenKind::Int => Some(Ty::named(self.members.primitive_ids[0])),
+            dartq_scanner::TokenKind::Double => Some(Ty::named(self.members.primitive_ids[1])),
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::True)
+            | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::False) => {
+                Some(Ty::named(self.members.primitive_ids[3]))
+            }
+            dartq_scanner::TokenKind::String => Some(Ty::named(self.members.primitive_ids[4])),
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Null) => Some(Ty::Null),
+            _ => self.recv_expression_ty(span),
+        }
     }
 }
 

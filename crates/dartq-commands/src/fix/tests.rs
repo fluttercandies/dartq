@@ -1802,7 +1802,7 @@ fn unit_features_derive_from_the_containing_package() {
                 ),
             )
             .expect("config");
-        let (table, _, _, _, _) = crate::workspace::package_assembly(&root).expect("assembly");
+        let (table, _, _, _, _, _) = crate::workspace::package_assembly(&root).expect("assembly");
         let features = unit_features(Some(&table), &root.join("lib/a.dart"));
         std::fs::remove_dir_all(&root).ok();
         features

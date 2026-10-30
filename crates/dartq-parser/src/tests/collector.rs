@@ -62,6 +62,9 @@ pub(crate) struct Collector {
     /// reference names; the log index interleaves identifier events with
     /// the structural log for nesting assertions.
     pub idents: Vec<(String, u32, u32, usize)>,
+    /// `handle_catch_trace_parameter` fires (the real-comma slot flip), in
+    /// fire order (log indices).
+    pub catch_trace_flips: Vec<usize>,
 }
 
 impl Collector {
@@ -92,6 +95,10 @@ impl ParserListener for Collector {
             token.range.offset + token.range.length,
             self.log.len(),
         ));
+    }
+
+    fn handle_catch_trace_parameter(&mut self) {
+        self.catch_trace_flips.push(self.log.len());
     }
 
     fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, end: TokenSpan) {

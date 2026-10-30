@@ -340,7 +340,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotation::is_meta_getter;
 use crate::bounds::{Bounds, Clause, TypeTree};
-use crate::codes::{ArgCountShape, ExecKind, SemanticCode, SuperShape};
+use crate::codes::{ArgCountShape, ExecKind, SemanticCode, SuperShape, UncheckedNullableKind};
 use crate::collector::container_modifiers;
 use crate::const_eval::{
     BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, Expr, IdentVerdict, UnOp, Verdict,
@@ -439,6 +439,19 @@ mod literal_constructor_tests;
 mod sealed_contract_tests;
 #[cfg(test)]
 mod tests;
+
+/// The #2878 display-retention pins: the function type's own
+/// type-parameter group and the named type's arguments surviving into
+/// the message slots, plus the redirect face's instantiated forms.
+#[cfg(test)]
+mod ticket_2878_tests;
+
+/// The #2879 anonymous-method pins: the captured invocations' shape and
+/// receiver-assignability rows over the two error/super-error corpus faces
+/// (the anonymous-methods experiment's `anonymous_method_wrong_parameter_*`
+/// pair, opted in per fixture).
+#[cfg(test)]
+mod ticket_2879_tests;
 
 /// The #2216-family producer pins (#2216/#2193/#2188 faces verified
 /// end-to-end): kept as a standalone module so the shared `tests` rig
@@ -655,6 +668,11 @@ pub(crate) fn subst_tree(tree: &TypeTree, map: &FxHashMap<StringId, TypeTree>) -
         out.function = Some(crate::capture::FnTree {
             ret: f.ret.as_ref().map(|r| Box::new(subst_tree(r, map))),
             type_params: f.type_params,
+            type_params_named: f
+                .type_params_named
+                .iter()
+                .map(|(n, b)| (*n, b.as_ref().map(|t| subst_tree(t, map))))
+                .collect(),
             positional: f.positional.iter().map(|p| subst_tree(p, map)).collect(),
             named: f
                 .named
@@ -1569,6 +1587,10 @@ pub fn fold_unit_with_ops<'t>(
     // `.address` reads (upstream ffi_verifier.dart, run after the parse so
     // same-file later declarations resolve).
     engine.finalize_ffi();
+    // The anonymous-methods experiment's receiver faces (#2879): the
+    // captured invocation entries re-derive the shape and
+    // receiver-assignability verdicts over the settled element model.
+    engine.finalize_anonymous_methods();
     // The F-C redirect cycle walk needs every constructor's initializer
     // edges (a later declaration can close a cycle an earlier one opened).
     engine.finalize_redirects();
@@ -3059,6 +3081,18 @@ pub(crate) fn use_kind_of(intent: &Intent) -> NameUse {
         Intent::Invoke => NameUse::Invoke,
         Intent::Write | Intent::ReadWrite => NameUse::Write,
         _ => NameUse::Read,
+    }
+}
+
+/// The unchecked-nullable variant of a member-face row: an invoked selector
+/// reports the method text, every other access shape the property text —
+/// the oracle's MethodInvocation-vs-property node-shape dispatch
+/// (type_property_resolver.dart:128-148).
+pub(crate) fn access_kind(intent: &Intent) -> UncheckedNullableKind {
+    if matches!(intent, Intent::Invoke) {
+        UncheckedNullableKind::Method
+    } else {
+        UncheckedNullableKind::Property
     }
 }
 
@@ -5064,6 +5098,31 @@ mod ticket_2784_tests;
 #[cfg(test)]
 mod ticket_2859_tests;
 
+/// The #2861 case-body dead-row anchor pins: a comment-led switch member
+/// body (`case null: // Unreachable`) anchors its dead row at the body's
+/// first statement — `trimmed_span`'s leading edge snaps to the first
+/// token in the span — with the comment-free regression and the
+/// multiple-statements first-statement pin.
+#[cfg(test)]
+mod ticket_2861_tests;
+
+/// The #2867 augmentation-signature-matching pins: the aug-side formal
+/// capture (the mux forward repair; non-empty `AugmentDecl.formals`), the
+/// accessor-family unification through the variable element's induced
+/// getter/setter chains, and the `declaration_already_complete` family —
+/// one oracle-derived row per broken face.
+#[cfg(test)]
+mod ticket_2867_tests;
+
+/// The #2860 error-scrutinee pins: a switch over a genuinely-unresolved
+/// call reads the oracle's `InvalidType` — the vacuous cover kills the
+/// chain (the covered case's `unreachable_switch_case`, the past-switch
+/// `dead_code`) with the exhaustiveness error suppressed, while the
+/// invokable-member and modeled-unknown-return heads keep the unknown
+/// face (no dead rows invented) and the join reports each dead row once.
+#[cfg(test)]
+mod ticket_2860_tests;
+
 /// The #2854 S1c operand pins: the completed send's declared return,
 /// the untyped collection literal's inferred element type, and the
 /// closure literal's written-signature function type reaching the
@@ -5208,6 +5267,13 @@ mod ticket_2835_tests;
 #[cfg(test)]
 mod ticket_2852_tests;
 
+/// The #2877 message-variant dispatch pins: the four shared-name
+/// `unchecked_use_of_nullable_value` rows (function / method / operator /
+/// property) each rendered with the oracle's exact text and correction by
+/// the access shape the emission face resolves.
+#[cfg(test)]
+mod ticket_2877_tests;
+
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.
 #[cfg(test)]
@@ -5281,3 +5347,13 @@ mod ticket_2831_tests;
 /// condition variable, live-if empty block).
 #[cfg(test)]
 mod ticket_2851_tests;
+/// The #2869 pins: the invocation-site type-argument bounds face (the
+/// written `<...>` of a send or creation against the callee's
+/// substituted bounds, the erroneous-type and `dynamic` suppressions).
+#[cfg(test)]
+mod ticket_2869_tests;
+/// The #2890 pins: the #2869 residual bounds faces — the tear-off and
+/// constructor-reference forms without a call, the super-send explicit
+/// arguments, and the keyword-form creation.
+#[cfg(test)]
+mod ticket_2890_tests;

@@ -914,11 +914,12 @@ fn diagnose_library(
     for file in &members {
         checkpoint.tick()?;
         let facts = &state.residency[file];
-        // A part's missing-target row spells the RESOLVED absolute form:
-        // the oracle's part-include state lands the URI on a `FileState`
-        // even when the file is absent, and the non-part-kind arm reports
-        // `includedFile.uriStr` — the `file://` URI
-        // (library_analyzer.dart:1030-1046). Imports/exports keep the
+        // A part's missing-target row spells the canonical URI form: the
+        // oracle's part-include state lands the URI on a `FileState` even
+        // when the file is absent, and the non-part-kind arm reports
+        // `includedFile.uriStr` — `FileState.uriStr`, the canonical
+        // spelling (`package:` inside a package, `file://` outside;
+        // library_analyzer.dart:1030-1046). Imports/exports keep the
         // written literal (`selectedUri.relativeUriStr`), so only `part`
         // rows re-spell, and only ones the URI layer coded at a target.
         out.extend(facts.diagnostics.iter().map(|row| {
@@ -943,13 +944,10 @@ fn diagnose_library(
             let ResolvedTarget::Resolved(target) = directive.target else {
                 return row.clone();
             };
-            let Some(path) = state.files.path(target) else {
-                return row.clone();
-            };
             let code = directive.code.expect("matched some above");
             Arc::new(l1::uri_diagnostic(
                 code,
-                &format!("file://{}", path.display()),
+                &canonical_uri_spelling(state, target),
                 row.range,
                 row.file,
             ))
@@ -983,15 +981,11 @@ fn diagnose_library(
                 // this check stays silent.
                 && !state.deps.units.contains_key(&target)
             {
-                // A part spells the resolved absolute form like the baked
-                // rows above (`includedFile.uriStr`); imports/exports keep
-                // the written literal.
+                // A part spells the canonical URI form like the baked rows
+                // above (`includedFile.uriStr`); imports/exports keep the
+                // written literal.
                 let uri = match directive.kind {
-                    DirectiveKind::Part => state
-                        .files
-                        .path(target)
-                        .map(|path| format!("file://{}", path.display()))
-                        .unwrap_or_else(|| directive.uri.clone().unwrap_or_default().to_string()),
+                    DirectiveKind::Part => canonical_uri_spelling(state, target),
                     _ => directive.uri.clone().unwrap_or_default().to_string(),
                 };
                 out.push(Arc::new(l1::uri_diagnostic(
@@ -2765,6 +2759,7 @@ mod tests {
             packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
             pub_config: Arc::clone(&config),
             config_dir,
+            context_roots: Vec::new(),
             semdiag: Some(diagnoser()),
             target: crate::DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),
@@ -4722,6 +4717,7 @@ mod tests {
             packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
             pub_config: Arc::clone(&config),
             config_dir,
+            context_roots: Vec::new(),
             semdiag: Some(diagnoser()),
             target: crate::DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),

@@ -65,17 +65,90 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// A catch clause parameter: first is the exception variable, second
-    /// the stack trace. The exception's auto-use bit patches in at
-    /// `handle_catch_block` when both facts are known.
+    /// A catch clause parameter: the slot it fills decides the kind — the
+    /// parser's comma fact ([`Engine::catch_trace_slot`], flipped on the
+    /// written comma), never the arrival order of the events: a recovery
+    /// shape whose exception name is synthetic (`catch (var e)`) lets the
+    /// real `e` reach the trace ensure while the official formals list
+    /// still reads it as `catchParameters[0]` — the exception. The
+    /// exception's auto-use bit patches in at `handle_catch_block` when
+    /// both facts are known.
     pub(crate) fn note_catch_parameter(&mut self, name: StringId, range: SourceRange) {
-        let kind = if self.catch_params == 0 {
-            LocalKind::CatchException { auto: false }
-        } else {
+        let kind = if self.catch_trace_slot {
             LocalKind::CatchStack
+        } else {
+            LocalKind::CatchException { auto: false }
         };
         self.catch_params += 1;
         self.add_tracked_local(name, range, kind);
+    }
+
+    /// `end_formal_parameters` for the catch group's re-parse: the official
+    /// AST reads the catch faces off the formals list
+    /// (`handleCatchBlock` — exception = `catchParameters[0].name`,
+    /// stack trace = `catchParameters[1].name`), so the re-parse's second
+    /// real formal name is the trace slot's own binding. The fast pass's
+    /// real trace name already carries the stack face; a junk-filled slot
+    /// (`{st}`, `[s0, s1]` — only the nameless synthetic row) hands the
+    /// face to that second name — the named-section/optional member the
+    /// re-parse recovered is the oracle's stack trace variable — and the
+    /// nameless ghost row retires into a silent parameter. A junk keyword
+    /// the re-parse consumed as its own second name (`catch (e, do …`) is
+    /// the slot's junk itself, never a recovered binding: the ghost keeps
+    /// the face. The flip never firing (a synthetic comma — the group
+    /// never gained a second slot) leaves the rows untouched.
+    ///
+    /// Every close also zeroes the catch rows' use counts: the formal
+    /// re-parse resolves its own tokens against the live scope, and a
+    /// fast-pass name re-read in type position (`catch (e, s l:` — the
+    /// junk tail parses `s` as the next formal's type) credits a phantom
+    /// use to the catch row. The official pipeline resolves uses on the
+    /// final AST alone — where the re-parse's faces are the parameter
+    /// names, never type annotations — so the group's close drops them;
+    /// the body's real reads land only after this point.
+    pub(crate) fn reconcile_catch_slots(&mut self, trace_row: Option<usize>) {
+        let Some(&mark) = self.frame_local_marks.last() else {
+            return;
+        };
+        for decl in &mut self.locals[mark..] {
+            if matches!(
+                decl.kind,
+                LocalKind::CatchException { .. } | LocalKind::CatchStack
+            ) {
+                decl.uses = 0;
+            }
+        }
+        if !self.catch_trace_slot {
+            return;
+        }
+        let mut ghost_offset: Option<u32> = None;
+        let mut ghost_rows: Vec<usize> = Vec::new();
+        for (i, decl) in self.locals[mark..].iter().enumerate() {
+            if matches!(decl.kind, LocalKind::CatchStack) {
+                if self.is_nameless(decl.name) {
+                    ghost_rows.push(mark + i);
+                    ghost_offset = Some(decl.range.offset);
+                } else {
+                    // The fast pass bound a real trace name — its row
+                    // carries the face and the re-parse's names are its
+                    // twin and junk tail.
+                    return;
+                }
+            }
+        }
+        let Some(row) = trace_row else {
+            return;
+        };
+        let range = self.locals[row].range;
+        if ghost_offset.is_some_and(|offset| offset == range.offset) {
+            return;
+        }
+        self.locals[row].kind = LocalKind::CatchStack;
+        // The silent-parameter kind never emits (`close_frame_locals`'s
+        // parameter arm).
+        for &i in &ghost_rows {
+            self.locals[i].kind = LocalKind::Parameter { site: None };
+        }
     }
 
     /// A named local function (reports as `unused_element`). The name
@@ -265,15 +338,23 @@ impl<'a> Engine<'a> {
     /// `handle_catch_block`: the clause's facts are complete (on-type,
     /// parameters, body block). The official auto-use decision patches the
     /// exception variable (plain `catch`, or a stack-trace sibling, uses
-    /// it), the clause joins the try's clause list, and the catch frame
-    /// closes — the parameters leave scope only after the body.
+    /// it — the sibling's presence reads off the clause's rows: a
+    /// `CatchStack` row exists exactly when the trace slot filled, be it
+    /// with a real name or the nameless synthetic), the clause joins the
+    /// try's clause list, and the catch frame closes — the parameters
+    /// leave scope only after the body.
     pub(crate) fn finish_catch_clause(&mut self) {
-        let auto = self.catch_on_type.is_none() || self.catch_params > 1;
-        if let Some(mark) = self.frame_local_marks.last().copied() {
-            for decl in self.locals[mark..].iter_mut().rev() {
+        let mark = self.frame_local_marks.last().copied();
+        let auto = self.catch_on_type.is_none()
+            || mark.is_some_and(|mark| {
+                self.locals[mark..]
+                    .iter()
+                    .any(|d| matches!(d.kind, LocalKind::CatchStack))
+            });
+        if let Some(mark) = mark {
+            for decl in &mut self.locals[mark..] {
                 if let LocalKind::CatchException { auto: slot } = &mut decl.kind {
                     *slot = auto;
-                    break;
                 }
             }
         }
@@ -1611,13 +1692,17 @@ impl<'a> Engine<'a> {
         // recovery cannot vouch for, so those solutions stay open.
         if let (Some(own), Some(callee_row)) = (ordered, callee_row)
             && let Some(callee_offset) = self.rows.get(callee_row).map(|r| r.range.offset)
-            && let Some((_, explicit)) = self
+            && let Some((_, entry)) = self
                 .call_type_args
                 .iter()
                 .find(|(row, _)| *row == callee_offset)
-            && explicit.len() == own
+            && entry.tys.len() == own
         {
-            for ((slot, fixed), ty) in solutions.iter_mut().zip(fixed.iter_mut()).zip(explicit) {
+            for ((slot, fixed), ty) in solutions
+                .iter_mut()
+                .zip(fixed.iter_mut())
+                .zip(entry.tys.iter())
+            {
                 *slot = Some(*ty);
                 *fixed = true;
             }
@@ -2810,8 +2895,15 @@ impl<'a> Engine<'a> {
                 .iter()
                 .map(|(name, f)| (*name, self.tree_ty(f)))
                 .collect();
-            return self.boundary.args.borrow_mut().function(
-                fn_tree.type_params,
+            // The signature's own group interns beside the shape (#2878),
+            // the same column the diagnose-side fn capture carries.
+            let type_params: Vec<(StringId, Option<Ty>)> = fn_tree
+                .type_params_named
+                .iter()
+                .map(|(name, bound)| (*name, bound.as_ref().map(|b| self.tree_ty(b))))
+                .collect();
+            return self.boundary.args.borrow_mut().function_generic(
+                &type_params,
                 ret,
                 &positional,
                 &named,

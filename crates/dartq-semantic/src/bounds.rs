@@ -1440,6 +1440,25 @@ impl<'a> Bounds<'a> {
         )
     }
 
+    /// A captured type alias's own parameters (name, written bound, poison
+    /// bit) in declaration order — the alias-creation bounds face's
+    /// parameter facts (#2869: the ALIAS's own bounds decide on a
+    /// creation spelled through the alias). `None` when the head captured
+    /// no alias; owned, mirroring [`Self::container_params`].
+    pub(crate) fn alias_params(
+        &self,
+        name: StringId,
+    ) -> Option<Vec<(StringId, Option<TypeTree>, bool)>> {
+        let capture = self.index.aliases.get(&name)?;
+        Some(
+            capture
+                .params
+                .iter()
+                .map(|(param, bound, poisoned)| (*param, bound.clone(), *poisoned))
+                .collect(),
+        )
+    }
+
     /// #2831 P1 — the raw-constructor inference face. A creation with no
     /// explicit type arguments and no downward context seeds every
     /// unconstrained parameter with the greatest closure of its bound

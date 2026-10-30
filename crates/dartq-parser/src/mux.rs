@@ -102,6 +102,11 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
         self.b.handle_identifier(token, context);
     }
 
+    fn handle_catch_trace_parameter(&mut self) {
+        self.a.handle_catch_trace_parameter();
+        self.b.handle_catch_trace_parameter();
+    }
+
     fn begin_type_arguments(&mut self, token: Token) {
         self.a.begin_type_arguments(token);
         self.b.begin_type_arguments(token);
@@ -261,9 +266,64 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
         self.b.begin_formal_parameters(token, kind);
     }
 
+    fn begin_anonymous_method_invocation(&mut self, token: Token) {
+        self.a.begin_anonymous_method_invocation(token);
+        self.b.begin_anonymous_method_invocation(token);
+    }
+
+    fn end_anonymous_method_invocation(
+        &mut self,
+        begin: Token,
+        function_definition: Option<Token>,
+        end: Token,
+        is_expression: bool,
+    ) {
+        self.a
+            .end_anonymous_method_invocation(begin, function_definition, end, is_expression);
+        self.b
+            .end_anonymous_method_invocation(begin, function_definition, end, is_expression);
+    }
+
+    fn handle_implicit_formal_parameters(&mut self, token: Token) {
+        self.a.handle_implicit_formal_parameters(token);
+        self.b.handle_implicit_formal_parameters(token);
+    }
+
     fn end_formal_parameters(&mut self, count: usize, begin: Token, end: Token, kind: MemberKind) {
         self.a.end_formal_parameters(count, begin, end, kind);
         self.b.end_formal_parameters(count, begin, end, kind);
+    }
+
+    fn begin_optional_formal_parameters(&mut self, token: Token) {
+        self.a.begin_optional_formal_parameters(token);
+        self.b.begin_optional_formal_parameters(token);
+    }
+
+    fn end_optional_formal_parameters(
+        &mut self,
+        count: usize,
+        begin: Token,
+        end: Token,
+        kind: MemberKind,
+    ) {
+        self.a
+            .end_optional_formal_parameters(count, begin, end, kind);
+        self.b
+            .end_optional_formal_parameters(count, begin, end, kind);
+    }
+
+    fn begin_formal_parameter(
+        &mut self,
+        token: Token,
+        kind: MemberKind,
+        required: Option<Token>,
+        covariant_kw: Option<Token>,
+        var_final_or_const: Option<Token>,
+    ) {
+        self.a
+            .begin_formal_parameter(token, kind, required, covariant_kw, var_final_or_const);
+        self.b
+            .begin_formal_parameter(token, kind, required, covariant_kw, var_final_or_const);
     }
 
     fn end_formal_parameter(
@@ -548,6 +608,36 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
             .begin_factory(kind, last_consumed, augment_kw, external_kw, const_keyword);
         self.b
             .begin_factory(kind, last_consumed, augment_kw, external_kw, const_keyword);
+    }
+
+    fn begin_initializers(&mut self, token: Token) {
+        self.a.begin_initializers(token);
+        self.b.begin_initializers(token);
+    }
+
+    fn end_initializers(&mut self, count: usize, begin: Token, end: Token) {
+        self.a.end_initializers(count, begin, end);
+        self.b.end_initializers(count, begin, end);
+    }
+
+    fn handle_no_initializers(&mut self) {
+        self.a.handle_no_initializers();
+        self.b.handle_no_initializers();
+    }
+
+    fn begin_redirecting_factory_body(&mut self, equals: Token) {
+        self.a.begin_redirecting_factory_body(equals);
+        self.b.begin_redirecting_factory_body(equals);
+    }
+
+    fn end_redirecting_factory_body(&mut self, equals: Token, end: Token) {
+        self.a.end_redirecting_factory_body(equals, end);
+        self.b.end_redirecting_factory_body(equals, end);
+    }
+
+    fn handle_no_function_body(&mut self, token: Token) {
+        self.a.handle_no_function_body(token);
+        self.b.handle_no_function_body(token);
     }
 
     fn end_factory(&mut self, kind: DeclarationKind, begin: Token, factory: Token, end: Token) {
@@ -986,6 +1076,7 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
 /// cannot see; keep them in lockstep.
 #[cfg(test)]
 const FORWARDED_METHODS: &[&str] = &[
+    "begin_anonymous_method_invocation",
     "begin_block_function_body",
     "begin_class_declaration",
     "begin_class_or_mixin_or_extension_body",
@@ -997,27 +1088,32 @@ const FORWARDED_METHODS: &[&str] = &[
     "begin_extension_type_declaration",
     "begin_factory",
     "begin_fields",
+    "begin_formal_parameter",
     "begin_formal_parameter_default_value_expression",
     "begin_formal_parameters",
     "begin_function_type",
     "begin_function_typed_formal_parameter",
     "begin_import",
+    "begin_initializers",
     "begin_library_augmentation",
     "begin_library_name",
     "begin_method",
     "begin_mixin_declaration",
     "begin_named_mixin_application",
+    "begin_optional_formal_parameters",
     "begin_part",
     "begin_primary_constructor",
     "begin_record_type",
     "begin_record_type_entry",
     "begin_record_type_named_fields",
+    "begin_redirecting_factory_body",
     "begin_top_level_method",
     "begin_type_arguments",
     "begin_type_list",
     "begin_type_variable",
     "begin_type_variables",
     "begin_typedef",
+    "end_anonymous_method_invocation",
     "end_class_declaration",
     "end_class_or_mixin_or_extension_body",
     "end_constructor",
@@ -1033,15 +1129,18 @@ const FORWARDED_METHODS: &[&str] = &[
     "end_formal_parameters",
     "end_function_type",
     "end_function_typed_formal_parameter",
+    "end_initializers",
     "end_metadata",
     "end_metadata_star",
     "end_method",
     "end_mixin_declaration",
     "end_named_mixin_application",
+    "end_optional_formal_parameters",
     "end_primary_constructor",
     "end_record_type",
     "end_record_type_entry",
     "end_record_type_named_fields",
+    "end_redirecting_factory_body",
     "end_top_level_fields",
     "end_top_level_method",
     "end_type_arguments",
@@ -1060,6 +1159,7 @@ const FORWARDED_METHODS: &[&str] = &[
     "handle_expression_function_body",
     "handle_identifier",
     "handle_implements",
+    "handle_implicit_formal_parameters",
     "handle_indexed_expression",
     "handle_mixin_header",
     "handle_mixin_on",
@@ -1070,6 +1170,8 @@ const FORWARDED_METHODS: &[&str] = &[
     "handle_no_extension_body",
     "handle_no_extension_type_body",
     "handle_no_formal_parameters",
+    "handle_no_function_body",
+    "handle_no_initializers",
     "handle_no_mixin_body",
     "handle_no_name",
     "handle_no_type",
@@ -1107,6 +1209,7 @@ mod tests {
     const DIAG_COLLECTOR_REQUIREMENTS: &[&str] =
         &["handle_experiment_not_enabled", "handle_recoverable_error"];
     const DECLARATION_COLLECTOR_REQUIREMENTS: &[&str] = &[
+        "begin_anonymous_method_invocation",
         "begin_block_function_body",
         "begin_class_declaration",
         "begin_class_or_mixin_or_extension_body",
@@ -1117,6 +1220,7 @@ mod tests {
         "begin_extension_type_declaration",
         "begin_factory",
         "begin_fields",
+        "begin_formal_parameter",
         "begin_formal_parameter_default_value_expression",
         "begin_formal_parameters",
         "begin_function_type",
@@ -1127,6 +1231,7 @@ mod tests {
         "begin_method",
         "begin_mixin_declaration",
         "begin_named_mixin_application",
+        "begin_optional_formal_parameters",
         "begin_part",
         "begin_primary_constructor",
         "begin_record_type",
@@ -1136,6 +1241,7 @@ mod tests {
         "begin_type_variable",
         "begin_type_variables",
         "begin_typedef",
+        "end_anonymous_method_invocation",
         "end_class_declaration",
         "end_constructor",
         "end_enum_declaration",
@@ -1153,6 +1259,7 @@ mod tests {
         "end_method",
         "end_mixin_declaration",
         "end_named_mixin_application",
+        "end_optional_formal_parameters",
         "end_primary_constructor",
         "end_record_type",
         "end_record_type_entry",
@@ -1172,6 +1279,7 @@ mod tests {
         "handle_expression_function_body",
         "handle_identifier",
         "handle_implements",
+        "handle_implicit_formal_parameters",
         "handle_mixin_header",
         "handle_mixin_on",
         "handle_named_mixin_application_with_clause",
@@ -1196,6 +1304,7 @@ mod tests {
     /// forwarded — an override can no longer be added without the mux
     /// learning to forward it.
     const DECLARATION_COLLECTOR_OVERRIDES: &[&str] = &[
+        "begin_anonymous_method_invocation",
         "begin_block_function_body",
         "begin_class_declaration",
         "begin_class_or_mixin_or_extension_body",
@@ -1206,6 +1315,7 @@ mod tests {
         "begin_extension_type_declaration",
         "begin_factory",
         "begin_fields",
+        "begin_formal_parameter",
         "begin_formal_parameter_default_value_expression",
         "begin_formal_parameters",
         "begin_function_type",
@@ -1216,6 +1326,7 @@ mod tests {
         "begin_method",
         "begin_mixin_declaration",
         "begin_named_mixin_application",
+        "begin_optional_formal_parameters",
         "begin_part",
         "begin_primary_constructor",
         "begin_record_type",
@@ -1225,6 +1336,7 @@ mod tests {
         "begin_type_variable",
         "begin_type_variables",
         "begin_typedef",
+        "end_anonymous_method_invocation",
         "end_class_declaration",
         "end_constructor",
         "end_enum_declaration",
@@ -1261,6 +1373,7 @@ mod tests {
         "handle_expression_function_body",
         "handle_identifier",
         "handle_implements",
+        "handle_implicit_formal_parameters",
         "handle_mixin_header",
         "handle_mixin_on",
         "handle_named_mixin_application_with_clause",
@@ -1307,6 +1420,7 @@ mod tests {
         "begin_type_list",
         "begin_type_variable",
         "begin_typedef",
+        "end_anonymous_method_invocation",
         "end_class_declaration",
         "end_class_or_mixin_or_extension_body",
         "end_constructor_reference",

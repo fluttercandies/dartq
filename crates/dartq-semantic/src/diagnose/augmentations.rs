@@ -31,12 +31,31 @@ use dartq_resolution::{LibraryGraph, LibraryId};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::codes::{ReturnShape, SemanticCode, WithoutDeclarationShape};
+use crate::codes::{AlreadyCompleteShape, ReturnShape, SemanticCode, WithoutDeclarationShape};
 use crate::library::ElementIndex;
 use crate::model::{
     AugKind, AugmentDecl, AugmentFormal, Container, ContainerKind, FileElements, Formal, Formals,
     MemberKind, Ty,
 };
+
+/// The variable family — a `Field`/`TopLevelVar` declaration and the
+/// getter/setter accessors its name space shares (upstream one
+/// `lastFragments[name]` slot across the accessor kinds, with the resolved
+/// element holding three independent fragment chains: the variable's own,
+/// its induced/written getter's, and its induced/written setter's —
+/// `_fieldElement(lastFragment)` resolves the element from a fragment of
+/// ANY accessor kind).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Accessor {
+    /// The variable chain itself (`Field`/`TopLevelVar` fragments).
+    Variable,
+    /// The getter chain (`Getter` fragments plus every variable fragment's
+    /// induced getter).
+    Getter,
+    /// The setter chain (`Setter` fragments plus every non-final variable
+    /// fragment's induced setter).
+    Setter,
+}
 
 /// One library-space declaration the target lookup resolves: the identity
 /// facts of the merge rule plus the pointer the compare-time face reads.
@@ -63,6 +82,46 @@ struct Entry {
     is_const: bool,
     /// A factory head.
     is_factory: bool,
+    /// The fragment's completeness bit (upstream `*FragmentImpl.isComplete`)
+    /// — the `declaration_already_complete` family's
+    /// `nearestPrecedingCompleteFragment` walk. Executable:
+    /// `external || nonEmptyBody`; constructor adds initializers/redirects/
+    /// initializing formals; variable-induced accessor: `external ||
+    /// !abstract`. Non-executable kinds (containers) never participate.
+    is_complete: bool,
+}
+
+impl Entry {
+    /// The variable family: this fragment's sub-chain membership (upstream
+    /// `element_builder.dart` — a `Field`/`TopLevelVar` fragment appends an
+    /// induced getter (always) and an induced setter (non-final) alongside
+    /// its own variable-chain slot; a `Getter`/`Setter`-only fragment backs
+    /// onto a synthetic `isOriginGetterSetter` field in the variable chain
+    /// and appends only to its own accessor chain).
+    fn in_accessor(&self, accessor: Accessor) -> bool {
+        match accessor {
+            // Every accessor-family fragment carries a variable-chain slot:
+            // a variable fragment by itself, an accessor-only fragment by
+            // its synthetic backing field.
+            Accessor::Variable => {
+                matches!(
+                    self.kind,
+                    AugKind::Field | AugKind::TopLevelVar | AugKind::Getter | AugKind::Setter
+                )
+            }
+            Accessor::Getter => {
+                matches!(
+                    self.kind,
+                    AugKind::Getter | AugKind::Field | AugKind::TopLevelVar
+                )
+            }
+            Accessor::Setter => {
+                self.kind == AugKind::Setter
+                    || (matches!(self.kind, AugKind::Field | AugKind::TopLevelVar)
+                        && !self.is_final)
+            }
+        }
+    }
 }
 
 /// The compare-time face of a resolved introductory declaration.
@@ -78,11 +137,8 @@ enum Face<'e> {
         is_setter: bool,
     },
     /// A top-level variable intro: the induced getter's return type is the
-    /// variable's own type; the induced-setter check reads the finality.
-    TopVar {
-        decl: &'e crate::model::TopDecl,
-        is_final: bool,
-    },
+    /// variable's own type.
+    TopVar(&'e crate::model::TopDecl),
     /// A constructor/factory intro: the formals live in the owning
     /// container's per-selector tables, the const/factory bits in the
     /// chain entry.
@@ -99,7 +155,7 @@ impl Face<'_> {
     fn formals(&self) -> Option<&Formals> {
         match self {
             Face::Member(m) => m.formals.as_deref(),
-            Face::TopFn { decl, .. } | Face::TopVar { decl, .. } => decl.formals.as_deref(),
+            Face::TopFn { decl, .. } | Face::TopVar(decl) => decl.formals.as_deref(),
             Face::Ctor {
                 container,
                 name,
@@ -128,7 +184,7 @@ impl Face<'_> {
                 _ => (m.return_ty, false),
             },
             Face::TopFn { decl, is_setter } => (decl.return_ty, *is_setter),
-            Face::TopVar { decl, .. } => (decl.var_ty, false),
+            Face::TopVar(decl) => (decl.var_ty, false),
             Face::Container(_) | Face::Ctor { .. } => (Ty::UNKNOWN, false),
         }
     }
@@ -139,7 +195,7 @@ impl Face<'_> {
         match self {
             Face::Container(c) => (&c.type_param_names, &c.type_param_bounds),
             Face::Member(m) => (&m.type_param_names, &m.type_param_bounds),
-            Face::TopFn { decl, .. } | Face::TopVar { decl, .. } => (&decl.type_param_names, &[]),
+            Face::TopFn { decl, .. } | Face::TopVar(decl) => (&decl.type_param_names, &[]),
             Face::Ctor { .. } => (&[], &[]),
         }
     }
@@ -159,50 +215,82 @@ impl Face<'_> {
             _ => [false; 6],
         }
     }
-
-    /// Whether the resolved intro is a variable that induces no setter
-    /// (`final`; `const` intros are not modeled apart — see the module
-    /// docs).
-    fn is_final_variable(&self) -> bool {
-        match self {
-            Face::Member(m) => m.kind == MemberKind::Field && m.is_final,
-            Face::TopVar { is_final, .. } => *is_final,
-            _ => false,
-        }
-    }
 }
 
 /// The declaration space a lookup key resolves in (upstream keeps types,
 /// constructors, members, and top-level declarations in separate fragment
-/// maps — the different-kind refusal only ever reads the type space's
-/// neighbors).
+/// maps — and within each map ONE `lastFragments[name]` slot covers every
+/// kind, so a method and a getter under the same name collide: the
+/// different-kind refusal reads that single slot's last fragment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Space {
     /// Container heads (`class`/`mixin`/`enum`/`extension`/extension type).
     Type,
     /// Constructors and factories (per-selector rows under the owner).
     Ctor,
-    /// Class members (methods, accessors, fields).
+    /// Instance members (upstream `_instanceNamespace`).
     Member,
-    /// Top-level functions, accessors, and variables.
+    /// Static members (upstream `_staticNamespace`) — an `int foo` and a
+    /// `static int foo` never collide.
+    StaticMember,
+    /// Top-level functions, accessors, and variables (one name slot).
     Top,
 }
 
-/// The table key of an `augment` declaration: the container it resolves
-/// under, its name, and its kind's space. A container augmentation targets
-/// the declaration it spells — `augment class C` keys under C itself (the
-/// container column is a member's owner and is absent on top-level heads).
-fn augment_key(aug: &AugmentDecl) -> (Option<StringId>, StringId, Space) {
-    match aug.kind {
-        AugKind::Class
-        | AugKind::Mixin
-        | AugKind::Enum
-        | AugKind::Extension
-        | AugKind::ExtensionType => (Some(aug.name), aug.name, Space::Type),
-        AugKind::Constructor => (aug.container, aug.name, Space::Ctor),
-        _ if aug.container.is_some() => (aug.container, aug.name, Space::Member),
-        _ => (None, aug.name, Space::Top),
+impl Space {
+    /// The slot an `augment` declaration resolves into. A container
+    /// augmentation targets the declaration it spells — `augment class C`
+    /// keys under C itself (the container column is a member's owner and
+    /// is absent on top-level heads).
+    fn of(aug: &AugmentDecl) -> Space {
+        match aug.kind {
+            AugKind::Class
+            | AugKind::Mixin
+            | AugKind::Enum
+            | AugKind::Extension
+            | AugKind::ExtensionType => Space::Type,
+            AugKind::Constructor => Space::Ctor,
+            _ if aug.container.is_some() => {
+                if aug.is_static {
+                    Space::StaticMember
+                } else {
+                    Space::Member
+                }
+            }
+            _ => Space::Top,
+        }
     }
+}
+
+/// The property name a variable-family slot keys under: a setter's
+/// `name=` lookup spelling folds to the property's plain name (upstream
+/// `lastFragments[name]` keys the element's name, not the declaration
+/// spelling — `summary2/library_builder.dart` spells setters `name=` only
+/// for the declaration map). Every other kind keeps its spelling.
+fn property_name(name: StringId, kind: AugKind, strings: &StringTable) -> StringId {
+    if kind != AugKind::Setter {
+        return name;
+    }
+    let spelling = strings.resolve(name);
+    match spelling.strip_suffix('=') {
+        Some(property) => strings.intern(property),
+        None => name,
+    }
+}
+
+/// The table key of an `augment` declaration: the container it resolves
+/// under, its property name, and its family's space.
+fn augment_key(aug: &AugmentDecl, strings: &StringTable) -> (Option<StringId>, StringId, Space) {
+    let container = match Space::of(aug) {
+        Space::Type => Some(aug.name),
+        Space::Ctor | Space::Member | Space::StaticMember => aug.container,
+        Space::Top => None,
+    };
+    (
+        container,
+        property_name(aug.name, aug.kind, strings),
+        Space::of(aug),
+    )
 }
 
 /// The verifier's rows: one pass per diagnosing file, the table built once
@@ -222,7 +310,7 @@ pub(super) fn augmentation_diagnostics(
         FxHashMap::default();
     for &unit in graph.unit_files(lib) {
         if let Some(elements) = index.get(unit) {
-            populate(&mut table, unit, elements);
+            populate(&mut table, unit, elements, strings);
         }
     }
     let mut out = Vec::new();
@@ -234,7 +322,7 @@ pub(super) fn augmentation_diagnostics(
         if aug.kind == AugKind::TypeAlias {
             continue;
         }
-        let key = augment_key(aug);
+        let key = augment_key(aug, strings);
         // Own-file augmentations resolve in source order: the chain visible
         // to this augment is everything captured so far (cross-file
         // augmentations joined at populate time).
@@ -245,40 +333,55 @@ pub(super) fn augmentation_diagnostics(
             .iter()
             .filter(|entry| !entry.is_augment || entry.unit != file || entry.aug_index < aug_index)
             .collect();
-        // The merge rule: the last fragment's kind must match and must not
-        // be a named mixin application.
-        let merged = matches!(
-            chain.last(),
-            Some(last) if !last.is_mixin_application && last.kind == aug.kind
+        let variable_family = matches!(
+            aug.kind,
+            AugKind::Field | AugKind::TopLevelVar | AugKind::Getter | AugKind::Setter
         );
-        if !merged {
-            without_declaration(&mut out, file, aug, &chain);
+        if variable_family {
+            process_variable(&mut out, file, aug, &chain, own, index, strings);
         } else {
-            // The trailing same-kind run: its first entry is the
-            // introductory declaration (an earlier different-kind
-            // declaration started a new element upstream and never joins
-            // this one's fragment list).
-            let run_start = chain
-                .iter()
-                .rposition(|entry| entry.kind != aug.kind)
-                .map_or(0, |i| i + 1);
-            let run = &chain[run_start..];
-            let intro = run[0];
-            let header_kind = matches!(
-                aug.kind,
-                AugKind::Class
-                    | AugKind::Mixin
-                    | AugKind::Enum
-                    | AugKind::Extension
-                    | AugKind::ExtensionType
+            // The merge rule: the last fragment's kind must match and must
+            // not be a named mixin application.
+            let merged = matches!(
+                chain.last(),
+                Some(last) if !last.is_mixin_application && last.kind == aug.kind
             );
-            if header_kind {
-                check_header(&mut out, file, own, index, strings, aug, intro, run);
-            } else if !intro.is_augment {
-                check_member_shape(&mut out, file, own, index, strings, aug, intro);
+            if !merged {
+                without_declaration(&mut out, file, aug, &chain);
+            } else {
+                // The trailing same-kind run: its first entry is the
+                // introductory declaration (an earlier different-kind
+                // declaration started a new element upstream and never
+                // joins this one's fragment list).
+                let run_start = chain
+                    .iter()
+                    .rposition(|entry| entry.kind != aug.kind)
+                    .map_or(0, |i| i + 1);
+                let run = &chain[run_start..];
+                let intro = run[0];
+                let header_kind = matches!(
+                    aug.kind,
+                    AugKind::Class
+                        | AugKind::Mixin
+                        | AugKind::Enum
+                        | AugKind::Extension
+                        | AugKind::ExtensionType
+                );
+                if header_kind {
+                    check_header(&mut out, file, own, index, strings, aug, intro, run);
+                } else {
+                    // The already-complete check runs against the chain's
+                    // completeness state before the shape checks (upstream
+                    // `visitConstructorDeclaration` /
+                    // `_checkForFunctionAlreadyComplete`).
+                    check_already_complete(&mut out, file, aug, run);
+                    if !intro.is_augment {
+                        check_member_shape(&mut out, file, own, index, strings, aug, intro);
+                    }
+                }
+                // An augmentation-only executable chain: the body checks
+                // bail (upstream `firstExecutableFragment.isAugmentation`).
             }
-            // An augmentation-only executable chain: the body checks bail
-            // (upstream `firstExecutableFragment.isAugmentation`).
         }
         // This augmentation joins the chain for the ones that follow it.
         table.entry(key).or_default().push(Entry {
@@ -291,9 +394,229 @@ pub(super) fn augmentation_diagnostics(
             is_final: aug.is_final,
             is_const: aug.const_kw.is_some(),
             is_factory: aug.factory_kw.is_some(),
+            is_complete: aug.is_complete,
         });
     }
     out
+}
+
+/// The `declaration_already_complete` family on the executable chains
+/// (constructor / function / method / getter / setter): when the `augment`
+/// fragment is itself complete and a preceding fragment in the same chain
+/// is complete, the check reports at the `augment` keyword (upstream
+/// `nearestPrecedingCompleteFragment` over `precedingFragments`). The
+/// variable family's induced accessors take the dedicated walk in
+/// [`process_variable`].
+fn check_already_complete(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    aug: &AugmentDecl,
+    run: &[&Entry],
+) {
+    if !aug.is_complete {
+        return;
+    }
+    let shape = match aug.kind {
+        AugKind::Constructor => AlreadyCompleteShape::Constructor,
+        AugKind::Function | AugKind::Method | AugKind::Getter | AugKind::Setter => {
+            AlreadyCompleteShape::Function
+        }
+        _ => return,
+    };
+    if run.iter().any(|entry| entry.is_complete) {
+        let code = SemanticCode::AugmentationAlreadyComplete(shape);
+        out.push(row(file, aug.augment_kw, code, code.message("", "")));
+    }
+}
+
+/// The variable-family merge and checks (upstream `visitFieldDeclaration` /
+/// `visitTopLevelVariableDeclaration` and the `_handleInstance*Accessor`
+/// handlers). The unified name slot's `lastFragment` resolves the variable
+/// element via `_fieldElement` — only accessor-family fragments resolve;
+/// a method/function tail means the element is absent and the augment
+/// reports `augmentation_of_different_declaration_kind`. The element's
+/// live sub-chains are the accessor-family fragments since the last
+/// non-accessor fragment (a method/function claiming the name closes the
+/// previous element generation).
+fn process_variable(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    aug: &AugmentDecl,
+    chain: &[&Entry],
+    own: &FileElements,
+    index: &ElementIndex,
+    strings: &StringTable,
+) {
+    let accessor_family = |kind: AugKind| {
+        matches!(
+            kind,
+            AugKind::Field | AugKind::TopLevelVar | AugKind::Getter | AugKind::Setter
+        )
+    };
+    // `_fieldElement(lastFragment)`: a non-accessor tail resolves no
+    // variable element — the augment faces `previousFragmentOfDifferentKind`.
+    let Some(last) = chain.last() else {
+        without_declaration(out, file, aug, chain);
+        return;
+    };
+    if !accessor_family(last.kind) || last.is_mixin_application {
+        without_declaration(out, file, aug, chain);
+        return;
+    }
+    // The live element generation: the accessor-family run ending at the
+    // name's last fragment (a method/function claiming the name closes the
+    // previous element generation).
+    let gen_start = chain
+        .iter()
+        .rposition(|entry| !accessor_family(entry.kind))
+        .map_or(0, |i| i + 1);
+    let generation = &chain[gen_start..];
+    // The sub-chains the augment merges into and (for a variable augment)
+    // induces.
+    let target = match aug.kind {
+        AugKind::Getter => Accessor::Getter,
+        AugKind::Setter => Accessor::Setter,
+        _ => Accessor::Variable,
+    };
+    let sub: Vec<&Entry> = generation
+        .iter()
+        .copied()
+        .filter(|entry| entry.in_accessor(target))
+        .collect();
+    // The merge: the resolved sub-chain must be non-empty — a getter
+    // augment needs a preceding getter, a setter augment a preceding
+    // setter, a variable augment a preceding variable-chain tail.
+    if sub.is_empty() {
+        without_declaration(out, file, aug, generation);
+        return;
+    }
+    let intro = sub[0];
+    if matches!(aug.kind, AugKind::Field | AugKind::TopLevelVar) {
+        // A variable augment merges onto the variable chain AND induces
+        // each accessor sub-chain independently (upstream the
+        // `_checkForAugmentationInducedAccessors*` pass): the induced
+        // getter's return comparison at the variable's name, the induced
+        // setter's presence row when the resolved setter chain is empty,
+        // and each induced accessor's already-complete row.
+        check_variable_augment(out, file, aug, generation, own, index, strings);
+    } else {
+        // A getter/setter augment merges onto its accessor sub-chain: the
+        // already-complete row (the augment fragment complete against a
+        // complete predecessor) then the executable pair checks.
+        if aug.is_complete && sub.iter().any(|entry| entry.is_complete) {
+            let code = SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::Function);
+            out.push(row(file, aug.augment_kw, code, code.message("", "")));
+        }
+        if let Some(intro_elements) = index.get(intro.unit)
+            && !intro.is_augment
+            && let Some(face) = intro_face(intro_elements, intro, aug)
+        {
+            let (intro_names, intro_bounds) = face.type_params();
+            check_type_param_rows(
+                out,
+                file,
+                own,
+                intro_elements,
+                strings,
+                aug,
+                intro_names,
+                intro_bounds,
+            );
+            if let Some(span) = aug.return_ty_range {
+                check_return(
+                    out,
+                    file,
+                    own,
+                    intro_elements,
+                    strings,
+                    aug,
+                    &face,
+                    false,
+                    span,
+                );
+            }
+            check_formals(out, file, own, intro_elements, strings, aug, face.formals());
+        }
+    }
+}
+
+/// A `Field`/`TopLevelVar` augmentation's induced-accessor pass (upstream
+/// `_checkAugmentationWithoutDeclarationForInducedAccessors` and
+/// `_checkForAugmentationInducedAccessorsAlreadyComplete` over the merged
+/// variable fragment): the absent-induced-setter row first, then each
+/// induced accessor's already-complete row, then the induced getter's
+/// return-type comparison at the variable's name.
+fn check_variable_augment(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    aug: &AugmentDecl,
+    generation: &[&Entry],
+    own: &FileElements,
+    index: &ElementIndex,
+    strings: &StringTable,
+) {
+    let getter_chain: Vec<&Entry> = generation
+        .iter()
+        .copied()
+        .filter(|entry| entry.in_accessor(Accessor::Getter))
+        .collect();
+    let setter_chain: Vec<&Entry> = generation
+        .iter()
+        .copied()
+        .filter(|entry| entry.in_accessor(Accessor::Setter))
+        .collect();
+    // The induced-accessor presence rows (upstream
+    // `_checkAugmentationWithoutDeclarationForInducedAccessors`): the
+    // augment field always induces a getter, a non-final one a setter —
+    // each induced accessor whose chain has no preceding fragment reports
+    // its `augmentationWithout{Getter,Setter}Declaration` variant at the
+    // variable's name.
+    if getter_chain.is_empty() {
+        let code = SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Getter);
+        let message = code.message(strings.resolve(aug.display_name), "");
+        out.push(row(file, aug.name_range, code, message));
+    }
+    if !aug.is_final && setter_chain.is_empty() {
+        let code = SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Setter);
+        let message = code.message(strings.resolve(aug.display_name), "");
+        out.push(row(file, aug.name_range, code, message));
+    }
+    // The already-complete rows: each induced accessor the augment carries
+    // (a non-final variable carries both) reports when both sides are
+    // complete — the augment's `is_complete` is the induced accessors'
+    // `external || !abstract`.
+    if aug.is_complete {
+        if getter_chain.iter().any(|entry| entry.is_complete) {
+            let code =
+                SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedGetter);
+            out.push(row(file, aug.name_range, code, code.message("", "")));
+        }
+        if !aug.is_final && setter_chain.iter().any(|entry| entry.is_complete) {
+            let code =
+                SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedSetter);
+            out.push(row(file, aug.name_range, code, code.message("", "")));
+        }
+    }
+    // The induced getter's return-type comparison at the variable's name
+    // (upstream `errorEntity: variable.name`) — against the getter chain's
+    // introductory face.
+    if let Some(intro) = getter_chain.first().copied()
+        && let Some(intro_elements) = index.get(intro.unit)
+        && !intro.is_augment
+        && let Some(face) = intro_face(intro_elements, intro, aug)
+    {
+        check_return(
+            out,
+            file,
+            own,
+            intro_elements,
+            strings,
+            aug,
+            &face,
+            true,
+            aug.name_range,
+        );
+    }
 }
 
 /// The container-family header checks (upstream `visitClassDeclaration`
@@ -428,7 +751,7 @@ fn check_member_shape(
             check_modifiers(out, file, aug, &checks);
             check_formals(out, file, own, intro_elements, strings, aug, face.formals());
         }
-        AugKind::Function | AugKind::Method | AugKind::Getter | AugKind::Setter => {
+        AugKind::Function | AugKind::Method => {
             let (intro_names, intro_bounds) = face.type_params();
             check_type_param_rows(
                 out,
@@ -455,9 +778,6 @@ fn check_member_shape(
             }
             check_formals(out, file, own, intro_elements, strings, aug, face.formals());
         }
-        AugKind::TopLevelVar | AugKind::Field => {
-            check_induced_accessors(out, file, own, intro_elements, strings, aug, &face);
-        }
         _ => {}
     }
 }
@@ -471,6 +791,7 @@ fn populate(
     table: &mut FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>>,
     unit: FileId,
     elements: &FileElements,
+    strings: &StringTable,
 ) {
     // Named mixin applications, marked by the collector's target rows
     // (introductory spellings only — the merge rule reads the intro).
@@ -535,6 +856,9 @@ fn populate(
             false,
             false,
             false,
+            // A container head is never an executable — the
+            // already-complete walk skips it.
+            false,
         );
         for (member_name, member) in container.members.iter() {
             let member_kind = match member.kind {
@@ -543,10 +867,19 @@ fn populate(
                 MemberKind::Setter => AugKind::Setter,
                 MemberKind::Field => AugKind::Field,
             };
+            let space = if member.is_static {
+                Space::StaticMember
+            } else {
+                Space::Member
+            };
             push_entry(
                 table,
                 unit,
-                (Some(name), *member_name, Space::Member),
+                (
+                    Some(name),
+                    property_name(*member_name, member_kind, strings),
+                    space,
+                ),
                 member_kind,
                 false,
                 0,
@@ -555,6 +888,11 @@ fn populate(
                 member.is_final,
                 false,
                 false,
+                // The accessor/variable completeness bit: `external ||
+                // !abstract` — a method/getter/setter's `has_body ||
+                // external` (the `is_abstract` complement), a field's
+                // induced accessors' `external || !abstract`.
+                member.is_external || !member.is_abstract,
             );
         }
     }
@@ -575,7 +913,11 @@ fn populate(
         push_entry(
             table,
             unit,
-            (target.container, target.name, space),
+            (
+                target.container,
+                property_name(target.name, target.kind, strings),
+                space,
+            ),
             target.kind,
             false,
             0,
@@ -584,6 +926,7 @@ fn populate(
             target.is_final,
             target.is_const,
             target.is_factory,
+            target.is_complete,
         );
     }
     for (aug_index, aug) in elements.augmentations().iter().enumerate() {
@@ -596,7 +939,7 @@ fn populate(
         push_entry(
             table,
             unit,
-            augment_key(aug),
+            augment_key(aug, strings),
             aug.kind,
             true,
             aug_index,
@@ -605,10 +948,12 @@ fn populate(
             aug.is_final,
             aug.const_kw.is_some(),
             aug.factory_kw.is_some(),
+            aug.is_complete,
         );
     }
 }
 
+#[expect(clippy::too_many_arguments)] // one column per `Entry` field
 fn push_entry(
     table: &mut FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>>,
     unit: FileId,
@@ -621,6 +966,7 @@ fn push_entry(
     is_final: bool,
     is_const: bool,
     is_factory: bool,
+    is_complete: bool,
 ) {
     table.entry(key).or_default().push(Entry {
         unit,
@@ -632,6 +978,7 @@ fn push_entry(
         is_final,
         is_const,
         is_factory,
+        is_complete,
     });
 }
 
@@ -799,40 +1146,6 @@ fn check_return(
     };
     let code = SemanticCode::AugmentationReturnTypeMismatch(shape);
     out.push(row(file, anchor, code, code.message(&actual, &expected)));
-}
-
-/// The variable faces (upstream `visitFieldDeclaration` /
-/// `visitTopLevelVariableDeclaration` variable loop): the induced-setter
-/// presence row, then the induced-getter return-type comparison at the
-/// variable's own name.
-fn check_induced_accessors(
-    out: &mut Vec<Diagnostic>,
-    file: FileId,
-    own: &FileElements,
-    intro_unit: &FileElements,
-    strings: &StringTable,
-    aug: &AugmentDecl,
-    face: &Face<'_>,
-) {
-    // A final augmentation induces no setter (`fragment.inducedSetter` is
-    // absent — the check skips). The getter variant of the upstream row is
-    // unreachable here: a preceding variable always induces a getter.
-    if !aug.is_final && face.is_final_variable() {
-        let code = SemanticCode::AugmentationWithoutDeclaration(WithoutDeclarationShape::Setter);
-        let message = code.message(strings.resolve(aug.display_name), "");
-        out.push(row(file, aug.name_range, code, message));
-    }
-    check_return(
-        out,
-        file,
-        own,
-        intro_unit,
-        strings,
-        aug,
-        face,
-        true,
-        aug.name_range,
-    );
 }
 
 /// The formal-parameter pass (upstream
@@ -1067,10 +1380,7 @@ fn intro_face<'e>(
                 .get(&aug.name)
                 .map(Face::Member)
         }
-        AugKind::TopLevelVar => elements.decl(aug.name).map(|decl| Face::TopVar {
-            decl,
-            is_final: intro.is_final,
-        }),
+        AugKind::TopLevelVar => elements.decl(aug.name).map(Face::TopVar),
         _ => elements.decl(aug.name).map(|decl| Face::TopFn {
             decl,
             is_setter: intro.kind == AugKind::Setter,

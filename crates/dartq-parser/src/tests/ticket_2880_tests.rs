@@ -8,7 +8,7 @@
 //! (the `(final external int i)` pair) are pinned WITHOUT dedup so count
 //! regressions surface.
 
-use super::collector::{latest_features, scan_ok, version_features, Collector};
+use super::collector::{Collector, latest_features, scan_ok, version_features};
 use crate::ParserFeatures;
 use crate::parser::Parser;
 
@@ -19,10 +19,7 @@ type Row = (&'static str, u32, u32, u32, &'static str);
 
 /// Parses `source` under `features` and returns the parser rows as
 /// `(code, start, end, text)` sorted by position (gate_2791 harness shape).
-fn faces_with(
-    features: ParserFeatures,
-    source: &'static str,
-) -> Vec<(String, u32, u32, String)> {
+fn faces_with(features: ParserFeatures, source: &'static str) -> Vec<(String, u32, u32, String)> {
     let (table, text) = scan_ok(source);
     let mut parser = Parser::new(
         text,
@@ -48,12 +45,7 @@ fn assert_rows(source: &'static str, expected: &[Row], label: &str) {
     assert_rows_with(latest_features(), source, expected, label);
 }
 
-fn assert_rows_with(
-    features: ParserFeatures,
-    source: &'static str,
-    expected: &[Row],
-    label: &str,
-) {
+fn assert_rows_with(features: ParserFeatures, source: &'static str, expected: &[Row], label: &str) {
     let line_starts: Vec<u32> = std::iter::once(0u32)
         .chain(
             source
@@ -393,13 +385,7 @@ fn return_named_method_rows() {
                 6,
                 "'return' can't be used as an identifier because it's a keyword.",
             ),
-            (
-                "unexpected_token",
-                3,
-                10,
-                6,
-                "Unexpected text 'return'.",
-            ),
+            ("unexpected_token", 3, 10, 6, "Unexpected text 'return'."),
         ],
         "return-named method",
     );
@@ -428,13 +414,7 @@ fn switch_named_method_body_rows() {
                 "'switch' can't be used as an identifier because it's a keyword.",
             ),
             ("expected_token", 3, 3, 6, "Expected to find ';'."),
-            (
-                "missing_identifier",
-                3,
-                10,
-                6,
-                "Expected an identifier.",
-            ),
+            ("missing_identifier", 3, 10, 6, "Expected an identifier."),
             (
                 "expected_body",
                 3,
@@ -442,13 +422,7 @@ fn switch_named_method_body_rows() {
                 1,
                 "A switch statement must have a body, even if it is empty.",
             ),
-            (
-                "missing_identifier",
-                3,
-                22,
-                1,
-                "Expected an identifier.",
-            ),
+            ("missing_identifier", 3, 22, 1, "Expected an identifier."),
         ],
         "switch-named method body",
     );

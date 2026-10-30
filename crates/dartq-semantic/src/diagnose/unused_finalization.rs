@@ -13,6 +13,7 @@ const IMPORT_WARNING_GATE: &[&str] = &[
     "new_with_non_type",
     "not_a_type",
     "prefix_identifier_not_followed_by_dot",
+    "undefined_annotation",
     "undefined_class",
     "undefined_function",
     "undefined_identifier",
@@ -1406,9 +1407,410 @@ impl<'a> Engine<'a> {
         // member spellings would over-credit both — an `InvalidType`
         // receiver's access resolving nothing still released the row.
         self.used_names = element_used;
+        self.credit_forward_references();
+        self.drop_pre_feature_underscore_locals();
         self.suppress_same_line_ignored_usage();
         self.report_unused_imports();
         self.report_deprecated_sdk_libraries();
+    }
+
+    /// The forward-reference credit (`referenced_before_declaration`,
+    /// referenced_before_declaration_test.dart's hideInBlock family): a
+    /// bare read of `v` before `var v` in the same block chain binds the
+    /// LOCAL in the oracle — the resolver's block scopes see the whole
+    /// block's declarations, so the read reports
+    /// `referenced_before_declaration` and marks the local element
+    /// referenced — and the local never reports
+    /// `unused_local_variable`. dartq's single-pass walk credits a read
+    /// only against an ALREADY-tracked local: the forward read bound the
+    /// top-level spelling (`RefTarget::Decl`) or missed outright, so the
+    /// not-yet-declared local stays un-referenced and stages a spurious
+    /// row. The walk files are held, so the credit lands here, at the
+    /// cluster's staging point: a staged local-variable/local-function
+    /// row whose name carries an earlier non-local read inside the
+    /// declaration's block chain drops.
+    ///
+    /// The chain test walks the real token stream between read and
+    /// declaration ([`Self::block_chain_holds`]): the declaration's block
+    /// must enclose the read, which holds exactly when the relative
+    /// brace depth at the declaration is zero or negative and the
+    /// running minimum never dips below it — a read in a sibling or
+    /// later-opened block (another executable, a local function's body)
+    /// stays excluded, so the credit cannot leak across executables. A
+    /// plain-assignment target never credits (a write-only life does not
+    /// spare an unused local — the verifier's credit counts reads);
+    /// compound targets read and credit. Pattern-group windows and
+    /// case-header binders decide their all-or-nothing joins inside the
+    /// frame close, before this pass — their rows keep the staged
+    /// verdict, the documented boundary.
+    fn credit_forward_references(&mut self) {
+        let local = SemanticCode::UnusedLocalVariable.code_info();
+        let element = SemanticCode::UnusedElement.code_info();
+        let site_anchors: FxHashSet<u32> = self
+            .decl_sites
+            .iter()
+            .map(|site| site.range.offset)
+            .collect();
+        // The candidate reads, keyed by spelling: every published bare
+        // reference that resolved to something other than a local or a
+        // type parameter (a local hit already credited its declaration at
+        // push time; a type parameter is never the oracle's block-scope
+        // answer for a value read), paired with its token end for the
+        // write-target peek.
+        let mut reads: FxHashMap<StringId, Vec<(u32, u32)>> = FxHashMap::default();
+        for r in &self.refs {
+            if !matches!(r.target, RefTarget::Local | RefTarget::TypeParam) {
+                reads
+                    .entry(r.name)
+                    .or_default()
+                    .push((r.range.offset, r.range.end()));
+            }
+        }
+        let mut drop: Vec<usize> = Vec::new();
+        for (index, row) in self.report.usage.iter().enumerate() {
+            if row.code != local && row.code != element {
+                continue;
+            }
+            let at = row.range.offset;
+            // A top-level or member declaration anchor: the element pool's
+            // own rows, never a frame local's.
+            if site_anchors.contains(&at) {
+                continue;
+            }
+            let byte = self.byte_of(at).min(self.source.len());
+            let end = self.byte_of(row.range.end()).min(self.source.len());
+            let name = self.intern(&self.source[byte..end]);
+            let Some(offsets) = reads.get(&name) else {
+                continue;
+            };
+            if offsets
+                .iter()
+                .filter(|&&(from, _)| from < at)
+                .any(|&(from, end)| {
+                    !self.is_plain_assignment_target(end) && self.block_chain_holds(from, at)
+                })
+            {
+                drop.push(index);
+            }
+        }
+        if drop.is_empty() {
+            return;
+        }
+        let mut next = 0usize;
+        let mut index = 0usize;
+        self.report.usage.retain(|_| {
+            let keep = next >= drop.len() || index != drop[next];
+            if !keep {
+                next += 1;
+            }
+            index += 1;
+            keep
+        });
+    }
+
+    /// Whether the block that declares `to` also encloses `from`: walking
+    /// the real tokens between the two offsets, the relative `{`/`}`
+    /// depth at `to` must be zero or negative (the declaration sits at
+    /// the read's depth or shallower — an ancestor block) and the running
+    /// minimum must never fall below it (the declaration's block never
+    /// closed on the way — a sibling or later-opened block fails).
+    /// Interpolation `${` opens count with plain braces, so a balanced
+    /// interpolation nets zero; string literals and comments carry no
+    /// tokens and never distort the count.
+    fn block_chain_holds(&self, from: u32, to: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let start = tokens.partition_point(|t| t.utf16_offset <= from);
+        let mut rel: i32 = 0;
+        let mut min: i32 = 0;
+        for t in &tokens[start..] {
+            if t.utf16_offset >= to {
+                break;
+            }
+            match t.kind {
+                dartq_scanner::TokenKind::OpenCurly
+                | dartq_scanner::TokenKind::StringInterpolationExpression => rel += 1,
+                dartq_scanner::TokenKind::CloseCurly => {
+                    rel -= 1;
+                    min = min.min(rel);
+                }
+                _ => {}
+            }
+        }
+        rel <= 0 && min >= rel
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2a/2b credits. Both passes re-derive element-level evidence
+    // ------------------------------------------------------------------
+    // Phase 2b credits. The pass re-derives element-level evidence at
+    // finalization from what the parse already published (the resolver
+    // files answer the same questions but hold no write lane here),
+    // keyed to the upstream `ImportsVerifier` this cluster mirrors. The
+    // invocation-form `call` credit of the same upstream family needs the
+    // parse-side frame (locals and written types are truncated per frame
+    // before this pass) and stays at its resolver wiring point.
+    // ------------------------------------------------------------------
+
+    /// The prefixed-import use evidence (Phase 2b): the StringId-level
+    /// pool cannot tell a prefix spelling from a same-spelling local or a
+    /// same-spelling member merge, so the prefixed `unused_import` credit
+    /// re-derives element-level evidence per prefix — which names the
+    /// prefix's namespace resolved, and whether the prefix itself was
+    /// referenced bare. The records:
+    ///
+    /// - member reads through a `Prefix` receiver are frame-aware at the
+    ///   merge (a shadowed spelling classifies as a local access there),
+    ///   and attribute their member name — except `loadLibrary`, which
+    ///   upstream resolves through `PrefixScope.lookup`'s early return
+    ///   (scope.dart 3.13 :630-638: the synthetic `loadLibraryFunction`
+    ///   answers before `lookupResult` ever runs) and so credits the
+    ///   import in neither the invoke nor the tear-off form
+    ///   (`MethodInvocationResolutionTest/
+    ///   test_hasReceiver_deferredImportPrefix_loadLibrary#0`);
+    /// - a member read the prefix scope did not resolve and no
+    ///   guard-ignore face suppressed keeps the raw posture (a bare
+    ///   credit — it cannot element-attribute, and the gate upstream
+    ///   would have silenced the pass beside the undefined face anyway);
+    /// - bare `Prefix` references in expression position (the receiver
+    ///   occurrence of a member read dedupes by offset) credit bare;
+    /// - type-annotation continuations (`p.T`) re-derive the shadow
+    ///   decision the Continuation arm made frame-aware at parse time —
+    ///   the type-use record is frame-blind, so
+    ///   [`Self::prefix_shadowed_at`] replays it from the declaration
+    ///   tables (the shadow corpus:
+    ///   `PrefixShadowedByLocalDeclarationTest/
+    ///   test_local_variable_type_inside_function_with_shadowing_variable_before#0`
+    ///   — the local's own uses must not resurrect the import);
+    /// - prefixed creation/metadata heads (`new p.C()`, `@p.C.a`)
+    ///   attribute their selector under the same shadow gate.
+    fn prefix_use_evidence(&self) -> FxHashMap<StringId, (FxHashSet<StringId>, bool)> {
+        let mut evidence: FxHashMap<StringId, (FxHashSet<StringId>, bool)> = FxHashMap::default();
+        let load_library = self.intern("loadLibrary");
+        // The parse's frame-aware shadow emissions, keyed by head-token
+        // offset ([`Self::prefix_shadowed_at`]).
+        let shadowed_heads: FxHashSet<u32> = self
+            .report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "prefix_shadowed_by_local_declaration")
+            .map(|d| d.range.offset)
+            .collect();
+        let prefixes: Vec<StringId> = self.imports.iter().filter_map(|site| site.prefix).collect();
+        for prefix in prefixes {
+            let entry = evidence.entry(prefix).or_default();
+            let mut receiver_uses: FxHashSet<u32> = FxHashSet::default();
+            for read in &self.member_reads {
+                let Receiver::Prefix { name } = read.recv else {
+                    continue;
+                };
+                if name != prefix {
+                    continue;
+                }
+                receiver_uses.insert(read.recv_span.offset);
+                if read.name == load_library {
+                    // The early-return face: resolved through the
+                    // synthetic function, never a namespace lookup — no
+                    // element, no credit (both invocation forms).
+                    continue;
+                }
+                if self.prefixed_hit(prefix, read.name)
+                    || self.guard.ignore(Some(prefix), read.name)
+                {
+                    entry.0.insert(read.name);
+                } else {
+                    entry.1 = true;
+                }
+            }
+            for r in &self.refs {
+                if r.name == prefix
+                    && matches!(r.target, RefTarget::Prefix)
+                    && !receiver_uses.contains(&r.range.offset)
+                {
+                    entry.1 = true;
+                }
+            }
+            for (range, name) in &self.type_uses {
+                let head_offset = self
+                    .prefix_head_before(range.offset)
+                    .or_else(|| self.prefix_head_at(range.offset));
+                let Some(head_offset) = head_offset else {
+                    continue;
+                };
+                if self.spelling_at(head_offset) != Some(prefix)
+                    || self.prefix_shadowed_at(&shadowed_heads, prefix, head_offset)
+                {
+                    continue;
+                }
+                entry.0.insert(*name);
+            }
+            for &offset in &self.ctor_prefix_heads {
+                if self.spelling_at(offset) != Some(prefix)
+                    || self.prefix_shadowed_at(&shadowed_heads, prefix, offset)
+                {
+                    continue;
+                }
+                match self.selector_after_prefix_head(offset) {
+                    Some(selector) => {
+                        entry.0.insert(selector);
+                    }
+                    None => entry.1 = true,
+                }
+            }
+        }
+        evidence
+    }
+
+    /// Whether the prefix spelling is shadowed at `at`: a top-level
+    /// declaration of the spelling shadows file-wide (the library scope's
+    /// flat answer — the oracle's declarations shadow imports), and the
+    /// parse's own frame-aware shadow decision at the head token — the
+    /// type-position arm emits `prefixShadowedByLocalDeclaration` exactly
+    /// at the dead head (`resolution.rs`'s `arm_type_prefix`), the one
+    /// record that survives the per-frame local truncation with the
+    /// binding facts intact. `shadowed_heads` is that emission's offset
+    /// set, precomputed by [`Self::prefix_use_evidence`].
+    fn prefix_shadowed_at(
+        &self,
+        shadowed_heads: &FxHashSet<u32>,
+        prefix: StringId,
+        at: u32,
+    ) -> bool {
+        self.decl_sites.iter().any(|site| {
+            self.bare_name(site.name) == prefix
+                && matches!(
+                    site.kind,
+                    DeclKind::TopLevelFn
+                        | DeclKind::TopLevelVar
+                        | DeclKind::TypeAlias
+                        | DeclKind::Container
+                )
+        }) || shadowed_heads.contains(&at)
+    }
+
+    /// The identifier token ending in `head . selector` before
+    /// `selector_offset`: the head token's offset, when the two preceding
+    /// tokens are exactly an identifier and a dot.
+    fn prefix_head_before(&self, selector_offset: u32) -> Option<u32> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens.partition_point(|t| t.utf16_offset < selector_offset);
+        let selector = tokens.get(index)?;
+        if selector.utf16_offset != selector_offset
+            || selector.kind != dartq_scanner::TokenKind::Identifier
+            || index < 2
+            || tokens[index - 1].kind != dartq_scanner::TokenKind::Period
+            || tokens[index - 2].kind != dartq_scanner::TokenKind::Identifier
+        {
+            return None;
+        }
+        Some(tokens[index - 2].utf16_offset)
+    }
+
+    /// Whether a `head . selector` group STARTS at `offset` (the head is
+    /// the token there) — the shape a type-use record spans whole (`p.T`).
+    fn prefix_head_at(&self, offset: u32) -> Option<u32> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens.partition_point(|t| t.utf16_offset < offset);
+        let head = tokens.get(index)?;
+        if head.utf16_offset != offset
+            || head.kind != dartq_scanner::TokenKind::Identifier
+            || tokens.get(index + 1)?.kind != dartq_scanner::TokenKind::Period
+            || tokens.get(index + 2)?.kind != dartq_scanner::TokenKind::Identifier
+        {
+            return None;
+        }
+        Some(offset)
+    }
+
+    /// The interned spelling of the identifier token at `offset`.
+    fn spelling_at(&self, offset: u32) -> Option<StringId> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens.partition_point(|t| t.utf16_offset < offset);
+        let token = tokens.get(index)?;
+        if token.utf16_offset != offset || token.kind != dartq_scanner::TokenKind::Identifier {
+            return None;
+        }
+        let byte = token.byte_offset as usize;
+        Some(self.intern(&self.source[byte..byte + token.byte_len as usize]))
+    }
+
+    /// The selector identifier following a prefix head at `offset`
+    /// (`head . selector`): the attributed member of a prefixed
+    /// creation/metadata head.
+    fn selector_after_prefix_head(&self, offset: u32) -> Option<StringId> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens.partition_point(|t| t.utf16_offset < offset);
+        let head = tokens.get(index)?;
+        if head.utf16_offset != offset
+            || head.kind != dartq_scanner::TokenKind::Identifier
+            || tokens.get(index + 1)?.kind != dartq_scanner::TokenKind::Period
+        {
+            return None;
+        }
+        let selector = tokens.get(index + 2)?;
+        if selector.kind != dartq_scanner::TokenKind::Identifier {
+            return None;
+        }
+        let byte = selector.byte_offset as usize;
+        Some(self.intern(&self.source[byte..byte + selector.byte_len as usize]))
+    }
+
+    /// Whether the identifier whose token ends at `end` is a plain
+    /// assignment target: the next non-whitespace byte is a single `=`
+    /// (not `==`). Only the bare-write shape loses the credit — compound
+    /// assignments read.
+    fn is_plain_assignment_target(&self, end: u32) -> bool {
+        let mut byte = self.byte_of(end);
+        let bytes = self.source.as_bytes();
+        while byte < bytes.len() && bytes[byte].is_ascii_whitespace() {
+            byte += 1;
+        }
+        bytes.get(byte) == Some(&b'=') && bytes.get(byte + 1) != Some(&b'=')
+    }
+
+    /// The unused-local verifier's pre-feature wildcard fallback
+    /// (`_isNamedWildcard`'s else branch, unused_local_elements_verifier.dart
+    /// :836-844): below 3.7 an ALL-UNDERSCORES name spares the
+    /// local-variable and catch-exception arms (neither carries the
+    /// explicit `_wildCardVariablesEnabled` conjunct the local-function
+    /// arm has, :1103 — a pre-feature `_()` function reports, the
+    /// preWildcards pin), and the catch-STACK arm has no wildcard test at
+    /// all. [`Self::is_wildcard`] mirrors the feature-gated exact-`_`
+    /// `isWildcardVariable` every other consumer applies, so this pass
+    /// restores the two fallback arms: with the feature off, staged
+    /// `unused_local_variable` / `unused_catch_clause` rows on
+    /// all-underscores names drop. A no-op under the feature — the
+    /// modern corpus pays one feature-bit check.
+    fn drop_pre_feature_underscore_locals(&mut self) {
+        if self.class_modifiers.wildcards_enabled(self.lib) {
+            return;
+        }
+        let local = SemanticCode::UnusedLocalVariable.code_info();
+        let catch_clause = SemanticCode::UnusedCatchClause.code_info();
+        let mut drop: Vec<usize> = Vec::new();
+        for (index, row) in self.report.usage.iter().enumerate() {
+            if row.code != local && row.code != catch_clause {
+                continue;
+            }
+            let byte = self.byte_of(row.range.offset).min(self.source.len());
+            let end = self.byte_of(row.range.end()).min(self.source.len());
+            let name = &self.source[byte..end];
+            if !name.is_empty() && name.bytes().all(|b| b == b'_') {
+                drop.push(index);
+            }
+        }
+        if drop.is_empty() {
+            return;
+        }
+        let mut next = 0usize;
+        let mut index = 0usize;
+        self.report.usage.retain(|_| {
+            let keep = next >= drop.len() || index != drop[next];
+            if !keep {
+                next += 1;
+            }
+            index += 1;
+            keep
+        });
     }
 
     /// The trailing same-line `// ignore:` face over the local-variable
@@ -1791,6 +2193,11 @@ impl<'a> Engine<'a> {
             .chain(&self.import_used)
             .copied()
             .collect();
+        // The per-prefix element evidence ([`Self::prefix_use_evidence`]):
+        // the prefixed credit decides on it, never on the raw spelling
+        // pool — a local or member merge sharing the prefix's spelling
+        // would otherwise hold the import open (the shadow corpus).
+        let prefix_evidence = self.prefix_use_evidence();
         // The extension-credit pool: `used` minus the spellings only
         // non-demonstrating member accesses contributed (see
         // [`Self::extension_credit_names`]).
@@ -1813,14 +2220,22 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let is_used = match prefix {
-                Some(prefix) => {
-                    self.used_names.contains(&prefix) || self.import_used.contains(&prefix)
-                }
+                Some(prefix) => match prefix_evidence.get(&prefix) {
+                    Some((attributed, bare)) => {
+                        *bare
+                            || attributed.iter().any(|&name| {
+                                edge.combinators.allows(name)
+                                    && self.graph.exported(target, name).is_some()
+                            })
+                    }
+                    // No evidence record for the spelling — keep the raw
+                    // posture (the under-report direction).
+                    None => self.used_names.contains(&prefix) || self.import_used.contains(&prefix),
+                },
                 None => {
                     let hit = used.iter().find(|&&n| {
                         edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
                     });
-                    if let Some(n) = hit {}
                     let credited = self.import_credits_extension_member(edge, target, &credit);
                     hit.is_some() || credited
                 }
@@ -2063,25 +2478,23 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The `_`-wildcard test (`_wildCardVariablesEnabled` +
-    /// `_isNamedWildcard`, unused_local_elements_verifier.dart:690-698,
-    /// 986-995): with the wildcard-variables feature (`enabledIn: 3.7.0`,
-    /// `tools/experimental_features.yaml`) only the exact name `_` is a
-    /// wildcard — `__`/`___` report; the all-underscores fallback is the
-    /// feature-off branch, live only below 3.7. dartq's supported universe
-    /// runs the modern posture (the same modern-library default
-    /// [`Self::library_facts`] documents for class-modifiers): a pre-3.7
-    /// `// @dart=` library under-reports its `__`-shaped bindings — a
-    /// documented divergence, unreachable in the oracle corpus.
-    pub(crate) const WILDCARD_VARIABLES_ENABLED: bool = true;
-
+    /// The `_`-wildcard test (`isWildcardVariable`, upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/element/extensions.dart:81): the
+    /// exact name `_` acting as a wildcard, gated on the DECLARING
+    /// library's wildcard-variables feature (`enabledIn: 3.7.0`,
+    /// `tools/experimental_features.yaml` — below 3.7 a `// @dart = 3.5`
+    /// library treats `_` as an ordinary name). ONE gate for every
+    /// wildcard kind (local variable, local function, prefix, type
+    /// parameter, formal parameter — the call sites are already
+    /// kind-restricted): the same shape the duplicate-definition
+    /// verifier's `isWildcard` applies (duplicate_definition_verifier.dart
+    /// :398-402). The unused-local verifier's own pre-feature fallback
+    /// (all-underscores names spare the local-variable and
+    /// catch-exception arms only, `_isNamedWildcard`'s else branch,
+    /// unused_local_elements_verifier.dart:836-844) is the
+    /// [`Self::drop_pre_feature_underscore_locals`] mirror.
     pub(crate) fn is_wildcard(&self, name: StringId) -> bool {
-        let text = self.strings.resolve(name);
-        if Self::WILDCARD_VARIABLES_ENABLED {
-            text == "_"
-        } else {
-            !text.is_empty() && text.bytes().all(|b| b == b'_')
-        }
+        self.class_modifiers.wildcards_enabled(self.lib) && self.strings.resolve(name) == "_"
     }
 
     /// The offset of the first non-whitespace byte at or after `from`,
@@ -2854,14 +3267,25 @@ mod pins {
     use crate::model::MicroKind;
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
-    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_resolution::{
+        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces,
+    };
     use dartq_scanner::ScanConfig;
     use dartq_source::{FileTable, StringTable};
     use std::path::Path;
 
     /// Diagnoses `source` as the sole file of a library with no imports —
-    /// the shared single-file rig.
+    /// the shared single-file rig, at the modern feature posture.
     fn report(source: &str) -> FileReport {
+        report_posture(source, None)
+    }
+
+    /// [`report`] with the analyzed library's wildcard-variables posture
+    /// pinned ([`LibraryClassModifiers::insert_wildcards`], the engine's
+    /// per-library feature channel): `Some(false)` models a pre-3.7
+    /// library (`// @dart = 3.4`), where the exact-`_` wildcard face is
+    /// off and the all-underscores fallback governs.
+    fn report_posture(source: &str, wildcard_variables: Option<bool>) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -2888,10 +3312,26 @@ mod pins {
             }
             builder.declare(lib, name, file);
         }
+        // The implicit dart:core face (the sibling rigs' minimal seed):
+        // core-typed fixtures resolve instead of reporting
+        // `undefined_class`. The lone prelude edge is skipped by
+        // `report_unused_imports`' alignment (the harness carries no
+        // written directives, so the edge list drains to empty).
+        builder.seed_implicit_core(
+            lib,
+            file,
+            &[
+                "Object", "String", "int", "bool", "double", "num", "List", "Map", "void",
+            ],
+        );
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let mut index = ElementIndex::default();
         index.insert(file, elements);
+        let mut class_modifiers = LibraryClassModifiers::default();
+        if let Some(enabled) = wildcard_variables {
+            class_modifiers.insert_wildcards(lib, enabled);
+        }
         diagnose_with(
             source,
             &scanned.tokens,
@@ -2903,7 +3343,7 @@ mod pins {
             &namespaces,
             &index,
             StrictModes::default(),
-            &LibraryClassModifiers::default(),
+            &class_modifiers,
             set.is_enabled(dartq_language::Feature::InferenceUpdate2),
         )
     }
@@ -3517,6 +3957,479 @@ mod pins {
                       \x20 s.m();\n\
                       }\n";
         let r = report(source);
+        assert_eq!(r.diagnostics, vec![], "{source:?}");
+    }
+
+    // —— the per-library wildcard gate (#2888 1a) ————————————————————————
+
+    /// The pre-3.7 local-function `_` (DeadCodeTest
+    /// test_localFunction_wildcard_preWildcards#0): with the
+    /// wildcard-variables feature off, a lone `_` is an ordinary name —
+    /// the unused local function reports (`_visitLocalFunctionElement`'s
+    /// `_wildCardVariablesEnabled && _isNamedWildcard` cut demands the
+    /// feature explicitly). The old hard-coded gate answered `true`
+    /// unconditionally and under-reported exactly this shape.
+    #[test]
+    fn local_function_wildcard_pre_feature_reports() {
+        let source = "void f() {\n\
+                      \x20 _(){}\n\
+                      }\n";
+        let at = source.find('_').unwrap() as u32;
+        let rows = report_posture(source, Some(false));
+        let rows: Vec<_> = rows
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_element")
+            .map(|d| d.range.offset)
+            .collect();
+        assert_eq!(rows, vec![at], "{source:?}");
+    }
+
+    /// The ≥3.7 twin: the same `_()` local function is a wildcard (name
+    /// `_`, kind LocalFunction, feature on — extensions.dart:81's one
+    /// gate for all five kinds), so the unused-element face stays silent.
+    /// The whole-declaration `dead_code` row still reports (the
+    /// DeadCodeVerifier's own `_` face, dead_code_verifier.dart:72-82) —
+    /// the pin is that nothing else reports beside it.
+    #[test]
+    fn local_function_wildcard_feature_enabled_stays_silent() {
+        let source = "void f() {\n\
+                      \x20 _(){}\n\
+                      }\n";
+        let r = report(source);
+        assert!(
+            r.diagnostics.iter().all(|d| d.code.name == "dead_code"),
+            "{:?} in {source:?}",
+            r.diagnostics
+        );
+    }
+
+    /// `__`/`___` are never wildcards under the feature (only the exact
+    /// `_` is) and report; below 3.7 the all-underscores fallback spares
+    /// them — the two postures diverge exactly here.
+    #[test]
+    fn multi_underscore_local_splits_by_posture() {
+        let source = "void f() {\n\
+                      \x20 var __ = 0;\n\
+                      \x20 var ___ = 1;\n\
+                      }\n";
+        let dunder = source.find("__").unwrap() as u32;
+        let triunder = source.find("___").unwrap() as u32;
+        assert_eq!(
+            unused_local_rows(source),
+            vec![(dunder, 2), (triunder, 3)],
+            "{source:?}"
+        );
+        let disabled = report_posture(source, Some(false));
+        let rows: Vec<_> = disabled
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_local_variable")
+            .collect();
+        assert!(rows.is_empty(), "{source:?}");
+    }
+
+    /// The local-variable `_` across both postures: silent with the
+    /// feature (the exact-`_` wildcard) and silent below 3.7 (the
+    /// all-underscores fallback spares it too — the local-VARIABLE arm
+    /// calls `_isNamedWildcard` without the explicit feature conjunct,
+    /// unlike the local-function arm).
+    #[test]
+    fn local_variable_underscore_silent_under_both_postures() {
+        let source = "void f() {\n\
+                      \x20 var _ = 0;\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+        assert_eq!(
+            report_posture(source, Some(false)).diagnostics,
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    // —— the forward-reference credit (#2888 1b) ——————————————————————————
+
+    /// ReferencedBeforeDeclarationTest test_hideInBlock_local: `print(v)`
+    /// before `var v = 2` binds the LOCAL in the oracle (the read reports
+    /// `referenced_before_declaration` and marks the element referenced),
+    /// so the local never reports unused. dartq's read bound the
+    /// top-level `v` and the un-referenced local staged a spurious row —
+    /// the forward-reference credit drops it.
+    #[test]
+    fn forward_reference_credits_the_local() {
+        let source = "var v = 1;\n\
+                      void main() {\n\
+                      \x20 print(v);\n\
+                      \x20 var v = 2;\n\
+                      }\n\
+                      print(x) {}\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// test_hideInBlock_local_subBlock: the read sits in a nested block,
+    /// the declaration in the enclosing block afterwards — the
+    /// declaration's block still encloses the read, so the credit holds.
+    /// The inline control is the sibling-block boundary: a read in a
+    /// SIBLING block (the declaration's block closed on the way) never
+    /// credits, and the genuinely unused local keeps its row.
+    #[test]
+    fn nested_block_forward_reference_credits_sibling_does_not() {
+        let source = "var v = 1;\n\
+                      void main() {\n\
+                      \x20 {\n\
+                      \x20   print(v);\n\
+                      \x20 }\n\
+                      \x20 var v = 2;\n\
+                      }\n\
+                      print(x) {}\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+        let control = "void v() {}\n\
+                       void main() {\n\
+                       \x20 {\n\
+                       \x20   print(v);\n\
+                       \x20 }\n\
+                       \x20 {\n\
+                       \x20   var v = 2;\n\
+                       \x20 }\n\
+                       }\n\
+                       print(x) {}\n";
+        let at = control.find("var v = 2").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(control), vec![(at, 1)], "{control:?}");
+    }
+
+    /// test_hideInBlock_function: the read also credits a LOCAL FUNCTION
+    /// declared after it (`v() {}` — the element the oracle's rbd binds),
+    /// so no `unused_element` row reports for it.
+    #[test]
+    fn forward_reference_credits_the_local_function() {
+        let source = "var v = 1;\n\
+                      void main() {\n\
+                      \x20 print(v);\n\
+                      \x20 v() {}\n\
+                      }\n\
+                      print(x) {}\n";
+        let r = report(source);
+        assert_eq!(r.diagnostics, vec![], "{source:?}");
+    }
+
+    // -- Phase 2b: the prefixed-import evidence rework -------------------
+    // (The invocation-form `call` credit of the same upstream family —
+    // corpus FunctionExpressionInvocationTest/test_expression_interfaceType_nullable_hasCall#0,
+    // `a()` over an extension-covered receiver — has no finalization-time
+    // evidence: the frame's locals and written types are truncated per
+    // frame before this pass. Its wiring point is the resolver's invoke
+    // arm, where the `Local` binding and the declaration-site type are
+    // both alive; the face is reported as held-file wiring.)
+
+    /// The `unused_import` rows of `r`, as (offset, name-token length)
+    /// pairs in source order.
+    fn import_rows(r: &FileReport) -> Vec<(u32, u32)> {
+        r.diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_import")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect()
+    }
+
+    /// One aux file of the import rig: its body, the written prefix (if
+    /// any), and the deferred bit — the import edge appended in written
+    /// order.
+    struct Aux {
+        prefix: Option<&'static str>,
+        deferred: bool,
+        body: &'static str,
+    }
+
+    /// [`report`] with written import directives: each [`Aux`] is
+    /// collected and declared into its own graph library node
+    /// (`package:t/a<n>.dart`), wired into the main library through an
+    /// import edge in written order — the positional alignment
+    /// `report_unused_imports` requires (the harness graph carries no
+    /// `dart:core` prelude, so no edge is skipped).
+    fn report_with_imports(source: &str, aux: &[Aux]) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        // The implicit dart:core face (the sibling rigs' minimal seed):
+        // without it every core-typed fixture reports `undefined_class`,
+        // which both pollutes the rows and trips the import-warning gate.
+        // Seeded first so the prelude edge sits at index 0, where
+        // `report_unused_imports`' alignment skips it.
+        builder.seed_implicit_core(
+            lib,
+            file,
+            &[
+                "Object", "String", "int", "bool", "double", "num", "List", "Map", "void",
+            ],
+        );
+        let mut aux_units = Vec::new();
+        for (position, item) in aux.iter().enumerate() {
+            let path = format!("a{position}.dart");
+            let aux_file = files.intern(Path::new(&path));
+            let scanned_aux = dartq_scanner::scan(
+                item.body,
+                ScanConfig {
+                    enable_triple_shift: true,
+                    enable_augmentations: true,
+                },
+                aux_file,
+            );
+            assert!(
+                scanned_aux.diagnostics.is_empty(),
+                "scanner diagnostics: {}",
+                item.body
+            );
+            let aux_elements = collect(item.body, &scanned_aux.tokens, features, &strings);
+            let aux_lib = builder.intern(&format!("package:t/{path}"));
+            for (name, decl) in aux_elements.declarations() {
+                if decl.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                builder.declare(aux_lib, name, aux_file);
+            }
+            builder.import(
+                lib,
+                ImportEdge {
+                    target: Some(aux_lib),
+                    prefix: item.prefix.map(|p| strings.intern(p)),
+                    deferred: item.deferred,
+                    combinators: Combinators::new(std::iter::empty(), &strings),
+                },
+            );
+            aux_units.push((aux_file, aux_elements));
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        for (aux_file, aux_elements) in aux_units {
+            index.insert(aux_file, aux_elements);
+        }
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        )
+    }
+
+    /// Corpus `MethodInvocationResolutionTest/
+    /// test_hasReceiver_deferredImportPrefix_loadLibrary#0`: `p.loadLibrary()`
+    /// resolves through `PrefixScope.lookup`'s early return (the synthetic
+    /// `loadLibraryFunction` answers before the namespace lookup ever
+    /// credits), so the deferred import still reports `unused_import` —
+    /// and nothing else (the loadLibrary face never turns undefined).
+    #[test]
+    fn load_library_invoke_keeps_the_deferred_import_unused() {
+        let source = "import 'a.dart' deferred as p;\n\
+                      main() {\n\
+                      \x20 p.loadLibrary();\n\
+                      }\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: Some("p"),
+                deferred: true,
+                body: "class A {}\n",
+            }],
+        );
+        let uri = source.find("'a.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(uri, 8)], "{source:?}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .all(|d| !d.code.name.starts_with("undefined_")),
+            "{source:?}: {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Corpus `PrefixShadowedByLocalDeclarationTest/
+    /// test_local_variable_type_inside_function_with_shadowing_variable_before#0`
+    /// (dart:async modeled by an aux `Future`): the local `a`'s own uses
+    /// share the prefix's spelling, and the shadowed `a.Future` type head
+    /// is dead — the import must still report `unused_import` beside the
+    /// `prefixShadowedByLocalDeclaration` face, never held open by the
+    /// spelling collision.
+    #[test]
+    fn prefix_shadowed_by_local_still_reports_unused_import() {
+        let source = "import 'a.dart' as a;\n\
+                      f() {\n\
+                      \x20 int a = 0;\n\
+                      \x20 a.Future? x = null;\n\
+                      \x20 return [x, a];\n\
+                      }\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: Some("a"),
+                deferred: false,
+                body: "class Future {}\n",
+            }],
+        );
+        let uri = source.find("'a.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(uri, 8)], "{source:?}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code.name == "prefix_shadowed_by_local_declaration"),
+            "{source:?}: {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Corpus `UnusedImportTest/test_library_prefixed_samePrefix_notUsed#0`:
+    /// two imports share the prefix `one` and only `one.A` resolves — the
+    /// element-level attribution names the first target alone, so only the
+    /// second directive reports (the shared spelling must not hold both
+    /// open).
+    #[test]
+    fn prefixed_same_prefix_attribution_reports_only_the_unresolved_edge() {
+        let source = "import 'a.dart' as one;\n\
+                      import 'b.dart' as one;\n\
+                      one.A a = one.A();\n";
+        let r = report_with_imports(
+            source,
+            &[
+                Aux {
+                    prefix: Some("one"),
+                    deferred: false,
+                    body: "class A {}\n",
+                },
+                Aux {
+                    prefix: Some("one"),
+                    deferred: false,
+                    body: "class B {}\n",
+                },
+            ],
+        );
+        let second = source.find("'b.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(second, 8)], "{source:?}");
+    }
+
+    /// The same-prefix control: a second edge whose target does export the
+    /// attributed name stays used — the attribution join, not the shared
+    /// prefix spelling, decides.
+    #[test]
+    fn prefixed_same_prefix_both_exporting_stay_used() {
+        let source = "import 'a.dart' as one;\n\
+                      import 'b.dart' as one;\n\
+                      one.A a = one.A();\n\
+                      one.B b = one.B();\n";
+        let r = report_with_imports(
+            source,
+            &[
+                Aux {
+                    prefix: Some("one"),
+                    deferred: false,
+                    body: "class A {}\n",
+                },
+                Aux {
+                    prefix: Some("one"),
+                    deferred: false,
+                    body: "class B {}\n",
+                },
+            ],
+        );
+        assert_eq!(import_rows(&r), vec![], "{source:?}");
+        assert_eq!(r.diagnostics, vec![], "{source:?}");
+    }
+
+    /// The import-warning gate face (the deprecated/experimental corpus
+    /// family, `DeprecatedMemberUse_PackageConfigWorkspaceTest/
+    /// test_constructor_inAnnotation#0`): an `undefined_annotation`
+    /// anywhere in the unit skips the whole import pass — the annotation
+    /// name might have come from the import — so the otherwise-unused
+    /// import stays silent (`library_analyzer.dart`
+    /// `_hasDiagnosticReportedThatPreventsImportWarnings`).
+    #[test]
+    fn undefined_annotation_gates_the_import_pass() {
+        let source = "import 'a.dart';\n\
+                      @nope\n\
+                      class C {}\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: None,
+                deferred: false,
+                body: "class A {}\n",
+            }],
+        );
+        assert_eq!(import_rows(&r), vec![], "{source:?}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code.name == "undefined_annotation"),
+            "{source:?}: {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// The gate control: without the annotation face the pass runs and the
+    /// unused import reports — the rig itself never silences it.
+    #[test]
+    fn unused_import_reports_without_a_gating_face() {
+        let source = "import 'a.dart';\n\
+                      class C {}\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: None,
+                deferred: false,
+                body: "class A {}\n",
+            }],
+        );
+        let uri = source.find("'a.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(uri, 8)], "{source:?}");
+    }
+
+    /// The prefixed-import control: a resolved `p.A` member read credits
+    /// exactly the edge whose target exports the name — the evidence
+    /// model's baseline posture (the shadow/same-prefix pins hold the
+    /// delta faces).
+    #[test]
+    fn prefixed_member_read_credits_the_exporting_edge() {
+        let source = "import 'a.dart' as p;\n\
+                      var x = p.A();\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: Some("p"),
+                deferred: false,
+                body: "class A {}\n",
+            }],
+        );
         assert_eq!(r.diagnostics, vec![], "{source:?}");
     }
 }

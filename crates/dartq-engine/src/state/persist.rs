@@ -858,7 +858,7 @@ mod tests {
         r#""code":"UriDoesNotExistInDocImport"},{"uri":null,"uri_span":{"offset":80,"length":9},"#,
         r#""code":"UriWithInterpolation"}],"#,
         r#""elements":{"strings":[],"decls":[],"containers":[],"container_order":[],"#,
-        r#""extension_faces":[],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[],"decl_kinds":[]},"#,
+        r#""extension_faces":[],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[],"decl_kinds":[],"anon_methods":[]},"#,
         r#""diagnostics":["#,
         r#"{"severity":"Error","code_name":"uri_does_not_exist","code_machine":"URI_DOES_NOT_EXIST","#,
         r#""code_dtype":"CompileTimeError","code_published":false,"message":"Target of URI "#,
@@ -1039,7 +1039,7 @@ mod tests {
     /// [`Self::populated_elements_shape_is_pinned`] fails — the same
     /// bump-the-version-and-re-pin contract as the main pin.
     const FACTS_SHAPE_ELEMENTS_JSON_PIN: &str = concat!(
-        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"default_value":null}],"named":[]}}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false}]}"#,
+        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"default_value":null}],"named":[]}}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false}],"anon_methods":[]}"#,
     );
 
     /// The element rows the main probe rides past empty, modeled on the
@@ -1095,6 +1095,7 @@ mod tests {
                             ty: PersistedTy::Function {
                                 nullable: true,
                                 type_params: 0,
+                                type_params_named: Vec::new(),
                                 return_ty: Box::new(PersistedTy::Named {
                                     name: 10,
                                     nullable: false,
@@ -1336,6 +1337,7 @@ mod tests {
                 group_open: None,
                 const_kw: None,
                 factory_kw: None,
+                is_complete: false,
             }],
             decl_kinds: vec![PersistedAugTarget {
                 container: Some(0),
@@ -1345,7 +1347,9 @@ mod tests {
                 is_mixin_application: false,
                 is_const: true,
                 is_factory: false,
+                is_complete: false,
             }],
+            anon_methods: Vec::new(),
         }
     }
 
@@ -1741,6 +1745,7 @@ mod tests {
             packages: PackageTable::basic(root, None).expect("table"),
             pub_config,
             config_dir: root.join(".dart_tool"),
+            context_roots: Vec::new(),
             semdiag: None,
             target: "vm".to_owned(),
             declared_variables: FxHashMap::default(),
@@ -1836,6 +1841,7 @@ mod tests {
                 packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
                 pub_config: Arc::clone(&pub_config),
                 config_dir: config_dir.clone(),
+                context_roots: Vec::new(),
                 semdiag: None,
                 target: "vm".to_owned(),
                 declared_variables: FxHashMap::default(),
@@ -1976,6 +1982,7 @@ mod tests {
             packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
             pub_config: Arc::clone(&pub_config),
             config_dir: config_dir.clone(),
+            context_roots: Vec::new(),
             semdiag: None,
             target: "vm".to_owned(),
             declared_variables: FxHashMap::default(),
@@ -2651,6 +2658,7 @@ mod tests {
                 packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
                 pub_config: Arc::clone(&pub_config),
                 config_dir: config_dir.clone(),
+                context_roots: Vec::new(),
                 semdiag: None,
                 target: "vm".to_owned(),
                 declared_variables: FxHashMap::default(),
@@ -2937,6 +2945,7 @@ mod tests {
                 packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
                 pub_config: Arc::clone(&pub_config),
                 config_dir: config_dir.clone(),
+                context_roots: Vec::new(),
                 semdiag: None,
                 target: "vm".to_owned(),
                 declared_variables: FxHashMap::default(),

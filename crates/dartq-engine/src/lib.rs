@@ -156,6 +156,16 @@ pub struct EngineConfig {
     pub pub_config: Arc<PackageConfig>,
     /// The directory holding `package_config.json` (normally `.dart_tool/`).
     pub config_dir: PathBuf,
+    /// The nested self-resolved context roots the assembly's workspace walk
+    /// discovered (canonical dirs carrying their own `pubspec.yaml` +
+    /// `.dart_tool/package_config.json` — the oracle's separate-context-root
+    /// trigger). The merged [`Self::pub_config`] keeps only one entry per
+    /// package name, so same-named sibling roots never survive as entries;
+    /// this list is where every root still exists, and the URI table builds
+    /// one package universe per root for spelling and `package:` resolution.
+    /// Empty on the common single-root shape — the flat table then spells
+    /// and resolves byte-identically.
+    pub context_roots: Vec<PathBuf>,
     /// The semantic diagnostics plug point (#120/#121); `None` keeps the
     /// engine's syntax + URI-layer set (under-reporting contract).
     pub semdiag: Option<Arc<dyn SemanticDiagnoser>>,
@@ -268,6 +278,7 @@ impl Engine {
             config.packages,
             &config.pub_config,
             &config.config_dir,
+            &config.context_roots,
             config.sdk,
             config.store,
             config.target,
@@ -2801,6 +2812,7 @@ mod tests {
             packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
             pub_config: Arc::clone(&config),
             config_dir,
+            context_roots: Vec::new(),
             semdiag: None,
             target: DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),
@@ -2953,6 +2965,7 @@ mod tests {
                 additional_properties: std::collections::BTreeMap::new(),
             }),
             config_dir: root.join(".dart_tool"),
+            context_roots: Vec::new(),
             semdiag: None,
             target: DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),
@@ -4001,6 +4014,7 @@ mod tests {
             packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
             pub_config: config,
             config_dir,
+            context_roots: Vec::new(),
             semdiag: Some(crate::semdiag::diagnoser()),
             target: DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),

@@ -84,7 +84,7 @@ pub fn collect_set_with_evidence(
     // unresolvable-include posture) while the options file's own rules
     // still load.
     let (table, packages, config_dir, advisory) = match assembly {
-        Some((table, packages, config_dir, _, advisory)) => {
+        Some((table, packages, config_dir, _, advisory, _)) => {
             (Some(table), packages, config_dir, advisory)
         }
         None => (

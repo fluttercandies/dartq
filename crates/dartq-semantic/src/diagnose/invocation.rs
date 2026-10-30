@@ -3985,6 +3985,172 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The invocation-site type-argument bounds face (#2869,
+    /// `_checkInvocationTypeArguments`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/type_arguments_verifier.dart:570-633):
+    /// every explicit type argument checks against its parameter's bound,
+    /// substituted with the written arguments (the
+    /// `<TFrom, TTo extends Iterable<TFrom>>` shapes). An arity mismatch
+    /// truncates to the shared prefix (the count reports as
+    /// `wrong_number_of_type_arguments`), and the report anchors at the
+    /// offending argument's own node (`typeArgumentList[i]`).
+    pub(crate) fn check_call_type_arg_bounds(
+        &mut self,
+        params: &[(StringId, Option<Ty>)],
+        args: &CallTypeArgs,
+    ) {
+        let len = params.len().min(args.tys.len());
+        let map: Vec<(StringId, Ty)> = params[..len]
+            .iter()
+            .zip(args.tys[..len].iter())
+            .map(|((param, _), ty)| (*param, *ty))
+            .collect();
+        for index in 0..len {
+            let Some(bound) = params[index].1 else {
+                continue;
+            };
+            let arg = args.tys[index];
+            // An unresolvable argument or bound reads `DynamicType`/null
+            // upstream (the resolver substituted dynamic before this face
+            // sees the types) and satisfies everything — deciding against
+            // an unsolved spelling would over-fire.
+            if !self.call_type_arg_decidable(arg) || !self.call_type_arg_decidable(bound) {
+                continue;
+            }
+            let Some(bound) = self.subst_params(bound, &map) else {
+                continue;
+            };
+            if self.assignable(arg, bound, false) != Some(false) {
+                continue;
+            }
+            let argument = self.ty_display(arg);
+            let parameter = self.strings.resolve(params[index].0).to_string();
+            let bound_text = self.ty_display(bound);
+            self.emit3(
+                SemanticCode::TypeArgumentNotMatchingBounds,
+                args.spans[index],
+                &argument,
+                &parameter,
+                &bound_text,
+            );
+        }
+    }
+
+    /// Whether a bounds-face type can decide a subtype question: a
+    /// compound shape always can; a bare named head must resolve as a
+    /// type (a primitive, an in-scope parameter, or a scoped
+    /// declaration) — an unresolved spelling is the oracle's
+    /// erroneous-type suppression, never a mismatch.
+    fn call_type_arg_decidable(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Named {
+                name,
+                args: ArgListId::EMPTY,
+                ..
+            } => self.named_type_is_type(name),
+            _ => true,
+        }
+    }
+
+    /// #2869 — the creation bounds face at the formals seam: a send whose
+    /// head has no formals (a ctor-less class creation, an alias
+    /// creation, a formals-less function) returns right below the
+    /// `check_creation_inference` call, and its written type arguments
+    /// still check against the head's substituted bounds. The head's
+    /// declaring parameters come from the container capture, the alias
+    /// capture, or the executable's own bound window — the same facts the
+    /// formals path gathers. Poisoned bounds keep the name-only shape
+    /// (the executable windows' rule), which the decidability gate
+    /// suppresses. The latch entry is PEEKED, never consumed: the
+    /// creation-type faces downstream (`creation_row_ty`,
+    /// `with_explicit_creation_args`) read the same entry to instantiate
+    /// the row — a drain here types every formals-less creation as its
+    /// bare head (the #2243 regression).
+    pub(crate) fn check_creation_type_arg_bounds(&mut self, callee: usize) {
+        let Some(offset) = self.rows.get(callee).map(|r| r.range.offset) else {
+            return;
+        };
+        let pos = self
+            .call_type_args
+            .iter()
+            .rposition(|(at, _)| *at == offset);
+        let Some(args) = pos.map(|p| self.call_type_args[p].1.clone()) else {
+            return;
+        };
+        let Some(row) = self.rows.get(callee) else {
+            return;
+        };
+        if row.qualified {
+            return;
+        }
+        let head_name = match &row.shape {
+            RowShape::Bare(BareInfo::Container {
+                name,
+                kind: ContainerKind::Class,
+            }) => Some(*name),
+            _ => self.bare_creation_head_name(row.range),
+        };
+        let params = head_name.and_then(|name| {
+            self.bounds
+                .container_params(name)
+                .or_else(|| self.bounds.alias_params(name))
+                .map(|capture| {
+                    capture
+                        .iter()
+                        .map(|(param, bound, _)| {
+                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                        })
+                        .collect::<Vec<(StringId, Option<Ty>)>>()
+                })
+        });
+        let params = match params {
+            Some(params) => params,
+            None => match self.exec_bounds.get(&row.name) {
+                Some(window) if !window.is_empty() => window.to_vec(),
+                _ => return,
+            },
+        };
+        self.check_call_type_arg_bounds(&params, &args);
+    }
+
+    /// #2890 — the keyword-form creation's bounds face (`new G<A>()`,
+    /// `const G<A>()`, and their `.new` spelling): the constructor name's
+    /// type is a NamedType, and the written arguments check exactly like an
+    /// annotation's — the substituted container bounds, or a type alias's
+    /// own when the head resolves through one (`checkNamedType` →
+    /// `_checkForTypeArgumentNotMatchingBounds`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/type_arguments_verifier.dart:243-247).
+    /// A resolved creation head pushes no row, so the group closed
+    /// unanchored: the capture never latched, and the still-open capture IS
+    /// the written group (a headed nested group never re-arms it, and its
+    /// members feed at a foreign depth). A missing capture means the
+    /// anchored latch already owns the group — the anchored arms read it,
+    /// never this seam. The named-constructor spellings (`C.named<int>`)
+    /// declare no type parameters — the `_constructor` count face stays
+    /// alone there.
+    fn check_creation_ref_bounds(&mut self, class: StringId) {
+        let Some(params) = self
+            .bounds
+            .container_params(class)
+            .or_else(|| self.bounds.alias_params(class))
+        else {
+            return;
+        };
+        let Some(capture) = self.call_args_capture.take() else {
+            return;
+        };
+        let (tys, spans): (Vec<Ty>, Vec<SourceRange>) = capture.members.into_iter().unzip();
+        let args = CallTypeArgs {
+            tys: tys.into_boxed_slice(),
+            spans: spans.into_boxed_slice(),
+        };
+        let params: Vec<(StringId, Option<Ty>)> = params
+            .iter()
+            .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
+            .collect();
+        self.check_call_type_arg_bounds(&params, &args);
+    }
+
     /// The generic inference-failure face (`couldNotInfer`, upstream Dart
     /// SDK source, pkg/analyzer/lib/src/dart/element/generic_inferrer.dart
     /// `tryChooseFinalTypes` :298-380, message assembly `_formatError`
@@ -4588,6 +4754,12 @@ impl<'a> Engine<'a> {
                     *range,
                     message,
                 );
+            } else {
+                // The conversion's own face (#2870): a granted `int →
+                // double` literal ask doubles as the imprecise-value check
+                // (the formal is the double context the oracle's
+                // `_checkForOutOfRange` double arm reports from).
+                self.check_imprecise_int_literal(flow_ty, formal.ty, *literal, *range);
             }
         }
     }
@@ -5073,6 +5245,9 @@ impl<'a> Engine<'a> {
                     *range,
                     message,
                 );
+            } else {
+                // The conversion's own face (#2870), same as the main walk.
+                self.check_imprecise_int_literal(flow_ty, formal.ty, *literal, *range);
             }
         }
     }
@@ -6372,6 +6547,14 @@ impl<'a> Engine<'a> {
         // statement creations). The engine-side wrapper owns the shape,
         // context, and explicit-argument guards and emits both rows.
         self.check_creation_inference(callee);
+        // #2869 — the creation bounds face rides the same seam: a send
+        // whose head has no formals returns below, and its written type
+        // arguments still check against the head's substituted bounds
+        // (the class's own, the alias's, or the executable's window).
+        // The formals path checks at the argument walk's wiring below.
+        if formals.is_none() {
+            self.check_creation_type_arg_bounds(callee);
+        }
         let Some(formals) = formals else {
             return;
         };
@@ -6573,6 +6756,26 @@ impl<'a> Engine<'a> {
         {
             exec_params = Some(names.into_iter().map(|name| (name, None)).collect());
         }
+        // The alias-callee route (#2841's bounds half): a creation spelled
+        // through a non-function type alias checks the ALIAS's own
+        // parameter bounds (`checkNamedType` reads
+        // `alias.element.typeParameters` on the alias application,
+        // type_arguments_verifier.dart:371-375). A poisoned bound keeps
+        // the name-only shape — recovery residue is never a fact, the
+        // same rule the executable windows capture by.
+        if exec_params.is_none()
+            && let Some((params, _)) =
+                creation_container.and_then(|head| self.bounds.alias_named_shape(head))
+        {
+            exec_params = Some(
+                params
+                    .iter()
+                    .map(|(param, bound, _)| {
+                        (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                    })
+                    .collect(),
+            );
+        }
         // The function-typed variable's written signature (the captured
         // `T Function<T>(T)` annotation): its declared type parameters
         // stand in for the element model's — the model poisons the
@@ -6750,11 +6953,57 @@ impl<'a> Engine<'a> {
         {
             self.check_could_not_infer(callee, container, params, &formals, &level, close);
         }
+        // The invocation-site bounds face (#2869): the written type
+        // arguments check against the callee's substituted bounds before
+        // the argument walk (`_checkInvocationTypeArguments`,
+        // upstream Dart SDK source,
+        // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
+        // :570-633 — the same `checkMethodInvocation`/
+        // `checkFunctionExpressionInvocation` drive the creations' bare
+        // `C<T>()` spelling).
+        if let (Some(params), Some(args)) = (&exec_params, &explicit_args) {
+            self.check_call_type_arg_bounds(params, args);
+        }
+        // #2890 — the super-send bounds face: `super.m<int>(...)` resolves
+        // through the SUPERCLASS's member table, which neither
+        // `member_send_params` nor the `exec_bounds` window answers, so the
+        // written arguments checked nothing (#2869 residual). The send
+        // closes before the dot-access merge — the callee is the unmerged
+        // qualified member placeholder with the receiver row directly
+        // below (the same geometry the formals read) — and the method's
+        // own parameters decide, substituted with the written arguments:
+        // the same `_checkInvocationTypeArguments` verdict
+        // (`checkMethodInvocation`, upstream Dart SDK source,
+        // pkg/analyzer/lib/src/error/type_arguments_verifier.dart:236-240),
+        // the report anchored at the offending argument's node. Gated on
+        // `exec_params.is_none()` so the chain's first-match-wins posture
+        // holds and an answered send never checks twice.
+        if exec_params.is_none()
+            && let Some(args) = &explicit_args
+            && let Some(row) = self.rows.get(callee)
+            && row.qualified
+            && matches!(&row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+            && let Receiver::Super { container, .. } = callee
+                .checked_sub(1)
+                .and_then(|index| self.rows.get(index))
+                .map_or(Receiver::Unknown, |below| self.argument_receiver(below))
+            && let Walk::Found(entry) = self.walk_super(container, callee_spelling)
+            && entry.kind == MemberKind::Method
+            && !entry.type_param_names.is_empty()
+        {
+            let params: Vec<(StringId, Option<Ty>)> = entry
+                .type_param_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (*name, entry.type_param_bounds.get(index).copied()))
+                .collect();
+            self.check_call_type_arg_bounds(&params, args);
+        }
         if let Some(params) = &exec_params {
             let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
             // The explicit fix precedes every inference face.
             if let Some(explicit) = &explicit_args {
-                for (slot, ty) in solutions.iter_mut().zip(explicit.iter()) {
+                for (slot, ty) in solutions.iter_mut().zip(explicit.tys.iter()) {
                     *slot = Some(*ty);
                 }
             }
@@ -7137,6 +7386,13 @@ impl<'a> Engine<'a> {
                 if !unbound_formal {
                     self.stage(StagedKind::Argument, *range, *ty, formal_ty, *literal);
                 }
+            } else {
+                // The conversion's own face (#2870): a granted `int →
+                // double` literal ask doubles as the imprecise-value check
+                // (the formal is the double context the oracle's
+                // `_checkForOutOfRange` double arm reports from). The
+                // rejecting side defers to the staged teardown above.
+                self.check_imprecise_int_literal(*ty, formal_ty, *literal, *range);
             }
         }
         // The substituted return type (#1351, part d): a generic send's
@@ -7693,6 +7949,78 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// The genuinely-unresolved bare-call-head face (#2860): the send's
+    /// callee resolved as nothing — [`Engine::resolve_bare`]'s full scope
+    /// chain (frames, the container member faces, the extension faces, the
+    /// scoped library lookup) answered `Missing` — so the oracle types the
+    /// invocation with `InvalidType` and every relation over it reads
+    /// vacuous. The refusal mirrors of the snapshot universe's buckets keep
+    /// the over-deading guard honest: a mixin/extension body's `on` face
+    /// may still define the name (`on_opaque` — the member could live on
+    /// the unindexed hop), a dart:core top-level facade spelling (`print`)
+    /// resolves through the implicit core import, and an invokable member
+    /// spelling (`int.parse`'s `parse` bare at top level) is the
+    /// name-keyed over-approximation the oracle's own scope also refuses —
+    /// those keep the unknown face (the conservative under-report).
+    fn unresolved_call_head(&self, row: &Row) -> bool {
+        if row.qualified {
+            return false;
+        }
+        let RowShape::Bare(BareInfo::Missing { on_opaque, .. }) = &row.shape else {
+            return false;
+        };
+        if *on_opaque
+            || super::types::CORE_TOP_LEVEL_FNS.contains(&self.strings.resolve(row.name))
+            || self.invokable_member_spelling(row.name)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Whether `name` spells an invokable member of some container this
+    /// engine's universe registers — the core member tables' spellings
+    /// ([`CORE_TYPE_MEMBERS`], [`OBJECT_MEMBERS`], [`ENUM_SYNTH_MEMBERS`],
+    /// [`CORE_MEMBER_RETURNS`]' static faces) plus this file's own
+    /// container members, the same name-keyed over-approximation the
+    /// snapshot's invokable face carries (`LibraryTypes::invokable_members`,
+    /// upstream Dart SDK source semantics: an instance or static member
+    /// spelling somewhere beats the unresolved-call face). Built once per
+    /// engine on the first unresolved-head send; every other send reads the
+    /// cached set (one hash probe).
+    fn invokable_member_spelling(&self, name: StringId) -> bool {
+        self.member_spellings
+            .get_or_init(|| {
+                let mut set = FxHashSet::default();
+                for (_, members) in crate::member_face::CORE_TYPE_MEMBERS {
+                    set.extend(members.iter().map(|spelling| self.strings.intern(spelling)));
+                }
+                set.extend(
+                    crate::member_face::OBJECT_MEMBERS
+                        .iter()
+                        .map(|spelling| self.strings.intern(spelling)),
+                );
+                set.extend(
+                    crate::member_face::ENUM_SYNTH_MEMBERS
+                        .iter()
+                        .map(|spelling| self.strings.intern(spelling)),
+                );
+                for (head, member, _) in crate::member_face::CORE_MEMBER_RETURNS {
+                    let _ = head;
+                    set.insert(self.strings.intern(member));
+                }
+                if let Some(elements) = self.index.get(self.file) {
+                    for &container in elements.container_order() {
+                        if let Some(container) = elements.container(container) {
+                            set.extend(container.members.keys().copied());
+                        }
+                    }
+                }
+                set
+            })
+            .contains(&name)
+    }
+
     pub(crate) fn consume_send(&mut self, end: Token) -> Option<SendExit> {
         // Honor the armed link only for the send whose closing token is the
         // argument group's own `)` — a constructor invocation's `()` arms it
@@ -7847,6 +8175,15 @@ impl<'a> Engine<'a> {
                 if let Some(row) = self.rows.get(callee) {
                     self.send_return_staging = Some((row.range.offset, ret));
                 }
+            } else if let Some(row) = self.rows.get(callee)
+                && self.unresolved_call_head(row)
+            {
+                // The genuinely-unresolved head (#2860): the oracle types
+                // the invocation `InvalidType`, so the listener stages the
+                // head's own name — the flow lattice's invalid stand-in —
+                // and a switch over the call answers the vacuous-cover
+                // chain instead of the undecidable unknown.
+                self.send_invalid_staging = Some((row.range.offset, row.name));
             }
             (self.is_never_ty(ret)).then_some(SendExit::Result)
         };
@@ -8328,16 +8665,49 @@ impl<'a> Engine<'a> {
         let Some((row_index, count, range)) = self.deferred_args.pop() else {
             return;
         };
-        // The tear-off consumed its group: the latched written arguments
-        // die with it (no call follows to ground).
-        let _ = self.call_args_for(row_index);
+        // The application's written arguments, latched for this row when the
+        // group anchored: the bounds faces consume them (#2890), every other
+        // arm drops them (no call follows to ground the latch).
+        let latched_args = self.call_args_for(row_index);
         let Some(row) = self.rows.get(row_index) else {
             return;
         };
+        // The facts the arms read past their `&mut` faces: the row borrow
+        // must not reach them.
+        let row_name = row.name;
+        let row_qualified = row.qualified;
         match &row.shape {
             RowShape::Bare(BareInfo::Container { name, .. }) => {
+                let class_name = *name;
                 // Type-literal instantiation `C<int>`: the base code.
-                self.check_annotation_arity(*name, count, range);
+                self.check_annotation_arity(class_name, count, range);
+                // #2890 — a `.` after the group is the constructor-reference
+                // spelling (`A<String>.new`): the rewrite keeps the type
+                // arguments on the constructor name's type whenever any exist
+                // (ast_rewrite.dart `_toConstructorReference_propertyAccess` —
+                // "it looks more like a constructor tearoff than anything
+                // else"), so `checkConstructorReference` checks them against
+                // the container's (or the alias's own) substituted bounds.
+                // Without the dot the node is a TypeLiteral, whose visit
+                // runs no bounds face — the plain `A<int>;` spelling stays
+                // silent. A prefixed head keeps the under-report posture
+                // (the same `!qualified` rule the creation faces share).
+                if !row_qualified
+                    && let Some(args) = &latched_args
+                    && self.dot_follows_range_end(range)
+                    && let Some(params) = self
+                        .bounds
+                        .container_params(class_name)
+                        .or_else(|| self.bounds.alias_params(class_name))
+                {
+                    let params: Vec<(StringId, Option<Ty>)> = params
+                        .iter()
+                        .map(|(param, bound, _)| {
+                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                        })
+                        .collect();
+                    self.check_call_type_arg_bounds(&params, args);
+                }
             }
             RowShape::Bare(BareInfo::Plain { ty }) => {
                 // A named top-level function tear-off, or an implicit call
@@ -8348,11 +8718,26 @@ impl<'a> Engine<'a> {
                 // `_function` face reports against, upstream's
                 // `InvocationTargetFunctionTypedExpression` shape).
                 let named_fn = self
-                    .top_level_decl(row.name)
+                    .top_level_decl(row_name)
                     .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
                     .map(|d| (d.type_params, ExecKind::Function));
                 if let Some((declared, kind)) = named_fn {
-                    self.emit_element_arity(row.name, declared, kind, count, range);
+                    self.emit_element_arity(row_name, declared, kind, count, range);
+                    // #2890 — the tear-off's bounds face
+                    // (`checkFunctionReference`, upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
+                    // :192-196): the written arguments check against the
+                    // function's declared bounds, the report anchored at the
+                    // offending argument's node. The `exec_bounds` window is
+                    // the declaring function's own capture — the same facts
+                    // the send path reads.
+                    if let Some(args) = &latched_args
+                        && let Some(window) = self.exec_bounds.get(&row_name)
+                        && !window.is_empty()
+                    {
+                        let window: Vec<(StringId, Option<Ty>)> = window.iter().copied().collect();
+                        self.check_call_type_arg_bounds(&window, args);
+                    }
                 } else if let Ty::Function { shape, .. } = *ty {
                     let declared = self.boundary.pool().function_shape(shape).type_params;
                     if declared != count {
@@ -8423,6 +8808,23 @@ impl<'a> Engine<'a> {
                                 &count.to_string(),
                             );
                         }
+                        // #2890 — the method tear-off's bounds face (the
+                        // same `checkFunctionReference` verdict over the
+                        // written arguments, the method's own parameters
+                        // deciding).
+                        if let Some(args) = &latched_args
+                            && !entry.type_param_names.is_empty()
+                        {
+                            let params: Vec<(StringId, Option<Ty>)> = entry
+                                .type_param_names
+                                .iter()
+                                .enumerate()
+                                .map(|(index, name)| {
+                                    (*name, entry.type_param_bounds.get(index).copied())
+                                })
+                                .collect();
+                            self.check_call_type_arg_bounds(&params, args);
+                        }
                     }
                     // Non-method finds (getter/field tear-offs) are the
                     // oracle's function-typed-expression target — the
@@ -8435,6 +8837,24 @@ impl<'a> Engine<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Whether a `.` followed by a name starts after `range`'s end (the
+    /// group's closer, a UTF-16 offset converted before the byte walk): the
+    /// constructor-reference follower (`A<String>.new`). The same source
+    /// probe the collection-literal bail uses, member-shaped — a bare `.`
+    /// with no name is recovery residue, not a selector.
+    fn dot_follows_range_end(&self, range: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(range.end());
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        cursor < bytes.len()
+            && bytes[cursor] == b'.'
+            && bytes
+                .get(cursor + 1)
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$')
     }
 
     /// The `_function` message's function-type display from a captured
@@ -8874,6 +9294,7 @@ impl<'a> Engine<'a> {
                     // (constructors never declare type parameters).
                     if ctor == class || self.strings.resolve(ctor) == "new" {
                         self.check_annotation_arity(class, count, range);
+                        self.check_creation_ref_bounds(class);
                     } else if let BareInfo::Prefix { .. } = self.resolve_bare(class).0 {
                         // The wave-3 reference is `prefix.Class<T>` — the
                         // parser cannot tell a prefixed class head from a
@@ -8915,7 +9336,10 @@ impl<'a> Engine<'a> {
                         );
                     }
                 }
-                None => self.check_annotation_arity(class, count, range),
+                None => {
+                    self.check_annotation_arity(class, count, range);
+                    self.check_creation_ref_bounds(class);
+                }
             }
             return;
         }

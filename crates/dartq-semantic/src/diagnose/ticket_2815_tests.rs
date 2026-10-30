@@ -14,11 +14,10 @@
 //! assignment_expression_resolver.dart (:232-278), field_promotability
 //! .dart (:70-76).
 //!
-//! Known message divergence (renderer debt, zero Jaccard effect — the
-//! conformance diff keys on (severity, code, file)): the binary-operator
-//! and bare-invocation faces render the property variant where the
-//! oracle spells the operator/function variants (codes.rs is another
-//! lane's file this wave).
+//! Message variants (#2877): the binary-operator face renders the
+//! operator variant and the bare-invocation face the function variant —
+//! messages.yaml's four shared-name rows dispatched by the access node's
+//! own shape (type_property_resolver.dart:128-148).
 
 use super::*;
 use crate::collector::collect;
@@ -179,9 +178,10 @@ fn param_bound_property_reports_unchecked() {
 
 // —— R2: the operator faces ——————————————————————————————————————————
 
-/// Binary operators on a nullable operand report at the operator token.
-/// The oracle spells the operator variant; the property text stands
-/// (renderer debt, codes.rs another lane's file).
+/// Binary operators on a nullable operand report at the operator token
+/// with the operator variant (#2877 — messages.yaml's
+/// `uncheckedOperatorInvocationOfNullableValue`, the BinaryExpression arm
+/// of the node-shape dispatch).
 #[test]
 fn binary_operator_on_nullable_reports_at_operator() {
     let src = "void f(int? x) {\n  x + 1;\n  x < 1;\n  x >>> 1;\n}";
@@ -189,6 +189,10 @@ fn binary_operator_on_nullable_reports_at_operator() {
     assert_eq!(rows.len(), 3, "{rows:?}");
     assert_eq!(rows[0].0, at(src, "+ 1"));
     assert_eq!(rows[0].1, 1);
+    assert_eq!(
+        rows[0].2,
+        "The operator '+' can't be unconditionally invoked because the receiver can be 'null'."
+    );
     assert_eq!(rows[1].0, at(src, "< 1"));
     assert_eq!(rows[2].0, at(src, ">>> 1"));
     assert_eq!(rows[2].1, 3);
@@ -264,9 +268,8 @@ fn member_result_compound_reports_at_operator() {
 
 /// A callee whose resolved type is a function type (the bare `Function`
 /// head, a written function shape, `Never?`, a function alias, a
-/// parameter through its bound) reports at the callee expression. The
-/// oracle spells the function variant; the property text stands
-/// (renderer debt).
+/// parameter through its bound) reports at the callee expression with
+/// the function variant (#2877).
 #[test]
 fn bare_invocation_function_callee_reports() {
     let src = "typedef F = void Function();\n\
@@ -281,18 +284,19 @@ fn bare_invocation_function_callee_reports() {
     ] {
         assert_eq!(row.0, at(src, name));
         assert_eq!(row.1, 1);
-        assert!(row.2.starts_with("The property"), "{}", row.2);
+        assert!(row.2.starts_with("The function"), "{}", row.2);
     }
 }
 
 /// A parameter spelling through a function bound joins the face (the
-/// oracle's `typeParametersNullableBounds` `func()` row).
+/// oracle's `typeParametersNullableBounds` `func()` row) with the
+/// function variant (#2877).
 #[test]
 fn param_function_bound_invoke_reports() {
     let src = "void f<FQ extends Function?>(FQ fn) {\n  fn();\n}";
     let (offset, _, message) = one_unchecked(src);
     assert_eq!(offset, at(src, "fn()"));
-    assert!(message.starts_with("The property"));
+    assert!(message.starts_with("The function"), "{message}");
 }
 
 /// A resolved call and a dynamic callee stay silent (the guard).

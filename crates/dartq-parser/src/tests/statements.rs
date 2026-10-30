@@ -714,6 +714,60 @@ fn catch_reserved_word_becomes_the_name() {
 }
 
 #[test]
+fn catch_junk_trace_fires_the_synthetic_parameter_event() {
+    // `catch (x, {st})`: the junk `{` fills the trace slot through the
+    // consume-in-doubt synthetic — the identifier event fires for it like
+    // for every other route (the rewriter's synthetic identifier exists
+    // "to satisfy listeners"), a zero-width identifier at the junk's own
+    // offset, after the real exception name. The written comma flips the
+    // trace slot exactly once.
+    let c = parse("void f() { try {} catch (x, {st}) {} }");
+    let catches: Vec<_> = c
+        .idents
+        .iter()
+        .filter(|(ctx, ..)| ctx == "CatchParameter")
+        .map(|(_, s, e, _)| (*s, *e))
+        .collect();
+    assert_eq!(catches, vec![(25, 26), (28, 28)], "{:?}", c.idents);
+    assert_eq!(c.catch_trace_flips.len(), 1);
+}
+
+#[test]
+fn catch_statement_start_trace_fires_the_synthetic_parameter_event() {
+    // `catch (e, do …)`: `do` is a statement start, so the template parks
+    // the synthetic name in front of it (:36-38) and the event fires for
+    // the nameless slot like for every other route; the statement keyword
+    // stays in the stream for the body parse.
+    let c = parse("f() { try {} catch (e, do {} while (true); }");
+    let catches: Vec<_> = c
+        .idents
+        .iter()
+        .filter(|(ctx, ..)| ctx == "CatchParameter")
+        .map(|(_, s, e, _)| (*s, *e))
+        .collect();
+    assert_eq!(catches, vec![(20, 21), (23, 23)], "{:?}", c.idents);
+    assert_eq!(c.catch_trace_flips.len(), 1);
+}
+
+#[test]
+fn catch_synthetic_comma_never_flips_the_trace_slot() {
+    // `catch (var e)`: the exception name recovers synthetically and the
+    // comma the recovery splices in is synthetic — the single-parameter
+    // recovery — so the slot flip never fires even though the trace ensure
+    // runs and fires its own (nameless) event; the real `e` binds through
+    // the formal re-parse only.
+    let c = parse("void f() { try {} catch (var e) {} }");
+    let catches: Vec<_> = c
+        .idents
+        .iter()
+        .filter(|(ctx, ..)| ctx == "CatchParameter")
+        .map(|(_, s, e, _)| (*s, *e))
+        .collect();
+    assert_eq!(catches, vec![(25, 25), (25, 25)], "{:?}", c.idents);
+    assert!(c.catch_trace_flips.is_empty());
+}
+
+#[test]
 fn switch_garbage_reports_expected_case() {
     let c = parse("void f() { switch (x) { + } }");
     let codes = c.error_codes();

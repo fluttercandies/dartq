@@ -361,6 +361,7 @@ fn analyze_environment(
         packages,
         pub_config: Arc::clone(config),
         config_dir: config_dir.to_path_buf(),
+        context_roots: Vec::new(),
         // The semantic families are part of the verdict (the compat face's
         // rationale): the SDK-difference signal rides the default diagnoser.
         semdiag: Some(semdiag::diagnoser()),

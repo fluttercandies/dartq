@@ -907,6 +907,16 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.super_formal_positional_index = 0;
         }
         engine.formal_list_depth += 1;
+        // The catch group's re-parse opens its ordinal window: the list's
+        // own first/second real formal names are the official AST's
+        // exception/trace faces (`handleCatchBlock`'s
+        // `catchParameters[0]/[1].name`); nested function-typed formals run
+        // at a deeper list and never count.
+        if kind == dartq_parser::MemberKind::Catch {
+            engine.catch_formal_group = Some(engine.formal_list_depth);
+            engine.catch_ord_exc = None;
+            engine.catch_ord_trace = None;
+        }
         engine.closure_formals_begin();
         if engine.formal_list_depth > 1 {
             // A function-typed formal's nested list: park the outer formal's
@@ -957,6 +967,17 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         if engine.formal_list_depth == 1 {
             engine.formal_written = engine.formal_written_saved.take();
+        }
+        // The catch group's re-parse closed: the second real formal name
+        // takes the stack-trace face when the fast pass's own trace slot
+        // stayed junk-filled (see [`Engine::reconcile_catch_slots`]).
+        if kind == dartq_parser::MemberKind::Catch {
+            let open = engine.catch_formal_group.take().is_some();
+            let trace = engine.catch_ord_trace.take();
+            engine.catch_ord_exc = None;
+            if open {
+                engine.reconcile_catch_slots(trace);
+            }
         }
     }
 
@@ -1363,6 +1384,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // rides onto its declaration site (the literal-constructor pass's
         // const face; `end_factory` clears it).
         engine.in_const_ctor = const_keyword.is_some();
+        // The augment bit rides onto the factory's site at its head — an
+        // `augment factory` merges into the selector's fragment chain
+        // exactly like an `augment` constructor (the
+        // `duplicate_constructor` pass skips augment sites), so it marks
+        // the same pending latch `begin_constructor` sets.
+        engine.ctor_augment_pending = augment_kw.is_some();
         // Factories have no `this`.
         engine.open_member_setter = false;
         engine.open_member_static = false;
@@ -1595,6 +1622,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.catch_on_type = None;
         engine.catch_on_nullable = None;
         engine.catch_params = 0;
+        engine.catch_trace_slot = false;
         engine.push_block_frame();
     }
 
@@ -2618,13 +2646,41 @@ impl ParserListener for DiagnoseListener<'_> {
                     } else {
                         engine.note_parameter(name, token.range);
                         engine.bind_parameter_type(name);
+                        // The catch group's ordinal: the list's own first
+                        // and second real formal names are the official
+                        // AST's exception/trace faces (nested lists run at
+                        // a deeper depth and never count).
+                        if engine.catch_formal_group == Some(engine.formal_list_depth) {
+                            let row = engine.locals.len().checked_sub(1);
+                            if engine.catch_ord_exc.is_none() {
+                                engine.catch_ord_exc = row;
+                            } else if engine.catch_ord_trace.is_none() {
+                                engine.catch_ord_trace = row;
+                            }
+                        }
                     }
                 }
             }
             C::CatchParameter => {
-                if let Some(name) = name {
-                    engine.note_catch_parameter(name, token.range);
-                    engine.bind_parameter_type(name);
+                match name {
+                    Some(name) => {
+                        engine.note_catch_parameter(name, token.range);
+                        engine.bind_parameter_type(name);
+                    }
+                    None => {
+                        // The nameless recovery face registers only on the
+                        // trace slot: the oracle's `<unnamed>` stack-trace
+                        // rows ride the junk-filled second slot, while a
+                        // nameless exception slot stays unregistered (the
+                        // oracle's exception verdicts there ride the
+                        // re-parse's real names, which the twin pass
+                        // already carries).
+                        if engine.catch_trace_slot
+                            && let Some(name) = engine.synthetic_name(token)
+                        {
+                            engine.note_catch_parameter(name, token.range);
+                        }
+                    }
                 }
             }
             C::LocalFunctionDeclaration => {
@@ -3066,7 +3122,14 @@ impl ParserListener for DiagnoseListener<'_> {
                         && !engine.group_late
                         && !ty_unresolved
                         && engine.written_potentially_non_nullable(ty);
-                    if final_gate || non_nullable_gate {
+                    // An `augment` field/variable group declares no new
+                    // variable — it merges into the element's fragment
+                    // chain and owns no initializer obligation, so the
+                    // `final_not_initialized` /
+                    // `not_initialized_non_nullable_variable` latches stay
+                    // off (upstream `checkElement` walks the element the
+                    // augment joins).
+                    if (final_gate || non_nullable_gate) && !engine.group_augment {
                         if context == C::FieldDeclaration {
                             let is_static = engine.open_member_static;
                             if let Some((container, _)) = engine.container_context() {
@@ -3328,7 +3391,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.armed_ty = Some(ty);
         // The written extent rides the armed slot (the pattern faces'
         // `pattern.type` anchor — the same span the return latch takes).
-        let span = match question {
+        let mut span = match question {
             Some(q) => SourceRange {
                 offset: name.range.offset,
                 length: q.range.end() - name.range.offset,
@@ -3352,10 +3415,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // re-fires arms its arguments for the binding declaration; any
         // other completion (a group-less head, a headless group's leaf)
         // resets the latch, so a stale annotation never reaches a bind.
+        let mut re_fired_group = false;
         match engine.completed_group.take() {
             Some((group_head, group_offset, args))
                 if group_head == leaf_id && group_offset == name.range.offset =>
             {
+                re_fired_group = true;
                 // The written arguments join the armed head (#611): the
                 // list interns into the boundary pool and the just-armed
                 // name-only head carries the canonical slot, so every
@@ -3371,6 +3436,22 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.completed_group = other;
             }
         }
+        // The written-argument extent (`List<int>`, not the bare head): a
+        // re-fired parameterized head's own group closed immediately
+        // before this completion, so `type_args_group_end` is its `>` and
+        // the annotation's span grows to it — the call-args capture's
+        // per-argument anchor (`_typeArgumentErrorNode` returns the whole
+        // written TypeAnnotation). A trailing `?` already spans past the
+        // group and keeps its longer face.
+        if re_fired_group
+            && let Some(end) = engine.type_args_group_end
+            && end > span.offset + span.length
+        {
+            span = SourceRange {
+                offset: span.offset,
+                length: end - span.offset,
+            };
+        }
         if let Some((head_name, head_range)) = head {
             engine.check_raw_type(head_name, head_range);
         }
@@ -3380,7 +3461,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(ty) = engine.armed_ty {
             let leaf = leaf_id;
             engine.fn_capture_type(ty, leaf, name.range.offset);
-            engine.call_args_feed(ty, leaf, name.range.offset);
+            engine.call_args_feed(ty, leaf, name.range.offset, span);
             // #1758: the re-walked return annotation of an in-flight
             // old-style function-typed formal is the innermost unfilled
             // slot AT THIS type-argument depth (the parser re-parses the
@@ -3444,7 +3525,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // stays written-shape).
         engine.var_leaf(void_id, token.range.offset, false);
         engine.fn_capture_type(Ty::Void, void_id, token.range.offset);
-        engine.call_args_feed(Ty::Void, void_id, token.range.offset);
+        engine.call_args_feed(Ty::Void, void_id, token.range.offset, token.range);
         engine.armed_ty_unresolved = false;
         engine.armed_ty = Some(Ty::Void);
         engine.armed_ty_span = Some(token.range);
@@ -3480,7 +3561,7 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         let void_id = engine.strings.intern("void");
         engine.fn_capture_type(Ty::Void, void_id, token.range.offset);
-        engine.call_args_feed(Ty::Void, void_id, token.range.offset);
+        engine.call_args_feed(Ty::Void, void_id, token.range.offset, token.range);
         engine.arm_return_span(token.range);
     }
 
@@ -3917,6 +3998,28 @@ impl ParserListener for DiagnoseListener<'_> {
                 },
                 tree,
             );
+        } else if let Some((offset, name)) = self.engine.send_invalid_staging.take() {
+            // The genuinely-unresolved head's Invalid face (#2860): the
+            // setter certified the call head resolves nowhere (the send's
+            // return read Unknown — the Named arm above could not have
+            // staged), so the oracle's static type for the invocation is
+            // `InvalidType`. The flow lattice spells it as the head's own
+            // interned name — the same unresolved-spelling stand-in the
+            // flow's bare-head face uses (a nowhere-resolving name maps to
+            // the invalid face, every relation over it vacuous) — so the
+            // existing consumer arms (the vacuous cover over typed
+            // patterns, the exhaustiveness suppression) read the Invalid
+            // scrutinee exactly like the oracle's chain.
+            let lexeme = self.engine.strings.resolve(name).to_string();
+            let base = self.flow().intern_name(&lexeme);
+            self.flow().stage_call_result(
+                offset,
+                FlowTy {
+                    base: FlowBase::Name(base),
+                    nullable: false,
+                },
+                Vec::new(),
+            );
         }
         // The exit records at the next forward ([`Self::flow`]) — never
         // ahead of the send's own statement wrapper.
@@ -4093,7 +4196,7 @@ impl ParserListener for DiagnoseListener<'_> {
                                     .call_type_args
                                     .iter()
                                     .find(|(row, _)| Some(*row) == rhs_offset)
-                                    .map(|(_, tys)| tys.clone());
+                                    .map(|(_, entry)| entry.tys.clone());
                                 match explicit {
                                     Some(tys) => {
                                         engine.boundary.args.borrow_mut().named(*name, false, &tys)
@@ -6442,7 +6545,11 @@ impl ParserListener for DiagnoseListener<'_> {
                         continue;
                     }
                     let name_text = engine.strings.resolve(getter).to_string();
-                    engine.emit_unchecked_nullable(ty_span, &name_text, false);
+                    engine.emit_unchecked_nullable(
+                        ty_span,
+                        &name_text,
+                        crate::codes::UncheckedNullableKind::Property,
+                    );
                 }
             }
         }
@@ -7085,8 +7192,10 @@ impl ParserListener for DiagnoseListener<'_> {
         let head = engine.pending_type_head.take();
         // The written-argument capture: a headless group is an invocation's
         // explicit type arguments (`f<int>(0)`, `C<num>(0)`); its members
-        // feed the argument check's grounding.
-        engine.call_args_begin(head.is_some());
+        // feed the argument check's grounding. The capture latches this
+        // group's own depth — the increment below — so a member's nested
+        // annotation never joins the member list.
+        engine.call_args_begin(head.is_some(), engine.type_arg_depth + 1);
         // The #610 capture: a type-reference group outside the capture
         // windows opens the site capture (a headless group is never a
         // site — bounds requires the head) — except an enum constant's
@@ -7939,6 +8048,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.group_const = var_final_or_const
             .and_then(|t| engine.text_of(t))
             .is_some_and(|text| text == "const");
+        // An `augment` field group declares no new field — the
+        // uninitialized latches stay off (the augment merges into the
+        // field element's existing fragment chain; it owns no initializer
+        // obligation of its own).
+        engine.group_augment = _augment_kw.is_some();
         if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
             engine.arm_const_group();
             // `const_instance_field` (error_verifier.dart:1260-1268): an
@@ -7970,6 +8084,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let engine = &mut self.engine;
         engine.field_group_open = false;
+        engine.group_augment = false;
         engine.disarm_const_group();
         // The field group closed: an unclaimed signature stash dies here.
         engine.fn_stash_drop();
@@ -7990,6 +8105,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         let engine = &mut self.engine;
         engine.field_group_open = false;
+        engine.group_augment = false;
         engine.disarm_const_group();
         // The frameless initializer locals die with their declaration: a
         // later declaration's reads must not resolve to them (the official
@@ -9236,6 +9352,13 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_break_statement(has_target, break_kw, end);
     }
 
+    fn handle_catch_trace_parameter(&mut self) {
+        // The written comma: the clause's following catch-parameter events
+        // fill the stack-trace slot (the engine's classification rides the
+        // parser's comma fact, never the event arrival order).
+        self.engine.catch_trace_slot = true;
+    }
+
     fn handle_catch_block(
         &mut self,
         on_kw: Option<Token>,
@@ -9354,7 +9477,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     let name_text = engine.strings.resolve(target_container).to_string();
                     engine.emit(SemanticCode::RedirectToNonClass, span, &name_text, "");
                 }
-                Some((target_decl, _)) => {
+                Some((target_decl, target_file)) => {
                     // The faces key on a resolved CONSTRUCTOR element
                     // upstream (`redirectedElement == null` early-returns
                     // into the missing-constructor face — a class with no
@@ -9363,14 +9486,48 @@ impl ParserListener for DiagnoseListener<'_> {
                     // the unnamed spellings (the head itself, `new`)
                     // through the implicit/explicit unnamed face.
                     if engine.ctor_face_exists(target_decl, target_container, target) {
-                        // Subtype check: the target's declared type against the
-                        // enclosing class's own name (the factory's declared
-                        // return type). `declared_subtype_negative` walks the
-                        // `from` container's supertype closure — a `Some(false)`
-                        // verdict means both resolve and `to` is absent, the
-                        // exact under-report shape the official gate picks.
-                        let from_ty = Ty::named(target_container);
-                        let to_ty = Ty::named(container);
+                        // The message spells the instantiated faces
+                        // (#2878; the oracle's `_checkForRedirectToInvalidReturnType`
+                        // renders the resolved types): the target
+                        // instantiated to its own parameter bounds (the
+                        // bare `= C.create` reading reads `C<dynamic>`
+                        // under an unbounded `C<T>` — instantiate-to-
+                        // bounds; the written arguments of the target
+                        // reference are not modeled here), the enclosing
+                        // class with its own parameters (`Link<T>` — the
+                        // factory's declared return face). The bounds ride
+                        // only for a LOCAL target — a foreign container's
+                        // bound slots are its own pool's, never rendered
+                        // through this one — and the subtype verdict reads
+                        // the heads only, so the enriched faces decide
+                        // exactly as the bare names did.
+                        let from_ty = if target_file == engine.file {
+                            let mut args = engine.boundary.args.borrow_mut();
+                            args.named(target_container, false, &target_decl.type_param_bounds)
+                        } else {
+                            Ty::named(target_container)
+                        };
+                        let to_ty = resolve_container(
+                            engine.graph,
+                            engine.namespaces,
+                            engine.index,
+                            engine.lib,
+                            engine.file,
+                            container,
+                        )
+                        .map_or_else(
+                            || Ty::named(container),
+                            |(decl, _)| {
+                                let type_args: Vec<Ty> = decl
+                                    .type_param_names
+                                    .iter()
+                                    .copied()
+                                    .map(Ty::named)
+                                    .collect();
+                                let mut args = engine.boundary.args.borrow_mut();
+                                args.named(container, false, &type_args)
+                            },
+                        );
                         if engine.declared_subtype_negative(&from_ty, &to_ty) == Some(false) {
                             let redirected_text = engine.render_ty(from_ty);
                             let redirecting_text = engine.render_ty(to_ty);

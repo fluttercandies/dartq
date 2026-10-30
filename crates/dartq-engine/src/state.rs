@@ -174,6 +174,30 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// resolved augmentation as `augmentation_without_declaration`; the bump
 /// forks such snapshots and forces re-capture. The columns ride the
 /// element row this version governs, so `SIGNATURE_VERSION` stays 13.
+/// v22: three capture columns entered together, and this is their record
+/// (the v15 retroactive posture — the const bump landed with the columns,
+/// the history entry did not). Function types carry their own type
+/// parameters as written (`PersistedTy::Function::type_params_named`,
+/// the #2878 display column); augmentation fragments and their
+/// target-kind rows carry the completeness bit
+/// (`PersistedAugment::is_complete` / `PersistedAugTarget::is_complete`,
+/// the `declaration_already_complete` chain walk); element models carry
+/// the anonymous-method invocation face (`PersistedElements::anon_methods`,
+/// `serde(default)` throughout). A v21 payload decodes names-less,
+/// completeness-false, anon-less — each the old producer's own rendering,
+/// but the display and verifier faces the current producer serves diverge
+/// from it; the bump forks such snapshots and forces re-capture. The
+/// columns ride rows this version governs, so `SIGNATURE_VERSION` stays
+/// 13. v23: the URI universe the facts capture against widened
+/// (#2876/#2882 — the assembly feeds its discovered sibling context
+/// roots into the package table [`EngineState`] builds, and a missing
+/// `part` target re-spells to the canonical URI at the report face).
+/// Directive targets and codes are baked facts — functions of that
+/// universe — so a payload the pre-wave producer wrote can carry targets
+/// the current producer resolves differently with no layout delta (the
+/// capture-behavior fork lane); the bump invalidates such snapshots and
+/// forces re-capture. The fold moves on the shape lane, so
+/// `SIGNATURE_VERSION` stays 13.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -192,7 +216,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 21;
+const FACTS_SHAPE_VERSION: u32 = 23;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with
@@ -1831,13 +1855,15 @@ impl EngineState {
         packages: IdentityTable,
         pub_config: &PackageConfig,
         config_dir: &Path,
+        nested_roots: &[PathBuf],
         sdk: SdkSnapshot,
         store: Box<dyn SourceStore + Send + Sync>,
         target: String,
         declared_variables: FxHashMap<String, String>,
         experiments: &[String],
     ) -> Result<Self, crate::EngineError> {
-        let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
+        let uri_packages =
+            UriPackageTable::new_with_context_roots(pub_config, config_dir, nested_roots)?;
         // Options are a context field: the include chains merge once here,
         // keyed by governing directory — package roots plus the nested
         // options directories inside them (cold path, workspace-assembly

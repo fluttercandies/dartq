@@ -58,9 +58,10 @@ pub(crate) struct TypeTree {
 }
 
 /// A function-type node's columns: the written return type (`None` for a
-/// bare `Function(...)` head — the implicit `dynamic`), the
-/// type-parameter group's count, and the formal list split exactly like a
-/// record's fields (named formals are the trailing entries that carried a
+/// bare `Function(...)` head — the implicit `dynamic`), the signature's
+/// own type-parameter group as written (#2878 — name + written bound,
+/// declaration order), and the formal list split exactly like a record's
+/// fields (named formals are the trailing entries that carried a
 /// named-formal event).
 #[derive(Clone, Debug)]
 pub(crate) struct FnTree {
@@ -68,6 +69,11 @@ pub(crate) struct FnTree {
     pub ret: Option<Box<TypeTree>>,
     /// The `<T, U>` group's count.
     pub type_params: u16,
+    /// The signature's own type parameters as written, parallel to the
+    /// count (name + bound tree; `None` = unbounded). The same column the
+    /// diagnose-side capture carries — both producers intern identical
+    /// written shapes to one slot.
+    pub type_params_named: Vec<(StringId, Option<TypeTree>)>,
     /// Positional formal types in source order.
     pub positional: Vec<TypeTree>,
     /// Named formals `(name, type)`, written order.
@@ -114,6 +120,7 @@ impl TypeTree {
     fn function_node(
         ret: Option<Box<TypeTree>>,
         type_params: u16,
+        type_params_named: Vec<(StringId, Option<TypeTree>)>,
         positional: Vec<TypeTree>,
         named: Vec<(StringId, TypeTree)>,
         nullable: bool,
@@ -135,6 +142,7 @@ impl TypeTree {
             function: Some(FnTree {
                 ret,
                 type_params,
+                type_params_named,
                 positional,
                 named,
             }),
@@ -170,8 +178,19 @@ pub(crate) struct Level {
     /// Function levels only: the type-variable group's count, latched
     /// while the group is open.
     type_params: u16,
+    /// Function levels only: the signature's own type variables as
+    /// written, in declaration order — the name latched at
+    /// [`TreeSink::function_type_variable`] paired with the bound list's
+    /// mark at that moment (the variable's own bound completes after its
+    /// begin; a shorter list at the group's close = unbounded).
+    type_vars: Vec<(StringId, usize)>,
+    /// Function levels only: the bound shapes completed inside the open
+    /// type-variable group, in completion order — each variable's mark
+    /// indexes it (#2878: the bound rides the shape beside its name).
+    bounds: Vec<TypeTree>,
     /// A type-variable group is open at this level (`<T extends …>`): the
-    /// bound shapes are not type-identity columns — their nodes drop.
+    /// bound shapes are not type-identity columns — their nodes drop
+    /// (except on a function level, where they collect into `bounds`).
     in_type_variables: bool,
     poisoned: bool,
 }
@@ -236,6 +255,8 @@ impl TreeSink {
             named_count: 0,
             formal_mark: 0,
             type_params: 0,
+            type_vars: Vec::new(),
+            bounds: Vec::new(),
             in_type_variables: false,
             poisoned: false,
         });
@@ -256,6 +277,8 @@ impl TreeSink {
             named_count: 0,
             formal_mark: 0,
             type_params: 0,
+            type_vars: Vec::new(),
+            bounds: Vec::new(),
             in_type_variables: false,
             poisoned: false,
         });
@@ -276,6 +299,8 @@ impl TreeSink {
             named_count: 0,
             formal_mark: 0,
             type_params: 0,
+            type_vars: Vec::new(),
+            bounds: Vec::new(),
             in_type_variables: false,
             poisoned: false,
         });
@@ -336,13 +361,15 @@ impl TreeSink {
 
     /// One type variable declared in the open group
     /// (`begin_type_variable`) — a function level's own `<T, U>` group
-    /// counts into its shape.
-    pub(crate) fn function_type_variable(&mut self) {
+    /// counts into its shape and records the spelling beside the bound
+    /// list's mark (#2878: the pair rides the tree's function node).
+    pub(crate) fn function_type_variable(&mut self, name: StringId) {
         if let Some(level) = self.stack.last_mut()
             && level.function
             && level.in_type_variables
         {
             level.type_params = level.type_params.saturating_add(1);
+            level.type_vars.push((name, level.bounds.len()));
         }
     }
 
@@ -459,9 +486,18 @@ impl TreeSink {
                 _ => positional.push(node),
             }
         }
+        // The signature's own group pairs up at the close: each variable's
+        // mark indexes its bound — a mark past the completed list is the
+        // unbounded reading (`<T>` carries no bound tree).
+        let type_params_named: Vec<(StringId, Option<TypeTree>)> = level
+            .type_vars
+            .into_iter()
+            .map(|(name, mark)| (name, level.bounds.get(mark).cloned()))
+            .collect();
         let node = TypeTree::function_node(
             ret,
             level.type_params,
+            type_params_named,
             positional,
             named,
             nullable,
@@ -472,11 +508,13 @@ impl TreeSink {
     }
 
     /// Feeds a completed node to the enclosing level (or `done`). A node
-    /// completing inside a type-variable group is a bound's shape — not a
-    /// type-identity column — and drops (the group's count is the only
-    /// face the model carries).
+    /// completing inside a type-variable group is a bound's shape — on a
+    /// function level it collects into `bounds` (the pair rides the
+    /// function node, #2878); on every other level it drops (the group's
+    /// count is the only face the model carries there).
     fn push_node(&mut self, node: TypeTree) {
         match self.stack.last_mut() {
+            Some(parent) if parent.in_type_variables && parent.function => parent.bounds.push(node),
             Some(parent) if !parent.in_type_variables => parent.nodes.push(node),
             Some(_) => {}
             None => self.done.push(node),

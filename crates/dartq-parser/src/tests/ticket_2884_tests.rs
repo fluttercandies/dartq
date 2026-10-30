@@ -11,7 +11,7 @@
 //! the #2880 faces), so these rows are pinned straight from the upstream
 //! semantics.
 
-use super::collector::{latest_features, scan_ok, Collector};
+use super::collector::{Collector, latest_features, scan_ok};
 use crate::parser::Parser;
 
 /// One expected oracle row, source-position based. `line`/`column` are the

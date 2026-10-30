@@ -150,10 +150,17 @@ pub enum DirectiveKind {
 /// pkg/analyzer/lib/src/context/context_locator.dart `_createContextRoots`:
 /// a locally different packages file splits the root), so a cross-package
 /// name visible only in a SIBLING's universe stays undefined here — the
-/// flat union would resolve it. Canonical-URI spelling stays flat (the
-/// `lib_dirs` scan): every nested root is an entry of this table (the
-/// assembly's nested-root extension), so `package:` spellings match what
-/// the owning context's own map produces.
+/// flat union would resolve it.
+///
+/// Context-root discovery rides two feeds: the merged config's own entries
+/// AND the assembly's discovered-roots list ([`Self::new_with_context_roots`])
+/// — the merge's one-identity-per-name dedup can drop a same-named sibling
+/// root's whole entry set, yet the oracle still gives that directory its own
+/// context. Canonical-URI spelling mirrors the split: a file under a nested
+/// root spells through that context's own package map (a same-named sibling
+/// would otherwise collapse to `file://` or, worse, a `package:` name the
+/// containing context cannot even resolve), and a file outside every
+/// context spells through the flat `lib_dirs` scan exactly as before.
 ///
 /// Root/lib-dir resolution is [`PackageConfig::resolve`], dartq-pub's
 /// single shared face — duplicate names floor the whole config at parse,
@@ -188,8 +195,12 @@ pub struct PackageTable {
     root_universe: Option<ContextUniverse>,
     /// Nested self-resolved context roots, deepest first: the canonical
     /// package root and the universe its own `package_config.json`
-    /// materializes. Bounded by the config entry count — discovery reads
-    /// one file per entry root and walks no directories.
+    /// materializes. Two discovery feeds union here: the config entries that
+    /// survived the assembly's merge (one file read per entry root, no
+    /// directory walk) and the assembly's own sibling-root list — which
+    /// also carries the roots whose entries the merge's one-identity-per-
+    /// name dedup dropped (chunked conformance floors run many same-named
+    /// sibling roots; the dropped roots are contexts all the same).
     contexts: Vec<(PathBuf, ContextUniverse)>,
 }
 
@@ -220,6 +231,25 @@ impl PackageTable {
     /// Duplicate names never reach here: dartq-pub floors the whole config
     /// at parse on the first repeat.
     pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
+        Self::new_with_context_roots(config, config_dir, &[])
+    }
+
+    /// [`Self::new`] plus the assembly's discovered sibling context roots:
+    /// canonical directories the nested-root walk identified as separate
+    /// context roots (own `pubspec.yaml` + own `.dart_tool/package_config.
+    /// json`). The merged config keeps only one entry per name, so a
+    /// same-named sibling root never survives as an entry — the walk's list
+    /// is the only place every root still exists, and each gets its own
+    /// [`ContextUniverse`] exactly like an entry-discovered one.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::new`].
+    pub fn new_with_context_roots(
+        config: &PackageConfig,
+        config_dir: &Path,
+        context_roots: &[PathBuf],
+    ) -> Result<Self, PubError> {
         let resolved = config.resolve(config_dir)?;
         let mut lib_dirs: Vec<(PathBuf, Box<str>)> = Vec::new();
         for package in &resolved {
@@ -263,32 +293,55 @@ impl PackageTable {
         // have landed (every export-forwarded name reporting undefined).
         // The context root itself needs no context: the root universe IS
         // its map.
+        // A nested config that exists but cannot back a universe is that
+        // context's `Packages.empty` floor: every `package:` URI from under
+        // the root stays unresolved — the oracle's parse-failure catch-all
+        // (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/context/packages.dart
+        // `parsePackageConfigJsonFile`), never a fall back to this table's
+        // universe.
+        fn context_universe(root: &Path) -> ContextUniverse {
+            let nested_dir = root.join(".dart_tool");
+            std::fs::read_to_string(nested_dir.join("package_config.json"))
+                .ok()
+                .and_then(|text| PackageConfig::parse(&text).ok())
+                .and_then(|nested| nested.resolve(&nested_dir).ok())
+                .map_or_else(
+                    || ContextUniverse::empty(root.to_path_buf()),
+                    |entries| ContextUniverse::new(&entries, root.to_path_buf()),
+                )
+        }
         let mut contexts: Vec<(PathBuf, ContextUniverse)> = Vec::new();
         for package in &resolved {
             let root = canonical_dir(&package.root);
             if root == workspace_root || !root.strip_prefix(&workspace_root).is_ok() {
                 continue;
             }
-            let nested_dir = root.join(".dart_tool");
-            let nested_config = nested_dir.join("package_config.json");
-            if !root.join("pubspec.yaml").is_file() || !nested_config.is_file() {
+            if !root.join("pubspec.yaml").is_file()
+                || !root.join(".dart_tool/package_config.json").is_file()
+            {
                 continue;
             }
-            // A nested config that exists but cannot back a universe is that
-            // context's `Packages.empty` floor: every `package:` URI from
-            // under the root stays unresolved — the oracle's parse-failure
-            // catch-all (upstream Dart SDK source,
-            // pkg/analyzer/lib/src/context/packages.dart
-            // `parsePackageConfigJsonFile`), never a fall back to this
-            // table's universe.
-            let universe = std::fs::read_to_string(&nested_config)
-                .ok()
-                .and_then(|text| PackageConfig::parse(&text).ok())
-                .and_then(|nested| nested.resolve(&nested_dir).ok())
-                .map_or_else(
-                    || ContextUniverse::empty(root.clone()),
-                    |entries| ContextUniverse::new(&entries, root.clone()),
-                );
+            let universe = context_universe(&root);
+            contexts.push((root, universe));
+        }
+        // The assembly's discovered roots union in: the merge's name dedup
+        // can drop a sibling root's whole entry set, so the scan above never
+        // sees it — but the oracle still gives the directory its own
+        // context. Same trigger (the walk already checked both files exist),
+        // same universe read chain, same strict-inside gate; a root the scan
+        // already built is skipped on its canonical path.
+        for extra in context_roots {
+            let root = normalize(extra);
+            if root == workspace_root
+                || !root.strip_prefix(&workspace_root).is_ok()
+                || !root.join("pubspec.yaml").is_file()
+                || !root.join(".dart_tool/package_config.json").is_file()
+                || contexts.iter().any(|(known, _)| *known == root)
+            {
+                continue;
+            }
+            let universe = context_universe(&root);
             contexts.push((root, universe));
         }
         if contexts.is_empty() {
@@ -349,11 +402,18 @@ impl PackageTable {
         if self.contexts.is_empty() {
             return None;
         }
+        self.context_for(container).or(self.root_universe.as_ref())
+    }
+
+    /// The deepest nested context root containing `path`, if any — the
+    /// containing-context face spelling consults. A linear scan over the
+    /// depth-sorted roots: no allocation, and the context count is bounded
+    /// by the discovered nested roots.
+    fn context_for(&self, path: &Path) -> Option<&ContextUniverse> {
         self.contexts
             .iter()
-            .find(|(root, _)| container.strip_prefix(root).is_ok())
+            .find(|(root, _)| path.strip_prefix(root).is_ok())
             .map(|(_, universe)| universe)
-            .or(self.root_universe.as_ref())
     }
 }
 
@@ -365,7 +425,14 @@ impl PackageTable {
 /// its own dependency closure, never a workspace-global table.
 #[derive(Debug)]
 struct ContextUniverse {
-    lib_dirs: FxHashMap<Box<str>, PathBuf>,
+    /// Lib dirs with their package names, depth-sorted (deepest first) —
+    /// the spelling face's prefix-scan index, in the flat table's
+    /// `lib_dirs` shape and under the same deepest-first argument. One
+    /// owned copy serves both faces through `indices`.
+    dirs: Vec<(PathBuf, Box<str>)>,
+    /// Package name → position in `dirs`: the resolution face's O(1)
+    /// `lib_dir` lookup without a second copy of any dir.
+    indices: FxHashMap<Box<str>, usize>,
     workspace_root: PathBuf,
 }
 
@@ -377,16 +444,24 @@ impl ContextUniverse {
         entries: impl IntoIterator<Item = &'p ResolvedPackage>,
         workspace_root: PathBuf,
     ) -> Self {
+        let mut dirs: Vec<(PathBuf, Box<str>)> = entries
+            .into_iter()
+            .map(|package| {
+                (
+                    canonical_dir(&package.lib_dir),
+                    Box::from(package.name.as_str()),
+                )
+            })
+            .collect();
+        dirs.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.components().count()));
+        let indices = dirs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, name))| (name.clone(), index))
+            .collect();
         Self {
-            lib_dirs: entries
-                .into_iter()
-                .map(|package| {
-                    (
-                        Box::from(package.name.as_str()),
-                        canonical_dir(&package.lib_dir),
-                    )
-                })
-                .collect(),
+            dirs,
+            indices,
             workspace_root,
         }
     }
@@ -395,7 +470,8 @@ impl ContextUniverse {
     /// cannot be read, parsed, or resolved resolves nothing.
     fn empty(workspace_root: PathBuf) -> Self {
         Self {
-            lib_dirs: FxHashMap::default(),
+            dirs: Vec::new(),
+            indices: FxHashMap::default(),
             workspace_root,
         }
     }
@@ -403,7 +479,23 @@ impl ContextUniverse {
     /// The lib dir of package `name`, or `None` for a package outside this
     /// context's universe.
     fn lib_dir(&self, name: &str) -> Option<&Path> {
-        self.lib_dirs.get(name).map(PathBuf::as_path)
+        let index = *self.indices.get(name)?;
+        Some(self.dirs[index].0.as_path())
+    }
+
+    /// The package whose lib dir (deepest match) contains `path`, with the
+    /// lib-relative path — [`package_of`]'s scan over this context's own
+    /// universe.
+    fn package_of(&self, path: &Path) -> Option<(&str, String)> {
+        for (dir, package) in &self.dirs {
+            if let Ok(rest) = path.strip_prefix(dir) {
+                if rest.as_os_str().is_empty() {
+                    continue;
+                }
+                return Some((package.as_ref(), rest.to_string_lossy().into_owned()));
+            }
+        }
+        None
     }
 }
 
@@ -547,8 +639,23 @@ fn canonical_uri_memo(
 /// The pure spelling computation behind [`canonical_uri_memo`] and
 /// [`UriResolver::canonical_uri`]: `package:` inside a package lib dir
 /// (deepest match wins), `file://` otherwise.
+///
+/// The containing context's own universe spells first — the oracle gives
+/// every context root its own `PackageMapUriResolver`, so a file under a
+/// nested self-resolved root spells through that context's package map
+/// (and only that map: a miss inside a context is `file://`, never a fall
+/// through to a sibling universe). Outside every context the flat merged
+/// scan spells exactly as before — the common single-root shape keeps one
+/// `contexts`-is-empty check plus the flat scan, byte-identical.
 pub fn compose_canonical_uri(packages: &PackageTable, path: &Path) -> Box<str> {
-    if let Some((package, rel)) = package_of(packages, path) {
+    let spelled = match packages.context_for(path) {
+        Some(universe) => universe.package_of(path),
+        // Outside every context — including the common no-contexts shape,
+        // where the empty `find` short-circuits — the flat merged scan
+        // spells byte-identically.
+        None => package_of(packages, path),
+    };
+    if let Some((package, rel)) = spelled {
         Box::from(format!("package:{package}/{}", encode_uri_path(&rel)))
     } else {
         let text = path.to_string_lossy();

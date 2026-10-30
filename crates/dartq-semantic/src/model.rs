@@ -160,7 +160,7 @@ impl Ty {
                     // splice — inside a record shape it is the only way the
                     // slot exists, so the display takes the oracle's name
                     // (`(int, InvalidType)`, the official `getDisplayString`).
-                    text.push_str(&render_record_field(*ty, strings, args));
+                    text.push_str(&render_slot(*ty, strings, args));
                 }
                 if !shape.named.is_empty() {
                     if !first {
@@ -173,7 +173,7 @@ impl Ty {
                         if index > 0 {
                             text.push_str(", ");
                         }
-                        text.push_str(&render_record_field(*ty, strings, args));
+                        text.push_str(&render_slot(*ty, strings, args));
                         text.push(' ');
                         text.push_str(strings.resolve(*name));
                     }
@@ -190,18 +190,40 @@ impl Ty {
                 text
             }
             Ty::Function { shape, nullable } => {
-                // The official `FunctionType` display: `T Function(...)`,
-                // the type-parameter group rides uncaptured (the shape
-                // carries the count, not the names — the count is hashed
-                // and persisted, the display under-reports it).
+                // The official `FunctionType` display (`T Function(...)`,
+                // `display_string_builder.dart` `writeFunctionType`): the
+                // signature's own type-parameter group rides verbatim
+                // between `Function` and the formal list — each parameter
+                // its name, then ` extends bound` only when written
+                // (`TypeParameterElementImpl.appendTo`). A count-only
+                // shape (no names recorded) renders without the group —
+                // the additive under-report.
                 let shape = args.function_shape(shape);
                 let mut text = shape.return_ty.render(strings, args);
-                text.push_str(" Function(");
+                text.push_str(" Function");
+                if !shape.type_params_named.is_empty() {
+                    text.push('<');
+                    for (index, (name, bound)) in shape.type_params_named.iter().enumerate() {
+                        if index > 0 {
+                            text.push_str(", ");
+                        }
+                        text.push_str(strings.resolve(*name));
+                        if let Some(bound) = bound {
+                            text.push_str(" extends ");
+                            // A recovered invalid bound is the oracle's
+                            // `InvalidType` (`writeInvalidType`), the same
+                            // splice spelling a record hole takes.
+                            text.push_str(&render_slot(*bound, strings, args));
+                        }
+                    }
+                    text.push('>');
+                }
+                text.push('(');
                 for (index, ty) in shape.positional.iter().enumerate() {
                     if index > 0 {
                         text.push_str(", ");
                     }
-                    text.push_str(&render_record_field(*ty, strings, args));
+                    text.push_str(&render_slot(*ty, strings, args));
                 }
                 if !shape.named.is_empty() {
                     if !shape.positional.is_empty() {
@@ -214,7 +236,7 @@ impl Ty {
                         if index > 0 {
                             text.push_str(", ");
                         }
-                        text.push_str(&render_record_field(*ty, strings, args));
+                        text.push_str(&render_slot(*ty, strings, args));
                         text.push(' ');
                         text.push_str(strings.resolve(*name));
                     }
@@ -252,10 +274,11 @@ impl Ty {
     }
 }
 
-/// One record field's display: the recovered comma hole is the analyzer's
-/// `InvalidType` splice and renders under its own name (`(int,
-/// InvalidType)`); every other field renders its ordinary shape.
-fn render_record_field(ty: Ty, strings: &StringTable, args: &ArgPool) -> String {
+/// One embedded type slot's display — a record field or a function-shape
+/// bound: the recovered comma hole is the analyzer's `InvalidType` splice
+/// and renders under its own name (`(int, InvalidType)`, `extends
+/// InvalidType`); every other slot renders its ordinary shape.
+fn render_slot(ty: Ty, strings: &StringTable, args: &ArgPool) -> String {
     match ty {
         Ty::Unknown => "InvalidType".to_string(),
         _ => ty.render(strings, args),
@@ -516,6 +539,21 @@ impl FnShapeId {
 pub struct FnShape {
     /// The type-parameter count (`<T, U>` group).
     pub type_params: u16,
+    /// The signature's own type parameters as written (`<T, U extends B>`
+    /// — name + written bound, declaration order), the display column the
+    /// official `FunctionType` display spells (`display_string_builder.dart`
+    /// `writeFunctionType` → `_writeTypeParameters`, each parameter its
+    /// name plus ` extends bound`). Participates in shape identity — a
+    /// distinct spelling is a distinct slot, so a render never borrows
+    /// another annotation's names; the decision drift is under-report only
+    /// (alpha-different spellings fall from the equal-shape cut into the
+    /// structural walk, which proves or suppresses, never invents a
+    /// rejection). An unbounded parameter carries `None` (the implicit
+    /// `dynamic` bound, never spelled). Empty exactly when the shape came
+    /// from a count-only producer ([`ArgPool::function`], a pre-#2878
+    /// capture or payload) — the display then under-reports the group, the
+    /// additive posture.
+    pub type_params_named: Box<[(StringId, Option<Ty>)]>,
     /// The declared return type ([`Ty::Dynamic`] for a bare
     /// `Function(...)` head — the implicit return).
     pub return_ty: Ty,
@@ -588,6 +626,7 @@ impl Default for ArgPool {
             record_at: FxHashMap::default(),
             functions: vec![FnShape {
                 type_params: 0,
+                type_params_named: Box::new([]),
                 return_ty: Ty::Dynamic,
                 positional: Box::new([]),
                 named: Box::new([]),
@@ -701,7 +740,10 @@ impl ArgPool {
 
     /// Interns one function-type shape canonically (named formals sort by
     /// name before hashing) and returns the function type — with its `?`
-    /// when `nullable`.
+    /// when `nullable`. The count-only producer: the `<...>` group rides
+    /// as its size, the names and bounds are not recorded and the display
+    /// under-reports the group. The with-names producer is
+    /// [`ArgPool::function_generic`].
     pub fn function(
         &mut self,
         type_params: u16,
@@ -711,7 +753,32 @@ impl ArgPool {
         nullable: bool,
     ) -> Ty {
         Ty::Function {
-            shape: self.intern_function(type_params, return_ty, positional, named),
+            shape: self.intern_function(type_params, &[], return_ty, positional, named),
+            nullable,
+        }
+    }
+
+    /// Interns one function-type shape with its own type parameters as
+    /// written (`void Function<T extends B>(...)`) — the display carries
+    /// the group verbatim, the official `FunctionType` display form. The
+    /// count derives from the slice; every written-annotation producer
+    /// routes here.
+    pub fn function_generic(
+        &mut self,
+        type_params: &[(StringId, Option<Ty>)],
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty)],
+        nullable: bool,
+    ) -> Ty {
+        Ty::Function {
+            shape: self.intern_function(
+                type_params.len().min(u16::MAX as usize) as u16,
+                type_params,
+                return_ty,
+                positional,
+                named,
+            ),
             nullable,
         }
     }
@@ -720,15 +787,23 @@ impl ArgPool {
     /// degenerate `dynamic Function()` is the reserved slot `0` and never
     /// interns. Named formals canonicalize by name before hashing — the
     /// named-formal set is type identity, so `({int a})` and `({int b})`
-    /// are distinct shapes while reorders share one slot.
+    /// are distinct shapes while reorders share one slot. `names` rides
+    /// the shape's own type-parameter group verbatim (empty for the
+    /// count-only producer, [`ArgPool::function`]) and joins identity, so
+    /// distinct spellings never merge.
     pub(crate) fn intern_function(
         &mut self,
         type_params: u16,
+        names: &[(StringId, Option<Ty>)],
         return_ty: Ty,
         positional: &[Ty],
         named: &[(StringId, Ty)],
     ) -> FnShapeId {
-        if type_params == 0 && return_ty == Ty::Dynamic && positional.is_empty() && named.is_empty()
+        if type_params == 0
+            && names.is_empty()
+            && return_ty == Ty::Dynamic
+            && positional.is_empty()
+            && named.is_empty()
         {
             return FnShapeId::EMPTY;
         }
@@ -740,11 +815,12 @@ impl ArgPool {
             sorted.sort_by_key(|(name, _)| *name);
             sorted.as_slice()
         };
-        let hash = hash_function(type_params, return_ty, positional, named);
+        let hash = hash_function(type_params, names, return_ty, positional, named);
         if let Some(slots) = self.function_at.get(&hash) {
             for &slot in slots {
                 let shape = &self.functions[slot as usize];
                 if shape.type_params == type_params
+                    && &*shape.type_params_named == names
                     && shape.return_ty == return_ty
                     && &*shape.positional == positional
                     && &*shape.named == named
@@ -756,6 +832,7 @@ impl ArgPool {
         let slot = saturate_slot_u32(self.functions.len());
         self.functions.push(FnShape {
             type_params,
+            type_params_named: Box::from(names),
             return_ty,
             positional: Box::from(positional),
             named: Box::from(named),
@@ -811,17 +888,23 @@ fn hash_record(positional: &[Ty], named: &[(StringId, Ty)]) -> u64 {
     hasher.finish()
 }
 
-/// The canonical-shape hash of one function type: the parameter count, the
-/// return type, positional children in order, then the (already sorted)
-/// named pairs. Children are canonical, so the id fold needs no recursion.
+/// The canonical-shape hash of one function type: the parameter count,
+/// the signature's own type-parameter group, the return type, positional
+/// children in order, then the (already sorted) named pairs. Children are
+/// canonical, so the id fold needs no recursion.
 fn hash_function(
     type_params: u16,
+    names: &[(StringId, Option<Ty>)],
     return_ty: Ty,
     positional: &[Ty],
     named: &[(StringId, Ty)],
 ) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     type_params.hash(&mut hasher);
+    for (name, bound) in names {
+        name.hash(&mut hasher);
+        bound.hash(&mut hasher);
+    }
     return_ty.hash(&mut hasher);
     positional.hash(&mut hasher);
     for (name, ty) in named {
@@ -1795,6 +1878,14 @@ pub struct AugTarget {
     pub is_const: bool,
     /// A factory (`factory` head).
     pub is_factory: bool,
+    /// The fragment's completeness bit (upstream `*FragmentImpl.isComplete`)
+    /// — the `declaration_already_complete` family's
+    /// `nearestPrecedingCompleteFragment` walk. Captured for the executable
+    /// target kinds (a constructor's `nonEmptyBody || initializers ||
+    /// initializing formals || redirect`; an executable's `external ||
+    /// nonEmptyBody`; a variable-induced accessor's `external ||
+    /// !abstract`). Container rows always carry `false`.
+    pub is_complete: bool,
 }
 
 /// One formal parameter of an `augment` declaration: the written facts the
@@ -1922,6 +2013,51 @@ pub struct AugmentDecl {
     pub const_kw: Option<SourceRange>,
     /// The `factory` keyword's span (constructor rows).
     pub factory_kw: Option<SourceRange>,
+    /// The fragment is complete (upstream `*FragmentImpl.isComplete`): an
+    /// executable reports `external || nonEmptyBody`; a constructor adds
+    /// initializers/redirects/initializing formals; a variable-induced
+    /// accessor reports `external || !abstract`. Feeds the
+    /// `declaration_already_complete` family's `nearestPrecedingComplete`.
+    pub is_complete: bool,
+}
+
+/// One anonymous-method invocation captured at parse time (the
+/// anonymous-methods experiment's member, `receiver.{ ... }` /
+/// `receiver.=> e` / `receiver.(p) { ... }`): the raw facts the diagnose
+/// pass's `anonymous_method_wrong_parameter_*` verdicts re-derive from.
+/// Upstream decision order (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/fasta/ast_builder.dart:918-929` shape check, then
+/// `pkg/analyzer/lib/src/generated/resolver.dart:2063-2079` type check):
+/// a written parameter list must be exactly one required positional
+/// parameter, and that parameter's written type must accept the receiver's
+/// static type — a failed shape check drops the list upstream, so the type
+/// check never sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnonMethodInvocation {
+    /// The `.`/`?.`/`..`/`?..` punctuation's span (the invocation's begin
+    /// event token; the receiver expression ends here).
+    pub punctuation: SourceRange,
+    /// The punctuation was null-aware (`?.`/`?..`): the receiver's static
+    /// type promotes to non-null before the assignability question
+    /// (`resolver.dart:1977-1982`, `promoteToNonNull`).
+    pub null_aware: bool,
+    /// The written parameter list's `(` through `)` spans; `None` = the
+    /// implicit form (`handle_implicit_formal_parameters`) — no list, no
+    /// shape constraint.
+    pub parens: Option<(SourceRange, SourceRange)>,
+    /// The list's declared parameter count (`end_formal_parameters`).
+    pub param_count: u16,
+    /// The first formal was named (`{...}` group).
+    pub first_named: bool,
+    /// The first formal was optional (`[...]` group or named).
+    pub first_optional: bool,
+    /// The first formal's written type annotation; `None` = unannotated
+    /// (the receiver's type flows in upstream — never a mismatch) or a
+    /// function-typed suffix formal (upstream skips the check for those).
+    /// The paired range is the annotation's span — the
+    /// `anonymous_method_wrong_parameter_type` anchor (`resolver.dart`
+    /// reports at `declaredParameterType`).
+    pub param_ty: Option<(Ty, SourceRange)>,
 }
 
 /// Everything one compilation unit contributes to the semantic model.
@@ -1948,6 +2084,11 @@ pub struct FileElements {
     /// faces, variable finality, per-constructor const/factory, named mixin
     /// applications), in source order.
     pub(crate) decl_kinds: Box<[AugTarget]>,
+    /// Every anonymous-method invocation of the unit, in end-event order
+    /// (the `anonymous_method_wrong_parameter_*` capture face). Nested
+    /// members close innermost-first, so the order is not source order by
+    /// offset; the emission pass sorts its rows before the merge.
+    pub(crate) anon_methods: Box<[AnonMethodInvocation]>,
     /// The top-level const variables whose initializer is one bare const
     /// creation, by name (the cross-library instance-equality face,
     /// [`ConstCreationFace`]).
@@ -2053,6 +2194,15 @@ impl FileElements {
     #[must_use]
     pub fn decl_kinds(&self) -> &[AugTarget] {
         &self.decl_kinds
+    }
+
+    /// Every anonymous-method invocation captured in this unit (the
+    /// anonymous-methods experiment's `anonymous_method_wrong_parameter_*`
+    /// capture face; empty for models restored from a payload written
+    /// before the face shipped — an under-report).
+    #[must_use]
+    pub fn anon_methods(&self) -> &[AnonMethodInvocation] {
+        &self.anon_methods
     }
 
     /// The unit's canonical argument pool ([`Ty::Named`] slots index into

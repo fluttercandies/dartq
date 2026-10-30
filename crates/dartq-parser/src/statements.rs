@@ -1662,6 +1662,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if self.peek_kind() != TokenKind::CloseParen {
             let mut current_comma = None;
             if self.peek_kind() == TokenKind::Comma {
+                // The real-comma fact: the ensure below fills the trace slot
+                // (the engine's stack-trace classification rides the flip). A
+                // synthetic comma is the single-parameter recovery — the
+                // official formals list gains no second slot — and never
+                // flips.
+                self.listener.handle_catch_trace_parameter();
                 current_comma = Some(self.peek_span());
                 self.cursor.advance();
             } else {

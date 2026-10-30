@@ -101,6 +101,7 @@ fn analyze(main: &str, other: &str) -> (FileId, Vec<Diagnostic>) {
         packages,
         pub_config: Arc::clone(&config),
         config_dir,
+        context_roots: Vec::new(),
         semdiag: Some(dartq_engine::semdiag::diagnoser()),
         target: dartq_engine::DEFAULT_TARGET.to_owned(),
         declared_variables: rustc_hash::FxHashMap::default(),

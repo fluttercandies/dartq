@@ -519,10 +519,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     } else if covariant.is_some() {
                         self.report(msg::conflicting_modifiers("const", "covariant"), t);
                     } else {
-                        let is_var = var_final_or_const
-                            .is_some_and(|v| self.cursor.lexeme(v.id) == "var");
-                        let is_final = var_final_or_const
-                            .is_some_and(|v| self.cursor.lexeme(v.id) == "final");
+                        let is_var =
+                            var_final_or_const.is_some_and(|v| self.cursor.lexeme(v.id) == "var");
+                        let is_final =
+                            var_final_or_const.is_some_and(|v| self.cursor.lexeme(v.id) == "final");
                         if is_final {
                             self.report(msg::const_and_final(), t);
                         } else if is_var {

@@ -768,6 +768,11 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// non-keyword junk does too ("consume in doubt", :39-42 — the rewriter
     /// inserts before the token, keeping it in the stream); a reserved word
     /// itself becomes the name after the report (:44 `return identifier`).
+    /// Every route — the synthetic ones included — fires
+    /// `handleIdentifier(CatchParameter)`: the rewriter's synthetic
+    /// identifier exists "to satisfy listeners", and the slot's event (a
+    /// real name or the nameless synthetic) is what the engine's catch
+    /// classification reads.
     pub(crate) fn ensure_catch_parameter(&mut self) -> TokenSpan {
         let peek = self.cursor.peek();
         if is_identifier(peek.kind) {
@@ -799,7 +804,10 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
         self.cursor.advance();
-        self.span_of(id)
+        let span = self.span_of(id);
+        self.listener
+            .handle_identifier(span, crate::listener::IdentifierContext::CatchParameter);
+        span
     }
 
     /// Official `ensureCloseParen` (`parser_impl.dart:5028`): consumes `)`

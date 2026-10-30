@@ -1919,6 +1919,9 @@ fn assemble_contexts(
                 packages: base.packages.clone(),
                 pub_config: std::sync::Arc::clone(&base.pub_config),
                 config_dir: base.config_dir.clone(),
+                // The fork shares the base resolution, so it shares the
+                // base's discovered context roots too.
+                context_roots: base.context_roots.clone(),
                 semdiag: base.semdiag.clone(),
                 target: context.target.map_or_else(
                     || dartq_engine::DEFAULT_TARGET.to_owned(),

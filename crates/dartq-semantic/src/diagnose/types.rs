@@ -2290,6 +2290,12 @@ pub(crate) struct Engine<'a> {
     pub(crate) group_late: bool,
     pub(crate) group_final: bool,
     pub(crate) group_const: bool,
+    /// #2867: the open group's `augment` bit — an `augment` field declares
+    /// no new field, so the `final_not_initialized` /
+    /// `not_initialized_non_nullable_variable` latches never arm on it
+    /// (the oracle's `checkElement` walks the field element the augment
+    /// merges into; the augment fragment owns no initializer obligation).
+    pub(crate) group_augment: bool,
     /// #1314 FAM10: the diagnosing file's own executables' type parameters
     /// with their written bounds, keyed by declaring name (`void f<T
     /// extends num>(T t)` → `[(T, num)]`). The argument-check
@@ -2358,7 +2364,7 @@ pub(crate) struct Engine<'a> {
     /// Explicit type arguments of pending calls, keyed by the callee's row
     /// index (pushed at the group's close, consumed by the argument check
     /// or the tear-off/implicit-creation faces).
-    pub(crate) call_type_args: Vec<(u32, Box<[Ty]>)>,
+    pub(crate) call_type_args: Vec<(u32, CallTypeArgs)>,
     /// The send-close upward inference's solved parameters, keyed by the
     /// callee row's range offset (stable while row indexes churn under the
     /// folds): a generic call's typed arguments unify against the callee's
@@ -2376,6 +2382,28 @@ pub(crate) struct Engine<'a> {
     /// (a switch over the call then answers the always-exhaustive
     /// verdict). Single slot, taken by the listener at the same event.
     pub(crate) send_return_staging: Option<(u32, Ty)>,
+    /// The last completed send's genuinely-unresolved bare head beside its
+    /// callee row's range offset (#2860): `consume_send` records the pair
+    /// when the send's return reads `Unknown` AND the head resolves nowhere
+    /// (the same universe the resolved back-end's `call_head_unresolved`
+    /// certifies — no registered container, no non-container declaration,
+    /// no invokable member, no core facade). The listener translates the
+    /// slot into the flow recorder's `stage_call_result` as the head's own
+    /// interned name — the flow lattice's `InvalidType` stand-in (a
+    /// nowhere-resolving spelling maps to the invalid face, every relation
+    /// over it vacuous) — so a switch whose scrutinee is the call answers
+    /// the vacuous-cover chain instead of the undecidable unknown. Single
+    /// slot, taken by the listener at the same event. A raw `Unknown`
+    /// return from an SDK-static or local modeling gap never takes the
+    /// slot — the over-deading guard keeps those on the unknown face.
+    pub(crate) send_invalid_staging: Option<(u32, StringId)>,
+    /// The invokable-member spelling set (`Engine::invokable_member_spelling`'s
+    /// verdict cache): the core member tables' spellings plus this file's own
+    /// container members, interned once on the first unresolved-head send —
+    /// the same name-keyed over-approximation the snapshot's invokable face
+    /// carries, rebuilt from the faces this engine already holds. Empty for
+    /// a run whose sends all resolve.
+    pub(crate) member_spellings: std::cell::OnceCell<FxHashSet<StringId>>,
     /// The numeric-call refinement's return (`e1.clamp(e2, e3)`,
     /// `e1.remainder(e2)`), keyed by the callee row's range offset —
     /// computed at the argument group's close where the typed arguments
@@ -3099,6 +3127,26 @@ pub(crate) struct Engine<'a> {
     /// Catch parameters seen in the clause in flight (0 = none, 1 =
     /// exception, 2 = exception + stack trace).
     pub(crate) catch_params: u8,
+    /// The clause in flight's parameter slot: `false` fills the exception
+    /// slot, `true` the stack-trace slot. The parser flips it on the written
+    /// comma (`handle_catch_trace_parameter`); a synthetic comma is the
+    /// single-parameter recovery and never flips — the slot a parameter
+    /// fills is the parser's comma fact, never the arrival order of the
+    /// events (`catch (var e)` recovers its exception name synthetically,
+    /// so the real `e` sits in the trace ensure yet stays the exception).
+    pub(crate) catch_trace_slot: bool,
+    /// The open catch re-parse's formal-list depth (latched at
+    /// `begin_formal_parameters` with [`dartq_parser::MemberKind::Catch`]),
+    /// gating the ordinal count to the group's own list against nested
+    /// function-typed formals.
+    pub(crate) catch_formal_group: Option<u32>,
+    /// The catch re-parse's first/second real formal-name rows — the
+    /// official AST's exception/trace faces (`handleCatchBlock`:
+    /// exception = `catchParameters[0].name`, stack trace =
+    /// `catchParameters[1].name`). Consumed by
+    /// [`Engine::reconcile_catch_slots`] at the list's close.
+    pub(crate) catch_ord_exc: Option<usize>,
+    pub(crate) catch_ord_trace: Option<usize>,
     /// Per open try, the completed catch-clause facts (the
     /// `_CatchClausesVerifier` state).
     pub(crate) try_clauses: Vec<Vec<CatchClauseFact>>,
@@ -3930,11 +3978,27 @@ pub(crate) enum FnFormalSection {
 /// for the argument check's explicit grounding.
 #[derive(Default)]
 pub(crate) struct CallArgsCapture {
-    /// The completed member types.
-    pub(crate) members: Vec<Ty>,
+    /// The completed member types with their written spans (each member's
+    /// annotation range — the bounds face's per-argument anchor).
+    pub(crate) members: Vec<(Ty, SourceRange)>,
     /// The leaf head awaiting its re-fired completion (same name at the
     /// same offset replaces instead of pushing a second member).
     pub(crate) pending: Option<(StringId, u32)>,
+    /// The group's own `type_arg_depth` (latched at the open): only
+    /// completions at this depth are members — a member's own nested
+    /// group (`List<int>` inside `f<List<int>>(...)`) completes at deeper
+    /// depths and its inner heads must never join the member list.
+    pub(crate) depth: u32,
+}
+
+/// The latched explicit type arguments of one call: the written types and
+/// each one's own annotation span.
+#[derive(Clone)]
+pub(crate) struct CallTypeArgs {
+    /// The written types, group order.
+    pub(crate) tys: Box<[Ty]>,
+    /// Each type's written span, aligned with [`Self::tys`].
+    pub(crate) spans: Box<[SourceRange]>,
 }
 
 /// One container's captured header: its type parameters (name, declared
@@ -5505,6 +5569,7 @@ mod boundary_projection {
             .intern_record(&[Ty::named(strings.intern("int"))], &[]);
         let function = boundary.args.borrow_mut().intern_function(
             0,
+            &[],
             Ty::named(strings.intern("int")),
             &[],
             &[],

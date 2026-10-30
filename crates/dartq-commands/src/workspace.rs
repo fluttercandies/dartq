@@ -325,7 +325,7 @@ pub fn engine_config_with_overrides_phased(
     };
     // The stale-config advisory rides `package_assembly`; the engine-backed
     // faces surface it through their output plumbing.
-    let (packages, config, config_dir, dir, stale_advisory) = package_assembly_with(
+    let (packages, config, config_dir, dir, stale_advisory, context_roots) = package_assembly_with(
         dir,
         overrides.packages.as_deref(),
         Some(&sdk_snapshot.dart.version),
@@ -356,6 +356,7 @@ pub fn engine_config_with_overrides_phased(
             packages,
             pub_config: config,
             config_dir,
+            context_roots,
             // The semantic families are part of the analyze contract (#236):
             // `undefined_*` / `wrong_number_of_*` ride the default diagnoser.
             semdiag: Some(semdiag::diagnoser()),
@@ -447,14 +448,16 @@ pub fn embedder_lib_dir(config: &PackageConfig, config_dir: &Path) -> Option<Pat
 /// [`WorkspaceError`] when the package directory or the pub faces are
 /// unusable.
 /// One assembled workspace face: the package table, the resolution config,
-/// the workspace root, the resolved pubspec path, and any non-fatal pub
-/// advisory.
+/// the workspace root, the resolved pubspec path, any non-fatal pub
+/// advisory, and the discovered nested context roots (canonical; empty when
+/// no nested self-resolved package exists).
 pub(crate) type WorkspaceAssembly = (
     PackageTable,
     Arc<PackageConfig>,
     PathBuf,
     PathBuf,
     Option<WorkspaceAdvisory>,
+    Vec<PathBuf>,
 );
 
 pub(crate) fn package_assembly(dir: &Path) -> Result<WorkspaceAssembly, WorkspaceError> {
@@ -488,8 +491,9 @@ pub(crate) fn package_assembly_with(
             config_dir,
             dir,
             advisory,
+            context_roots,
             ..
-        } => Ok((packages, config, config_dir, dir, advisory)),
+        } => Ok((packages, config, config_dir, dir, advisory, context_roots)),
     }
 }
 
@@ -523,7 +527,7 @@ pub(crate) type StrictAssembly = (
 /// message byte-identical to [`load_workspace_faces`]'s.
 pub(crate) fn package_assembly_strict(dir: &Path) -> Result<StrictAssembly, WorkspaceError> {
     match assemble(dir, None, None)? {
-        AssemblyBody::Floor((_, _, config_dir, _, advisory)) => {
+        AssemblyBody::Floor((_, _, config_dir, _, advisory, _)) => {
             Err(WorkspaceError(match advisory {
                 Some(WorkspaceAdvisory::MissingConfig(config_path)) => format!(
                     "no package config at {} (run `dart pub get`)",
@@ -569,6 +573,10 @@ enum AssemblyBody {
         config_dir: PathBuf,
         dir: PathBuf,
         advisory: Option<WorkspaceAdvisory>,
+        /// The nested-root walk's discovered context roots (canonical) —
+        /// threaded to the URI table, which builds one package universe per
+        /// root. Empty when no nested self-resolved package exists.
+        context_roots: Vec<PathBuf>,
     },
 }
 
@@ -687,8 +695,8 @@ fn assemble(
     // so discovery is skipped exactly there. The freshness face re-reads
     // the on-disk config, so the in-memory extension never moves the
     // advisory.
-    let config = if packages_overridden {
-        config
+    let (config, context_roots) = if packages_overridden {
+        (config, Vec::new())
     } else {
         extend_config_with_nested_roots(config, &config_dir, &dir)
     };
@@ -764,6 +772,7 @@ fn assemble(
         config_dir,
         dir,
         advisory: stale_advisory,
+        context_roots,
     })
 }
 
@@ -800,13 +809,15 @@ fn no_root_posture(dir: &Path, packages_overridden: bool) -> Result<AssemblyBody
         // directory of independent case roots, each analyzed against its own
         // resolution). The single-context stand-in merges those resolutions
         // into the floor's config.
-        bare_assembly(dir).map(|(packages, config, config_dir, analyzed, advisory)| {
+        bare_assembly(dir).map(|(packages, config, config_dir, analyzed, advisory, _)| {
+            let (config, context_roots) = extend_config_with_nested_roots(config, &config_dir, dir);
             AssemblyBody::Floor((
                 packages,
-                extend_config_with_nested_roots(config, &config_dir, dir),
+                config,
                 config_dir,
                 analyzed,
                 advisory,
+                context_roots,
             ))
         })
     }
@@ -834,6 +845,7 @@ fn degraded_assembly(
         root.join(".dart_tool"),
         dir.to_path_buf(),
         Some(WorkspaceAdvisory::MissingConfig(config_path.to_path_buf())),
+        Vec::new(),
     ))
 }
 
@@ -861,6 +873,7 @@ fn corrupt_config_assembly(root: &Path, dir: &Path) -> Result<Assembly, Workspac
         root.join(".dart_tool"),
         dir.to_path_buf(),
         None,
+        Vec::new(),
     ))
 }
 
@@ -879,6 +892,7 @@ fn bare_assembly(dir: &Path) -> Result<Assembly, WorkspaceError> {
         Some(WorkspaceAdvisory::MissingConfig(
             dir.join(".dart_tool/package_config.json"),
         )),
+        Vec::new(),
     ))
 }
 
@@ -907,13 +921,17 @@ fn nearest_pubspec_dir(from: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The [`package_assembly`] tuple, named for the two floor helpers.
+/// The [`package_assembly`] tuple, named for the two floor helpers: the
+/// package table, the resolution config, the config directory, the analyzed
+/// dir, the advisory, and the discovered nested context roots (canonical;
+/// empty on the floors that never run the nested-root extension).
 type Assembly = (
     PackageTable,
     Arc<PackageConfig>,
     PathBuf,
     PathBuf,
     Option<WorkspaceAdvisory>,
+    Vec<PathBuf>,
 );
 
 /// Why [`load_workspace_faces`] failed, split on the face the two callers
@@ -1214,12 +1232,19 @@ const NESTED_ROOT_WALK_BUDGET: usize = 10_000;
 /// roots are, mirroring the locator's recursion; the walk stops at
 /// [`NESTED_ROOT_WALK_BUDGET`] directories.
 ///
-/// The common case — no nested roots — returns `config` unchanged.
+/// The common case — no nested roots — returns `config` unchanged with an
+/// empty root list.
+///
+/// The second tuple element is every discovered context root (canonical,
+/// normalized), whether its entries merged or were dropped by the
+/// one-identity-per-name dedup: the URI table builds one context universe
+/// per root, so a same-named sibling root the merge could not keep still
+/// governs its own subtree (the oracle splits each into its own context).
 fn extend_config_with_nested_roots(
     config: Arc<PackageConfig>,
     config_dir: &Path,
     dir: &Path,
-) -> Arc<PackageConfig> {
+) -> (Arc<PackageConfig>, Vec<PathBuf>) {
     let taken_names: BTreeSet<&str> = config
         .packages
         .iter()
@@ -1233,6 +1258,7 @@ fn extend_config_with_nested_roots(
         .collect();
 
     let mut entries = Vec::new();
+    let mut discovered_roots: Vec<PathBuf> = Vec::new();
     let mut added_roots: BTreeSet<PathBuf> = BTreeSet::new();
     let mut added_names: BTreeSet<String> = BTreeSet::new();
     let mut visited = 0usize;
@@ -1280,6 +1306,9 @@ fn extend_config_with_nested_roots(
         if taken_roots.contains(&target) || !added_roots.insert(target.clone()) {
             continue;
         }
+        // The root itself is a context root however its entries fare below:
+        // the URI table keys universes by root, not by merged entry.
+        discovered_roots.push(target.clone());
         let base = config_dir.parent().unwrap_or(config_dir);
         let nested_config_dir = target.join(".dart_tool");
         let nested_config = fs::read_to_string(nested_config_dir.join("package_config.json"))
@@ -1353,11 +1382,11 @@ fn extend_config_with_nested_roots(
         }
     }
     if entries.is_empty() {
-        return config;
+        return (config, discovered_roots);
     }
     let mut extended = (*config).clone();
     extended.packages.extend(entries);
-    Arc::new(extended)
+    (Arc::new(extended), discovered_roots)
 }
 
 /// The `rootUri` for a merged nested-config entry: a relative URI path from
@@ -1559,7 +1588,7 @@ mod tests {
 .expect("config");
 
         let root = root.canonicalize().expect("root");
-        let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
+        let (_, _, _, _, advisory, _) = package_assembly(&root).expect("assembly");
         let advisory = advisory.expect("stale");
         let WorkspaceAdvisory::Stale(stale) = &advisory else {
             panic!("stale advisory, got {advisory:?}")
@@ -1596,7 +1625,7 @@ mod tests {
         .expect("set mtime");
 
         let root = root.canonicalize().expect("root");
-        let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
+        let (_, _, _, _, advisory, _) = package_assembly(&root).expect("assembly");
         assert!(advisory.is_none(), "unexpected: {advisory:?}");
 
         fs::remove_dir_all(&root).ok();
@@ -1631,7 +1660,7 @@ mod tests {
         .expect("set mtime");
 
         let root = root.canonicalize().expect("root");
-        let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
+        let (_, _, _, _, advisory, _) = package_assembly(&root).expect("assembly");
         let advisory = advisory.expect("member finding");
         let WorkspaceAdvisory::Stale(stale) = &advisory else {
             panic!("stale advisory, got {advisory:?}")
@@ -1656,7 +1685,7 @@ mod tests {
 .expect("config");
 
         let root = root.canonicalize().expect("root");
-        let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
+        let (_, _, _, _, advisory, _) = package_assembly(&root).expect("assembly");
         assert_eq!(
             advisory.expect("stale").config_path(),
             root.join(".dart_tool/package_config.json")
@@ -1709,7 +1738,7 @@ mod tests {
             r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
         )
         .expect("config");
-        let (packages, _, config_dir, _, advisory) =
+        let (packages, _, config_dir, _, advisory, _) =
             package_assembly_with(&root, Some(&config), None).expect("override assembly");
         assert_eq!(config_dir, other, "the override's directory");
         assert!(packages.get("fixture").is_some(), "the override's entries");
@@ -1742,7 +1771,7 @@ mod tests {
         fs::create_dir_all(&bare).expect("bare dir");
 
         let floor = no_root_posture(&bare, false).expect("bare floor");
-        let AssemblyBody::Floor((_, _, _, _, advisory)) = floor else {
+        let AssemblyBody::Floor((_, _, _, _, advisory, _)) = floor else {
             panic!("bare floor, got a Resolved body")
         };
         assert!(
@@ -2077,6 +2106,15 @@ mod tests {
         // The duplicated self name goes to the alphabetically first root —
         // rebased against that root's own `.dart_tool/`, not the chunk root.
         assert_eq!(by_name["test"].root, normalize(&chunk.join("0")));
+        // BOTH discovered roots still reach the engine: the merged config
+        // cannot hold two `test` identities, so the URI table's per-context
+        // universes key off this root list — a dropped entry must not drop
+        // the context (the oracle splits each sibling into its own root).
+        assert_eq!(
+            config.context_roots,
+            vec![normalize(&chunk.join("0")), normalize(&chunk.join("1"))],
+            "every same-named sibling root threads through as a context root"
+        );
         // The floor's attribution face is unchanged: the identity table
         // stays bare; only the URI face joins the nested resolutions.
         assert!(
@@ -2205,7 +2243,7 @@ mod tests {
 .expect("override config");
 
         let root = root.canonicalize().expect("root");
-        let (packages, _, _, _, _) =
+        let (packages, _, _, _, _, _) =
             package_assembly_with(&root, Some(&override_config), None).expect("override assembly");
         let nested = packages
             .containing(&root.join("example/lib/main.dart"))

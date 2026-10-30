@@ -1902,7 +1902,10 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn named_function_expression() -> Message {
-        Message::new(NAMED_FUNCTION_EXPRESSION, "Function expressions can't be named.")
+        Message::new(
+            NAMED_FUNCTION_EXPRESSION,
+            "Function expressions can't be named.",
+        )
     }
 
     pub(crate) fn binary_operator_written_out(written: &str, operator: &str) -> Message {

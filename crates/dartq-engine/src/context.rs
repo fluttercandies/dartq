@@ -627,6 +627,7 @@ mod tests {
             packages: packages.clone(),
             pub_config: Arc::clone(config),
             config_dir: root.join(".dart_tool"),
+            context_roots: Vec::new(),
             semdiag: None,
             target: crate::DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),

@@ -167,6 +167,27 @@ pub enum SemanticCode {
     /// `Setters must declare exactly one required positional parameter.`
     /// (no arguments — `ParserErrorWithoutArguments`)
     WrongNumberOfParametersForSetter,
+    /// `An anonymous method with a parameter list must have exactly one
+    /// required, positional parameter.` (no arguments — a *syntactic* error
+    /// in the oracle: `type: syntacticError`,
+    /// `_fe_analyzer_shared/messages.yaml` `anonymousMethodWrongParameterList`,
+    /// fired from the pinned 3.13.7 `ast_builder.dart:918-929` when the
+    /// anonymous-method member's written parameter list is empty, plural,
+    /// or opens with a named/optional formal; the list drops there, so the
+    /// type-check row below never co-fires). The anonymous-methods
+    /// experiment's row — only reachable under the experiment flag, where
+    /// the parser fires the member events at all.
+    AnonymousMethodWrongParameterList,
+    /// `The receiver type '{0}' must be assignable to the formal parameter
+    /// type '{1}' in an anonymous method.` — the anonymous-methods
+    /// experiment's receiver check (`type: compileTimeError`,
+    /// `analyzer/messages.yaml` `anonymousMethodWrongParameterType`): the
+    /// surviving single required positional's written type must accept the
+    /// receiver's static type (null-aware punctuation promotes to non-null
+    /// first — `resolver.dart:1977-1982,2063-2079`). `{0}` is the
+    /// receiver's type, `{1}` the written parameter type; the anchor is the
+    /// written annotation.
+    AnonymousMethodWrongParameterType,
     /// `The type '{0}' is declared with {1} type parameters, but {2} type
     /// arguments were given.`
     WrongNumberOfTypeArguments,
@@ -217,6 +238,19 @@ pub enum SemanticCode {
     EnumWithoutConstants,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
+    /// `The integer literal is being used as a double, but can't be
+    /// represented as a 64-bit double without overflow or loss of
+    /// precision: '{0}'.` — an integer literal whose double context
+    /// (`analyzeIntLiteral`'s `convertToDouble`) types it `double` while
+    /// the value is not exactly representable as an IEEE 754 double
+    /// (`integerLiteralImpreciseAsDouble`, messages.yaml:9350-9356; the
+    /// informal-spec predicate is `IntegerLiteralImpl.isValidAsDouble`,
+    /// upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart,
+    /// fired from `_checkForOutOfRange`, error_verifier.dart). `{0}` is
+    /// the literal's lexeme, `-`-prefixed when it is the operand of a
+    /// unary minus (`immediatelyNegated`); the anchor is the literal
+    /// token, never the negation.
+    IntegerLiteralImpreciseAsDouble,
     /// `The member '{0}' can only be used within '{1}' or a template
     /// library.` — a member annotated `@visibleForTemplate`
     /// (package:angular_meta) referenced from another library
@@ -1569,6 +1603,12 @@ pub enum SemanticCode {
     /// (`parser_impl.dart:1453` reports it at the `augment` keyword); the
     /// capture log rides the merged output observably identically.
     TypedefAugmentation,
+    /// The shared `declaration_already_complete` code — four upstream
+    /// problemMessages (`constructorAlreadyComplete`,
+    /// `functionAlreadyComplete`, `augmentationInducedGetterAlreadyComplete`,
+    /// `augmentationInducedSetterAlreadyComplete`) ride one analyzer name
+    /// (`sharedName`); the shape enum picks the message.
+    AugmentationAlreadyComplete(AlreadyCompleteShape),
 }
 
 /// The message shapes of the shared `augmentation_without_declaration` code
@@ -1595,6 +1635,28 @@ pub enum ReturnShape {
     /// `The getter induced by this augmentation has return type '{1}', but
     /// the getter being augmented has return type '{0}'.`
     InducedGetter,
+}
+
+/// The message shapes of the shared `declaration_already_complete` code
+/// (upstream `sharedName` — one analyzer code, four problemMessages).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AlreadyCompleteShape {
+    /// `The augmentation can't provide a body, initializers, or initializing
+    /// formal or super formal parameters because the constructor is already
+    /// complete.` — `constructorAlreadyComplete`.
+    Constructor,
+    /// `The augmentation can't provide a body because the function or member
+    /// is already complete.` — `functionAlreadyComplete` (the function,
+    /// method, getter, and setter augment rows).
+    Function,
+    /// `The getter induced by this augmentation is complete, but the getter
+    /// being augmented is already complete.` —
+    /// `augmentationInducedGetterAlreadyComplete`.
+    InducedGetter,
+    /// `The setter induced by this augmentation is complete, but the setter
+    /// being augmented is already complete.` —
+    /// `augmentationInducedSetterAlreadyComplete`.
+    InducedSetter,
 }
 
 /// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
@@ -1665,6 +1727,24 @@ pub enum SuperShape {
     Operator,
     /// `The setter '{0}' isn't defined in a superclass of '{1}'.`
     Setter,
+}
+
+/// The unchecked-nullable family's per-site variant (messages.yaml's four
+/// shared-name `uncheckedUseOfNullableValue` rows): the oracle picks by the
+/// access node's own shape (type_property_resolver.dart:128-148), so the
+/// kind rides the emission face — a bare nullable function expression
+/// invoked is `Function`, a member invocation `Method`, a binary-operator
+/// application `Operator`, every other access `Property`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UncheckedNullableKind {
+    /// `The function can't be unconditionally invoked because it can be 'null'.`
+    Function,
+    /// `The method '{0}' can't be unconditionally invoked because the receiver can be 'null'.`
+    Method,
+    /// `The operator '{0}' can't be unconditionally invoked because the receiver can be 'null'.`
+    Operator,
+    /// `The property '{0}' can't be unconditionally accessed because the receiver can be 'null'.`
+    Property,
 }
 
 /// Renders a registry-covered row's message from the dartq-diagnostics table
@@ -1745,6 +1825,14 @@ impl SemanticCode {
                 "wrong_number_of_parameters_for_setter",
                 "WRONG_NUMBER_OF_PARAMETERS_FOR_SETTER",
             ),
+            Self::AnonymousMethodWrongParameterList => (
+                "anonymous_method_wrong_parameter_list",
+                "ANONYMOUS_METHOD_WRONG_PARAMETER_LIST",
+            ),
+            Self::AnonymousMethodWrongParameterType => (
+                "anonymous_method_wrong_parameter_type",
+                "ANONYMOUS_METHOD_WRONG_PARAMETER_TYPE",
+            ),
             Self::WrongNumberOfTypeArguments => (
                 "wrong_number_of_type_arguments",
                 "WRONG_NUMBER_OF_TYPE_ARGUMENTS",
@@ -1779,6 +1867,10 @@ impl SemanticCode {
             ),
             Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
+            Self::IntegerLiteralImpreciseAsDouble => (
+                "integer_literal_imprecise_as_double",
+                "INTEGER_LITERAL_IMPRECISE_AS_DOUBLE",
+            ),
             Self::InvalidUseOfVisibleForTemplateMember => (
                 "invalid_use_of_visible_for_template_member",
                 "INVALID_USE_OF_VISIBLE_FOR_TEMPLATE_MEMBER",
@@ -2264,6 +2356,10 @@ impl SemanticCode {
                 "AUGMENTATION_RETURN_TYPE_MISMATCH",
             ),
             Self::TypedefAugmentation => ("typedef_augmentation", "TYPEDEF_AUGMENTATION"),
+            Self::AugmentationAlreadyComplete(_) => (
+                "declaration_already_complete",
+                "DECLARATION_ALREADY_COMPLETE",
+            ),
             // The #743 W1-micro cluster. The NaN pair keeps one registry
             // name (sharedName `unnecessaryNanComparison`; the polarity
             // lives in the message shape), like the null-comparison pair.
@@ -2579,7 +2675,13 @@ impl SemanticCode {
     #[must_use]
     pub const fn dtype(self) -> DiagnosticType {
         match self {
-            Self::WrongNumberOfParametersForSetter
+            // The anonymous-method shape row is a *syntactic* error in the
+            // oracle (`type: syntacticError`,
+            // `_fe_analyzer_shared/messages.yaml` :553) — its trigger lives
+            // in the parser's list builder there (`ast_builder.dart:918`),
+            // like the setter row's.
+            Self::AnonymousMethodWrongParameterList
+            | Self::WrongNumberOfParametersForSetter
             | Self::MemberWithClassName
             | Self::ExpectedRepresentationType => DiagnosticType::SyntacticError,
             Self::InvalidNullAwareOperator
@@ -2688,35 +2790,45 @@ impl SemanticCode {
         self.dtype().severity()
     }
 
-    /// The unchecked-nullable family's per-site problem message (messages.yaml
-    /// `uncheckedMethodInvocationOfNullableValue` /
-    /// `uncheckedPropertyAccessOfNullableValue`, shared name
-    /// `uncheckedUseOfNullableValue`): a method invocation renders the
-    /// invoked-method text, every other access shape the property text —
-    /// upstream picks by the access node's own shape
-    /// (type_property_resolver.dart:128-148).
+    /// The unchecked-nullable family's per-site problem message (messages.yaml's
+    /// four shared-name `uncheckedUseOfNullableValue` rows): the variant
+    /// follows the access node's own shape
+    /// (type_property_resolver.dart:128-148) — a bare nullable function
+    /// expression invoked reports the function row, a member invocation the
+    /// method row, a binary-operator application the operator row, every
+    /// other access the property row.
     #[must_use]
-    pub fn unchecked_nullable_message(is_method: bool, name: &str) -> String {
-        if is_method {
-            format!(
+    pub fn unchecked_nullable_message(kind: UncheckedNullableKind, name: &str) -> String {
+        match kind {
+            UncheckedNullableKind::Function => {
+                "The function can't be unconditionally invoked because it can be 'null'."
+                    .to_string()
+            }
+            UncheckedNullableKind::Method => format!(
                 "The method '{name}' can't be unconditionally invoked because the receiver can be 'null'."
-            )
-        } else {
-            format!(
+            ),
+            UncheckedNullableKind::Operator => format!(
+                "The operator '{name}' can't be unconditionally invoked because the receiver can be 'null'."
+            ),
+            UncheckedNullableKind::Property => format!(
                 "The property '{name}' can't be unconditionally accessed because the receiver can be 'null'."
-            )
+            ),
         }
     }
 
-    /// The family's per-site correction: the call conditional for a method
-    /// invocation, the access conditional otherwise (messages.yaml, the
-    /// two shared-name variants).
+    /// The family's per-site correction, dispatched with the message
+    /// (messages.yaml's four shared-name variants).
     #[must_use]
-    pub fn unchecked_nullable_correction(is_method: bool) -> &'static str {
-        if is_method {
-            "Try making the call conditional (using '?.') or adding a null check to the target ('!')."
-        } else {
-            "Try making the access conditional (using '?.') or adding a null check to the target ('!')."
+    pub fn unchecked_nullable_correction(kind: UncheckedNullableKind) -> &'static str {
+        match kind {
+            UncheckedNullableKind::Function => "Try adding a null check ('!').",
+            UncheckedNullableKind::Method => {
+                "Try making the call conditional (using '?.') or adding a null check to the target ('!')."
+            }
+            UncheckedNullableKind::Operator => "Try adding a null check to the target ('!').",
+            UncheckedNullableKind::Property => {
+                "Try making the access conditional (using '?.') or adding a null check to the target ('!')."
+            }
         }
     }
 
@@ -2937,6 +3049,23 @@ impl SemanticCode {
             Self::WrongNumberOfParametersForSetter => {
                 registry_message("wrong_number_of_parameters_for_setter")
             }
+            // The anonymous-method rows are analyzer-tier (the
+            // `analyzer-codes.tsv` table carries names and metadata; the
+            // generated message accessor covers the syntax tier only), so
+            // the texts render as local verbatim literals pinned against
+            // the table in the #2879 pins — the #279 const-eval family's
+            // posture. The shape row is argument-less; the type row's
+            // `{0}`/`{1}` slots are the receiver's type and the written
+            // parameter type.
+            Self::AnonymousMethodWrongParameterList => {
+                "An anonymous method with a parameter list must have exactly one required, \
+                 positional parameter."
+                    .to_string()
+            }
+            Self::AnonymousMethodWrongParameterType => format!(
+                "The receiver type '{a0}' must be assignable to the formal parameter type \
+                 '{a1}' in an anonymous method."
+            ),
             // The #279 constant-evaluation family: no-argument rows (the
             // pinned registry `diagnostic.g.dart` texts).
             Self::ConstInitializedWithNonConstantValue => {
@@ -3069,6 +3198,7 @@ impl SemanticCode {
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
+            | Self::IntegerLiteralImpreciseAsDouble
             | Self::InvalidUseOfVisibleForTemplateMember
             | Self::ArgumentTypeNotAssignable
             | Self::ExtensionOverrideArgumentNotAssignable
@@ -3636,6 +3766,23 @@ impl SemanticCode {
                 format!("The getter induced by this augmentation has return type '{a0}', but the getter being augmented has return type '{a1}'.")
             }
             Self::TypedefAugmentation => "Type aliases can't be augmented.".to_string(),
+            Self::AugmentationAlreadyComplete(AlreadyCompleteShape::Constructor) => {
+                "The augmentation can't provide a body, initializers, or initializing formal or super formal parameters because the constructor is already complete.".to_string()
+            }
+            Self::AugmentationAlreadyComplete(AlreadyCompleteShape::Function) => {
+                "The augmentation can't provide a body because the function or member is already complete.".to_string()
+            }
+            Self::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedGetter) => {
+                "The getter induced by this augmentation is complete, but the getter being augmented is already complete.".to_string()
+            }
+            Self::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedSetter) => {
+                "The setter induced by this augmentation is complete, but the setter being augmented is already complete.".to_string()
+            }
+            // `{0}` is the literal's lexeme, `-`-prefixed under an
+            // immediately-negated operand (messages.yaml:9355).
+            Self::IntegerLiteralImpreciseAsDouble => {
+                format!("The integer literal is being used as a double, but can't be represented as a 64-bit double without overflow or loss of precision: '{a0}'.")
+            }
         }
     }
 
@@ -3725,6 +3872,11 @@ impl SemanticCode {
             }
             Self::InvalidAssignment => {
                 format!("A value of type '{a0}' can't be assigned to a variable of type '{a1}'.")
+            }
+            // `{0}` is the literal's lexeme, `-`-prefixed under an
+            // immediately-negated operand (messages.yaml:9355).
+            Self::IntegerLiteralImpreciseAsDouble => {
+                format!("The integer literal is being used as a double, but can't be represented as a 64-bit double without overflow or loss of precision: '{a0}'.")
             }
             // `{0}` is the member name, `{1}` the declaring library's URI
             // (diagnostic.g.dart:9814).
@@ -4305,6 +4457,25 @@ impl SemanticCode {
                 "Try removing or changing some of the elements so that all of the elements are consistent."
                     .to_string(),
             ),
+            // `{a2}` is the closest valid double, printed as an exact
+            // integer (the oracle's `BigInt.from(nearestValidDouble)`
+            // rendering, messages.yaml:9356).
+            Self::IntegerLiteralImpreciseAsDouble => Some(format!(
+                "Try using the class 'BigInt', or switch to the closest valid double: '{a2}'."
+            )),
+            // The anonymous-method rows' verbatim oracle correctionMessages
+            // (`analyzer-codes.tsv`, the pinned 3.13.7
+            // `_fe_analyzer_shared/messages.yaml` :556 and
+            // `analyzer/messages.yaml` :1357).
+            Self::AnonymousMethodWrongParameterList => Some(
+                "Try removing the parameter list, or changing it to have exactly one \
+                 required positional parameter."
+                    .to_string(),
+            ),
+            Self::AnonymousMethodWrongParameterType => Some(
+                "Try removing the parameter type, or make it a supertype of the receiver type."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -4423,6 +4594,8 @@ mod tests {
             SemanticCode::InvalidUseOfVisibleForTemplateMember,
             SemanticCode::ArgumentTypeNotAssignable,
             SemanticCode::ExtensionOverrideArgumentNotAssignable,
+            // The #2870 literal-conversion face.
+            SemanticCode::IntegerLiteralImpreciseAsDouble,
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),
             SemanticCode::ReturnOfInvalidType(ExecKind::Method),
             SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
@@ -5214,10 +5387,16 @@ mod tests {
         match code {
             SemanticCode::AmbiguousExtensionMemberTwo
             | SemanticCode::AmbiguousExtensionMemberThreeOrMore
+            // The #2879 anonymous-method rows: analyzer-tier table rows
+            // (names/metadata only — messages render as local literals at
+            // the message arm, not via the syntax-tier generated accessor).
+            | SemanticCode::AnonymousMethodWrongParameterList
+            | SemanticCode::AnonymousMethodWrongParameterType
             | SemanticCode::ArgumentTypeNotAssignable
-            // The #2784 augmentation faces — none registry-backed (the
+            // The #2784/#2867 augmentation faces — none registry-backed (the
             // dartq-diagnostics table predates them; the inline `message`
             // arms above are the sole template source).
+            | SemanticCode::AugmentationAlreadyComplete(_)
             | SemanticCode::AugmentationExtendsClauseAlreadyPresent
             | SemanticCode::AugmentationFormalParameterModifierExtra
             | SemanticCode::AugmentationFormalParameterModifierMissing
@@ -5291,6 +5470,7 @@ mod tests {
             | SemanticCode::InheritsAbstractMemberThree
             | SemanticCode::InheritsAbstractMemberTwo
             | SemanticCode::InvalidAssignment
+            | SemanticCode::IntegerLiteralImpreciseAsDouble
             | SemanticCode::InvalidUseOfVisibleForTemplateMember
             | SemanticCode::InvalidConstant
             | SemanticCode::InvalidImplementationOverride
@@ -5511,7 +5691,13 @@ mod tests {
         vec![
             SemanticCode::AmbiguousExtensionMemberTwo,
             SemanticCode::AmbiguousExtensionMemberThreeOrMore,
+            SemanticCode::AnonymousMethodWrongParameterList,
+            SemanticCode::AnonymousMethodWrongParameterType,
             SemanticCode::ArgumentTypeNotAssignable,
+            SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::Constructor),
+            SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::Function),
+            SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedGetter),
+            SemanticCode::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedSetter),
             SemanticCode::AugmentationExtendsClauseAlreadyPresent,
             SemanticCode::AugmentationFormalParameterModifierExtra,
             SemanticCode::AugmentationFormalParameterModifierMissing,

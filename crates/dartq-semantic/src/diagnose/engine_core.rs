@@ -200,6 +200,7 @@ impl<'a> Engine<'a> {
             group_late: false,
             group_final: false,
             group_const: false,
+            group_augment: false,
             exec_bounds: FxHashMap::default(),
             method_exec_bounds: FxHashMap::default(),
             pending_exec_is_method: false,
@@ -358,6 +359,10 @@ impl<'a> Engine<'a> {
             catch_on_nullable: None,
             catch_clause_start: None,
             catch_params: 0,
+            catch_trace_slot: false,
+            catch_formal_group: None,
+            catch_ord_exc: None,
+            catch_ord_trace: None,
             try_clauses: Vec::new(),
             if_null_groups: Vec::new(),
             if_null_rhs_end: None,
@@ -394,6 +399,8 @@ impl<'a> Engine<'a> {
             call_ends: Vec::new(),
             solved_call_params: FxHashMap::default(),
             send_return_staging: None,
+            send_invalid_staging: None,
+            member_spellings: std::cell::OnceCell::new(),
             refined_call_returns: FxHashMap::default(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),
@@ -464,33 +471,47 @@ impl<'a> Engine<'a> {
 
     /// The whitespace-trimmed span between two offsets (the switch member
     /// body rows' shape: the official row trims to the member's statement
-    /// extent, `dead_code_verifier.dart`'s `flowEnd` member trim). Interior
+    /// extent, `dead_code_verifier.dart`'s `flowEnd` member trim). The
+    /// leading edge snaps to the first token in the span — comments are
+    /// trivia outside the token table (the parser attaches them to the
+    /// following token), so a comment-led case body anchors at its first
+    /// statement, never the `// …` after the head's `:` (#2861). Interior
     /// comments ride along — a documented divergence.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn trimmed_span(&self, start: u32, end_excl: u32) -> Option<SourceRange> {
+        // The first token at/after `start` opens the span when it lands
+        // inside it; a token-free span keeps the byte walk below (and dies
+        // on all-trivia). In code the first non-whitespace byte before the
+        // next token is that token, so comment-free spans are unchanged —
+        // only a leading comment (invisible to the token table) gets
+        // skipped.
+        let toks = self.tokens.as_slice();
+        let head = match toks.get(toks.partition_point(|t| t.utf16_offset < start)) {
+            Some(t) if t.utf16_offset < end_excl => t.utf16_offset,
+            _ => start,
+        };
         // Both bounds arrive as UTF-16 offsets (row/token spans) while the
         // trim walk reads source bytes: convert at the boundary — a wide
         // char anywhere before the span would otherwise desync the slice (or
         // cut mid-character, #2594) — and convert the trimmed bounds back so
         // the returned span keeps the external UTF-16 convention.
-        let start = self.byte_of(start);
+        let start = self.byte_of(head);
         let end = self.byte_of(end_excl).min(self.source.len());
         if start >= end {
             return None;
         }
         let text = &self.source[start..end];
-        let lead = text.len() - text.trim_start().len();
         let trimmed = text.trim_end();
         if trimmed.is_empty() {
             return None;
         }
-        // `trimmed` keeps the leading run `offset` already skipped, so the
-        // length drops it too — the span is both-ends trimmed.
-        let offset = self.utf16_of(start + lead);
+        // The span opens at the snapped token head — every leading
+        // whitespace and comment byte is behind it — and trims only the
+        // trailing run: both-ends trimmed.
         let end16 = self.utf16_of(start + trimmed.len());
         Some(SourceRange {
-            offset,
-            length: end16.saturating_sub(offset),
+            offset: head,
+            length: end16.saturating_sub(head),
         })
     }
 
@@ -584,26 +605,29 @@ impl<'a> Engine<'a> {
         ));
     }
 
-    /// The unchecked-nullable row's per-site rendering: a method invocation
-    /// (`a.foo()` on a nullable receiver) reports the invoked-method text
-    /// with the call correction, every other access shape the property
-    /// text with the access correction — upstream picks by the access
-    /// node's own shape (`type_property_resolver.dart:128-148`,
-    /// messages.yaml's two shared-name variants).
+    /// The unchecked-nullable row's per-site rendering, dispatched by the
+    /// access shape the caller resolves (`UncheckedNullableKind`): the
+    /// function text for a bare nullable function expression invoked, the
+    /// method text for a member invocation (the index and compound/unary
+    /// operator shapes included, the oracle's `[]`/`unary-` spellings), the
+    /// operator text for a binary-operator application, the property text
+    /// for every other access — with the matching correction
+    /// (type_property_resolver.dart:128-148, messages.yaml's four
+    /// shared-name variants).
     pub(crate) fn emit_unchecked_nullable(
         &mut self,
         range: SourceRange,
         name: &str,
-        is_method: bool,
+        kind: UncheckedNullableKind,
     ) {
         let code = SemanticCode::UncheckedUseOfNullableValue;
         self.report.diagnostics.push(Diagnostic::new(
             code.severity(),
             code.code_info(),
-            SemanticCode::unchecked_nullable_message(is_method, name),
+            SemanticCode::unchecked_nullable_message(kind, name),
             self.file,
             range,
-            Some(SemanticCode::unchecked_nullable_correction(is_method).to_string()),
+            Some(SemanticCode::unchecked_nullable_correction(kind).to_string()),
         ));
     }
 
@@ -3039,7 +3063,7 @@ impl<'a> Engine<'a> {
     /// `subtype.dart` runs before any structural ask), the same
     /// convention `bind_declared_type` applies to the frame's declared
     /// types.
-    fn tear_off_fn_ty(&self, sig: &FnVarSig) -> Ty {
+    fn tear_off_fn_ty(&self, sig: &FnVarSig, type_params: &[(StringId, Option<Ty>)]) -> Ty {
         let named: Vec<(StringId, Ty)> = sig
             .named
             .iter()
@@ -3050,13 +3074,22 @@ impl<'a> Engine<'a> {
             .iter()
             .map(|ty| self.fold_alias_ty(*ty))
             .collect();
-        self.boundary.intern_function_ty(
-            0,
+        // The declaration's own parameter group rides the shape (#2878):
+        // the generic tear-off's display spells it (`void foo<T>(T a)`
+        // reads `void Function<T>(T)`). The names travel beside the
+        // signature — `FnVarSig::params` feeds the subtype and inference
+        // verdicts, which keep their count-only posture; this face is
+        // display-only. A `Dynamic` bound is the unbounded face.
+        let mut args = self.boundary.args.borrow_mut();
+        let ty = args.function_generic(
+            type_params,
             self.fold_alias_ty(sig.return_ty),
             &positional,
             &named,
             false,
-        )
+        );
+        drop(args);
+        ty
     }
 
     /// The bare-read tear-off face at an `is` operand (`f0 is F0<int>`
@@ -3084,9 +3117,12 @@ impl<'a> Engine<'a> {
         // static type is the declaration's own signature as a function
         // type ([`Self::capture_local_fn_tearoff`]'s capture).
         if self.frames.iter().any(|f| f.locals.contains(&operand.name)) {
+            // The local capture records no parameter group (its verdict
+            // face keeps the count-only posture) — the display
+            // under-reports the group, the same additive posture.
             return self
                 .local_fn_sig(operand.name)
-                .map(|sig| self.tear_off_fn_ty(sig));
+                .map(|sig| self.tear_off_fn_ty(sig, &[]));
         }
         if !matches!(
             operand.shape,
@@ -3095,9 +3131,20 @@ impl<'a> Engine<'a> {
             return None;
         }
         // The top-level function face (`tear_off_sig`'s value-read
-        // gate): the signature interns whole.
+        // gate): the signature interns whole, the declaration's own
+        // parameter spellings beside it (#2878).
         if let Some(sig) = self.tear_off_sig(operand) {
-            return Some(self.tear_off_fn_ty(&sig));
+            let type_params: Vec<(StringId, Option<Ty>)> = self
+                .top_level_decl(operand.name)
+                .map(|decl| {
+                    decl.type_param_names
+                        .iter()
+                        .copied()
+                        .map(|name| (name, None))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Some(self.tear_off_fn_ty(&sig, &type_params));
         }
         // The enclosing-container member face: the unqualified read of a
         // method/getter/field of `this`'s container (`m0` inside the
@@ -4403,13 +4450,32 @@ impl<'a> Engine<'a> {
         let named: Vec<(StringId, Ty)> = formals
             .map(|f| f.named.iter().map(|p| (p.name, p.ty)).collect())
             .unwrap_or_default();
-        Some(self.boundary.args.borrow_mut().function(
-            entry.type_params,
-            entry.return_ty,
-            &positional,
-            &named,
-            false,
-        ))
+        // The declaration's own parameter group rides the shape (#2878):
+        // the tear-off's display spells it (`C m<T>(T)` reads
+        // `T Function<T>(T)`); a `Dynamic` bound is the unbounded face
+        // (never spelled). A pre-field payload row carries the count
+        // without names — the count-only form keeps its exact identity.
+        let type_params: Vec<(StringId, Option<Ty>)> = entry
+            .type_param_names
+            .iter()
+            .copied()
+            .zip(entry.type_param_bounds.iter().copied())
+            .map(|(name, bound)| (name, (bound != Ty::Dynamic).then_some(bound)))
+            .collect();
+        let mut args = self.boundary.args.borrow_mut();
+        let fn_ty = if type_params.is_empty() && entry.type_params > 0 {
+            args.function(
+                entry.type_params,
+                entry.return_ty,
+                &positional,
+                &named,
+                false,
+            )
+        } else {
+            args.function_generic(&type_params, entry.return_ty, &positional, &named, false)
+        };
+        drop(args);
+        Some(fn_ty)
     }
 
     /// The in-scope type-parameter test: `type_params`/`pending_type_params`

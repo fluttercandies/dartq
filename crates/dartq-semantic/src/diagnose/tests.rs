@@ -15384,6 +15384,125 @@ fn unused_catch_stack_reports_alone() {
     assert_eq!(unused, vec![("unused_catch_stack", "stack")]);
 }
 
+/// The junk-trace recovery shape binds its named section member as the
+/// stack trace (`handleCatchBlock` reads the faces off the re-parsed
+/// formals list — `catchParameters[1].name`; oracle pinned row
+/// `TryStatementResolutionTest.test_catch_parameters_stackTrace_named`:
+/// `catch (x, {st})` anchors the stack verdict on `st` with a
+/// `catchSyntax` on the `{`). The slot classification rides the parser's
+/// comma fact, so the synthetic-filled slot cannot shift `st` into the
+/// exception arm.
+#[test]
+fn unused_catch_stack_named_trace_shape() {
+    let source = "void f() { try {} catch (x, {st}) {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, vec![("unused_catch_stack", "st")]);
+}
+
+/// The optional-positional junk-trace twin: `[st]` recovers its member as
+/// the stack trace exactly like the named section (oracle pinned row
+/// `test_catch_parameters_stackTrace_optionalPositional`).
+#[test]
+fn unused_catch_stack_optional_positional_trace_shape() {
+    let source = "void f() { try {} catch (x, [st]) {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, vec![("unused_catch_stack", "st")]);
+}
+
+/// The real trace name after a real comma keeps its verdict even when the
+/// parameter group's tail turns to junk (oracle pinned row
+/// `test_try_statement_catch_identifierCommaIdentifier_labeled`:
+/// `catch (e, s l:` anchors on `s`, never on the junk tail).
+#[test]
+fn unused_catch_stack_real_trace_with_junk_tail() {
+    let source = "f() { try {} catch (e, s l: {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, vec![("unused_catch_stack", "s")]);
+}
+
+/// A stack-trace sibling spares the exception even under an `on` type and
+/// even when the sibling's own slot was junk-filled: the auto-use reads
+/// the trace slot's presence, not the parameter event count (oracle
+/// `on catch (e, {` — the clause's `unused_catch_clause` for `e` is
+/// absent; only the trace face reports).
+#[test]
+fn on_catch_exception_spared_by_junk_filled_trace_slot() {
+    let source = "void f() { try {} on int catch (x, {st}) {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, vec![("unused_catch_stack", "st")]);
+}
+
+/// `catch (var e)`: the exception name recovers synthetically, so the
+/// real `e` reaches the trace ensure while the official formals list
+/// reads it as `catchParameters[0]` — the exception (comma-fact slot
+/// classification; the synthetic comma never flips the slot). A plain
+/// catch auto-uses it: silent.
+#[test]
+fn catch_var_keyword_classifies_the_real_name_exception() {
+    let source = "void f() { try {} catch (var e) {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert!(unused.is_empty(), "{unused:?}");
+}
+
+/// The `on`-type `var`-keyword twin: both ensure routes hit the reserved
+/// `var`, so the real `e` binds solely through the formal re-parse as a
+/// parameter twin — no CatchParameter event fires and no unused face
+/// reports (the oracle's residual `<unnamed>` clause row is the
+/// unnamed-family geometry noted in the ticket, not this pin's scope).
+#[test]
+fn on_catch_var_keyword_binds_only_as_a_parameter_twin() {
+    let source = "void f() { try {} on int catch (var e) {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, Vec::<(&str, &str)>::new());
+}
+
+/// Regression: a plain single-parameter catch keeps both postures — a
+/// read spares, and an unread exception stays silent as today (no
+/// `on`-type spares it exactly like the official rule's
+/// `node.onKeyword == null` auto-use, unused_local_elements_verifier
+/// .dart:72-74).
+#[test]
+fn plain_catch_exception_postures_unchanged() {
+    let used = "void f() { try {} catch (e) { print(e); } }";
+    let used_report = report(used);
+    assert!(
+        !anchors(used, &used_report)
+            .iter()
+            .any(|(code, _)| code.starts_with("unused"))
+    );
+    let unread = "void f() { try {} catch (e) {} }";
+    let report = report(unread);
+    let unused: Vec<_> = anchors(unread, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, Vec::<(&str, &str)>::new());
+}
+
 /// `_visitConstructorElement` visits named constructors only
 /// (`node.name != null`, unused_local_elements_verifier.dart:716-723):
 /// a single unnamed constructor of a private class is never reported —

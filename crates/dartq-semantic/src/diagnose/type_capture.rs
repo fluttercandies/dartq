@@ -890,8 +890,11 @@ impl<'a> Engine<'a> {
             .map(|(name, ty, _)| (*name, *ty))
             .collect();
         let return_ty = capture.ret.map_or(Ty::Dynamic, |(ty, ..)| ty);
-        let fn_ty = self.boundary.args.borrow_mut().function(
-            capture.params.len().min(u16::MAX as usize) as u16,
+        // The written `<T, U extends B>` group rides the shape (#2878):
+        // the message slots spell it back (`void Function<T>(T)`), the
+        // official `FunctionType` display form.
+        let fn_ty = self.boundary.args.borrow_mut().function_generic(
+            &capture.params,
             return_ty,
             &capture.positional,
             &named,
@@ -1234,20 +1237,37 @@ impl<'a> Engine<'a> {
 
     /// `begin_type_arguments`: a headless group at call depth opens the
     /// written-argument capture (an invocation's `<...>`; headed groups
-    /// are annotations and ride the #610 sink).
-    pub(crate) fn call_args_begin(&mut self, headed: bool) {
+    /// are annotations and ride the #610 sink). `depth` is the group's
+    /// own `type_arg_depth` (the engine's counter after this group's
+    /// increment).
+    pub(crate) fn call_args_begin(&mut self, headed: bool, depth: u32) {
         if headed {
             return;
         }
-        self.call_args_capture = Some(CallArgsCapture::default());
+        self.call_args_capture = Some(CallArgsCapture {
+            depth,
+            ..CallArgsCapture::default()
+        });
     }
 
     /// A type completion inside the open call-argument group (the merge
-    /// latch mirrors the sink's: the re-fired head replaces its own leaf).
-    pub(crate) fn call_args_feed(&mut self, ty: Ty, head: StringId, offset: u32) {
+    /// latch mirrors the sink's: the re-fired head replaces its own
+    /// leaf). A completion at a deeper depth is a member's own nested
+    /// annotation (`List<int>` inside `f<List<int>>(...)`) — never a
+    /// member of this group.
+    pub(crate) fn call_args_feed(
+        &mut self,
+        ty: Ty,
+        head: StringId,
+        offset: u32,
+        span: SourceRange,
+    ) {
         let Some(capture) = self.call_args_capture.as_mut() else {
             return;
         };
+        if capture.depth != self.type_arg_depth {
+            return;
+        }
         if capture
             .pending
             .is_some_and(|(prev_head, prev_offset)| prev_head != head || prev_offset != offset)
@@ -1257,7 +1277,7 @@ impl<'a> Engine<'a> {
             capture.members.pop();
         }
         capture.pending = Some((head, offset));
-        capture.members.push(ty);
+        capture.members.push((ty, span));
     }
 
     /// `end_type_arguments`: the headless group closed; its written
@@ -1275,15 +1295,21 @@ impl<'a> Engine<'a> {
             return;
         };
         let head_offset = head.range.offset;
+        let (tys, spans): (Vec<Ty>, Vec<SourceRange>) = capture.members.into_iter().unzip();
         self.call_type_args
             .retain(|(offset, _)| *offset < head_offset);
-        self.call_type_args
-            .push((head_offset, capture.members.into_boxed_slice()));
+        self.call_type_args.push((
+            head_offset,
+            CallTypeArgs {
+                tys: tys.into_boxed_slice(),
+                spans: spans.into_boxed_slice(),
+            },
+        ));
     }
 
     /// The explicit type arguments of the callee row, if a call-site
     /// group latched any.
-    pub(crate) fn call_args_for(&mut self, callee: usize) -> Option<Box<[Ty]>> {
+    pub(crate) fn call_args_for(&mut self, callee: usize) -> Option<CallTypeArgs> {
         let offset = self.rows.get(callee)?.range.offset;
         let pos = self
             .call_type_args

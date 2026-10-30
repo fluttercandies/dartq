@@ -33,6 +33,7 @@ fn context_config(fixture: &Fixture, flags: u64) -> ContextConfig {
             packages: fixture.packages.clone(),
             pub_config: Arc::clone(&fixture.config),
             config_dir: fixture.config_dir.clone(),
+            context_roots: Vec::new(),
             semdiag: Some(dartq_engine::semdiag::diagnoser()),
             target: dartq_engine::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),

@@ -1381,6 +1381,12 @@ pub trait ParserListener {
     }
     fn begin_catch_clause(&mut self, token: Token) {}
     fn end_catch_clause(&mut self, token: Token) {}
+    /// The real-comma fact of the clause in flight: the following catch
+    /// parameter ensure fills the stack-trace slot (`parseTryStatement`'s
+    /// second `catchParameter` position). A synthetic comma is the
+    /// single-parameter recovery — the official formals list gains no
+    /// second slot — so only a written comma fires this.
+    fn handle_catch_trace_parameter(&mut self) {}
     /// `handleCatchBlock(onKeyword, catchKeyword, comma)`.
     fn handle_catch_block(
         &mut self,

@@ -135,6 +135,7 @@ impl Workspace {
             packages: self.packages.clone(),
             pub_config: Arc::clone(&self.config),
             config_dir: self.config_dir.clone(),
+            context_roots: Vec::new(),
             semdiag: Some(dartq_engine::semdiag::diagnoser()),
             target: dartq_engine::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
