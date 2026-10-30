@@ -381,7 +381,25 @@ impl Interp<'_> {
                 crate::ty::EMPTY_ARGS,
             ),
             Ev::Bool { value } => {
-                let mut expr = Expr::trivial(Ty::UNKNOWN);
+                // The literal's static type is `bool` (official
+                // `literalBool`'s recorded type — the `matchedType` an
+                // initializer or assignment write promotes through:
+                // `Object? o = true` promotes `o` to `Object` because
+                // `bool <: Object`, flow_analysis.dart:3982-4098's
+                // `_tryPromoteToTypeOfInterest`). Spelling it lets the
+                // resolved seam answer the subtype question the opaque
+                // unknown face never could; without the interned id (a
+                // direct-constructed interp) the face stays unknown — the
+                // under-report posture, unchanged.
+                let ty = self
+                    .closed
+                    .bool_name
+                    .map(|id| Ty {
+                        base: crate::ty::Base::Name(id),
+                        nullable: false,
+                    })
+                    .unwrap_or(Ty::UNKNOWN);
+                let mut expr = Expr::trivial(ty);
                 expr.bool_value = Some(*value);
                 // A boolean literal can never evaluate to null — the same
                 // guaranteed-non-null face `type.isNonNullable` gives the
@@ -389,13 +407,51 @@ impl Interp<'_> {
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
+            Ev::Int { .. } => {
+                // The literal's static type is `int` — the same
+                // `matchedType` face `Ev::Bool` spells `bool` for
+                // (`num? n = 1` promotes `n` to `num`: `int <: num` makes
+                // the declared non-null form a type of interest, official
+                // `_tryPromoteToTypeOfInterest`,
+                // flow_analysis.dart:3982-4098). Without the interned id
+                // (a direct-constructed interp) the face stays unknown —
+                // the under-report posture, unchanged.
+                let ty = self
+                    .closed
+                    .int_name
+                    .map(|id| Ty {
+                        base: crate::ty::Base::Name(id),
+                        nullable: false,
+                    })
+                    .unwrap_or(Ty::UNKNOWN);
+                let mut expr = Expr::trivial(ty);
+                // An integer literal can never evaluate to null — the
+                // same guaranteed-non-null face `type.isNonNullable`
+                // gives the `??`/`?.` kills.
+                expr.non_null_literal = true;
+                self.exprs.push(expr);
+            }
+            Ev::Double { .. } => {
+                // `Ev::Int`'s `double` twin (`num? d = 1.5` promotes `d`
+                // to `num`).
+                let ty = self
+                    .closed
+                    .double_name
+                    .map(|id| Ty {
+                        base: crate::ty::Base::Name(id),
+                        nullable: false,
+                    })
+                    .unwrap_or(Ty::UNKNOWN);
+                let mut expr = Expr::trivial(ty);
+                expr.non_null_literal = true;
+                self.exprs.push(expr);
+            }
             Ev::Null => self.exprs.push(Expr::trivial(Ty::NULL)),
             Ev::OtherExpr { .. } => {
-                // `Ev::OtherExpr`'s producers are the non-collection leaf
-                // literals (integer, double, `super`) — every one evaluates
-                // to a non-null value, so the guaranteed-non-null kills
-                // (`1 ?? x`, `super.field?.m`) apply even though the type
-                // face stays the opaque unknown.
+                // `Ev::OtherExpr`'s only remaining producer is the `super`
+                // read — it evaluates to a non-null value, so the
+                // guaranteed-non-null kills (`super.field?.m`) apply even
+                // though the type face stays the opaque unknown.
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
@@ -843,6 +899,7 @@ impl Interp<'_> {
                         events.get(i.wrapping_sub(1)),
                         Some(
                             Ev::ListLitEnd { .. }
+                                | Ev::SetOrMapLitEnd { .. }
                                 | Ev::RecordLitEnd { .. }
                                 | Ev::EndLiteralString { .. }
                         )
@@ -2532,13 +2589,37 @@ impl Interp<'_> {
                 self.flush_null_shorts_above(self.consumer_base(*count));
                 self.literal_value_keep_ty(*count)
             }
-            Ev::ListLitEnd { count } => {
+            Ev::ListLitEnd { count, args } => {
                 // The literal's elements are complete expressions: rejoin
                 // the null-shorting they opened (the receiver-chain `?`
                 // outside the literal stays open to the enclosing
                 // expression's end).
                 self.flush_null_shorts_above(self.consumer_base(*count));
-                self.literal_value(*count)
+                // `List`'s interned id spells the literal's static type —
+                // `List<E>` over the written `<E>` arguments (upstream
+                // `resolveListLiteral`'s written-arguments arm,
+                // typed_literal_resolver.dart:68-107): `var l = <int>[]`'s
+                // static type is `List<int>`, the `matchedType` an
+                // initializer or assignment write promotes through.
+                self.literal_value(*count, self.closed.list_name, *args)
+            }
+            Ev::SetOrMapLitEnd {
+                count,
+                is_set,
+                args,
+            } => {
+                self.flush_null_shorts_above(self.consumer_base(*count));
+                // `<E>{...}` spells `Set<E>` and `<K,V>{...}` spells
+                // `Map<K,V>` (upstream `resolveSetOrMapLiteral`'s
+                // written-arguments arm,
+                // typed_literal_resolver.dart:732-758); the recorder
+                // resolved the head (see [`Ev::SetOrMapLitEnd`]).
+                let name = if *is_set {
+                    self.closed.set_name
+                } else {
+                    self.closed.map_name
+                };
+                self.literal_value(*count, name, *args)
             }
             Ev::MapEntryEnd => {
                 // The entry's key and value are complete expressions:
@@ -2763,9 +2844,23 @@ impl Interp<'_> {
                 for _ in 0..*interpolation_count {
                     self.exprs.pop();
                 }
+                // The literal's static type is `String` — the same
+                // `matchedType` face `Ev::Bool` spells `bool` for
+                // (`Object? s = 'x'` promotes `s` to `Object`: `String <:
+                // Object` makes the declared non-null form a type of
+                // interest). Without the interned id the face stays
+                // unknown — the under-report posture.
+                let ty = self
+                    .closed
+                    .string_name
+                    .map(|id| Ty {
+                        base: crate::ty::Base::Name(id),
+                        nullable: false,
+                    })
+                    .unwrap_or(Ty::UNKNOWN);
                 // A string literal can never evaluate to null — the same
                 // guaranteed-non-null face the leaf literals carry.
-                let mut expr = Expr::trivial(Ty::UNKNOWN);
+                let mut expr = Expr::trivial(ty);
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
@@ -2983,7 +3078,16 @@ impl Interp<'_> {
         }
     }
 
-    fn literal_value(&mut self, count: usize) {
+    /// [`Self::literal_value_keep_ty`]'s collection-literal variant: the
+    /// collapsed tail's face is the container's static type — `List`,
+    /// `Set`, or `Map` over the literal's written type-argument tree —
+    /// never the last element's own (possibly nullable) type
+    /// (`[stream.char()]`'s `String?` element must not leak into the
+    /// inferred local — UNCHECKED on every later member access). `name`
+    /// is the container head's interned id (`None` under a
+    /// direct-constructed interp — the literal keeps the opaque unknown
+    /// face, the consistent under-report).
+    fn literal_value(&mut self, count: usize, name: Option<u32>, args: u32) {
         if count > 0 {
             self.exprs
                 .truncate(self.exprs.len().saturating_sub(count - 1));
@@ -2993,16 +3097,13 @@ impl Interp<'_> {
         if let Some(head) = self.exprs.last_mut() {
             head.literal = true;
             head.non_null_literal = true;
-            // The literal's own face is the collection, never the
-            // element: the collapsed tail row is the last element's
-            // value row reused for the LIFO pop, and its (possibly
-            // nullable) element type must not stand as the
-            // collection's type (`[stream.char()]`'s `String?`
-            // element leaking into the inferred local — UNCHECKED on
-            // every later member access). The empty literal's unknown
-            // face is the consistent under-report.
-            head.ty = Ty::UNKNOWN;
-            head.args = crate::ty::EMPTY_ARGS;
+            head.ty = name
+                .map(|id| Ty {
+                    base: crate::ty::Base::Name(id),
+                    nullable: false,
+                })
+                .unwrap_or(Ty::UNKNOWN);
+            head.args = args;
         }
     }
 

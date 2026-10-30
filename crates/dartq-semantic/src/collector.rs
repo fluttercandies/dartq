@@ -81,7 +81,7 @@ use crate::model::{
     Annotation, AnonMethodInvocation, ArgListId, ArgPool, ArityDecl, ArityViolation, AugKind,
     AugTarget, AugmentDecl, AugmentFormal, AugmentModifiers, AugmentTypeParam, ConstCreationFace,
     Container, ContainerKind, DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals,
-    MemberEntry, MemberKind, MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
+    MemberEntry, MemberKind, MicroKind, NameMap, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures,
@@ -100,6 +100,27 @@ use dartq_source::SourceRange;
 const OPERATORS_WITH_ONE_PARAMETER: [&str; 16] = [
     "<", ">", "<=", ">=", "==", "+", "/", "~/", "*", "%", "|", "^", "&", "<<", ">>", ">>>",
 ];
+
+/// One member-claim bit of a container's duplicate scope: the oracle's
+/// `_checkDuplicateIdentifier` keys every member by its BARE lexeme
+/// (a setter `foo` claims `foo`, not `foo=`) and merges a lone getter
+/// with a lone setter into a getter/setter pair — every other
+/// combination collides (member_duplicate_definition_verifier.dart:297-346).
+const DUP_GETTER: u8 = 1;
+const DUP_SETTER: u8 = 2;
+const DUP_OTHER: u8 = 4;
+const DUP_PAIR: u8 = DUP_GETTER | DUP_SETTER;
+
+/// The finished member-duplicate scopes of one container name (upstream's
+/// `_InstanceElementContext` pair: one instance scope, one static scope).
+/// A container family's augment fragments share the declaration name, so
+/// these accumulate across same-name container declarations exactly like
+/// the oracle's per-element scopes do.
+#[derive(Default)]
+struct DupScope {
+    instance: NameMap<u8>,
+    static_: NameMap<u8>,
+}
 
 /// An open container on the capture stack.
 #[expect(
@@ -124,6 +145,13 @@ struct OpenContainer {
     /// The member name set so far (sorted-insert; sealed into the
     /// finished [`Container::members`] at the close).
     members: NameMapBuilder<MemberEntry>,
+    /// The declaration-scoped member-claim bitmasks (bare lexeme →
+    /// `DUP_*` bits), mirroring the oracle's per-element
+    /// `instanceScope`/`staticScope` — getter/setter pair merges and
+    /// every other same-name claim report here, independently of the
+    /// keep-first `members` map.
+    dup_instance: NameMapBuilder<u8>,
+    dup_static: NameMapBuilder<u8>,
     type_params: u16,
     /// The header's type-parameter spellings in declaration order (the
     /// container-open take of the buffered group; empty when the header
@@ -293,6 +321,10 @@ struct PendingTop {
     formals: Option<Box<Formals>>,
     is_external: bool,
     has_body: bool,
+    /// The declaration's own metadata star, claimed at
+    /// `begin_top_level_method` (the star precedes the begin) so body-local
+    /// metadata never joins it.
+    annotations: Vec<Annotation>,
 }
 
 /// One conservatively parsed type spelling of a typed collection
@@ -322,6 +354,10 @@ struct PendingTypedef {
     /// group, [`Builder::attach_formals`]' typedef arm) — the columns of
     /// the synthesized function type `end_typedef` interns.
     formals: Option<Box<Formals>>,
+    /// The declaration's metadata star, claimed at `begin_typedef` (the
+    /// star precedes the begin — the same claim `begin_top_level_method`
+    /// makes for the function face).
+    annotations: Vec<Annotation>,
 }
 
 /// An `augment` executable under construction (`begin_method` /
@@ -381,6 +417,18 @@ struct Builder<'src, 'tab> {
     /// containers live on [`Builder::containers`]).
     named_containers: NameMapBuilder<Container>,
     containers: Vec<OpenContainer>,
+    /// The member-duplicate scopes of closed containers, merged by
+    /// container name — a same-named augment fragment's members claim
+    /// into the shared scope, matching the oracle's per-element
+    /// `instanceScope`/`staticScope` accumulation.
+    finished_dup_scopes: NameMapBuilder<DupScope>,
+    /// The top-level setter claims (`definedSetters`, upstream
+    /// duplicate_definition_verifier.dart checkUnit): a non-final
+    /// top-level variable claims its induced `name=` setter alongside
+    /// its getter, so a later `set name` or a same-name setter claim
+    /// collides here; `decls` keys the induced setter under `name=`
+    /// only when a real setter declares it.
+    top_setters: NameMapBuilder<()>,
     /// Declaration-order container names and the unit's extension faces;
     /// sealed into boxed slices at [`Builder::finish`].
     container_order: Vec<StringId>,
@@ -388,6 +436,11 @@ struct Builder<'src, 'tab> {
     /// Capture-time duplicate/arity logs; sealed into boxed slices at
     /// [`Builder::finish`].
     duplicates: Vec<DuplicateDecl>,
+    /// Wildcard-`_` second declarations (same shape as `duplicates`, a
+    /// separate log — upstream `_` declarations never collide under the
+    /// wildcards feature, so these rows emit conditionally at diagnose
+    /// time rather than unconditionally from `duplicates`).
+    wildcard_dups: Vec<DuplicateDecl>,
     arity_violations: Vec<ArityDecl>,
     /// The anonymous-method invocations, sealed into the model's
     /// `anon_methods` at [`Builder::finish`] (the
@@ -469,6 +522,11 @@ struct Builder<'src, 'tab> {
     field_external: bool,
     /// The field group's `final` modifier (the abstract-field setter split).
     field_final: bool,
+    /// The field group's `late` modifier: `late final` declares a setter
+    /// only while the declarator has no initializer (the induced-accessor
+    /// fact `field.definesSetter` reads, upstream
+    /// member_duplicate_definition_verifier.dart:128-149).
+    field_late: bool,
     /// The field group's `augment` keyword span (`begin_fields` latches,
     /// `end_fields`/`end_top_level_fields` clears) — every group member is
     /// an augmentation declaration.
@@ -506,6 +564,22 @@ struct Builder<'src, 'tab> {
     /// (a body closure's own group is a no-op); `end_constructor` flushes
     /// it into the open container's `ctor_formals`.
     pending_ctor_formals: Option<(StringId, Option<Box<Formals>>)>,
+    /// The constructor's own metadata star, claimed at
+    /// `begin_constructor`/`begin_factory` (the star precedes the
+    /// declaration's name); flushed into the model's `ctor_annotations`
+    /// side-map at the end event under the SAME lookup spelling the
+    /// formal table seals on (the selector for `A.named`, the class name
+    /// for the unnamed face — `note_constructor_continuation` rewrites it
+    /// exactly like the formals key). Constructors carry no
+    /// [`MemberEntry`], so the star joins beside the container face.
+    pending_ctor_annotations: Vec<Annotation>,
+    /// The metadata star latched at the current depth-1 formal parameter's
+    /// own `begin` — `end_formal_parameter` drains it into the
+    /// `formal_annotations` side-map under the resolved owner join. Empty
+    /// outside a formal that claimed a star (a formal's own pending
+    /// buffer is separate so a local annotation inside a default never
+    /// reaches the declaration face).
+    formal_param_annotations: Vec<Annotation>,
     /// Formal-nesting depth; the executable's own group is depth 1.
     formal_depth: u32,
     /// The open default-value expression's nesting depth
@@ -588,21 +662,53 @@ struct Builder<'src, 'tab> {
     /// The metadata star of the declaration that opens next, in written
     /// order (`crate::model::Annotation`). Sealed at `end_metadata`,
     /// claimed by the declaration it precedes — a container open, a member
-    /// begin (`begin_method`), an enum-value name, or a field group latch —
-    /// and dropped at every other declaration boundary: annotations bind to
-    /// the declaration they directly precede.
+    /// begin (`begin_method`), an enum-value name, a field group latch, or
+    /// a top-level executable/typedef (`begin_top_level_method` /
+    /// `begin_typedef` ride the same pending buffer — the star still
+    /// binds to the declaration it directly precedes) — and dropped at
+    /// every other declaration boundary: annotations bind to the
+    /// declaration they directly precede.
     pending_annotations: Vec<Annotation>,
     /// The open field group's metadata star, latched at `begin_fields` (the
     /// group's star precedes the group, not its first name) and copied into
     /// every [`MemberEntry`] the group's names build (`@meta int a, b;`
     /// annotates both). Cleared at the group's end; the top-level-variable
-    /// branch never reads it, which is exactly the old drop.
+    /// branch reads the same latch — a top-level variable group's star is
+    /// the declaration's, not a member's.
     field_annotations: Vec<Annotation>,
     /// The annotation being parsed (open between `begin_metadata` and
     /// `end_metadata`): the head name latches at `MetadataReference`,
     /// qualified segments join, `end_metadata` seals the entry. `None`
     /// outside a metadata star at top level.
     open_annotation: Option<Annotation>,
+    /// The formal-parameter metadata stars of the unit's executables, keyed
+    /// by the owner's dot-joined one-head spelling — a top-level `f` under
+    /// its name, a member `m` of container `C` under `C.m`, a constructor
+    /// under `C.<key>` with `ctor_formals`'s key — to each formal's name,
+    /// to that formal's star (the `deprecated_member_use` parameter face's
+    /// model side; upstream `element_usage_detector.dart`'s
+    /// `_visitParametersAndArguments` pairs the call site's labels against
+    /// the declaration's own table). Side-map, not a [`Formal`] column —
+    /// the `Copy` formal shape is field-frozen by foreign literal
+    /// constructions.
+    formal_annotations: NameMapBuilder<NameMapBuilder<Box<[crate::model::Annotation]>>>,
+    /// The constructor and factory metadata stars of the unit's containers,
+    /// keyed by `ctor_formals`/`factory_formals`'s lookup spelling (the
+    /// selector for `A.named`, the container's name for the unnamed face):
+    /// container name → key → the star. Constructors carry no
+    /// [`MemberEntry`] row, so their star joins the model beside
+    /// [`Container::annotations`] — the deprecated named-constructor face's
+    /// model side (upstream anchors on the creation's constructor-name
+    /// element).
+    ctor_annotations: NameMapBuilder<NameMapBuilder<Box<[crate::model::Annotation]>>>,
+    /// The `library` directive's own metadata star (`@deprecated library
+    /// lib;`): the whole-file frontier the member-use reporter reads —
+    /// upstream's `ElementUsageFrontierDetector` pushes the LIBRARY
+    /// element's tags onto the same sticky stacks as every declaration's,
+    /// so a deprecated library silences the tag across its whole unit
+    /// (upstream `element_usage_frontier_detector.dart`'s
+    /// `pushElement(_currentLibrary)` — best_practices_verifier.dart:166).
+    library_annotations: Vec<Annotation>,
 }
 
 impl<'src, 'tab> Builder<'src, 'tab> {
@@ -617,9 +723,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             top_const_group: false,
             named_containers: NameMapBuilder::default(),
             containers: Vec::new(),
+            finished_dup_scopes: NameMapBuilder::default(),
+            top_setters: NameMapBuilder::default(),
             container_order: Vec::new(),
             extension_faces: Vec::new(),
             duplicates: Vec::new(),
+            wildcard_dups: Vec::new(),
             arity_violations: Vec::new(),
             anon_methods: Vec::new(),
             pending_anon: Vec::new(),
@@ -641,6 +750,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             field_abstract: false,
             field_external: false,
             field_final: false,
+            field_late: false,
             field_augment: None,
             field_static: None,
             pending_member: None,
@@ -652,6 +762,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             factory_ctor_open: false,
             factory_ctor_head: None,
             pending_ctor_formals: None,
+            pending_ctor_annotations: Vec::new(),
+            formal_param_annotations: Vec::new(),
             formal_depth: 0,
             formal_default_depth: 0,
             positional_formals: Vec::new(),
@@ -676,6 +788,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_annotations: Vec::new(),
             field_annotations: Vec::new(),
             open_annotation: None,
+            formal_annotations: NameMapBuilder::default(),
+            ctor_annotations: NameMapBuilder::default(),
+            library_annotations: Vec::new(),
         }
     }
 
@@ -723,9 +838,93 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.duplicates.push(DuplicateDecl { name, range });
     }
 
+    /// Records a duplicate whose name is the wildcard `_` (upstream
+    /// `isWildcardVariable`, duplicate_definition_verifier.dart:350-360 —
+    /// the variable declares nothing under the feature). The row parks in
+    /// the wildcard log; the diagnose pass emits it only when the feature
+    /// is off for the unit's language version.
+    fn record_wildcard_duplicate(&mut self, range: SourceRange) {
+        self.wildcard_dups.push(DuplicateDecl {
+            name: self.strings.intern("_"),
+            range,
+        });
+    }
+
     /// Records a declaration-arity violation.
     fn record_arity(&mut self, violation: ArityViolation, range: SourceRange) {
         self.arity_violations.push(ArityDecl { violation, range });
+    }
+
+    /// Claims `bare` (the member's BARE lexeme — a setter `foo` claims
+    /// `foo`, upstream keys every fragment by `nameToken.lexeme`) in the
+    /// open container's instance or static duplicate scope, reporting a
+    /// `duplicate_definition` when the claim collides. The transition
+    /// table mirrors `_ScopeEntryGetterSetterPair`
+    /// (member_duplicate_definition_verifier.dart:320-334): a lone
+    /// getter accepts a lone setter into a pair (and vice versa); every
+    /// other occupied claim is a duplicate. `claim` is one of
+    /// `DUP_GETTER`/`DUP_SETTER`/`DUP_OTHER`; augment members never reach
+    /// here (their fragments neither check nor claim, upstream :307-309).
+    ///
+    /// An unnamed container (an unnamed extension) claims only in its own
+    /// scope — the finished-scope merge keys on the container name.
+    fn member_dup_claim(&mut self, bare: StringId, is_static: bool, claim: u8, range: SourceRange) {
+        let Some(open) = self.containers.last_mut() else {
+            return;
+        };
+        // The open scope first, then the finished scope this container's
+        // name already accumulated (same-name fragments share the
+        // element's scopes).
+        let scope = if is_static {
+            &mut open.dup_static
+        } else {
+            &mut open.dup_instance
+        };
+        let prior_open = match scope.entry(bare) {
+            Entry::Vacant(_) => None,
+            Entry::Occupied(bits) => Some(*bits),
+        };
+        let prior = prior_open.or_else(|| {
+            let (name, _) = open.name?;
+            let finished = self.finished_dup_scopes.get(&name)?;
+            let bits = if is_static {
+                finished.static_.get(&bare)
+            } else {
+                finished.instance.get(&bare)
+            };
+            bits.copied()
+        });
+        match prior {
+            None => {
+                scope.insert(bare, claim);
+            }
+            Some(DUP_GETTER) if claim == DUP_SETTER => {
+                scope.insert(bare, DUP_PAIR);
+            }
+            Some(DUP_SETTER) if claim == DUP_GETTER => {
+                scope.insert(bare, DUP_PAIR);
+            }
+            _ => {
+                self.record_duplicate(bare, range);
+            }
+        }
+    }
+
+    /// Whether the current declarator carries an initializer: the same
+    /// declaration-site byte-scan posture as
+    /// [`Self::numeric_initializer_ty`] — whitespace-skipping read from the
+    /// name's byte end, `=` (not `==`, which a field group never writes in
+    /// the declarator slot) means initialized, `,`/`;`/end means none.
+    /// `name_end` is the name token's UTF-16 span end converted to a byte
+    /// offset by the caller (the group's `is_ascii` fast path covers the
+    /// common case).
+    fn has_initializer(&self, name_end: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = name_end as usize;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        bytes.get(i) == Some(&b'=') && bytes.get(i + 1) != Some(&b'=')
     }
 
     /// Declares a top-level name, logging a duplicate when taken. An
@@ -734,6 +933,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// `duplicate_definition` for same-name introductions only).
     fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) {
         let augmenting = self.declaring_augment;
+        let setter_spelling = self.is_setter_spelling(name);
         match self.decls.entry(name) {
             // A type parameter's placeholder (declaration-scoped in truth)
             // never collides with a top-level declaration: the real
@@ -742,9 +942,41 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 self.decls.insert(name, decl);
             }
             Entry::Occupied(_) if augmenting => {}
+            // A `name=` spelling is a top-level setter: its collision
+            // surface is `top_setters` (`definedSetters`), which already
+            // reported — `decls` stays the model face only.
+            Entry::Occupied(_) if setter_spelling => {}
             Entry::Occupied(_) => self.record_duplicate(name, range),
             Entry::Vacant(slot) => {
                 slot.insert(decl);
+            }
+        }
+    }
+
+    /// Whether the spelling is a setter's `name=` lookup spelling.
+    fn is_setter_spelling(&self, name: StringId) -> bool {
+        self.strings.resolve(name).ends_with('=')
+    }
+
+    /// The setter-side half of the top-level duplicate check (upstream
+    /// `checkUnit`'s `definedSetters`, duplicate_definition_verifier.dart
+    /// :116-307): `spelling` is the `name=` lookup spelling. A non-final
+    /// top-level variable claims its induced `name=` setter here
+    /// alongside its `decls` getter claim; a real `set name` collides
+    /// with that claim — or with a real setter already claimed — and
+    /// reports under the `name=` spelling (the oracle's `lookupName`,
+    /// which renders `f=`). An `augment` declaration neither checks nor
+    /// claims.
+    fn declare_top_setter(&mut self, spelling: StringId, range: SourceRange) {
+        if self.declaring_augment {
+            return;
+        }
+        match self.top_setters.entry(spelling) {
+            Entry::Occupied(_) => {
+                self.record_duplicate(spelling, range);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(());
             }
         }
     }
@@ -1612,6 +1844,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             is_interface: false,
             is_mixin_class: false,
             members: NameMapBuilder::default(),
+            dup_instance: NameMapBuilder::default(),
+            dup_static: NameMapBuilder::default(),
             type_params: header_type_params,
             type_param_names,
             type_param_bounds,
@@ -1721,6 +1955,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 type_param_names,
                 type_param_bounds,
                 members: members.finish(),
+                // The unnamed face keeps the same star the container open
+                // claimed — the application-use reporter answers the
+                // extension's tag off the face itself.
+                annotations: open.annotations.clone().into_boxed_slice(),
             });
             return;
         }
@@ -1737,6 +1975,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 type_param_names: type_param_names.clone(),
                 type_param_bounds: type_param_bounds.clone(),
                 members: members.clone().finish(),
+                // The same star the container row seals below — the face's
+                // own copy so the use reporter never joins the container.
+                annotations: open.annotations.clone().into_boxed_slice(),
             });
         }
         if let Some((name, _range)) = open.name {
@@ -1776,6 +2017,34 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 factory_formals: open.factory_formals.finish(),
                 annotations: open.annotations.into_boxed_slice(),
             });
+        }
+        // The closed container's member-claim bitmasks merge into the
+        // per-name finished scope: a same-named declaration later in the
+        // unit (an `augment` fragment re-opening the element's scopes, or
+        // a part-mate sharing the name) claims into the same scope — the
+        // oracle's scopes live on the element, not the fragment
+        // (member_duplicate_definition_verifier.dart `_InstanceElementContext`
+        // :657-677). Unnamed containers claim nothing anywhere.
+        if let Some((name, _)) = open.name {
+            let instance = open.dup_instance.finish();
+            let static_ = open.dup_static.finish();
+            if !instance.is_empty() || !static_.is_empty() {
+                let scope = self
+                    .finished_dup_scopes
+                    .or_insert_with(name, DupScope::default);
+                let merge = |dst: &mut NameMap<u8>, src: &NameMap<u8>| {
+                    let mut rows: Vec<(StringId, u8)> = dst.iter().map(|&(k, v)| (k, v)).collect();
+                    for &(member, bits) in src.iter() {
+                        match rows.binary_search_by_key(&member, |&(k, _)| k) {
+                            Ok(i) => rows[i].1 |= bits,
+                            Err(i) => rows.insert(i, (member, bits)),
+                        }
+                    }
+                    *dst = rows.into_iter().collect();
+                };
+                merge(&mut scope.instance, &instance);
+                merge(&mut scope.static_, &static_);
+            }
         }
         // Extension headers capture no residue (their window's types latch
         // through `note_header_reference`, not the clause buffer), so
@@ -2023,6 +2292,52 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
     }
 
+    /// The dot-joined owner spelling the depth-1 formal belongs to — the
+    /// `formal_annotations` side-map's key. A member `m` of container `C`
+    /// keys under `C.m`; a top-level `f` under `f`; a constructor or
+    /// factory under `C.<key>` where `<key>` is `ctor_formals`'s lookup
+    /// spelling (the selector for `A.named`, the class name for the
+    /// unnamed face — `pending_ctor_formals`'s key carries exactly that,
+    /// already rewritten by `note_constructor_continuation`). `None` when
+    /// no executable owns the formal (a function-type shape's nested list,
+    /// or a name the collector cannot join — the tag-absent direction).
+    fn formal_owner_key(&self) -> Option<StringId> {
+        if let Some(pending) = &self.pending_member
+            && let Some((member, _, _)) = pending.shape
+            && let Some((container, _)) = self.containers.last().and_then(|open| open.name)
+        {
+            let joined = format!(
+                "{}.{}",
+                self.strings.resolve(container),
+                self.strings.resolve(member)
+            );
+            return Some(self.strings.intern(&joined));
+        }
+        if let Some(pending) = &self.pending_top
+            && let Some((name, _)) = pending.name
+        {
+            return Some(name);
+        }
+        if let Some((key, _)) = &self.pending_ctor_formals
+            && let Some((container, _)) = self.containers.last().and_then(|open| open.name)
+        {
+            let joined = format!(
+                "{}.{}",
+                self.strings.resolve(container),
+                self.strings.resolve(*key)
+            );
+            return Some(self.strings.intern(&joined));
+        }
+        if let Some(pending) = &self.pending_typedef
+            && let Some((name, _)) = pending.name
+        {
+            // A typedef's own formal list (the old-style `typedef fx(x)`)
+            // is the declaration's own group — the owner is the alias.
+            return Some(name);
+        }
+        None
+    }
+
     /// Attaches the depth-0 formal group to the pending executable, once.
     /// The constructor arm is first-wins like the member arm: a body
     /// closure's own group re-fires this at depth 0→1 after the header
@@ -2152,13 +2467,29 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             container_order: self.container_order.into_boxed_slice(),
             extension_faces: self.extension_faces.into_boxed_slice(),
             duplicates: self.duplicates.into_boxed_slice(),
+            wildcard_duplicates: self.wildcard_dups.into_boxed_slice(),
             arity_violations: self.arity_violations.into_boxed_slice(),
             anon_methods: self.anon_methods.into_boxed_slice(),
             augmentations: self.augmentations.into_boxed_slice(),
             decl_kinds: self.decl_kinds.into_boxed_slice(),
+            formal_annotations: finish_nested(self.formal_annotations),
+            ctor_annotations: finish_nested(self.ctor_annotations),
+            library_annotations: self.library_annotations.into_boxed_slice(),
             type_args: self.type_args,
         }
     }
+}
+
+/// Seals a nested owner-keyed builder (`name → name → value`) into the
+/// model's immutable map — the side-map columns keep-first at both levels,
+/// sealed at exact length like every other finished face.
+fn finish_nested<V: Clone>(builder: NameMapBuilder<NameMapBuilder<V>>) -> NameMap<NameMap<V>> {
+    let outer = builder.finish();
+    let rows: Vec<(StringId, NameMap<V>)> = outer
+        .iter()
+        .map(|(name, inner)| (*name, inner.clone().finish()))
+        .collect();
+    NameMap::from_iter(rows)
 }
 
 /// The [`ParserListener`] implementation feeding a `Builder`: driven
@@ -2247,7 +2578,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn begin_library_name(&mut self, _token: Token) {
-        self.builder.drop_pending_annotations();
+        // `@deprecated library lib;` — the directive's own star is the
+        // whole-file frontier the member-use reporter reads (upstream's
+        // frontier detector pushes the LIBRARY element's tags like any
+        // declaration's). Take it instead of dropping.
+        self.builder.library_annotations = std::mem::take(&mut self.builder.pending_annotations);
     }
 
     fn begin_library_augmentation(&mut self, _augment_kw: Token, _library_keyword: Token) {
@@ -3077,10 +3412,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     let is_abstract = builder.field_abstract;
                     let is_external = builder.field_external;
                     let is_final = builder.field_final;
+                    let field_late = builder.field_late;
+                    let name_end = if builder.source.is_ascii() {
+                        range.end()
+                    } else {
+                        dartq_source::utf16_offset_to_byte(builder.source, range.end()) as u32
+                    };
+                    // The `late final` initializer face (`definesSetter`
+                    // reads it): computed before the container borrow
+                    // below, which `open` holds across the member insert.
+                    let has_init = builder.has_initializer(name_end);
                     if context == IdentifierContext::TopLevelVariableDeclaration {
-                        // The const-creation face capture rides the same
-                        // UTF-16 → byte conversion the inference scanners
-                        // use (the name span is UTF-16).
                         if builder.top_const_group {
                             let name_end = if builder.source.is_ascii() {
                                 range.end()
@@ -3151,14 +3493,40 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 var_ty: ty,
                                 return_ty: Ty::UNKNOWN,
                                 formals: None,
+                                // The group star latched at `begin_fields`
+                                // (`@deprecated int a, b;` annotates both
+                                // declarators) — a top-level variable's
+                                // star IS the declaration's, so the use-face
+                                // reporter reads it off the decl row.
+                                annotations: builder.field_annotations.clone().into_boxed_slice(),
                             },
                         );
+                        // The induced setter joins `definedSetters` — a
+                        // non-final top-level variable claims `name=` so a
+                        // later `set name` reports the `f=` face (upstream
+                        // `declaredElement.definesSetter`, checkUnit
+                        // TopLevelVariableDeclaration arm): every
+                        // non-final variable, plus `late final` only while
+                        // the declarator carries no initializer. `const`
+                        // groups set `top_const_group`, not `field_final`
+                        // — fold it into the finality here.
+                        let effectively_final = is_final || builder.top_const_group;
+                        if !effectively_final || (field_late && is_final && !has_init) {
+                            let setter = builder.setter_spelling(name);
+                            builder.declare_top_setter(setter, range);
+                        }
                     } else if let Some(open) = builder.containers.last_mut() {
                         // The group's latched star rides every group member
                         // (`@meta int a, b;` annotates both).
                         let annotations = builder.field_annotations.clone().into_boxed_slice();
                         let augmenting = builder.field_augment;
-                        let duplicate = match open.members.entry(name) {
+                        // The induced-setter fact before the borrow below
+                        // (`field.definesSetter` — upstream
+                        // member_duplicate_definition_verifier.dart:128-149):
+                        // every non-final field, plus `late final` only
+                        // while the declarator carries no initializer.
+                        let defines_setter = !is_final || (field_late && is_final && !has_init);
+                        match open.members.entry(name) {
                             Entry::Vacant(slot) => {
                                 slot.insert(MemberEntry {
                                     kind: MemberKind::Field,
@@ -3175,21 +3543,25 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     annotations,
                                     name_range: range,
                                 });
-                                false
                             }
-                            // Same-bit collision: the second field is a
-                            // duplicate. Keep-first; a cross-bit coexistence
-                            // is `conflicting_static_and_instance`'s
-                            // business, not a duplicate. An `augment` group
-                            // never duplicates: augmenting an existing field
-                            // is the augmentation face's business.
-                            Entry::Occupied(existing) => {
-                                existing.is_static == is_static && augmenting.is_none()
-                            }
-                        };
+                            // Keep-first: the second field leaves the map
+                            // untouched; the duplicate-scope claim below is
+                            // the collision surface (the oracle's scope,
+                            // not the member map, is what pairs a lone
+                            // getter with a lone setter).
+                            Entry::Occupied(_) => {}
+                        }
+                        // The member-scope claims the field's induced
+                        // accessors make (getter always, setter when
+                        // `definesSetter`). An augment group never checks
+                        // nor claims (upstream :307-309 — the augment
+                        // fragment returns before the scope claim).
                         let container = open.name.map(|(n, _)| n);
-                        if duplicate {
-                            builder.record_duplicate(name, range);
+                        if augmenting.is_none() {
+                            builder.member_dup_claim(name, is_static, DUP_GETTER, range);
+                            if defines_setter {
+                                builder.member_dup_claim(name, is_static, DUP_SETTER, range);
+                            }
                         }
                         if let Some(augment_kw) = augmenting {
                             builder.augmentations.push(AugmentDecl {
@@ -3250,11 +3622,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 name_range: range,
                             });
                         }
-                        Entry::Occupied(existing) => {
-                            if existing.is_static {
-                                builder.record_duplicate(name, range);
-                            }
-                        }
+                        // Keep-first; the duplicate-scope claim below is
+                        // the collision surface.
+                        Entry::Occupied(_) => {}
+                    }
+                    // An enum constant claims the getter face in the static
+                    // scope (upstream pushes the constant's induced getter;
+                    // a `get e`/`set e` member pair collides there — the
+                    // `E.e1`-face rows of enhanced_enums_error_test).
+                    // An augment constant neither checks nor claims.
+                    if !builder.declaring_augment {
+                        builder.member_dup_claim(name, true, DUP_GETTER, range);
                     }
                 }
             }
@@ -3320,9 +3698,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if let Some((name, range)) = builder.capture_name(token) {
             // `duplicate_definition` compares type parameters per list
             // (`duplicate_definition_verifier.dart:124-135`); the unit-wide
-            // name set keeps its first entry only.
+            // name set keeps its first entry only. The scope behaves
+            // pre-feature (`_` claims the `_` slot like any name): a
+            // second `_` is wildcard-shaped — upstream `isWildcardVariable`
+            // skips it before the scope lookup when the feature is on —
+            // so its row parks in the wildcard log, emitted only when the
+            // unit's language version lacks wildcards.
             if builder.type_var_group.contains(&name) {
-                builder.record_duplicate(name, range);
+                if builder.strings.resolve(name) == "_" {
+                    builder.record_wildcard_duplicate(range);
+                } else {
+                    builder.record_duplicate(name, range);
+                }
             } else {
                 builder.type_var_group.push(name);
                 // The bound latches at the variable's `end_type_variable`;
@@ -3439,6 +3826,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_final = _var_final_or_const
             .and_then(|t| builder.tokens.get(t.id as usize))
             .is_some_and(|tok| &builder.source[tok.byte_range()] == "final");
+        builder.field_late = _late_kw.is_some();
         // A top-level `const` group opens the const-creation face's
         // capture window (member and local groups never latch it).
         builder.top_const_group = builder.containers.is_empty()
@@ -3472,6 +3860,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_late = false;
         builder.field_augment = None;
         builder.declaring_augment = false;
         builder.top_const_group = false;
@@ -3504,6 +3893,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_late = false;
         builder.field_augment = None;
         builder.declaring_augment = false;
         builder.top_const_group = false;
@@ -3705,6 +4095,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             let formals = pending.formals.as_deref();
             builder.drain_arity(name, kind, range, formals);
+            let mut minus_split_exempt = false;
             if let Some(open) = builder.containers.last_mut() {
                 let entry = MemberEntry {
                     kind,
@@ -3728,13 +4119,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     Entry::Vacant(slot) => {
                         slot.insert(entry);
                     }
-                    // Same-bit collisions are duplicates; cross-bit ones are not.
-                    // The `unary -`/`binary -` pair is exempt: Dart keeps
-                    // the two signatures as distinct members (0 vs 1
-                    // positional formals), so an `operator -()` beside
-                    // `operator -(o)` is not a redeclaration (the oracle's
-                    // `operator_minus` count table already reflects the
-                    // split — the pair only duplicates a same-arity `-`).
+                    // Keep-first; the duplicate-scope claim below is the
+                    // collision surface. The `unary -`/`binary -` pair is
+                    // exempt from it: Dart keeps the two signatures as
+                    // distinct members (0 vs 1 positional formals), so an
+                    // `operator -()` beside `operator -(o)` is not a
+                    // redeclaration (the oracle's `operator_minus` count
+                    // table already reflects the split — the pair only
+                    // duplicates a same-arity `-`). The exemption reads
+                    // the KEPT entry's arity, so it needs the occupied
+                    // row.
                     Entry::Occupied(existing) => {
                         let arity = |e: &MemberEntry| {
                             e.formals.as_ref().map_or(u16::MAX, |f| {
@@ -3746,13 +4140,35 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             && existing.kind == MemberKind::Method
                             && entry.kind == MemberKind::Method
                             && arity(existing) != arity(&entry);
-                        if existing.is_static == pending.is_static
-                            && !is_minus_split
-                            && !builder.declaring_augment
-                        {
-                            builder.record_duplicate(name, range);
+                        if is_minus_split {
+                            minus_split_exempt = true;
                         }
                     }
+                }
+                // The member-scope claim the executable's accessor face
+                // makes (upstream `_checkDuplicateIdentifier` keys a setter
+                // by its bare lexeme and merges a lone getter/setter pair;
+                // methods and operators claim `OTHER`). A same-name claim
+                // in the other staticness scope is `conflicting_static_
+                // and_instance`'s business — separate scopes like the
+                // oracle's. An augment member neither checks nor claims.
+                if !builder.declaring_augment && !minus_split_exempt {
+                    let claim = match kind {
+                        MemberKind::Getter => DUP_GETTER,
+                        MemberKind::Setter => DUP_SETTER,
+                        _ => DUP_OTHER,
+                    };
+                    // The scope keys the BARE lexeme — the written setter
+                    // `foo` claims `foo`, not the `foo=` map spelling.
+                    let bare = if kind == MemberKind::Setter {
+                        let text = builder.strings.resolve(name);
+                        builder
+                            .strings
+                            .intern(text.strip_suffix('=').unwrap_or(text))
+                    } else {
+                        name
+                    };
+                    builder.member_dup_claim(bare, pending.is_static, claim, range);
                 }
             }
         }
@@ -3770,7 +4186,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         external: Option<Token>,
     ) {
         let builder = &mut self.builder;
-        builder.drop_pending_annotations();
+        // The star preceding the function belongs to it — the same claim
+        // `begin_method` makes for a member: body-local metadata pends
+        // after this take and drops at the end, never joining the
+        // declaration's own row.
+        let annotations = std::mem::take(&mut builder.pending_annotations);
         builder.pending_top = Some(PendingTop {
             name: None,
             type_params: 0,
@@ -3779,6 +4199,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             formals: None,
             is_external: external.is_some(),
             has_body: false,
+            annotations,
         });
         builder.declaring_augment = augment.is_some();
         if let Some(kw) = augment {
@@ -3931,8 +4352,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,
+                    annotations: pending.annotations.into_boxed_slice(),
                 },
             );
+            // The setter-scope claim `definedSetters` sees (a getter or
+            // method claims only `decls`). `set f` reports its own
+            // duplicate through `top_setters` — `decls` stays the model
+            // face only for `=` spellings.
+            if setter {
+                builder.declare_top_setter(spelling, range);
+            }
         }
         builder.declaring_augment = false;
         builder.executable_header_done = false;
@@ -3940,13 +4369,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_typedef(&mut self, _token: Token) {
         let builder = &mut self.builder;
-        builder.drop_pending_annotations();
+        // The star preceding the alias belongs to it — claimed like the
+        // top-level executable's own star so a body-local star never joins.
+        let annotations = std::mem::take(&mut builder.pending_annotations);
         builder.pending_typedef = Some(PendingTypedef {
             name: None,
             type_params: 0,
             type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
+            annotations,
         });
         // The typedef opens a fresh declaration header: a preceding
         // declaration's (or a previous typedef RHS's) closed formal list
@@ -3971,7 +4403,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         const_keyword: Option<Token>,
     ) {
         let builder = &mut self.builder;
-        builder.drop_pending_annotations();
+        // A factory's star is the declaration's own — same claim as
+        // `begin_constructor` (the factory's use-face joins the
+        // `ctor_annotations` side-map under its formal-table key).
+        builder.pending_ctor_annotations = std::mem::take(&mut builder.pending_annotations);
         let factory_is_const = const_keyword.is_some();
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
@@ -4153,11 +4588,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // generative arm.
         if !declaring_augment_factory
             && let Some((key, formals)) = builder.pending_ctor_formals.take()
-            && let Some(formals) = formals
             && let Some(open) = builder.containers.last_mut()
         {
-            open.factory_formals.insert(key, formals);
+            if let Some(formals) = formals {
+                open.factory_formals.insert(key, formals);
+            }
+            // The factory's star joins the same side-map under its own
+            // lookup spelling (the factory-creation face's constructor key).
+            if !builder.pending_ctor_annotations.is_empty()
+                && let Some((container, _)) = open.name
+            {
+                builder
+                    .ctor_annotations
+                    .or_insert_with(container, NameMapBuilder::default)
+                    .insert(
+                        key,
+                        std::mem::take(&mut builder.pending_ctor_annotations)
+                            .into_boxed_slice(),
+                    );
+            }
         }
+        builder.pending_ctor_annotations.clear();
         builder.factory_ctor_head = None;
     }
 
@@ -4176,10 +4627,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _enclosing_declaration_name: Option<&str>,
     ) {
         let builder = &mut self.builder;
-        // The star preceding the constructor binds to no modeled row (the
-        // model keeps no constructor entry) — claim it so it can neither
-        // leak into the next member nor into the next container's star.
-        builder.drop_pending_annotations();
+        // The star preceding the constructor belongs to it (the
+        // `deprecated_member_use` face's named-constructor arm reads it
+        // off the `ctor_annotations` side-map — the model keeps no
+        // constructor MemberEntry row, so the star joins beside the
+        // container). Claim it like `begin_method`'s own take; a
+        // body-local star pends after this and drops at the end.
+        builder.pending_ctor_annotations = std::mem::take(&mut builder.pending_annotations);
         // The unnamed shape is the constructor's declared name matching the
         // enclosing class (`A()` — or the head recovered); a mismatched
         // factory selector (`class G { factory H() ... }`) declares a NAMED
@@ -4390,14 +4844,33 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // shape, never the augment's).
         if !declaring_augment_ctor
             && let Some((key, formals)) = builder.pending_ctor_formals.take()
-            && let Some(formals) = formals
             && let Some(open) = builder.containers.last_mut()
         {
-            open.ctor_formals.insert(key, formals);
+            if let Some(formals) = formals {
+                open.ctor_formals.insert(key, formals);
+            }
+            // The constructor's own star joins the side-map under the SAME
+            // lookup spelling its formal table sealed on (`A.named` reads
+            // the selector; `A()`/`A.new` the class name — the formal
+            // table's key rewrite in `note_constructor_continuation` is
+            // exactly the key this star takes).
+            if !builder.pending_ctor_annotations.is_empty()
+                && let Some((container, _)) = open.name
+            {
+                builder
+                    .ctor_annotations
+                    .or_insert_with(container, NameMapBuilder::default)
+                    .insert(
+                        key,
+                        std::mem::take(&mut builder.pending_ctor_annotations)
+                            .into_boxed_slice(),
+                    );
+            }
         }
         // Anything buffered inside the body or the parameter list
         // (local-declaration and parameter metadata) binds to no modeled
         // row — drop it with the constructor.
+        builder.pending_ctor_annotations.clear();
         builder.drop_pending_annotations();
     }
 
@@ -4531,6 +5004,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     var_ty,
                     return_ty: Ty::UNKNOWN,
                     formals: None,
+                    annotations: pending.annotations.into_boxed_slice(),
                 },
             );
         }
@@ -4808,6 +5282,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 required.map(|t| builder.span_of(t)),
             ));
         }
+        // The star preceding a depth-1 formal binds to it — the
+        // `deprecated_member_use` parameter face's model side (upstream
+        // `element_usage_detector.dart`'s
+        // `_visitParametersAndArguments` reads the PARAMETER's metadata).
+        // `end_formal_parameter` drains this latch under the resolved
+        // owner join; a star that pends outside a depth-1 formal stays in
+        // `pending_annotations` for the declaration boundary to claim.
+        if builder.formal_depth == 1 && !builder.pending_annotations.is_empty() {
+            builder.formal_param_annotations = std::mem::take(&mut builder.pending_annotations);
+        } else {
+            builder.formal_param_annotations.clear();
+        }
     }
 
     fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
@@ -4984,6 +5470,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 annotations: Box::default(),
                 name_range: range,
             });
+            // The declaring formal's field claims the instance getter face
+            // (upstream `checkPrimaryConstructorFormals` walks the induced
+            // accessor; the field's `is_final` capture hardcodes false
+            // below — a latent under-report on `final` declaring formals'
+            // setter claim, ledger).
+            builder.member_dup_claim(name, false, DUP_GETTER, range);
         }
         // A positional `super.name` formal carries the marker so the
         // use-site patch can count the forwards preceding it
@@ -5043,17 +5535,68 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 default_value
             },
         };
-        if matches!(
+        // `checkParameters` shares ONE `_FormalParameterDuplicateIdentifierScope`
+        // across the whole list — a positional formal's name collides with a
+        // named formal's and vice versa (duplicate_definition_verifier.dart
+        // :56-82; the `parameters_*` census rows report positional collisions
+        // the named-only scan missed). The wildcard gate: `this._` is a
+        // FieldFormalParameterElement — never a wildcard — while `super._`
+        // and a `var`/`final` primary-constructor declaring formal are
+        // ordinary parameters and DO wildcard (upstream :444-457 reads the
+        // element kind, not the keyword). A second `_` therefore parks in
+        // the wildcard log unless it is a `this.` formal.
+        let is_named = matches!(
             kind,
             FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
-        ) {
-            // Duplicate named formals are `duplicate_definition`s
-            // (`checkParameters`, duplicate_definition_verifier.dart:71-90).
-            if builder.named_formals.iter().any(|f| f.name == name) {
-                builder.record_duplicate(name, range);
+        );
+        let dup_hit = builder.positional_formals.iter().any(|f| f.name == name)
+            || builder.named_formals.iter().any(|f| f.name == name);
+        if dup_hit {
+            let wildcard = builder.strings.resolve(name) == "_"
+                && this_keyword.is_none()
+                && !(member_kind == ParserMemberKind::PrimaryConstructor && var_or_final.is_some());
+            if wildcard {
+                builder.record_wildcard_duplicate(range);
             } else {
-                builder.named_formals.push(formal);
+                builder.record_duplicate(name, range);
             }
+        }
+        // The formal's own star — drained from the latch `begin_formal_
+        // parameter` armed — joins the side-map under the resolved owner
+        // join (the `deprecated_member_use` parameter face reads it off
+        // the call site's label pairing). A local/anonymous or
+        // function-typed shape's formal binds to no modeled owner — its
+        // star drops (the declaration's own pending buffer is untouched).
+        // Empty when the formal carried no metadata (the tag-absent
+        // direction).
+        let modeled_owner = matches!(
+            member_kind,
+            ParserMemberKind::NonStaticMethod
+                | ParserMemberKind::StaticMethod
+                | ParserMemberKind::TopLevelMethod
+                | ParserMemberKind::ExtensionNonStaticMethod
+                | ParserMemberKind::ExtensionStaticMethod
+                | ParserMemberKind::ExtensionTypeNonStaticMethod
+                | ParserMemberKind::ExtensionTypeStaticMethod
+                | ParserMemberKind::PrimaryConstructor
+                | ParserMemberKind::Factory
+        );
+        if modeled_owner
+            && !builder.formal_param_annotations.is_empty()
+            && let Some(owner) = builder.formal_owner_key()
+        {
+            builder
+                .formal_annotations
+                .or_insert_with(owner, NameMapBuilder::default)
+                .insert(
+                    name,
+                    std::mem::take(&mut builder.formal_param_annotations)
+                        .into_boxed_slice(),
+                );
+        }
+        builder.formal_param_annotations.clear();
+        if is_named {
+            builder.named_formals.push(formal);
         } else {
             builder.positional_formals.push(formal);
         }
@@ -5098,9 +5641,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 annotations: Box::default(),
                 name_range: range,
             });
+            // The representation field's induced getter claims the
+            // instance scope (the representation formal is `final` — no
+            // setter face).
+            builder.member_dup_claim(name, false, DUP_GETTER, range);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "diagnose/ticket_2934_tests.rs"]
+mod ticket_2934_tests;
 
 #[cfg(test)]
 mod tests {

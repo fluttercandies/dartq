@@ -93,6 +93,167 @@ impl DiagnoseListener<'_> {
             Some("Try adding a null check to the target ('!').".to_string()),
         ));
     }
+
+    /// The relational pattern's operand consult (#2917): the matched type
+    /// and the operator lexeme under the shared window — the open
+    /// switch's scrutinee exactly when every frame above the root is a
+    /// logical-or/and operand (the same posture the nullable twin
+    /// documents; a pattern under a record/list/map/object field frame
+    /// carries a property column the name level never descends into), and
+    /// `==`/`!=` excluded (both spell `operator ==`, which every type
+    /// resolves on `Object`).
+    fn relational_pattern_operand(&self, operator: Token) -> Option<(Ty, String)> {
+        let engine = &self.engine;
+        if !engine
+            .switch
+            .pattern_stack
+            .iter()
+            .skip(1)
+            .all(|frame| frame.binary.is_some())
+        {
+            return None;
+        }
+        let scrutinee = engine
+            .switch
+            .switches
+            .last()
+            .map_or(Ty::Unknown, |ctx| ctx.scrutinee);
+        let op_text = engine.text_of(operator)?.to_owned();
+        if op_text == "==" || op_text == "!=" {
+            return None;
+        }
+        Some((scrutinee, op_text))
+    }
+
+    /// The relational pattern's operator-definedness face (`case > 0` over
+    /// a class without `>`): the matched type answers the operator's
+    /// definedness, a miss reports `undefined_operator` at the pattern's
+    /// operator token (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/resolver.dart:1696-1731 —
+    /// `resolveRelationalPatternOperator` feeds `typePropertyResolver
+    /// .resolve` the matched type with `propertyErrorEntity: node.operator`,
+    /// and `needsGetterError` reports `undefinedOperator` there).
+    /// dynamic/void/unknown faces dispatch dynamically — silent. An
+    /// applicable extension operator resolves the consult silent, and a
+    /// scope-parameter matched value answers through its written bound
+    /// (the `resolveToBound` consult — the same composition the shared
+    /// operator-definedness face runs for the expression twins,
+    /// #2909's `adjacent_operator_defined`).
+    fn check_relational_pattern_operator(&mut self, operator: Token) {
+        let Some((scrutinee, op_text)) = self.relational_pattern_operand(operator) else {
+            return;
+        };
+        let engine = &mut self.engine;
+        // The extension walk runs on the alias-folded face (the nullable
+        // twin's posture): `typedef A = C` reaches `C`'s extensions through
+        // `C`, never through the alias spelling.
+        let face = engine.fold_alias_ty(scrutinee);
+        let probe = engine.intern(&op_text);
+        let defined = match &face {
+            Ty::Named { name, .. } => {
+                matches!(engine.walk_members(*name, probe), Walk::Found(_))
+                    || Self::relational_bound_defines(engine, *name, probe)
+                    || matches!(
+                        engine.extension_application(*name, face, probe, false, false),
+                        ExtensionApp::Single | ExtensionApp::UnsafeSingle
+                    )
+            }
+            // A record or function face declares no relational operator —
+            // the same verdict the applied-operator face reports with the
+            // full render.
+            Ty::Record { .. } | Ty::Function { .. } => false,
+            _ => true,
+        };
+        if defined {
+            return;
+        }
+        let type_text = match &face {
+            Ty::Record { .. } | Ty::Function { .. } => {
+                face.render(&engine.strings, &engine.boundary.pool())
+            }
+            Ty::Named { name, .. } => engine.strings.resolve(*name).to_owned(),
+            _ => return,
+        };
+        engine.emit(
+            SemanticCode::UndefinedOperator,
+            operator.range,
+            &op_text,
+            &type_text,
+        );
+    }
+
+    /// The scope-parameter bound's operator face (the upstream
+    /// `resolveToBound` consult — binary_expression_resolver.dart:461): a
+    /// parameter-typed matched value resolves the pattern's operator
+    /// through its written bound (`T extends num` keeps `case > 0`
+    /// silent). The captured windows survive the pass-2 frame teardown
+    /// ([`Engine::param_bound_of`]); a class-generic parameter stays
+    /// unmodeled (`None` — the under-report direction).
+    fn relational_bound_defines(engine: &Engine<'_>, name: StringId, probe: StringId) -> bool {
+        let Some(bound) = engine
+            .param_bound(name)
+            .or_else(|| engine.param_bound_of(name))
+        else {
+            return false;
+        };
+        let Ty::Named { name, .. } = engine.fold_alias_ty(bound) else {
+            return false;
+        };
+        matches!(engine.walk_members(name, probe), Walk::Found(_))
+    }
+
+    /// The increment/decrement operand's index-write marking (`a[0]++`):
+    /// the operand resolves for write with read (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/postfix_expression_resolver.dart
+    /// :35-37 `resolveForWrite(hasRead: true)` and the prefix twin at
+    /// prefix_expression_resolver.dart:50), so the index access needs BOTH
+    /// spellings — the write state the assignment junction's compound face
+    /// sets on the `[]` operator row (`mark_assignment`'s index arm).
+    /// Without it the `[]`/`[]=` both-missing pair stays half-silent
+    /// (`operator_spellings` answers the read spelling only). The
+    /// operand's folded stand-in row (the `]` token) sits directly above
+    /// the `[]` operator row; any other operand shape carries no index
+    /// write (an unfolded bracket — a group receiver — materialized no
+    /// operator row, and a nested `a[0][1]++` writes through a result the
+    /// dynamic suppression covers).
+    fn mark_index_compound_write(&mut self) {
+        let engine = &mut self.engine;
+        let index_op = engine.intern("[]");
+        let Some(mut top) = engine.rows.len().checked_sub(1) else {
+            return;
+        };
+        while matches!(engine.rows[top].shape, RowShape::TypeUse(..)) {
+            top = match top.checked_sub(1) {
+                Some(next) => next,
+                None => return,
+            };
+        }
+        if !matches!(engine.rows[top].shape, RowShape::Value) {
+            return;
+        }
+        let Some(below) = top.checked_sub(1) else {
+            return;
+        };
+        let stand_in = engine.rows[top].range;
+        let (hit, bracket_offset) = match &engine.rows[below].intent {
+            Intent::Operator(op, bracket) => (
+                *op == index_op
+                    && bracket.offset <= stand_in.offset
+                    && stand_in.end() <= bracket.end(),
+                bracket.offset,
+            ),
+            _ => (false, 0),
+        };
+        if hit {
+            engine.rows[below].write_op = Some(OpWrite::Compound);
+            // The compound index's argument check (`++a[i]`/`a[i]++`): the
+            // `[]`/`[]=` element pair both apply (`hasRead: true`) — the
+            // staged operand decides at the bracket (upstream Dart SDK
+            // source, `checkIndexExpressionIndex`,
+            // error_detection_helpers.dart:260-289).
+            engine.check_index_argument(bracket_offset, Some(OpWrite::Compound));
+        }
+    }
 }
 
 impl ParserListener for DiagnoseListener<'_> {
@@ -1032,6 +1193,15 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(capture) = engine.closure_caps.last_mut() {
             capture.poisoned = true;
         }
+        // #2937 (3c): the old-style formal's own signature capture — the
+        // nested list `(int p)` of `b(int p)` is the formal's parameter
+        // shape. The modern `Function(...)` face stashes a `FnVarSig` at
+        // `fn_capture_end`; the old-style spelling feeds the same per-formal
+        // machinery through a dedicated capture pushed here and sealed at
+        // `end_function_typed_formal_parameter` (the element model's formal
+        // keeps no callable record, so `fn_param_sigs` is the callee's only
+        // formals — upstream's `FunctionType` on the parameter element).
+        engine.fn_type_capture.push(FnTypeCapture::default());
         // #1463: the formal's name token is consumed without an identifier
         // event — latch the shape for the `end_formal_parameter` bind.
         engine.fn_typed_formal_open = true;
@@ -1439,6 +1609,12 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // A recovery path whose name event never fired drops the latch.
         engine.factory_ret_open = false;
+        // The completion staging reads the factory's frame (the container
+        // latched as the return at the name event) before it pops — the
+        // official walk checks factory constructors only
+        // (`resolver.dart`'s `factoryKeyword != null` gate; a generative
+        // constructor's body never stages).
+        engine.stage_body_completion(None, end);
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
         engine.pop_frame();
@@ -1549,6 +1725,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // channel (initializer / assignment / argument / return) keys on.
         let (ctx, ctx_from_arg) = engine.closure_context_ty(token.range.offset);
         engine.closure_capture_begin(token.range.offset, ctx, ctx_from_arg);
+        // The completion arm rides the same context: the context
+        // function's return arms the literal's frame (the official
+        // `imposedType` — the completion warning checks a closure under a
+        // typed context at its body brace).
+        engine.arm_closure_completion(ctx);
     }
 
     fn end_function_expression(&mut self, begin: Token, end: Token) {
@@ -1557,6 +1738,10 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         let literal_ty = engine.closure_capture_end(end.range.end());
         engine.const_capture.end_opaque_group(end.range);
+        // The completion staging reads the literal's frame (the context
+        // return armed at the begin, the body brace, the modifiers)
+        // before it pops.
+        engine.stage_body_completion(None, end);
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
         // The literal folds to one expression node upstream: its own
@@ -1622,12 +1807,22 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.open_exec_augment = false;
         }
         engine.push_executable_frame(instance);
+        // The named literal sits in the same expression slots as the
+        // anonymous form — the context resolves through the same channels
+        // and arms the completion face (the official checks a named
+        // function expression as a closure too: `isFunctionDeclaration`
+        // is a FunctionDeclaration parent, never a name).
+        let (ctx, _) = engine.closure_context_ty(token.range.offset);
+        engine.arm_closure_completion(ctx);
     }
 
     fn end_named_function_expression(&mut self, end: Token) {
         self.flow().end_named_function_expression(end);
 
         let engine = &mut self.engine;
+        // The completion staging reads the literal's frame before it pops
+        // (the context return armed at the begin, the body brace).
+        engine.stage_body_completion(None, end);
         // Same pop-before-materialize discipline as the declaration form.
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
@@ -2637,6 +2832,14 @@ impl ParserListener for DiagnoseListener<'_> {
                         None
                     };
                     engine.bind_declared_type(name);
+                } else if let Some(name) = engine.synthetic_name(token) {
+                    // The nameless recovery face (`name ?? '<unnamed>'`):
+                    // upstream registers a real `LocalVariableElement` with
+                    // a null name, so the tracked local joins under the
+                    // empty name — the unused-local arm renders it
+                    // `<unnamed>` exactly like the oracle's nameless row.
+                    engine.note_local(name, token.range);
+                    engine.const_decl_name(name, false);
                 }
             }
             C::FormalParameterDeclaration => {
@@ -2722,16 +2925,18 @@ impl ParserListener for DiagnoseListener<'_> {
                         engine.bind_parameter_type(name);
                     }
                     None => {
-                        // The nameless recovery face registers only on the
-                        // trace slot: the oracle's `<unnamed>` stack-trace
-                        // rows ride the junk-filled second slot, while a
-                        // nameless exception slot stays unregistered (the
-                        // oracle's exception verdicts there ride the
-                        // re-parse's real names, which the twin pass
-                        // already carries).
-                        if engine.catch_trace_slot
-                            && let Some(name) = engine.synthetic_name(token)
-                        {
+                        // The nameless recovery face registers a real
+                        // element on either slot: upstream reports a
+                        // null-name catch element (`name == null`), never a
+                        // dropped one — the `<unnamed>` exception row of
+                        // `catch (var)` and the `<unnamed>` stack-trace row
+                        // of a junk-filled second slot both surface. The
+                        // slot decides the kind (`note_catch_parameter`
+                        // reads the parser's comma fact): a nameless
+                        // exception row still spares the auto-used plain
+                        // face through `finish_catch_clause`, matching the
+                        // oracle's silence there.
+                        if let Some(name) = engine.synthetic_name(token) {
                             engine.note_catch_parameter(name, token.range);
                         }
                     }
@@ -2773,6 +2978,19 @@ impl ParserListener for DiagnoseListener<'_> {
                     {
                         engine.frames[enclosing].fn_formal_rets.insert(name, ret);
                     }
+                } else if let Some(name) = engine.synthetic_name(token) {
+                    // The nameless recovery face (`name ?? '<unnamed>'`):
+                    // upstream registers a real `LocalFunctionElement` with
+                    // a null name — the tracked entry joins under the empty
+                    // name at the same boundary a named head owns (the
+                    // stash drop and the `unknown` return latch mirror the
+                    // oracle's dynamic-return face for a local function
+                    // written without one), and the frame's locals set
+                    // keeps a resolution entry the body's recovery reads
+                    // can hit.
+                    engine.note_local_function(name, token.range);
+                    engine.fn_stash_drop();
+                    engine.latch_return_type(ExecKind::Function, name, token.range);
                 }
             }
             C::LabelDeclaration => {
@@ -3054,6 +3272,33 @@ impl ParserListener for DiagnoseListener<'_> {
                         );
                         engine.open_exec_site = Some(site);
                     }
+                } else if let Some(name) = engine.synthetic_name(token) {
+                    // The nameless recovery face (`name ?? '<unnamed>'`):
+                    // upstream registers a real `MethodElement` with a null
+                    // name (element.dart:2179's `isPrivate` maps it private,
+                    // so the unused-element gate owns it), never a dropped
+                    // member. A nameless head is never a constructor head —
+                    // the provisional site's range is a real head token —
+                    // so the member twin registers unconditionally under
+                    // the empty name at the anchor chain.
+                    let is_setter = engine.open_member_setter;
+                    let spelling = if is_setter {
+                        engine.setter_spelling(name)
+                    } else {
+                        name
+                    };
+                    let is_static = engine.open_member_static;
+                    let container = engine.container_context().map_or(name, |(c, _)| c);
+                    let site = engine.note_decl_site(
+                        spelling,
+                        token.range,
+                        DeclKind::Member {
+                            kind: MemberKind::Method,
+                            is_static,
+                            container,
+                        },
+                    );
+                    engine.open_exec_site = Some(site);
                 }
             }
             C::OperatorName => {
@@ -3102,22 +3347,35 @@ impl ParserListener for DiagnoseListener<'_> {
                             engine.factory_head_anchors.insert(site, *head);
                         }
                     }
-                    // The constructor's message display joins the selector
-                    // (`C.named`, `ConstructorElement.displayName`): the
-                    // head event latched the bare container; the selector
-                    // arrives here. A `new` selector keeps the bare face
-                    // (`displayName`'s `name == 'new'` arm answers the
-                    // container).
-                    if engine.strings.resolve(name) != "new"
+                    // The completion row's anchor is the compound name
+                    // (`ConstructorDeclaration.errorRange`: the type name
+                    // through the selector's end — `factory A.named() {}`
+                    // reports at `A.named`). The head event latched the
+                    // bare container name; the selector's end widens it
+                    // here (the factory frames only — `ret.ctor`).
+                    if let Some((head, _)) = engine.factory_head
                         && let Some(frame) = engine.frames.last_mut()
                         && let FrameKind::Executable { ret: Some(ret), .. } = &mut frame.kind
                         && ret.ctor
                     {
-                        ret.display = Some(engine.strings.intern(&format!(
-                            "{}.{}",
-                            engine.strings.resolve(container),
-                            engine.strings.resolve(name)
-                        )));
+                        ret.name_span = SourceRange {
+                            offset: head.offset,
+                            length: token.range.end().saturating_sub(head.offset),
+                        };
+                        // The constructor's message display joins the
+                        // selector (`C.named`,
+                        // `ConstructorElement.displayName`): the head
+                        // event latched the bare container; the selector
+                        // arrives here. A `new` selector keeps the bare
+                        // face (`displayName`'s `name == 'new'` arm
+                        // answers the container).
+                        if engine.strings.resolve(name) != "new" {
+                            ret.display = Some(engine.strings.intern(&format!(
+                                "{}.{}",
+                                engine.strings.resolve(container),
+                                engine.strings.resolve(name)
+                            )));
+                        }
                     }
                 }
             }
@@ -3244,13 +3502,32 @@ impl ParserListener for DiagnoseListener<'_> {
                     } else {
                         engine.note_decl_site(name, token.range, DeclKind::TopLevelVar);
                     }
-                } else if context == C::TopLevelVariableDeclaration {
-                    // The nameless recovery face (see the top-level
-                    // function arm); a nameless field keeps the
-                    // suppression direction.
-                    let empty = engine.intern("");
-                    let anchor = engine.nameless_site_range();
-                    engine.note_decl_site(empty, anchor, DeclKind::TopLevelVar);
+                } else if let Some(name) = engine.synthetic_name(token) {
+                    // The nameless recovery face (`name ?? '<unnamed>'`):
+                    // upstream registers a real `FieldElement` /
+                    // `TopLevelVariableElement` with a null name — a real
+                    // element, not a dropped declaration. Inside a
+                    // container the member site joins under the empty name
+                    // (element.dart:2179's `isPrivate` maps a null name
+                    // private, so the unused-field gate owns it); at top
+                    // level the same face keeps the `<unnamed>` anchor.
+                    if context == C::FieldDeclaration {
+                        if let Some((container, _)) = engine.container_context() {
+                            let is_static = engine.open_member_static;
+                            engine.note_decl_site(
+                                name,
+                                token.range,
+                                DeclKind::Member {
+                                    kind: MemberKind::Field,
+                                    is_static,
+                                    container,
+                                },
+                            );
+                        }
+                    } else {
+                        let anchor = engine.nameless_site_range();
+                        engine.note_decl_site(name, anchor, DeclKind::TopLevelVar);
+                    }
                 }
             }
             // A `show`-list name joins the current import's shown set with
@@ -4406,6 +4683,29 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         engine.const_capture.assignment(operator.range);
         engine.mark_assignment(operator);
+        // The index-write's argument check (#2937): `mark_assignment` just
+        // landed the write form on the `[]` operator row (`=` → `Assign`,
+        // `+=` → `Compound`), so the staged operand decides against the
+        // `[]=` first formal (a plain `=`) or the `[]`/`[]=` pair (a
+        // compound). Scan for the operator row the mark touched — a `[]`
+        // carrying a staged `index_arg_faces` entry is the one.
+        {
+            let index_op = engine.intern("[]");
+            let marked = engine.rows.iter().find_map(|row| {
+                match (&row.intent, row.write_op) {
+                    (Intent::Operator(op, bracket), write_op @ Some(_))
+                        if *op == index_op
+                            && engine.index_arg_faces.contains_key(&bracket.offset) =>
+                    {
+                        Some((bracket.offset, write_op))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some((bracket_offset, write_op)) = marked {
+                engine.check_index_argument(bracket_offset, write_op);
+            }
+        }
         engine.check_assignment(operator);
         engine.cancel_dead_chains_on_write(operator);
         engine.check_dead_null_assignment(operator);
@@ -4686,6 +4986,10 @@ impl ParserListener for DiagnoseListener<'_> {
             let receiver_ty = engine.receiver_static_ty(row);
             engine.stage_receiver_of_type_never(at, receiver_ty);
         }
+        // The index operand's compound write (`++a[0]` — the same
+        // `resolveForWrite(hasRead: true)` consult the postfix face runs):
+        // both `[]` spellings check.
+        self.mark_index_compound_write();
         let _ = operator;
     }
 
@@ -4700,6 +5004,12 @@ impl ParserListener for DiagnoseListener<'_> {
             let receiver_ty = engine.receiver_static_ty(row);
             engine.stage_receiver_of_type_never(at, receiver_ty);
         }
+        // The index operand's compound write (`a[0]++` — upstream Dart SDK
+        // source, postfix_expression_resolver.dart:35-37
+        // `resolveForWrite(hasRead: true)`): the `[]` operator row carries
+        // the compound write state the `+=` junction's marking already
+        // sets, so the `[]`/`[]=` pair reports.
+        self.mark_index_compound_write();
     }
 
     fn begin_conditional_expression(&mut self, question: Token) {
@@ -4823,6 +5133,40 @@ impl ParserListener for DiagnoseListener<'_> {
             {
                 end = span.end();
             }
+            // The prefixed target's continuation (`is lib.T1`): `handle_type`
+            // anchors the qualified head at the prefix token (the parser's
+            // `PrefixedType.parseType` fires `handleType` there, never at the
+            // continuation), so the armed slot ends at `lib` while the
+            // oracle's TypeAnnotation spans through `T1`. The continuation
+            // sits in the source bytes directly after the head — one
+            // `.ident` step (a `<` group rides `type_args_group_end`; a
+            // trailing `?` stays out, the parser never arms the qualified
+            // question and a conditional `?` after the target is not the
+            // type's).
+            if let Some(span) = engine.armed_ty_span
+                && span.offset >= is_operator.range.end()
+            {
+                let mut p = span.end();
+                while matches!(engine.byte_at(p), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                    p += 1;
+                }
+                if engine.byte_at(p) == Some(b'.') {
+                    p += 1;
+                    while matches!(engine.byte_at(p), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                        p += 1;
+                    }
+                    let ident = p;
+                    while engine
+                        .byte_at(p)
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+                    {
+                        p += 1;
+                    }
+                    if p > ident {
+                        end = end.max(p);
+                    }
+                }
+            }
             end
         };
         let verdict_at = if let Some((_, range)) = keyword_operand {
@@ -4837,7 +5181,10 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.operand_row().map_or(is_operator.range, |row| {
                 let start = literal_open
                     .filter(|&(close, _)| close == row.range.offset)
-                    .map_or(row.range.offset, |(_, open)| open);
+                    .map_or_else(
+                        || operand_expr_head(engine, row.range.offset),
+                        |(_, open)| open,
+                    );
                 let end = type_end(row.range.end());
                 SourceRange {
                     offset: start,
@@ -4845,7 +5192,33 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
             })
         };
+        // The prefixed checked head (`is p.T`): `handle_type` arms the
+        // dot-joined spelling (`Named{"p.T"}` — the intern table's
+        // one-head convention for prefixed annotations), which the
+        // verdict's `InvalidType` gate cannot scope — a joined name is
+        // no bare name, so `is p.T` would answer `None` where the
+        // oracle's resolved NamedType (`TypeAnnotation.type` = `T`)
+        // decides. The continuation segment carries the resolved local
+        // head: substitute it for the verdict alone — the armed slot
+        // keeps the joined spelling every later face (declaration
+        // binds, span latches) reads.
+        let checked_saved = engine.armed_ty;
+        if let Some(Ty::Named {
+            name,
+            nullable,
+            args,
+        }) = checked_saved
+            && let Some((_, local)) = engine.strings.resolve(name).split_once('.')
+            && !local.is_empty()
+        {
+            engine.armed_ty = Some(Ty::Named {
+                name: engine.intern(local),
+                nullable,
+                args,
+            });
+        }
         engine.check_type_check(verdict_at, keyword_operand, not.is_some());
+        engine.armed_ty = checked_saved;
         engine.const_capture.not_constant(is_operator.range);
         // An `is` expression is statically `bool` — the enclosing condition
         // checkpoint spares the operand row.
@@ -5504,6 +5877,22 @@ impl ParserListener for DiagnoseListener<'_> {
                 *given = (*given).max(positional);
             }
         }
+        // The annotation's argument-assignability face (#2937): the same
+        // pending-metadata condition as the arity registration above — a
+        // metadata creation's invoke slot carries no callee link, so the
+        // generic `close_arguments` walk never pairs the arguments against
+        // the annotated constructor's formals. Resolve the constructor
+        // here and run the argument walk (upstream Dart SDK source,
+        // resolver.dart:1887 — `visitAnnotation`'s
+        // `checkForArgumentTypesNotAssignableInList`).
+        if let Some(level) = engine.arg_levels.last()
+            && engine.invokes.last().and_then(|slot| *slot).is_none()
+            && !level.enum_const
+            && let Some(annotation) = engine.pending_annotations.last().map(|a| a.name)
+        {
+            let args = level.args.clone();
+            engine.check_annotation_arguments(annotation, &args);
+        }
         engine.close_arguments(u16::try_from(count).unwrap_or(u16::MAX), end.range);
         // The constant-pattern object shape (`case const A():`) never fires
         // a send event — its argument list closes without an invocation
@@ -5882,6 +6271,51 @@ impl ParserListener for DiagnoseListener<'_> {
                 ty => ty,
             };
 
+            // The index-argument check staging (#2937): the operand rows
+            // fold away below, so the index argument's static type and span
+            // — and the receiver's named head — ride `index_arg_faces`
+            // keyed by the bracket's open `[`. The read/write `[]`/`[]=`
+            // element pair resolves at emission time once the write form
+            // finalizes (a `=`/`+=`/`++` mark sets the operator row's
+            // `write_op` after this fold); a pure `a[i]` drains as the
+            // read-only face at the unit's end (upstream Dart SDK source,
+            // `checkIndexExpressionIndex`,
+            // error_detection_helpers.dart:260-289).
+            {
+                // The index argument is the outermost operand row — the
+                // last stacked expression inside the bracket (a member
+                // merge, a send fold, or a bare/literal operand all leave
+                // exactly one row covering the argument's span).
+                let arg = engine
+                    .rows
+                    .get(pos + 1..)
+                    .and_then(|rows| {
+                        rows.iter()
+                            .filter(|row| {
+                                open.range.offset <= row.range.offset
+                                    && row.range.end() <= close.range.end()
+                            })
+                            .max_by_key(|row| (row.range.end(), row.range.offset))
+                    });
+                if let Some(arg) = arg {
+                    let index_ty = engine.expression_row_ty(arg);
+                    let literal = Engine::primitive_literal(arg, &engine.members.primitive_ids);
+                    let recv = match engine.fold_alias_ty(receiver_ty) {
+                        Ty::Named { name, .. } => Some(name),
+                        _ => None,
+                    };
+                    engine.index_arg_faces.insert(
+                        open.range.offset,
+                        IndexArgFace {
+                            index_ty,
+                            index_range: arg.range,
+                            literal,
+                            recv,
+                        },
+                    );
+                }
+            }
+
             // The operand rows leave the stack, but every operand still
             // owes its pass-2 resolution — the official resolves every
             // subexpression (`builder..foo[bar]`'s `bar` reports its
@@ -5916,6 +6350,20 @@ impl ParserListener for DiagnoseListener<'_> {
                 result.ty = result_ty;
             }
         }
+    }
+
+    /// The unit's end (`endCompilationUnit`): every index expression's write
+    /// form is final — a `[]` operator row an assignment/compound mark never
+    /// touched is a pure read. The staged `index_arg_faces` entries that
+    /// survive (no `=`/`+=`/`++` consumed them) check against the `[]`
+    /// element's first formal only (`checkIndexExpressionIndex`'s read-arm,
+    /// resolver.dart:3380 — `writeElement: null`).
+    fn end_compilation_unit(&mut self, count: usize, token: Token) {
+        let staged: Vec<u32> = self.engine.index_arg_faces.keys().copied().collect();
+        for bracket in staged {
+            self.engine.check_index_argument(bracket, None);
+        }
+        let _ = (count, token);
     }
 
     // —— patterns & switch exhaustiveness (M2 face) ——————————————————————
@@ -6216,6 +6664,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // `typePropertyResolver.resolve` with the matched type as the
         // receiver, `propertyErrorEntity: node.operator`).
         self.check_relational_pattern_nullable(operator);
+        // The operator-definedness consult (#2917): the same official
+        // consult's `needsGetterError` arm — a matched class without the
+        // spelled operator reports `undefined_operator` at the operator
+        // token.
+        self.check_relational_pattern_operator(operator);
         // The shape's failure arm joins the flow's unmatched chain — a
         // top-level `case == 5`/`case > 0` can fail, so the code after an
         // if-case stays live (flow_analysis.dart's pattern dispatch).
@@ -9048,6 +9501,33 @@ impl ParserListener for DiagnoseListener<'_> {
                 let name_id = self.engine.name_of(name);
                 if let Some(name_id) = name_id {
                     self.engine.note_parameter(name_id, name.range);
+                    // #2937 (3c): the old-style formal's callable signature —
+                    // `end_function_typed_formal_parameter` sealed the nested
+                    // list's `FnVarSig` into `fn_type_stash`; the formal
+                    // claims it for the invocation face's formals exactly
+                    // like the modern `Function(...)` spelling's
+                    // `FormalParameterDeclaration` claim (upstream's
+                    // `FunctionType` on the parameter element; `b('0')` over
+                    // `b(int p)` counts against `int`).
+                    if let Some(sig) = self.engine.fn_type_stash.take() {
+                        self.engine.fn_var_sigs.insert(name_id, sig.clone());
+                        self.engine.fn_param_sigs.insert(name_id, sig.clone());
+                        if let Some(exec) =
+                            self.engine.frames.last().and_then(|f| match &f.kind {
+                                FrameKind::Executable { ret: Some(ret), .. } => {
+                                    Some(ret.name)
+                                }
+                                _ => None,
+                            })
+                        {
+                            let table = self.engine.fn_formal_sigs.entry(exec).or_default();
+                            if self.engine.fn_formal_named_section {
+                                table.named.insert(name_id, sig);
+                            } else {
+                                table.positional.push(sig);
+                            }
+                        }
+                    }
                     if let Some(ret) = ret
                         && let Some(frame) = self.engine.frames.last_mut()
                     {
@@ -9283,6 +9763,28 @@ impl ParserListener for DiagnoseListener<'_> {
         // `dynamic`) ends first and would steal the pending slot.
         self.engine.last_fn_formal_ret =
             self.engine.fn_formal_ret_pending.pop().and_then(|(_, t)| t);
+        // #2937 (3c): seal the old-style formal's signature capture — the
+        // dedicated frame `begin_function_typed_formal_parameter` pushed.
+        // The nested list's formals are its positional/named columns and
+        // the return annotation is its `ret`; `b('0')` then counts against
+        // this shape through `fn_param_sigs` exactly like the modern
+        // `Function(...)` spelling (the desugared `FunctionType` on the
+        // parameter element). A poisoned capture (a stray/unnamed nested
+        // formal) stays the under-report posture.
+        if let Some(capture) = self.engine.fn_type_capture.pop() {
+            if !capture.poisoned {
+                let return_ty = capture.ret.map_or(Ty::Dynamic, |(ty, ..)| ty);
+                self.engine.fn_type_stash = Some(Box::new(FnVarSig {
+                    params: capture.params.into_boxed_slice(),
+                    required_positional: capture
+                        .required_positional
+                        .min(u16::MAX as usize) as u16,
+                    positional: capture.positional.into_boxed_slice(),
+                    named: capture.named.into_boxed_slice(),
+                    return_ty,
+                }));
+            }
+        }
     }
 
     fn end_if_control_flow(&mut self, token: Token) {
@@ -10959,3 +11461,322 @@ enum LeafSide {
     /// literal, so it forces nothing and vetoes the `_either` tail.
     Blind,
 }
+
+/// The operand expression's head offset for the is-verdict span. The merged
+/// operand row anchors at its own member/index token (a `receiver.member`
+/// merge keeps the member name's offset, an index merge the `]`), while the
+/// oracle's `.at(node)` anchors at the operand expression's head
+/// (`IsExpressionImpl.offset`: `c1.a`, `super.remove`, `list[0]`,
+/// `(-0.0).ceil()`, `new Foo()`). The head sits in the source bytes — the
+/// same walk the binary-expression fold takes (dotted chains), extended
+/// with the bracket closer's opener (plus the receiver identifier before
+/// it) and the whole-word `new`/`const` instance-creation keyword.
+/// Unrecognized bytes stop the walk; a bare head returns `from` unchanged.
+fn operand_expr_head(engine: &Engine<'_>, from: u32) -> u32 {
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let mut head = from;
+    loop {
+        // The instance-creation keyword: a whole-word `new`/`const`
+        // separated from the current head by whitespace (`new C()`,
+        // `new C.named()`, `const C()` — a tear-off's `.new` included: the
+        // dot arm below takes the receiver next).
+        let mut gap = head;
+        while gap > 0 && engine.byte_at(gap - 1).is_some_and(is_ws) {
+            gap -= 1;
+        }
+        let keywords: [&[u8]; 2] = [b"new", b"const"];
+        let keyword = keywords.into_iter().find(|kw| {
+            gap >= kw.len() as u32
+                && (gap == kw.len() as u32
+                    || !engine
+                        .byte_at(gap - kw.len() as u32 - 1)
+                        .is_some_and(is_ident_byte))
+                && kw
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| engine.byte_at(gap - kw.len() as u32 + i as u32) == Some(*b))
+        });
+        if let Some(kw) = keyword {
+            head = gap - kw.len() as u32;
+            continue;
+        }
+        // The bracketed group: a `)`/`]` at (or, after whitespace, before)
+        // the head — an index merge's own anchor, or a call/paren receiver's
+        // closer the dot walk stopped at — jumps to its opener, and the
+        // receiver identifier before the opener joins (`list[0]`,
+        // `(-0.5).ceil()`, `(C<int>).toString()`).
+        let closer = if matches!(engine.byte_at(head), Some(b')' | b']')) {
+            Some(head)
+        } else {
+            let mut gap = head;
+            while gap > 0 && engine.byte_at(gap - 1).is_some_and(is_ws) {
+                gap -= 1;
+            }
+            (gap > 0 && matches!(engine.byte_at(gap - 1), Some(b')' | b']'))).then_some(gap - 1)
+        };
+        if let Some(closer) = closer {
+            let (open, close) = match engine.byte_at(closer) {
+                Some(b']') => (b'[', b']'),
+                _ => (b'(', b')'),
+            };
+            let mut depth = 0u32;
+            let mut scan = closer;
+            let opener = loop {
+                if scan == 0 {
+                    break None;
+                }
+                scan -= 1;
+                match engine.byte_at(scan) {
+                    Some(b) if b == close => depth += 1,
+                    Some(b) if b == open => {
+                        if depth == 0 {
+                            break Some(scan);
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            };
+            if let Some(opener) = opener {
+                head = opener;
+                while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte) {
+                    head -= 1;
+                }
+                continue;
+            }
+            break;
+        }
+        // The dotted chain: `.member` / `?.member` — the identifier before
+        // the dot is the next head (`c1.a`, `super.remove`, `d.caa_.b_`); a
+        // non-identifier before the dot (a group's `)`) defers to the
+        // bracket arm on the next lap.
+        if head == 0 || engine.byte_at(head - 1) != Some(b'.') {
+            break;
+        }
+        head = if head >= 2 && engine.byte_at(head - 2) == Some(b'?') {
+            head - 2
+        } else {
+            head - 1
+        };
+        while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte) {
+            head -= 1;
+        }
+        // The dotted chain's receiver may carry a type-argument group
+        // (`C<int>.constr`, `prefix.C<int>.new`): the ident walk stopped
+        // at the group's `>`. Walk the balanced `<>` back to its `<`,
+        // then over the head ident — the same walk the `)`/`]` bracket
+        // arm applies to call/index receivers.
+        if head > 0 && engine.byte_at(head - 1) == Some(b'>') {
+            let mut depth = 0u32;
+            let mut scan = head - 1;
+            let opener = loop {
+                if scan == 0 {
+                    break None;
+                }
+                scan -= 1;
+                match engine.byte_at(scan) {
+                    Some(b'>') => depth += 1,
+                    Some(b'<') => {
+                        if depth == 0 {
+                            break Some(scan);
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            };
+            if let Some(opener) = opener {
+                head = opener;
+                while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte) {
+                    head -= 1;
+                }
+            }
+        }
+    }
+    head
+}
+
+/// The `unnecessary_type_check` verdict's span pins: the oracle's
+/// `_checkAllTypeChecks` reports `.at(node)` on the whole `IsExpression`
+/// (best_practices_verifier.dart:886-890) — the operand expression's head
+/// through the written type's end — so every operand shape anchors at its
+/// own head, not at the merged row's member/index token.
+#[cfg(test)]
+mod type_check_span_pins {
+    use crate::diagnose::test_rig::{
+        CORE_PRELUDE, RigImport, report_ops, report_ops_imports, rows,
+    };
+
+    /// One `unnecessary_type_check` spanning exactly `text` inside
+    /// `source` — the (offset, length) pair pinned by the text itself:
+    /// the row's offset..end must slice out `text` verbatim and carry
+    /// the pinned `length` (the oracle's whole-IsExpression span, per
+    /// operand shape). The report's ranges are absolute into the mounted
+    /// unit (`CORE_PRELUDE + source`), so the slice runs over the same
+    /// buffer the engine saw.
+    fn pin(source: &str, text: &str, length: u32) {
+        pin_report(
+            report_ops(source),
+            &format!("{CORE_PRELUDE}{source}"),
+            text,
+            length,
+        );
+    }
+
+    /// [`pin`] with sibling libraries mounted — the fixture names the
+    /// dep's declarations through `prefix` without an in-source
+    /// `import` directive (a directive after `CORE_PRELUDE`'s
+    /// declarations would mis-parse before the pin's face runs).
+    fn pin_imports(source: &str, imports: &[RigImport<'_>], text: &str, length: u32) {
+        pin_report(
+            report_ops_imports(source, imports),
+            &format!("{CORE_PRELUDE}{source}"),
+            text,
+            length,
+        );
+    }
+
+    fn pin_report(report: crate::diagnose::FileReport, full: &str, text: &str, length: u32) {
+        let utc: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unnecessary_type_check")
+            .collect();
+        assert_eq!(
+            utc.len(),
+            1,
+            "exactly one row expected: {:#?}",
+            rows(&report)
+        );
+        let d = utc[0];
+        assert_eq!(
+            full.get(d.range.offset as usize..d.range.end() as usize),
+            Some(text),
+            "row at ({}, {}) spans the wrong text: {:#?}",
+            d.range.offset,
+            d.range.length,
+            rows(&report)
+        );
+        assert_eq!(
+            d.range.length,
+            length,
+            "pinned length: {:#?}",
+            rows(&report)
+        );
+    }
+
+    /// Instance-creation operand (`new Foo() is Foo` — cycle_test_none):
+    /// the span starts at `new`, not at the constructor name row.
+    #[test]
+    fn instance_creation_operand_spans_the_keyword() {
+        pin(
+            "class C {}\nvoid f() {\n  if (new C() is C) {}\n}\n",
+            "new C() is C",
+            12,
+        );
+    }
+
+    /// `const` twin of the keyword face.
+    #[test]
+    fn const_instance_creation_operand_spans_the_keyword() {
+        pin(
+            "class C {}\nvoid f() {\n  if (const C() is C) {}\n}\n",
+            "const C() is C",
+            14,
+        );
+    }
+
+    /// Member-chain operand (`c1.a is A` — CastOperator_A01_t01,
+    /// `d.caa_.b_ is B<AA>` — generic_test): the span starts at the
+    /// receiver, not at the merged member-name row.
+    #[test]
+    fn member_chain_operand_spans_the_receiver() {
+        pin(
+            "class A { int i = 0; }\nvoid f(A a) {\n  if (a.i is int) {}\n}\n",
+            "a.i is int",
+            10,
+        );
+    }
+
+    /// Index operand (`list[0] is S` — closure_test): the index merge
+    /// anchors at the `]`; the span starts at the receiver identifier.
+    #[test]
+    fn index_operand_spans_the_receiver() {
+        pin(
+            "void f(List<int> l) {\n  if (l[0] is int) {}\n}\n",
+            "l[0] is int",
+            11,
+        );
+    }
+
+    /// Parenthesized receiver over a call (`(-0.0).ceil() is int` —
+    /// arithmetic_test): the dot walk stops at the group's `)`; the span
+    /// starts at the opener. The member call names a fixture-declared
+    /// element — the prelude's names-only `double` stub carries no
+    /// `ceil`, so a core stub member would pin `undefined_method`, not
+    /// the span.
+    #[test]
+    fn parenthesized_call_operand_spans_the_group() {
+        pin(
+            "class D { int ceil() => 0; }\nvoid f(D d) {\n  if ((d).ceil() is int) {}\n}\n",
+            "(d).ceil() is int",
+            17,
+        );
+    }
+
+    /// Prefixed target (`r1 is lib.T1` — Records/static_semantics_A02):
+    /// `handle_type` anchors the qualified head at the prefix token, but
+    /// the TypeAnnotation spans through the continuation — the verdict
+    /// ends at `T1`, not at `lib`. The prefix binds through the imports
+    /// rig — an in-source `import` after `CORE_PRELUDE`'s declarations
+    /// would only pin a `directive_after_declaration`, never the span.
+    /// The `is!` polarity keeps the operand unprefixed (the same type
+    /// reaches it through the plain edge): a `p.T`-typed operand arms
+    /// the prefix head, which the verdict's Prefix gate silences before
+    /// the span question is ever asked.
+    #[test]
+    fn prefixed_target_ends_at_the_continuation() {
+        pin_imports(
+            "void f(T l) {\n  if (l is! p.T) {}\n}\n",
+            &[
+                RigImport {
+                    uri: "package:t/p.dart",
+                    prefix: Some("p"),
+                    source: "class T {}\n",
+                },
+                RigImport {
+                    uri: "package:t/p.dart",
+                    prefix: None,
+                    source: "class T {}\n",
+                },
+            ],
+            "l is! p.T",
+            9,
+        );
+    }
+
+    /// The bare head control: the walk must leave a plain identifier's
+    /// span untouched (the landed family's anchor).
+    #[test]
+    fn bare_operand_head_is_unchanged() {
+        pin("void f(int x) {\n  if (x is int) {}\n}\n", "x is int", 8);
+    }
+}
+
+/// The #2937 pins (the index-expression argument check, the annotation
+/// argument-assignability face, and the old-style function-typed
+/// formal's callee signature). Kept as a standalone `#[path]` submodule
+/// so the in-file test modules stay untouched by the registration.
+#[cfg(test)]
+#[path = "ticket_2937_tests.rs"]
+mod ticket_2937_tests;
+
+/// The #2933 pins (the nameless-declaration registration: local variable,
+/// field, method, local function, and catch parameter join as real
+/// elements under the empty name — `name ?? '<unnamed>'`,
+/// element.dart:2093 — and the unused-family gates map the null name
+/// private, element.dart:2179).
+#[cfg(test)]
+#[path = "ticket_2933_tests.rs"]
+mod ticket_2933_tests;

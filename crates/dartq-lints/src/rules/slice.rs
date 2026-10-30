@@ -372,6 +372,20 @@ pub(crate) fn named_arg_name(c: &Check<'_>, pieces: &[u32], marker: usize) -> Op
 /// comma) sits inside its root's span and never splits. Each segment holds
 /// one element's pieces with its root last; a `MapEntry` marker trails its
 /// key/value pieces inside a map literal's segment.
+///
+/// The send-leaf span contract makes the coverage boundary strict: a
+/// bare-name `Send` leaf's span extends through its unconsumed follower
+/// token — the element comma when the next element follows directly — so a
+/// row *ending exactly at* the comma is the follower, never content, and
+/// upstream terminates an element's span at its own last token (`upstream
+/// Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart:3117`,
+/// `AstNodeImpl.end => endToken.end`). Coverage is therefore
+/// strict-interior (`comma.end < piece.end`): the `[j, 1]` comma still
+/// separates. Rows sitting ON a separator (the extension `Send` ends at
+/// it, the follower-anchored `NoTypeArguments`/`NoArguments` leaves cover
+/// or anchor it) join the open segment without extending its content end
+/// past the separator — the same boundary `declarations.rs`'s
+/// `collection_elements` walks.
 pub(crate) fn comma_segments(c: &Check<'_>, literal: u32, rows: &[u32]) -> Vec<Vec<u32>> {
     let tokens = c.unit.ast.token_range(literal);
     let mut separators = Vec::new();
@@ -382,10 +396,10 @@ pub(crate) fn comma_segments(c: &Check<'_>, literal: u32, rows: &[u32]) -> Vec<V
         let comma = crate::rules::byte_span_of_token(c, token);
         let covered = rows.iter().any(|&row| {
             let piece = c.byte_span(row);
-            piece.start <= comma.start && comma.end <= piece.end
+            piece.start <= comma.start && comma.end < piece.end
         });
         if !covered {
-            separators.push(comma.start);
+            separators.push(comma);
         }
     }
     let mut segments = Vec::new();
@@ -393,15 +407,26 @@ pub(crate) fn comma_segments(c: &Check<'_>, literal: u32, rows: &[u32]) -> Vec<V
     let mut end = 0usize;
     for &row in rows {
         let piece = c.byte_span(row);
+        if piece.is_empty() {
+            if !current.is_empty() {
+                current.push(row);
+            }
+            continue;
+        }
         if !current.is_empty()
             && separators
                 .iter()
-                .any(|&sep| end <= sep && sep < piece.start)
+                .any(|sep| end <= sep.start && sep.start < piece.start)
         {
             segments.push(core::mem::take(&mut current));
             end = 0;
         }
-        end = end.max(piece.end);
+        if !separators
+            .iter()
+            .any(|sep| sep.start == piece.start || sep.end == piece.end)
+        {
+            end = end.max(piece.end);
+        }
         current.push(row);
     }
     if !current.is_empty() {

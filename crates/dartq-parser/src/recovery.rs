@@ -408,7 +408,14 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                     .cursor
                     .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
                 self.cursor.advance();
-                return self.span_of(id);
+                let span = self.span_of(id);
+                // Same unconditional `handleIdentifier` as the tail below
+                // (parser_impl.dart:4038): the spliced nameless declaration
+                // must carry its slot event — `augment mixin M {}` declares
+                // the `<unnamed>` variable upstream, and the miss is the
+                // same Face-A element hole the other arms closed.
+                self.listener.handle_identifier(span, context);
+                return span;
             }
             self.check_async_keyword_as_identifier(&peek, context);
             let id = self.cursor.advance();
@@ -482,64 +489,78 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // findPreviousNonZeroLengthToken walk-back anchors on the junk token
         // itself (oracle `void<int> x, ?y;`: the `?` is absorbed by the
         // member and `expected_token ';'` anchors at the `?`).
-        if !leave_for_grammar
+        let id = if !leave_for_grammar
             && matches!(
                 context,
                 crate::listener::IdentifierContext::TopLevelVariableDeclaration
                     | crate::listener::IdentifierContext::FieldDeclaration
-            )
-        {
+            ) {
             let junk_end = peek.span.range.offset + peek.span.range.length;
             self.cursor.advance();
+            self.cursor
+                .insert_synthetic(TokenKind::Identifier, junk_end)
+        } else {
             let id = self
                 .cursor
-                .insert_synthetic(TokenKind::Identifier, junk_end);
-            return self.span_of(id);
-        }
-        let id = self
-            .cursor
-            .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
-        if leave_for_grammar {
-            // Branch 2: the official `insertSyntheticIdentifier(token)`
-            // (token_stream_rewriter.dart:238) inserts after the anchor and
-            // RETURNS the synthetic, so the official parse resumes with the
-            // synthetic as the current token and the offending follower as
-            // `token.next`. Drain to the queued synthetic (the
-            // ensureSemicolon idiom) for the same posture — an undrained
-            // queue resurfaces the zero-width identifier as a phantom
-            // parse: `void f(int,, int b)` then re-enters the parameter
-            // loop's tail recovery and stacks an `expected_token` on the
-            // oracle's single missing_identifier.
-            self.cursor.drain_to(id);
-        } else if matches!(
-            context,
-            crate::listener::IdentifierContext::FormalParameterDeclaration
-                | crate::listener::IdentifierContext::LibraryName
-        ) {
-            // Branch 3, aligned: the rewriter splices the synthetic after
-            // the junk (insertToken, :84), so the junk lands behind the
-            // parse pointer. Drain to the synthetic, then consume the junk
-            // for the same stream shape.
-            self.cursor.drain_to(id);
-            self.cursor.advance();
-        } else {
-            // Leave posture (the pre-#564 branch-3 shape): the junk stays
-            // current; the caller's grammar cascades against it.
-            self.cursor.advance();
-        }
+                .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+            if leave_for_grammar {
+                // Branch 2: the official `insertSyntheticIdentifier(token)`
+                // (token_stream_rewriter.dart:238) inserts after the anchor and
+                // RETURNS the synthetic, so the official parse resumes with the
+                // synthetic as the current token and the offending follower as
+                // `token.next`. Drain to the queued synthetic (the
+                // ensureSemicolon idiom) for the same posture — an undrained
+                // queue resurfaces the zero-width identifier as a phantom
+                // parse: `void f(int,, int b)` then re-enters the parameter
+                // loop's tail recovery and stacks an `expected_token` on the
+                // oracle's single missing_identifier.
+                self.cursor.drain_to(id);
+            } else if matches!(
+                context,
+                crate::listener::IdentifierContext::FormalParameterDeclaration
+                    | crate::listener::IdentifierContext::LibraryName
+            ) {
+                // Branch 3, aligned: the rewriter splices the synthetic after
+                // the junk (insertToken, :84), so the junk lands behind the
+                // parse pointer. Drain to the synthetic, then consume the junk
+                // for the same stream shape.
+                self.cursor.drain_to(id);
+                self.cursor.advance();
+            } else {
+                // Leave posture (the pre-#564 branch-3 shape): the junk stays
+                // current; the caller's grammar cascades against it.
+                self.cursor.advance();
+            }
+            id
+        };
         let span = self.span_of(id);
         // Official `ensureIdentifier` fires `handleIdentifier` on the
-        // recovery template's returned synthetic (parser_impl.dart:4083) —
-        // the enum-constant constructor selector's empty-name event rides
-        // it (official trace, issue_48380_1: `handleIdentifier(,
-        // constructorReferenceContinuationAfterTypeArguments)`). Fired for
-        // the constructor-reference continuations only — their downstream
-        // consumers are name-gated, so every other recovery face stays
-        // byte-stable.
+        // recovery template's returned synthetic UNCONDITIONALLY
+        // (parser_impl.dart:4031-4040 — the context template reports
+        // `missing_identifier` and inserts the synthetic first, then the
+        // parser-level wrapper fires the event at :4038 whatever identifier
+        // came back; the enum-constant constructor selector's empty-name
+        // event rides it, official trace issue_48380_1:
+        // `handleIdentifier(, constructorReferenceContinuationAfterTypeArguments)`).
+        // Fired for the constructor-reference continuations (their
+        // downstream consumers are name-gated) and the name-producing
+        // declaration contexts: the nameless declaration's slot event is
+        // what the downstream capture reads (dartq-semantic's
+        // declaration-name arms), and the order matches upstream — the
+        // recovery report lands BEFORE the event, in every posture here
+        // (report at the template entry, event after the postures).
         if matches!(
             context,
             crate::listener::IdentifierContext::ConstructorReferenceContinuation
                 | crate::listener::IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments
+                | crate::listener::IdentifierContext::TypedefDeclaration
+                | crate::listener::IdentifierContext::FieldDeclaration
+                | crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                | crate::listener::IdentifierContext::TopLevelFunctionDeclaration
+                | crate::listener::IdentifierContext::MethodDeclaration
+                | crate::listener::IdentifierContext::LocalVariableDeclaration
+                | crate::listener::IdentifierContext::LocalFunctionDeclaration
+                | crate::listener::IdentifierContext::RecordFieldDeclaration
         ) {
             self.listener.handle_identifier(span, context);
         }

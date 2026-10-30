@@ -1530,6 +1530,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             synthetic_open
         };
         self.cursor.advance(); // `(`
+        // The condition/message parse with function expressions enabled
+        // unconditionally (parser_impl.dart:11067-11068, restored :11098):
+        // `assert` in a constructor initializer — the one context that holds
+        // `may_parse_function_expressions == false` (official :4755) — still
+        // parses `assert((x) => x > 0)`'s closure, and an `assert` reached
+        // as an expression inside a `may_parse_function_expressions == false`
+        // frame (a switch-expression case body, :12405) does the same.
+        let saved = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let _ = self.parse_expression();
         let mut comma = None;
         if self.peek_kind() == TokenKind::Comma {
@@ -1545,6 +1554,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
         }
         let end = self.ensure_close_paren(open);
+        self.may_parse_function_expressions = saved;
         if kind == AssertKind::Statement {
             self.ensure_semicolon();
         }
@@ -1630,16 +1640,28 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if self.peek_kind() != TokenKind::OpenParen {
             // Recovery: `insertParens(includeIdentifier: true)`. The official
             // parser then re-enters parseFormalParameters at the synthetic
-            // `(` and parses the empty list; our cursor cannot re-serve
-            // inserted tokens, so the same empty-list event shape is emitted
-            // directly.
+            // `(` and parses the list — the synthetic identifier IS an
+            // identifier token, so the re-parse's name slot fires
+            // `handleIdentifier` on it (parser_impl.dart:4038 via
+            // parseFormalParameter's `ensureIdentifier`, :2348) and the list
+            // carries one parameter (CatchClauseParameter, name empty,
+            // synthetic — analyzer try_statement corpus). Our cursor cannot
+            // re-serve inserted tokens, so the same shape is emitted
+            // directly: the slot's CatchParameter event fires at the name's
+            // position (before the formal-list events, the pre-scan slot
+            // [`Self::ensure_catch_parameter`] owns on the normal path);
+            // the `catch_syntax` report above is the clause's single row,
+            // exactly upstream's (the report at :10741 precedes
+            // `insertParens`, and the event fires later — no second row).
             let at = self.peek_span();
             self.report(msg::catch_syntax(), at);
             let offset = at.range.offset;
             let open = self.synthetic(TokenKind::OpenParen, offset);
             self.cursor.advance();
-            self.synthetic(TokenKind::Identifier, offset);
+            let name = self.synthetic(TokenKind::Identifier, offset);
             self.cursor.advance();
+            self.listener
+                .handle_identifier(name, crate::listener::IdentifierContext::CatchParameter);
             let close = self.synthetic(TokenKind::CloseParen, offset);
             self.cursor.advance();
             self.listener

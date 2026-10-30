@@ -608,15 +608,15 @@ pub(crate) struct Expr {
     /// `_PropertyReference`, flow_analysis.dart:7772-7800), so an `is`
     /// test on it never takes the non-reference literal folds.
     pub ref_chain: bool,
-    /// The written form can never evaluate to null while carrying no
-    /// real type head the lattice can classify — a non-collection
+    /// The written form can never evaluate to null — a non-collection
     /// literal (`'s'`, `1`, `true`), `this`, or another producer whose
     /// static type is `Never`-free and non-nullable by construction.
-    /// [`Expr::ty`] stays the opaque unknown face for these, so the
-    /// `??`/`?.` guaranteed-non-null kills that consult
-    /// [`NameTypeOps::classify`] would never fire on them; this flag
-    /// feeds the same verdict through [`Interp::guaranteed_non_null`]
-    /// (official `type.isNonNullable` on the literal's real static type).
+    /// Producers that spell no real type head keep [`Expr::ty`] the opaque
+    /// unknown face (`true` spells `bool` — a `bool <: T` question a write
+    /// asks resolves through the head, not this flag), so the `??`/`?.`
+    /// guaranteed-non-null kills that consult [`NameTypeOps::classify`]
+    /// fire through this flag ([`Interp::guaranteed_non_null`], official
+    /// `type.isNonNullable` on the literal's real static type).
     pub non_null_literal: bool,
 }
 

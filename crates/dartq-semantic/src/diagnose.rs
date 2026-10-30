@@ -375,23 +375,6 @@ use dartq_types::{
     Case, Exhaustiveness, ExhaustivenessWorld, Variance, Witness as EngineWitness, compute,
 };
 
-// TEMPORARY R53 differential probes — `DQ_PROBE` env-gated eprintln, zero
-// output and one atomic read when unset. Every call site is stripped before
-// commit (the R52+ probe discipline).
-pub(crate) fn dq_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DQ_PROBE").is_some())
-}
-
-#[allow(unused_macros)] // the R53 probe facility: call sites are stripped before commit
-macro_rules! dq_probe {
-    ($($arg:tt)*) => {
-        if crate::diagnose::dq_probe_enabled() {
-            eprintln!($($arg)*);
-        }
-    };
-}
-
 mod assignability;
 mod augmentations;
 mod best_practices_verifier;
@@ -439,6 +422,14 @@ mod literal_constructor_tests;
 mod sealed_contract_tests;
 #[cfg(test)]
 mod tests;
+
+/// The #2904 `invalid_override` pins: the combined-signature inference
+/// (`instance_member_inferrer.dart`), the per-face merged witness
+/// (`inheritance_manager3.dart`'s most-specific candidate order), the
+/// inherited field's induced setter face, and the frozen `Object`/`Enum`
+/// top faces.
+#[cfg(test)]
+mod ticket_2904_tests;
 
 /// The #2878 display-retention pins: the function type's own
 /// type-parameter group and the named type's arguments surviving into
@@ -522,6 +513,13 @@ mod ticket_assignability_family_tests;
 /// untouched while its lane is in flight.
 #[cfg(test)]
 mod ticket_2243_tests;
+
+/// The #2909 pins: the `undefined_operator` faces over record/function/
+/// bound/typed-receiver operands, the compound/prefix/postfix consult, and
+/// the prefixed-type error-range spans (`_getErrorRange`) with the
+/// prefix-qualified `dynamic` export face.
+#[cfg(test)]
+mod ticket_2909_tests;
 
 /// The #2245 composite-argument pins: a comparison (`==`/`!=`/`&&`/`||`)
 /// argument folds no single row, so the argument windows recover the
@@ -1007,13 +1005,18 @@ pub struct UnitFold {
 /// Builds the capture-time duplicate log's `duplicate_definition` rows —
 /// the one construction both emission faces render (the fold's lead rows
 /// and the engine's `l1::duplicate_diagnostics` bake): ERROR at the second
-/// declaration's name token, setters named by their bare identifier, plus
-/// the oracle's first-declaration context row when `first_decl` resolves
-/// the kept declaration's name span (`diagnostic_factory.dart`
-/// `duplicateDefinition` — "The first definition of this name." at the
-/// original element's fragment). The model keeps no declaration spans, so
-/// each face resolves from its own capture grade; an unresolved anchor
-/// degrades to the plain row, never a dropped diagnostic.
+/// declaration's name token, plus the oracle's first-declaration context
+/// row when `first_decl` resolves the kept declaration's name span
+/// (`diagnostic_factory.dart` `duplicateDefinition` — "The first
+/// definition of this name." at the original element's fragment). The
+/// stored name renders verbatim: a top-level setter duplicates under its
+/// `name=` lookup spelling (`checkUnit`'s `definedSetters` — the oracle's
+/// `lookupName` renders `f=`, duplicate_definition_verifier.dart:116-307;
+/// the class-member face captures the bare lexeme, so its rows read `b`),
+/// and stripping here would diverge from the byte-exact message text. The
+/// model keeps no declaration spans, so each face resolves from its own
+/// capture grade; an unresolved anchor degrades to the plain row, never a
+/// dropped diagnostic.
 pub fn duplicate_definition_diagnostics(
     file: FileId,
     elements: &FileElements,
@@ -1024,8 +1027,7 @@ pub fn duplicate_definition_diagnostics(
         .duplicates()
         .iter()
         .map(|dup| {
-            let text = strings.resolve(dup.name);
-            let display = text.strip_suffix('=').unwrap_or(text);
+            let display = strings.resolve(dup.name);
             Diagnostic::new(
                 Severity::Error,
                 SemanticCode::DuplicateDefinition.code_info(),
@@ -1861,9 +1863,11 @@ pub fn fold_unit_with_ops<'t>(
     report.diagnostics = merge_source_ordered(report.diagnostics, dead_cases);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
-    // Setters live under `name=` in the model; the oracle's message names
-    // the bare identifier. The first-declaration context row resolves from
-    // the fold's own capture grade ([`first_decl_site`]).
+    // A top-level setter duplicates under its `name=` lookup spelling and
+    // renders it verbatim (duplicate_definition_verifier.dart:116-307);
+    // the class-member face captures the bare lexeme. The
+    // first-declaration context row resolves from the fold's own capture
+    // grade ([`first_decl_site`]).
     let mut diagnostics = Vec::with_capacity(
         index
             .get(file)
@@ -1876,6 +1880,42 @@ pub fn fold_unit_with_ops<'t>(
             strings,
             |name, duplicate| first_decl_site(&engine, elements, name, duplicate),
         ));
+        // The wildcard-`_` leftovers drain: a unit whose walk reached no
+        // drain hook — a pure typedef's `typedef F<_, _>` type-parameter
+        // dups, whose `end_typedef` fires no executable-end event — parks
+        // its rows unemitted. The same cursor-gated posture as the
+        // walk-time drain ([`Engine::emit_wildcard_dups`]): a pre-feature
+        // unit renders the not-yet-drained suffix interleaved in source
+        // order among the duplicate rows (the oracle's verifier emits the
+        // duplicate family in one pass) and the log parks single-shot;
+        // the feature's units emit nothing (`isWildcardVariable` — `_`
+        // declares no name).
+        if !engine.is_wildcard(engine.intern("_")) {
+            let leftover = elements
+                .wildcard_duplicates()
+                .iter()
+                .skip(engine.wildcard_dups_emitted)
+                .map(|dup| {
+                    Diagnostic::new(
+                        Severity::Error,
+                        SemanticCode::DuplicateDefinition.code_info(),
+                        SemanticCode::DuplicateDefinition.message(
+                            strings.resolve(dup.name),
+                            "",
+                        ),
+                        file,
+                        dup.range,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            engine.wildcard_dups_emitted = usize::MAX;
+            for row in leftover {
+                let position =
+                    diagnostics.partition_point(|d| d.range.offset <= row.range.offset);
+                diagnostics.insert(position, row);
+            }
+        }
         // The declaration-arity log folds next (capture-time order =
         // source order): operator parameter counts and the setter shape
         // rule.
@@ -5370,8 +5410,127 @@ mod ticket_2851_tests;
 /// substituted bounds, the erroneous-type and `dynamic` suppressions).
 #[cfg(test)]
 mod ticket_2869_tests;
+/// The #2873 pins: wave-4 over-fire corrections — the super-invocation
+/// field-formal patch preceding the clause substitution, the substituted
+/// tear-off argument pair on class-type-vs-fn-context formals, the
+/// decided-matrix finality against the declared-closure negative (the
+/// `FutureOr` union faces), and the creation-row instantiation riding the
+/// message slots.
+#[cfg(test)]
+mod ticket_2873_tests;
 /// The #2890 pins: the #2869 residual bounds faces — the tear-off and
 /// constructor-reference forms without a call, the super-send explicit
 /// arguments, and the keyword-form creation.
 #[cfg(test)]
 mod ticket_2890_tests;
+/// The #2908 pins: the instantiation-site bounds faces the capture
+/// windows shadowed — the type-ALIAS instantiation arm at every site
+/// kind, and the written type-parameter bounds' own argument checks.
+#[cfg(test)]
+mod ticket_2908_tests;
+/// The #2912 pins: the null-safety assignability faces — the
+/// whole-expression emission anchor (`await`/paren/`as`/unary wrappers),
+/// the `extension E<T> on T` applicability binding, the return-check's
+/// cast-face `from`, the compound-assignment await flatten, and the
+/// executable head-region function-type capture.
+#[cfg(test)]
+mod ticket_2912_tests;
+/// The #2913 pins: the `unnecessary_type_check` constructor tear-off
+/// operand faces — a `C.constr`/`C.new`/`C<int>.constr`/prefixed head or
+/// a `var`-bound tear-off tested with `is`/`as` reports constant-true
+/// against the tear-off's `C Function(...)` type; the non-constructor
+/// selector and the wrong-target faces stay silent.
+#[cfg(test)]
+mod ticket_2913_tests;
+/// The #2914 pins: the declarations-conflict faces — `duplicate_definition`
+/// (member-scope pair claims, positional formal collisions, wildcard `_`
+/// pre/post-feature postures, top-level setter `f=` scope, field
+/// induced-accessor claims) and `conflicting_static_and_instance` /
+/// `extension_conflicting_static_and_instance` (own-scope, inherited
+/// three-arg message, enum `getMember` implicit faces).
+#[cfg(test)]
+mod ticket_2914_tests;
+/// The #2917 pins: the increment/decrement index compound-write pair
+/// (`a[0]++` reporting both `[]`/`[]=`), the relational pattern's
+/// operator-definedness face (`case > 0` over an operator-less class),
+/// and the constructor tear-off instantiation faces (the bare generic
+/// `C.new`, the receiver instantiation `C<int>.new`, the parenthesized
+/// `((C.new)<int>)`).
+#[cfg(test)]
+mod ticket_2917_tests;
+/// The #2918 pins: the raw generic head's instantiate-to-bounds display
+/// — a bare `G`/`A` in a declared or inferred type renders the oracle's
+/// `G<A<dynamic>>`/`A<dynamic, dynamic>` in every diagnostic message,
+/// never the bare fold-sentinel head.
+#[cfg(test)]
+mod ticket_2918_tests;
+/// The #2919 member-send resolution pins: the nullable implicit `this`
+/// inside `extension on A?` (the `isNullable` tail the type-property
+/// resolver runs before the member lookup — `this.m()`/`this.f`/`this.f =
+/// v`/`this[i]`/`-this` report `unchecked_use_of_nullable_value` at the
+/// selector), the accessor-result callee function check
+/// (`x.first()` over `List<T?>` invoking `T?`), and the three-segment
+/// creation head's `unresolved.Class` span tail (the class-name token, not
+/// the `?` generic tail).
+#[cfg(test)]
+mod ticket_2919_tests;
+/// The #2920 pins: the inferred-context closure return faces — the
+/// `Future` constructor's `FutureOr<T>` formal channel, the async
+/// body's `flatten`-based context return, the future-value
+/// projection's `FutureOr<V>` arm, and the old-style function-typedef
+/// declaration channel.
+#[cfg(test)]
+mod ticket_2920_tests;
+/// The #2921 pins: the `argument_type_not_assignable` assignability
+/// faces — the staged-check teardown's bottom (`Never`) acceptance,
+/// the function-subtype arity/optional-positional/named rules the
+/// `fn_sig_subtype` machinery models, the `class-with-call`→`Function`
+/// implicit-call supertype face, and the ordinary `T?`→`T` rejection
+/// the nullability arms decide.
+#[cfg(test)]
+mod ticket_2921_tests;
+/// The #2922 pins: the invocation/bounds `argument_type_not_assignable`
+/// faces — the generic-formal substitution gaps (`new B(...)` under a
+/// superinterface context; `new C().m(42)` upward inference on a folded
+/// creation receiver), the unwalked closure-literal argument pairing, and
+/// the extension-type primary-constructor instantiation check.
+#[cfg(test)]
+mod ticket_2922_tests;
+/// The #2925 pins: the instantiate-to-bounds display face adopted at
+/// the freed bind/display sites — `bind_declared_type` /
+/// `bind_parameter_type` (the declared-variable and formal-parameter
+/// annotations) and `ty_display` (the message render) fill a bare
+/// `Named{head, EMPTY}` with its parameter defaults through
+/// [`Engine::instantiated_head_ty`], so `G` binds and renders
+/// `G<A<dynamic>>` the way the oracle's resolved `staticType` /
+/// `getDisplayString` does.
+#[cfg(test)]
+mod ticket_2925_tests;
+/// The #2926 pins: the two #2919 residuals and the rider's fourth I2B
+/// adoption — the bare sends inside `extension on A?` (`foo()` / `foo` /
+/// `foo = 0` reporting the oracle's unchecked Method/Property variants
+/// at the selector through a push-time `on`-face latch, with the
+/// write-side `name=` spelling probe suppressing `undefined_identifier`
+/// either way), the parenthesized unbound type-parameter receiver
+/// `(t).foo` reading its erased `Object?` bound through the
+/// container-owned window fallback, and `fold_alias_ty`'s terminal bare
+/// head instantiating through [`Engine::instantiated_head_ty`].
+#[cfg(test)]
+mod ticket_2926_tests;
+/// The #2928 pins: the pure-typedef wildcard-`_` leftovers drain (the
+/// fold's duplicate assembly renders the not-yet-drained suffix behind
+/// the engine's cursor), the top-level setter `f=` lookup-spelling
+/// duplicate message beside the member face's bare lexeme, and the
+/// variance argument relation (`in` right-to-left, `inout` both ways,
+/// legacy covariant left-to-right).
+#[cfg(test)]
+mod ticket_2928_tests;
+/// The #2936 pins: the clause/bound `type_argument_not_matching_bounds`
+/// faces — the nested `NamedType` walk inside clause and bound arguments
+/// (the `A<X?>` of `X extends FutureOr<A<X?>>`), the bare clause head's
+/// instantiate-to-bounds verdict with its raw-type context row, the
+/// type-alias right-hand side's `GenericTypeAlias` deny arm, and the
+/// could_not_infer "declared to extend ... producing" message shape the
+/// raw-constructor inference face emits.
+#[cfg(test)]
+mod ticket_2936_tests;

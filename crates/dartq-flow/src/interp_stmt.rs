@@ -1497,7 +1497,27 @@ impl Interp<'_> {
                     // demotion reason attaches (the official
                     // `declare`/`_initialize` carry no
                     // `nonPromotionReason`, `flow_analysis.dart:4914-4916`).
-                    self.apply_write(var, rhs.ty, rhs.args, true, None, false);
+                    // The type-of-interest promotion is the official's
+                    // `promoteToTypeOfInterest: !isImplicitlyTyped &&
+                    // !isFinal` (`_initialize`, flow_analysis.dart:7583): an
+                    // implicitly typed declarator's slot is the inferred
+                    // type itself (nothing to promote toward), and a
+                    // `final`/`const` local's initializer never promotes
+                    // (`final Object? o = true` stays `Object?` upstream).
+                    // The implicit face is the written header's unknown
+                    // slot; `rhs.literal` rides the same collection-literal
+                    // bridge the plain-assign write passes
+                    // (`Object? o = <num>[]` promotes `o` to `Object`).
+                    let promote_to_interest = !self.decl.is_final
+                        && self.decl.ty.base != crate::ty::Base::Unknown;
+                    self.apply_write(
+                        var,
+                        rhs.ty,
+                        rhs.args,
+                        promote_to_interest,
+                        None,
+                        rhs.literal,
+                    );
                     if let (Some(value), Some(meta)) =
                         (const_feed, self.vars.get_mut(var as usize))
                     {

@@ -77,6 +77,19 @@ pub struct Flow<'t> {
     /// before the row (official `parseArguments`,
     /// `type_info_impl.dart:1158/1191`).
     pending_type_args: u32,
+    /// Written type-argument trees headed for a collection literal
+    /// (`<E>` of `<E>[...]`, `<E>`/`<K,V>` of `{...}`), each paired with
+    /// the literal's own opening-bracket utf16 offset. `end_type_arguments`
+    /// pushes the just-interned list when the token directly following the
+    /// group's `>` is `[`, `[]`, or `{`; `handle_literal_list` and
+    /// `handle_literal_set_or_map` pop the top entry when its offset is
+    /// their own `left` bracket's. Pushing at the group's close — before
+    /// any element expression runs — keeps an element's own type
+    /// arguments from clobbering the literal's, and the offset pairing
+    /// keeps nested literals (`<num>[<int>[]]`) self-balancing; entries
+    /// whose literal never ends (recovery) stay, bounded by the unit's
+    /// literal count.
+    literal_args: Vec<(u32, u32)>,
     /// Inferred locals' declared types keyed on the declarator name
     /// token's offset (#2140): the semantic layer derives a `var`/`final`
     /// declarator's static type from its initializer (the property-read
@@ -353,6 +366,7 @@ impl<'t> Flow<'t> {
             type_args: vec![Vec::new()],
             non_promotions: vec![Vec::new()],
             pending_type_args: crate::ty::EMPTY_ARGS,
+            literal_args: Vec::new(),
             inferred_locals: FxHashMap::default(),
             staged_rhs: FxHashMap::default(),
             staged_calls: FxHashMap::default(),
@@ -449,6 +463,31 @@ impl<'t> Flow<'t> {
         let id = self.type_args.len() as u32;
         self.type_args.push(entries);
         id
+    }
+
+    /// The written type-argument tree heading the literal whose opening
+    /// bracket is `left` — the pair `end_type_arguments` latched when the
+    /// group's `>` sat directly before this `[`/`[]`/`{`
+    /// ([`Flow::literal_args`]). [`crate::ty::EMPTY_ARGS`] when the
+    /// literal spelled none (or a stale pair shadows it — under-report,
+    /// never a wrong tree). The literal's own group — and anything an
+    /// element left unclaimed — never reaches `handle_type`'s row, so
+    /// `pending_type_args` is taken here too (the same leak-clearing
+    /// posture `handle_send` takes for a head-less group).
+    fn take_literal_args(&mut self, left: Token) -> u32 {
+        let args = if self
+            .literal_args
+            .last()
+            .is_some_and(|(_, offset)| *offset == left.range.offset)
+        {
+            self.literal_args
+                .pop()
+                .map_or(crate::ty::EMPTY_ARGS, |(args, _)| args)
+        } else {
+            crate::ty::EMPTY_ARGS
+        };
+        self.pending_type_args = crate::ty::EMPTY_ARGS;
+        args
     }
 
     /// Interns a staged written-argument tree (#2364) into the same arena
@@ -1015,6 +1054,20 @@ impl<'t> Flow<'t> {
         self.closed.bool_name = Some(self.intern_lexeme("bool"));
         self.closed.future_or = Some(self.intern_lexeme("FutureOr"));
         self.intern_lexeme("Future");
+        // The literal static-type spellings (idempotent interning — an
+        // id already interned keeps its id, so existing name-id
+        // assertions never shift): the leaf literals' `int`/`double`/
+        // `String` and the collection heads' `List`/`Set`/`Map`. The
+        // replay spells each literal's static type through them the same
+        // way `Ev::Bool` spells `bool` (#2940), feeding the promotion
+        // write's `matchedType` a concrete type instead of the opaque
+        // unknown face.
+        self.closed.int_name = Some(self.intern_lexeme("int"));
+        self.closed.double_name = Some(self.intern_lexeme("double"));
+        self.closed.string_name = Some(self.intern_lexeme("String"));
+        self.closed.list_name = Some(self.intern_lexeme("List"));
+        self.closed.set_name = Some(self.intern_lexeme("Set"));
+        self.closed.map_name = Some(self.intern_lexeme("Map"));
         let fallback = NameTypeOps;
         let ops = self.ops.unwrap_or(&fallback);
         let mut interp = Interp::new(ops, &self.type_args, &self.boundaries);
@@ -1760,11 +1813,29 @@ impl ParserListener for Flow<'_> {
         self.pending_type_args = crate::ty::EMPTY_ARGS;
     }
 
-    fn end_type_arguments(&mut self, _count: usize, _begin: Token, _end: Token) {
+    fn end_type_arguments(&mut self, _count: usize, _begin: Token, end: Token) {
         // The group is complete (every argument row fired before the
         // close, nested groups folded bottom-up); the head row follows.
         let entries = self.type_arg_groups.pop().unwrap_or_default();
         self.pending_type_args = self.intern_args(entries);
+        // A collection literal's head group (`<E>[...]`, `<E>`/`<K,V>`
+        // `{...}`): the `>` closer sits directly before the literal's
+        // `[`/`[]`/`{` — every other consumer's group is followed by
+        // its own continuation (a name head, `(`, `.`). Latch the args
+        // now, keyed on the bracket's offset, so element expressions
+        // with their own type arguments cannot clobber them before the
+        // literal's end hook runs (see [`Flow::literal_args`]).
+        if let Some(next) = self.tokens.get(end.id as usize + 1)
+            && matches!(
+                next.kind,
+                dartq_scanner::TokenKind::OpenSquare
+                    | dartq_scanner::TokenKind::Index
+                    | dartq_scanner::TokenKind::OpenCurly
+            )
+        {
+            self.literal_args
+                .push((self.pending_type_args, next.utf16_offset));
+        }
     }
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
@@ -2444,19 +2515,19 @@ impl ParserListener for Flow<'_> {
     }
 
     fn handle_literal_int(&mut self, token: Token) {
-        self.record(Ev::OtherExpr { span: token });
+        self.record(Ev::Int { span: token });
     }
 
     fn handle_literal_int_with_separators(&mut self, token: Token) {
-        self.record(Ev::OtherExpr { span: token });
+        self.record(Ev::Int { span: token });
     }
 
     fn handle_literal_double(&mut self, token: Token) {
-        self.record(Ev::OtherExpr { span: token });
+        self.record(Ev::Double { span: token });
     }
 
     fn handle_literal_double_with_separators(&mut self, token: Token) {
-        self.record(Ev::OtherExpr { span: token });
+        self.record(Ev::Double { span: token });
     }
 
     fn end_literal_string(&mut self, interpolation_count: usize, _end: Token) {
@@ -2472,22 +2543,44 @@ impl ParserListener for Flow<'_> {
     fn handle_literal_list(
         &mut self,
         count: usize,
-        _left: Token,
+        left: Token,
         _const_keyword: Option<Token>,
         _right: Token,
     ) {
-        self.record(Ev::ListLitEnd { count });
+        let args = self.take_literal_args(left);
+        self.record(Ev::ListLitEnd { count, args });
     }
 
     fn handle_literal_set_or_map(
         &mut self,
         count: usize,
-        _left: Token,
+        left: Token,
         _const_keyword: Option<Token>,
         _right: Token,
-        _has_set_entry: bool,
+        has_set_entry: bool,
     ) {
-        self.record(Ev::ListLitEnd { count });
+        let args = self.take_literal_args(left);
+        // Upstream's set-vs-map resolution order
+        // (typed_literal_resolver.dart:346-363/:299-305): the written
+        // type arguments decide first — one argument is a `Set`, two a
+        // `Map`; otherwise the leaf elements' own signal (the parser's
+        // FIRST-wins `has_set_entry`) decides, the empty `{}` falling to
+        // `Map` exactly like the official's `mapType(dynamic, dynamic)`
+        // default.
+        let args_len = self
+            .type_args
+            .get(args as usize)
+            .map_or(0, |args| args.len());
+        let is_set = match args_len {
+            1 => true,
+            2 => false,
+            _ => has_set_entry,
+        };
+        self.record(Ev::SetOrMapLitEnd {
+            count,
+            is_set,
+            args,
+        });
     }
 
     fn handle_literal_map_entry(

@@ -2278,6 +2278,11 @@ pub(crate) mod use_primary_constructors;
 pub(crate) mod use_setters_to_change_properties;
 pub(crate) mod use_to_and_as_if_applicable;
 pub(crate) mod var_with_no_type_annotation;
+/// The #2846 shared-face pins: a bare-identifier collection element's
+/// `Send` piece must not fold the element comma into the segment
+/// (`slice::comma_segments`' strict-interior boundary).
+#[cfg(test)]
+mod w2846_pins;
 /// The W5 (#1124) approximation pins over real parser trees.
 #[cfg(test)]
 mod w5_approx_pins;

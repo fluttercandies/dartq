@@ -1374,9 +1374,21 @@ impl AnalysisOptions {
     /// its directory. Descent prunes against the globs accumulated so far —
     /// the root's own first, each nested file's as it registers — mirroring
     /// the official locator's walk under `containingRoot.excludedGlobs`
-    /// (context_locator.dart:411-431). Termination: the queue holds real
-    /// directories only (symlinked dirs are never entered, `entry.file_type`
-    /// is link-host) over a finite tree.
+    /// (context_locator.dart:411-431).
+    ///
+    /// Termination is the official guard (`context_locator.dart:384-388`:
+    /// `canonicalFolderPath = folder.resolveSymbolicLinksSync().path;
+    /// if (!visited.add(canonicalFolderPath)) return;`): every directory
+    /// entered is canonicalized once and re-entering the same canonical
+    /// directory stops the descent. The official needs it because its
+    /// `listSync()` follows links and symlinked folders *are* descended;
+    /// here `entry.file_type()` reports link-host facts so a symlinked dir
+    /// is never queued, yet the bound still matters — a bind-mount or
+    /// firmlink loop is a *real* directory reachable through infinitely many
+    /// lexical spellings, and without the canonical key the queue would
+    /// never drain (the #2557 /tmp cyclic-root hang). A hard depth cap is
+    /// the second net for the only residual case (canonicalize fails while
+    /// `read_dir` still yields children).
     fn locate_nested(
         root: &Path,
         base: Arc<AnalysisOptions>,
@@ -1386,6 +1398,19 @@ impl AnalysisOptions {
         config_dir: &Path,
         all_roots: &rustc_hash::FxHashSet<PathBuf>,
     ) {
+        /// Second termination net: the lexical-spelling depth below which a
+        /// queued dir must sit. Filesystem paths are byte-bounded (~4096),
+        /// so a real tree never approaches this — it only cuts the residual
+        /// loop where canonicalization cannot dedupe spellings.
+        const MAX_NESTED_DEPTH: u32 = 256;
+        /// The dedupe key of the official `visited.add(canonicalFolderPath)`:
+        /// the canonicalized spelling collapses symlink, mount and `..`
+        /// aliases onto one identity; a path that cannot be canonicalized
+        /// (a dangling race) falls back to its lexical form — such an entry
+        /// yields no children anyway when `read_dir` fails alongside.
+        fn visit_key(path: &Path) -> PathBuf {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
         // The accumulated governing entries: the root's own first, each
         // nested file's as it registers. Exclusion tests every entry's
         // globs, each anchored to its declaring directory.
@@ -1393,25 +1418,36 @@ impl AnalysisOptions {
         let excluded = |path: &Path, governing: &[Arc<AnalysisOptions>]| {
             governing.iter().any(|options| options.is_excluded(path))
         };
+        // Canonical identity of every directory already entered: the root
+        // itself first, each queued dir as it pops. Children of a dir whose
+        // canonical key repeats are never read — that is the loop break.
+        let mut visited: FxHashSet<PathBuf> = FxHashSet::default();
+        visited.insert(visit_key(root));
         // The whole root, like discovery's walk (every non-dot child
-        // directory; the root's own options file is `base`).
-        let mut queue: Vec<PathBuf> = std::fs::read_dir(root)
+        // directory; the root's own options file is `base`). Each entry
+        // carries its lexical depth for the second termination net.
+        let mut queue: Vec<(PathBuf, u32)> = std::fs::read_dir(root)
             .map(|entries| {
                 entries
                     .flatten()
                     .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
                     .filter(|entry| !entry.file_name().as_encoded_bytes().starts_with(b"."))
-                    .map(|entry| entry.path())
-                    .filter(|path| !all_roots.contains(path))
+                    .map(|entry| (entry.path(), 1))
+                    .filter(|(path, _)| !all_roots.contains(path))
                     .collect()
             })
             .unwrap_or_default();
-        while let Some(dir) = queue.pop() {
+        while let Some((dir, depth)) = queue.pop() {
             // Pop-time exclusion: a glob registered while this dir sat in
             // the queue (its parent batch found a nested options file) must
             // prune it — registration order inside one batch must not leak
             // through.
             if excluded(&dir, &governing) {
+                continue;
+            }
+            // The official `visited` guard: one canonicalized key per dir,
+            // resolved once here at pop (excluded dirs cost no syscall).
+            if !visited.insert(visit_key(&dir)) {
                 continue;
             }
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1425,8 +1461,11 @@ impl AnalysisOptions {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if file_type.is_dir() {
-                    if !name.starts_with('.') && !all_roots.contains(&path) {
-                        queue.push(path);
+                    if !name.starts_with('.')
+                        && depth < MAX_NESTED_DEPTH
+                        && !all_roots.contains(&path)
+                    {
+                        queue.push((path, depth + 1));
                     }
                 } else if name == OPTIONS_FILE_NAME {
                     let options = loaded

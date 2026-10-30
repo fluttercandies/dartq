@@ -335,6 +335,18 @@ pub enum Ev {
         value: bool,
     },
     Null,
+    /// An integer literal: distinguished from [`Ev::OtherExpr`] so the
+    /// replay can spell its static type `int` — the `matchedType` an
+    /// initializer or assignment write promotes through (`num? n = 1`
+    /// promotes `n` to `num`, the same face [`Ev::Bool`] spells `bool`
+    /// for). The span keeps the event's partition anchor.
+    Int {
+        span: TokenSpan,
+    },
+    /// A double literal — [`Ev::Int`]'s `double` twin.
+    Double {
+        span: TokenSpan,
+    },
     OtherExpr {
         span: TokenSpan,
     },
@@ -549,10 +561,28 @@ pub enum Ev {
     RecordLitEnd {
         count: usize,
     },
-    /// List/set/map literal end: `count` elements were parsed, each of
-    /// which netted exactly one expression value.
+    /// List literal end: `count` elements were parsed, each of which
+    /// netted exactly one expression value. `args` is the literal's own
+    /// written type-argument tree (`<E>` of `<E>[...]` — an arena index,
+    /// [`crate::ty::EMPTY_ARGS`] when the literal spells none): the
+    /// literal's static type is `List` instantiated over it (upstream
+    /// `resolveListLiteral`'s written-arguments arm,
+    /// typed_literal_resolver.dart:68-107).
     ListLitEnd {
         count: usize,
+        args: u32,
+    },
+    /// Set/map literal end: `count` elements were parsed, each of which
+    /// netted exactly one expression value. `is_set` resolves the
+    /// literal's head — the recorder applies upstream's resolution order
+    /// (one written type argument → `Set`, two → `Map`, otherwise the
+    /// leaf elements' own signal, the empty `{}` falling to `Map` —
+    /// typed_literal_resolver.dart:299-305/:346-363). `args` is the
+    /// written type-argument tree, exactly as [`Ev::ListLitEnd::args`].
+    SetOrMapLitEnd {
+        count: usize,
+        is_set: bool,
+        args: u32,
     },
     /// One map entry (`k: v`) ended after its value's events: the key and
     /// value each left one expression value.
@@ -777,6 +807,8 @@ impl Ev {
             | Ev::Break { span, .. }
             | Ev::Continue { span, .. }
             | Ev::OtherExpr { span }
+            | Ev::Int { span }
+            | Ev::Double { span }
             | Ev::PatternBegin { span, .. }
             | Ev::This { span } => Some(*span),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),

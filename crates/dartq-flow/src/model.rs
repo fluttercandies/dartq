@@ -537,17 +537,31 @@ impl State {
                     names,
                     &mut candidates,
                 );
-                // A collection literal's name-level face is the unknown
-                // type, but the written value IS a `List`/`Set`/`Map` —
-                // a proper subtype of any declared non-null form the
-                // oracle compares against the literal's real static type
-                // (`o = <num>[]` on `Object? o` promotes `o` to `Object`,
-                // flow_analysis.dart:4955-5000's written-type gate
-                // answered on `List<num>`). The written-type leg of the
-                // gate is what the unknown face cannot answer; the
-                // step legs below still run over the declared pair.
+                // A collection literal's written value IS a
+                // `List`/`Set`/`Map` — a proper subtype of any declared
+                // non-null form the oracle compares against the literal's
+                // real static type (`o = <num>[]` on `Object? o` promotes
+                // `o` to `Object`, flow_analysis.dart:4955-5000's
+                // written-type gate answered on `List<num>`). The
+                // written-type leg of the gate is what the name-level
+                // lattice cannot answer — `List<num> <: Object` needs a
+                // real hierarchy — so the admit fires where `consider`
+                // could not already take the candidate: the literal's
+                // face used to be the opaque unknown (the original arm);
+                // it is now the literal's real static type (a named
+                // head), and the same under-report posture carries it.
+                // A resolved seam answers the written-type leg through
+                // `consider` itself — the admit then never fires.
                 let literal_admit = literal_rhs
-                    && written == Ty::UNKNOWN
+                    && matches!(written.base, Base::Unknown | Base::Name(_))
+                    && !ops.is_subtype_typed(
+                        written,
+                        written_args,
+                        declared_non_null,
+                        declared_args,
+                        arena,
+                        names,
+                    )
                     && !candidates
                         .iter()
                         .any(|&(existing, _)| existing == declared_non_null)

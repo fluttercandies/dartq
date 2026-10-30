@@ -4,13 +4,17 @@ use super::*;
 /// whole import-warning pass (upstream Dart SDK source,
 /// library_analyzer.dart `_hasDiagnosticReportedThatPreventsImportWarnings`
 /// — the exact set, machine spellings lowered to the engine's code names).
+/// The upstream list's `constWithNonType` and `newWithNonType` entries both
+/// carry the machine name `creation_with_non_type` (diagnostic.g.dart
+/// :3237 and :12035 — one registry spelling shared by the two unique
+/// names), which is also this engine's emitted spelling (`codes.rs`), so a
+/// single entry covers both.
 const IMPORT_WARNING_GATE: &[&str] = &[
     "ambiguous_import",
-    "const_with_non_type",
+    "creation_with_non_type",
     "extends_non_class",
     "implements_non_class",
     "mixin_of_non_class",
-    "new_with_non_type",
     "not_a_type",
     "prefix_identifier_not_followed_by_dot",
     "undefined_annotation",
@@ -153,12 +157,35 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(crate) fn finalize_bounds(&mut self) {
-        let strings = self.strings;
-        // The clause-site face (`checkNamedType` at every supertype
-        // annotation; `_shouldAllowSuperBoundedTypes` denies the super pass
-        // on the clause contexts, so every violation reports plain).
-        for issue in self.bounds.check_clause_sites(strings) {
+    /// One `type_argument_not_matching_bounds` row with its context rows
+    /// (`buildContextMessages`, type_arguments_verifier.dart:417-435): the
+    /// raw-type instantiation row first when the checked annotation spelled
+    /// no arguments, then the inverted-type row when the super-bounded pass
+    /// ran — both anchored at the checked `NamedType`'s own span.
+    fn emit_bounded_issue(&mut self, issue: crate::bounds::BoundedIssue) {
+        let mut context = Vec::new();
+        if let Some(raw) = &issue.raw_instantiated {
+            context.push(ContextMessage {
+                message: format!(
+                    "The raw type was instantiated as '{raw}', and is not regular-bounded."
+                )
+                .into(),
+                file: self.file,
+                range: issue.site,
+            });
+        }
+        if let Some(inverted) = &issue.inverted_type {
+            context.push(ContextMessage {
+                message: format!(
+                    "The inverted type '{inverted}' is also not regular-bounded, \
+                     so the type is not well-bounded."
+                )
+                .into(),
+                file: self.file,
+                range: issue.site,
+            });
+        }
+        if context.is_empty() {
             self.emit3(
                 SemanticCode::TypeArgumentNotMatchingBounds,
                 issue.range,
@@ -166,6 +193,47 @@ impl<'a> Engine<'a> {
                 &issue.parameter,
                 &issue.bound,
             );
+        } else {
+            self.emit3_with_context(
+                SemanticCode::TypeArgumentNotMatchingBounds,
+                issue.range,
+                &issue.argument,
+                &issue.parameter,
+                &issue.bound,
+                context,
+            );
+        }
+    }
+
+    pub(crate) fn finalize_bounds(&mut self) {
+        let strings = self.strings;
+        // The annotation faces share one document-ordered stream — the
+        // oracle's `checkNamedType` runs at every `NamedType` during the
+        // resolution walk, so a bound's nested argument reports ahead of a
+        // later-spelled alias-RHS argument regardless of which capture owns
+        // the tree. The three enumerations feed one offset-sorted batch:
+        // - the clause-site face (`checkNamedType` at every supertype
+        //   annotation; `_shouldAllowSuperBoundedTypes` denies the super
+        //   pass on the clause contexts, so a violation reports plain —
+        //   plus the raw-type context row a bare clause head carries,
+        //   type_arguments_verifier.dart:441-446);
+        // - the alias-RHS face (#2936): a type alias's named right-hand
+        //   side is a `NamedType` under a `GenericTypeAlias` parent — the
+        //   deny list's same arm — so its arguments answer the regular
+        //   verdict with no super pass; a function-shaped RHS's own named
+        //   types keep the pass (their parents are the function type's
+        //   nodes);
+        // - the bound-annotation face (#2908): the bound trees parse
+        //   inside the declaring `<...>` window, which claims them before
+        //   the use-site capture can open; `TypeParameter` is not in the
+        //   deny list, so the super pass runs and the context row rides
+        //   conditionally like the site arm.
+        let mut issues = self.bounds.check_clause_sites(strings);
+        issues.extend(self.bounds.check_alias_rhs_sites(strings));
+        issues.extend(self.bounds.check_bound_annotation_sites(strings));
+        issues.sort_by_key(|issue| issue.range.offset);
+        for issue in issues {
+            self.emit_bounded_issue(issue);
         }
         for check in std::mem::take(&mut self.pending_bounded_checks) {
             match check {
@@ -175,38 +243,11 @@ impl<'a> Engine<'a> {
                     in_scope,
                     site,
                 } => {
-                    let issues = self.bounds.check_site(strings, head, &args, &in_scope);
+                    let issues = self
+                        .bounds
+                        .check_site(strings, head, &args, &in_scope, site);
                     for issue in issues {
-                        // The inverted-type context row rides every
-                        // super-bounded-path report; the extension-type face
-                        // carries none (the raw-type row keys on absent
-                        // written arguments, which this capture's sites
-                        // always have).
-                        match issue.inverted_type {
-                            Some(inverted) => self.emit3_with_context(
-                                SemanticCode::TypeArgumentNotMatchingBounds,
-                                issue.range,
-                                &issue.argument,
-                                &issue.parameter,
-                                &issue.bound,
-                                vec![ContextMessage {
-                                    message: format!(
-                                        "The inverted type '{inverted}' is also not regular-bounded, \
-                                         so the type is not well-bounded."
-                                    )
-                                    .into(),
-                                    file: self.file,
-                                    range: site,
-                                }],
-                            ),
-                            None => self.emit3(
-                                SemanticCode::TypeArgumentNotMatchingBounds,
-                                issue.range,
-                                &issue.argument,
-                                &issue.parameter,
-                                &issue.bound,
-                            ),
-                        }
+                        self.emit_bounded_issue(issue);
                     }
                 }
                 PendingBoundedCheck::Enum { name, range } => {
@@ -1019,9 +1060,21 @@ impl<'a> Engine<'a> {
                 DeclKind::Container => {
                     // `_visitClassElement` (classes, enums, mixins, and
                     // extension types; extensions are never visited): the
-                    // same public/used gate.
+                    // same public/used gate. A NAMELESS recovery container
+                    // never reports: the class/mixin/enum/extension-type
+                    // element answers `isPrivate` through its fragment
+                    // (`InstanceElementImpl.isPrivate` →
+                    // `_firstFragment.isPrivate`), and
+                    // `FragmentImpl.isPrivate` maps a null name to PUBLIC
+                    // (element.dart:4539-4544, upstream Dart SDK source) —
+                    // the parser-recovery `<unnamed>` face is exported and
+                    // exempt (the fragment_offset `_missingName` corpus).
+                    // The opposite null-name reading belongs to
+                    // `ElementImpl` (top-level fns/vars/type aliases, the
+                    // arm above) and to extension fragments; neither is a
+                    // `Container` site.
                     if !site.annotated
-                        && (self.is_private_name(site.name) || self.is_nameless(site.name))
+                        && self.is_private_name(site.name)
                         && !element_used.contains(&bare)
                     {
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
@@ -1043,6 +1096,13 @@ impl<'a> Engine<'a> {
                     // a sibling class's same-spelled field does not).
                     let eligible = !site.annotated
                         && (self.is_private_name(site.name)
+                            // A nameless recovery field maps a null name to
+                            // PRIVATE upstream (`ElementImpl.isPrivate`'s
+                            // `name == null → true`, element.dart:2179) —
+                            // the same gate the top-level arm applies, so
+                            // the `<unnamed>` member reports like a private
+                            // field rather than reading public.
+                            || self.is_nameless(site.name)
                             || (self.is_private_name(container) && is_static));
                     if !eligible {
                         continue;
@@ -1152,7 +1212,7 @@ impl<'a> Engine<'a> {
                     };
                     let spared = site.annotated
                         || (!self.is_nameless(site.name)
-                            && self.is_publicly_accessible(site.name, site.kind))
+                            && self.is_publicly_accessible(site.name, site.kind, false))
                         || member_used
                         || matches!(self.walk_super(container, site.name), Walk::Found(_));
                     if !spared {
@@ -1196,7 +1256,11 @@ impl<'a> Engine<'a> {
                         let spared = !multi
                             || site.annotated
                             || (!self.is_nameless(site.name)
-                                && self.is_publicly_accessible(site.name, site.kind))
+                                && self.is_publicly_accessible(
+                                    site.name,
+                                    site.kind,
+                                    site.is_factory,
+                                ))
                             || element_used.contains(&bare)
                             || matches!(self.walk_super(container, site.name), Walk::Found(_));
                         if !spared {
@@ -1578,10 +1642,12 @@ impl<'a> Engine<'a> {
     ///   import in neither the invoke nor the tear-off form
     ///   (`MethodInvocationResolutionTest/
     ///   test_hasReceiver_deferredImportPrefix_loadLibrary#0`);
-    /// - a member read the prefix scope did not resolve and no
-    ///   guard-ignore face suppressed keeps the raw posture (a bare
-    ///   credit — it cannot element-attribute, and the gate upstream
-    ///   would have silenced the pass beside the undefined face anyway);
+    /// - a member read the prefix scope did not resolve credits nothing
+    ///   (upstream `lookupResult(null)` records no element — the oracle's
+    ///   `undefined_getter`-on-a-found-prefix face is ungated and the
+    ///   import reports unused); the broken-import suppression face
+    ///   (`guard.ignore`) keeps its attribution — those edges carry no
+    ///   resolvable target, so the directive pass skips them regardless;
     /// - bare `Prefix` references in expression position (the receiver
     ///   occurrence of a member read dedupes by offset) credit bare;
     /// - type-annotation continuations (`p.T`) re-derive the shadow
@@ -1628,9 +1694,19 @@ impl<'a> Engine<'a> {
                     || self.guard.ignore(Some(prefix), read.name)
                 {
                     entry.0.insert(read.name);
-                } else {
-                    entry.1 = true;
                 }
+                // A member read the prefix scope did not resolve credits
+                // nothing: upstream `PrefixScope.lookup` answers the miss
+                // and `lookupResult(null)` records no element (scope.dart
+                // :651-653) — a bare credit here would hold the import open
+                // beside a miss the oracle answers with `undefined_getter`
+                // on the FOUND prefix (ungated — the Unquoted-imports
+                // `keywords_A01_t01` family), where the import stays
+                // unused. Inert under the engine's current
+                // `undefined_prefixed_name` classification of the same miss
+                // (a gate-listed code returns the pass before this pool is
+                // consulted); the mirror must stand when that
+                // classification lands the oracle's split.
             }
             for r in &self.refs {
                 if r.name == prefix
@@ -1922,9 +1998,19 @@ impl<'a> Engine<'a> {
     /// accessible; an instance member of a private interface stays
     /// reachable through exported instances; a static member or
     /// constructor of a private interface is not; a member of an extension
-    /// is accessible exactly when the extension is; a constructor of an
-    /// enum never is.
-    pub(crate) fn is_publicly_accessible(&self, name: StringId, kind: DeclKind) -> bool {
+    /// is accessible exactly when the extension is; a GENERATIVE
+    /// constructor of an enum never is, while an enum's FACTORY
+    /// constructor falls through to the interface arm — a public enum's
+    /// `factory E.named()` is exported (`isGenerative` gates only the
+    /// generative face, unused_local_elements_verifier.dart:1010-1014,
+    /// upstream Dart SDK source — the constructor_body constFactory corpus,
+    /// where the error'd factory body never turns into an unused row).
+    pub(crate) fn is_publicly_accessible(
+        &self,
+        name: StringId,
+        kind: DeclKind,
+        is_factory: bool,
+    ) -> bool {
         if self.is_private_name(name) {
             return false;
         }
@@ -1946,7 +2032,8 @@ impl<'a> Engine<'a> {
             return true;
         };
         match c.kind {
-            ContainerKind::Enum => !(is_ctor || (self.is_private_name(container) && is_static)),
+            ContainerKind::Enum if is_ctor => is_factory && !self.is_private_name(container),
+            ContainerKind::Enum => !(self.is_private_name(container) && is_static),
             ContainerKind::Extension => !self.is_private_name(container),
             _ => !(self.is_private_name(container) && (is_static || is_ctor)),
         }
@@ -2555,7 +2642,7 @@ impl<'a> Engine<'a> {
         // correspondence — the under-report direction) plus the
         // super-initialization corresponding face below; methods run the
         // official per-parameter override gate in the loops.
-        if self.is_publicly_accessible(site.name, site.kind) {
+        if self.is_publicly_accessible(site.name, site.kind, site.is_factory) {
             return;
         }
         let overridden = match site.kind {
@@ -2744,6 +2831,22 @@ impl<'a> Engine<'a> {
         // non-demonstrating member accesses contributed (see
         // [`Self::extension_credit_names`]).
         let credit: Vec<StringId> = self.extension_credit_names(&used);
+        // The library's own top-level names — the defining unit and every
+        // part ([`LibraryGraph::unit_files`]). A name the library declares
+        // resolves LOCALLY in the library scope: upstream's lookup answers
+        // the local element before any import is consulted (`PrefixScope`
+        // holds imported elements alone), so a local spelling never credits
+        // an import through a bare name overlap (the local class shadows
+        // the imported one and the import stays unused — `unsorted/
+        // extends_test`; the same shadow through a part unit is
+        // `part/of_multiple_libs_test`).
+        let local_names: FxHashSet<StringId> = self
+            .graph
+            .unit_files(self.lib)
+            .iter()
+            .filter_map(|&file| self.index.get(file))
+            .flat_map(|elements| elements.declarations().map(|(name, _)| name))
+            .collect();
         for (index, edge) in edges.iter().enumerate() {
             // Copied first: the emit below mutates the report.
             let (uri_text, uri_range, prefix, shown) = {
@@ -2769,6 +2872,18 @@ impl<'a> Engine<'a> {
                                 edge.combinators.allows(name)
                                     && self.graph.exported(target, name).is_some()
                             })
+                            // The implicit-extension credit is prefix-blind
+                            // upstream: `notifyExtensionUsed` walks the
+                            // tracking map per prefix scope too (scope.dart
+                            // :204-321) — an extension reached through a
+                            // prefixed import applies implicitly with or
+                            // without a bare prefix use (`accessibility_
+                            // A01_t02`'s `"".id1` over `as p`, the
+                            // wildcard-prefix corpus `wildcard_variables/
+                            // import/import_test`), so the applied face's
+                            // members spare this edge exactly as the
+                            // unprefixed arm's do.
+                            || self.import_credits_extension_member(edge, target, &credit)
                     }
                     // No evidence record for the spelling — keep the raw
                     // posture (the under-report direction).
@@ -2776,7 +2891,9 @@ impl<'a> Engine<'a> {
                 },
                 None => {
                     let hit = used.iter().find(|&&n| {
-                        edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
+                        edge.combinators.allows(n)
+                            && !local_names.contains(&n)
+                            && self.graph.exported(target, n).is_some()
                     });
                     let credited = self.import_credits_extension_member(edge, target, &credit);
                     hit.is_some() || credited
@@ -4687,8 +4804,17 @@ mod pins {
     /// (`package:t/a<n>.dart`), wired into the main library through an
     /// import edge in written order — the positional alignment
     /// `report_unused_imports` requires (the harness graph carries no
-    /// `dart:core` prelude, so no edge is skipped).
+    /// `dart:core` prelude, so no edge is skipped). The main file
+    /// registers as the library's defining unit, so the directive pass's
+    /// library-local shadow face sees the unit set.
     fn report_with_imports(source: &str, aux: &[Aux]) -> FileReport {
+        report_with_imports_parts(source, aux, &[])
+    }
+
+    /// [`report_with_imports`] with part units: each body is collected and
+    /// declared into the main library under its own file id, registered as
+    /// a compilation unit — the `part` tree the caller folds in production.
+    fn report_with_imports_parts(source: &str, aux: &[Aux], parts: &[&'static str]) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -4715,6 +4841,7 @@ mod pins {
             }
             builder.declare(lib, name, file);
         }
+        builder.unit(lib, file);
         // The implicit dart:core face (the sibling rigs' minimal seed):
         // without it every core-typed fixture reports `undefined_class`,
         // which both pollutes the rows and trips the import-warning gate.
@@ -4727,6 +4854,32 @@ mod pins {
                 "Object", "String", "int", "bool", "double", "num", "List", "Map", "void",
             ],
         );
+        let mut part_units = Vec::new();
+        for (position, body) in parts.iter().enumerate() {
+            let path = format!("p{position}.dart");
+            let part_file = files.intern(Path::new(&path));
+            let scanned_part = dartq_scanner::scan(
+                body,
+                ScanConfig {
+                    enable_triple_shift: true,
+                    enable_augmentations: true,
+                },
+                part_file,
+            );
+            assert!(
+                scanned_part.diagnostics.is_empty(),
+                "scanner diagnostics: {body}"
+            );
+            let part_elements = collect(body, &scanned_part.tokens, features, &strings);
+            for (name, decl) in part_elements.declarations() {
+                if decl.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                builder.declare(lib, name, part_file);
+            }
+            builder.unit(lib, part_file);
+            part_units.push((part_file, part_elements));
+        }
         let mut aux_units = Vec::new();
         for (position, item) in aux.iter().enumerate() {
             let path = format!("a{position}.dart");
@@ -4767,6 +4920,9 @@ mod pins {
         let namespaces = Namespaces::build(&graph);
         let mut index = ElementIndex::default();
         index.insert(file, elements);
+        for (part_file, part_elements) in part_units {
+            index.insert(part_file, part_elements);
+        }
         for (aux_file, aux_elements) in aux_units {
             index.insert(aux_file, aux_elements);
         }
@@ -4975,6 +5131,107 @@ mod pins {
         assert_eq!(r.diagnostics, vec![], "{source:?}");
     }
 
+    /// Corpus `UnusedImportTest/test_library_prefixed#0` family control,
+    /// gate side (`regress/regress21793_test`'s `CREATION_WITH_NON_TYPE`
+    /// marker): a prefixed creation miss on a resolvable prefix emits
+    /// `creation_with_non_type` — the machine spelling BOTH upstream gate
+    /// entries `constWithNonType`/`newWithNonType` share
+    /// (diagnostic.g.dart :3237/:12035) — and the gate skips the whole
+    /// import pass, so the untouched import stays silent.
+    #[test]
+    fn creation_with_non_type_gates_the_import_pass() {
+        let source = "import 'a.dart' as p;\n\
+                      main() {\n\
+                      \x20 new p.B();\n\
+                      }\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: Some("p"),
+                deferred: false,
+                body: "class A {}\n",
+            }],
+        );
+        assert_eq!(import_rows(&r), vec![], "{source:?}");
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code.name == "creation_with_non_type"),
+            "{source:?}: {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Corpus `unsorted/extends_test`: the local `class A` shadows the
+    /// imported one — `S extends A` resolves the LOCAL declaration, the
+    /// library scope answers before any import is consulted, and the name
+    /// overlap must not credit `a.dart` (the import reports unused).
+    #[test]
+    fn local_declaration_shadows_the_imported_name() {
+        let source = "import 'a.dart';\n\
+                      class S extends A {}\n\
+                      class A {}\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: None,
+                deferred: false,
+                body: "class A {}\n",
+            }],
+        );
+        let uri = source.find("'a.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(uri, 8)], "{source:?}");
+    }
+
+    /// Corpus `part/of_multiple_libs_test`: the shadowing declaration
+    /// lives in a PART unit (`part of` file declaring `foo`), and the
+    /// library scope covers every unit — the part's `foo` answers `m()`'s
+    /// call locally, so the import of the also-exporting library reports
+    /// unused.
+    #[test]
+    fn part_declared_name_shadows_the_imported_name() {
+        let source = "import 'a.dart';\n\
+                      part 'p0.dart';\n\
+                      void m() {\n\
+                      \x20 foo();\n\
+                      }\n";
+        let r = report_with_imports_parts(
+            source,
+            &[Aux {
+                prefix: None,
+                deferred: false,
+                body: "void foo() {}\n",
+            }],
+            &["part of 'main.dart';\nvoid foo() {}\n"],
+        );
+        let uri = source.find("'a.dart'").unwrap() as u32;
+        assert_eq!(import_rows(&r), vec![(uri, 8)], "{source:?}");
+    }
+
+    /// Corpus `Extension-methods/accessibility_A01_t02` (and the
+    /// wildcard-prefix twin `wildcard_variables/import/import_test`): an
+    /// extension reached through a PREFIXED import applies implicitly —
+    /// `"".id1` needs no bare prefix use — and `notifyExtensionUsed`
+    /// credits the prefix-scoped edge exactly as the unprefixed arm's
+    /// (scope.dart :204-321 walks the tracking map per prefix scope), so
+    /// the import stays used.
+    #[test]
+    fn prefixed_extension_application_spares_the_import() {
+        let source = "import 'a.dart' as p;\n\
+                      void m() {\n\
+                      \x20 ''.id1;\n\
+                      }\n";
+        let r = report_with_imports(
+            source,
+            &[Aux {
+                prefix: Some("p"),
+                deferred: false,
+                body: "extension StringExt on String {\n  String get id1 => 'StringExt';\n}\n",
+            }],
+        );
+        assert_eq!(import_rows(&r), vec![], "{source:?}");
+    }
+
     /// #2898-a: a super-initialization's NAMED argument gives the resolved
     /// super constructor's formal — `super(e: 1)` supplies `_A({this.e})`'s
     /// `e` (`_addParametersForArguments` at `visitSuperConstructorInvocation`
@@ -5171,6 +5428,108 @@ mod pins {
         assert_eq!(
             rows_with_code(source, "unused_element_parameter"),
             vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2911-a, the nameless recovery face (the census `unused_element`
+    /// over-fire family, fragment_offset `_missingName` corpus): a class
+    /// whose name the parser never produced reports `missing_identifier`
+    /// and NOTHING else — the element answers `isPrivate` through its
+    /// fragment and `FragmentImpl.isPrivate` maps a null name to PUBLIC
+    /// (`InstanceElementImpl.isPrivate` → `_firstFragment.isPrivate`,
+    /// element.dart:4539-4544, upstream Dart SDK source), so the
+    /// `<unnamed>` face never joins the unused walk. Before the gate fix
+    /// this fired `The declaration '<unnamed>' isn't referenced.` at 1:1.
+    #[test]
+    fn nameless_class_recovery_is_silent() {
+        let source = "library;\n\n\
+                      class {}\n";
+        assert_eq!(unused_element_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2911-b: the class-type-alias recovery shape (`class = Object with
+    /// M;` — the name token is missing, the recovered head carries a null
+    /// name): same public-face exemption, the `with M` clause keeps `M`
+    /// alive and the `<unnamed>` alias face stays silent.
+    #[test]
+    fn nameless_class_type_alias_recovery_is_silent() {
+        let source = "mixin M {}\n\
+                      class = Object with M;\n";
+        assert_eq!(unused_element_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2911-c: the enum recovery shape — a nameless enum declaration is
+    /// public through the same fragment route; its constant's
+    /// `unused_field` face is outside this pin (the oracle reports the
+    /// constant separately when unused).
+    #[test]
+    fn nameless_enum_recovery_is_silent() {
+        let source = "enum { v; }\n";
+        assert_eq!(unused_element_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2911-d, the errored-declaration face (constructor_body
+    /// `test_enum_secondaryConstructor_constFactory_blockBody` corpus): a
+    /// const factory with a block body carries the `constFactory` error,
+    /// and the constructor still never reports unused — `_isPubliclyAccessible`'s
+    /// EnumElement arm gates only GENERATIVE constructors
+    /// (`element.isGenerative`, unused_local_elements_verifier.dart:
+    /// 1010-1014, upstream Dart SDK source); the factory falls through to
+    /// the interface arm and a public enum's factory is exported. Before
+    /// the gate fix this fired `The declaration 'E.named' isn't
+    /// referenced.`.
+    #[test]
+    fn errored_enum_factory_constructor_is_silent() {
+        let source = "enum E {\n\
+                      \x20 v;\n\
+                      \x20 const E();\n\
+                      \x20 const factory E.named() {\n\
+                      \x20   return v;\n\
+                      \x20 }\n\
+                      }\n";
+        assert_eq!(unused_element_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2911-e: the boundary that keeps #2911-d honest — a GENERATIVE
+    /// named constructor of an enum is not publicly accessible, so an
+    /// unused one among several declared constructors still reports
+    /// (`_visitConstructorElement`'s more-than-one gate holds).
+    #[test]
+    fn enum_generative_named_constructor_still_reports() {
+        let source = "enum E {\n\
+                      \x20 v;\n\
+                      \x20 const E();\n\
+                      \x20 const E.named();\n\
+                      }\n";
+        let offset = source.find("named").unwrap() as u32;
+        assert_eq!(
+            unused_element_rows(source),
+            vec![(
+                offset,
+                "The declaration 'E.named' isn't referenced.".to_string()
+            )],
+            "{source:?}"
+        );
+    }
+
+    /// #2911-f: the over-suppression regression guard — a genuinely unused
+    /// PRIVATE named declaration still reports after the recovery gates.
+    /// `_C` is kept alive by the public function's signature; `_dead` has
+    /// no reference and reports exactly as before.
+    #[test]
+    fn real_unused_named_member_still_reports() {
+        let source = "class _C {\n\
+                      \x20 void _dead() {}\n\
+                      }\n\
+                      void f(_C c) {}\n";
+        let offset = source.find("_dead").unwrap() as u32;
+        assert_eq!(
+            unused_element_rows(source),
+            vec![(
+                offset,
+                "The declaration '_dead' isn't referenced.".to_string()
+            )],
             "{source:?}"
         );
     }

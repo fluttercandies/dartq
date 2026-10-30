@@ -189,6 +189,30 @@ pub(crate) struct ClosedNames {
     /// `FutureOr`'s interned id — the verdict recurses into its single
     /// argument (type_system.dart:865); `None` until interned.
     pub(crate) future_or: Option<u32>,
+    /// The leaf literal types' interned ids — `int`, `double`, `String`.
+    /// A literal's static type feeds the promotion write's `matchedType`
+    /// exactly like `bool` (`literalInt`/`literalDouble`/`literalString`'s
+    /// recorded types — `int <: num` makes `num` a type of interest on
+    /// `num? n = 1`, flow_analysis.dart:3982-4098's
+    /// `_tryPromoteToTypeOfInterest`); `None` until interned — a
+    /// direct-constructed interp keeps the opaque unknown face.
+    pub(crate) int_name: Option<u32>,
+    /// See [`Self::int_name`].
+    pub(crate) double_name: Option<u32>,
+    /// See [`Self::int_name`].
+    pub(crate) string_name: Option<u32>,
+    /// The collection literal heads' interned ids — `List`, `Set`, `Map`.
+    /// A `<E>[...]`/`<E>{...}`/`<K,V>{...}` literal's static type is the
+    /// container head instantiated over its written arguments (upstream
+    /// `resolveListLiteral`/`resolveSetOrMapLiteral`,
+    /// typed_literal_resolver.dart:68-107/:732-758); `None` until
+    /// interned — a direct-constructed interp keeps the opaque unknown
+    /// face.
+    pub(crate) list_name: Option<u32>,
+    /// See [`Self::list_name`].
+    pub(crate) set_name: Option<u32>,
+    /// See [`Self::list_name`].
+    pub(crate) map_name: Option<u32>,
 }
 
 /// The client-supplied type operations seam (official

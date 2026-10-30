@@ -2717,9 +2717,10 @@ pub(crate) mod strict_top_level_inference {
     /// type skips (its type arrives from the field/super parameter), with
     /// a written one stops the list. `element.typeInferenceError`
     /// (:214-219) is dropped (an error-code face only). Primary
-    /// constructors (:92-95) stay unported (the experiment is unshipped;
-    /// the syntax is a compile error at every shipped version).
-    /// `container.isReflectiveTest` (:251) lands as any `@reflectiveTest`
+    /// constructors (:92-95) walk their formals exactly like a
+    /// constructor declaration — the declaring (`final`/`var`) keyword
+    /// decides the correction the same way. `container.isReflectiveTest`
+    /// (:251) lands as any `@reflectiveTest`
     /// annotation on the enclosing class-like. The verbatim abort
     /// polarity ports: a function-typed formal (:176-186) or a formal
     /// with a written type (:183) stops the whole parameter list.
@@ -2730,6 +2731,7 @@ pub(crate) mod strict_top_level_inference {
             NodeKind::Method,
             NodeKind::Constructor,
             NodeKind::Factory,
+            NodeKind::PrimaryConstructor,
             NodeKind::VariablesDeclaration,
         ],
         check,
@@ -2746,6 +2748,9 @@ pub(crate) mod strict_top_level_inference {
             // `visitConstructorDeclaration` (:56-61): formals only,
             // never an override face.
             NodeKind::Constructor | NodeKind::Factory => check_formals(c, node, None),
+            // `visitPrimaryConstructorDeclaration` (:92-95): the same
+            // formals-only face.
+            NodeKind::PrimaryConstructor => check_formals(c, node, None),
             // `visitVariableDeclarationList` (:97-135).
             NodeKind::VariablesDeclaration => variable_list(c, node),
             _ => {}
@@ -3297,6 +3302,58 @@ pub(crate) mod strict_top_level_inference {
             let f = Fixture::parse(
                 "class S {\n  S(int p1);\n}\nclass C extends S {\n  C(super.p1);\n}\n",
             );
+            assert!(f.run(&one_rule("strict_top_level_inference")).is_empty());
+        }
+
+        /// `test_primaryConstructorParameter_positional` /
+        /// `test_primaryConstructorParameter_named_declaring_final` /
+        /// `test_primaryConstructorParameter_named_declaring_var` /
+        /// `test_primaryConstructorParameter_positional_declaring_final` /
+        /// `test_primaryConstructorParameter_positional_declaring_var` —
+        /// the primary-constructor formals walk exactly like a
+        /// constructor's (`visitPrimaryConstructorDeclaration` :92-95):
+        /// an untyped formal reports at its name, the declaring
+        /// `final`/`var` keyword decides the correction, a typed formal
+        /// passes.
+        #[test]
+        fn primary_constructor_formal_faces() {
+            let f = Fixture::parse("class C(p1);\n");
+            let lints = f.run(&one_rule("strict_top_level_inference"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let name = tok(&f.source, &f.tokens, "p1", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, name));
+
+            let f = Fixture::parse("class C({final p1});\n");
+            let lints = f.run(&one_rule("strict_top_level_inference"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].correction.as_deref(),
+                Some("Try adding a type annotation.")
+            );
+
+            let f = Fixture::parse("class C({var p1});\n");
+            let lints = f.run(&one_rule("strict_top_level_inference"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].correction.as_deref(),
+                Some("Try replacing 'var' with a type annotation.")
+            );
+
+            let f = Fixture::parse("class C([final p1]);\n");
+            let lints = f.run(&one_rule("strict_top_level_inference"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let name = tok(&f.source, &f.tokens, "p1", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, name));
+
+            let f = Fixture::parse("class C([var p1]);\n");
+            let lints = f.run(&one_rule("strict_top_level_inference"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].correction.as_deref(),
+                Some("Try replacing 'var' with a type annotation.")
+            );
+
+            let f = Fixture::parse("class C(int p1);\n");
             assert!(f.run(&one_rule("strict_top_level_inference")).is_empty());
         }
 

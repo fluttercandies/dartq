@@ -10164,7 +10164,12 @@ fn mixin_application_member_resolves() {
 /// Later applications win: with `M1.m: int` and `M2.m: String` fields,
 /// the `m` read resolves M2's `String` — proven by the return-type
 /// mismatch against an `int` host (`inheritance_manager3.dart:571-579`:
-/// each mixin replaces the members of the interface).
+/// each mixin replaces the members of the interface). The application
+/// point also carries the oracle's override rows: each application checks
+/// its declared field faces against the interface accumulated so far
+/// (`inheritance_override.dart`'s per-application declared-member walk),
+/// so the `String`/`int` field conflict reports on the getter face and
+/// the setter face of the `M2` application.
 #[test]
 fn later_mixin_application_wins() {
     let report = report(
@@ -10175,12 +10180,16 @@ fn later_mixin_application_wins() {
     );
     assert_eq!(
         code_names(&report),
-        ["return_of_invalid_type"],
+        [
+            "invalid_override",
+            "invalid_override",
+            "return_of_invalid_type"
+        ],
         "{:?}",
         code_names(&report)
     );
     assert_eq!(
-        report.diagnostics[0].message,
+        report.diagnostics[2].message,
         "A value of type 'String' can't be returned from the method 'f' because it has a return type of 'int'."
     );
 }
@@ -10861,6 +10870,87 @@ fn used_prefix_import_stays_silent() {
         !code_names(&r).contains(&"unused_import"),
         "{:?}",
         code_names(&r)
+    );
+}
+
+/// #2794: an interpolated import URI still contributes a directive site
+/// (the upstream `DirectiveUriWithoutString` shape — the directive exists,
+/// its edge carries no target, `ast.dart:34082` + `file_state.dart:765`).
+/// The site's empty `uri_text` keeps it out of the `unused_import` and
+/// `deprecated_sdk_library` faces, while the positional edge alignment
+/// stays intact: a following unused import still reports at its URI
+/// (before the fix the interpolated head dropped the site, misaligning
+/// `imports` against the graph's per-directive edges and suppressing the
+/// whole `unused_import` pass, `imports_verifier.dart:232+`'s
+/// per-directive iteration).
+#[test]
+fn interpolated_import_keeps_edge_alignment() {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let source = "import 'a${b}c.dart'; import 'other.dart'; void main() {}";
+    let scanned = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        file,
+    );
+    assert!(scanned.diagnostics.is_empty());
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ));
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let other = builder.intern("package:t/other.dart");
+    builder.declare(other, strings.intern("thing"), file);
+    // The interpolated head: a directive exists (an edge is pushed) but its
+    // URI carries no resolvable string — target `None`, the resolution
+    // layer's `uri_with_interpolation` face.
+    builder.import(
+        lib,
+        ImportEdge {
+            target: None,
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    builder.import(
+        lib,
+        ImportEdge {
+            target: Some(other),
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    let r = diagnose(
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+    );
+    let names = code_names(&r);
+    // One `unused_import` row — on `other.dart`, never on the interpolated
+    // head (upstream's `uri !is DirectiveUriWithLibraryImpl` skip,
+    // imports_verifier.dart:247-263).
+    assert_eq!(names, ["unused_import"], "{names:?}");
+    assert_eq!(r.diagnostics[0].message, "Unused import: 'other.dart'.");
+    assert_eq!(
+        r.diagnostics[0].range.offset,
+        offset_of(source, "'other.dart'")
     );
 }
 
@@ -12476,15 +12566,16 @@ fn body_might_complete_normally_nullable_spares_generator_and_illegal_async() {
 }
 
 /// An `async` body's completion verdict reads the declared return's
-/// future-flattened face (`TypeSystem.flatten`,
-/// type_analyzer.dart:682-704), not the `Future<...>` head: a
-/// `Future<void>` async body flattens to `void` and stays silent, a
-/// `FutureOr<int>` async body flattens to the potentially non-nullable
-/// `int` and reports. The declared `Future<int>` head itself is
-/// non-nullable — reading it raw would over-fire (the
-/// `notifications/audit_log.dart` `record()` row).
+/// completion context — the official `_contextTypeForImposed` final arm
+/// (body_inference_context.dart), the `FutureOr<V>` union over the
+/// future value type, not the flatten: a `Future<void>` async body's
+/// union base is `void` and stays silent, a `FutureOr<int>` async body
+/// asks through the potentially non-nullable `FutureOr<int>` and
+/// reports. The declared `Future<int>` head itself is non-nullable —
+/// reading it raw would over-fire (the `notifications/audit_log.dart`
+/// `record()` row).
 #[test]
-fn body_might_complete_normally_reads_the_async_flattened_return() {
+fn body_might_complete_normally_reads_the_async_context_union() {
     assert_eq!(
         code_names(&report("class Future<T> {} Future<void> f() async {}")),
         [] as [&str; 0],
@@ -12502,6 +12593,205 @@ fn body_might_complete_normally_reads_the_async_flattened_return() {
             "class int {} class Future<T> {} class FutureOr<T> {} \
                  FutureOr<int> g() async {}"
         ))
+    );
+}
+
+/// The async completion context's display face (the same
+/// `_contextTypeForImposed` union): the diagnostic renders the
+/// constructed `FutureOr<V>` — `'FutureOr<int>'` for a `Future<int>`
+/// async body (the corpus
+/// `test_function_future_int_blockBody_async` row), and the nullable
+/// twin renders `'FutureOr<int?>'` (the corpus
+/// `test_function_async_block_futureOrIntQuestion` row). A nullable
+/// `Future<int>?` head reads `FutureOr<int?>` too — the future value
+/// type strips the head's question before the union arms.
+#[test]
+fn body_might_complete_normally_async_renders_the_union_display() {
+    let r = report("class int {} class Future<T> {} class FutureOr<T> {} Future<int> f() async {}");
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The body might complete normally, causing 'null' to be returned, but the return type, 'FutureOr<int>', is a potentially non-nullable type."
+    );
+    let r =
+        report("class int {} class Future<T> {} class FutureOr<T> {} Future<int?> g() async {}");
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally_nullable"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].message,
+        "This function has a nullable return type of 'FutureOr<int?>', but ends without returning a value."
+    );
+    // The silent union faces: `FutureOr<void>`-shaped contexts (a void
+    // or bare-Future element), and `dynamic` — the nullable-twin walk's
+    // base-silent arm.
+    assert_eq!(
+        code_names(&report(
+            "class int {} class Future<T> {} Future<void> h() async {} \
+                 Future i() async {} dynamic d() async {}"
+        )),
+        [] as [&str; 0],
+        "{:?}",
+        code_names(&report(
+            "class int {} class Future<T> {} Future<void> h() async {} \
+                 Future i() async {} dynamic d() async {}"
+        ))
+    );
+}
+
+/// The completion walk's resolved declared return: a type-alias head
+/// answers its captured right-hand side before any question reads it
+/// (the official `returnType?.type` face —
+/// `test_typeAlias_asReturnType_void` resolves `Nothing` to `void`).
+/// Both twins stage through the resolved type: a `void` right-hand side
+/// silences the direct face and the nullable twin alike (the union base
+/// is `void`), an `int?` right-hand side reports the nullable warning
+/// with the aliased display text where the raw head reported the ERROR
+/// twin. `class int {}` follows the harness convention.
+#[test]
+fn body_might_complete_normally_resolves_a_type_alias_return_head() {
+    // `void` right-hand side: both spellings silent.
+    assert_eq!(
+        code_names(&report("typedef Nothing = void; Nothing f() {}")),
+        [] as [&str; 0],
+        "{:?}",
+        code_names(&report("typedef Nothing = void; Nothing f() {}"))
+    );
+    assert_eq!(
+        code_names(&report("typedef Nothing = void; Nothing? g() {}")),
+        [] as [&str; 0]
+    );
+    // The nullable right-hand side: the nullable warning, the aliased
+    // display text.
+    let r = report("class int {} typedef Maybe = int?; Maybe m() {}");
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally_nullable"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].message,
+        "This function has a nullable return type of 'int?', but ends without returning a value."
+    );
+    // The plain right-hand side keeps the direct face (the resolved
+    // `int` is potentially non-nullable), displayed resolved.
+    let r = report("class int {} typedef Num = int; Num n() {}");
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert!(
+        r.diagnostics[0].message.contains("'int'"),
+        "{}",
+        r.diagnostics[0].message
+    );
+}
+
+/// The factory and function-literal staging faces: a factory's verdict
+/// anchors at the compound name (`ConstructorDeclaration.errorRange` —
+/// the type name through the selector), a closure literal's at its
+/// body's `{` (the official `BlockFunctionBody` anchor), both reading
+/// the same async union context as the declared shapes; the braceless
+/// const-redirect and external factories stay behind the block-body
+/// gate, and an untyped or `void` closure context stays silent (the
+/// imposed-null face).
+#[test]
+fn body_might_complete_normally_reports_factories_and_closures() {
+    // factory A.named() — reports at the compound `A.named`.
+    let src = "class A { factory A.named() {} }";
+    let r = report(src);
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].range.offset, 18,
+        "the compound name 'A.named'"
+    );
+    assert_eq!(r.diagnostics[0].range.length, 7);
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The body might complete normally, causing 'null' to be returned, but the return type, 'A', is a potentially non-nullable type."
+    );
+    // factory A() — reports at the container name `A`.
+    let r = report("class A { factory A() {} }");
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(r.diagnostics[0].range.offset, 18);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    // A `const` redirect and an `external` factory carry no block body —
+    // the brace gate keeps both silent.
+    assert_eq!(
+        code_names(&report(
+            "class A { const factory A() = _A; } class _A implements A { const _A(); }"
+        )),
+        [] as [&str; 0],
+        "{:?}",
+        code_names(&report(
+            "class A { const factory A() = _A; } class _A implements A { const _A(); }"
+        ))
+    );
+    assert_eq!(
+        code_names(&report("class A { external factory A(); }")),
+        [] as [&str; 0]
+    );
+    // A closure literal under a typed context reports at its `{` — sync
+    // and async (the async union display) alike; a `void` context and an
+    // untyped argument slot stay silent.
+    let src = "class int {} void f() { int Function() g = () {}; g; }";
+    let r = report(src);
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].range.offset,
+        src.rfind('{').unwrap() as u32,
+        "the closure's body brace, not the declaring name"
+    );
+    let src = "class int {} class Future<T> {} class FutureOr<T> {} \
+         void f() { Future<int> Function() g = () async {}; g; }";
+    let r = report(src);
+    assert_eq!(
+        code_names(&r),
+        ["body_might_complete_normally"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].range.offset,
+        src.rfind('{').unwrap() as u32
+    );
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The body might complete normally, causing 'null' to be returned, but the return type, 'FutureOr<int>', is a potentially non-nullable type."
+    );
+    assert_eq!(
+        code_names(&report("void f() { void Function() g = () {}; g; }")),
+        [] as [&str; 0]
+    );
+    assert_eq!(
+        code_names(&report("void f(void Function() g) { g(() {}); }")),
+        [] as [&str; 0]
     );
 }
 

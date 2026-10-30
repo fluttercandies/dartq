@@ -1,4 +1,5 @@
 use dartq_ast::NodeKind;
+use dartq_scanner::TokenKind;
 
 use super::{Check, PayloadField, RuleSpec};
 use crate::rules::NONE_TOKEN;
@@ -6,30 +7,39 @@ use crate::rules::NONE_TOKEN;
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/switch_on_type.dart` — a switch
 /// statement/expression whose scrutinee's static type is assignable
-/// to `Type` reports once at the scrutinee (:53-60, :71-121): the
-/// recursion faces are the then/else arms of a conditional, both
-/// operands of a `+` (string building), a nested switch expression's
-/// case values, and a string interpolation's segments; the leaf faces
-/// are a `.runtimeType` tail, a bare `Type`-written name, a type
-/// parameter, and a type literal — a `.toString()` call walks its
-/// target (:111-112).
+/// to `Type` reports once at the scrutinee expression node
+/// (`visitSwitchExpression`/`visitSwitchStatement` :53-60 →
+/// `_processExpression` :71-126): the recursion faces are the
+/// then/else arms of a conditional, both operands of a `+` (string
+/// building), a nested switch expression's case values, and a string
+/// interpolation's segments; the leaf faces are a `.runtimeType`
+/// tail, a bare `Type`-written name, a type parameter, and a type
+/// literal — a `.toString()` call walks its target (:111-112). The
+/// report pins the scrutinee expression's own text span.
 ///
 /// Gate: the official registration bails without the patterns feature
 /// (:34) — the same [`crate::engine::Features::patterns`] bit.
 ///
-/// Faces over the syntax substrate: the scrutinee is the piece run of
-/// the switch head (the adopted-begin tiling leaks the expression
-/// rows before the condition container; the container's window rows
-/// follow it). The written-type face reads same-file bindings
-/// (`Type t` reports, `String s` and inferred locals stay silent, the
-/// nullability-sensitive `isAssignableTo` posture); the
-/// implicit-`this` `runtimeType` face is name-level (a same-file
-/// override returning a non-`Type` over-reports); the type-literal
-/// face reuses the `type_literal_in_constant_pattern` channel
-/// (same-file type or an unshadowed built-in; a prefixed spelling
-/// under-reports). The string-interpolation faces (a `$t` segment)
-/// are the documented under-report — interpolation segments produce
-/// no AST rows (the token-layer carry). Message:
+/// Faces over the syntax substrate: both switch heads wrap the
+/// scrutinee in a parenthesized-condition container
+/// (`ensure_parenthesized_condition`), so the head walk unwraps it —
+/// the adopted-begin tiling leaks some expression rows ahead of the
+/// container and keeps the rest inside it. The report span is
+/// token-anchored: the first expression row opens it and the token
+/// before the container's `)` closes it, the exact expression text
+/// the official `reportAtNode` pins. The written-type face reads
+/// same-file bindings (`Type t` reports, `String s` and inferred
+/// locals stay silent, the nullability-sensitive `isAssignableTo`
+/// posture); the implicit-`this` `runtimeType` face is name-level (a
+/// same-file override returning a non-`Type` over-reports); the
+/// type-literal face reuses the `type_literal_in_constant_pattern`
+/// channel (same-file type or an unshadowed built-in; a prefixed
+/// spelling under-reports). The string-interpolation faces ride the
+/// token layer (`_processInterpolation` :128-149): the segments
+/// produce no AST rows, so the head's token run is scanned — a
+/// depth-0 `$name` segment resolves through the identifier face and a
+/// `${expr}` segment re-enters the token walk (conditional arms,
+/// nested switch values, `+` operands, the leaf chain). Message:
 /// `diagnostic.g.dart` `switchOnType`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "switch_on_type",
@@ -42,23 +52,52 @@ fn check(c: &mut Check<'_>) {
     if !c.unit.features.patterns {
         return;
     }
-    let Some(rows) = scrutinee_rows(c) else {
+    let Some((rows, open)) = scrutinee_head(c) else {
         return;
     };
-    if type_scrutinee(c, &rows) {
-        // One report per switch, at the whole scrutinee run
-        // (`reportAtNode(node.expression)`).
-        let start = c.utf16_span(rows[0]).start;
-        let end = c.utf16_span(rows[rows.len() - 1]).end;
-        c.report(start..end, &[]);
+    if rows.is_empty() {
+        return;
+    }
+    // The row faces first; the interpolation segments (no AST rows) ride
+    // the token layer. Both answer the same single scrutinee report.
+    let row_face = type_scrutinee(c, &rows);
+    let token_face = !row_face && interpolation_scrutinee(c, &rows, open);
+    if row_face || token_face {
+        report_scrutinee(c, &rows, open);
     }
 }
 
-/// The scrutinee piece run: the rows before the condition container
-/// plus the container's window rows (the statement face), or the rows
-/// before the case block (the switch-expression face). A `case`
-/// clause (`switch (x case ...)`) is not the lint's face.
-fn scrutinee_rows(c: &Check<'_>) -> Option<Vec<u32>> {
+/// One report per switch, at the scrutinee expression
+/// (`reportAtNode(node.expression)`): the token-anchored span — the
+/// token right after the wrapping `(` opens it and the token before
+/// the matching `)` closes it, the exact expression text the official
+/// report pins. The row span is the fallback: the adopted-begin tiling
+/// can leak the head's leading pieces ahead of the container, so a row
+/// read can start inside the expression (a nested switch's head row
+/// anchored at its scrutinee, not the `switch` keyword).
+fn report_scrutinee(c: &mut Check<'_>, rows: &[u32], open: Option<u32>) {
+    let span = open
+        .and_then(|open| {
+            let close = c.unit.tokens.matching_end(open as usize)?;
+            let first = u32::try_from(open as usize + 1).ok()?;
+            let last = u32::try_from(close.checked_sub(1)?).ok()?;
+            (close > open as usize + 1)
+                .then(|| crate::rules::utf16_token_span(c, first).start)
+                .zip(Some(crate::rules::utf16_token_span(c, last).end))
+                .map(|(start, end)| start..end)
+        })
+        .unwrap_or_else(|| {
+            let start = c.utf16_span(rows[0]).start;
+            let end = c.utf16_span(rows[rows.len() - 1]).end;
+            start..end
+        });
+    c.report(span, &[]);
+}
+
+/// The scrutinee piece run with the head container unwrapped, plus the
+/// `(` token of the wrapping container when present. A `case` clause
+/// (`switch (x case ...)`) is not the lint's face.
+fn scrutinee_head(c: &Check<'_>) -> Option<(Vec<u32>, Option<u32>)> {
     let node = c.node();
     let kids = c.collect_direct(node);
     match c.kind(node) {
@@ -74,13 +113,26 @@ fn scrutinee_rows(c: &Check<'_>) -> Option<Vec<u32>> {
             }
             let mut rows: Vec<u32> = kids[..position].to_vec();
             rows.extend(c.children(container));
-            Some(rows)
+            Some((rows, Some(c.head_token(container))))
         }
         NodeKind::SwitchExpression => {
             let position = kids
                 .iter()
                 .position(|&kid| c.kind(kid) == NodeKind::SwitchExpressionBlock)?;
-            Some(kids[..position].to_vec())
+            // The head's parenthesized-condition container carries the
+            // scrutinee rows its tiling did not leak ahead of it; unwrap
+            // it the way the statement face does.
+            let mut rows: Vec<u32> = Vec::new();
+            let mut open = None;
+            for &kid in &kids[..position] {
+                if c.kind(kid) == NodeKind::ParenthesizedCondition {
+                    rows.extend(c.children(kid));
+                    open = Some(c.head_token(kid));
+                } else {
+                    rows.push(kid);
+                }
+            }
+            Some((rows, open))
         }
         _ => None,
     }
@@ -261,6 +313,267 @@ fn is_enclosing_type_parameter(c: &Check<'_>, name: &str) -> bool {
         }
     }
     false
+}
+
+/// The string-interpolation faces (`_processInterpolation` :128-149):
+/// the segments of a scrutinee interpolation produce no AST rows, so
+/// the head's token run is scanned. A depth-0 `$name` segment resolves
+/// through the identifier face, a `${expr}` segment re-enters the
+/// token walk; segments buried in nested groups stay silent the way
+/// the official expression-shape read leaves a parenthesized operand
+/// unanswered. `open` is the wrapping container's `(`.
+fn interpolation_scrutinee(c: &Check<'_>, rows: &[u32], open: Option<u32>) -> bool {
+    let Some(open) = open else {
+        return false;
+    };
+    // The token run is `(open+1 .. close)`: the container's `(` anchors
+    // the walk regardless of which expression rows the tiling leaked —
+    // the row set only supplies the binding anchor.
+    if c.lexeme(open) != "(" {
+        return false;
+    }
+    let Some(close) = c.unit.tokens.matching_end(open as usize) else {
+        return false;
+    };
+    let Ok(close) = u32::try_from(close) else {
+        return false;
+    };
+    token_walk(c, open + 1, close, rows[0])
+}
+
+/// The token-run mirror of `_processExpression` (:76-126) over
+/// `[start, end)`: the depth-0 structure decides — interpolation
+/// segments, the conditional split, a nested switch expression's case
+/// values, the `+` split — then the leaf access chain. `anchor` is the
+/// row the name faces read bindings against (the head's first
+/// expression row; every relevant binding precedes it).
+fn token_walk(c: &Check<'_>, start: u32, end: u32, anchor: u32) -> bool {
+    if start >= end {
+        return false;
+    }
+    let tokens = c.unit.tokens;
+    // The interpolation segments first (:80-82): a `$name` segment is
+    // the `$` marker plus the name token; a `${expr}` segment's group
+    // re-enters the walk. The depth-0 scan keeps a segment buried in a
+    // nested group silent — the official read answers only the
+    // expression shapes themselves.
+    let mut depth: u32 = 0;
+    let mut i = start;
+    while i < end {
+        match tokens.get(i as usize).map_or(TokenKind::Eof, |t| t.kind) {
+            TokenKind::StringInterpolationIdentifier if depth == 0 => {
+                if i + 1 < end && name_is_type(c, anchor, c.lexeme(i + 1)) {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            TokenKind::StringInterpolationExpression if depth == 0 => {
+                let Some(close) = tokens.matching_end(i as usize) else {
+                    return false;
+                };
+                let Ok(close) = u32::try_from(close) else {
+                    return false;
+                };
+                if close >= end {
+                    return false;
+                }
+                if token_walk(c, i + 1, close, anchor) {
+                    return true;
+                }
+                i = close + 1;
+                continue;
+            }
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // The depth-0 structure scan: the conditional's `?`/`:`, the `+`
+    // operands, a nested switch expression's head.
+    let mut depth: u32 = 0;
+    let mut question = None;
+    let mut colon = None;
+    let mut plus = None;
+    let mut nested = None;
+    let mut i = start;
+    while i < end {
+        match tokens.get(i as usize).map_or(TokenKind::Eof, |t| t.kind) {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+            }
+            TokenKind::Question if depth == 0 => question = Some(i),
+            TokenKind::Colon if depth == 0 && question.is_some() && colon.is_none() => {
+                colon = Some(i);
+            }
+            TokenKind::Plus if depth == 0 => plus = Some(i),
+            TokenKind::Keyword(_) if depth == 0 && c.lexeme(i) == "switch" => nested = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    // The conditional face (:83-89): the arms decide, the condition is
+    // ignored.
+    if let (Some(q), Some(colon)) = (question, colon)
+        && colon > q
+    {
+        return token_walk(c, start, q, anchor) || token_walk(c, colon + 1, end, anchor);
+    }
+    // A nested switch expression's case values walk (:91-98): the value
+    // run after each depth-0 `=>` inside the head's block.
+    if let Some(switch_kw) = nested
+        && let Some(values) = nested_switch_values(c, switch_kw, end)
+    {
+        return values
+            .into_iter()
+            .any(|range| token_walk(c, range.start, range.end, anchor));
+    }
+    // The `+` concatenation face (:100-109): both operand runs walk.
+    if let Some(plus) = plus {
+        return token_walk(c, start, plus, anchor) || token_walk(c, plus + 1, end, anchor);
+    }
+    token_leaf(c, start, end, anchor)
+}
+
+/// The case-value runs of the switch-expression block that follows the
+/// `switch (` group opening at `switch_kw`: each depth-0 `=>` inside
+/// the block opens a value run ending at the next `,` (or the block's
+/// `}`).
+fn nested_switch_values(
+    c: &Check<'_>,
+    switch_kw: u32,
+    end: u32,
+) -> Option<Vec<core::ops::Range<u32>>> {
+    let tokens = c.unit.tokens;
+    let open = switch_kw.checked_add(1)?;
+    (c.lexeme(open) == "(").then_some(())?;
+    let close = u32::try_from(tokens.matching_end(open as usize)?).ok()?;
+    let block = close.checked_add(1)?;
+    (c.lexeme(block) == "{").then_some(())?;
+    let block_close = u32::try_from(tokens.matching_end(block as usize)?).ok()?;
+    let block_close = block_close.min(end);
+    let mut values = Vec::new();
+    let mut depth: u32 = 0;
+    let mut value: Option<u32> = None;
+    let mut i = block + 1;
+    while i < block_close {
+        match tokens.get(i as usize).map_or(TokenKind::Eof, |t| t.kind) {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+            }
+            // `=>` lexes as one token in expression position.
+            TokenKind::Function if depth == 0 => value = Some(i + 1),
+            TokenKind::Comma if depth == 0 && value.is_some() => {
+                let start = value.take().expect("checked above");
+                values.push(start..i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(start) = value {
+        values.push(start..block_close);
+    }
+    Some(values)
+}
+
+/// The leaf face over a token run (:111-119): a trailing invocation
+/// group whose callee is `.toString` walks its target; the outermost
+/// top-level selector names the expression's type (`runtimeType`
+/// reports, other selectors and tear-offs stay silent); a bare name is
+/// the identifier face.
+fn token_leaf(c: &Check<'_>, start: u32, end: u32, anchor: u32) -> bool {
+    let tokens = c.unit.tokens;
+    let tail = end - 1;
+    // A trailing balanced group: `name(args)` (a call) or `(...)`
+    // (parenthesized — the official expression read answers no arm and
+    // stays silent).
+    if c.lexeme(tail) == ")" {
+        let Some(group_open) = group_open_before(c, start, tail) else {
+            return false;
+        };
+        if group_open == start {
+            return false;
+        }
+        let head = group_open - 1;
+        if head > start && c.lexeme(head - 1) == "." && c.lexeme(head) == "toString" {
+            return token_walk(c, start, head - 1, anchor);
+        }
+        return false;
+    }
+    // The outermost top-level `.` selector.
+    let mut depth: u32 = 0;
+    let mut dot = None;
+    let mut i = start;
+    while i < end {
+        match tokens.get(i as usize).map_or(TokenKind::Eof, |t| t.kind) {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+            }
+            TokenKind::Period if depth == 0 => dot = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(dot) = dot
+        && dot + 1 < end
+        && tokens
+            .get(dot as usize + 1)
+            .is_some_and(|t| t.kind == TokenKind::Identifier)
+    {
+        // `a.runtimeType` reports; `a.b` and `a.toString` tear-offs name
+        // no `Type` on this read.
+        return c.lexeme(dot + 1) == "runtimeType";
+    }
+    // The bare-name face: the run is one identifier (`switch (T)`,
+    // `switch (int)`); any other shape answers no official arm.
+    (end == start + 1)
+        && tokens
+            .get(start as usize)
+            .is_some_and(|t| t.kind == TokenKind::Identifier)
+        && name_is_type(c, anchor, c.lexeme(start))
+}
+
+/// The matching group opener at or after `start` for the closer at
+/// `close` (a backward depth scan; an unbalanced run answers `None`).
+fn group_open_before(c: &Check<'_>, start: u32, close: u32) -> Option<u32> {
+    let tokens = c.unit.tokens;
+    let mut depth: u32 = 0;
+    let mut i = close;
+    while i > start {
+        i -= 1;
+        match tokens.get(i as usize).map_or(TokenKind::Eof, |t| t.kind) {
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth += 1;
+            }
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn token_byte(c: &Check<'_>, token: u32) -> usize {
@@ -459,7 +772,9 @@ mod tests {
         );
     }
 
-    /// The report pins the scrutinee run (`[!i.runtimeType!]`).
+    /// The report pins the scrutinee EXPRESSION text — the container's
+    /// window rows run into the head's `)`, the token-anchored close
+    /// does not (`test_runtimeType`: `[!i.runtimeType!]`).
     #[test]
     fn report_pins_the_scrutinee_run() {
         let source = "void f(num i) {\n  switch (i.runtimeType) {\n    case const (int):\n      break;\n    default:\n      break;\n  }\n}\n";
@@ -470,5 +785,114 @@ mod tests {
             lints[0].range.start,
             utf16_at(&f, tok(source, &f.tokens, "i", 1))
         );
+        // `i.runtimeType` — 13 UTF-16 units, the `)` excluded.
+        assert_eq!(lints[0].range.end - lints[0].range.start, 13);
+    }
+
+    /// `test_variableType` — a bare `Type` scrutinee pins exactly its
+    /// name (`[!t!]`, one UTF-16 unit): the token-anchored close lands
+    /// on the token before the container's `)`, never the `)` itself.
+    #[test]
+    fn bare_name_report_excludes_the_paren() {
+        let source = "void f(Type t) {\n  switch (t) {\n    case const (int):\n      break;\n    default:\n      break;\n  }\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("switch_on_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(source, &f.tokens, "t", 1))
+        );
+        assert_eq!(lints[0].range.end - lints[0].range.start, 1);
+    }
+
+    /// `test_nestedSwitch` — the nested switch expression IS the
+    /// scrutinee expression the official `reportAtNode` pins
+    /// (`[!switch (o) {_ => t}!]` — 18 UTF-16 units from the inner
+    /// `switch` keyword).
+    #[test]
+    fn nested_switch_report_pins_the_expression() {
+        let source = "void f(Type t, Object o) {\n  switch (switch (o) {_ => t}) {\n    case const (int):\n      break;\n    default:\n      break;\n  }\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("switch_on_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(source, &f.tokens, "switch", 1))
+        );
+        // `switch (o) {_ => t}` — 18 UTF-16 units.
+        assert_eq!(lints[0].range.end - lints[0].range.start, 18);
+    }
+
+    /// `SwitchExpressionOnTypeTest` — the expression head's container
+    /// unwraps like the statement head: the variable face, the
+    /// conditional arms, the `+` operands, and the `.runtimeType` access
+    /// chain all decide inside `(switch (...) {`.
+    #[test]
+    fn switch_expression_unwrap_faces_report() {
+        let expr = |scrutinee: &str| {
+            format!(
+                "void f(Type t, num i) {{\n  (switch ({scrutinee}) {{\n    'type: int' => null,\n    _ => null,\n  }});\n}}\n"
+            )
+        };
+        // test_variableType
+        assert_eq!(run(&expr("t")).len(), 1, "t");
+        // test_runtimeType
+        assert_eq!(run(&expr("i.runtimeType")).len(), 1, "i.runtimeType");
+        // test_conditionalBoth / test_conditionalElse
+        assert_eq!(run(&expr("1 == 1 ? t : '$t'")).len(), 1, "cond both");
+        assert_eq!(run(&expr("1 == 1 ? 'other' : '$t'")).len(), 1, "cond else");
+        // test_binaryExpression
+        assert_eq!(run(&expr("'' + '$t'")).len(), 1, "binary");
+        // test_runtimeTypeToString
+        assert_eq!(run(&expr("i.runtimeType.toString()")).len(), 1, "toString");
+        // test_nestedSwitch
+        assert_eq!(run(&expr("switch (i) { _ => t }")).len(), 1, "nested");
+    }
+
+    /// `test_stringInterpolation*` — the interpolation segments ride the
+    /// token layer on both switch heads: a `$t` segment and every
+    /// `${...}` shape (a conditional arm, a nested interpolation, a
+    /// nested switch's value, a `.toString()` target) report; a segment
+    /// buried in a parenthesized operand stays silent the way the
+    /// official expression read leaves the shape unanswered.
+    #[test]
+    fn interpolation_faces_report() {
+        let cases: [(&str, &str, usize); 8] = [
+            // (label, scrutinee, expected count)
+            ("statement", "'type: $t'", 1),
+            ("expression", "'type: $t'", 1),
+            ("inner conditional", "'type: ${1 == 1 ? '$t' : 'other'}'", 1),
+            ("inner interpolation", "'type: ${'inner string $t'}'", 1),
+            ("inner switch", "'type: ${switch (1) { _ => '$t', }}'", 1),
+            ("inner toString", "'type: ${t.toString()}'", 1),
+            ("silent string", "'type: $s'", 0),
+            ("buried segment", "('$t')", 0),
+        ];
+        for (label, scrutinee, expected) in cases {
+            let statement = format!(
+                "void f(Type t, String s) {{\n  switch ({scrutinee}) {{\n    case 'type: int':\n      break;\n    default:\n      break;\n  }}\n}}\n"
+            );
+            assert_eq!(run(&statement).len(), expected, "{label}");
+            let expression = format!(
+                "void f(Type t, String s) {{\n  (switch ({scrutinee}) {{\n    'type: int' => null,\n    _ => null,\n  }});\n}}\n"
+            );
+            assert_eq!(run(&expression).len(), expected, "{label} (expression)");
+        }
+    }
+
+    /// The interpolation report pins the whole scrutinee expression
+    /// (`[!'' + '$t'!]` — the string-literal operands included).
+    #[test]
+    fn interpolation_report_pins_the_expression() {
+        let source = "void f(Type t) {\n  switch ('' + '$t') {\n    case 'type: int':\n      break;\n    default:\n      break;\n  }\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("switch_on_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(source, &f.tokens, "''", 0))
+        );
+        // `'' + '$t'` — 9 UTF-16 units, the `)` excluded.
+        assert_eq!(lints[0].range.end - lints[0].range.start, 9);
     }
 }

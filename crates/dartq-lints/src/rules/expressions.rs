@@ -20,14 +20,15 @@ pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
 
 /// A row's own token span as the semantic query face's `SourceRange` —
 /// the analysis queries' span contract (a row and its fold row share the
-/// identifier token's own range). UTF-16 — the fold rows' coordinate
-/// convention; the queries match on the start offset, the length rides
-/// along for construction.
+/// identifier token's own range). BYTE offsets — the fold rows' coordinate
+/// convention (`read_types`, `refs`, `type_uses` key `SourceRange.offset`
+/// from `byte_span`); the queries match on the start offset, the length
+/// rides along for construction.
 pub(crate) fn query_site(c: &Check<'_>, row: u32) -> dartq_source::SourceRange {
-    let span = c.utf16_span(row);
+    let span = c.byte_span(row);
     dartq_source::SourceRange {
-        offset: span.start,
-        length: span.end - span.start,
+        offset: span.start as u32,
+        length: (span.end - span.start) as u32,
     }
 }
 
@@ -214,6 +215,10 @@ pub(crate) mod use_is_even_rather_than_modulo;
 pub(crate) mod use_named_constants;
 pub(crate) mod use_truncating_division;
 pub(crate) mod void_checks;
+/// The #2927 census pins: `no_dynamic_casts`, `avoid_dynamic_calls`, and
+/// `unnecessary_parenthesis` oracle shapes through the production bridge.
+#[cfg(test)]
+mod w2927_pins;
 /// The W2-remainder expression rules' production-bridge pins: each rule
 /// runs with the semantic face mounted (the gap1 face construction), so
 /// the pins decide the tiling reading, not just the registration.

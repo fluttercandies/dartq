@@ -1587,7 +1587,9 @@ impl GapPass {
                 _ => {}
             },
             Ev::This { span } => self.push_val(Kind::This, *span, NO_GUARD),
-            Ev::OtherExpr { span } => self.push_val(Kind::Other, *span, NO_GUARD),
+            Ev::OtherExpr { span } | Ev::Int { span } | Ev::Double { span } => {
+                self.push_val(Kind::Other, *span, NO_GUARD)
+            }
             Ev::Bool { value } => {
                 // A constant condition checks nothing: both polarities
                 // carry side-tagged guards only so the branch maps apply.
@@ -1885,7 +1887,8 @@ impl GapPass {
             | Ev::EndLiteralString {
                 interpolation_count: count,
             }
-            | Ev::ListLitEnd { count } => {
+            | Ev::ListLitEnd { count, .. }
+            | Ev::SetOrMapLitEnd { count, .. } => {
                 let n = (*count).min(self.markers.len());
                 for _ in 0..n {
                     self.pop_val();

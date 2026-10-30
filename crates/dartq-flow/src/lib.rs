@@ -151,3 +151,12 @@ mod ticket_2850_tests;
 
 #[cfg(test)]
 mod ticket_2905_tests;
+
+#[cfg(test)]
+mod ticket_2940_tests;
+
+#[cfg(test)]
+mod ticket_2475_tests;
+
+#[cfg(test)]
+mod ticket_2943_tests;

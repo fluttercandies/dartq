@@ -203,12 +203,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
 
         // Dispatch: the token AFTER the name decides method vs fields
-        // (official parser_impl.dart:3946-3953 — a `!` right after the name
+        // (official parser_impl.dart:4327-4341 — a `!` right after the name
         // is skipped for the decision, then `next = next.next!` and the
         // follower value `(`/`{`/`<`/`.`/`=>` selects the method path; the
-        // `!` itself is consumed later by `parse_method_type_var`). The
-        // cursor stays on the name: `parse_top_level_method` consumes it.
-        let follower = if self.cursor.look_kind(1) == TokenKind::Bang {
+        // `!` itself is consumed later by `parse_method_type_var`). When the
+        // head-scan spliced a synthetic name the synthetic occupies the name
+        // slot upstream, so the follower IS the junk token itself (`void`
+        // `() {}` routes method, `void 5() {}` routes fields — the junk's
+        // own `!` still gets the skip). Otherwise the cursor sits on the
+        // real name and the follower is one ahead; either way
+        // `parse_top_level_method`/`parse_fields` owns the name slot.
+        let follower = if synthetic_name.is_some() {
+            if self.peek_kind() == TokenKind::Bang {
+                self.cursor.look_kind(1)
+            } else {
+                self.peek_kind()
+            }
+        } else if self.cursor.look_kind(1) == TokenKind::Bang {
             self.cursor.look_kind(2)
         } else {
             self.cursor.look_kind(1)
@@ -240,6 +251,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 before_type,
                 type_info,
                 get_or_set,
+                synthetic_name,
                 name_is_recovered,
             );
         } else {
@@ -419,6 +431,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         before_type: crate::cursor::CursorMark,
         type_info: TypeInfo,
         get_or_set: Option<TokenSpan>,
+        synthetic_name: Option<TokenSpan>,
         name_is_recovered: bool,
     ) {
         let last_consumed = self.span_at_mark(before_type);
@@ -444,7 +457,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 get_set
             }
             None => {
-                if name_is_recovered {
+                if let Some(synthetic) = synthetic_name {
+                    // The head-scan spliced the name-slot synthetic upstream
+                    // of the junk (`void () {}`): official `parseTopLevelMethod`
+                    // receives it as `name` and
+                    // `ensureIdentifierPotentiallyRecovered` takes the
+                    // IDENTIFIER fast path — the `handleIdentifier` fires
+                    // unconditionally (parser_impl.dart:4575-4579/:4109) with
+                    // no re-report (the head-scan's `missing_identifier` is
+                    // the only name-slot row). The span survives the reset's
+                    // queue truncate (events carry ids, not queue entries).
+                    self.listener
+                        .handle_identifier(synthetic, IdentifierContext::TopLevelFunctionDeclaration);
+                    synthetic
+                } else if name_is_recovered {
                     self.ensure_identifier_recovered(IdentifierContext::TopLevelFunctionDeclaration)
                 } else {
                     self.ensure_identifier(IdentifierContext::TopLevelFunctionDeclaration)
@@ -1880,26 +1906,86 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             DeclarationKind::TopLevel => IdentifierContext::TopLevelVariableDeclaration,
             _ => IdentifierContext::FieldDeclaration,
         };
+        // Whether the name slot carries a synthetic — the missing-`;`
+        // re-entry NamedType fires only for a written name (the `augment int
+        // field;` annotation reparse lookup), never for an empty one.
+        let mut first_name_is_synthetic = synthetic_name.is_some();
         let first_name = match synthetic_name {
-            Some(name) => name,
+            Some(name) => {
+                // The head-scan's synthetic name flows through the slot
+                // exactly like a parsed one: official `parseFields` routes
+                // `name` through `ensureIdentifierPotentiallyRecovered`,
+                // whose `handleIdentifier` fires unconditionally
+                // (parser_impl.dart:4107-4109 — `topLevelVariableDeclaration`
+                // for `DeclarationKind.TopLevel`, `fieldDeclaration`
+                // otherwise, :4447-4449) whatever identifier came back,
+                // head-scan synthetic included. `var = 42;` at top level
+                // therefore carries the TopLevelVariableDeclaration event
+                // upstream (the declaration's `<unnamed>` element exists).
+                self.listener.handle_identifier(name, context);
+                name
+            }
             None if mods.var_final_or_const.is_none()
                 && !is_keyword_or_identifier(self.peek_kind()) =>
             {
                 // Member-level junk-name recovery arriving without a
-                // `var`/`final`/`const` modifier (`late ;`, `int ;`,
-                // `int }` — the class-member `recoverFromInvalidMember`
-                // fallback): the official insert is silent here and
-                // `parseFields`' type face is the only row (probed oracle
-                // 3.13.1: `late ;` → missingConstFinalVarOrType on `late`;
-                // `var ;` → missing_identifier on `;`). The keyword case
-                // stays on `ensureIdentifier`, which owns its own
-                // reporting split.
+                // `var`/`final`/`const` modifier (`void ;`, `void 5;` —
+                // the class-member `recoverFromInvalidMember` fallback,
+                // which hands `parseFields` the junk token itself as
+                // `name`. Only a self-committing type like `void` gets
+                // here: `int ;` parses `int` as the name because a
+                // `required = false` type commits only when an identifier
+                // follows; `}`/EOF heads are claimed by
+                // `expectedClassMember` upstream of this arm). Official
+                // `FieldDeclarationIdentifierContext.ensureIdentifier`
+                // (identifier_context_impl.dart:487-510) splits on the
+                // keep-set: `;`/`=`/`,`/`}`/EOF/next-member-start take the
+                // insert-before branch (`insertSyntheticIdentifier(token,
+                // this)`), everything else is consumed in doubt with the
+                // synthetic spliced after (`insertSyntheticIdentifier(
+                // identifier, this, message: expectedIdentifier)`). BOTH
+                // arms report — `insertSyntheticIdentifier` reports
+                // `context.recoveryTemplate` when no `message` is passed
+                // (parser_impl.dart:4016-4019 → `expectedIdentifier`, the
+                // `PseudoSharedCode.missingIdentifier` face → analyzer
+                // `missing_identifier`; the `:491` "no error reported" TODO
+                // is stale). The name event still fires on the synthetic
+                // (parser_impl.dart:4109 unconditional).
                 let at = self.peek_span();
-                let id = self
-                    .cursor
-                    .insert_synthetic(TokenKind::Identifier, at.range.offset);
-                self.cursor.advance();
-                self.span_of(id)
+                self.report(msg::missing_identifier(), at);
+                let keep = matches!(
+                    self.peek_kind(),
+                    TokenKind::Semicolon
+                        | TokenKind::Eq
+                        | TokenKind::Comma
+                        | TokenKind::CloseCurly
+                        | TokenKind::Eof
+                        | TokenKind::At
+                );
+                let id = if keep {
+                    let id = self
+                        .cursor
+                        .insert_synthetic(TokenKind::Identifier, at.range.offset);
+                    self.cursor.advance();
+                    id
+                } else {
+                    // Consume-in-doubt (`int 5;`): the junk lands behind the
+                    // parse pointer and the spliced synthetic is the name —
+                    // drain to it so `;`/`=`/`,` reads see the follower like
+                    // upstream's `name.next` (`rewriter.
+                    // insertSyntheticIdentifier(identifier)` shape).
+                    self.cursor.advance();
+                    let id = self.cursor.insert_synthetic(
+                        TokenKind::Identifier,
+                        at.range.offset + at.range.length,
+                    );
+                    self.cursor.drain_to(id);
+                    id
+                };
+                let span = self.span_of(id);
+                self.listener.handle_identifier(span, context);
+                first_name_is_synthetic = true;
+                span
             }
             None => {
                 if name_is_recovered {
@@ -1952,7 +2038,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // oracle, member_declarations.dart line 14). Fire the NamedType
         // event for the written name so the reparsed reference reaches
         // resolution.
-        if !had_semicolon && self.peek_kind() == TokenKind::Identifier && synthetic_name.is_none() {
+        if !had_semicolon
+            && self.peek_kind() == TokenKind::Identifier
+            && !first_name_is_synthetic
+        {
             self.listener.handle_type(first_name, None);
         }
         self.listener

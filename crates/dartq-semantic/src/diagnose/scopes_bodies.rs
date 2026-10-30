@@ -254,32 +254,56 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// `begin_import`: the URI literal is the token after the keyword.
-    /// Only an honestly quoted literal joins (recovery shapes stay
-    /// silent — the under-report direction).
+    /// `begin_import`: one site per `import` directive whose URI starts
+    /// with a `String` token — the `unused_import` pass aligns `imports`
+    /// positionally against the library's import edges, and an import
+    /// element exists upstream for every written directive whatever its
+    /// URI shape (the interpolation arm still contributes a
+    /// `libraryImports[index]` and an edge with no target;
+    /// `imports_verifier.dart:232+` iterates the directive list, so a
+    /// dropped site here would misalign every following import against
+    /// the engine's per-directive `ImportEdge`, `file_state.dart`'s
+    /// `LibraryImport` construction).
+    ///
+    /// Only an honestly quoted single token carries `uri_text`: a string
+    /// interpolation's first segment is a `String` token whose lexeme is
+    /// an opening fragment (`'a` of `'a${b}c.dart'`, or `'$` of
+    /// `'${x}.dart'`) that fails the closing-quote check, so the site
+    /// joins with an empty `uri_text` — the upstream
+    /// `stringValue == null` / `DirectiveUriWithoutString` face
+    /// (`uri_with_interpolation`, `ast.dart:34082` + `file_state.dart:765`),
+    /// which never resolves and never reports on the import side.
+    /// `uri_range` still anchors at the first URI token so
+    /// `directive_range_around` can walk back to the `import` keyword.
+    /// A non-string URI head (`import 5;`) carries no site at all — the
+    /// same under-report posture as before, matching the directive walk's
+    /// own non-string URI arm.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn begin_import_site(&mut self, import_kw: Token) {
         let Some(uri) = self.tokens.get(import_kw.id as usize + 1) else {
             return;
         };
+        if uri.kind != dartq_scanner::TokenKind::String {
+            return;
+        }
         let raw = &self.source[uri.byte_range()];
-        let bytes = raw.as_bytes();
-        if bytes.len() < 2 {
-            return;
-        }
-        let quote = bytes[0];
-        if (quote != b'\'' && quote != b'"') || bytes[bytes.len() - 1] != quote {
-            return;
-        }
-        self.imports.push(ImportSite {
-            uri_text: raw[1..raw.len() - 1].to_string(),
+        let mut site = ImportSite {
+            uri_text: String::new(),
             uri_range: SourceRange {
                 offset: uri.utf16_offset,
                 length: raw.chars().map(char::len_utf16).sum::<usize>() as u32,
             },
             prefix: None,
             shown: Vec::new(),
-        });
+        };
+        let bytes = raw.as_bytes();
+        if bytes.len() >= 2 {
+            let quote = bytes[0];
+            if (quote == b'\'' || quote == b'"') && bytes[bytes.len() - 1] == quote {
+                site.uri_text = raw[1..raw.len() - 1].to_string();
+            }
+        }
+        self.imports.push(site);
     }
 
     /// The statement-window read rule (the official `_isUsefulRead`,
@@ -1278,10 +1302,17 @@ impl<'a> Engine<'a> {
     /// Binds the open declaration group's type to `name` in the innermost
     /// frame (one `parse_type` arms the group; every name in it binds). The
     /// bound type folds through a type alias first — the frame's declared
-    /// types are the resolved interface types every verdict reads.
+    /// types are the resolved interface types every verdict reads. A bare
+    /// parameterized head surviving the fold (`G source` over `typedef
+    /// G<X extends A<X>> = X Function()`, `G?` alike) binds its
+    /// instantiate-to-bounds face — the oracle's resolved `staticType` for
+    /// a written `G` is `G<A<dynamic>>` (`type.dart`
+    /// `instantiateTypeFormalsToBounds`), so the declared slot carries the
+    /// defaults, never the raw head.
     pub(crate) fn bind_declared_type(&mut self, name: StringId) {
         let ty = self.pending_decl_ty.unwrap_or(Ty::UNKNOWN);
         let ty = self.fold_alias_ty(ty);
+        let ty = self.instantiated_head_ty(ty);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
         }
@@ -1299,7 +1330,10 @@ impl<'a> Engine<'a> {
     /// type binds itself, `dynamic` stays `dynamic` and never infers). Only
     /// a `FunctionType` context supplies any inference; every other slot
     /// keeps `dynamic` — the suppress-everything face `Ty::UNKNOWN` already
-    /// carries.
+    /// carries. A bare parameterized head surviving the fold (`testme(G
+    /// source)` — the co19 `Instantiate-to-bound` typedef family's spelled
+    /// annotation) binds its instantiate-to-bounds face, the same resolved
+    /// `staticType` the declared-type arm above binds.
     pub(crate) fn bind_parameter_type(&mut self, name: StringId) {
         let ty = self
             .armed_ty
@@ -1307,6 +1341,7 @@ impl<'a> Engine<'a> {
             .or_else(|| self.closure_param_context_ty(name))
             .unwrap_or(Ty::UNKNOWN);
         let ty = self.fold_alias_ty(ty);
+        let ty = self.instantiated_head_ty(ty);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
         }
@@ -2450,11 +2485,19 @@ impl<'a> Engine<'a> {
         Vec<(StringId, Ty)>,
         Option<usize>,
     )> {
-        if decl.kind != MicroKind::TopLevelFn || decl.type_params == 0 {
+        if decl.type_params == 0 {
             return None;
         }
         let arity = usize::from(decl.type_params);
 
+        // A declaration carrying its parameter spellings — a generic
+        // class (`Future<T>`'s `T`), a type alias, a generic top-level
+        // function — pairs them positionally against the call's explicit
+        // type arguments (the `ordered` arm `closure_schema_instantiate`
+        // runs). The kind gate widened past `TopLevelFn` for the
+        // constructor-callee face: `Future<Null>(() => 1)`'s callee is
+        // `Future` the class, and its `T` is what the written `Null`
+        // fixes.
         if decl.type_param_names.len() == arity {
             return Some((
                 decl.type_param_names
@@ -2464,6 +2507,9 @@ impl<'a> Engine<'a> {
                 Vec::new(),
                 Some(arity),
             ));
+        }
+        if decl.kind != MicroKind::TopLevelFn {
+            return None;
         }
         let mut names: Vec<StringId> = Vec::new();
         if let Some(formals) = decl.formals.as_deref() {
@@ -2970,6 +3016,72 @@ impl<'a> Engine<'a> {
         Some(formals)
     }
 
+    /// Publishes one resolved constructor-use edge (#2931): a `member_refs`
+    /// row the annotation verifier's `member: Some` arm drains — its
+    /// `ctor_annotations` fallback answers the deprecated-constructor face
+    /// (constructors carry no [`MemberEntry`] row, so a member-shaped edge
+    /// is the only substrate the verifier reads). Upstream fires from
+    /// `ElementUsageDetector.constructorName` reading `node.element`'s
+    /// metadata (upstream Dart SDK source, pkg/analyzer/lib/src/error/
+    /// element_usage_detector.dart:189-191, driven from
+    /// `best_practices_verifier.dart` `visitConstructorName`:321-324).
+    ///
+    /// `selector` is the written selector (`named` in `A.named(`, `new` in
+    /// `A.new(`, the class name for the bare `A(`); it normalizes to the
+    /// `ctor_formals` lookup spelling the star keys under — `new` reads as
+    /// the class name, the same rewrite `note_constructor_continuation`
+    /// applies at capture. `range` is the `ConstructorName` span upstream
+    /// anchors (the class+selector compound for a named creation, the
+    /// head token for the unnamed face). An unresolvable container or a
+    /// genuinely absent constructor face mints nothing — the oracle's
+    /// `node.element == null` silence.
+    pub(crate) fn note_ctor_use(
+        &mut self,
+        class: StringId,
+        selector: StringId,
+        range: SourceRange,
+    ) {
+        let Some((decl, file)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            class,
+        ) else {
+            return;
+        };
+        self.note_ctor_use_in(decl, file, class, selector, range);
+    }
+
+    /// [`Self::note_ctor_use`] with the declaring container already
+    /// resolved — the prefixed fold's `prefixed_container` hit carries the
+    /// owner the bare namespace walk would look up in the wrong scope.
+    pub(crate) fn note_ctor_use_in(
+        &mut self,
+        decl: &Container,
+        file: FileId,
+        class: StringId,
+        selector: StringId,
+        range: SourceRange,
+    ) {
+        if !self.ctor_face_exists(decl, class, selector) {
+            return;
+        }
+        let key = if selector == self.intern("new") {
+            class
+        } else {
+            selector
+        };
+        self.report.member_refs.push(MemberRef {
+            range,
+            kind: MemberRefKind::Invoked,
+            target_file: file,
+            target_name: key,
+            target_container: class,
+        });
+    }
+
     /// The written function shape of a type, aliases unfolded — the
     /// argument-slot schema the closure-literal inference reads.
     fn closure_schema_sig(&self, ty: Ty) -> Option<FnVarSig> {
@@ -3021,9 +3133,22 @@ impl<'a> Engine<'a> {
         // misses.
         if self.init_mark == Some(mark)
             && let Some(ty) = self.pending_decl_ty
-            && let Some(ctx) = self.function_ty_of(self.fold_alias_ty(ty))
         {
-            return (Some(ctx), false);
+            let folded = self.fold_alias_ty(ty);
+            if let Some(ctx) = self.function_ty_of(folded) {
+                return (Some(ctx), false);
+            }
+            // The old-style typedef's element-model face: `typedef T
+            // Function2<S, T>(S x)` spells its `Ty::Function` RHS through
+            // `decl.var_ty`, with the written arguments pairing through
+            // the shape's own `type_params_named` — `instantiate_alias`'s
+            // `type_param_names` gate misses this spelling entirely.
+            if let Ty::Named { name, args, .. } = folded
+                && args != ArgListId::EMPTY
+                && let Some(ctx) = self.closure_typedef_function_ty(name, args)
+            {
+                return (Some(ctx), false);
+            }
         }
         // (ii) The assignment right-hand side: the token directly before
         // the literal is `=`/`??=` and the closest non-value row before it
@@ -3340,6 +3465,185 @@ impl<'a> Engine<'a> {
             // Function/record schema entries bind themselves (a
             // function-typed `Qi` greatest-closes to its own shape).
             other => Some(other),
+        }
+    }
+
+    /// The instantiated function type an old-style (function) typedef's
+    /// use spells — `Function2<int, String>` for `typedef T Function2<S,
+    /// T>(S x)` — the channel-(i) fallback when [`Self::fold_alias_ty`]
+    /// yields no `Ty::Function`. The element model is the only whole
+    /// record the old spelling arms: the collector synthesizes the RHS
+    /// `Ty::Function` into `decl.var_ty` (its `type_params_named` pairs
+    /// the written arguments positionally), while `decl.type_param_names`
+    /// stays empty (the count-only payload `instantiate_alias` refuses —
+    /// resolution.rs:234). `None` for a non-alias head, a non-function
+    /// `var_ty`, or an arity mismatch.
+    fn closure_typedef_function_ty(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        let (owner, decl) = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (self.file, decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                (file, self.index.get(file).and_then(|f| f.decl(name))?)
+            }
+            _ => return None,
+        };
+        if decl.kind != MicroKind::TypeAlias || decl.var_ty == Ty::UNKNOWN {
+            return None;
+        }
+        let Ty::Function { shape, nullable } = self.boundary.ty(owner, decl.var_ty) else {
+            return None;
+        };
+        let (type_params_named, return_ty, positional, named) = {
+            let pool = self.boundary.pool();
+            let shape = pool.function_shape(shape);
+            (
+                shape.type_params_named.clone(),
+                shape.return_ty,
+                shape.positional.to_vec(),
+                shape.named.to_vec(),
+            )
+        };
+        if type_params_named.is_empty() {
+            // A non-generic old-style typedef's `var_ty` IS the answer —
+            // `fold_alias_ty` already folded it when it could; reaching
+            // here means the RHS carried no names worth substituting.
+            return Some(Ty::Function { shape, nullable });
+        }
+        let written: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+        if written.len() != type_params_named.len() {
+            return None;
+        }
+        let map: FxHashMap<StringId, Ty> = type_params_named
+            .iter()
+            .map(|(param, _)| *param)
+            .zip(written)
+            .collect();
+        let ret = self.closure_subst_param_ty(return_ty, &map);
+        let positional: Vec<Ty> = positional
+            .iter()
+            .map(|ty| self.closure_subst_param_ty(*ty, &map))
+            .collect();
+        let named: Vec<(StringId, Ty)> = named
+            .iter()
+            .map(|(n, ty)| (*n, self.closure_subst_param_ty(*ty, &map)))
+            .collect();
+        // The substituted shape is a concrete signature — the typedef's
+        // own parameter group is consumed by the instantiation, so the
+        // answer carries no `type_params` of its own.
+        Some(
+            self.boundary
+                .args
+                .borrow_mut()
+                .function(0, ret, &positional, &named, nullable),
+        )
+    }
+
+    /// The use-site substitution of one typedef's parameter spellings:
+    /// a bare leaf naming a parameter binds the written argument (its
+    /// nullability joining the leaf's); a generic head substitutes
+    /// pairwise through its argument list; a function subtree substitutes
+    /// through return, positionals, named, and written bounds. Every
+    /// other face stands — a non-parameter leaf is some other
+    /// declaration's spelling, never this alias's.
+    fn closure_subst_param_ty(&self, ty: Ty, map: &FxHashMap<StringId, Ty>) -> Ty {
+        if let Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        } = ty
+            && let Some(replacement) = map.get(&name)
+        {
+            // The written argument's type joins the leaf's own
+            // nullability — `T?` under `T := int` spells `int?`.
+            if !nullable {
+                return *replacement;
+            }
+            return match *replacement {
+                Ty::Named { name, args, .. } => Ty::Named {
+                    name,
+                    nullable: true,
+                    args,
+                },
+                Ty::Record { shape, .. } => Ty::Record {
+                    shape,
+                    nullable: true,
+                },
+                Ty::Function { shape, .. } => Ty::Function {
+                    shape,
+                    nullable: true,
+                },
+                other => other,
+            };
+        }
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } if args != ArgListId::EMPTY => {
+                let written: Vec<Ty> = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                };
+                let substituted: Vec<Ty> = written
+                    .iter()
+                    .map(|arg| self.closure_subst_param_ty(*arg, map))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &substituted)
+            }
+            Ty::Function { shape, nullable } => {
+                let (type_params, names, return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.type_params_named.clone(),
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|ty| self.closure_subst_param_ty(*ty, map))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(n, ty)| (*n, self.closure_subst_param_ty(*ty, map)))
+                    .collect();
+                let names: Vec<(StringId, Option<Ty>)> = names
+                    .iter()
+                    .map(|&(n, bound)| (n, bound.map(|b| self.closure_subst_param_ty(b, map))))
+                    .collect();
+                let mut args = self.boundary.args.borrow_mut();
+                if names.is_empty() && type_params > 0 {
+                    args.function(
+                        type_params,
+                        self.closure_subst_param_ty(return_ty, map),
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+                } else {
+                    args.function_generic(
+                        &names,
+                        self.closure_subst_param_ty(return_ty, map),
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+                }
+            }
+            _ => ty,
         }
     }
 
@@ -3665,11 +3969,31 @@ impl<'a> Engine<'a> {
         self.push_frame(FrameKind::Executable {
             instance,
             ret: None,
+            ctx_ret: None,
             super_invoked: false,
             body_brace: None,
             is_async: false,
             generator: false,
         });
+    }
+
+    /// Arms a function literal's completion context (the official
+    /// `imposedType`): the context type's function return, with the
+    /// dynamic/unknown heads dropped — those leave `contextType` null and
+    /// the completion walk silent (`function_expression_resolver.dart`
+    /// :44-53). A context that answers no function return (an untyped
+    /// slot) stays unarmed — the same under-report. Called at the
+    /// literal's begin, while its own frame is innermost; the closure
+    /// staging reads the arm at the literal's end.
+    pub(crate) fn arm_closure_completion(&mut self, ctx: Option<Ty>) {
+        let ctx_ret = ctx
+            .and_then(|ctx| self.function_shape_return(ctx))
+            .filter(|ret| !matches!(ret, Ty::Dynamic | Ty::Unknown));
+        if let Some(frame) = self.frames.last_mut()
+            && let FrameKind::Executable { ctx_ret: slot, .. } = &mut frame.kind
+        {
+            *slot = ctx_ret;
+        }
     }
 
     /// Latches the body's async modifier onto the innermost executable
@@ -3678,6 +4002,19 @@ impl<'a> Engine<'a> {
     /// Normally`'s `body.isGenerator` / `body.isAsynchronous` arms). The
     /// modifier event belongs to the body whose frame is innermost — a
     /// nested function literal latches its own frame.
+    ///
+    /// For a non-generator `async` literal the matched context's return
+    /// type additionally rewrites: the oracle's `element.returnType` is
+    /// the imposed `R` async-wrapped through `Future<flatten(R)>`
+    /// (body_inference_context.dart:132-153, `computeInferredReturnType`
+    /// — a body whose returns do not satisfy the context clamps to `R`,
+    /// and `FutureOr<futureValueType(imposedType)>` at :259-261 supplies
+    /// the async body's context). `void Function() test = () async {
+    /// return v; }` reports `'Future<void>'` as the destination, not the
+    /// raw `void` — the literal's own `Ty::Function` face carries the
+    /// wrapped return for both the verdict and the Value row. Formals
+    /// bind before this event fires, so the rewrite never disturbs the
+    /// per-formal inference arm.
     pub(crate) fn note_async_modifier(&mut self, is_async: bool, generator: bool) {
         if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable {
@@ -3688,6 +4025,55 @@ impl<'a> Engine<'a> {
         {
             *slot_async = is_async;
             *slot_generator = generator;
+        }
+        if !is_async || generator {
+            return;
+        }
+        // The read-only phase: extract the latched context's shape
+        // fields and compute the async-wrapped return — the mutable
+        // borrow resumes only for the assignment, so `intern`/`pool`/
+        // `intern_list` never fight the `last_mut` borrow.
+        let Some(Ty::Function { shape, nullable }) =
+            self.closure_caps.last().and_then(|capture| capture.ctx)
+        else {
+            return;
+        };
+        let (type_params, names, return_ty, positional, named) = {
+            let pool = self.boundary.pool();
+            let shape = pool.function_shape(shape);
+            (
+                shape.type_params,
+                shape.type_params_named.clone(),
+                shape.return_ty,
+                shape.positional.to_vec(),
+                shape.named.to_vec(),
+            )
+        };
+        let flat = engine_core::flatten_ty(self.strings, &self.boundary.pool(), return_ty);
+        let future = Ty::Named {
+            name: self.intern("Future"),
+            nullable: false,
+            args: self.boundary.intern_list(&[flat]),
+        };
+        let wrapped = if names.is_empty() && type_params > 0 {
+            self.boundary.args.borrow_mut().function(
+                type_params,
+                future,
+                &positional,
+                &named,
+                nullable,
+            )
+        } else {
+            self.boundary.args.borrow_mut().function_generic(
+                &names,
+                future,
+                &positional,
+                &named,
+                nullable,
+            )
+        };
+        if let Some(capture) = self.closure_caps.last_mut() {
+            capture.ctx = Some(wrapped);
         }
     }
 
@@ -3719,8 +4105,12 @@ impl<'a> Engine<'a> {
     /// fact carries — and the declaring name's span (the completion rows'
     /// anchor) stage for the teardown's fold to join
     /// (`body_might_complete_normally_nullable`). Setters stay out (the
-    /// official `!node.isSetter` gate), and frames without a latched return
-    /// type (constructors, closures) under-report. The
+    /// official `!node.isSetter` gate). A function literal stages its
+    /// context return (`arm_closure_completion`'s arm) anchored at the
+    /// body brace — the official `BlockFunctionBody` anchor (the
+    /// `resolver.dart` switch's `errorNode.block.leftBracket`) — and
+    /// frames with neither a latched return nor an armed context
+    /// (constructors, untyped closures) under-report. The
     /// modifier gates front-run the staging: a generator body always
     /// completes normally (`body.isGenerator` early return,
     /// type_analyzer.dart:658-660), and an `async` body under an illegal
@@ -3733,7 +4123,8 @@ impl<'a> Engine<'a> {
         let Some(Frame {
             kind:
                 FrameKind::Executable {
-                    ret: Some(exec),
+                    ret,
+                    ctx_ret,
                     body_brace,
                     is_async,
                     generator,
@@ -3744,10 +4135,28 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        if *generator || (*is_async && !self.legal_async_return(exec.ty)) {
+        // A declared shape stages its latched return (the anchor is the
+        // declaring name); a closure literal stages its armed context
+        // return, anchored at the body brace — a braceless literal (an
+        // arrow body) has no block face to ask about.
+        let (staged, anchor) = match (ret.as_ref(), ctx_ret.as_ref(), *body_brace) {
+            (Some(exec), ..) => (exec.ty, exec.name_span),
+            (None, Some(ctx), Some(brace)) => (*ctx, brace),
+            _ => return,
+        };
+        // The staged type is the RESOLVED declared return (the official
+        // walk reads `returnType?.type`, the resolved annotation): an
+        // alias head answers its captured right-hand side before any
+        // question asks — `typedef Nothing = void; Nothing f() {}` walks
+        // as `void` (silent), not as the alias head (a false
+        // non-nullable), and the nullable twin reports the aliased display
+        // text (`typedef N = int?; N f() {}` → `'int?'`, the nullable
+        // warning, not the ERROR twin on the raw head).
+        let declared = self.completion_declared_ty(staged);
+        if *generator || (*is_async && !self.legal_async_return(declared)) {
             return;
         }
-        let row = (end.range, exec.ty, *body_brace, *is_async, exec.name_span);
+        let row = (end.range, declared, *body_brace, *is_async, anchor);
         match self
             .body_completions
             .binary_search_by(|(r, ..)| r.offset.cmp(&row.0.offset))
@@ -3814,12 +4223,21 @@ impl<'a> Engine<'a> {
         // The block-body gate only: the official `BlockFunctionBody`s-only
         // face; the row's anchor is the declaring name, not the `{`.
         (*brace)?;
-        // An `async` body's completion type is the declared return's
-        // future-flattened form (`TypeSystem.flatten`,
-        // type_analyzer.dart:682-704): `Future<void>` flattens to `void`
-        // (silent), `Future<T>`/`FutureOr<T>` to `flatten(T)`.
+        // An `async` body's completion question reads the declared
+        // return's completion context — the official
+        // `_contextTypeForImposed`'s final arm
+        // (body_inference_context.dart): the `FutureOr<V>` union over the
+        // future value type, never the flatten — `Future<int> f() async
+        // {}` asks through `FutureOr<int>` and the diagnostic renders that
+        // union (the corpus `'FutureOr<int>'` row), a nullable element
+        // (`Future<int>?`) reads `FutureOr<int?>`. The imposed-null face —
+        // no written return type, our `Unknown` stand-in — keeps the
+        // oracle's null contextType: the walk never fires.
         let ret = if *is_async {
-            self.flatten_future(*declared)
+            if *declared == Ty::Unknown {
+                return None;
+            }
+            self.async_completion_context(*declared)
         } else {
             *declared
         };
@@ -3882,28 +4300,101 @@ impl<'a> Engine<'a> {
         Some((code, ret, *name))
     }
 
-    /// `TypeSystem::flatten` at name level for an `async` body's declared
-    /// return: `Future<T>`/`FutureOr<T>` unwrap to `flatten(T)`, `dynamic`
-    /// stays `dynamic`, every other type is its own flatten. A bare
-    /// `Future`/`FutureOr` spells `Future<dynamic>` — the implicit
-    /// argument unwraps to `dynamic` (`Future m1() async {}` completes
-    /// with null legally, so its body check stays silent).
-    pub(crate) fn flatten_future(&self, ty: Ty) -> Ty {
-        let Ty::Named { name, args, .. } = ty else {
+    /// The completion walk's resolved declared return: the shared alias
+    /// fold plus the terminal `void`/`Null`/`Never` right-hand sides it
+    /// keeps written (the shared fold's other consumers model no
+    /// nullability face through them). The official walk reads
+    /// `returnType?.type` — the resolved annotation: `typedef Nothing =
+    /// void; Nothing f() {}` answers `void` (the named-type resolution's
+    /// `type: void`), never the alias head, and the same read decides the
+    /// nullable `Nothing?` twin (its `FutureOr` base is `void` — silent).
+    pub(crate) fn completion_declared_ty(&self, ty: Ty) -> Ty {
+        // Only a head that RESOLVES as a type in scope folds: an
+        // unresolved head is the oracle's `InvalidType` — the completion
+        // question never reaches it (the silent
+        // [`Engine::named_type_is_type`] face), and the alias chase must
+        // not resurrect it through an invisible library's declaration. A
+        // type parameter or a primitive head is a type through the frame,
+        // never an alias use — the chase's not-found face must not see
+        // them either.
+        let Ty::Named { name, .. } = ty else {
             return ty;
         };
-        if name != self.intern("Future") && name != self.intern("FutureOr") {
+        if !self.named_type_is_type(name)
+            || self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+            || self.members.primitive_ids.contains(&name)
+        {
             return ty;
         }
-        if args == ArgListId::EMPTY {
-            return Ty::Dynamic;
+        let folded = self.fold_alias_ty(ty);
+        let Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        } = folded
+        else {
+            return folded;
+        };
+        match self.alias_rhs(name) {
+            // `void` swallows the question (a void type carries no `?`).
+            Some(Ty::Void) => Ty::Void,
+            // `Null` is the model's nullable-without-suffix leaf either way.
+            Some(Ty::Null) => Ty::Null,
+            // A questioned `Never` has no modeled face (`Ty::Never` carries
+            // no nullability) — the written use stays.
+            Some(Ty::Never) if !nullable => Ty::Never,
+            _ => folded,
         }
-        let pool = self.boundary.pool();
-        let list = pool.get(args);
-        if list.len() != 1 {
-            return ty;
+    }
+
+    /// The async body's completion context — official
+    /// `_contextTypeForImposed`'s final arm (body_inference_context.dart)
+    /// as a `Ty`: the `FutureOr<V>` union over the declared return's
+    /// future value type. The verdict reads the union's faces through the
+    /// same arms as any written `FutureOr`, and the nullable twin renders
+    /// the union itself — the oracle's display text (`'FutureOr<int>'` for
+    /// `Future<int> f() async {}`).
+    pub(crate) fn async_completion_context(&self, declared: Ty) -> Ty {
+        let value = self.future_value_type(declared);
+        Ty::Named {
+            name: self.intern("FutureOr"),
+            nullable: false,
+            args: self.boundary.intern_list(&[value]),
         }
-        self.flatten_future(list[0])
+    }
+
+    /// `TypeSystem.futureValueType` at name level (type_system.dart:471):
+    /// `S?` strips to `S`, a `Future<S>`/`FutureOr<S>` head unwraps to `S`
+    /// (a bare head spells `<dynamic>` — its element is `dynamic`),
+    /// `dynamic`/`void` stay themselves, and every other head answers
+    /// `Object?`. The recovery leaves (`Never`/`Null`/records/functions)
+    /// never reach the answer alive — the async-legality gate silences
+    /// them at staging — so the `Object?` arm is the totality face.
+    pub(crate) fn future_value_type(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Named {
+                name,
+                nullable: true,
+                args,
+            } => self.future_value_type(Ty::Named {
+                name,
+                nullable: false,
+                args,
+            }),
+            Ty::Named { name, args, .. }
+                if name == self.intern("Future") || name == self.intern("FutureOr") =>
+            {
+                if args == ArgListId::EMPTY {
+                    return Ty::Dynamic;
+                }
+                let pool = self.boundary.pool();
+                let list = pool.get(args);
+                if list.len() == 1 { list[0] } else { ty }
+            }
+            Ty::Dynamic | Ty::Void => ty,
+            _ => self.object_question(),
+        }
     }
 
     /// `TypeSystem::futureOrBase` at name level: a written `FutureOr<T>`
