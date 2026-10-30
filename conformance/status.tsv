@@ -31,7 +31,7 @@ diagnostic	anonymous_method_wrong_parameter_list	7	2	5	0	6	red
 diagnostic	anonymous_method_wrong_parameter_type	3	2	1	0	2	red
 diagnostic	argument_must_be_a_constant	11	4	7	0	8	red
 diagnostic	argument_must_be_native	9	7	2	0	6	red
-diagnostic	argument_type_not_assignable	552	111	441	0	447	red
+diagnostic	argument_type_not_assignable	552	112	440	0	449	red
 diagnostic	argument_type_not_assignable_to_error_handler	62	27	35	0	35	red
 diagnostic	assert_in_redirecting_constructor	17	10	7	0	11	red
 diagnostic	asset_directory_does_not_exist	2	2	0	0	1	green
@@ -115,7 +115,7 @@ diagnostic	conflicting_type_variable_and_member	30	2	28	0	29	red
 diagnostic	const_and_final	5	5	0	0	5	green
 diagnostic	const_class	2	2	0	0	2	green
 diagnostic	const_constructor_field_type_mismatch	8	3	5	0	8	red
-diagnostic	const_constructor_param_type_mismatch	44	16	28	0	32	red
+diagnostic	const_constructor_param_type_mismatch	45	16	29	0	33	red
 diagnostic	const_constructor_throws_exception	2	0	2	0	2	red
 diagnostic	const_constructor_with_body	45	35	10	0	45	red
 diagnostic	const_constructor_with_field_initialized_by_non_const	27	6	21	0	21	red
@@ -177,7 +177,7 @@ diagnostic	dead_code	1420	787	633	0	1336	red
 diagnostic	dead_code_catch_following_catch	28	19	9	0	25	red
 diagnostic	dead_code_on_catch_subtype	18	7	11	0	16	red
 diagnostic	dead_null_aware_expression	88	47	41	0	81	red
-diagnostic	declaration_already_complete	282	96	186	0	233	red
+diagnostic	declaration_already_complete	166	98	68	0	162	red
 diagnostic	default_in_switch_expression	3	3	0	0	3	green
 diagnostic	default_value_already_specified_in_augmentation_chain	16	0	16	0	16	red
 diagnostic	default_value_in_function_type	18	18	0	0	17	green
@@ -447,7 +447,7 @@ diagnostic	invalid_annotation	38	3	35	0	35	red
 diagnostic	invalid_annotation_constant_value_from_deferred_library	3	1	2	0	2	red
 diagnostic	invalid_annotation_from_deferred_library	7	3	4	0	5	red
 diagnostic	invalid_annotation_target	143	60	83	0	83	red
-diagnostic	invalid_assignment	912	146	766	0	798	red
+diagnostic	invalid_assignment	914	146	768	0	798	red
 diagnostic	invalid_await_in_for	8	5	3	0	8	red
 diagnostic	invalid_await_not_required_annotation	20	12	8	0	8	red
 diagnostic	invalid_code_point	1	1	0	0	1	green
@@ -533,7 +533,7 @@ diagnostic	invalid_widget_preview_application	36	9	27	0	28	red
 diagnostic	invalid_widget_preview_private_argument	10	2	8	0	8	red
 diagnostic	invocation_of_extension_without_call	5	1	4	0	4	red
 diagnostic	invocation_of_non_function	16	5	11	0	16	red
-diagnostic	invocation_of_non_function_expression	107	31	76	0	74	red
+diagnostic	invocation_of_non_function_expression	107	32	75	0	74	red
 diagnostic	label_in_outer_scope	5	2	3	0	3	red
 diagnostic	label_undefined	51	2	49	0	49	red
 diagnostic	late_final_field_with_const_constructor	20	2	18	0	18	red
@@ -542,7 +542,7 @@ diagnostic	late_pattern_variable_declaration	1	1	0	0	1	green
 diagnostic	leaf_call_must_not_return_handle	12	5	7	0	9	red
 diagnostic	leaf_call_must_not_take_handle	10	5	5	0	7	red
 diagnostic	library_directive_not_first	10	10	0	0	10	green
-diagnostic	list_element_type_not_assignable	152	46	106	0	121	red
+diagnostic	list_element_type_not_assignable	157	47	110	0	125	red
 diagnostic	literal_with_class	9	9	0	0	9	green
 diagnostic	literal_with_class_and_new	6	0	6	0	6	red
 diagnostic	literal_with_new	3	3	0	0	3	green
@@ -808,8 +808,8 @@ diagnostic	rethrow_outside_catch	10	4	6	0	6	red
 diagnostic	return_in_generative_constructor	24	3	21	0	21	red
 diagnostic	return_in_generator	44	7	37	0	37	red
 diagnostic	return_of_do_not_store	12	5	7	0	8	red
-diagnostic	return_of_invalid_type	480	182	298	0	409	red
-diagnostic	return_of_invalid_type_from_closure	76	12	64	0	68	red
+diagnostic	return_of_invalid_type	490	182	308	0	413	red
+diagnostic	return_of_invalid_type_from_closure	79	19	60	0	71	red
 diagnostic	return_without_value	37	8	29	0	29	red
 diagnostic	sdk_version_constructor_tearoffs	3	1	2	0	3	red
 diagnostic	sdk_version_gt_gt_gt_operator	8	7	1	0	5	red
@@ -861,7 +861,7 @@ diagnostic	top_level_cycle	35	4	31	0	35	red
 diagnostic	top_level_operator	8	5	3	0	8	red
 diagnostic	type_alias_cannot_reference_itself	50	10	40	0	47	red
 diagnostic	type_annotation_deferred_class	32	6	26	0	31	red
-diagnostic	type_argument_not_matching_bounds	451	107	344	0	427	red
+diagnostic	type_argument_not_matching_bounds	451	110	341	0	428	red
 diagnostic	type_arguments_on_type_variable	1	1	0	0	1	green
 diagnostic	type_before_factory	2	1	1	0	1	red
 diagnostic	type_check_with_null	19	12	7	0	18	red
@@ -890,9 +890,9 @@ diagnostic	undefined_hidden_name	7	4	3	0	6	red
 diagnostic	undefined_identifier	1642	1358	284	0	1600	red
 diagnostic	undefined_identifier_await	6	6	0	0	5	green
 diagnostic	undefined_lint	8	1	7	0	5	red
-diagnostic	undefined_method	283	107	176	0	213	red
+diagnostic	undefined_method	283	109	174	0	213	red
 diagnostic	undefined_named_parameter	51	17	34	0	47	red
-diagnostic	undefined_operator	193	86	107	0	173	red
+diagnostic	undefined_operator	194	86	108	0	173	red
 diagnostic	undefined_prefixed_name	30	11	19	0	27	red
 diagnostic	undefined_referenced_parameter	7	7	0	0	5	green
 diagnostic	undefined_setter	115	31	84	0	72	red
@@ -918,7 +918,7 @@ diagnostic	unnecessary_null_check_pattern	17	10	7	0	16	red
 diagnostic	unnecessary_null_comparison	136	41	95	0	130	red
 diagnostic	unnecessary_question_mark	15	15	0	0	11	green
 diagnostic	unnecessary_set_literal	39	17	22	0	22	red
-diagnostic	unnecessary_type_check	1088	501	587	0	1071	red
+diagnostic	unnecessary_type_check	1087	501	586	0	1071	red
 diagnostic	unnecessary_wildcard_pattern	42	24	18	0	29	red
 diagnostic	unqualified_reference_to_non_local_static_member	10	1	9	0	9	red
 diagnostic	unqualified_reference_to_static_member_of_extended_type	8	2	6	0	6	red
@@ -933,14 +933,14 @@ diagnostic	unsupported_value	1	0	1	0	1	red
 diagnostic	unterminated_multi_line_comment	3	3	0	0	2	green
 diagnostic	unterminated_string_literal	24	23	1	0	24	red
 diagnostic	unused_catch_clause	129	98	31	0	123	red
-diagnostic	unused_catch_stack	153	117	36	0	150	red
-diagnostic	unused_element	1711	1169	542	0	1375	red
-diagnostic	unused_element_parameter	188	42	146	0	155	red
+diagnostic	unused_catch_stack	153	119	34	0	150	red
+diagnostic	unused_element	1709	1170	539	0	1375	red
+diagnostic	unused_element_parameter	185	42	143	0	155	red
 diagnostic	unused_field	417	323	94	0	383	red
 diagnostic	unused_field_from_primary_constructor	37	34	3	0	30	red
 diagnostic	unused_import	837	692	145	0	783	red
 diagnostic	unused_label	97	65	32	0	93	red
-diagnostic	unused_local_variable	5025	4768	257	0	4993	red
+diagnostic	unused_local_variable	5025	4769	256	0	4993	red
 diagnostic	unused_result	119	103	16	0	26	red
 diagnostic	unused_shown_name	50	50	0	0	41	green
 diagnostic	uri_does_not_exist	743	608	135	0	733	red
