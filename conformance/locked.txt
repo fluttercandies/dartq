@@ -46,6 +46,7 @@ diagnostic/deprecated_lint
 diagnostic/duplicate_deferred
 diagnostic/duplicate_hidden_name
 diagnostic/duplicate_label_in_switch_statement
+diagnostic/duplicate_part
 diagnostic/duplicate_prefix
 diagnostic/duplicate_shown_name
 diagnostic/empty_enum_body
@@ -63,6 +64,7 @@ diagnostic/expected_representation_field
 diagnostic/experiment_not_enabled_off_by_default
 diagnostic/export_directive_after_part_directive
 diagnostic/extension_augmentation_has_on_clause
+diagnostic/extension_declares_constructor
 diagnostic/extension_primary_constructor
 diagnostic/extension_type_augmentation_specifies_representation_field
 diagnostic/extension_type_extends
@@ -118,6 +120,7 @@ diagnostic/invalid_code_point
 diagnostic/invalid_constant_pattern_duplicate_const
 diagnostic/invalid_constant_pattern_empty_record_literal
 diagnostic/invalid_constant_pattern_generic
+diagnostic/invalid_constructor_name
 diagnostic/invalid_covariant_modifier_in_primary_constructor
 diagnostic/invalid_generic_function_type
 diagnostic/invalid_hex_escape
@@ -142,6 +145,7 @@ diagnostic/literal_with_new
 diagnostic/local_function_declaration_modifier
 diagnostic/mismatched_annotation_on_struct_field
 diagnostic/missing_annotation_on_struct_field
+diagnostic/missing_assignment_in_initializer
 diagnostic/missing_catch_or_finally
 diagnostic/missing_closing_parenthesis
 diagnostic/missing_dependency
@@ -162,6 +166,7 @@ diagnostic/missing_quote
 diagnostic/missing_star_after_sync
 diagnostic/missing_variable_in_for_each
 diagnostic/mixed_parameter_groups
+diagnostic/mixin_application_class_augmentation
 diagnostic/mixin_declares_constructor
 diagnostic/mixin_primary_constructor
 diagnostic/mixin_with_clause
@@ -176,6 +181,7 @@ diagnostic/multiple_plugins
 diagnostic/multiple_positional_parameter_groups
 diagnostic/multiple_with_clauses
 diagnostic/name_not_string
+diagnostic/named_function_expression
 diagnostic/named_function_type
 diagnostic/native_clause_should_be_annotation
 diagnostic/native_field_missing_type
@@ -354,6 +360,7 @@ lint/prefer_iterable_wheretype
 lint/prefer_mixin
 lint/prefer_single_quotes
 lint/provide_deprecation_message
+lint/simplify_variable_pattern
 lint/sized_box_for_whitespace
 lint/super_goes_last
 lint/unnecessary_brace_in_string_interps
