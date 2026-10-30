@@ -168,3 +168,54 @@ main() {
     let report = report_ops(source);
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
+
+/// The satisfying generic-function-type argument
+/// (TypeArgumentNotMatchingBoundsTest/
+/// test_methodInvocation_genericFunctionTypeArgument_match): `F` unfolds
+/// to `void Function<T extends num>()`, whose parameter bound equals the
+/// target's per `relateTypeParameters` (`fn_sig_subtype`'s positional
+/// unification) — the invocation face stays silent. The declaring
+/// header's OWN bound window decides: a bound's function-type variables
+/// (`<X extends num>` inside `T extends void Function<X extends num>()`)
+/// close a nested group and never pair as the executable's parameters
+/// (#2897 — the stolen `[(X, num)]` window made this fire against `num`).
+#[test]
+fn generic_function_type_argument_matching_bound_stays_silent() {
+    let source = r#"
+typedef F = void Function<T extends num>();
+void f<T extends void Function<X extends num>()>() {}
+void g() {
+  f<F>();
+}
+"#;
+    let report = report_ops(source);
+    assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
+}
+
+/// The explicit extension override with a violating type argument
+/// (TypeArgumentNotMatchingBoundsTest/
+/// test_extensionOverride_hasTypeArguments_call): the written arguments
+/// check against the extension's declared bounds exactly like a send's,
+/// the report anchored at the offending argument.
+#[test]
+fn extension_override_bad_type_argument_reports_at_the_argument() {
+    let source = r#"
+extension E<T extends num> on int {
+  void call() {}
+}
+void f() {
+  E<String>(0)();
+}
+"#;
+    let report = report_ops(source);
+    assert_eq!(
+        bounds_rows(&report),
+        [(
+            at(source, "String>(0)()"),
+            6,
+            "'String' doesn't conform to the bound 'num' of the type parameter 'T'.".to_string()
+        )],
+        "{:?}",
+        report.diagnostics
+    );
+}

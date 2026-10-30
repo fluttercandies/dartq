@@ -970,13 +970,15 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // The catch group's re-parse closed: the second real formal name
         // takes the stack-trace face when the fast pass's own trace slot
-        // stayed junk-filled (see [`Engine::reconcile_catch_slots`]).
+        // stayed junk-filled, and the typed-catch recovery (`catch (int
+        // e)`) hands the face to the scan's second name (see
+        // [`Engine::reconcile_catch_slots`]).
         if kind == dartq_parser::MemberKind::Catch {
             let open = engine.catch_formal_group.take().is_some();
+            let exc = engine.catch_ord_exc.take();
             let trace = engine.catch_ord_trace.take();
-            engine.catch_ord_exc = None;
             if open {
-                engine.reconcile_catch_slots(trace);
+                engine.reconcile_catch_slots(exc, trace);
             }
         }
     }
@@ -1542,19 +1544,66 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.open_exec_augment = false;
         }
         engine.push_executable_frame(instance);
-        engine.closure_capture_begin(token.range.offset);
+        // The literal's context type `K` resolves while its marks still
+        // hold — the row count the literal opened at is the mark every
+        // channel (initializer / assignment / argument / return) keys on.
+        let (ctx, ctx_from_arg) = engine.closure_context_ty(token.range.offset);
+        engine.closure_capture_begin(token.range.offset, ctx, ctx_from_arg);
     }
 
     fn end_function_expression(&mut self, begin: Token, end: Token) {
         self.flow().end_function_expression(begin, end);
 
         let engine = &mut self.engine;
-        engine.closure_capture_end(end.range.end());
+        let literal_ty = engine.closure_capture_end(end.range.end());
         engine.const_capture.end_opaque_group(end.range);
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
+        // The literal folds to one expression node upstream: its own
+        // rows — every body read, every inner send — belong to the node,
+        // not the stack. Drain them into the deferred pass-2 queue (the
+        // list-literal and send folds' precedent: the checks they owed
+        // already ran against their rows, and the deferred queue still
+        // credits their reads and resolves their own misses), so the
+        // enclosing single-row faces — `init_mark`'s `rows.len() ==
+        // mark + 1` window, `check_assignment`'s single-RHS scan — see
+        // the literal's own row alone.
+        let mark = engine
+            .frames
+            .last()
+            .map(|frame| frame.row_mark)
+            .unwrap_or_else(|| engine.rows.len());
+        // The literal's own node end: `end` bounds the head (the `=>`
+        // arrow for an expression body), so the body's last completed row
+        // supplies the real close — the oracle's FunctionExpression span
+        // covers the body (`(x) => 3` ends at `3`, not `>`).
+        let interior_end = engine
+            .rows
+            .iter()
+            .skip(mark.min(engine.rows.len()))
+            .map(|row| row.range.end())
+            .max();
+        for row in engine.rows.drain(mark.min(engine.rows.len())..) {
+            engine.deferred_miss_rows.push(row);
+        }
         engine.pop_frame();
-        engine.push_value_row(end);
+        match literal_ty {
+            // A matched context supplied the literal's final type: the row
+            // spans the literal (the oracle's function-expression anchor)
+            // and carries the inferred `Ty::Function` — the decl
+            // initializer, assignment, and argument faces read it like any
+            // typed expression.
+            Some((offset, ty)) => {
+                let lit_end = interior_end.unwrap_or(0).max(end.range.end());
+                let range = SourceRange {
+                    offset,
+                    length: lit_end.saturating_sub(offset),
+                };
+                engine.closure_literal_starts.insert(offset);
+                engine.push_typed_value_row(range, ty);
+            }
+            None => engine.push_value_row(end),
+        }
     }
 
     fn begin_named_function_expression(&mut self, token: Token) {
@@ -2292,6 +2341,11 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some((var_name, var_range)) = engine.var_name_stack.pop() {
             engine.var_type_variable(var_name, variance, var_range);
         }
+        // A literal's own `<T…>` variable counts toward the context-match
+        // gate (a foreign variable's close — a nested annotation's —
+        // never reaches here with `list_depth` still 0 while frames
+        // match, so the guard inside keys on the literal's own frame).
+        engine.closure_type_variable();
     }
 
     fn end_type_variables(&mut self, begin: Token, end: Token) {
@@ -5549,13 +5603,23 @@ impl ParserListener for DiagnoseListener<'_> {
         // flattened return type is `VoidType` — an expression-bodied
         // `void f() => e` runs the expression for its value, not its type).
         // The statement body's `return e` keeps checking upstream, so the
-        // skip lives only on this event.
+        // skip lives only on this event. The innermost executable's own
+        // return decides: a literal (`ret: None`) asks its matched context
+        // (`(x) => 3` inside `void f` is no void body — the context's
+        // return `R` is the `=>` body's `T`, and `T_v`'s `void`-ness is
+        // what the official early return reads); a context-free literal
+        // answers `dynamic`, which the gate treats as non-void — the same
+        // posture the declared path carries.
         let void_return = engine
             .frames
             .iter()
             .rev()
             .find_map(|f| match &f.kind {
                 FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty == Ty::Void),
+                FrameKind::Executable { ret: None, .. } => {
+                    let ctx_ret = engine.closure_context_return();
+                    Some(ctx_ret == Some(Ty::Void))
+                }
                 _ => None,
             })
             .unwrap_or(false);

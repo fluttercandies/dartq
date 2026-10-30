@@ -21,6 +21,13 @@ const IMPORT_WARNING_GATE: &[&str] = &[
     "deprecated_export_use",
 ];
 
+/// The super-initialization token walk's backward cap (tokens scanned from
+/// a `super` occurrence to its containing construct opener and its class
+/// header): a constructor header plus its initializer entries never
+/// approach this, so exhaustion means recovery residue — the occurrence is
+/// skipped (the under-report direction), never spun over.
+const SUPER_WALK_BACKWARD_CAP: usize = 8192;
+
 impl<'a> Engine<'a> {
     /// The with-clause entry face (`class_used_as_mixin`, messages.yaml
     /// :2737-2741): every entry span whose name resolves to a plain class —
@@ -906,6 +913,10 @@ impl<'a> Engine<'a> {
     /// unmodelable corner suppresses (the under-report direction).
     pub(crate) fn finalize_usage(&mut self) {
         self.credit_derived_extension_uses();
+        // The super-initialization pass: the invocation givens land in the
+        // given sets the parameter face reads, and the resolved-target map
+        // feeds the constructor corresponding-parameter face.
+        let super_ctor_targets = self.walk_super_invocation_givens();
         // The element-attributed use pool: `used_names` minus the member
         // spellings that only an unresolved access contributed (the
         // `Receiver::Unknown`/`Prefix` rows — an `InvalidType` or `dynamic`
@@ -1208,7 +1219,7 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            self.report_optional_parameters(site_index, &site);
+            self.report_optional_parameters(site_index, &site, &super_ctor_targets);
         }
         // The recursive-constant-constructor face: a const constructor
         // whose own formal default values const-instantiate the SAME
@@ -2012,6 +2023,465 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The super-initialization pass (`visitSuperConstructorInvocation` +
+    /// `_addParametersForArguments`, upstream Dart SDK source,
+    /// unused_local_elements_verifier.dart:353-355 and 394-398): every
+    /// constructor-initializer `super(...)`/`super.sel(...)` invocation
+    /// credits the resolved super constructor's formal parameters as given
+    /// at the call — a named argument (`super(e: 1)`) spares the target's
+    /// named formal, a positional count the prefix of its positional
+    /// formals. The credits land in the given sets the
+    /// `unused_element_parameter` face already reads
+    /// ([`Engine::named_given`]/[`Engine::positional_given`]), keyed by the
+    /// target's spelling exactly as [`Engine::credit_super_formal_givens`]
+    /// keys them (the written selector, else the superclass name).
+    ///
+    /// The pass runs at finalization reading the token table (the parse-side
+    /// walk lives in the held invocation lane). Containment is decided by
+    /// the balanced-brace backward walk: the innermost `{` still holding the
+    /// `super` token opens the class body exactly when the occurrence sits
+    /// in an initializer list — a method body's `{` opens closer and fails
+    /// the class-header parse, so `super.m(...)` sends never credit here
+    /// (the under-report direction). Bounded: the backward walk caps its
+    /// distance, the argument walk stops at the matching `)`.
+    ///
+    /// Returns the resolved super-initialization target per constructor —
+    /// `(container, constructor selector) → super target selector` (the
+    /// unnamed face keyed by the container spelling, `None` = the unnamed
+    /// super constructor) — the map the constructor corresponding-parameter
+    /// face reads for `enclosingElement.superConstructor`.
+    fn walk_super_invocation_givens(
+        &mut self,
+    ) -> FxHashMap<(StringId, StringId), Option<StringId>> {
+        let mut targets: FxHashMap<(StringId, StringId), Option<StringId>> = FxHashMap::default();
+        let tokens = self.tokens.as_slice();
+        // The interpolation closers: a `${…}` group's `}` closes a
+        // `StringInterpolationExpression` begin and carries no matching `{`
+        // in the stream — every brace walk below excludes them so the
+        // balance invariant holds (files without interpolations never build
+        // the table).
+        let table = self.tokens;
+        let mut interp_closers: FxHashSet<usize> = FxHashSet::default();
+        if tokens
+            .iter()
+            .any(|t| t.kind == dartq_scanner::TokenKind::StringInterpolationExpression)
+        {
+            for (index, t) in tokens.iter().enumerate() {
+                if t.kind == dartq_scanner::TokenKind::StringInterpolationExpression
+                    && let Some(end) = table.matching_end(index)
+                {
+                    interp_closers.insert(end);
+                }
+            }
+        }
+        for i in 0..tokens.len() {
+            if tokens[i].kind != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Super) {
+                continue;
+            }
+            // The invocation shape: `super (` or `super . ident (` — a
+            // property access (`super.x = v`) or any other follower carries
+            // no argument list.
+            let (selector, open_index) = match tokens.get(i + 1).map(|t| &t.kind) {
+                Some(dartq_scanner::TokenKind::OpenParen) => (None, i + 1),
+                Some(dartq_scanner::TokenKind::Period) => {
+                    let Some(sel) = tokens
+                        .get(i + 2)
+                        .filter(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+                    else {
+                        continue;
+                    };
+                    if !matches!(
+                        tokens.get(i + 3).map(|t| &t.kind),
+                        Some(dartq_scanner::TokenKind::OpenParen)
+                    ) {
+                        continue;
+                    }
+                    let sel = self.intern(self.token_text(sel));
+                    let selector = (sel != self.intern("new")).then_some(sel);
+                    (selector, i + 3)
+                }
+                _ => continue,
+            };
+            // The innermost containing `{`: every `}` before an opener nets
+            // out against its own `{`, so the first `{` met at depth zero is
+            // the opener of the construct holding the invocation.
+            let Some(opener) = (|interp: &FxHashSet<usize>| {
+                let mut depth = 0usize;
+                for j in (0..i).rev() {
+                    if i - j > SUPER_WALK_BACKWARD_CAP {
+                        return None;
+                    }
+                    match tokens[j].kind {
+                        dartq_scanner::TokenKind::CloseCurly if !interp.contains(&j) => depth += 1,
+                        dartq_scanner::TokenKind::OpenCurly => {
+                            if depth == 0 {
+                                return Some(j);
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            })(&interp_closers) else {
+                continue;
+            };
+            // The class-header parse decides the initializer context: a
+            // method body or closure opens closer, and its backward header
+            // walk hits the enclosing `{` (or a `;`) before any
+            // `class`/`enum` keyword.
+            let Some(container) = self.class_header_name(tokens, opener) else {
+                continue;
+            };
+            self.credit_super_invocation_arguments(
+                tokens,
+                &interp_closers,
+                open_index,
+                container,
+                selector,
+            );
+            // The constructor header between the member anchor and its
+            // initializer colon names the owner the target map keys on (`C`,
+            // `C.sel`, `C(params)`); a field or method header contributes no
+            // entry and the corresponding face keeps its unnamed default.
+            if let Some(ctor_sel) = self.ctor_header_selector(tokens, &interp_closers, opener, i) {
+                let key = ctor_sel.unwrap_or(container);
+                targets.insert((container, key), selector);
+            }
+        }
+        targets
+    }
+
+    /// One invocation's givenness credit: the argument group's top-level
+    /// shape against the resolved super constructor's formals (the credit
+    /// key mirrors [`Engine::credit_super_formal_givens`] — the written
+    /// selector, else the superclass spelling). A group whose target
+    /// declares no formals (`undefined_constructor_in_initializer`
+    /// territory) credits nothing, matching the oracle's unresolved
+    /// `correspondingParameter`.
+    fn credit_super_invocation_arguments(
+        &mut self,
+        tokens: &[dartq_scanner::Token],
+        interp_closers: &FxHashSet<usize>,
+        open_index: usize,
+        container: StringId,
+        selector: Option<StringId>,
+    ) {
+        let Some(decl) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+            .and_then(|c| c.superclass)
+        else {
+            return;
+        };
+        let key = selector.unwrap_or(decl);
+        // The target must declare formals — an invocation of a constructor
+        // the superclass lacks resolves no corresponding parameter upstream
+        // (`undefined_constructor_in_initializer` owns that face).
+        if !resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            decl,
+        )
+        .is_some_and(|(super_container, _)| super_container.ctor_formals.get(&key).is_some())
+        {
+            return;
+        }
+        // The argument walk: top-level commas split the arguments; an
+        // identifier at an argument start immediately followed by `:` labels
+        // a named argument (a ternary's colon never follows an argument-start
+        // identifier, and nested groups sit below depth zero).
+        let mut depth = 0u32;
+        let mut commas = 0usize;
+        let mut saw_argument = false;
+        let mut trailing_comma = false;
+        let mut at_argument_start = true;
+        let mut named: Vec<StringId> = Vec::new();
+        let mut k = open_index + 1;
+        while let Some(t) = tokens.get(k) {
+            match t.kind {
+                dartq_scanner::TokenKind::CloseParen if depth == 0 => break,
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => {
+                    depth += 1;
+                    at_argument_start = false;
+                }
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                    depth = depth.saturating_sub(1);
+                    at_argument_start = false;
+                }
+                // An interpolation's `}` carries no `{` in the stream — it
+                // moves neither the depth nor the argument shape.
+                dartq_scanner::TokenKind::CloseCurly if !interp_closers.contains(&k) => {
+                    depth = depth.saturating_sub(1);
+                    at_argument_start = false;
+                }
+                dartq_scanner::TokenKind::Comma if depth == 0 => {
+                    commas += 1;
+                    at_argument_start = true;
+                    trailing_comma = true;
+                }
+                dartq_scanner::TokenKind::Identifier
+                    if depth == 0
+                        && at_argument_start
+                        && tokens
+                            .get(k + 1)
+                            .is_some_and(|n| n.kind == dartq_scanner::TokenKind::Colon) =>
+                {
+                    named.push(self.intern(self.token_text(t)));
+                    at_argument_start = false;
+                    k += 1;
+                }
+                _ => {
+                    at_argument_start = false;
+                    trailing_comma = false;
+                }
+            }
+            if !matches!(t.kind, dartq_scanner::TokenKind::Comma) {
+                saw_argument = true;
+            }
+            k += 1;
+        }
+        let args = if trailing_comma {
+            commas
+        } else {
+            commas + usize::from(saw_argument)
+        };
+        let positional = args.saturating_sub(named.len());
+        if let Ok(count) = u16::try_from(positional)
+            && count > 0
+        {
+            let given = self.positional_given.entry(key).or_default();
+            *given = (*given).max(count);
+        }
+        for name in named {
+            self.named_given.insert((key, name));
+        }
+    }
+
+    /// The container name a class-family header writes before its body
+    /// opener — the identifier directly behind a `class` keyword, scanned
+    /// backward across the extends/with/implements clauses and the primary
+    /// constructor's formals. `None` for every other construct (a method
+    /// body, a closure, a local class): the header walk stops at the
+    /// enclosing `{` or a `;` first.
+    fn class_header_name(
+        &self,
+        tokens: &[dartq_scanner::Token],
+        opener: usize,
+    ) -> Option<StringId> {
+        let start = opener.saturating_sub(SUPER_WALK_BACKWARD_CAP);
+        for j in (start..opener).rev() {
+            match tokens[j].kind {
+                dartq_scanner::TokenKind::OpenCurly
+                | dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::Semicolon => return None,
+                dartq_scanner::TokenKind::Identifier
+                    if j > 0
+                        && matches!(
+                            tokens[j - 1].kind,
+                            dartq_scanner::TokenKind::Keyword(
+                                dartq_scanner::Keyword::Class
+                                    | dartq_scanner::Keyword::Enum
+                                    | dartq_scanner::Keyword::Mixin
+                            )
+                        ) =>
+                {
+                    return Some(self.intern(self.token_text(&tokens[j])));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The constructor selector the initializer list at `opener` belongs to:
+    /// the member header between the last `;`-anchored member start (or the
+    /// class body opener) and its initializer colon, read as `C` /
+    /// `C.sel` / `C(params)` — `None` for the unnamed face. A header that
+    /// parses as a field or method (`int x = …`, `void f() …`) answers
+    /// `None` and the caller skips the map entry; the anchor scan keeps to
+    /// brace-depth zero so a closure's interior `;` never steals it.
+    fn ctor_header_selector(
+        &self,
+        tokens: &[dartq_scanner::Token],
+        interp_closers: &FxHashSet<usize>,
+        opener: usize,
+        super_at: usize,
+    ) -> Option<Option<StringId>> {
+        let mut anchor = opener;
+        let mut depth = 0i32;
+        for j in opener + 1..super_at {
+            match tokens[j].kind {
+                dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                dartq_scanner::TokenKind::CloseCurly if !interp_closers.contains(&j) => depth -= 1,
+                dartq_scanner::TokenKind::Semicolon if depth == 0 => anchor = j,
+                _ => {}
+            }
+        }
+        // The header run ends at its initializer colon (or a later member's
+        // boundary).
+        let mut end = anchor + 1;
+        depth = 0;
+        while end < super_at {
+            match tokens[end].kind {
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                    depth -= 1
+                }
+                dartq_scanner::TokenKind::CloseCurly if !interp_closers.contains(&end) => {
+                    depth -= 1
+                }
+                dartq_scanner::TokenKind::Colon | dartq_scanner::TokenKind::Semicolon
+                    if depth == 0 =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        let run = tokens.get(anchor + 1..end.min(super_at))?;
+        let new = self.intern("new");
+        match run {
+            // `C(...)` — the unnamed face (a primary constructor's formals
+            // ride the same shape).
+            [first, second, ..]
+                if first.kind == dartq_scanner::TokenKind::Identifier
+                    && second.kind == dartq_scanner::TokenKind::OpenParen =>
+            {
+                Some(None)
+            }
+            // `C.sel(...)` / `C.new(...)` — the written selector (the `new`
+            // fold answers the unnamed face).
+            [first, dot, sel, paren, ..]
+                if first.kind == dartq_scanner::TokenKind::Identifier
+                    && dot.kind == dartq_scanner::TokenKind::Period
+                    && sel.kind == dartq_scanner::TokenKind::Identifier
+                    && paren.kind == dartq_scanner::TokenKind::OpenParen =>
+            {
+                let sel = self.intern(self.token_text(sel));
+                Some((sel != new).then_some(sel))
+            }
+            _ => None,
+        }
+    }
+
+    /// The written text of one scanner token (byte span straight off the
+    /// token — the identifier charset is ASCII, the same shape
+    /// [`Engine::ident_span_before_dot`] reads).
+    fn token_text(&self, token: &dartq_scanner::Token) -> &str {
+        let start = token.byte_offset as usize;
+        let end = start + token.byte_len as usize;
+        self.source.get(start..end).unwrap_or("")
+    }
+
+    /// The overridden instance members behind one member declaration
+    /// (`_overriddenElements`, inheritance_manager3.dart `getOverridden`):
+    /// the nearest same-named non-static member of each direct super face —
+    /// the `extends` face, each `with` mixin, each `implements` interface, a
+    /// mixin's `on` constraints — deduplicated by the entry identity the
+    /// boundary's projection keeps stable (one member surfaced through
+    /// several faces is one overridden executable).
+    fn overridden_executables(
+        &self,
+        container: StringId,
+        name: StringId,
+    ) -> Vec<(Projected<'a, MemberEntry>, StringId, FileId)> {
+        let Some(decl) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+        else {
+            return Vec::new();
+        };
+        let mut faces: Vec<StringId> = Vec::new();
+        faces.extend(decl.superclass);
+        faces.extend(decl.with_clause.iter().copied());
+        faces.extend(decl.implements_clause.iter().copied());
+        faces.extend(decl.on_clause.iter().copied());
+        let mut out: Vec<(Projected<'a, MemberEntry>, StringId, FileId)> = Vec::new();
+        let mut seen: Vec<*const MemberEntry> = Vec::new();
+        for face in faces {
+            if let Some((entry, face_name, owner)) = self.face_member(container, face, name)
+                && seen.iter().all(|ptr| !std::ptr::eq(*ptr, entry.ptr()))
+            {
+                seen.push(entry.ptr());
+                out.push((entry, face_name, owner));
+            }
+        }
+        out
+    }
+
+    /// The per-parameter override gate (`_overridesUsedParameter`,
+    /// unused_local_elements_verifier.dart:1027-1049): the formal spares
+    /// only when an overridden member's CORRESPONDING parameter — the same
+    /// name for a named formal, the same positional index otherwise — is
+    /// required there, or is itself used: an invocation supplied it (the
+    /// spelling-keyed given index; overrides share the member name), or the
+    /// overridden executable's own body references it (its declaration
+    /// site's parameter-use set, the `_useIdentifierElement` credit — same
+    /// library only, exactly where a private member's overrides live). A
+    /// formal the overridden member lacks (added in the override) spares on
+    /// nothing.
+    fn override_parameter_spared(
+        &self,
+        overridden: &[(Projected<'a, MemberEntry>, StringId, FileId)],
+        bare: StringId,
+        positional: Option<usize>,
+        formal: StringId,
+    ) -> bool {
+        for (entry, container, owner) in overridden {
+            let Some(of) = entry.formals.as_deref() else {
+                continue;
+            };
+            let Some(corresponding) = (match positional {
+                Some(index) => of.positional.get(index),
+                None => of.named.iter().find(|f| f.name == formal),
+            }) else {
+                continue;
+            };
+            if corresponding.required {
+                return true;
+            }
+            let given_used = match positional {
+                Some(index) => self
+                    .positional_given
+                    .get(&bare)
+                    .is_some_and(|&n| usize::from(n) > index),
+                None => self.named_given.contains(&(bare, corresponding.name)),
+            };
+            if given_used {
+                return true;
+            }
+            if owner == &self.file
+                && self.decl_sites.iter().enumerate().any(|(index, site)| {
+                    matches!(
+                        &site.kind,
+                        DeclKind::Member {
+                            container: c,
+                            ..
+                        } if c == container
+                    ) && site.name == bare
+                        && self
+                            .site_param_uses
+                            .get(&index)
+                            .is_some_and(|uses| uses.contains(&corresponding.name))
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The `unused_element_parameter` pass over one executable's
     /// declaration site (`visitFormalParameterList` +
     /// `_isUsedElement`'s parameter arm,
@@ -2019,11 +2489,18 @@ impl<'a> Engine<'a> {
     /// of constructors, methods, and top-level functions that no body use
     /// resolves to and no invocation supplies. The official exemptions in
     /// order: a required parameter, a constructor of a generic class, a
-    /// generic executable, a publicly accessible executable, an executable
-    /// overriding a super-name, and the super-parameter face (unmodelable —
-    /// suppressed).
+    /// generic executable, a publicly accessible executable, the
+    /// super-parameter corresponding faces (a constructor's resolved super
+    /// constructor carrying a required corresponding parameter), and the
+    /// per-parameter override gate (a method whose overridden member's
+    /// corresponding parameter is required or used).
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
-    pub(crate) fn report_optional_parameters(&mut self, site_index: usize, site: &DeclSite) {
+    pub(crate) fn report_optional_parameters(
+        &mut self,
+        site_index: usize,
+        site: &DeclSite,
+        super_ctor_targets: &FxHashMap<(StringId, StringId), Option<StringId>>,
+    ) {
         let (member_kind, container) = match &site.kind {
             DeclKind::Member {
                 kind, container, ..
@@ -2073,15 +2550,59 @@ impl<'a> Engine<'a> {
         if member_generic || (class_generic && matches!(site.kind, DeclKind::Constructor { .. })) {
             return;
         }
-        // The accessibility and override gates.
+        // The accessibility and override gates. Constructors keep the
+        // blanket super-name pardon (the walk cannot see per-parameter
+        // correspondence — the under-report direction) plus the
+        // super-initialization corresponding face below; methods run the
+        // official per-parameter override gate in the loops.
         if self.is_publicly_accessible(site.name, site.kind) {
             return;
         }
-        if let Some(c) = container
+        let overridden = match site.kind {
+            DeclKind::Member { container, .. } => self.overridden_executables(container, site.name),
+            _ => Vec::new(),
+        };
+        if overridden.is_empty()
+            && matches!(site.kind, DeclKind::Constructor { .. })
+            && let Some(c) = container
             && matches!(self.walk_super(c, site.name), Walk::Found(_))
         {
             return;
         }
+        // The super-initialization corresponding face (`_isUsedElement`'s
+        // ConstructorElement block, unused_local_elements_verifier.dart
+        // :932-946): the resolved super constructor — the written
+        // `super(...)`/`super.sel(...)` target, else the unnamed face —
+        // spares the formal whose corresponding parameter is required
+        // there. A formal the super constructor lacks spares on nothing.
+        let super_formals: Option<Formals> = match site.kind {
+            DeclKind::Constructor { .. } => container.and_then(|c| {
+                let superclass = self
+                    .index
+                    .get(self.file)
+                    .and_then(|f| f.container(c))
+                    .and_then(|d| d.superclass)?;
+                let target = super_ctor_targets
+                    .get(&(c, site.name))
+                    .or_else(|| super_ctor_targets.get(&(c, c)))
+                    .copied()
+                    .flatten();
+                let key = target
+                    .filter(|s| *s != self.intern("new"))
+                    .unwrap_or(superclass);
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    superclass,
+                )
+                .and_then(|(super_container, _)| super_container.ctor_formals.get(&key))
+                .map(|f| (**f).clone())
+            }),
+            _ => None,
+        };
         // A redirecting factory's target receives every parameter the
         // factory forwards — its optional formals are all supplied.
         if let (DeclKind::Constructor { container }, Some(_)) = (site.kind, container) {
@@ -2118,6 +2639,17 @@ impl<'a> Engine<'a> {
             if referenced || given_positional > index as u16 {
                 continue;
             }
+            // The super-initialization corresponding face (constructors) and
+            // the per-parameter override gate (methods).
+            let spared_by_super = super_formals
+                .as_ref()
+                .and_then(|f| f.positional.get(index))
+                .is_some_and(|f| f.required);
+            if spared_by_super
+                || self.override_parameter_spared(&overridden, bare, Some(index), formal.name)
+            {
+                continue;
+            }
             let text = self.strings.resolve(formal.name).to_string();
             let range = name_span(self, formal.name);
             self.stage_usage(SemanticCode::UnusedElementParameter, range, &text);
@@ -2128,6 +2660,16 @@ impl<'a> Engine<'a> {
             }
             let referenced = body_uses.as_ref().is_some_and(|u| u.contains(&formal.name));
             if referenced || self.named_given.contains(&(bare, formal.name)) {
+                continue;
+            }
+            let spared_by_super = super_formals.as_ref().is_some_and(|f| {
+                f.named_formal(formal.name)
+                    .or_else(|| f.named_formal(self.formal_public_name(formal.name)))
+                    .is_some_and(|f| f.required)
+            });
+            if spared_by_super
+                || self.override_parameter_spared(&overridden, bare, None, formal.name)
+            {
                 continue;
             }
             let text = self.strings.resolve(formal.name).to_string();
@@ -4431,5 +4973,205 @@ mod pins {
             }],
         );
         assert_eq!(r.diagnostics, vec![], "{source:?}");
+    }
+
+    /// #2898-a: a super-initialization's NAMED argument gives the resolved
+    /// super constructor's formal — `super(e: 1)` supplies `_A({this.e})`'s
+    /// `e` (`_addParametersForArguments` at `visitSuperConstructorInvocation`
+    /// marks `argument.correspondingParameter` used), so the field formal
+    /// never reports. The corpus shape
+    /// (`test_classPrivate_secondaryConstructor_unnamed_fieldFormal_
+    /// optionalNamed_superInvocation_isUsed`) used to report `_A.e` — the
+    /// parse-side argument walk lives in the held invocation lane, so the
+    /// credit runs from this pass over the token table.
+    #[test]
+    fn super_invocation_named_argument_spares_the_target_formal() {
+        let source = "class _A {\n\
+                      \x20 final int? e;\n\
+                      \x20 _A({this.e});\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 _B([int? e]) : super(e: 1);\n\
+                      }\n\
+                      \n\
+                      var b = _B(1);\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-b: the positional counterpart — `super(e)` supplies
+    /// `_A([this.e])`'s first positional formal, and the supplied-argument
+    /// count the credit records spares it (`isUsed` corpus twin of the
+    /// positional shape).
+    #[test]
+    fn super_invocation_positional_argument_spares_the_target_formal() {
+        let source = "class _A {\n\
+                      \x20 final int? e;\n\
+                      \x20 _A([this.e]);\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 _B(int e) : super(e);\n\
+                      }\n\
+                      \n\
+                      var b = _B(1);\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-c: a named super-initialization keys the credit on the written
+    /// selector — `super._a(e: 1)` supplies `_A._a`'s formal, not the
+    /// unnamed face's (the same spelling key `credit_super_formal_givens`
+    /// writes); a credit keyed on the superclass alone would spare nothing
+    /// here and `_A._a`'s `e` would report.
+    #[test]
+    fn super_invocation_selector_keys_the_credit() {
+        let source = "class _A {\n\
+                      \x20 final int? e;\n\
+                      \x20 _A._a({this.e});\n\
+                      \x20 _A();\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 _B() : super._a(e: 1);\n\
+                      }\n\
+                      var b = _B();\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-d: the per-parameter override gate (`_overridesUsedParameter`)
+    /// — an override chain whose corresponding parameter is used nowhere
+    /// reports BOTH sides. The blanket super-name pardon used to spare
+    /// `_B._m` wholesale (the miss side of the face); the gate spares only
+    /// when the overridden member's corresponding parameter is required or
+    /// used.
+    #[test]
+    fn override_chain_with_unused_param_reports_both_sides() {
+        let source = "class _A {\n\
+                      \x20 void _m({int? x}) {}\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 void _m({int? x}) {}\n\
+                      }\n";
+        let a_x = source.find("int? x").unwrap() as u32 + 5;
+        let b_x = source.rfind("int? x").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(a_x, 1), (b_x, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-e: the constructor's super-initialization corresponding face
+    /// (`_isUsedElement`'s ConstructorElement block): `_B`'s optional
+    /// `super.b` corresponds to `A.b` — a REQUIRED named parameter — so it
+    /// spares (`overrideRequired_noDiagnostic` corpus shape; the implicit
+    /// `super()` resolves the unnamed super constructor). Without the face
+    /// the formal reported.
+    #[test]
+    fn super_formal_corresponding_required_spares() {
+        let source = "class A {\n\
+                      \x20 A({required this.a, required this.b});\n\
+                      \x20 final String a;\n\
+                      \x20 final String b;\n\
+                      }\n\
+                      \n\
+                      class _B extends A {\n\
+                      \x20 _B({required super.a, super.b = 'b'});\n\
+                      }\n\
+                      \n\
+                      var foo = _B(a: 'a');\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-f: the override gate's used arm — the overridden executable's
+    /// own body references the formal (`_useIdentifierElement` credits the
+    /// parameter element), so the override's corresponding formal spares.
+    /// Must not report (the negative against over-tightening).
+    #[test]
+    fn override_used_corresponding_spares() {
+        let source = "class _A {\n\
+                      \x20 void _m({int? x}) {\n\
+                      \x20   if (x != null) {}\n\
+                      \x20 }\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 void _m({int? x}) {}\n\
+                      }\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-g: the partial-chain negative — the override gate walks every
+    /// direct super face, and the required arm holds across them:
+    /// `_B._m`'s `x` corresponds to a required parameter on the superclass
+    /// face and to an optional-unused one on the interface face, so it
+    /// spares (reporting on the interface answer alone would create the
+    /// extra the tightening forbids). `_I._m`'s own `x` reports exactly as
+    /// upstream — a private method of a private interface is not publicly
+    /// accessible and overrides nothing.
+    #[test]
+    fn override_multi_face_required_holds() {
+        let source = "class _A {\n\
+                      \x20 void _m({required int x}) {}\n\
+                      }\n\
+                      \n\
+                      abstract class _I {\n\
+                      \x20 void _m({int? x});\n\
+                      }\n\
+                      \n\
+                      class _B extends _A implements _I {\n\
+                      \x20 void _m({int? x}) {}\n\
+                      }\n";
+        let i_x = source.find("int? x").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(i_x, 1)],
+            "{source:?}"
+        );
+    }
+
+    /// #2898-h: the override gate's given arm — an invocation supplying the
+    /// corresponding parameter (`a._m(1)` maps its argument to `_A._m`'s
+    /// first positional formal) spares the override's corresponding formal
+    /// through the spelling-keyed given index.
+    #[test]
+    fn override_invocation_given_spares_the_override() {
+        let source = "class _A {\n\
+                      \x20 void _m([int? x]) {}\n\
+                      }\n\
+                      \n\
+                      class _B extends _A {\n\
+                      \x20 void _m([int? x]) {}\n\
+                      }\n\
+                      \n\
+                      void t(_A a) {\n\
+                      \x20 a._m(1);\n\
+                      }\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
     }
 }

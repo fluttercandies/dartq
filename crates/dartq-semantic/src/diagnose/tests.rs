@@ -13942,6 +13942,57 @@ fn wildcard_catch_clause_follows_the_gate() {
     let flagged = report("class int {} void main() { try {} on int catch (__) {} }");
     assert_eq!(code_names(&flagged), ["unused_catch_clause"]);
 }
+
+/// The typed-catch recovery (`catch (int e)`): the official rewriter's
+/// synthetic comma stays in the stream for the formals re-parse, so the
+/// official faces read `int` = exception, `e` = stack trace
+/// (`handleCatchBlock`'s `catchParameters[0]/[1].name` — oracle-probed:
+/// one `unused_catch_stack` row at the `e` token, the exception auto-used
+/// by the plain catch). The trace face lands on the scan's second name
+/// ([`Engine::reconcile_catch_slots`]'s typed-catch handoff).
+#[test]
+fn typed_catch_recovery_reports_the_trace_variable() {
+    let source = "class int {} void main() { try {} catch (int e) {} }";
+    let r = report(source);
+    let unused: Vec<_> = anchors(source, &r)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, vec![("unused_catch_stack", "e")]);
+}
+
+/// A body use of the recovered trace name spares it — the count rides the
+/// twin parameter row, the same double-pass spare the comma shapes read.
+#[test]
+fn typed_catch_recovery_trace_use_spares() {
+    let source =
+        "class int {} void main() { try {} catch (int e) { print2(e); } } void print2(int x) {}";
+    let r = report(source);
+    assert!(
+        !anchors(source, &r)
+            .iter()
+            .any(|(code, _)| code.starts_with("unused")),
+        "{:?}",
+        code_names(&r)
+    );
+}
+
+/// A first slot the re-parse consumed as a MODIFIER (`catch (var e)` —
+/// `var` arms no written type; the official formals list collapses to
+/// `[e]`) stays silent: both scan rows keep the exception face and the
+/// plain catch auto-uses it (oracle-probed: no unused row on `e`).
+#[test]
+fn modifier_catch_recovery_stays_silent() {
+    let source = "void main() { try {} catch (var e) {} }";
+    let r = report(source);
+    assert!(
+        !anchors(source, &r)
+            .iter()
+            .any(|(code, _)| code.starts_with("unused")),
+        "{:?}",
+        code_names(&r)
+    );
+}
 // —— #890: the W3 semantic dead-code queue ———————————————————————————
 
 /// A total-match member (`case _`) drives the official flow `unmatched`
@@ -15501,6 +15552,52 @@ fn plain_catch_exception_postures_unchanged() {
         .filter(|(code, _)| code.starts_with("unused"))
         .collect();
     assert_eq!(unused, Vec::<(&str, &str)>::new());
+}
+
+/// The nameless recovery family (oracle `unused_catch_stack` rows with
+/// len-0 anchors — pinned corpus row
+/// `StatementParserTest.test_parseTryStatement_catch_error_missingCatchTrace`,
+/// `catch (e,)` at `2:6|0`): the missing trace identifier rides the
+/// parser's synthetic empty spelling, and the row's `{0}` renders
+/// `<unnamed>` (`ElementImpl.displayName`'s `name ?? '<unnamed>'`),
+/// never the bare empty string.
+#[test]
+fn unused_catch_stack_nameless_renders_unnamed() {
+    let source = "void f() { try {} catch (e,) {} }";
+    let report = report(source);
+    let unused: Vec<_> = anchors(source, &report)
+        .into_iter()
+        .filter(|(code, _)| code.starts_with("unused"))
+        .collect();
+    assert_eq!(unused, vec![("unused_catch_stack", "")]);
+    let row = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "unused_catch_stack")
+        .unwrap();
+    assert_eq!(
+        row.message,
+        "The stack trace variable '<unnamed>' isn't used and can be removed."
+    );
+}
+
+/// The empty-spelling gate is keyed on the row being nameless: a named
+/// stack trace keeps its own spelling in the message (the mapping never
+/// leaks onto real names).
+#[test]
+fn unused_catch_stack_named_row_keeps_its_spelling() {
+    let source = "void f() { try {} catch (e, stack) {} }";
+    let report = report(source);
+    let rows: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "unused_catch_stack")
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
+    assert_eq!(
+        rows[0].message,
+        "The stack trace variable 'stack' isn't used and can be removed."
+    );
 }
 
 /// `_visitConstructorElement` visits named constructors only

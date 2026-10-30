@@ -14236,18 +14236,18 @@ diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_
 diagnostics/type_annotation_deferred_class/doc_0	ERROR|type_annotation_deferred_class|lib/test.dart|3:8|7|The deferred type 'io.File' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/fix_0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_classTypeAlias#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|6:13|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_const#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_const#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|7:22|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_const_matching#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_enum_inferred#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_enum_inferred#0	ERROR|argument_type_not_assignable|lib/test.dart|3:5|2|The argument type 'String' can't be assigned to the parameter type 'int'. 	ERROR|const_constructor_param_type_mismatch|lib/test.dart|3:5|2|A value of type 'String' can't be assigned to a parameter of type 'int' in a const constructor.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_enum_superBounded#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_enum_withTypeArguments#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:5|6|'String' doesn't conform to the bound 'int' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extends#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:19|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extends_regressionInIssue18468Fix#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:22|1|'U' doesn't conform to the bound 'Type' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionOverride_hasTypeArguments#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|7:5|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionOverride_hasTypeArguments_call#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionType_superBounded#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionType_withTypeArguments#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_fieldFormalParameter#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionOverride_hasTypeArguments_call#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|7:5|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionType_superBounded#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:8|1|'A<dynamic>' doesn't conform to the bound 'A<A<dynamic>>' of the type parameter 'T'.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_extensionType_withTypeArguments#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:10|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_fieldFormalParameter#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|7:7|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_functionExpressionInvocation#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:26|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_functionExpressionInvocation_implicitCall#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|7:5|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_functionReference#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:7|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
@@ -14268,22 +14268,22 @@ diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_methodInvocation_localFunction#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|10:11|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_methodInvocation_method#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|13:23|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_methodInvocation_topLevelFunction#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|11:11|6|'String' doesn't conform to the bound 'num' of the type parameter 'T'.
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_methodReturnType#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_new#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_methodReturnType#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|6:5|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_new#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:20|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_new_matching#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_new_superTypeOfUpperBound#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|6:20|1|'A' doesn't conform to the bound 'B' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_body_typeArgument_mismatch#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:15|1|'B' doesn't conform to the bound 'A' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_body_typeArgument_regularBounded#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_body_typeArgument_superBounded#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_body_mismatch#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_body_mismatch#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:15|1|'B' doesn't conform to the bound 'A' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_body_regularBounded#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_body_superBounded#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_body_superBounded#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:16|1|'A<dynamic>' doesn't conform to the bound 'A<A<dynamic>>' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_parameter#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:10|6|'String' doesn't conform to the bound 'A' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_interfaceType_parameter_regularBounded#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_parameter#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_notRegularBounded_notSuperBounded_parameter_invariant#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_not_matching_bounds#0	-
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_nonFunctionTypeAlias_parameter#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|7:15|1|'A' doesn't conform to the bound 'B' of the type parameter 'T'.	WARNING|unused_local_variable|lib/test.dart|7:5|1|The value of the local variable 'd' isn't used.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_notRegularBounded_notSuperBounded_parameter_invariant#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:5|1|'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'X'.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_not_matching_bounds#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:19|3|'Foo<dynamic>' doesn't conform to the bound 'Foo<Foo<dynamic>>' of the type parameter 'T'.
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:3|1|'B' doesn't conform to the bound 'A' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias_hasBound2_matching#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias_hasBound_matching#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_ofFunctionTypeAlias_noBound_matching#0	-
@@ -14294,13 +14294,13 @@ diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_regression_42196_void#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_superBounded#0	-
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeArgumentList#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|6:5|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeLiteral_class#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeLiteral_class#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:11|6|'String' doesn't conform to the bound 'int' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeLiteral_functionTypeAlias#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:12|6|'String' doesn't conform to the bound 'int' of the type parameter 'T'.
-diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeLiteral_typeAlias#0	-
+diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeLiteral_typeAlias#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|4:11|6|'String' doesn't conform to the bound 'int' of the type parameter 'T'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_typeParameter#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|6:21|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_variableDeclaration#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:3|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_with#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:31|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
-diagnostics/type_argument_not_matching_bounds/doc_0	-
+diagnostics/type_argument_not_matching_bounds/doc_0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:11|6|'String' doesn't conform to the bound 'num' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/fix_0	-
 diagnostics/type_check_is_not_null/TypeCheckIsNotNullTest/test_not_Null#0	-
 diagnostics/type_check_is_null/TypeCheckIsNullTest/test_is_Null#0	-

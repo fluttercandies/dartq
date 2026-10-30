@@ -291,6 +291,8 @@ struct PendingTop {
     type_param_names: Vec<StringId>,
     return_ty: Ty,
     formals: Option<Box<Formals>>,
+    is_external: bool,
+    has_body: bool,
 }
 
 /// One conservatively parsed type spelling of a typed collection
@@ -3592,6 +3594,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if let Some(pending) = self.builder.pending_member.as_mut() {
             pending.has_body = true;
         }
+        if let Some(pending) = self.builder.pending_top.as_mut() {
+            pending.has_body = true;
+        }
         if let Some(pending) = self.builder.pending_aug.as_mut() {
             pending.has_body = true;
         }
@@ -3602,6 +3607,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
         if let Some(pending) = self.builder.pending_member.as_mut() {
+            pending.has_body = true;
+        }
+        if let Some(pending) = self.builder.pending_top.as_mut() {
             pending.has_body = true;
         }
         if let Some(pending) = self.builder.pending_aug.as_mut() {
@@ -3759,7 +3767,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         &mut self,
         _last_consumed: Token,
         augment: Option<Token>,
-        _external: Option<Token>,
+        external: Option<Token>,
     ) {
         let builder = &mut self.builder;
         builder.drop_pending_annotations();
@@ -3769,6 +3777,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
+            is_external: external.is_some(),
+            has_body: false,
         });
         builder.declaring_augment = augment.is_some();
         if let Some(kw) = augment {
@@ -3793,7 +3803,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 const_kw: None,
                 factory_kw: None,
                 has_body: false,
-                is_external: _external.is_some(),
+                is_external: external.is_some(),
                 ctor_completion: false,
             });
         }
@@ -3856,10 +3866,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_mixin_application: false,
                     is_const: false,
                     is_factory: false,
-                    // A top-level executable is `external || nonEmptyBody`;
-                    // the bodiless non-external spelling never parses, so
-                    // every reachable intro is complete.
-                    is_complete: true,
+                    // `external || nonEmptyBody` — the executable
+                    // completeness bit (`MethodFragmentImpl.isComplete`).
+                    // Under the augmentations experiment a bodiless
+                    // introductory spelling (`void foo();`) parses and is
+                    // incomplete: the augmentation legitimately supplies the
+                    // body and `declaration_already_complete` must not fire.
+                    is_complete: pending.is_external || pending.has_body,
                 });
             }
             if let Some(mut augment) = builder.pending_aug.take() {

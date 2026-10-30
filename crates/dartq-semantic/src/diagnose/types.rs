@@ -679,6 +679,28 @@ pub(crate) struct ClosureCapture {
     /// The index of the first optional positional formal (`[`), if any.
     pub(crate) optional_from: Option<usize>,
     pub(crate) poisoned: bool,
+    /// The literal's context type `K`, matched and folded at open time
+    /// (`inferLocalFunction`, inference_visitor_base.dart:2229-2263): the
+    /// enclosing site's function type when it supplies one — the
+    /// declaration's written type, the assignment target's declared type,
+    /// the argument slot's formal type, or the enclosing return position's
+    /// function shape. `None` keeps the no-context posture (dynamic /
+    /// bare `Function` / non-function context / wrong type-parameter
+    /// count — the last is re-checked at close, once the literal's own
+    /// group is counted).
+    pub(crate) ctx: Option<Ty>,
+    /// `ctx` latched through the argument channel (the literal IS an
+    /// argument): the per-formal bind keeps the live [`Engine::closure_
+    /// param_context_ty`] schema path — a promotion-latched receiver below
+    /// the callee re-derives at pass 2, and the begin-time latch would
+    /// freeze the unpromoted face (`h.items.map((e) => …)` under `h is!
+    /// Impl`). The latched `ctx` still supplies the body's return context
+    /// and the final Value-row signature.
+    pub(crate) ctx_from_arg: bool,
+    /// The literal's own `<T…>` group size, counted while its type
+    /// variables close (0 for the plain `(x) => …` shape) — the upstream
+    /// match gate pairs it against `ctx`'s type-parameter count.
+    pub(crate) type_params: u16,
 }
 
 /// One open record-type annotation's captured fields: `fields` holds one
@@ -1769,6 +1791,13 @@ pub(crate) struct Engine<'a> {
     /// the return check re-types against the host's declared return
     /// (typed_literal_resolver.dart's context-driven resolution).
     pub(crate) untyped_literals: FxHashMap<u32, UntypedLiteral>,
+    /// Completed function literals' Value-row offsets: the assignability
+    /// teardown's invocation/property span widening reads `call_ends` at
+    /// the RHS offset, and a literal's own `(`-formals sits in that table —
+    /// widening a literal row would anchor the diagnostic inside the
+    /// formal list. The literal's own span is the oracle's
+    /// FunctionExpression anchor, so these offsets refuse the widening.
+    pub(crate) closure_literal_starts: FxHashSet<u32>,
     /// The dart:core collection heads pre-interned: the assignability
     /// matrix's collection-vs-primitive negative and the SDK type-literal
     /// operator face compare ids, never text.

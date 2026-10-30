@@ -27,7 +27,18 @@ impl<'a> Engine<'a> {
     /// precedes its own window, a foreign window's close sits after a
     /// later declaration's name and drops (the latch clears either way —
     /// keep-first, one window adopts once).
+    ///
+    /// A nested group's close never pairs (#2897): a bound's function-type
+    /// variables (`void f<T extends void Function<X extends num>>()`)
+    /// close INSIDE the header's group — adopting there would overwrite
+    /// the executable's parameters with the bound's own variable
+    /// (`X extends num`) and every bounds face would check the wrong
+    /// variable. The gate reads the still-open enclosing group after the
+    /// window latch, before the executable latch is consumed.
     pub(crate) fn pair_exec_window(&mut self, window_end: u32) {
+        if self.bounds.in_type_variables() {
+            return;
+        }
         let Some((name, name_offset)) = self.pending_exec_name else {
             return;
         };
@@ -1080,8 +1091,16 @@ impl<'a> Engine<'a> {
     }
 
     /// `begin_function_expression` (the literal's frame already open):
-    /// starts the literal's signature capture.
-    pub(crate) fn closure_capture_begin(&mut self, offset: u32) {
+    /// starts the literal's signature capture. `ctx` is the matched
+    /// context function type the enclosing site supplied
+    /// ([`Engine::closure_context_ty`]) — `None` on every non-function
+    /// context (the oracle's no-inference arm).
+    pub(crate) fn closure_capture_begin(
+        &mut self,
+        offset: u32,
+        ctx: Option<Ty>,
+        ctx_from_arg: bool,
+    ) {
         self.closure_caps.push(ClosureCapture {
             offset,
             frame_depth: self.frames.len(),
@@ -1090,7 +1109,28 @@ impl<'a> Engine<'a> {
             positional: Vec::new(),
             optional_from: None,
             poisoned: false,
+            ctx,
+            ctx_from_arg,
+            type_params: 0,
         });
+    }
+
+    /// The literal's own `<T…>` variable closed (the group sits between
+    /// `begin_function_expression` and the literal's formal list): the
+    /// upstream match gate pairs this count against the context's
+    /// type-parameter count at close time. A nested type-annotation's
+    /// variable reports against its own capture, not the literal's —
+    /// those live inside the literal's formal list (`list_depth > 0`)
+    /// or inside a deeper frame, and the two guards exclude both.
+    pub(crate) fn closure_type_variable(&mut self) {
+        let frames = self.frames.len();
+        if let Some(capture) = self.closure_caps.last_mut()
+            && capture.frame_depth == frames
+            && capture.list_depth == 0
+            && self.fn_type_capture.is_empty()
+        {
+            capture.type_params = capture.type_params.saturating_add(1);
+        }
     }
 
     /// `begin_formal_parameters` (depth already bumped): the first list
@@ -1136,20 +1176,46 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// A formal of the literal's own list: its written type (still armed)
-    /// joins the capture; an untyped formal poisons — its type is the
-    /// solver's downward answer, which this face does not compute.
+    /// A formal of the literal's own list: its resolved type joins the
+    /// capture — the written type when present, else the context schema's
+    /// downward answer (`greatestClosure(Qi)`, `Object?` for `Qi <: Null`,
+    /// `dynamic` when the context supplies nothing —
+    /// `inferLocalFunction`'s `Ri`). An untyped formal under no context
+    /// poisons, the same under-report posture as before.
     pub(crate) fn closure_formal(&mut self) {
         let depth = self.formal_list_depth;
         let ty = self.armed_ty;
-        if let Some(capture) = self.closure_caps.last_mut()
-            && capture.list_open
-            && capture.list_depth == depth
-        {
-            match ty {
-                Some(ty) if ty != Ty::Unknown => capture.positional.push(ty),
-                _ => capture.poisoned = true,
+        // The formal's ordinal and the context answer resolve before the
+        // mutable borrow of the capture stack.
+        let (index, ctx) = match self.closure_caps.last() {
+            Some(capture)
+                if capture.list_open
+                    && capture.frame_depth == self.frames.len()
+                    && capture.list_depth == depth =>
+            {
+                (capture.positional.len(), capture.ctx)
             }
+            _ => return,
+        };
+        let resolved = match ty {
+            Some(ty) if ty != Ty::Unknown => Some(ty),
+            _ => match ctx {
+                Some(ctx) => Some(
+                    self.closure_ctx_formal_ty(ctx, index)
+                        .unwrap_or(Ty::Dynamic),
+                ),
+                // No context: the type is the solver's downward answer,
+                // which this face does not compute — the same under-report
+                // poison as before.
+                None => None,
+            },
+        };
+        let Some(capture) = self.closure_caps.last_mut() else {
+            return;
+        };
+        match resolved {
+            Some(ty) => capture.positional.push(ty),
+            None => capture.poisoned = true,
         }
     }
 
@@ -1157,10 +1223,15 @@ impl<'a> Engine<'a> {
     /// the capture and hands an exact signature to the enclosing argument
     /// list. An `async`/generator body changes the literal's return type
     /// (`Future<void>`), which this capture does not render — poisoned.
-    pub(crate) fn closure_capture_end(&mut self, end: u32) {
-        let Some(capture) = self.closure_caps.pop() else {
-            return;
-        };
+    /// Returns the literal's span start plus the final inferred type when
+    /// a matched context `K` supplied one (`inferLocalFunction`'s
+    /// `(R0, …, Rn) -> M'`: written-and-inferred formals, the context
+    /// return under the cap `S = T if T <: R else S = R` — the body's
+    /// returns already re-checked against `R`, so `S = R` is the face the
+    /// cap produces on this name-level walk, keeping the failure the
+    /// closure-return row's and never the enclosing assignability row's).
+    pub(crate) fn closure_capture_end(&mut self, end: u32) -> Option<(u32, Ty)> {
+        let capture = self.closure_caps.pop()?;
         // The closure-return tally closes with the literal: a counted
         // return set with no valid entry marks the closure all-invalid —
         // its `T Function(...)` consumers infer an `InvalidType` result.
@@ -1183,20 +1254,42 @@ impl<'a> Engine<'a> {
                     }
             )
         });
+        // The upstream match gate closes at the literal's own group count
+        // (`typeContext.typeParameters.length == functionTypeParameters
+        // .length`): a counted literal under a mismatched-count context
+        // acquires nothing — the context face stays the under-report
+        // posture every channel carried before.
+        let ctx = capture
+            .ctx
+            .filter(|ctx| self.closure_ctx_matches(*ctx, capture.type_params));
         if capture.poisoned || capture.list_depth == 0 || suspends {
-            return;
+            return None;
         }
         let required = capture.optional_from.unwrap_or(capture.positional.len());
         let sig = Box::new(FnVarSig {
             params: Box::default(),
             required_positional: u16::try_from(required).unwrap_or(u16::MAX),
-            positional: capture.positional.into_boxed_slice(),
+            positional: capture.positional.clone().into_boxed_slice(),
             named: Box::default(),
             return_ty: Ty::Void,
         });
         if let Some(level) = self.arg_levels.last_mut() {
             level.closures.push((capture.offset, end, sig));
         }
+        // The final literal type rides the pushed Value row: the context's
+        // return under the cap over the literal's own resolved formals.
+        // A `void`-returning consumer admits the `void` stub above; the
+        // typed row carries the context's real return so the assignability
+        // and return channels read the same face the oracle infers.
+        ctx.and_then(|ctx| {
+            let ret = self.function_shape_return(ctx)?;
+            let ty =
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .function(0, ret, &capture.positional, &[], false);
+            Some((capture.offset, ty))
+        })
     }
 
     /// An unattributable shape inside the open capture (an inline

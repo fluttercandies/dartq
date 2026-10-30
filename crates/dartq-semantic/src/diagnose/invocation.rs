@@ -4948,6 +4948,28 @@ impl<'a> Engine<'a> {
                         let mut formals = formals;
                         self.project_formals(super_owner, &mut formals);
                         self.patch_super_formals(superclass, &mut formals);
+                        // An untyped initializing formal reads its field's
+                        // declared type BEFORE the clause substitution
+                        // (#2873): `Indexable(this._value)` over
+                        // `final ReadType _value` captures the formal
+                        // `Unknown`, and a substitution running before the
+                        // field patch would skim past it — the raw
+                        // parameter spelling (`ReadType`) decided and
+                        // displayed where the oracle pairs
+                        // `Indexable<String?, String?>`'s `String?`.
+                        for formal in formals
+                            .positional
+                            .iter_mut()
+                            .chain(formals.named.iter_mut())
+                        {
+                            if formal.ty == Ty::UNKNOWN
+                                && let Some(entry) = super_container.members.get(&formal.name)
+                                && entry.kind == MemberKind::Field
+                                && !entry.is_static
+                            {
+                                formal.ty = self.boundary.ty(super_owner, entry.var_ty);
+                            }
+                        }
                         // The subclass's written instantiation substitutes
                         // the superclass's own parameters in the formals
                         // (`PathMap<V> extends MapView<String?, V>` pairs
@@ -5040,27 +5062,6 @@ impl<'a> Engine<'a> {
             ),
             None => return,
         };
-        // An untyped field formal (`this.name`) takes its field's declared
-        // type — the field may be declared after the constructor, so the
-        // whole-file member table answers it (the enum-constant walk
-        // applies the same face).
-        if let Some((super_container, super_owner)) = super_container {
-            for formal in formals
-                .positional
-                .iter_mut()
-                .chain(formals.named.iter_mut())
-            {
-                if formal.ty == Ty::UNKNOWN
-                    && let Some(entry) = super_container.members.get(&formal.name)
-                    && entry.kind == MemberKind::Field
-                    && !entry.is_static
-                {
-                    // The field's declared type is owned by the same foreign
-                    // pool as the constructor table — project it too.
-                    formal.ty = self.boundary.ty(super_owner, entry.var_ty);
-                }
-            }
-        }
         // The count decisions and the per-argument walk mirror
         // [`Engine::check_arguments`]: the deficit anchors after the last
         // positional argument (the closing paren at an empty or named-only
@@ -7201,6 +7202,46 @@ impl<'a> Engine<'a> {
             let Some(formal) = formal else {
                 continue;
             };
+            // The substituted parameter type (#2873) — computed BEFORE the
+            // function-subtype face so the tear-off rejection decides and
+            // displays on the bound parameter (`test<Function>(foo, bar)`
+            // pairs `void Function()` against the WRITTEN `Function`, never
+            // the callee's own out-of-scope `T` spelling). The substitution
+            // keeps every non-type-parameter callee byte-identical: a bare
+            // parameter leaf maps to its solved slot; a COMPOUND face
+            // (`Stream.transform`'s `StreamTransformer<T, S>` over the
+            // receiver-seeded `T` and the argument-solved `S`) substitutes
+            // the whole solved map through `subst_params` — an unsolved
+            // parameter maps to its own spelling, so only solved slots
+            // move.
+            let formal_ty = match (&exec_params, formal.ty) {
+                (
+                    Some(params),
+                    Ty::Named {
+                        name: param,
+                        nullable: false,
+                        args,
+                    },
+                ) if args == ArgListId::EMPTY => params
+                    .iter()
+                    .position(|(p, _)| *p == param)
+                    .map(|index| effective[index])
+                    .unwrap_or(formal.ty),
+                (Some(params), formal_ty)
+                    if !matches!(formal_ty, Ty::Unknown)
+                        && params
+                            .iter()
+                            .any(|(p, _)| self.formal_mentions_param(formal_ty, *p)) =>
+                {
+                    let map: Vec<(StringId, Ty)> = params
+                        .iter()
+                        .zip(effective.iter())
+                        .map(|((param, _), ty)| (*param, *ty))
+                        .collect();
+                    self.subst_params(formal_ty, &map).unwrap_or(formal_ty)
+                }
+                _ => formal.ty,
+            };
             // The function-subtype face (`_isFunctionSubtypeOf`,
             // upstream Dart SDK source, pkg/analyzer/lib/src/dart/element/
             // subtype.dart): a formal carrying a written generic
@@ -7252,8 +7293,11 @@ impl<'a> Engine<'a> {
                     // (`_isFunctionSubtypeOf` unfolds the alias), so the
                     // tear-off decides on the two signatures — not on the
                     // alias head. No captured RHS (or an undecidable pair)
-                    // falls through to the ordinary face below.
-                    if let Some(alias_sig) = match formal.ty {
+                    // falls through to the ordinary face below. The
+                    // substituted type decides (#2873): `test<Foo>(foo)`
+                    // unfolds the alias instantiation the written argument
+                    // bound, never the raw parameter spelling.
+                    if let Some(alias_sig) = match formal_ty {
                         Ty::Named {
                             name,
                             args: ArgListId::EMPTY,
@@ -7266,7 +7310,7 @@ impl<'a> Engine<'a> {
                             Some(false) => {
                                 let code = SemanticCode::ArgumentTypeNotAssignable;
                                 let from_text = self.fn_sig_display(&arg_sig);
-                                let to_text = self.ty_display(formal.ty);
+                                let to_text = self.ty_display(formal_ty);
                                 let message = code.message3(&from_text, &to_text, "");
                                 let index = self.report.diagnostics.len();
                                 self.emit_message_with_correction(code, *range, message);
@@ -7282,9 +7326,14 @@ impl<'a> Engine<'a> {
                     // `void`); every other resolvable written formal
                     // refuses — the message renders the tear-off's written
                     // shape (the `c(print)` face, `void Function(Object?)`
-                    // vs `int`). Unknown, a bound type parameter, and the
-                    // structured formals keep the under-report posture.
-                    let refused = match formal.ty {
+                    // vs `int`). The SUBSTITUTED type decides (#2873): a
+                    // solved parameter leaf reads its bound written type
+                    // (`test<Function>(foo, bar)` pairs against `Function`
+                    // and stays silent), an unsolved one keeps the raw
+                    // spelling and the prior posture. Unknown, a bound type
+                    // parameter, and the structured formals keep the
+                    // under-report posture.
+                    let refused = match formal_ty {
                         Ty::Named {
                             name,
                             args: ArgListId::EMPTY,
@@ -7300,7 +7349,7 @@ impl<'a> Engine<'a> {
                     if refused {
                         let code = SemanticCode::ArgumentTypeNotAssignable;
                         let from_text = self.fn_sig_display(&arg_sig);
-                        let to_text = self.ty_display(formal.ty);
+                        let to_text = self.ty_display(formal_ty);
                         let message = code.message3(&from_text, &to_text, "");
                         let index = self.report.diagnostics.len();
                         self.emit_message_with_correction(code, *range, message);
@@ -7309,42 +7358,6 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            // The substituted parameter type (the substitution keeps
-            // every non-type-parameter callee byte-identical). A bare
-            // parameter leaf maps to its solved slot; a COMPOUND face
-            // (`Stream.transform`'s `StreamTransformer<T, S>` over the
-            // receiver-seeded `T` and the argument-solved `S`) substitutes
-            // the whole solved map through `subst_params` — an unsolved
-            // parameter maps to its own spelling, so only solved slots
-            // move.
-            let formal_ty = match (&exec_params, formal.ty) {
-                (
-                    Some(params),
-                    Ty::Named {
-                        name: param,
-                        nullable: false,
-                        args,
-                    },
-                ) if args == ArgListId::EMPTY => params
-                    .iter()
-                    .position(|(p, _)| *p == param)
-                    .map(|index| effective[index])
-                    .unwrap_or(formal.ty),
-                (Some(params), formal_ty)
-                    if !matches!(formal_ty, Ty::Unknown)
-                        && params
-                            .iter()
-                            .any(|(p, _)| self.formal_mentions_param(formal_ty, *p)) =>
-                {
-                    let map: Vec<(StringId, Ty)> = params
-                        .iter()
-                        .zip(effective.iter())
-                        .map(|((param, _), ty)| (*param, *ty))
-                        .collect();
-                    self.subst_params(formal_ty, &map).unwrap_or(formal_ty)
-                }
-                _ => formal.ty,
-            };
             if self.argument_verdict(*ty, formal_ty, *literal) == Some(false) {
                 // The raw-generic face (#2172's `_base.equals(e1, e2)`): a
                 // member-invocation formal leaf that spells the declaring
@@ -7739,11 +7752,58 @@ impl<'a> Engine<'a> {
                 // `extension on int?` over `int? a`), upstream Dart SDK
                 // source, pkg/analyzer/lib/src/dart/resolver/
                 // function_expression_invocation_resolver.dart:92-100.
+                //
+                // The answer doubles as the member's use credit (#2894):
+                // the send spells no `.call` selector, so no resolution-side
+                // capture records the member, and a finalize-time
+                // re-derivation cannot — the frame is gone by then. The
+                // credit rides the INVOKE event while the frame is alive: a
+                // resolved class `call` method joins the name-level pool,
+                // and the applied extension's `call` joins the
+                // element-attributed set (the face's declaring file + pool
+                // slot — the `usedElements.members` key) with its
+                // contributing import credited for a foreign face. Only a
+                // UNIQUE application credits — an ambiguous pool resolves
+                // no member upstream, so every candidate stays
+                // unreferenced.
+                let call = self.intern("call");
                 if matches!(
-                    self.resolved_member(name, self.intern("call")),
+                    self.resolved_member(name, call),
                     Some(entry) if entry.kind == MemberKind::Method
-                ) || self.extension_call_member(name, ty_nullable)
-                {
+                ) {
+                    self.used_names.insert(call);
+                    return;
+                }
+                let call_faces = self.extension_call_faces(name, ty_nullable);
+                // An ambiguous pool keeps the standing callable verdict (any
+                // applicable face answered) with no member credit — the
+                // oracle resolves no member, so every candidate stays
+                // unreferenced.
+                if call_faces.len() > 1 {
+                    return;
+                }
+                if let Some((face, face_file)) = call_faces.into_iter().next() {
+                    // The element key: the face's position in its
+                    // declaring file's `extension_faces()` pool (pointer
+                    // identity IS element identity within an analysis —
+                    // the pool is frozen before the walk). A face the
+                    // index cannot see credits nothing rather than
+                    // guessing a slot.
+                    if let Some(face_index) = self
+                        .index
+                        .get(face_file)
+                        .and_then(|elements| {
+                            elements
+                                .extension_faces()
+                                .iter()
+                                .position(|entry| std::ptr::eq(entry, face))
+                        })
+                        .and_then(|index| u32::try_from(index).ok())
+                    {
+                        self.extension_member_used
+                            .insert((face_file, face_index, call));
+                    }
+                    self.credit_extension_import(face, face_file);
                     return;
                 }
                 // A type-parameter-typed callee resolves through its written
@@ -7937,16 +7997,34 @@ impl<'a> Engine<'a> {
     /// `applicableTo` predicate), matching the face's own applicability
     /// gate.
     pub(crate) fn extension_call_member(&mut self, name: StringId, nullable: bool) -> bool {
+        !self.extension_call_faces(name, nullable).is_empty()
+    }
+
+    /// Every accessible extension face applicable to the head `name` at the
+    /// receiver's nullability that declares a `call` METHOD — the candidate
+    /// pool behind [`Self::extension_call_member`]'s verdict and the
+    /// invoke-site use credit (#2894). A nullable receiver matches only a
+    /// nullable `on` type (`String?` is not a subtype of `String` — the
+    /// `applicableTo` predicate), matching the face's own applicability
+    /// gate.
+    fn extension_call_faces(
+        &mut self,
+        name: StringId,
+        nullable: bool,
+    ) -> Vec<(&'a ExtensionFace, FileId)> {
         let call = self.intern("call");
-        let pairs: Vec<(&ExtensionFace, FileId)> = self.accessible_extension_faces().to_vec();
-        pairs.iter().any(|(face, _)| {
-            face.on_type == Some(name)
-                && (!nullable || face.on_type_nullable)
-                && matches!(
-                    face.members.get(&call),
-                    Some(entry) if entry.kind == MemberKind::Method
-                )
-        })
+        self.accessible_extension_faces()
+            .iter()
+            .filter(|(face, _)| {
+                face.on_type == Some(name)
+                    && (!nullable || face.on_type_nullable)
+                    && matches!(
+                        face.members.get(&call),
+                        Some(entry) if entry.kind == MemberKind::Method
+                    )
+            })
+            .copied()
+            .collect()
     }
 
     /// The genuinely-unresolved bare-call-head face (#2860): the send's

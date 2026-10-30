@@ -245,56 +245,70 @@ impl<'a> Engine<'a> {
         // The same arrow face [`Self::typed_list_literal_ty`] rejects: a
         // `=> [` opens an untyped switch-arm/arrow-body literal, and the
         // byte before its bracket is the arrow's `>`, never a group close.
-        if cursor < 2 || bytes[cursor - 1] != b'>' || bytes[cursor - 2] == b'=' {
-            return;
-        }
-        // The nearest type reference ending before the bracket names the
-        // element type's GROUP — but a generic element type
-        // (`<Map<K, V>>[…]`) ends with its LAST inner argument, not the
-        // head. The group's own `<…>` span is walked back from the `>`
-        // (angle-balanced), and the FIRST use inside the group is the
-        // head — `Map`, not `V` — with the raw face the pool's
-        // covariant element rule answers against the written arguments.
-        let mut depth = 1usize;
-        let mut group_open = cursor - 1;
-        while group_open > 0 {
-            match bytes[group_open - 1] {
-                b'>' => depth += 1,
-                b'<' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
+        let declared = if cursor >= 2 && bytes[cursor - 1] == b'>' && bytes[cursor - 2] != b'=' {
+            // The nearest type reference ending before the bracket names the
+            // element type's GROUP — but a generic element type
+            // (`<Map<K, V>>[…]`) ends with its LAST inner argument, not the
+            // head. The group's own `<…>` span is walked back from the `>`
+            // (angle-balanced), and the FIRST use inside the group is the
+            // head — `Map`, not `V` — with the raw face the pool's
+            // covariant element rule answers against the written arguments.
+            let mut depth = 1usize;
+            let mut group_open = cursor - 1;
+            while group_open > 0 {
+                match bytes[group_open - 1] {
+                    b'>' => depth += 1,
+                    b'<' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                group_open -= 1;
             }
-            group_open -= 1;
-        }
-        if depth != 0 {
-            return;
-        }
-        let head_start = group_open;
-        // The walked group bounds are bytes; `type_uses` ranges are UTF-16.
-        let (head_start16, group_close16) = (self.utf16_of(head_start), self.utf16_of(cursor - 1));
-        let Some((name_range, name)) = self
-            .type_uses
-            .iter()
-            .filter(|(range, _)| range.offset >= head_start16 && range.end() <= group_close16)
-            .min_by_key(|(range, _)| range.offset)
-            .copied()
-        else {
-            return;
-        };
-        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
-            return;
-        }
-        // The `?` suffix rides the token after the type-use range, the same
-        // suffix `typed_list_literal_ty` reads (`<String?>` declares `String?`
-        // elements, not `String` — #2161).
-        let declared = Ty::Named {
-            name,
-            nullable: self.written_nullable_suffix(name_range.end()),
-            args: crate::model::ArgListId::EMPTY,
+            if depth != 0 {
+                return;
+            }
+            let head_start = group_open;
+            // The walked group bounds are bytes; `type_uses` ranges are UTF-16.
+            let (head_start16, group_close16) =
+                (self.utf16_of(head_start), self.utf16_of(cursor - 1));
+            let Some((name_range, name)) = self
+                .type_uses
+                .iter()
+                .filter(|(range, _)| range.offset >= head_start16 && range.end() <= group_close16)
+                .min_by_key(|(range, _)| range.offset)
+                .copied()
+            else {
+                return;
+            };
+            if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+                return;
+            }
+            // The `?` suffix rides the token after the type-use range, the same
+            // suffix `typed_list_literal_ty` reads (`<String?>` declares `String?`
+            // elements, not `String` — #2161).
+            Ty::Named {
+                name,
+                nullable: self.written_nullable_suffix(name_range.end()),
+                args: crate::model::ArgListId::EMPTY,
+            }
+        } else {
+            // No written group: the untyped literal resolves its elements
+            // against the position's context — `=> […]` and `return […]`
+            // read the innermost executable's effective return (the
+            // closure's matched context `K` for a literal, the folded
+            // declared return otherwise), whose element argument is the
+            // declared face each element answers (`typed_literal_resolver
+            // .dart` `_fromContextType`). A deeper position — an
+            // initializer, an argument, a nested slot — has no return
+            // context of its own here and keeps the opaque posture.
+            let Some(declared) = self.list_literal_ctx_element(left) else {
+                return;
+            };
+            declared
         };
         // Top-level element segments: comma splits at bracket depth 0,
         // string-literal contents skipped.
@@ -405,6 +419,42 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    /// The untyped `[…]`'s context element type when the literal sits in a
+    /// return position: the token immediately before its bracket spells
+    /// `=>` or `return` (the token table's spelling — the same table
+    /// [`Self::assignment_ctx_at`] reads for the write channel), and the
+    /// innermost executable's effective return supplies the context. A
+    /// literal's return comes from its matched context `K`
+    /// ([`Self::closure_context_return`]); a declared executable's from
+    /// its folded written return. `List`/`Set`/`Iterable` donate their
+    /// single argument; every other shape answers `None` — including a
+    /// `Function`-returning context, whose element ask is meaningless.
+    fn list_literal_ctx_element(&self, left: Token) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens
+            .partition_point(|t| t.utf16_offset < left.range.offset)
+            .checked_sub(1)?;
+        let text = &self.source[tokens[index].byte_range()];
+        let in_return_position = text == "=>" || text == "return";
+        if !in_return_position {
+            return None;
+        }
+        let to = self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
+            FrameKind::Executable { ret: None, .. } => self.closure_context_return(),
+            _ => None,
+        })?;
+        let to = self.fold_alias_ty(to);
+        let Ty::Named { name, args, .. } = to else {
+            return None;
+        };
+        let heads = &self.collection_heads;
+        if !(name == heads[0] || name == heads[1] || name == heads[3]) {
+            return None;
+        }
+        self.boundary.args.borrow().get(args).first().copied()
     }
 
     /// The written `on` clause of a named extension, its head and written
@@ -2394,10 +2444,16 @@ impl<'a> Engine<'a> {
             // teardown's re-decision on the interned Tys alone carries no
             // parameter bounds. The message spells the deciding
             // signatures (#2849).
-            let range = self
-                .invocation_span(row.range)
-                .or_else(|| self.property_access_span(row.range))
-                .unwrap_or(row.range);
+            let range = if self.closure_literal_starts.contains(&row.range.offset) {
+                // A function-literal RHS anchors at its own span — the
+                // `(`-formals' `call_ends` entry is the literal's own
+                // parameter list, not an invocation to widen to.
+                row.range
+            } else {
+                self.invocation_span(row.range)
+                    .or_else(|| self.property_access_span(row.range))
+                    .unwrap_or(row.range)
+            };
             let (_, from_sig, to_sig) = stashed.expect("checked above");
             let (from_text, to_text) =
                 (self.fn_sig_display(&from_sig), self.fn_sig_display(&to_sig));
@@ -2600,6 +2656,15 @@ impl<'a> Engine<'a> {
         let Some(to) = self.closure_context_return() else {
             return;
         };
+        // The declared path's untyped-literal arm (`_fromContextType`): a
+        // collection literal body resolves against the context return
+        // before the assignability ask, so `[3]` under `List<String>`
+        // reads `List<String>` and the verdict stays clean — the element
+        // check itself reports the leaf.
+        let from = match self.untyped_literals.get(&range.offset) {
+            Some(&kind) => self.literal_return_ty(kind, to),
+            None => from,
+        };
         // The declared path's context gate: an unresolved written head
         // (`named_type_resolver.dart`'s InvalidType annotation) asks no
         // assignability question.
@@ -2627,53 +2692,25 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The context return type a function literal's body checks against.
-    /// The two channels this name-level model carries: the declaration
-    /// initializer's written function type (the literal IS the
-    /// initializer), and the enclosing executable's return position (the
-    /// literal IS the `return` expression, whose declared type is
-    /// function-shaped — the literal's context is that function type, its
-    /// body checks against the shape's return). Every other context (an
-    /// argument formal, a generic method's solved `T`, the enclosing
-    /// `=>` body) answers `None` — under-report.
-    fn closure_context_return(&self) -> Option<Ty> {
-        let frame = self.frames.last()?;
-        let FrameKind::Executable { body_brace, .. } = &frame.kind else {
-            return None;
-        };
-        let open_mark = frame.row_mark;
-        // The declaration initializer: the literal opened exactly where the
-        // initializer began, so its context is the group's written function
-        // type's return (`String Function() f = () => 1;`). A deeper
-        // literal inside the initializer (`f = g(() => 1)`) opened after
-        // the callee's row — its mark no longer equals the initializer's.
-        if self.init_mark == Some(open_mark)
-            && let Some(Ty::Function { shape, .. }) = self.pending_decl_ty
-        {
-            let ret = {
-                let pool = self.boundary.pool();
-                pool.function_shape(shape).return_ty
-            };
-            return Some(ret);
-        }
-        // The enclosing executable's return position: the literal opened
-        // exactly where the in-flight `return` began, and the enclosing
-        // declared return is function-shaped — its return is the literal's
-        // context. An arrow-bodied literal only: a block body's own first
-        // `return` re-arms the mark inside the literal, where the equality
-        // can no longer separate the outer return position from the
-        // literal's own body returns (the false direction — never
-        // reported). The `=>`-body position of the enclosing executable
-        // stays under-report: the literal's own body event consumes the
-        // body mark before this check reads it.
-        if body_brace.is_some() || self.return_mark != Some(open_mark) {
+    /// The context return type a function literal's body checks against:
+    /// the innermost open capture's matched context `K` — latched at
+    /// `begin_function_expression` from whichever channel supplied it
+    /// (the declaration's folded written type, the assignment target's
+    /// declared type, the argument slot's formal type, or the enclosing
+    /// return position's function shape — [`Engine::closure_context_ty`]),
+    /// gated on the literal's own type-parameter count matching `K`'s
+    /// (the upstream `typeContext is FunctionType` equality arm). Its
+    /// return is the body's `R`. Every unmatched context — dynamic, bare
+    /// `Function`, a count-mismatched generic, an argument formal the
+    /// callee tables cannot see — answers `None`, the under-report
+    /// posture.
+    pub(crate) fn closure_context_return(&self) -> Option<Ty> {
+        let capture = self.closure_caps.last()?;
+        let ctx = capture.ctx?;
+        if !self.closure_ctx_matches(ctx, capture.type_params) {
             return None;
         }
-        let enclosing = self.frames.iter().rev().find_map(|f| match &f.kind {
-            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
-            _ => None,
-        })?;
-        self.function_shape_return(enclosing)
+        self.function_shape_return(ctx)
     }
 
     /// An unannotated collection literal's static type in a return
@@ -4608,7 +4645,7 @@ impl<'a> Engine<'a> {
     /// The return type of a function-shaped written type — the
     /// [`Engine::function_shape_sig`] answer's own return. `None` for
     /// every non-function shape.
-    fn function_shape_return(&self, ty: Ty) -> Option<Ty> {
+    pub(crate) fn function_shape_return(&self, ty: Ty) -> Option<Ty> {
         Some(self.function_shape_sig(ty)?.return_ty)
     }
 
@@ -5890,14 +5927,15 @@ mod closure_return_tests {
         assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
-    /// The leak control: a literal nested deeper in the body (an argument,
-    /// not the return expression) checks nothing — the oracle's context is
-    /// the argument formal's signature, which this layer does not carry,
-    /// and the enclosing declared return must never adjudicate it. The
-    /// final return-position literal stays clean. With the alias spelling
-    /// the enclosing context IS decidable, so a leaked mark equality would
-    /// misjudge the argument literal — the empty report proves the
-    /// channel's mark discipline.
+    /// The argument literal's own context adjudicates it, not the
+    /// enclosing return: `take(() => DB())` infers against the `F` formal
+    /// (#2868's argument channel — the slot's folded schema IS the
+    /// literal's `K`), so its `DB()` body reports the closure-return row;
+    /// the final return-position literal's `Str()` body satisfies its own
+    /// `F` context and stays silent. One row, anchored on the argument
+    /// literal's body — the enclosing `F` return never adjudicates the
+    /// wrong literal (the mark discipline keeps each context to its own
+    /// capture).
     #[test]
     fn argument_position_literal_never_leaks_to_the_enclosing_return() {
         let report = report(
@@ -5906,7 +5944,7 @@ mod closure_return_tests {
              F take(F f) => Str();\n\
              F h() {\n  take(() => DB());\n  return () => Str();\n}",
         );
-        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+        assert_eq!(code_names(&report), ["return_of_invalid_type_from_closure"]);
     }
 
     /// A non-function context is no context: a literal initialized into a

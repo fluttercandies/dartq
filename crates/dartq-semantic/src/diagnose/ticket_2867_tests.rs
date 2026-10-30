@@ -128,6 +128,49 @@ augment void f(int p) {}
 }
 
 // ---------------------------------------------------------------------------
+// P3 — the `is_complete` chain: a bodiless introductory declaration is NOT
+// complete, so a body-supplying `augment` never reports
+// `declaration_already_complete` (upstream `_checkForFunctionAlreadyComplete`
+// fires only when `nearestPrecedingCompleteFragment` finds a preceding
+// fragment that is itself complete).
+// ---------------------------------------------------------------------------
+
+/// `void foo(); augment void foo() {}` — the augmentation legitimately
+/// supplies the body. Oracle: SILENT (`ExecutableBodyTest
+/// test_topLevel_function_augmentation_hasBody`; the wave-5 regression
+/// fired the row because the intro's completeness bit was hard-wired true).
+#[test]
+fn bodiless_intro_body_augment_is_silent() {
+    let src = r#"
+void foo();
+augment void foo() {}
+"#;
+    let report = report_ops(src);
+    assert!(
+        named_rows(&report, "declaration_already_complete").is_empty(),
+        "{:#?}",
+        rows(&report)
+    );
+}
+
+/// `int get foo; augment int get foo => 0;` — same shape on the accessor
+/// family: the getter augment completes the bodiless intro, no row
+/// (`ExecutableBodyTest test_topLevel_getter_augmentation_hasBody`).
+#[test]
+fn bodiless_getter_intro_body_augment_is_silent() {
+    let src = r#"
+int get foo;
+augment int get foo => 0;
+"#;
+    let report = report_ops(src);
+    assert!(
+        named_rows(&report, "declaration_already_complete").is_empty(),
+        "{:#?}",
+        rows(&report)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // P2 — accessor-family unification (the variable element owns its induced
 // getter/setter chains; `augment get`/`set`/`field` resolve through it).
 // ---------------------------------------------------------------------------

@@ -5069,6 +5069,15 @@ mod ticket_2777_tests;
 #[cfg(test)]
 mod ticket_2781_tests;
 
+/// The #2894 invocation-form `call` credit pins: an `a()` send resolving
+/// through a `call` member (a class method or an applied extension's
+/// member) credits that member at the resolver's invoke arm while the
+/// frame is alive — the named/unnamed extension faces stay silent, an
+/// un-invoked `call` still reports `unused_element`, and the class-member
+/// shape keeps its callable verdict.
+#[cfg(test)]
+mod ticket_2894_tests;
+
 /// The #2782 key-only-diff sweep's pins: one exact oracle row per fixed
 /// code — the span/message conventions (`displayName` shapes, the Label
 /// node, the whole-initializer node, the accessor host word, the `Type`
@@ -5113,6 +5122,15 @@ mod ticket_2861_tests;
 /// one oracle-derived row per broken face.
 #[cfg(test)]
 mod ticket_2867_tests;
+
+/// The #2868 closure context-type inference pins (`inferLocalFunction`):
+/// the folded context latched at literal-open from the four channels
+/// (declaration, assignment, argument slot, enclosing return position),
+/// the downward-inferred formals, the body's returns checked against the
+/// context return under the cap, and the final literal type on the Value
+/// row lighting the decl/assign/argument faces.
+#[cfg(test)]
+mod ticket_2868_tests;
 
 /// The #2860 error-scrutinee pins: a switch over a genuinely-unresolved
 /// call reads the oracle's `InvalidType` — the vacuous cover kills the

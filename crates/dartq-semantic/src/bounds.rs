@@ -559,6 +559,11 @@ pub(crate) struct Bounds<'a> {
     window: Vec<(StringId, Option<TypeTree>, bool)>,
     /// The just-closed window, awaiting its container's begin event.
     pending: Option<Vec<(StringId, Option<TypeTree>, bool)>>,
+    /// The enclosing type-variables groups' in-flight capture. A bound's
+    /// own function-type variables (`void f<T extends void Function<X>>>()`)
+    /// open a group INSIDE the declaring header's group; their events must
+    /// not disturb the header's window, sink, or latch (#2897).
+    frames: Vec<(Vec<(StringId, Option<TypeTree>, bool)>, Option<TreeSink>)>,
     /// The open container-header supertype capture: its container's name
     /// (the capture was created by [`Self::note_container`] at the same
     /// begin event) and the clause cursor.
@@ -592,11 +597,16 @@ impl<'a> Bounds<'a> {
     }
 
     /// A `<...>` type-variables group opened: its variables' bounds are
-    /// captured (a new window also invalidates any unclaimed latch).
+    /// captured. The outermost group also invalidates any unclaimed
+    /// window latch; a nested group (a bound's function-type variables)
+    /// keeps it — the enclosing header's adopter has not run yet (#2897).
     pub(crate) fn begin_type_variables(&mut self) {
-        self.pending = None;
+        if self.frames.is_empty() {
+            self.pending = None;
+        }
+        self.frames
+            .push((std::mem::take(&mut self.window), self.bound_sink.take()));
         self.bound_sink = Some(TreeSink::default());
-        self.window = Vec::new();
     }
 
     /// One type variable completed (`end_type_variable`). The parser
@@ -622,13 +632,15 @@ impl<'a> Bounds<'a> {
         self.window.push((name, bound, poisoned));
     }
 
-    /// The group closed: latch for the owning declaration's begin event.
+    /// The group closed: the outermost close latches for the owning
+    /// declaration's begin event and feeds the alias capture; a nested
+    /// close (a bound's function-type variables) belongs to the function
+    /// type's own scope — its window never parks for a declaring header,
+    /// and the enclosing group's in-flight capture is restored (#2897).
     /// The parser completes the variables in reverse declaration order,
     /// so the window reverses back — a capture's parameter order is the
     /// written one. Names bounded here latch the sticky bounded-parameter
-    /// set — function scopes included. An open alias capture adopts the
-    /// window as its declaring parameters (#1351: the typedef's name
-    /// precedes the group, so the close always lands inside its capture).
+    /// set — function scopes included.
     pub(crate) fn end_type_variables(&mut self) {
         let mut window = std::mem::take(&mut self.window);
         self.bound_sink = None;
@@ -637,6 +649,14 @@ impl<'a> Bounds<'a> {
             if bound.is_some() || *poisoned {
                 self.index.bounded_params.insert(*name);
             }
+        }
+        let Some((outer_window, outer_sink)) = self.frames.pop() else {
+            return;
+        };
+        self.window = outer_window;
+        self.bound_sink = outer_sink;
+        if !self.frames.is_empty() {
+            return;
         }
         self.alias_type_variables(&window);
         self.pending = (!window.is_empty()).then_some(window);
@@ -648,6 +668,13 @@ impl<'a> Bounds<'a> {
     /// function's latch is always its own.
     pub(crate) fn pending_window(&self) -> Option<&[(StringId, Option<TypeTree>, bool)]> {
         self.pending.as_deref()
+    }
+
+    /// Whether a type-variables group is still open: a nested group's
+    /// close (a bound's function-type variables) must never pair a
+    /// declaring header's executable latch (#2897).
+    pub(crate) fn in_type_variables(&self) -> bool {
+        !self.frames.is_empty()
     }
 
     /// The container begin event: adopts the latch when the declaring

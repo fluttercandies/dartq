@@ -89,6 +89,7 @@ impl<'a> Engine<'a> {
             dup_scopes: Vec::new(),
             dup_for_parts: FxHashMap::default(),
             untyped_literals: FxHashMap::default(),
+            closure_literal_starts: FxHashSet::default(),
             collection_heads: [
                 strings.intern("List"),
                 strings.intern("Set"),
@@ -1265,10 +1266,13 @@ impl<'a> Engine<'a> {
             // end, `.at(expression)`), not the name alone. A bare operand's
             // row already is its own span.
             let range = match check.kind {
-                StagedKind::Assignment | StagedKind::Argument => self
-                    .invocation_span(check.range)
-                    .or_else(|| self.property_access_span(check.range))
-                    .unwrap_or(check.range),
+                StagedKind::Assignment | StagedKind::Argument
+                    if !self.closure_literal_starts.contains(&check.range.offset) =>
+                {
+                    self.invocation_span(check.range)
+                        .or_else(|| self.property_access_span(check.range))
+                        .unwrap_or(check.range)
+                }
                 _ => check.range,
             };
             let (a0, a1) = (self.ty_display(from), self.ty_display(check.to));
@@ -1892,7 +1896,20 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let wildcard = self.is_wildcard(name);
-            let name_text = self.strings.resolve(name).to_string();
+            // The nameless recovery face renders `<unnamed>` (`ElementImpl
+            // .displayName`'s `name ?? '<unnamed>'`); only the catch rows
+            // can carry an empty spelling — the parser's synthetic-filled
+            // trace slot (`C::CatchParameter`'s `synthetic_name` intern).
+            let raw_text = self.strings.resolve(name);
+            let name_text = if raw_text.is_empty()
+                && matches!(
+                    kind,
+                    LocalKind::CatchException { .. } | LocalKind::CatchStack
+                ) {
+                "<unnamed>".to_string()
+            } else {
+                raw_text.to_string()
+            };
             let (code, name) = match kind {
                 LocalKind::Variable | LocalKind::PatternVariable => {
                     // The wildcard-variables feature: an all-underscores

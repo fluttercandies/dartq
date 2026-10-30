@@ -95,8 +95,8 @@ impl<'a> Engine<'a> {
     /// nameless ghost row retires into a silent parameter. A junk keyword
     /// the re-parse consumed as its own second name (`catch (e, do …`) is
     /// the slot's junk itself, never a recovered binding: the ghost keeps
-    /// the face. The flip never firing (a synthetic comma — the group
-    /// never gained a second slot) leaves the rows untouched.
+    /// the face. The flip never firing (a synthetic comma) routes to the
+    /// typed-catch handoff below.
     ///
     /// Every close also zeroes the catch rows' use counts: the formal
     /// re-parse resolves its own tokens against the live scope, and a
@@ -106,7 +106,11 @@ impl<'a> Engine<'a> {
     /// final AST alone — where the re-parse's faces are the parameter
     /// names, never type annotations — so the group's close drops them;
     /// the body's real reads land only after this point.
-    pub(crate) fn reconcile_catch_slots(&mut self, trace_row: Option<usize>) {
+    pub(crate) fn reconcile_catch_slots(
+        &mut self,
+        exc_row: Option<usize>,
+        trace_row: Option<usize>,
+    ) {
         let Some(&mark) = self.frame_local_marks.last() else {
             return;
         };
@@ -119,6 +123,48 @@ impl<'a> Engine<'a> {
             }
         }
         if !self.catch_trace_slot {
+            // The typed-catch recovery (`catch (int e)`): the scan's
+            // synthetic comma is real for the OFFICIAL rewriter — it stays
+            // in the stream when `parseFormalParameters` re-enters, so the
+            // official formals list reads `[int, e]` and
+            // `handleCatchBlock` names `int` the exception and `e` the
+            // stack trace (`catchParameters[0]/[1].name`). Our re-parse
+            // walks the raw pair, where `int` armed the twin formal's
+            // WRITTEN TYPE — the same fact read the other way: when the
+            // re-parse's first formal carries a written type spelled by
+            // the scan's first real name, and the scan ensured a second
+            // real name, that second name takes the trace face. The
+            // type-name row keeps the exception face (a plain catch
+            // auto-uses it at `finish_catch_clause`; a sibling presence
+            // auto-uses it through the CatchStack check). A first slot the
+            // re-parse consumed as a MODIFIER (`catch (var e)` — `var`
+            // arms no written type; the official list collapses to `[e]`)
+            // leaves the rows untouched: both scan rows keep the exception
+            // face and stay silent.
+            let twin_ty = exc_row
+                .filter(|&row| matches!(self.locals[row].kind, LocalKind::Parameter { .. }))
+                .and_then(|row| {
+                    let twin = self.locals[row].name;
+                    self.frames
+                        .last()
+                        .and_then(|frame| frame.var_types.get(&twin))
+                        .copied()
+                });
+            let slots = self.catch_scan_slots(mark);
+            if let (
+                Some(Ty::Named {
+                    name: head,
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                }),
+                Some((first, second)),
+            ) = (twin_ty, slots)
+                && !self.is_nameless(self.locals[first].name)
+                && !self.is_nameless(self.locals[second].name)
+                && head == self.locals[first].name
+            {
+                self.locals[second].kind = LocalKind::CatchStack;
+            }
             return;
         }
         let mut ghost_offset: Option<u32> = None;
@@ -149,6 +195,20 @@ impl<'a> Engine<'a> {
         for &i in &ghost_rows {
             self.locals[i].kind = LocalKind::Parameter { site: None };
         }
+    }
+
+    /// The catch frame window's scan-slot rows — the two `CatchException`
+    /// rows the fast pass ensured — as `(first, second)` when exactly two
+    /// exist. A third row (recovery residue) is not a scan shape.
+    fn catch_scan_slots(&self, mark: usize) -> Option<(usize, usize)> {
+        let mut slots = self.locals[mark..]
+            .iter()
+            .enumerate()
+            .filter(|(_, decl)| matches!(decl.kind, LocalKind::CatchException { .. }))
+            .map(|(i, _)| mark + i);
+        let first = slots.next()?;
+        let second = slots.next()?;
+        slots.next().is_none().then_some((first, second))
     }
 
     /// A named local function (reports as `unused_element`). The name
@@ -1295,6 +1355,40 @@ impl<'a> Engine<'a> {
         } else {
             SchemaSlot::Positional(self.frames.last()?.var_types.len())
         };
+        // The captured context answers first when it latched through a
+        // non-argument channel — the declaration initializer, the
+        // assignment target, the enclosing return position folded into
+        // `ctx` at open time; a matched count admits its schema entry
+        // directly (the same greatest-closure walk the live arg-channel
+        // recompute below runs, minus the receiver/classification
+        // machinery only the arg channel needs). An argument-channel
+        // latch stands aside: this formal's own slot/schema recompute
+        // below is the same answer, and the promotion-latched receiver
+        // below the callee re-derives at pass 2 — the frozen begin-time
+        // face would bind the unpromoted type (`h.items.map((e) => …)`
+        // under `h is! Impl` reads `ElImpl`, never `El`).
+        if !capture.ctx_from_arg
+            && let Some(ctx) = capture.ctx
+            && self.closure_ctx_matches(ctx, capture.type_params)
+        {
+            return match formal {
+                SchemaSlot::Positional(index) => self.closure_ctx_formal_ty(ctx, index),
+                SchemaSlot::Named(label) => {
+                    let Ty::Function { shape, .. } = ctx else {
+                        return None;
+                    };
+                    let schema = {
+                        let pool = self.boundary.pool();
+                        pool.function_shape(shape)
+                            .named
+                            .iter()
+                            .find(|(n, _)| *n == label)
+                            .map(|(_, ty)| *ty)
+                    };
+                    schema.and_then(|schema| self.closure_ctx_greatest_closure(schema))
+                }
+            };
+        }
         // The literal's argument slot in the open invocation: completed
         // positional arguments before it, or the pending named label.
         let level = self.arg_levels.last()?;
@@ -1839,8 +1933,37 @@ impl<'a> Engine<'a> {
         // unresolvable-schema recovery and emit the very row the
         // unsubstituted schema never did (`Bag<Und>`'s `T` is a provable
         // same-file type parameter, `Und` is not). Rejection keeps the
-        // schema untouched — exactly the pre-existing route.
-        (out != ty && self.schema_type_is_decidable(out)).then_some(out)
+        // schema untouched — exactly the pre-existing route. A function
+        // schema decides through its parts: the literal's context latch
+        // (#2868's argument channel) consumes `K` whole, and a part the
+        // solve left as a bare callee parameter (`mapIt`'s unsolved `R`)
+        // keeps the schema out of scope's reach — no context.
+        (out != ty && self.schema_ty_fully_decidable(out)).then_some(out)
+    }
+
+    /// [`Self::schema_type_is_decidable`] lifted over `Ty::Function`: a
+    /// substituted function schema is decidable when its return and every
+    /// formal decide. The leaf ask is the same except the always-decidable
+    /// arms join — a `void`/`dynamic`/`Null`/`Never` part is a solved
+    /// answer, never an unresolved spelling.
+    fn schema_ty_fully_decidable(&self, ty: Ty) -> bool {
+        let Ty::Function { shape, .. } = ty else {
+            return self.schema_type_is_decidable(ty);
+        };
+        let sig = {
+            let pool = self.boundary.pool();
+            pool.function_shape(shape).clone()
+        };
+        let decidable = |ty: Ty| {
+            matches!(ty, Ty::Dynamic | Ty::Void | Ty::Null | Ty::Never)
+                || self.schema_type_is_decidable(ty)
+        };
+        decidable(sig.return_ty)
+            && sig
+                .positional
+                .iter()
+                .chain(sig.named.iter().map(|(_, ty)| ty))
+                .all(|ty| decidable(*ty))
     }
 
     /// The closure-return tally's recording half (the listener's return
@@ -2868,6 +2991,355 @@ impl<'a> Engine<'a> {
             }
             Ty::Named { name, .. } => self.alias_fn_sig(name).map(|sig| *sig),
             _ => None,
+        }
+    }
+
+    /// The context type `K` a function literal opens under
+    /// (`inferLocalFunction`, inference_visitor_base.dart:2229): the first
+    /// available of four channels — (i) the declaration initializer's
+    /// written type folded through its alias (`Function2<int, String> f =
+    /// (x) => …` reads `String Function(int)`); (ii) the assignment
+    /// target's declared type when the literal IS the right-hand side
+    /// (`f = (x) => …`); (iii) the argument slot's formal type in the
+    /// open invocation (`useNum((x) => …)`); (iv) the enclosing
+    /// executable's function-shaped return position (`return (x) => …`).
+    /// Every channel answers the folded [`Ty::Function`] itself — the
+    /// literal's formals, return checks, and final Value-row type all
+    /// read it. A non-function or undecidable context answers `None`
+    /// (dynamic, a bare `Function` head, an unresolvable shape) — the
+    /// pre-existing under-report posture stays.
+    /// Returns the latched context plus `true` when the argument channel
+    /// supplied it — the per-formal bind keeps the live re-derive path
+    /// there (the receiver below the callee re-binds at pass 2, the
+    /// begin-time latch is its stale face).
+    pub(crate) fn closure_context_ty(&mut self, literal_offset: u32) -> (Option<Ty>, bool) {
+        let mark = self.rows.len();
+        // (i) The declaration initializer: the literal opened exactly at
+        // the initializer's mark (a deeper literal inside it opened after
+        // a callee's row and misses). `Function2<int, String>` folds to
+        // `String Function(int)` — the alias the raw `pending_decl_ty`
+        // misses.
+        if self.init_mark == Some(mark)
+            && let Some(ty) = self.pending_decl_ty
+            && let Some(ctx) = self.function_ty_of(self.fold_alias_ty(ty))
+        {
+            return (Some(ctx), false);
+        }
+        // (ii) The assignment right-hand side: the token directly before
+        // the literal is `=`/`??=` and the closest non-value row before it
+        // is the write target. `x = (e) => 3` over a `Function2` field
+        // reads the folded target face; a literal deeper in the RHS (a
+        // send's argument, a `??` operand) sits behind a `(`/`?`/`,`
+        // token and never matches.
+        if let Some(ctx) = self.assignment_ctx_at(literal_offset) {
+            return (Some(ctx), false);
+        }
+        // (iii) The argument slot: the literal opened exactly where the
+        // pending argument's rows begin — `arg_open` holds between
+        // `open_argument` and the flush, `mark` is the row count the
+        // argument's own rows start at. The slot's declared formal folds
+        // to the schema function; the call's inference parameters already
+        // substituted ride the instantiated answer.
+        if let Some(ctx) = self.argument_ctx_at(mark) {
+            return (Some(ctx), true);
+        }
+        // (iv) The enclosing executable's return position: the literal
+        // opened exactly where the in-flight `return` began and the
+        // enclosing declared return is function-shaped — `return (x) => …`
+        // inside `Function2<int, String> f() { … }`. The mark holds for
+        // arrow AND block bodies (the body's own returns re-arm
+        // `return_mark` inside the literal, where the capture already
+        // latched the context — the false direction the old mark-equality
+        // read could not separate). The `=>`-body arm (`body_mark` latches
+        // where the body's expression begins) is the same position spelled
+        // without `return`: `f() => (x) => …` — gated on the enclosing
+        // body's brace being absent, so a block body's first-statement
+        // literal (`f() { (x) => …; }`) never takes the channel.
+        let at_return = self.return_mark == Some(mark);
+        let at_arrow_body = self.body_mark == Some(mark)
+            && self.frames.iter().rev().any(|f| match &f.kind {
+                FrameKind::Executable {
+                    ret: Some(_),
+                    body_brace,
+                    ..
+                } => body_brace.is_none(),
+                _ => false,
+            });
+        if at_return || at_arrow_body {
+            // The enclosing return context: the nearest declared `ret`
+            // answers its folded face; an enclosing literal's own matched
+            // context supplies ITS return first (a literal nested in a
+            // literal's `=>` body infers under the outer's context
+            // return, never the outer declaration's — `(x) => (y) => …`
+            // under `Function2<int, String>` reads `String`, which is no
+            // function type, so the inner literal acquires nothing).
+            for (index, frame) in self.frames.iter().enumerate().rev() {
+                match &frame.kind {
+                    FrameKind::Executable { ret: Some(ret), .. } => {
+                        return (self.function_ty_of(self.fold_alias_ty(ret.ty)), false);
+                    }
+                    FrameKind::Executable { ret: None, .. } => {
+                        if let Some(capture) = self
+                            .closure_caps
+                            .iter()
+                            .find(|capture| capture.frame_depth == index + 1)
+                            && let Some(ctx) = capture.ctx
+                            && self.closure_ctx_matches(ctx, capture.type_params)
+                        {
+                            return (
+                                self.function_shape_return(ctx)
+                                    .and_then(|ret| self.function_ty_of(self.fold_alias_ty(ret))),
+                                false,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (None, false)
+    }
+
+    /// The assignment-channel context at `literal_offset`: a bare `=` or
+    /// `??=` directly ahead of the literal (the token table's spelling —
+    /// `==`, `=>`, `>=` never spell `=`; the literal's own offset is its
+    /// first token, so the token before it is the operator), the closest
+    /// non-value row before it the write target, whose declared type
+    /// folds to the schema. `None` on every other shape (an operator, a
+    /// comma, an open paren — all non-assignment positions).
+    fn assignment_ctx_at(&mut self, literal_offset: u32) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let index = tokens
+            .partition_point(|t| t.utf16_offset < literal_offset)
+            .checked_sub(1)?;
+        let text = &self.source[tokens[index].byte_range()];
+        if text != "=" && text != "??=" {
+            return None;
+        }
+        let limit = tokens[index].utf16_offset;
+        let target = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))?
+            .clone();
+        // `c[i] = e` writes through `[]=` — the operator row's declared
+        // face is not the assignment's destination (the same gate
+        // `check_assignment` runs).
+        if matches!(target.intent, Intent::Operator(..)) {
+            return None;
+        }
+        let ty = self.assignment_target_ty(&target);
+        self.function_ty_of(self.fold_alias_ty(ty))
+    }
+
+    /// The argument-slot channel: the literal IS the pending argument of
+    /// the open invocation (its rows begin at `mark`). The slot pairs
+    /// like [`Self::closure_param_context_ty`]'s — `pending_name` or the
+    /// completed positional count — and the slot's declared formal folds
+    /// through the same schema face (an alias spelling, a written
+    /// signature table entry, then the inference-parameter instantiation
+    /// the bind-time solver runs). `None` when the literal sits deeper
+    /// (a nested collection, a named value mid-spelling) or the callee
+    /// answers no function-shaped formal.
+    fn argument_ctx_at(&mut self, mark: usize) -> Option<Ty> {
+        let level = self.arg_levels.last()?;
+        if level.mark != mark {
+            return None;
+        }
+        let slot = match level.pending_name {
+            Some(label) => SchemaSlot::Named(label),
+            None => SchemaSlot::Positional(
+                level
+                    .args
+                    .iter()
+                    .filter(|(label, ..)| label.is_none())
+                    .count(),
+            ),
+        };
+        let callee_row = level.callee_row?;
+        let callee = self.rows.get(callee_row)?.clone();
+        let recv = if callee.qualified {
+            callee_row
+                .checked_sub(1)
+                .and_then(|below| self.rows.get(below))
+                .map_or(Receiver::Unknown, |below| {
+                    let recv = self.argument_receiver(below);
+                    if matches!(recv, Receiver::Unknown) {
+                        self.chain_link_receiver(below)
+                    } else {
+                        recv
+                    }
+                })
+        } else {
+            Receiver::Unknown
+        };
+        let callee_name = callee.name;
+        // The slot's own declared type — the schema function the literal
+        // matches. The element formals answer first; a function-typed
+        // variable callee's captured signature closes (the same two
+        // lanes [`Self::closure_context_schema`] opens).
+        let slot_ty = match slot {
+            SchemaSlot::Positional(index) => self
+                .callee_formals(&recv, callee_name)
+                .and_then(|f| f.positional.get(index).map(|f| f.ty)),
+            SchemaSlot::Named(label) => self
+                .callee_formals(&recv, callee_name)
+                .and_then(|f| f.named_formal(label).map(|f| f.ty)),
+        }
+        .or_else(|| {
+            self.fn_var_sigs
+                .get(&callee_name)
+                .and_then(|sig| match slot {
+                    SchemaSlot::Positional(index) => sig.positional.get(index).copied(),
+                    SchemaSlot::Named(label) => sig
+                        .named
+                        .iter()
+                        .find(|(n, ..)| *n == label)
+                        .map(|(_, ty, _)| *ty),
+                })
+        })?;
+        // Fold through the schema face: an alias spelling yields the
+        // signature; the call's solved parameters substitute in (the
+        // upward face the bind-time solver runs — `map`'s `E` from the
+        // receiver's written instantiation).
+        let folded = self.fold_alias_ty(slot_ty);
+        if folded != slot_ty {
+            return self.function_ty_of(folded);
+        }
+        // The schema's own inference parameters gate the latch: the call
+        // solved them (explicit type arguments, the receiver's written
+        // instantiation, the arguments already typed) and the whole
+        // schema substitutes decidable — `fold<Fo?>(null, (result,
+        // folder) …)` reads `Fo? Function(Fo?, Fo?)`. An unsolved or
+        // half-solved schema keeps the literal context-free — the
+        // bind-time face pairs its own channels per formal, and a raw
+        // `T Function(T)` latch would adjudicate the body's returns
+        // against a bare callee parameter (the oracle's context is the
+        // solved signature; an unsolved `T` is no context at all).
+        let inst = self.closure_schema_instantiate(slot_ty, &recv, callee_name, Some(callee_row));
+        match inst {
+            Some(ty) => self.function_ty_of(ty),
+            None => {
+                let has_open_param = self
+                    .closure_callee_params(&recv, callee_name)
+                    .map(|(params, ..)| {
+                        let names: Vec<StringId> = params.iter().map(|(name, _)| *name).collect();
+                        !names.is_empty() && self.ty_names_any(slot_ty, &names)
+                    })
+                    .unwrap_or(false);
+                if has_open_param {
+                    None
+                } else {
+                    self.function_ty_of(slot_ty)
+                }
+            }
+        }
+    }
+
+    /// `ty`'s shape mentions any of `names` as a bare head — the callee
+    /// parameter a failed solve left standing (`T Function(T)`'s `T`s).
+    fn ty_names_any(&self, ty: Ty, names: &[StringId]) -> bool {
+        match ty {
+            Ty::Named { name, args, .. } => {
+                names.contains(&name)
+                    || (args != ArgListId::EMPTY && {
+                        let list = self.boundary.args.borrow().get(args).to_vec();
+                        list.iter().any(|ty| self.ty_names_any(*ty, names))
+                    })
+            }
+            Ty::Function { shape, .. } => {
+                let sig = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                self.ty_names_any(sig.return_ty, names)
+                    || sig
+                        .positional
+                        .iter()
+                        .chain(sig.named.iter().map(|(_, ty)| ty))
+                        .any(|ty| self.ty_names_any(*ty, names))
+            }
+            _ => false,
+        }
+    }
+
+    /// `ty` when it spells a function type — the context-shape gate
+    /// `inferLocalFunction`'s `typeContext is FunctionType` applies. The
+    /// bare `Function` head is a `Ty::Named` here (the parser fires a
+    /// plain type completion for it), so a non-function spelling, a bare
+    /// `Function`, `dynamic`, and the undecidable faces all answer
+    /// `None` — the no-context posture.
+    fn function_ty_of(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::Function { .. } => Some(ty),
+            _ => None,
+        }
+    }
+
+    /// Whether the matched context `ctx` admits the literal's own
+    /// type-parameter count (`typeContext.typeParameters.length ==
+    /// functionTypeParameters.length` — the upstream match gate). A
+    /// count-miss acquires NOTHING (the literal's own group is a fresh
+    /// quantification the context's instantiator cannot read).
+    pub(crate) fn closure_ctx_matches(&self, ctx: Ty, literal_type_params: u16) -> bool {
+        match ctx {
+            Ty::Function { shape, .. } => {
+                self.boundary.pool().function_shape(shape).type_params == literal_type_params
+            }
+            _ => false,
+        }
+    }
+
+    /// The downward-inferred type of the literal's `index`-th positional
+    /// formal under the matched context `ctx` (`_inferFormalParameters`):
+    /// `greatestClosure(Qi)` — a decidable named schema entry binds
+    /// itself; `T <: Null` (the unresolvable head, `Null`, `Never`) and
+    /// the invalid faces bind `Object?`; `dynamic` supplies nothing and
+    /// the formal keeps `dynamic`. Positional pairing by declaration
+    /// order is the only face this name-level model carries (named
+    /// literals poison before here).
+    pub(crate) fn closure_ctx_formal_ty(&self, ctx: Ty, index: usize) -> Option<Ty> {
+        let Ty::Function { shape, .. } = ctx else {
+            return None;
+        };
+        let schema = {
+            let pool = self.boundary.pool();
+            *pool.function_shape(shape).positional.get(index)?
+        };
+        self.closure_ctx_greatest_closure(schema)
+    }
+
+    /// `greatestClosure(Qi)` for one context schema entry
+    /// (`computeGreatestClosure2`'s face at name level): a decidable named
+    /// schema entry binds itself; `T <: Null` — `Null`, `Never`, and the
+    /// invalid/unresolvable heads — binds `Object?`; `dynamic` supplies
+    /// nothing (the formal keeps `dynamic`, `None` here). Function and
+    /// record shapes greatest-close to their own face.
+    fn closure_ctx_greatest_closure(&self, schema: Ty) -> Option<Ty> {
+        match schema {
+            // `dynamic` never infers — the formal keeps `dynamic`.
+            Ty::Dynamic => None,
+            // `T <: Null` and the invalid faces: `Object?`.
+            Ty::Unknown | Ty::Null | Ty::Never => Some(self.object_question()),
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if self.named_type_is_type(name) && self.args_are_types(args) {
+                    Some(Ty::Named {
+                        name,
+                        nullable,
+                        args,
+                    })
+                } else {
+                    Some(self.object_question())
+                }
+            }
+            // Function/record schema entries bind themselves (a
+            // function-typed `Qi` greatest-closes to its own shape).
+            other => Some(other),
         }
     }
 
