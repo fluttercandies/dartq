@@ -222,23 +222,11 @@ fn attribute(
     chunk_dir: &Path,
     indices: &[usize],
 ) -> BTreeMap<usize, Vec<Row>> {
-    let chunk_prefix = chunk_dir.to_string_lossy();
     let mut rows: BTreeMap<usize, Vec<Row>> = indices.iter().map(|i| (*i, Vec::new())).collect();
     let mut outside = 0usize;
     for diag in diags {
         let path = Path::new(&diag.file);
-        let Some(rel) = path.strip_prefix(chunk_dir).ok().and_then(|rest| {
-            let mut comps = rest.components();
-            let index = comps.next()?.as_os_str().to_string_lossy().into_owned();
-            let index: usize = index.parse().ok()?;
-            let file: Vec<String> = comps
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            if file.is_empty() {
-                return None;
-            }
-            Some((index, file.join("/")))
-        }) else {
+        let Some(rel) = split_under_chunk(path, chunk_dir) else {
             outside += 1;
             continue;
         };
@@ -246,12 +234,19 @@ fn attribute(
             outside += 1;
             continue;
         }
-        let root = format!("{chunk_prefix}/{}", rel.0);
+        // The message embeds the case root in the diagnostic's own spelling
+        // of the chunk prefix, so derive the needle from the reported path.
+        let root = path
+            .ancestors()
+            .nth(rel.1.len())
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|root| !root.is_empty())
+            .unwrap_or_else(|| format!("{}/{}", chunk_dir.to_string_lossy(), rel.0));
         let message = diag.message.replace(root.as_str(), "<chunk>");
         rows.get_mut(&rel.0).expect("checked above").push(Row {
             severity: diag.severity.clone(),
             code: diag.code.clone(),
-            file: rel.1,
+            file: rel.1.join("/"),
             line: diag.line,
             column: diag.column,
             length: diag.length,
@@ -267,6 +262,33 @@ fn attribute(
         crate::rows::sort_rows(batch);
     }
     rows
+}
+
+/// Splits a diagnostic path into `(case index, relative file components)`
+/// under the chunk dir: `<chunk>/<index>/<file…>`. The analyzer may report
+/// files under a different symlink spelling than the directory passed on its
+/// command line (macOS resolves `/tmp` to `/private/tmp`), so when the
+/// direct prefix strip fails the fully resolved forms of both sides are
+/// compared before the row is given up on.
+fn split_under_chunk(path: &Path, chunk_dir: &Path) -> Option<(usize, Vec<String>)> {
+    let rest = match path.strip_prefix(chunk_dir) {
+        Ok(rest) => rest.to_owned(),
+        Err(_) => {
+            let resolved = std::fs::canonicalize(path).ok()?;
+            let resolved_chunk = std::fs::canonicalize(chunk_dir).ok()?;
+            resolved.strip_prefix(resolved_chunk).ok()?.to_owned()
+        }
+    };
+    let mut comps = rest.components();
+    let index = comps.next()?.as_os_str().to_string_lossy().into_owned();
+    let index: usize = index.parse().ok()?;
+    let file: Vec<String> = comps
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if file.is_empty() {
+        return None;
+    }
+    Some((index, file))
 }
 
 fn warn(message: &str) {
@@ -371,6 +393,27 @@ mod tests {
             rows[&7][1].message,
             "Workspace values must be a subdirectory of '<chunk>'."
         );
+    }
+
+    #[test]
+    fn attribution_resolves_a_symlinked_chunk_spelling() {
+        // The chunk is passed to the analyzer (and to `attribute`) through a
+        // symlink, while the analyzer reports the fully resolved spelling of
+        // the same directory; the rows must still attribute.
+        let base = std::env::temp_dir().join(format!("conf-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("7/lib")).expect("creates package root");
+        std::fs::write(real.join("7/lib/test.dart"), "var x = 1;\n").expect("writes file");
+        std::fs::create_dir_all(&base).expect("creates base");
+        std::os::unix::fs::symlink(&real, base.join("link")).expect("links chunk dir");
+        let mut reported = diag(real.join("7/lib/test.dart").to_str().unwrap());
+        reported.message = format!("Something is wrong with '{}'.", real.join("7").display());
+        let rows = attribute(&[reported], &base.join("link"), &[7]);
+        assert_eq!(rows[&7].len(), 1);
+        assert_eq!(rows[&7][0].file, "lib/test.dart");
+        assert_eq!(rows[&7][0].message, "Something is wrong with '<chunk>'.");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

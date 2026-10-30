@@ -12172,21 +12172,21 @@ diagnostics/non_constant_default_value/NonConstantDefaultValueTest/test_primaryC
 diagnostics/non_constant_default_value/doc_0	ERROR|non_constant_default_value|lib/test.dart|3:21|12|The default value of an optional parameter must be constant.
 diagnostics/non_constant_default_value/fix_0	-
 diagnostics/non_constant_default_value/fix_1	-
-diagnostics/non_constant_default_value_from_deferred_library/NonConstantDefaultValueFromDeferredLibraryTest/test_deferred#0	-
-diagnostics/non_constant_default_value_from_deferred_library/NonConstantDefaultValueFromDeferredLibraryTest/test_nested#0	-
+diagnostics/non_constant_default_value_from_deferred_library/NonConstantDefaultValueFromDeferredLibraryTest/test_deferred#0	ERROR|non_constant_default_value_from_deferred_library|lib/test.dart|4:10|1|Constant values from a deferred library can't be used as a default parameter value.
+diagnostics/non_constant_default_value_from_deferred_library/NonConstantDefaultValueFromDeferredLibraryTest/test_nested#0	ERROR|non_constant_default_value_from_deferred_library|lib/test.dart|4:10|1|Constant values from a deferred library can't be used as a default parameter value.
 diagnostics/non_constant_default_value_from_deferred_library/doc_0	ERROR|non_constant_default_value_from_deferred_library|lib/test.dart|3:19|4|Constant values from a deferred library can't be used as a default parameter value.
 diagnostics/non_constant_default_value_from_deferred_library/fix_0	-
 diagnostics/non_constant_default_value_from_deferred_library/fix_1	-
 diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenElseFalse_finalElse#0	ERROR|non_constant_list_element|lib/test.dart|3:34|1|The values in a const list literal must be constants.
-diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenElseFalse_finalThen#0	-
-diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenElseTrue_finalElse#0	-
+diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenElseFalse_finalThen#0	ERROR|non_constant_list_element|lib/test.dart|3:27|1|The values in a const list literal must be constants.
+diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenElseTrue_finalElse#0	ERROR|non_constant_list_element|lib/test.dart|3:34|1|The values in a const list literal must be constants.
 diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenElseTrue_finalThen#0	ERROR|non_constant_list_element|lib/test.dart|3:27|1|The values in a const list literal must be constants.
 diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenFalse_constThen#0	-
 diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenFalse_finalThen#0	ERROR|non_constant_list_element|lib/test.dart|3:27|1|The values in a const list literal must be constants.
 diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenTrue_constThen#0	-
-diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenTrue_finalThen#0	-
-diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_topVar#0	-
-diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_topVar_nested#0	-
+diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_ifElement_thenTrue_finalThen#0	ERROR|non_constant_list_element|lib/test.dart|3:27|1|The values in a const list literal must be constants.
+diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_topVar#0	ERROR|non_constant_list_element|lib/test.dart|3:16|1|The values in a const list literal must be constants.
+diagnostics/non_constant_list_element/NonConstantListElementTest/test_const_topVar_nested#0	ERROR|non_constant_list_element|lib/test.dart|3:16|1|The values in a const list literal must be constants.
 diagnostics/non_constant_list_element/NonConstantListElementTest/test_nonConst_topVar#0	-
 diagnostics/non_constant_list_element/doc_0	ERROR|non_constant_list_element|lib/test.dart|2:27|1|The values in a const list literal must be constants.
 diagnostics/non_constant_list_element/fix_0	-
@@ -12200,10 +12200,10 @@ diagnostics/non_constant_map_element/NonConstantMapElementTest/test_forElement_n
 diagnostics/non_constant_map_element/NonConstantMapElementTest/test_ifElementWithElse_mayBeConst#0	WARNING|dead_code|lib/test.dart|4:47|10|Dead code.
 diagnostics/non_constant_map_element/NonConstantMapElementTest/test_ifElement_mayBeConst#0	-
 diagnostics/non_constant_map_element/NonConstantMapElementTest/test_ifElement_nested_mayBeConst#0	-
-diagnostics/non_constant_map_element/NonConstantMapElementTest/test_ifElement_notConstCondition#0	-
+diagnostics/non_constant_map_element/NonConstantMapElementTest/test_ifElement_notConstCondition#0	ERROR|non_constant_map_element|lib/test.dart|4:23|8|The elements in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapElementTest/test_spreadElement_mayBeConst#0	-
-diagnostics/non_constant_map_element/NonConstantMapElementTest/test_spreadElement_notConst#0	-
-diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_ifElement_thenElseFalse_finalElse#0	-
+diagnostics/non_constant_map_element/NonConstantMapElementTest/test_spreadElement_notConst#0	ERROR|non_constant_map_element|lib/test.dart|4:22|8|The elements in a const map literal must be constant.
+diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_ifElement_thenElseFalse_finalElse#0	ERROR|non_constant_map_key|lib/test.dart|3:47|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_ifElement_thenElseFalse_finalThen#0	ERROR|non_constant_map_key|lib/test.dart|3:37|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_ifElement_thenElseTrue_finalElse#0	ERROR|non_constant_map_key|lib/test.dart|3:47|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_ifElement_thenElseTrue_finalThen#0	ERROR|non_constant_map_key|lib/test.dart|3:37|1|The keys in a const map literal must be constant.
@@ -12214,11 +12214,11 @@ diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_ifElement_
 diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_const_topVar#0	ERROR|non_constant_map_key|lib/test.dart|3:26|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapKeyTest/test_nonConst_topVar#0	-
 diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenElseFalse_finalElse#0	ERROR|non_constant_map_value|lib/test.dart|3:50|1|The values in a const map literal must be constant.
-diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenElseFalse_finalThen#0	-
+diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenElseFalse_finalThen#0	ERROR|non_constant_map_value|lib/test.dart|3:40|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenElseTrue_finalElse#0	ERROR|non_constant_map_value|lib/test.dart|3:50|1|The values in a const map literal must be constant.
-diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenElseTrue_finalThen#0	-
+diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenElseTrue_finalThen#0	ERROR|non_constant_map_value|lib/test.dart|3:40|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenFalse_constThen#0	-
-diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenFalse_finalThen#0	-
+diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenFalse_finalThen#0	ERROR|non_constant_map_value|lib/test.dart|3:40|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenTrue_constThen#0	-
 diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_ifElement_thenTrue_finalThen#0	ERROR|non_constant_map_value|lib/test.dart|3:40|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_element/NonConstantMapValueTest/test_const_topVar#0	ERROR|non_constant_map_value|lib/test.dart|3:29|1|The values in a const map literal must be constant.
@@ -12227,35 +12227,35 @@ diagnostics/non_constant_map_element/doc_0	ERROR|non_constant_map_element|lib/te
 diagnostics/non_constant_map_element/doc_1	ERROR|non_constant_map_element|lib/test.dart|2:32|8|The elements in a const map literal must be constant.
 diagnostics/non_constant_map_element/fix_0	-
 diagnostics/non_constant_map_element/fix_1	-
-diagnostics/non_constant_map_key/NonConstantMapKeyTest/test_const_ifElement_thenTrue_elseFinal#0	-
+diagnostics/non_constant_map_key/NonConstantMapKeyTest/test_const_ifElement_thenTrue_elseFinal#0	ERROR|non_constant_map_key|lib/test.dart|4:36|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_key/NonConstantMapKeyTest/test_const_ifElement_thenTrue_thenFinal#0	ERROR|non_constant_map_key|lib/test.dart|4:26|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_key/NonConstantMapKeyTest/test_const_topLevel#0	ERROR|non_constant_map_key|lib/test.dart|3:16|1|The keys in a const map literal must be constant.
-diagnostics/non_constant_map_key/doc_0	-
+diagnostics/non_constant_map_key/doc_0	ERROR|non_constant_map_key|lib/test.dart|2:16|1|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_key/fix_0	-
 diagnostics/non_constant_map_key/fix_1	-
-diagnostics/non_constant_map_key_from_deferred_library/NonConstantMapKeyFromDeferredLibraryTest/test_const_ifElement_thenTrue_deferredElse#0	-
+diagnostics/non_constant_map_key_from_deferred_library/NonConstantMapKeyFromDeferredLibraryTest/test_const_ifElement_thenTrue_deferredElse#0	ERROR|non_constant_map_key|lib/test.dart|4:37|3|The keys in a const map literal must be constant.
 diagnostics/non_constant_map_key_from_deferred_library/NonConstantMapKeyFromDeferredLibraryTest/test_const_ifElement_thenTrue_deferredThen#0	ERROR|collection_element_from_deferred_library|lib/test.dart|4:29|1|Constant values from a deferred library can't be used as keys in a 'const' map literal.
 diagnostics/non_constant_map_key_from_deferred_library/NonConstantMapKeyFromDeferredLibraryTest/test_const_topLevel_deferred#0	ERROR|collection_element_from_deferred_library|lib/test.dart|3:18|1|Constant values from a deferred library can't be used as keys in a 'const' map literal.
 diagnostics/non_constant_map_key_from_deferred_library/NonConstantMapKeyFromDeferredLibraryTest/test_const_topLevel_deferred_nested#0	ERROR|collection_element_from_deferred_library|lib/test.dart|3:18|1|Constant values from a deferred library can't be used as keys in a 'const' map literal.
 diagnostics/non_constant_map_pattern_key/NonConstantMapPatternKeyTest/test_formalParameter#0	ERROR|non_constant_map_pattern_key|lib/test.dart|3:15|1|Key expressions in map patterns must be constants.
 diagnostics/non_constant_map_pattern_key/NonConstantMapPatternKeyTest/test_instanceCreation_noConst#0	ERROR|non_constant_map_pattern_key|lib/test.dart|3:15|3|Key expressions in map patterns must be constants.
 diagnostics/non_constant_map_pattern_key/NonConstantMapPatternKeyTest/test_integerLiteral#0	-
-diagnostics/non_constant_map_pattern_key/doc_0	-
+diagnostics/non_constant_map_pattern_key/doc_0	ERROR|non_constant_map_pattern_key|lib/test.dart|2:15|3|Key expressions in map patterns must be constants.
 diagnostics/non_constant_map_pattern_key/fix_0	-
 diagnostics/non_constant_map_value/NonConstantMapValueTest/test_const_ifTrue_elseFinal#0	ERROR|non_constant_map_value|lib/test.dart|4:42|1|The values in a const map literal must be constant.
-diagnostics/non_constant_map_value/NonConstantMapValueTest/test_const_ifTrue_thenFinal#0	-
+diagnostics/non_constant_map_value/NonConstantMapValueTest/test_const_ifTrue_thenFinal#0	ERROR|non_constant_map_value|lib/test.dart|4:32|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_value/NonConstantMapValueTest/test_const_topLevel#0	ERROR|non_constant_map_value|lib/test.dart|3:22|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_value/doc_0	ERROR|non_constant_map_value|lib/test.dart|2:19|1|The values in a const map literal must be constant.
 diagnostics/non_constant_map_value/fix_0	-
 diagnostics/non_constant_map_value/fix_1	-
-diagnostics/non_constant_map_value_from_deferred_library/NonConstantMapValueFromDeferredLibraryTest/test_const_ifElement_thenTrue_elseDeferred#0	-
-diagnostics/non_constant_map_value_from_deferred_library/NonConstantMapValueFromDeferredLibraryTest/test_const_ifElement_thenTrue_thenDeferred#0	-
+diagnostics/non_constant_map_value_from_deferred_library/NonConstantMapValueFromDeferredLibraryTest/test_const_ifElement_thenTrue_elseDeferred#0	ERROR|non_constant_map_value|lib/test.dart|4:47|3|The values in a const map literal must be constant.
+diagnostics/non_constant_map_value_from_deferred_library/NonConstantMapValueFromDeferredLibraryTest/test_const_ifElement_thenTrue_thenDeferred#0	ERROR|collection_element_from_deferred_library|lib/test.dart|4:35|1|Constant values from a deferred library can't be used as values in a 'const' map literal.
 diagnostics/non_constant_map_value_from_deferred_library/NonConstantMapValueFromDeferredLibraryTest/test_const_topLevel_deferred#0	ERROR|collection_element_from_deferred_library|lib/test.dart|3:24|1|Constant values from a deferred library can't be used as values in a 'const' map literal.
 diagnostics/non_constant_map_value_from_deferred_library/NonConstantMapValueFromDeferredLibraryTest/test_const_topLevel_deferred_nested#0	ERROR|collection_element_from_deferred_library|lib/test.dart|3:24|1|Constant values from a deferred library can't be used as values in a 'const' map literal.
 diagnostics/non_constant_record_field/NonConstantRecordFieldTest/test_const_namedField#0	ERROR|non_constant_record_field|lib/test.dart|3:19|1|The fields in a const record literal must be constants.
 diagnostics/non_constant_record_field/NonConstantRecordFieldTest/test_const_positionalField#0	ERROR|non_constant_record_field|lib/test.dart|3:16|1|The fields in a const record literal must be constants.
 diagnostics/non_constant_record_field/NonConstantRecordFieldTest/test_nonConst#0	-
-diagnostics/non_constant_record_field_from_deferred_library/NonConstantRecordFieldFromDeferredLibraryTest/test_const_deferred#0	-
+diagnostics/non_constant_record_field_from_deferred_library/NonConstantRecordFieldFromDeferredLibraryTest/test_const_deferred#0	ERROR|non_constant_record_field_from_deferred_library|lib/test.dart|3:18|1|Constant values from a deferred library can't be used as fields in a 'const' record literal.
 diagnostics/non_constant_record_field_from_deferred_library/NonConstantRecordFieldFromDeferredLibraryTest/test_const_notDeferred#0	-
 diagnostics/non_constant_record_field_from_deferred_library/NonConstantRecordFieldFromDeferredLibraryTest/test_nonConst_deferred#0	-
 diagnostics/non_constant_relational_pattern_expression/NonConstantRelationalPatternExpressionTest/test_const_imported#0	-
@@ -12264,21 +12264,21 @@ diagnostics/non_constant_relational_pattern_expression/NonConstantRelationalPatt
 diagnostics/non_constant_relational_pattern_expression/NonConstantRelationalPatternExpressionTest/test_const_topLevelVariable#0	-
 diagnostics/non_constant_relational_pattern_expression/NonConstantRelationalPatternExpressionTest/test_notConst_formalParameter#0	ERROR|non_constant_relational_pattern_expression|lib/test.dart|3:16|1|The relational pattern expression must be a constant.
 diagnostics/non_constant_relational_pattern_expression/NonConstantRelationalPatternExpressionTest/test_notConst_topLevelVariable#0	ERROR|non_constant_relational_pattern_expression|lib/test.dart|5:16|1|The relational pattern expression must be a constant.
-diagnostics/non_constant_relational_pattern_expression/doc_0	-
+diagnostics/non_constant_relational_pattern_expression/doc_0	ERROR|non_constant_relational_pattern_expression|lib/test.dart|4:16|1|The relational pattern expression must be a constant.
 diagnostics/non_constant_relational_pattern_expression/fix_0	-
-diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenElseFalse_finalElse#0	-
-diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenElseFalse_finalThen#0	-
+diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenElseFalse_finalElse#0	ERROR|non_constant_set_element|lib/test.dart|3:39|1|The values in a const set literal must be constants.
+diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenElseFalse_finalThen#0	ERROR|non_constant_set_element|lib/test.dart|3:32|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenElseTrue_finalElse#0	ERROR|non_constant_set_element|lib/test.dart|3:39|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenElseTrue_finalThen#0	ERROR|non_constant_set_element|lib/test.dart|3:32|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenFalse_constThen#0	-
-diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenFalse_finalThen#0	-
+diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenFalse_finalThen#0	ERROR|non_constant_set_element|lib/test.dart|3:32|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenTrue_constThen#0	-
-diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenTrue_finalThen#0	-
+diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_ifElement_thenTrue_finalThen#0	ERROR|non_constant_set_element|lib/test.dart|3:32|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_parameter#0	ERROR|non_constant_set_element|lib/test.dart|3:17|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_spread_final#0	ERROR|non_constant_set_element|lib/test.dart|3:19|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_const_topVar#0	ERROR|non_constant_set_element|lib/test.dart|3:21|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/NonConstantSetElementTest/test_nonConst_topVar#0	-
-diagnostics/non_constant_set_element/doc_0	-
+diagnostics/non_constant_set_element/doc_0	ERROR|non_constant_set_element|lib/test.dart|3:16|1|The values in a const set literal must be constants.
 diagnostics/non_constant_set_element/fix_0	-
 diagnostics/non_constant_set_element/fix_1	-
 diagnostics/non_constant_type_argument/NonConstantTypeArgumentTest/test_asFunction_R#0	ERROR|non_constant_type_argument|lib/test.dart|6:18|1|The type arguments to 'asFunction' must be known at compile time, so they can't be type parameters.
@@ -12287,13 +12287,13 @@ diagnostics/non_constant_type_argument/NonConstantTypeArgumentWarningTest/test_r
 diagnostics/non_constant_type_argument/NonConstantTypeArgumentWarningTest/test_refWithFinalizer_typeParameter#0	ERROR|non_constant_type_argument|lib/test.dart|5:5|27|The type arguments to 'refWithFinalizer' must be known at compile time, so they can't be type parameters.
 diagnostics/non_constant_type_argument/NonConstantTypeArgumentWarningTest/test_ref_class#0	-
 diagnostics/non_constant_type_argument/NonConstantTypeArgumentWarningTest/test_ref_class_cascade#0	-
-diagnostics/non_constant_type_argument/NonConstantTypeArgumentWarningTest/test_ref_typeParameter#0	-
+diagnostics/non_constant_type_argument/NonConstantTypeArgumentWarningTest/test_ref_typeParameter#0	ERROR|non_constant_type_argument|lib/test.dart|5:5|5|The type arguments to 'ref' must be known at compile time, so they can't be type parameters.
 diagnostics/non_constant_type_argument/doc_0	ERROR|non_constant_type_argument|lib/test.dart|7:18|1|The type arguments to 'asFunction' must be known at compile time, so they can't be type parameters.
 diagnostics/non_constant_type_argument/fix_0	-
-diagnostics/non_covariant_type_parameter_position_in_representation_type/NonCovariantTypeParameterPositionInRepresentationTypeTest/test_contravariant#0	-
+diagnostics/non_covariant_type_parameter_position_in_representation_type/NonCovariantTypeParameterPositionInRepresentationTypeTest/test_contravariant#0	ERROR|non_covariant_type_parameter_position_in_representation_type|lib/test.dart|2:18|1|An extension type parameter can't be used in a non-covariant position of its representation type.
 diagnostics/non_covariant_type_parameter_position_in_representation_type/NonCovariantTypeParameterPositionInRepresentationTypeTest/test_covariant#0	-
-diagnostics/non_covariant_type_parameter_position_in_representation_type/NonCovariantTypeParameterPositionInRepresentationTypeTest/test_invariant#0	-
-diagnostics/non_covariant_type_parameter_position_in_representation_type/doc_0	-
+diagnostics/non_covariant_type_parameter_position_in_representation_type/NonCovariantTypeParameterPositionInRepresentationTypeTest/test_invariant#0	ERROR|non_covariant_type_parameter_position_in_representation_type|lib/test.dart|2:18|1|An extension type parameter can't be used in a non-covariant position of its representation type.
+diagnostics/non_covariant_type_parameter_position_in_representation_type/doc_0	ERROR|non_covariant_type_parameter_position_in_representation_type|lib/test.dart|1:18|1|An extension type parameter can't be used in a non-covariant position of its representation type.
 diagnostics/non_covariant_type_parameter_position_in_representation_type/fix_0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchExpressionTest/test_bool_true#0	ERROR|non_exhaustive_switch_expression|lib/test.dart|3:10|6|The type 'bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'false'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchExpressionTest/test_bool_true_false#0	-
@@ -12311,7 +12311,7 @@ diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysEx
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_Null_noError#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_boolNullable_true_false#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|3:3|6|The type 'bool?' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'null'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_boolNullable_true_false_null#0	-
-diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_bool_true#0	-
+diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_bool_true#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|3:3|6|The type 'bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'false'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_bool_true_false#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_bool_wildcard_typed_bool#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_bool_wildcard_typed_int#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|3:3|6|The type 'bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'true'.	WARNING|pattern_never_matches_value_type|lib/test.dart|4:10|3|The matched value type 'bool' can never match the required type 'int'.
@@ -12320,9 +12320,9 @@ diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysEx
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_enum_2at2_cases#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_enum_2at2_hasWhen#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|7:3|6|The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.a'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_enum_2at2_logicalOr#0	-
-diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_enum_cannotCompute#0	-
+diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_enum_cannotCompute#0	ERROR|recursive_compile_time_constant|lib/test.dart|3:3|2|The compile-time constant expression depends on itself.	ERROR|recursive_compile_time_constant|lib/test.dart|3:11|2|The compile-time constant expression depends on itself.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_recordType_bool_bool_4at4#0	-
-diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_sealedClass_2at1#0	-
+diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_sealedClass_2at1#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|7:3|6|The type 'A' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'C()'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_sealedClass_2at2#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_sealedClass_2at2_wildcard#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_sealedClass_constraintsMixin#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|9:3|6|The type 'A' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'M()'.
@@ -12338,16 +12338,16 @@ diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysEx
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_typeVariable_bound_bool_true_false#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_typeVariable_promoted_bool_true#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|4:5|6|The type 'T & bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'false'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_alwaysExhaustive_typeVariable_promoted_bool_true_false#0	-
-diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_invalidType_empty#0	-
+diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_invalidType_empty#0	ERROR|undefined_class|lib/test.dart|2:8|10|Undefined class 'Unresolved'.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_notAlwaysExhaustive_int#0	-
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_private_enum#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|5:3|6|The enum '_E' isn't exhaustively matched by the switch cases because some of the enum constants are private.	WARNING|unused_field|lib/private_enum.dart|2:14|1|The value of the field 'b' isn't used.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_private_enumConstant#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|5:3|6|The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.b'.	WARNING|unused_field|lib/private_enum.dart|2:16|2|The value of the field '_c' isn't used.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_private_enumConstant_only#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|5:3|6|The enum 'E' isn't exhaustively matched by the switch cases because some of the enum constants are private.	WARNING|unused_field|lib/private_enum.dart|2:16|2|The value of the field '_c' isn't used.
 diagnostics/non_exhaustive_switch/NonExhaustiveSwitchStatementTest/test_private_sealed#0	ERROR|non_exhaustive_switch_statement|lib/test.dart|5:3|6|The type '_A' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'B()'.
-diagnostics/non_exhaustive_switch_expression/doc_0	-
+diagnostics/non_exhaustive_switch_expression/doc_0	ERROR|non_exhaustive_switch_expression|lib/test.dart|3:18|6|The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.three'.
 diagnostics/non_exhaustive_switch_expression/fix_0	-
 diagnostics/non_exhaustive_switch_expression/fix_1	-
-diagnostics/non_exhaustive_switch_statement/doc_0	-
+diagnostics/non_exhaustive_switch_statement/doc_0	ERROR|non_exhaustive_switch_statement|lib/test.dart|4:3|6|The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.three'.
 diagnostics/non_exhaustive_switch_statement/fix_0	-
 diagnostics/non_exhaustive_switch_statement/fix_1	-
 diagnostics/non_final_field_in_enum/NonFinalFieldInEnumTest/test_declaringFormalParameter_optionalNamed_typeInt_final#0	-
@@ -12368,22 +12368,22 @@ diagnostics/non_final_field_in_enum/NonFinalFieldInEnumTest/test_fieldDeclaratio
 diagnostics/non_final_field_in_enum/NonFinalFieldInEnumTest/test_fieldDeclaration_instance_late#0	ERROR|non_final_field_in_enum|lib/test.dart|4:12|3|Enums can only declare final fields.
 diagnostics/non_final_field_in_enum/NonFinalFieldInEnumTest/test_fieldDeclaration_static#0	-
 diagnostics/non_final_field_in_enum/NonFinalFieldInEnumTest/test_fieldDeclaration_static_final#0	-
-diagnostics/non_final_field_in_enum/doc_0	-
+diagnostics/non_final_field_in_enum/doc_0	ERROR|non_final_field_in_enum|lib/test.dart|4:7|1|Enums can only declare final fields.
 diagnostics/non_final_field_in_enum/fix_0	-
 diagnostics/non_final_field_in_enum/fix_1	-
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_explicit_constructor#0	ERROR|non_generative_constructor|lib/test.dart|7:9|13|The generative constructor 'A.named()' is expected, but a factory was found.
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_explicit_primaryConstructor_hasBody#0	ERROR|non_generative_constructor|lib/test.dart|7:10|13|The generative constructor 'A.named()' is expected, but a factory was found.
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_implicit_constructor_newHead#0	ERROR|non_generative_constructor|lib/test.dart|7:3|7|The generative constructor 'A()' is expected, but a factory was found.
-diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_implicit_constructor_typeName#0	-
+diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_implicit_constructor_typeName#0	ERROR|non_generative_constructor|lib/test.dart|7:3|5|The generative constructor 'A()' is expected, but a factory was found.
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_implicit_constructor_typeName_external#0	-
-diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_implicit_primaryConstructor_hasBody#0	-
+diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_factory_implicit_primaryConstructor_hasBody#0	ERROR|non_generative_constructor|lib/test.dart|7:3|4|The generative constructor 'A()' is expected, but a factory was found.
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_generative_constructor#0	-
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_generative_primaryConstructor#0	-
 diagnostics/non_generative_constructor/NonGenerativeConstructorTest/test_generative_primaryContructor#0	-
-diagnostics/non_generative_constructor/doc_0	-
+diagnostics/non_generative_constructor/doc_0	ERROR|non_generative_constructor|lib/test.dart|7:9|11|The generative constructor 'A.one()' is expected, but a factory was found.
 diagnostics/non_generative_constructor/fix_0	-
 diagnostics/non_generative_implicit_constructor/NonGenerativeImplicitConstructorTest/test_explicit_augmentationDeclares#0	-
-diagnostics/non_generative_implicit_constructor/NonGenerativeImplicitConstructorTest/test_implicit#0	-
+diagnostics/non_generative_implicit_constructor/NonGenerativeImplicitConstructorTest/test_implicit#0	ERROR|non_generative_implicit_constructor|lib/test.dart|6:7|1|The unnamed constructor of superclass 'A' (called by the default constructor of 'B') must be a generative constructor, but factory found.
 diagnostics/non_generative_implicit_constructor/doc_0	ERROR|non_generative_implicit_constructor|lib/test.dart|7:7|1|The unnamed constructor of superclass 'A' (called by the default constructor of 'B') must be a generative constructor, but factory found.
 diagnostics/non_generative_implicit_constructor/fix_0	-
 diagnostics/non_generative_implicit_constructor/fix_1	-
@@ -12398,15 +12398,15 @@ diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_dy
 diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_inheritedDynamic#0	WARNING|non_nullable_equals_parameter|lib/test.dart|4:17|2|The parameter type of '==' operators should be non-nullable.	WARNING|non_nullable_equals_parameter|lib/test.dart|8:17|2|The parameter type of '==' operators should be non-nullable.
 diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_inheritedFromObject#0	-
 diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_int#0	-
-diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_nullableObject#0	-
+diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_nullableObject#0	WARNING|non_nullable_equals_parameter|lib/test.dart|4:17|2|The parameter type of '==' operators should be non-nullable.
 diagnostics/non_nullable_equals_parameter/NonNullableEqualsParameterTest/test_object#0	-
 diagnostics/non_nullable_equals_parameter/doc_0	WARNING|non_nullable_equals_parameter|lib/test.dart|3:17|2|The parameter type of '==' operators should be non-nullable.
 diagnostics/non_nullable_equals_parameter/fix_0	-
 diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_multi_negative#0	ERROR|non_positive_array_dimension|lib/test.dart|5:17|2|Array dimensions must be positive numbers.
 diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_multi_oneOfMany#0	ERROR|non_positive_array_dimension|lib/test.dart|5:26|2|Array dimensions must be positive numbers.
 diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_multi_positive#0	-
-diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_multi_zero#0	-
-diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_single_negative#0	-
+diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_multi_zero#0	ERROR|non_positive_array_dimension|lib/test.dart|5:17|1|Array dimensions must be positive numbers.
+diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_single_negative#0	ERROR|non_positive_array_dimension|lib/test.dart|5:10|3|Array dimensions must be positive numbers.
 diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_single_positive#0	-
 diagnostics/non_positive_array_dimension/NonPositiveArrayDimensionTest/test_single_zero#0	ERROR|non_positive_array_dimension|lib/test.dart|5:10|1|Array dimensions must be positive numbers.
 diagnostics/non_positive_array_dimension/doc_0	ERROR|non_positive_array_dimension|lib/test.dart|4:10|2|Array dimensions must be positive numbers.
@@ -12420,10 +12420,10 @@ diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGe
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_class_generative_nonRedirecting#0	ERROR|non_redirecting_generative_constructor_with_primary|lib/test.dart|3:3|7|Classes with primary constructors can't have non-redirecting generative constructors.
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_class_generative_redirectingToNonPrimary#0	ERROR|non_redirecting_generative_constructor_with_primary|lib/test.dart|4:3|8|Classes with primary constructors can't have non-redirecting generative constructors.
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_class_generative_redirectingToPrimary#0	-
-diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_class_generative_redirectingToUnresolved#0	-
+diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_class_generative_redirectingToUnresolved#0	ERROR|redirect_generative_to_missing_constructor|lib/test.dart|3:15|14|The constructor 'C.missing' couldn't be found in 'C'.
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_class_noPrimaryConstructor#0	-
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_enum_factory#0	-
-diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_enum_generative_nonRedirecting#0	-
+diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_enum_generative_nonRedirecting#0	ERROR|non_redirecting_generative_constructor_with_primary|lib/test.dart|4:9|7|Classes with primary constructors can't have non-redirecting generative constructors.	WARNING|unused_element|lib/test.dart|4:11|5|The declaration 'E.named' isn't referenced.
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_enum_generative_redirectingToPrimary#0	WARNING|unused_element|lib/test.dart|4:11|5|The declaration 'E.named' isn't referenced.
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_enum_noPrimaryConstructor#0	-
 diagnostics/non_redirecting_generative_constructor_with_primary/NonRedirectingGenerativeConstructorWithPrimaryTest/test_extensionType_generative_nonRedirecting#0	-
@@ -12435,10 +12435,10 @@ diagnostics/non_sized_type_argument/NonSizedTypeArgument/test_invalid_union#0	ER
 diagnostics/non_sized_type_argument/NonSizedTypeArgument/test_valid#0	-
 diagnostics/non_sized_type_argument/doc_0	ERROR|non_sized_type_argument|lib/test.dart|5:18|4|The type 'Void' isn't a valid type argument for 'Array'. The type argument must be a native integer, 'Float', 'Double', 'Pointer', or subtype of 'Struct', 'Union', or 'AbiSpecificInteger'.
 diagnostics/non_sized_type_argument/fix_0	-
-diagnostics/non_sync_factory/doc_0	-
+diagnostics/non_sync_factory/doc_0	ERROR|invalid_modifier_on_constructor|lib/test.dart|2:15|5|The modifier 'async' can't be applied to the body of a constructor.	ERROR|non_sync_factory|lib/test.dart|2:15|5|Factory bodies can't use 'async', 'async*', or 'sync*'.
 diagnostics/non_sync_factory/fix_0	-
 diagnostics/non_sync_factory/fix_1	-
-diagnostics/non_type_as_type_argument/NonTypeAsTypeArgumentTest/test_issue54388#0	-
+diagnostics/non_type_as_type_argument/NonTypeAsTypeArgumentTest/test_issue54388#0	ERROR|non_type_as_type_argument|lib/test.dart|4:36|1|The name 'A' isn't a type, so it can't be used as a type argument.
 diagnostics/non_type_as_type_argument/NonTypeAsTypeArgumentTest/test_notAType#0	ERROR|non_type_as_type_argument|lib/test.dart|4:5|1|The name 'A' isn't a type, so it can't be used as a type argument.
 diagnostics/non_type_as_type_argument/NonTypeAsTypeArgumentTest/test_undefinedIdentifier#0	ERROR|non_type_as_type_argument|lib/test.dart|3:5|1|The name 'A' isn't a type, so it can't be used as a type argument.
 diagnostics/non_type_as_type_argument/doc_0	ERROR|non_type_as_type_argument|lib/test.dart|2:6|1|The name 'x' isn't a type, so it can't be used as a type argument.
@@ -12450,10 +12450,10 @@ diagnostics/non_type_in_catch_clause/NonTypeInCatchClauseTest/test_isInterfaceTy
 diagnostics/non_type_in_catch_clause/NonTypeInCatchClauseTest/test_isTypeParameter#0	-
 diagnostics/non_type_in_catch_clause/NonTypeInCatchClauseTest/test_noType#0	-
 diagnostics/non_type_in_catch_clause/NonTypeInCatchClauseTest/test_notDefined#0	ERROR|non_type_in_catch_clause|lib/test.dart|4:8|1|The name 'T' isn't a type and can't be used in an on-catch clause.
-diagnostics/non_type_in_catch_clause/NonTypeInCatchClauseTest/test_notType#0	-
-diagnostics/non_type_in_catch_clause/doc_0	-
+diagnostics/non_type_in_catch_clause/NonTypeInCatchClauseTest/test_notType#0	ERROR|non_type_in_catch_clause|lib/test.dart|5:8|1|The name 'T' isn't a type and can't be used in an on-catch clause.
+diagnostics/non_type_in_catch_clause/doc_0	ERROR|non_type_in_catch_clause|lib/test.dart|4:8|1|The name 'f' isn't a type and can't be used in an on-catch clause.
 diagnostics/non_type_in_catch_clause/fix_0	-
-diagnostics/non_void_return_for_operator/NonVoidReturnForOperatorTest/test_indexSetter#0	-
+diagnostics/non_void_return_for_operator/NonVoidReturnForOperatorTest/test_indexSetter#0	ERROR|non_void_return_for_operator|lib/test.dart|3:3|3|The return type of the operator []= must be 'void'.
 diagnostics/non_void_return_for_operator/NonVoidReturnForOperatorTest/test_no_return#0	-
 diagnostics/non_void_return_for_operator/NonVoidReturnForOperatorTest/test_void#0	-
 diagnostics/non_void_return_for_operator/doc_0	ERROR|non_void_return_for_operator|lib/test.dart|2:3|3|The return type of the operator []= must be 'void'.
@@ -12461,7 +12461,7 @@ diagnostics/non_void_return_for_operator/fix_0	-
 diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_function#0	ERROR|non_void_return_for_setter|lib/test.dart|2:1|3|The return type of the setter must be 'void' or absent.
 diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_function_no_return#0	-
 diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_function_void#0	-
-diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_method#0	-
+diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_method#0	ERROR|non_void_return_for_setter|lib/test.dart|3:3|3|The return type of the setter must be 'void' or absent.
 diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_method_no_return#0	-
 diagnostics/non_void_return_for_setter/NonVoidReturnForSetterTest/test_method_void#0	-
 diagnostics/non_void_return_for_setter/doc_0	ERROR|non_void_return_for_setter|lib/test.dart|2:3|3|The return type of the setter must be 'void' or absent.
@@ -12469,18 +12469,18 @@ diagnostics/non_void_return_for_setter/fix_0	-
 diagnostics/not_a_type/NotATypeTest/test_class_constructor#0	ERROR|not_a_type|lib/test.dart|6:1|5|A.foo isn't a type.
 diagnostics/not_a_type/NotATypeTest/test_class_method#0	ERROR|not_a_type|lib/test.dart|6:1|5|A.foo isn't a type.
 diagnostics/not_a_type/NotATypeTest/test_extension#0	ERROR|not_a_type|lib/test.dart|3:1|1|E isn't a type.
-diagnostics/not_a_type/NotATypeTest/test_function#0	-
+diagnostics/not_a_type/NotATypeTest/test_function#0	ERROR|not_a_type|lib/test.dart|4:3|1|f isn't a type.	WARNING|unused_local_variable|lib/test.dart|4:5|1|The value of the local variable 'v' isn't used.
 diagnostics/not_a_type/doc_0	ERROR|not_a_type|lib/test.dart|2:3|1|f isn't a type.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftExpression#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_compound#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_compound_assignInRight#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:13|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_pure_eq#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_pure_eq_self#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:7|1|The non-nullable local variable 'v' must be assigned before it can be used.
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_pure_questionEq#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_pure_questionEq#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|dead_code|lib/test.dart|4:9|2|Dead code.	WARNING|dead_null_aware_expression|lib/test.dart|4:9|1|The left operand can't be null, so the right operand is never executed.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_assignment_leftLocal_pure_questionEq_self#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:9|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|dead_code|lib/test.dart|4:9|2|Dead code.	WARNING|dead_null_aware_expression|lib/test.dart|4:9|1|The left operand can't be null, so the right operand is never executed.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_basic#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_ifNull_left#0	WARNING|dead_code|lib/test.dart|4:11|4|Dead code.	WARNING|dead_null_aware_expression|lib/test.dart|4:14|1|The left operand can't be null, so the right operand is never executed.
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_ifNull_right#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_ifNull_right#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|dead_code|lib/test.dart|4:5|10|Dead code.	WARNING|dead_null_aware_expression|lib/test.dart|4:8|7|The left operand can't be null, so the right operand is never executed.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_logicalAnd_left#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_logicalAnd_right#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_logicalOr_left#0	-
@@ -12489,15 +12489,15 @@ diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedP
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_binaryExpression_plus_right#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_conditionalExpression_condition#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_conditional_both#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_conditional_else#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_conditional_else#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_conditional_then#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_breakOuterFromInner#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|14:3|2|The non-nullable local variable 'v3' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_break_afterAssignment#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_break_beforeAssignment#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|8:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition_break#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition_break_continue#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition_continue#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:5|2|The non-nullable local variable 'v1' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition_break#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|7:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition_break_continue#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|12:28|2|The non-nullable local variable 'v4' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|14:3|2|The non-nullable local variable 'v3' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|15:3|2|The non-nullable local variable 'v5' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|16:3|2|The non-nullable local variable 'v6' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_condition_continue#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:23|2|The non-nullable local variable 'v2' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|11:3|2|The non-nullable local variable 'v3' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_continue_beforeAssignment#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|8:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_doWhile_true_assignInBreak#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_extensionType_hasImplements#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|6:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
@@ -12509,24 +12509,24 @@ diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedP
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_break#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|2|The non-nullable local variable 'v1' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|10:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_break_updaters#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_condition#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_continue#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_continue#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|2|The non-nullable local variable 'v1' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|10:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_continue_updaters#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:18|2|The non-nullable local variable 'v2' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_initializer_expression#0	WARNING|dead_code|lib/test.dart|7:3|2|Dead code.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_initializer_variable#0	WARNING|dead_code|lib/test.dart|7:3|2|Dead code.	WARNING|unused_local_variable|lib/test.dart|4:12|1|The value of the local variable 't' isn't used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_updaters#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|4:37|2|The non-nullable local variable 'v4' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:5|2|The non-nullable local variable 'v1' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|7:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.	WARNING|unused_local_variable|lib/test.dart|3:15|2|The value of the local variable 'v3' isn't used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_for_updaters_afterBody#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_closure_read#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_closure_write#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_local#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_local2#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_read#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_closure_read#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:5|2|The non-nullable local variable 'v2' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_closure_write#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_local#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:5|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|unused_element|lib/test.dart|7:8|1|The declaration 'f' isn't referenced.	WARNING|unused_local_variable|lib/test.dart|3:7|1|The value of the local variable 'v' isn't used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_local2#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|12:5|2|The non-nullable local variable 'v3' must be assigned before it can be used.	WARNING|unused_element|lib/test.dart|7:8|1|The declaration 'f' isn't referenced.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_read#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:5|2|The non-nullable local variable 'v2' must be assigned before it can be used.	WARNING|unused_element|lib/test.dart|7:8|1|The declaration 'f' isn't referenced.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_functionExpression_localFunction_write#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|unused_element|lib/test.dart|5:8|1|The declaration 'f' isn't referenced.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_futureOr_questionArgument_none#0	WARNING|unused_local_variable|lib/test.dart|5:18|1|The value of the local variable 'v' isn't used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_hasInitializer#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_false#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_logicalAnd#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_logicalOr#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_false#0	WARNING|dead_code|lib/test.dart|4:14|25|Dead code.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_logicalAnd#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|7:5|1|The non-nullable local variable 'v' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_logicalOr#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|5:5|1|The non-nullable local variable 'v' must be assigned before it can be used.	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_notFalse#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_notTrue#0	WARNING|dead_code|lib/test.dart|4:14|25|Dead code.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_if_condition_true#0	-
@@ -12540,10 +12540,10 @@ diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedP
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_notUsed#0	WARNING|unused_local_variable|lib/test.dart|3:7|1|The value of the local variable 'v' isn't used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_nullable#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case1_default#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|14:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case1_default_language219#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case2_default#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case2_default_language219#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case_default_break#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case1_default_language219#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|15:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case2_default#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|15:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case2_default_language219#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|16:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case_default_break#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|16:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case_default_break_language219#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|17:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case_default_continue#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_switch_case_default_continue_language219#0	-
@@ -12570,23 +12570,23 @@ diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedP
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_type_void#0	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'v' isn't used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_condition#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_condition_notTrue#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|8:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_breakOuterFromInner#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_breakOuterFromInner#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|15:3|2|The non-nullable local variable 'v3' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_afterAssignment#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_beforeAssignment#0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_if#0	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_beforeAssignment#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|9:3|1|The non-nullable local variable 'v' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_if#0	WARNING|dead_code|lib/test.dart|12:5|2|Dead code.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_if2#0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_break_if3#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|16:3|2|The non-nullable local variable 'v2' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_continue#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|8:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|dead_code|lib/test.dart|8:3|2|Dead code.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/NotInitializedPotentiallyNonNullableLocalVariableTest/test_while_true_noBreak#0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|8:3|1|The non-nullable local variable 'v' must be assigned before it can be used.	WARNING|dead_code|lib/test.dart|8:3|2|Dead code.
-diagnostics/not_assigned_potentially_non_nullable_local_variable/doc_0	-
-diagnostics/not_assigned_potentially_non_nullable_local_variable/doc_1	-
+diagnostics/not_assigned_potentially_non_nullable_local_variable/doc_0	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|3:10|1|The non-nullable local variable 'x' must be assigned before it can be used.
+diagnostics/not_assigned_potentially_non_nullable_local_variable/doc_1	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|6:10|1|The non-nullable local variable 'x' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/doc_2	ERROR|not_assigned_potentially_non_nullable_local_variable|lib/test.dart|7:12|1|The non-nullable local variable 'x' must be assigned before it can be used.
 diagnostics/not_assigned_potentially_non_nullable_local_variable/fix_0	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/fix_1	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/fix_2	-
 diagnostics/not_assigned_potentially_non_nullable_local_variable/fix_3	-
-diagnostics/not_binary_operator/NonBinaryOperatorTest/test_unaryTilde#0	-
-diagnostics/not_binary_operator/doc_0	-
+diagnostics/not_binary_operator/NonBinaryOperatorTest/test_unaryTilde#0	ERROR|not_binary_operator|lib/test.dart|2:11|1|'~' isn't a binary operator.
+diagnostics/not_binary_operator/doc_0	ERROR|not_binary_operator|lib/test.dart|1:11|1|'~' isn't a binary operator.
 diagnostics/not_binary_operator/fix_0	-
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_annotation_named#0	ERROR|not_enough_positional_arguments|lib/test.dart|5:10|1|1 positional argument expected by 'named', but 0 found.
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_annotation_withArgumentList#0	ERROR|not_enough_positional_arguments|lib/test.dart|5:4|1|1 positional argument expected by 'A.new', but 0 found.
@@ -12600,40 +12600,40 @@ diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/tes
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_instanceCreationExpression_const_namedArgument_insteadOfRequiredPositional#0	ERROR|not_enough_positional_arguments|lib/test.dart|6:11|1|1 positional argument expected by 'A.new', but 0 found.	ERROR|undefined_named_parameter|lib/test.dart|6:11|1|The named parameter 'p' isn't defined.
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_instanceCreationExpression_named#0	ERROR|not_enough_positional_arguments|lib/test.dart|7:12|1|2 positional arguments expected by 'named', but 1 found.
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_instanceCreationExpression_positionalAndNamed#0	ERROR|not_enough_positional_arguments|lib/test.dart|7:6|1|2 positional arguments expected by 'A.new', but 1 found.
-diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_methodInvocation_function#0	-
-diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_redirectingConstructorInvocation#0	-
-diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_redirectingConstructorInvocation_named#0	-
-diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_superConstructorInvocation#0	-
+diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_methodInvocation_function#0	ERROR|not_enough_positional_arguments|lib/test.dart|4:5|1|2 positional arguments expected by 'f', but 0 found.
+diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_redirectingConstructorInvocation#0	ERROR|not_enough_positional_arguments|lib/test.dart|4:31|1|1 positional argument expected by 'A.new', but 0 found.
+diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_redirectingConstructorInvocation_named#0	ERROR|not_enough_positional_arguments|lib/test.dart|4:31|1|1 positional argument expected by 'named', but 0 found.
+diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_superConstructorInvocation#0	ERROR|not_enough_positional_arguments|lib/test.dart|6:21|1|1 positional argument expected by 'A.new', but 0 found.
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_superConstructorInvocation_named#0	ERROR|not_enough_positional_arguments|lib/test.dart|6:27|1|1 positional argument expected by 'named', but 0 found.
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_superConstructorInvocation_superParameter_optional#0	-
 diagnostics/not_enough_positional_arguments/NotEnoughPositionalArgumentsTest/test_superConstructorInvocation_superParameter_required#0	-
 diagnostics/not_enough_positional_arguments/doc_0	ERROR|not_enough_positional_arguments|lib/test.dart|3:6|1|2 positional arguments expected by 'f', but 1 found.
 diagnostics/not_enough_positional_arguments/fix_0	-
-diagnostics/not_initialized_non_nullable_instance_field/doc_0	-
+diagnostics/not_initialized_non_nullable_instance_field/doc_0	ERROR|not_initialized_non_nullable_instance_field|lib/test.dart|2:7|1|Non-nullable instance field 'x' must be initialized.
 diagnostics/not_initialized_non_nullable_instance_field/doc_1	ERROR|not_initialized_non_nullable_instance_field|lib/test.dart|6:3|3|Non-nullable instance field 'x' must be initialized.
 diagnostics/not_initialized_non_nullable_instance_field/fix_0	-
 diagnostics/not_initialized_non_nullable_instance_field/fix_1	-
 diagnostics/not_initialized_non_nullable_instance_field/fix_2	-
 diagnostics/not_initialized_non_nullable_variable/doc_0	ERROR|not_initialized_non_nullable_variable|lib/test.dart|2:14|1|The non-nullable variable 'f' must be initialized.
-diagnostics/not_initialized_non_nullable_variable/doc_1	-
+diagnostics/not_initialized_non_nullable_variable/doc_1	ERROR|not_initialized_non_nullable_variable|lib/test.dart|1:5|1|The non-nullable variable 'v' must be initialized.
 diagnostics/not_initialized_non_nullable_variable/fix_0	-
 diagnostics/not_initialized_non_nullable_variable/fix_1	-
 diagnostics/not_initialized_non_nullable_variable/fix_2	-
-diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_argumentDeep_notInstantiated#0	-
+diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_argumentDeep_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:19|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_argument_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:19|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_bound_argument_instantiated#0	-
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_bound_argument_recursive_instantiated#0	-
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_bound_bound_instantiated#0	-
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_function_instantiated#0	-
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_instantiated#0	-
-diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_boundArgument_notInstantiated#0	-
+diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_boundArgument_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|2:21|1|Type parameter bound types must be instantiated.	ERROR|not_instantiated_bound|lib/test.dart|3:21|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|2:19|1|Type parameter bound types must be instantiated.	ERROR|not_instantiated_bound|lib/test.dart|3:19|1|Type parameter bound types must be instantiated.	ERROR|not_instantiated_bound|lib/test.dart|4:19|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_notInstantiated_genericFunctionType#0	ERROR|not_instantiated_bound|lib/test.dart|2:33|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_notInstantiated_genericFunctionType2#0	ERROR|not_instantiated_bound|lib/test.dart|2:43|1|Type parameter bound types must be instantiated.
-diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_typedef_notInstantiated#0	-
+diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_recursion_typedef_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:19|1|Type parameter bound types must be instantiated.	ERROR|not_instantiated_bound|lib/test.dart|4:19|1|Type parameter bound types must be instantiated.	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_class_typedef_instantiated#0	-
-diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_direct_notInstantiated#0	-
-diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_functionType_notInstantiated#0	-
+diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_direct_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:19|1|Type parameter bound types must be instantiated.
+diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_functionType_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|4:19|1|Type parameter bound types must be instantiated.	ERROR|not_instantiated_bound|lib/test.dart|5:19|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_indirect_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:24|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_typedef_argumentDeep_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:26|1|Type parameter bound types must be instantiated.
 diagnostics/not_instantiated_bound/NotInstantiatedBoundTest/test_typedef_argument_notInstantiated#0	ERROR|not_instantiated_bound|lib/test.dart|3:26|1|Type parameter bound types must be instantiated.
@@ -14160,10 +14160,10 @@ diagnostics/todo/TodoTest/test_todo_singleLineCommentMoreIndentedContinuation#0	
 diagnostics/todo/TodoTest/test_todo_singleLineCommentNested#0	-
 diagnostics/todo/TodoTest/test_todo_singleLineCommentWrapped#0	-
 diagnostics/todo/TodoTest/test_undone#0	-
-diagnostics/top_level_cycle/TopLevelCycleTest/test_cycle_fields#0	-
-diagnostics/top_level_cycle/TopLevelCycleTest/test_cycle_fields_chain#0	-
-diagnostics/top_level_cycle/TopLevelCycleTest/test_cycle_topLevelVariables#0	-
-diagnostics/top_level_cycle/TopLevelCycleTest/test_singleVariable#0	-
+diagnostics/top_level_cycle/TopLevelCycleTest/test_cycle_fields#0	ERROR|top_level_cycle|lib/test.dart|3:16|1|The type of 'x' can't be inferred because it depends on itself through the cycle: x, y.	ERROR|top_level_cycle|lib/test.dart|4:16|1|The type of 'y' can't be inferred because it depends on itself through the cycle: x, y.
+diagnostics/top_level_cycle/TopLevelCycleTest/test_cycle_fields_chain#0	ERROR|top_level_cycle|lib/test.dart|3:16|1|The type of 'a' can't be inferred because it depends on itself through the cycle: a, c.	ERROR|top_level_cycle|lib/test.dart|5:9|1|The type of 'c' can't be inferred because it depends on itself through the cycle: a, c.
+diagnostics/top_level_cycle/TopLevelCycleTest/test_cycle_topLevelVariables#0	ERROR|top_level_cycle|lib/test.dart|2:5|1|The type of 'x' can't be inferred because it depends on itself through the cycle: x, y.	ERROR|top_level_cycle|lib/test.dart|3:5|1|The type of 'y' can't be inferred because it depends on itself through the cycle: x, y.
+diagnostics/top_level_cycle/TopLevelCycleTest/test_singleVariable#0	ERROR|top_level_cycle|lib/test.dart|2:5|1|The type of 'x' can't be inferred because it depends on itself through the cycle: x.
 diagnostics/top_level_cycle/TopLevelCycleTest/test_singleVariable_fromList#0	ERROR|top_level_cycle|lib/test.dart|2:5|5|The type of 'elems' can't be inferred because it depends on itself through the cycle: elems.
 diagnostics/top_level_instance_getter/TopLevelInstanceGetterTest/test_call#0	-
 diagnostics/top_level_instance_getter/TopLevelInstanceGetterTest/test_field#0	-
@@ -14198,38 +14198,38 @@ diagnostics/top_level_instance_getter/TopLevelInstanceGetterTest/test_implicitly
 diagnostics/top_level_instance_getter/TopLevelInstanceGetterTest/test_implicitlyTyped_prefixedIdentifier#0	-
 diagnostics/top_level_instance_getter/TopLevelInstanceGetterTest/test_implicitlyTyped_propertyAccessLhs#0	-
 diagnostics/top_level_instance_getter/TopLevelInstanceGetterTest/test_prefixedIdentifier#0	-
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_functionTypeAlias_typeParameterBounds#0	-
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_functionTypeAlias_typeParameterBounds#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_functionTypedParameter_returnType#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_generic#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.	ERROR|type_alias_cannot_reference_itself|lib/test.dart|3:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_genericTypeAlias_typeParameterBounds#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_infiniteParameterBoundCycle#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_issue11987#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:14|1|Typedefs can't reference themselves directly or recursively via another typedef.	ERROR|type_alias_cannot_reference_itself|lib/test.dart|3:14|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_issue19459#0	-
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_cycleOf2#0	-
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_cycleOf2#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|2|Typedefs can't reference themselves directly or recursively via another typedef.	ERROR|type_alias_cannot_reference_itself|lib/test.dart|3:9|2|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_directly_ListOfIt#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_directly_functionWithIt#0	-
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_directly_functionWithIt#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_directly_it_none#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_aliasedType_directly_it_question#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_typeParameterBounds#0	-
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_named#0	-
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_positional#0	-
-diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_required#0	-
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_nonFunction_typeParameterBounds#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_named#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_positional#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
+diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_required#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_parameterType_typeArgument#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_referencesReturnType_inTypeAlias#0	-
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_returnClass_withTypeAlias#0	-
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_returnType#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:11|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_returnType_indirect#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:11|1|Typedefs can't reference themselves directly or recursively via another typedef.	ERROR|type_alias_cannot_reference_itself|lib/test.dart|3:11|1|Typedefs can't reference themselves directly or recursively via another typedef.
 diagnostics/type_alias_cannot_reference_itself/TypeAliasCannotReferenceItselfTest/test_usingRecordType_directly#0	ERROR|type_alias_cannot_reference_itself|lib/test.dart|2:9|1|Typedefs can't reference themselves directly or recursively via another typedef.
-diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_annotation_typeArgument#0	-
-diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_asExpression#0	-
-diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_catchClause#0	-
-diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_fieldFormalParameter#0	-
+diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_annotation_typeArgument#0	ERROR|type_annotation_deferred_class|lib/test.dart|5:4|3|The deferred type 'a.D' can't be used in a declaration, cast, or type test.
+diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_asExpression#0	ERROR|type_annotation_deferred_class|lib/test.dart|5:8|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
+diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_catchClause#0	ERROR|type_annotation_deferred_class|lib/test.dart|6:8|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
+diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_fieldFormalParameter#0	ERROR|type_annotation_deferred_class|lib/test.dart|6:5|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_functionDeclaration_returnType#0	ERROR|type_annotation_deferred_class|lib/test.dart|4:1|4|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_functionTypedFormalParameter_returnType#0	ERROR|type_annotation_deferred_class|lib/test.dart|4:3|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_isExpression#0	ERROR|type_annotation_deferred_class|lib/test.dart|5:17|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.	WARNING|unused_local_variable|lib/test.dart|5:8|1|The value of the local variable 'b' isn't used.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_methodDeclaration_returnType#0	ERROR|type_annotation_deferred_class|lib/test.dart|5:3|4|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_simpleFormalParameter#0	ERROR|type_annotation_deferred_class|lib/test.dart|4:3|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
-diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_typeArgumentList#0	-
+diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_typeArgumentList#0	ERROR|type_annotation_deferred_class|lib/test.dart|5:3|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_typeArgumentList2#0	ERROR|type_annotation_deferred_class|lib/test.dart|5:3|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.	ERROR|type_annotation_deferred_class|lib/test.dart|5:8|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_typeParameter_bound#0	ERROR|type_annotation_deferred_class|lib/test.dart|4:19|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
 diagnostics/type_annotation_deferred_class/TypeAnnotationDeferredClassTest/test_variableDeclarationList#0	ERROR|type_annotation_deferred_class|lib/test.dart|4:1|3|The deferred type 'a.A' can't be used in a declaration, cast, or type test.
@@ -14302,36 +14302,36 @@ diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/
 diagnostics/type_argument_not_matching_bounds/TypeArgumentNotMatchingBoundsTest/test_with#0	ERROR|type_argument_not_matching_bounds|lib/test.dart|5:31|1|'B' doesn't conform to the bound 'A' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/doc_0	ERROR|type_argument_not_matching_bounds|lib/test.dart|3:11|6|'String' doesn't conform to the bound 'num' of the type parameter 'E'.
 diagnostics/type_argument_not_matching_bounds/fix_0	-
-diagnostics/type_check_is_not_null/TypeCheckIsNotNullTest/test_not_Null#0	-
-diagnostics/type_check_is_null/TypeCheckIsNullTest/test_is_Null#0	-
+diagnostics/type_check_is_not_null/TypeCheckIsNotNullTest/test_not_Null#0	WARNING|type_check_with_null|lib/test.dart|3:10|10|Tests for non-null should be done with '!= null'.
+diagnostics/type_check_is_null/TypeCheckIsNullTest/test_is_Null#0	WARNING|type_check_with_null|lib/test.dart|3:10|9|Tests for null should be done with '== null'.
 diagnostics/type_check_with_null/doc_0	WARNING|type_check_with_null|lib/test.dart|2:7|9|Tests for null should be done with '== null'.
 diagnostics/type_check_with_null/doc_1	WARNING|type_check_with_null|lib/test.dart|2:7|10|Tests for non-null should be done with '!= null'.
 diagnostics/type_check_with_null/fix_0	-
 diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_field#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:10|1|Static members can't reference type parameters of the class.
-diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_getter#0	-
-diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_method_bodyReference#0	-
+diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_getter#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:10|1|Static members can't reference type parameters of the class.
+diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_method_bodyReference#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|5:5|1|Static members can't reference type parameters of the class.
 diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_method_closure#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|4:13|1|Static members can't reference type parameters of the class.
 diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_method_parameter#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:14|1|Static members can't reference type parameters of the class.
 diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_method_return#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:10|1|Static members can't reference type parameters of the class.
 diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_class_setter#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:18|1|Static members can't reference type parameters of the class.
-diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_expression_method#0	-
-diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_extension_field#0	-
-diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_extension_method_return#0	-
-diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_mixin_field#0	-
-diagnostics/type_parameter_referenced_by_static/doc_0	-
+diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_expression_method#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|4:5|1|Static members can't reference type parameters of the class.
+diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_extension_field#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:10|1|Static members can't reference type parameters of the class.
+diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_extension_method_return#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:10|1|Static members can't reference type parameters of the class.
+diagnostics/type_parameter_referenced_by_static/TypeParameterReferencedByStaticTest/test_mixin_field#0	ERROR|type_parameter_referenced_by_static|lib/test.dart|3:10|1|Static members can't reference type parameters of the class.
+diagnostics/type_parameter_referenced_by_static/doc_0	ERROR|type_parameter_referenced_by_static|lib/test.dart|2:41|1|Static members can't reference type parameters of the class.
 diagnostics/type_parameter_referenced_by_static/fix_0	-
 diagnostics/type_parameter_referenced_by_static/fix_1	-
 diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|2:9|1|'T' can't be a supertype of its upper bound.
 diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1_local#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|3:14|1|'T' can't be a supertype of its upper bound.
 diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1_local_viaExtensionType#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|5:14|1|'U' can't be a supertype of its upper bound.
-diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1_used#0	-
-diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1_viaExtensionType#0	-
-diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_2of2_local_viaExtensionType#0	-
-diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_2of2_viaExtensionType#0	-
+diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1_used#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|2:9|1|'T' can't be a supertype of its upper bound.
+diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_1of1_viaExtensionType#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|4:9|1|'U' can't be a supertype of its upper bound.
+diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_2of2_local_viaExtensionType#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|5:14|2|'T1' can't be a supertype of its upper bound.	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|5:32|2|'T2' can't be a supertype of its upper bound.
+diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_2of2_viaExtensionType#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|4:9|2|'T1' can't be a supertype of its upper bound.	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|4:27|2|'T2' can't be a supertype of its upper bound.
 diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_2of3#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|2:9|2|'T1' can't be a supertype of its upper bound.	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|2:28|2|'T3' can't be a supertype of its upper bound.
 diagnostics/type_parameter_supertype_of_its_bound/TypeParameterSupertypeOfItsBoundTest/test_local_2of3#0	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|3:14|2|'T1' can't be a supertype of its upper bound.	ERROR|type_parameter_supertype_of_its_bound|lib/test.dart|3:33|2|'T3' can't be a supertype of its upper bound.
-diagnostics/type_test_with_non_type/TypeTestWithNonTypeTest/test_parameter#0	-
-diagnostics/type_test_with_non_type/doc_0	-
+diagnostics/type_test_with_non_type/TypeTestWithNonTypeTest/test_parameter#0	ERROR|type_test_with_non_type|lib/test.dart|4:12|1|The name 'A' isn't a type and can't be used in an 'is' expression.
+diagnostics/type_test_with_non_type/doc_0	ERROR|type_test_with_non_type|lib/test.dart|4:12|1|The name 'b' isn't a type and can't be used in an 'is' expression.
 diagnostics/type_test_with_non_type/fix_0	-
 diagnostics/type_test_with_non_type/fix_1	-
 diagnostics/type_test_with_undefined_name/TypeTestWithUndefinedNameTest/test_undefined#0	ERROR|type_test_with_undefined_name|lib/test.dart|3:12|1|The name 'A' isn't defined, so it can't be used in an 'is' expression.
@@ -14341,25 +14341,25 @@ diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_arr
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_dynamic#0	-
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_dynamic_returnType#0	WARNING|unawaited_return_in_try_block|lib/test.dart|4:5|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_finallyBlock#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_futureOr#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_futureOr_returnType#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_futureSubtype#0	-
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_futureOr#0	WARNING|unawaited_return_in_try_block|lib/test.dart|6:5|6|Returning a 'Future' without 'await' inside a try block.
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_futureOr_returnType#0	WARNING|unawaited_return_in_try_block|lib/test.dart|6:5|6|Returning a 'Future' without 'await' inside a try block.
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_futureSubtype#0	WARNING|unawaited_return_in_try_block|lib/test.dart|4:5|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_insideBlock#0	WARNING|unawaited_return_in_try_block|lib/test.dart|5:7|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_insideClosure#0	-
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_insideClosure_functionExpression#0	ERROR|unexpected_token|lib/test.dart|4:25|6|Unexpected text 'return'.	WARNING|unused_local_variable|lib/test.dart|4:9|1|The value of the local variable 'x' isn't used.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_invalidType#0	ERROR|undefined_identifier|lib/test.dart|3:10|7|Undefined name 'unknown'.
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_localFunction#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_localFunctionExpression_blockBody#0	-
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_localFunction#0	WARNING|unawaited_return_in_try_block|lib/test.dart|5:7|6|Returning a 'Future' without 'await' inside a try block.
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_localFunctionExpression_blockBody#0	WARNING|unawaited_return_in_try_block|lib/test.dart|5:7|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_method#0	WARNING|unawaited_return_in_try_block|lib/test.dart|5:7|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_nestedTry#0	WARNING|unawaited_return_in_try_block|lib/test.dart|6:7|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_nonFuture#0	-
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_notAsync#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_stream#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_typeParameter#0	-
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_stream#0	ERROR|return_in_generator|lib/test.dart|7:5|6|Can't return a value from a generator function that uses the 'async*' or 'sync*' modifier.
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_typeParameter#0	WARNING|unawaited_return_in_try_block|lib/test.dart|4:5|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_withinTryCatch#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_withinTryCatch_withinTryBlock#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_wrongType#0	-
-diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_wrongType2#0	-
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_withinTryCatch_withinTryBlock#0	WARNING|unawaited_return_in_try_block|lib/test.dart|5:7|6|Returning a 'Future' without 'await' inside a try block.
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_wrongType#0	ERROR|return_of_invalid_type|lib/test.dart|3:10|2|A value of type 'String' can't be returned from the function 'foo' because it has a return type of 'Future<int>'.
+diagnostics/unawaited_return_in_try_block/UnawaitedReturnInTryBlockTest/test_wrongType2#0	ERROR|return_of_invalid_type|lib/test.dart|3:10|24|A value of type 'Future<Null>' can't be returned from the function 'foo' because it has a return type of 'Future<int>?'.
 diagnostics/unawaited_return_in_try_block/doc_0	WARNING|unawaited_return_in_try_block|lib/test.dart|3:5|6|Returning a 'Future' without 'await' inside a try block.
 diagnostics/unawaited_return_in_try_block/fix_0	-
 diagnostics/unchecked_use_of_nullable_value/doc_0	ERROR|unchecked_use_of_nullable_value|lib/test.dart|2:9|6|The property 'length' can't be unconditionally accessed because the receiver can be 'null'.
@@ -14367,33 +14367,33 @@ diagnostics/unchecked_use_of_nullable_value/fix_0	-
 diagnostics/unchecked_use_of_nullable_value/fix_1	-
 diagnostics/unchecked_use_of_nullable_value/fix_2	-
 diagnostics/undefined_annotation/UndefinedAnnotationTest/test_identifier1_localVariable_const#0	-
-diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_identifier#0	-
+diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_identifier#0	ERROR|undefined_annotation|lib/test.dart|2:1|11|Undefined name 'unresolved' used as an annotation.
 diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_invocation#0	ERROR|undefined_annotation|lib/test.dart|2:1|13|Undefined name 'Unresolved' used as an annotation.
 diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_prefix#0	ERROR|undefined_annotation|lib/test.dart|2:1|7|Undefined name 'p' used as an annotation.
-diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_prefixed#0	-
-diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_prefixedIdentifier#0	-
-diagnostics/undefined_annotation/UndefinedAnnotationTest/test_useLibraryScope#0	-
-diagnostics/undefined_annotation/doc_0	-
+diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_prefixed#0	ERROR|undefined_annotation|lib/test.dart|4:1|7|Undefined name 'A' used as an annotation.
+diagnostics/undefined_annotation/UndefinedAnnotationTest/test_unresolved_prefixedIdentifier#0	ERROR|undefined_annotation|lib/test.dart|3:1|13|Undefined name 'unresolved' used as an annotation.
+diagnostics/undefined_annotation/UndefinedAnnotationTest/test_useLibraryScope#0	ERROR|undefined_annotation|lib/test.dart|2:1|4|Undefined name 'foo' used as an annotation.
+diagnostics/undefined_annotation/doc_0	ERROR|undefined_annotation|lib/test.dart|1:1|10|Undefined name 'undefined' used as an annotation.
 diagnostics/undefined_annotation/fix_0	-
 diagnostics/undefined_annotation/fix_1	-
 diagnostics/undefined_class/UndefinedClassTest/test_Record#0	-
 diagnostics/undefined_class/UndefinedClassTest/test_Record_language219#0	ERROR|undefined_class|lib/test.dart|3:8|6|Undefined class 'Record'.
 diagnostics/undefined_class/UndefinedClassTest/test_Record_language219_exported#0	-
-diagnostics/undefined_class/UndefinedClassTest/test_const#0	-
+diagnostics/undefined_class/UndefinedClassTest/test_const#0	ERROR|creation_with_non_type|lib/test.dart|3:16|1|The name 'A' isn't a class.
 diagnostics/undefined_class/UndefinedClassTest/test_dynamic_coreWithPrefix#0	ERROR|undefined_class|lib/test.dart|4:1|7|Undefined class 'dynamic'.
 diagnostics/undefined_class/UndefinedClassTest/test_ignore_libraryImport_prefix#0	ERROR|uri_does_not_exist|lib/test.dart|2:8|8|Target of URI doesn't exist: 'a.dart'.
 diagnostics/undefined_class/UndefinedClassTest/test_ignore_libraryImport_show_it#0	ERROR|uri_does_not_exist|lib/test.dart|2:8|8|Target of URI doesn't exist: 'a.dart'.
 diagnostics/undefined_class/UndefinedClassTest/test_ignore_libraryImport_show_other#0	ERROR|undefined_class|lib/test.dart|4:1|1|Undefined class 'A'.	ERROR|uri_does_not_exist|lib/test.dart|2:8|8|Target of URI doesn't exist: 'a.dart'.
-diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_exists_uriGenerated_nameIgnorable#0	-
-diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriGenerated2_nameIgnorable#0	-
-diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriGenerated_nameIgnorable#0	-
-diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriGenerated_nameNotIgnorable#0	-
+diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_exists_uriGenerated_nameIgnorable#0	ERROR|undefined_class|lib/test.dart|4:1|3|Undefined class '_$A'.
+diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriGenerated2_nameIgnorable#0	ERROR|uri_has_not_been_generated|lib/test.dart|2:6|17|Target of URI hasn't been generated: 'package:test/a.template.dart'.
+diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriGenerated_nameIgnorable#0	ERROR|uri_has_not_been_generated|lib/test.dart|2:6|10|Target of URI hasn't been generated: 'package:test/a.g.dart'.
+diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriGenerated_nameNotIgnorable#0	ERROR|undefined_class|lib/test.dart|4:1|1|Undefined class 'A'.	ERROR|uri_has_not_been_generated|lib/test.dart|2:6|10|Target of URI hasn't been generated: 'package:test/a.g.dart'.
 diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriNotGenerated_nameIgnorable#0	ERROR|undefined_class|lib/test.dart|4:1|3|Undefined class '_$A'.	ERROR|uri_does_not_exist|lib/test.dart|2:6|8|Target of URI doesn't exist: 'package:test/a.dart'.
 diagnostics/undefined_class/UndefinedClassTest/test_ignore_part_notExist_uriNotGenerated_nameNotIgnorable#0	ERROR|undefined_class|lib/test.dart|4:1|1|Undefined class 'A'.	ERROR|uri_does_not_exist|lib/test.dart|2:6|8|Target of URI doesn't exist: 'package:test/a.dart'.
-diagnostics/undefined_class/UndefinedClassTest/test_import_exists_prefixed#0	-
-diagnostics/undefined_class/UndefinedClassTest/test_instanceCreation#0	-
-diagnostics/undefined_class/UndefinedClassTest/test_variableDeclaration#0	-
-diagnostics/undefined_class/doc_0	-
+diagnostics/undefined_class/UndefinedClassTest/test_import_exists_prefixed#0	ERROR|undefined_class|lib/test.dart|4:1|3|Undefined class 'A'.
+diagnostics/undefined_class/UndefinedClassTest/test_instanceCreation#0	ERROR|creation_with_non_type|lib/test.dart|2:11|1|The name 'C' isn't a class.
+diagnostics/undefined_class/UndefinedClassTest/test_variableDeclaration#0	ERROR|undefined_class|lib/test.dart|2:7|1|Undefined class 'C'.	WARNING|unused_local_variable|lib/test.dart|2:9|1|The value of the local variable 'c' isn't used.
+diagnostics/undefined_class/doc_0	ERROR|undefined_class|lib/test.dart|3:8|5|Undefined class 'Piont'.
 diagnostics/undefined_class/fix_0	-
 diagnostics/undefined_class_boolean/UndefinedClassBooleanTest/test_variableDeclaration#0	ERROR|undefined_class|lib/test.dart|2:7|7|Undefined class 'boolean'.	WARNING|unused_local_variable|lib/test.dart|2:15|1|The value of the local variable 'v' isn't used.
 diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializerTest/test_explicit_named_defined_constructor#0	-
@@ -14403,7 +14403,7 @@ diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializ
 diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializerTest/test_explicit_unnamed_defined_constructor#0	-
 diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializerTest/test_explicit_unnamed_defined_primaryConstructorBody#0	-
 diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializerTest/test_explicit_unnamed_notDefined_constructor#0	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:9|7|The class 'A' doesn't have an unnamed constructor.
-diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializerTest/test_explicit_unnamed_notDefined_primaryConstructorBody#0	-
+diagnostics/undefined_constructor_in_initializer/UndefinedConstructorInInitializerTest/test_explicit_unnamed_notDefined_primaryConstructorBody#0	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:10|7|The class 'A' doesn't have an unnamed constructor.
 diagnostics/undefined_constructor_in_initializer/doc_0	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:9|7|The class 'A' doesn't have an unnamed constructor.
 diagnostics/undefined_constructor_in_initializer/doc_1	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:9|9|The class 'A' doesn't have a constructor named 'm'.
 diagnostics/undefined_constructor_in_initializer/fix_0	-
@@ -14414,11 +14414,11 @@ diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInI
 diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_defined_primaryConstructor_noBody#0	-
 diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_notDefined_constructor_newHead#0	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:3|7|The class 'A' doesn't have an unnamed constructor.
 diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_notDefined_constructor_typeName#0	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:3|5|The class 'A' doesn't have an unnamed constructor.
-diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_notDefined_primaryConstructor_hasBody#0	-
-diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_notDefined_primaryConstructor_noBody#0	-
+diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_notDefined_primaryConstructor_hasBody#0	ERROR|undefined_constructor_in_initializer|lib/test.dart|6:3|4|The class 'A' doesn't have an unnamed constructor.
+diagnostics/undefined_constructor_in_initializer_default/UndefinedConstructorInInitializerDefaultTest/test_implicit_notDefined_primaryConstructor_noBody#0	ERROR|undefined_constructor_in_initializer|lib/test.dart|5:7|5|The class 'A' doesn't have an unnamed constructor.
 diagnostics/undefined_enum_constant/UndefinedEnumConstantTest/test_defined#0	-
-diagnostics/undefined_enum_constant/UndefinedEnumConstantTest/test_undefined#0	-
-diagnostics/undefined_enum_constant/doc_0	-
+diagnostics/undefined_enum_constant/UndefinedEnumConstantTest/test_undefined#0	ERROR|undefined_enum_constant|lib/test.dart|4:12|3|There's no constant named 'TWO' in 'E'.
+diagnostics/undefined_enum_constant/doc_0	ERROR|undefined_enum_constant|lib/test.dart|3:11|1|There's no constant named 'c' in 'E'.
 diagnostics/undefined_enum_constant/fix_0	-
 diagnostics/undefined_enum_constant/fix_1	-
 diagnostics/undefined_enum_constructor/doc_0	ERROR|undefined_enum_constructor|lib/test.dart|2:3|1|The enum doesn't have an unnamed constructor.
@@ -14427,12 +14427,12 @@ diagnostics/undefined_enum_constructor/fix_0	-
 diagnostics/undefined_enum_constructor/fix_1	-
 diagnostics/undefined_enum_constructor/fix_2	-
 diagnostics/undefined_enum_constructor/fix_3	-
-diagnostics/undefined_enum_constructor_named/UndefinedEnumConstructorNamedTest/test_it#0	-
+diagnostics/undefined_enum_constructor_named/UndefinedEnumConstructorNamedTest/test_it#0	ERROR|undefined_enum_constructor|lib/test.dart|3:5|5|The enum doesn't have a constructor named 'named'.
 diagnostics/undefined_enum_constructor_unnamed/UndefinedEnumConstructorUnnamedTest/test_withArguments#0	ERROR|undefined_enum_constructor|lib/test.dart|3:3|1|The enum doesn't have an unnamed constructor.
 diagnostics/undefined_enum_constructor_unnamed/UndefinedEnumConstructorUnnamedTest/test_withoutArguments#0	ERROR|undefined_enum_constructor|lib/test.dart|3:3|1|The enum doesn't have an unnamed constructor.
 diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_override_defined#0	-
-diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_override_undefined#0	-
-diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_override_undefined_hasSetter#0	-
+diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_override_undefined#0	ERROR|undefined_extension_getter|lib/test.dart|4:10|1|The getter 'g' isn't defined for the extension 'E'.
+diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_override_undefined_hasSetter#0	ERROR|undefined_extension_getter|lib/test.dart|6:8|3|The getter 'foo' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_override_undefined_hasSetter_plusEq#0	ERROR|undefined_extension_getter|lib/test.dart|6:8|3|The getter 'foo' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_static_withInference#0	ERROR|undefined_extension_getter|lib/test.dart|3:11|1|The getter 'v' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_getter/UndefinedExtensionGetterTest/test_static_withoutInference#0	ERROR|undefined_extension_getter|lib/test.dart|4:5|1|The getter 'v' isn't defined for the extension 'E'.
@@ -14442,8 +14442,8 @@ diagnostics/undefined_extension_getter/fix_0	-
 diagnostics/undefined_extension_getter/fix_1	-
 diagnostics/undefined_extension_getter/fix_2	-
 diagnostics/undefined_extension_method/UndefinedExtensionMethodTest/test_method_defined#0	-
-diagnostics/undefined_extension_method/UndefinedExtensionMethodTest/test_method_undefined#0	-
-diagnostics/undefined_extension_method/UndefinedExtensionMethodTest/test_static_withInference#0	-
+diagnostics/undefined_extension_method/UndefinedExtensionMethodTest/test_method_undefined#0	ERROR|undefined_extension_method|lib/test.dart|4:10|1|The method 'm' isn't defined for the extension 'E'.
+diagnostics/undefined_extension_method/UndefinedExtensionMethodTest/test_static_withInference#0	ERROR|undefined_extension_method|lib/test.dart|3:11|1|The method 'm' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_method/UndefinedExtensionMethodTest/test_static_withoutInference#0	ERROR|undefined_extension_method|lib/test.dart|4:5|1|The method 'm' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_method/doc_0	ERROR|undefined_extension_method|lib/test.dart|10:10|1|The method 'b' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_method/doc_1	ERROR|undefined_extension_method|lib/test.dart|3:11|1|The method 'a' isn't defined for the extension 'E'.
@@ -14454,11 +14454,11 @@ diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_bin
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_binary_undefined#0	ERROR|undefined_extension_operator|lib/test.dart|4:10|1|The operator '+' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_getSet_hasBoth#0	-
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_getSet_hasGetter#0	ERROR|undefined_extension_operator|lib/test.dart|9:7|3|The operator '[]=' isn't defined for the extension 'E'.
-diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_getSet_hasNone#0	-
+diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_getSet_hasNone#0	ERROR|undefined_extension_operator|lib/test.dart|7:7|3|The operator '[]' isn't defined for the extension 'E'.	ERROR|undefined_extension_operator|lib/test.dart|7:7|3|The operator '[]=' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_getSet_hasSetter#0	ERROR|undefined_extension_operator|lib/test.dart|9:7|3|The operator '[]' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_get_hasGetter#0	-
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_get_hasNone#0	ERROR|undefined_extension_operator|lib/test.dart|7:7|3|The operator '[]' isn't defined for the extension 'E'.
-diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_get_hasSetter#0	-
+diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_get_hasSetter#0	ERROR|undefined_extension_operator|lib/test.dart|9:7|3|The operator '[]' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_set_hasGetter#0	ERROR|undefined_extension_operator|lib/test.dart|9:7|3|The operator '[]=' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_set_hasNone#0	ERROR|undefined_extension_operator|lib/test.dart|7:7|3|The operator '[]=' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_operator/UndefinedExtensionOperatorTest/test_index_set_hasSetter#0	-
@@ -14470,24 +14470,24 @@ diagnostics/undefined_extension_operator/fix_1	-
 diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_defined#0	-
 diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_undefined#0	ERROR|undefined_extension_setter|lib/test.dart|4:8|3|The setter 'foo' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_undefined_hasGetterAndNonExtensionSetter#0	ERROR|undefined_extension_setter|lib/test.dart|12:10|2|The setter 'id' isn't defined for the extension 'Ext'.
-diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_undefined_hasGetter_eq#0	-
-diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_undefined_hasGetter_plusEq#0	-
-diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_static_undefined#0	-
-diagnostics/undefined_extension_setter/doc_0	-
+diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_undefined_hasGetter_eq#0	ERROR|undefined_extension_setter|lib/test.dart|6:8|3|The setter 'foo' isn't defined for the extension 'E'.
+diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_override_undefined_hasGetter_plusEq#0	ERROR|undefined_extension_setter|lib/test.dart|6:8|3|The setter 'foo' isn't defined for the extension 'E'.
+diagnostics/undefined_extension_setter/UndefinedExtensionSetterTest/test_static_undefined#0	ERROR|undefined_extension_setter|lib/test.dart|4:5|3|The setter 'foo' isn't defined for the extension 'E'.
+diagnostics/undefined_extension_setter/doc_0	ERROR|undefined_extension_setter|lib/test.dart|10:10|1|The setter 'b' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_setter/doc_1	ERROR|undefined_extension_setter|lib/test.dart|4:5|1|The setter 'a' isn't defined for the extension 'E'.
 diagnostics/undefined_extension_setter/fix_0	-
 diagnostics/undefined_extension_setter/fix_1	-
 diagnostics/undefined_extension_setter/fix_2	-
-diagnostics/undefined_function/doc_0	-
+diagnostics/undefined_function/doc_0	ERROR|undefined_function|lib/test.dart|4:9|4|The function 'emty' isn't defined.
 diagnostics/undefined_function/fix_0	-
 diagnostics/undefined_getter/UndefinedGetterTest/test_compoundAssignment_hasSetter_instance#0	ERROR|undefined_getter|lib/test.dart|7:5|3|The getter 'foo' isn't defined for the type 'C'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_compoundAssignment_hasSetter_static#0	ERROR|undefined_getter|lib/test.dart|7:5|3|The getter 'foo' isn't defined for the type 'C'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_emptyName#0	ERROR|missing_identifier|lib/test.dart|5:13|1|Expected an identifier.
 diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_extendedHasSetter_extensionHasGetter#0	ERROR|undefined_getter|lib/test.dart|10:10|3|The getter 'foo' isn't defined for the type 'C'.
-diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_undefined_hasSetter#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_withInference#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_withoutInference#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_extension_this_extendedHasSetter_extensionHasGetter#0	-
+diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_undefined_hasSetter#0	ERROR|undefined_getter|lib/test.dart|6:5|3|The getter 'foo' isn't defined for the type 'int'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_withInference#0	ERROR|undefined_getter|lib/test.dart|3:11|1|The getter 'v' isn't defined for the type 'int'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_extension_instance_withoutInference#0	ERROR|undefined_getter|lib/test.dart|7:5|1|The getter 'a' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_extension_this_extendedHasSetter_extensionHasGetter#0	ERROR|undefined_getter|lib/test.dart|11:5|3|The getter 'foo' isn't defined for the type 'C'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_functionAlias_typeInstantiated_getter#0	ERROR|undefined_getter|lib/test.dart|5:11|3|The getter 'foo' isn't defined for the 'Fn' function type.
 diagnostics/undefined_getter/UndefinedGetterTest/test_functionAlias_typeInstantiated_getter_parenthesized#0	-
 diagnostics/undefined_getter/UndefinedGetterTest/test_generic_function_call#0	-
@@ -14499,120 +14499,120 @@ diagnostics/undefined_getter/UndefinedGetterTest/test_get_from_external_static_f
 diagnostics/undefined_getter/UndefinedGetterTest/test_get_from_external_static_field_valid#0	-
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inList_notPromoted#0	ERROR|undefined_getter|lib/test.dart|3:30|6|The getter 'length' isn't defined for the type 'int'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inList_promoted#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inMap_notPromoted#0	-
+diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inMap_notPromoted#0	ERROR|undefined_getter|lib/test.dart|3:34|6|The getter 'length' isn't defined for the type 'int'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inMap_promoted#0	-
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inSet_notPromoted#0	ERROR|undefined_getter|lib/test.dart|3:30|6|The getter 'length' isn't defined for the type 'int'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifElement_inSet_promoted#0	-
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifStatement_notPromoted#0	ERROR|undefined_getter|lib/test.dart|4:7|6|The getter 'length' isn't defined for the type 'int'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_ifStatement_promoted#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_instance_undefined#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_instance_undefined_mixin#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_new_cascade#0	-
+diagnostics/undefined_getter/UndefinedGetterTest/test_instance_undefined#0	ERROR|undefined_getter|lib/test.dart|3:19|1|The getter 'm' isn't defined for the type 'T'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_instance_undefined_mixin#0	ERROR|undefined_getter|lib/test.dart|3:21|1|The getter 'm' isn't defined for the type 'M'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_new_cascade#0	ERROR|undefined_getter|lib/test.dart|5:6|3|The getter 'new' isn't defined for the type 'C?'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_new_dynamic#0	ERROR|undefined_getter|lib/test.dart|3:5|3|The getter 'new' isn't defined for the type 'dynamic'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_new_expression#0	ERROR|undefined_getter|lib/test.dart|5:14|3|The getter 'new' isn't defined for the type 'C'.
-diagnostics/undefined_getter/UndefinedGetterTest/test_new_nullAware#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_new_prefixedIdentifier#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_new_simpleIdentifier#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_new_typeVariable#0	-
+diagnostics/undefined_getter/UndefinedGetterTest/test_new_nullAware#0	ERROR|undefined_getter|lib/test.dart|5:6|3|The getter 'new' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_new_prefixedIdentifier#0	ERROR|undefined_getter|lib/test.dart|9:7|3|The getter 'new' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_new_simpleIdentifier#0	ERROR|undefined_getter|lib/test.dart|5:5|3|The getter 'new' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_new_typeVariable#0	ERROR|undefined_getter|lib/test.dart|3:5|3|The getter 'new' isn't defined for the type 'T'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_nullMember_undefined#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:9|3|An expression whose value is always 'null' can't be dereferenced.
 diagnostics/undefined_getter/UndefinedGetterTest/test_object_call#0	ERROR|undefined_getter|lib/test.dart|3:12|4|The getter 'call' isn't defined for the type 'Object'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_promotedTypeParameter_regress35305#0	ERROR|undefined_getter|lib/test.dart|4:7|6|The getter 'isEven' isn't defined for the type 'Y'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_propertyAccess_functionClass_call#0	ERROR|return_of_invalid_type|lib/test.dart|3:10|8|A value of type 'Function' can't be returned from the function 'f' because it has a return type of 'void'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_propertyAccess_functionType_call#0	-
 diagnostics/undefined_getter/UndefinedGetterTest/test_static_conditionalAccess_defined#0	WARNING|invalid_null_aware_operator|lib/test.dart|5:10|2|The receiver can't be null, so the null-aware operator '?.' is unnecessary.
-diagnostics/undefined_getter/UndefinedGetterTest/test_static_definedInSuperclass#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_static_extension_InstanceAccess#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_static_undefined#0	-
-diagnostics/undefined_getter/UndefinedGetterTest/test_typeLiteral_cascadeTarget#0	-
+diagnostics/undefined_getter/UndefinedGetterTest/test_static_definedInSuperclass#0	ERROR|undefined_getter|lib/test.dart|7:7|1|The getter 'g' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_static_extension_InstanceAccess#0	ERROR|undefined_getter|lib/test.dart|10:8|1|The getter 'a' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_static_undefined#0	ERROR|undefined_getter|lib/test.dart|4:7|1|The getter 'm' isn't defined for the type 'C'.
+diagnostics/undefined_getter/UndefinedGetterTest/test_typeLiteral_cascadeTarget#0	ERROR|undefined_getter|lib/test.dart|6:6|3|The getter 'foo' isn't defined for the type 'Type'.
 diagnostics/undefined_getter/UndefinedGetterTest/test_typeLiteral_conditionalAccess#0	ERROR|undefined_getter|lib/test.dart|3:11|8|The getter 'hashCode' isn't defined for the type 'A'.	WARNING|invalid_null_aware_operator|lib/test.dart|3:9|2|The receiver can't be null, so the null-aware operator '?.' is unnecessary.
 diagnostics/undefined_getter/UndefinedGetterTest/test_typeSubstitution_defined#0	-
 diagnostics/undefined_getter/doc_0	ERROR|undefined_getter|lib/test.dart|1:22|3|The getter 'len' isn't defined for the type 'String'.
 diagnostics/undefined_getter/fix_0	-
-diagnostics/undefined_hidden_name/UndefinedHiddenNameTest/test_export#0	-
-diagnostics/undefined_hidden_name/UndefinedHiddenNameTest/test_import#0	-
+diagnostics/undefined_hidden_name/UndefinedHiddenNameTest/test_export#0	WARNING|undefined_hidden_name|lib/test.dart|2:25|1|The library 'package:test/lib1.dart' doesn't export a member with the hidden name 'a'.
+diagnostics/undefined_hidden_name/UndefinedHiddenNameTest/test_import#0	WARNING|undefined_hidden_name|lib/test.dart|2:25|1|The library 'package:test/lib1.dart' doesn't export a member with the hidden name 'a'.	WARNING|unused_import|lib/test.dart|2:8|11|Unused import: 'lib1.dart'.
 diagnostics/undefined_hidden_name/doc_0	WARNING|undefined_hidden_name|lib/test.dart|1:25|6|The library 'dart:math' doesn't export a member with the hidden name 'String'.
 diagnostics/undefined_hidden_name/fix_0	-
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_class#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:13|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:13|3|Undefined name 'foo'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_class_from_type_parameter#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:21|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:21|3|Undefined name 'foo'.
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_extension#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_extension_from_type_parameter#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_mixin#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_mixin_from_type_parameter#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_uses_scope_resolution_class#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_uses_scope_resolution_extension#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_extension#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:13|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:13|3|Undefined name 'foo'.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_extension_from_type_parameter#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:25|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:25|3|Undefined name 'foo'.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_mixin#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:13|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:13|3|Undefined name 'foo'.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_references_static_method_in_mixin_from_type_parameter#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:21|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:21|3|Undefined name 'foo'.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_uses_scope_resolution_class#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:30|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:30|3|Undefined name 'foo'.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_uses_scope_resolution_extension#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:34|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:34|3|Undefined name 'foo'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_annotation_uses_scope_resolution_mixin#0	ERROR|const_with_non_constant_argument|lib/test.dart|2:30|3|Arguments of a constant creation must be constant expressions.	ERROR|undefined_identifier|lib/test.dart|2:30|3|Undefined name 'foo'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_assignedPatternVariable#0	ERROR|undefined_identifier|lib/test.dart|3:4|1|Undefined name 'x'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_commentReference#0	WARNING|deprecated_new_in_comment_reference|lib/test.dart|2:14|3|Using the 'new' keyword in a comment reference is deprecated.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_compoundAssignment_noGetter_hasSetter#0	ERROR|undefined_identifier|lib/test.dart|5:3|3|Undefined name 'foo'.
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_compoundAssignment_noGetter_noSetter#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_for#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_compoundAssignment_noGetter_noSetter#0	ERROR|undefined_identifier|lib/test.dart|3:3|3|Undefined name 'foo'.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_for#0	ERROR|undefined_identifier|lib/test.dart|3:8|1|Undefined name 'e'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_forElement_inList_insideElement#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_forElement_inList_outsideElement#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_forElement_inList_outsideElement#0	ERROR|undefined_identifier|lib/test.dart|3:35|1|Undefined name 'x'.	WARNING|unused_local_variable|lib/test.dart|3:20|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_forStatement_inBody#0	-
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_forStatement_outsideBody#0	ERROR|undefined_identifier|lib/test.dart|4:3|1|Undefined name 'x'.	WARNING|unused_local_variable|lib/test.dart|3:12|1|The value of the local variable 'x' isn't used.
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_function#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_function#0	ERROR|undefined_identifier|lib/test.dart|2:12|1|Undefined name 'b'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_get_from_external_variable_final_valid#0	-
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_get_from_external_variable_valid#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_importCore_withShow#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_importCore_withShow#0	ERROR|undefined_identifier|lib/test.dart|5:3|6|Undefined name 'String'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_inheritedGetter_shadowedBy_topLevelSetter#0	ERROR|undefined_identifier|lib/test.dart|10:5|3|Undefined name 'foo'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_initializer#0	ERROR|undefined_identifier|lib/test.dart|2:9|1|Undefined name 'b'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_methodInvocation#0	ERROR|undefined_identifier|lib/test.dart|2:7|1|Undefined name 'C'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_postfixExpression_increment_noGetter_hasSetter#0	ERROR|undefined_identifier|lib/test.dart|5:3|3|Undefined name 'foo'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_prefixExpression_increment_noGetter_hasSetter#0	ERROR|undefined_identifier|lib/test.dart|5:5|3|Undefined name 'foo'.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_private_getter#0	ERROR|undefined_identifier|lib/test.dart|5:13|4|Undefined name '_foo'.	WARNING|unused_field|lib/lib.dart|4:7|4|The value of the field '_foo' isn't used.	WARNING|unused_local_variable|lib/test.dart|5:9|1|The value of the local variable 'v' isn't used.
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_private_setter#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_private_setter#0	ERROR|undefined_identifier|lib/test.dart|5:5|4|Undefined name '_foo'.	WARNING|unused_field|lib/lib.dart|4:7|4|The value of the field '_foo' isn't used.
 diagnostics/undefined_identifier/UndefinedIdentifierTest/test_set_external_variable_valid#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_synthetic_whenExpression_defined#0	-
-diagnostics/undefined_identifier/UndefinedIdentifierTest/test_synthetic_whenMethodName_defined#0	-
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_synthetic_whenExpression_defined#0	ERROR|missing_identifier|lib/test.dart|4:9|2|Expected an identifier.
+diagnostics/undefined_identifier/UndefinedIdentifierTest/test_synthetic_whenMethodName_defined#0	ERROR|missing_identifier|lib/test.dart|4:5|1|Expected an identifier.	ERROR|undefined_getter|lib/test.dart|4:5|1|The getter '(' isn't defined for the type 'int'.
 diagnostics/undefined_identifier/doc_0	ERROR|undefined_identifier|lib/test.dart|1:41|5|Undefined name 'rihgt'.
 diagnostics/undefined_identifier/fix_0	-
 diagnostics/undefined_identifier_await/UndefinedIdentifierAwaitTest/test_function#0	ERROR|undefined_identifier_await|lib/test.dart|2:12|5|Undefined name 'await' in function body not marked with 'async'.
 diagnostics/undefined_identifier_await/doc_0	ERROR|undefined_identifier_await|lib/test.dart|2:3|5|Undefined name 'await' in function body not marked with 'async'.	WARNING|unused_local_variable|lib/test.dart|2:9|1|The value of the local variable 'p' isn't used.
 diagnostics/undefined_identifier_await/fix_0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_conditional_expression_condition_context#0	-
+diagnostics/undefined_method/UndefinedMethodTest/test_conditional_expression_condition_context#0	ERROR|undefined_method|lib/test.dart|5:22|8|The method 'whatever' isn't defined for the type 'bool'.
 diagnostics/undefined_method/UndefinedMethodTest/test_constructor_defined#0	-
 diagnostics/undefined_method/UndefinedMethodTest/test_definedInPrivateExtension#0	ERROR|undefined_method|lib/test.dart|5:5|1|The method 'a' isn't defined for the type 'B'.	WARNING|unused_element|lib/lib.dart|5:8|1|The declaration 'a' isn't referenced.
 diagnostics/undefined_method/UndefinedMethodTest/test_definedInUnnamedExtension#0	ERROR|undefined_method|lib/test.dart|5:5|1|The method 'a' isn't defined for the type 'C'.	WARNING|unused_element|lib/lib.dart|5:8|1|The declaration 'a' isn't referenced.
 diagnostics/undefined_method/UndefinedMethodTest/test_extensionMethodHiddenByStaticSetter#0	ERROR|undefined_method|lib/test.dart|4:5|3|The method 'foo' isn't defined for the type 'C'.
-diagnostics/undefined_method/UndefinedMethodTest/test_extensionMethodShadowingTopLevelSetter#0	-
+diagnostics/undefined_method/UndefinedMethodTest/test_extensionMethodShadowingTopLevelSetter#0	ERROR|undefined_method|lib/test.dart|4:5|3|The method 'foo' isn't defined for the type 'C'.
 diagnostics/undefined_method/UndefinedMethodTest/test_functionAlias_notInstantiated#0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_functionAlias_typeInstantiated#0	-
+diagnostics/undefined_method/UndefinedMethodTest/test_functionAlias_typeInstantiated#0	ERROR|undefined_method|lib/test.dart|5:11|3|The method 'foo' isn't defined for the 'Fn' function type.
 diagnostics/undefined_method/UndefinedMethodTest/test_functionAlias_typeInstantiated_parenthesized#0	-
 diagnostics/undefined_method/UndefinedMethodTest/test_functionExpression_callMethod_defined#0	-
 diagnostics/undefined_method/UndefinedMethodTest/test_functionExpression_directCall_defined#0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_ignoreTypePropagation#0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_localSetterShadowingExtensionMethod#0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined#0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined_cascade#0	-
+diagnostics/undefined_method/UndefinedMethodTest/test_ignoreTypePropagation#0	ERROR|undefined_method|lib/test.dart|9:7|1|The method 'm' isn't defined for the type 'A'.
+diagnostics/undefined_method/UndefinedMethodTest/test_localSetterShadowingExtensionMethod#0	ERROR|undefined_method|lib/test.dart|12:5|3|The method 'foo' isn't defined for the type 'C'.
+diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined#0	ERROR|undefined_method|lib/test.dart|4:5|3|The method 'abs' isn't defined for the type 'C'.
+diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined_cascade#0	ERROR|undefined_method|lib/test.dart|4:6|3|The method 'abs' isn't defined for the type 'C'.
 diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined_enum#0	ERROR|undefined_method|lib/test.dart|3:10|3|The method 'abs' isn't defined for the type 'E'.
 diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined_mixin#0	ERROR|undefined_method|lib/test.dart|4:5|3|The method 'abs' isn't defined for the type 'M'.
 diagnostics/undefined_method/UndefinedMethodTest/test_method_undefined_mixin_cascade#0	ERROR|undefined_method|lib/test.dart|4:6|3|The method 'abs' isn't defined for the type 'M'.
 diagnostics/undefined_method/UndefinedMethodTest/test_static_conditionalAccess_defined#0	WARNING|invalid_null_aware_operator|lib/test.dart|5:8|2|The receiver can't be null, so the null-aware operator '?.' is unnecessary.
-diagnostics/undefined_method/UndefinedMethodTest/test_static_extension_instanceAccess#0	-
-diagnostics/undefined_method/UndefinedMethodTest/test_static_mixinApplication_superConstructorIsFactory#0	-
+diagnostics/undefined_method/UndefinedMethodTest/test_static_extension_instanceAccess#0	ERROR|undefined_method|lib/test.dart|9:5|1|The method 'a' isn't defined for the type 'C'.
+diagnostics/undefined_method/UndefinedMethodTest/test_static_mixinApplication_superConstructorIsFactory#0	ERROR|undefined_method|lib/test.dart|12:5|5|The method 'named' isn't defined for the type 'B'.
 diagnostics/undefined_method/UndefinedMethodTest/test_typeAlias_functionType#0	ERROR|undefined_method|lib/test.dart|5:5|3|The method 'foo' isn't defined for the type 'Type'.
 diagnostics/undefined_method/UndefinedMethodTest/test_typeAlias_interfaceType#0	ERROR|undefined_method|lib/test.dart|5:5|3|The method 'foo' isn't defined for the type 'List'.
 diagnostics/undefined_method/UndefinedMethodTest/test_withExtension#0	ERROR|undefined_method|lib/test.dart|9:5|1|The method 'c' isn't defined for the type 'C'.
 diagnostics/undefined_method/doc_0	ERROR|undefined_method|lib/test.dart|1:25|12|The method 'removeMiddle' isn't defined for the type 'List'.
 diagnostics/undefined_method/fix_0	-
-diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_constConstructor#0	-
-diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_constructor#0	-
-diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_enumConstant#0	-
+diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_constConstructor#0	ERROR|undefined_named_parameter|lib/test.dart|6:11|1|The named parameter 'p' isn't defined.
+diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_constructor#0	ERROR|undefined_named_parameter|lib/test.dart|6:5|1|The named parameter 'p' isn't defined.
+diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_enumConstant#0	ERROR|undefined_named_parameter|lib/test.dart|3:5|1|The named parameter 'a' isn't defined.
 diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_function#0	ERROR|undefined_named_parameter|lib/test.dart|4:5|1|The named parameter 'c' isn't defined.
-diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_method#0	-
+diagnostics/undefined_named_parameter/UndefinedNamedParameterTest/test_method#0	ERROR|undefined_named_parameter|lib/test.dart|6:9|1|The named parameter 'p' isn't defined.
 diagnostics/undefined_named_parameter/doc_0	ERROR|undefined_named_parameter|lib/test.dart|6:7|1|The named parameter 'a' isn't defined.
 diagnostics/undefined_named_parameter/fix_0	-
 diagnostics/undefined_named_parameter/fix_1	-
 diagnostics/undefined_named_parameter/fix_2	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_assignmentExpression_undefined#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_assignmentExpression_undefined#0	ERROR|undefined_operator|lib/test.dart|6:7|2|The operator '+' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_binaryExpression#0	ERROR|undefined_operator|lib/test.dart|5:7|1|The operator '+' isn't defined for the type 'A'.
-diagnostics/undefined_operator/UndefinedOperatorTest/test_binaryExpression_enum#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_binaryExpression_enum#0	ERROR|undefined_operator|lib/test.dart|3:13|1|The operator '+' isn't defined for the type 'E'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_binaryExpression_inSubtype#0	ERROR|undefined_operator|lib/test.dart|8:7|1|The operator '+' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_binaryExpression_mixin#0	ERROR|undefined_operator|lib/test.dart|3:13|1|The operator '+' isn't defined for the type 'M'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_indexBoth_undefined#0	ERROR|undefined_operator|lib/test.dart|4:4|3|The operator '[]' isn't defined for the type 'A'.	ERROR|undefined_operator|lib/test.dart|4:4|3|The operator '[]=' isn't defined for the type 'A'.
-diagnostics/undefined_operator/UndefinedOperatorTest/test_indexGetter_undefined#0	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_indexSetter_undefined#0	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_index_both#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_indexGetter_undefined#0	ERROR|undefined_operator|lib/test.dart|4:4|3|The operator '[]' isn't defined for the type 'A'.
+diagnostics/undefined_operator/UndefinedOperatorTest/test_indexSetter_undefined#0	ERROR|undefined_operator|lib/test.dart|4:4|3|The operator '[]=' isn't defined for the type 'A'.
+diagnostics/undefined_operator/UndefinedOperatorTest/test_index_both#0	ERROR|undefined_operator|lib/test.dart|5:4|3|The operator '[]' isn't defined for the type 'A'.	ERROR|undefined_operator|lib/test.dart|5:4|3|The operator '[]=' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_defined#0	-
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_enum#0	ERROR|undefined_operator|lib/test.dart|4:4|3|The operator '[]' isn't defined for the type 'E'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_get_extendedHasNone_extensionHasGetter#0	-
@@ -14620,32 +14620,32 @@ diagnostics/undefined_operator/UndefinedOperatorTest/test_index_get_extendedHasS
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_getter#0	ERROR|undefined_operator|lib/test.dart|5:4|3|The operator '[]' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_mixin#0	ERROR|undefined_operator|lib/test.dart|4:4|3|The operator '[]' isn't defined for the type 'M'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|3:4|1|An expression whose value is always 'null' can't be dereferenced.
-diagnostics/undefined_operator/UndefinedOperatorTest/test_index_set_extendedHasGetter_extensionHasSetter#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_index_set_extendedHasGetter_extensionHasSetter#0	ERROR|undefined_operator|lib/test.dart|11:4|3|The operator '[]=' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_index_set_extendedHasNone_extensionHasSetter#0	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_index_setter#0	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_minusEq_null#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_index_setter#0	ERROR|undefined_operator|lib/test.dart|5:4|3|The operator '[]=' isn't defined for the type 'A'.
+diagnostics/undefined_operator/UndefinedOperatorTest/test_minusEq_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:5|2|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_minus_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:5|1|An expression whose value is always 'null' can't be dereferenced.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_plusEq_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:5|2|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_plus_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:5|1|An expression whose value is always 'null' can't be dereferenced.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_plus_undefined#0	ERROR|undefined_operator|lib/test.dart|4:5|1|The operator '+' isn't defined for the type 'A'.
-diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixDec_null#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixDec_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:4|2|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixExpression#0	ERROR|undefined_operator|lib/test.dart|5:6|2|The operator '+' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixExpression_inSubtype#0	ERROR|undefined_operator|lib/test.dart|8:6|2|The operator '+' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixExpression_mixin#0	ERROR|undefined_operator|lib/test.dart|4:4|2|The operator '+' isn't defined for the type 'M'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixExpression_undefined#0	ERROR|undefined_operator|lib/test.dart|4:4|2|The operator '+' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_postfixInc_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:4|2|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixDec_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:3|2|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
-diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression#0	ERROR|undefined_operator|lib/test.dart|5:5|2|The operator '+' isn't defined for the type 'A'.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression_inSubtype#0	ERROR|undefined_operator|lib/test.dart|8:5|2|The operator '+' isn't defined for the type 'A'.
-diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression_mixin#0	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression_undefined#0	-
-diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixInc_null#0	-
+diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression_mixin#0	ERROR|undefined_operator|lib/test.dart|4:3|1|The operator 'unary-' isn't defined for the type 'M'.
+diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixExpression_undefined#0	ERROR|undefined_operator|lib/test.dart|4:3|2|The operator '+' isn't defined for the type 'A'.
+diagnostics/undefined_operator/UndefinedOperatorTest/test_prefixInc_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:3|2|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_operator/UndefinedOperatorTest/test_tilde_defined#0	-
 diagnostics/undefined_operator/UndefinedOperatorTest/test_unaryMinus_null#0	ERROR|invalid_use_of_null_value|lib/test.dart|4:3|1|An expression whose value is always 'null' can't be dereferenced.	WARNING|unused_local_variable|lib/test.dart|3:8|1|The value of the local variable 'x' isn't used.
 diagnostics/undefined_operator/doc_0	ERROR|undefined_operator|lib/test.dart|3:15|1|The operator '+' isn't defined for the type 'C'.
 diagnostics/undefined_operator/fix_0	-
-diagnostics/undefined_prefixed_name/UndefinedPrefixedNameTest/test_getterContext#0	-
-diagnostics/undefined_prefixed_name/UndefinedPrefixedNameTest/test_new#0	-
+diagnostics/undefined_prefixed_name/UndefinedPrefixedNameTest/test_getterContext#0	ERROR|undefined_prefixed_name|lib/test.dart|3:10|1|The name 'c' is being referenced through the prefix 'p', but it isn't defined in any of the libraries imported using that prefix.
+diagnostics/undefined_prefixed_name/UndefinedPrefixedNameTest/test_new#0	ERROR|undefined_prefixed_name|lib/test.dart|4:5|3|The name 'new' is being referenced through the prefix 'p', but it isn't defined in any of the libraries imported using that prefix.
 diagnostics/undefined_prefixed_name/UndefinedPrefixedNameTest/test_setterContext#0	ERROR|undefined_prefixed_name|lib/test.dart|4:5|1|The name 'c' is being referenced through the prefix 'p', but it isn't defined in any of the libraries imported using that prefix.
 diagnostics/undefined_prefixed_name/doc_0	ERROR|undefined_prefixed_name|lib/test.dart|4:5|1|The name 'a' is being referenced through the prefix 'p', but it isn't defined in any of the libraries imported using that prefix.
 diagnostics/undefined_referenced_parameter/UndefinedReferencedParameterTest/test_messageText_literalString#0	WARNING|undefined_referenced_parameter|lib/test.dart|5:39|7|The parameter 'undef' isn't defined by 'foo'.

@@ -13,12 +13,23 @@
 //!
 //! These ids get no status row by design and are excluded from the
 //! unregistered-code warning, which therefore reports only genuine gaps.
+//!
+//! A second accounted class is the pin-absent dartq-only row codes: the
+//! parser emits `local_code` diagnostics that have no analyzer registry
+//! entry at the pinned oracle (upstream Dart SDK source, analyzer
+//! diagnostic registry, 3.13.7) — `abstract_extension_field`,
+//! `extension_augmentation_without_name`, and
+//! `mixin_augmentation_has_on_clause` are CFE/parser-side faces that the
+//! oracle surfaces through different codes or not at all. They arrive
+//! through actual dartq rows only, so they are exclusions rather than
+//! accounting gaps.
 
 /// Sorted id list; lookups use binary search.
 pub const GROUPING_IDS: &[&str] = &[
     "_core",
     "_misc",
     "abi_specific_integer_mapping",
+    "abstract_extension_field",
     "abstract_field_constructor_initializer",
     "ambiguous_set_or_map_literal",
     "analyzer_element_model_tracking",
@@ -54,6 +65,7 @@ pub const GROUPING_IDS: &[&str] = &[
     "extends_deferred_class",
     "extends_disallowed_class",
     "extends_type_alias_expands_to_type_parameter",
+    "extension_augmentation_without_name",
     "extension_declares_field",
     "extension_type_implements_not_supertype_of_erasure",
     "external_field_constructor_initializer",
@@ -81,6 +93,7 @@ pub const GROUPING_IDS: &[&str] = &[
     "invalid_type_argument_in_const_list",
     "invalid_type_argument_in_const_map",
     "invalid_type_argument_in_const_set",
+    "mixin_augmentation_has_on_clause",
     "mixin_class_declaration",
     "mixin_deferred_class",
     "mixin_inference_no_possible_substitution",
