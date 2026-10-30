@@ -72,11 +72,14 @@
 //! nullability merge + `FutureOr` merging + the record field merge), and
 //! the `==`-grade structural equality with function alpha-equivalence
 //! ([`TypeSystem::is_structurally_equal`], the `FunctionTypeImpl.==`
-//! port).
+//! port). Generic-function correlation carries the bounds-compatibility
+//! leg on both grades (`relateTypeParameters`, type_system.dart:1581-1635,
+//! mutual subtyping; `relateTypeFormals`, type.dart:430-492, plain
+//! equality), armed by the facts snapshot like the
+//! left-type-variable-bound rule.
 //!
-//! Not implemented (M2): promoted bounds (flow), declared bounds inside
-//! function-subtype correlation, variance annotations in the subtype walk,
-//! extension types, `UnknownInferredType`,
+//! Not implemented (M2): promoted bounds (flow), variance annotations in
+//! the subtype walk, extension types, `UnknownInferredType`,
 //! function/function LUB merging (falls back to bare `Function`), and
 //! implicit `call` tear-offs in assignability. Each
 //! fallback is documented at its site and matches an official fallback path
@@ -99,6 +102,11 @@ mod system;
 mod table;
 mod ty;
 mod variance;
+
+#[cfg(test)]
+mod ticket_3030_tests;
+#[cfg(test)]
+mod ticket_3031_tests;
 
 pub use error::TypeError;
 pub use exhaustive::{

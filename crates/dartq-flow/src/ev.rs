@@ -604,7 +604,13 @@ pub enum Ev {
     },
     Spread,
     NullAwareElement,
-    IfControlFlowBegin,
+    /// `if_kw`: the element's `if` keyword — the official's `IfElement`
+    /// first token and the dead-row anchor when the element itself is the
+    /// first dead node (its own condition killed the walk —
+    /// `checkUnreachableNode(ifElement)`, dead_code_verifier.dart:431-457).
+    IfControlFlowBegin {
+        if_kw: TokenSpan,
+    },
     /// `arm_start`: the then-element's first token offset (official
     /// `handleThenControlFlow` fires right after the condition's `)`).
     ThenControlFlow {

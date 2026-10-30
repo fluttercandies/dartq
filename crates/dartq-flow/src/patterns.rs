@@ -142,8 +142,22 @@ impl Interp<'_> {
                 // the matched value — a field's constant sub-pattern
                 // (`case Point(x: 5)`) constrains that field, not the
                 // scrutinee (the same depth gate
-                // [`Interp::matched_object_pattern`] uses).
+                // [`Interp::matched_object_pattern`] uses). The narrowing
+                // arms stay top-level-only, but the MAY-FAIL side effect
+                // rides at every depth: upstream's `constantPattern_end`
+                // runs for a nested constant too and its
+                // `_NoEqualityInformation` arm joins the matched state into
+                // the enclosing context's unmatched chain
+                // (`_unmatched = _join(_unmatched!, _current)`,
+                // flow_analysis.dart:7470-7475) — a constant can fail on
+                // its own value, so the enclosing pattern's cannot-fail
+                // posture stands down and a `||` right operand over it
+                // (`King(suit: E.a || E.b)`, `A && 1 || 2`) stays reachable.
+                // Skipping the join left the alternation frame reading the
+                // left operand as clean and over-reporting the right side
+                // dead over enum/constant alternations.
                 if self.pattern_depth != 1 {
+                    self.join_unmatched(self.current.clone());
                     return;
                 }
                 let Some(constant) = constant else {
@@ -506,10 +520,48 @@ impl Interp<'_> {
                     const_bool: None,
                 };
                 let shadowed = self.bound_var(*name);
-                self.declare_var(*name, meta, true);
+                // The stacked-head alias (official `switchStatement_
+                // endAlternative`'s copyPromotionData, flow_analysis.dart
+                // :6660-6686): a later head of the same shared-body group
+                // that re-declares a name an earlier head bound does not
+                // mint a second variable — upstream keys every head's
+                // binder of the name to the FIRST head's promotion key and
+                // copies the later head's model into it, so the shared
+                // body's reads and writes address ONE variable whose model
+                // joins assigned across every matched head. Aliasing at
+                // the binding keeps the same observable: the name stays
+                // bound to the first binder and this head's matched path
+                // declares it initialized exactly like the first head's
+                // did. Without it, the body's reads would resolve to the
+                // LAST head's binder — fresh-unassigned on the earlier
+                // heads' matched paths — and a spurious potentially-
+                // unassigned row would fire over a body upstream reads as
+                // assigned. Gate: a switch-statement case head's own
+                // binder (head region open, no guard — a body's pattern
+                // declarations see the registry cleared, and a guard's
+                // interior never declares), and the current binding is the
+                // registry's own variable.
+                let aliased = if self.case_head_depth > 0 && self.guard_depth == 0 {
+                    self.case_group_binders
+                        .get(name)
+                        .copied()
+                        .filter(|&first| shadowed == Some(first))
+                } else {
+                    None
+                };
+                if let Some(first) = aliased {
+                    self.current = self.current.clone().declare(first, true);
+                } else {
+                    let var = self.declare_var(*name, meta, true);
+                    if self.case_head_depth > 0 && self.guard_depth == 0 {
+                        self.case_group_binders.insert(*name, var);
+                    }
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.shadowed.push((*name, shadowed));
+                    }
+                }
                 if let Some(pattern) = self.pattern.as_mut() {
                     pattern.pending_decls.push((*name, *is_final));
-                    pattern.shadowed.push((*name, shadowed));
                 }
                 // The pattern's bind buffer: the event stream is
                 // post-order, so a property sub-pattern's shorthand bind
@@ -637,6 +689,10 @@ impl Interp<'_> {
                 }
             }
             Ev::GuardBegin => {
+                // The guard's interior events are expression events — they
+                // must not read as the head region's end (the dispatcher's
+                // group-boundary clear checks this depth).
+                self.guard_depth += 1;
                 // Snapshot the pre-guard state: the guard's own events run
                 // on `current` next and leave it on the guard-true arm, so
                 // this snapshot is the guard-false arm for the close's
@@ -646,6 +702,7 @@ impl Interp<'_> {
                 }
             }
             Ev::GuardEnd => {
+                self.guard_depth = self.guard_depth.saturating_sub(1);
                 // The guard expression ends: rejoin null-shorting opened
                 // inside it before its value is read; an enclosing `?`
                 // chain stays open.
@@ -797,9 +854,28 @@ impl Interp<'_> {
             }
             return;
         }
-        let known = Ty {
-            base: Base::Name(name),
-            nullable: false,
+        // The `Null(...)` head's required type IS the Null type: the same
+        // spelling→base normalization the annotation path performs
+        // (record.rs's "Null" arm). Without it the head classifies as a
+        // plain non-nullable name, so `promoteForPattern`'s covers and
+        // disjoint verdicts mis-fire both ways over a Null-typed matched
+        // value (`if (nullValue case Null())` missed its dead else —
+        // `Null <: Null` is the guaranteed cover; a non-nullable matched
+        // value missed the disjoint kill).
+        let known = if self
+            .names
+            .get(name as usize)
+            .is_some_and(|n| &**n == "Null")
+        {
+            Ty {
+                base: Base::Null,
+                nullable: false,
+            }
+        } else {
+            Ty {
+                base: Base::Name(name),
+                nullable: false,
+            }
         };
         if self.pattern_known_invalid(known, args) {
             return;

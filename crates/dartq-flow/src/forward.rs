@@ -570,6 +570,10 @@ impl ParserListener for SharedFlow<'_> {
             .handle_assignment_expression(operator, end);
     }
 
+    fn begin_if_null_assignment_rhs(&mut self, operator: Token) {
+        self.0.borrow_mut().begin_if_null_assignment_rhs(operator);
+    }
+
     fn begin_cascade(&mut self, operator: Token) {
         self.0.borrow_mut().begin_cascade(operator);
     }

@@ -71,6 +71,13 @@ impl Interp<'_> {
                     }
                     Ctx::Expression => match self.resolve(*name) {
                         Some(Resolved::Local(var)) => {
+                            // The header-part leaf's dead poll, twin to
+                            // `Ev::Int`'s (`for (;; 0, throw 1, i++)`'s
+                            // `i` — the updater leaf dying mid-list is the
+                            // official's first dead node).
+                            if self.for_header_depth > self.header_cond_depth {
+                                self.dead_code(*token);
+                            }
                             self.check_unassigned_read(*token, var);
                             self.record_read(var);
                             let model = self.current.model(var);
@@ -214,6 +221,13 @@ impl Interp<'_> {
                             expr.args = top.args;
                             expr.read_span = Some(*token);
                             expr.name = Some(*name);
+                            // No constant feed: the official never folds a
+                            // named `const`/`final` element's value into
+                            // flow analysis — `booleanLiteral` fires on the
+                            // literal node alone, so `if (DEBUG)` over
+                            // `const bool DEBUG = false` keeps both arms
+                            // live (dead_code_test.dart's debugConst family
+                            // expects silence).
                             self.exprs.push(expr);
                             // The bottom-typed read's exit — the
                             // `Resolved::Local` arm's face applied to the
@@ -407,7 +421,20 @@ impl Interp<'_> {
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
-            Ev::Int { .. } => {
+            Ev::Int { span } => {
+                // The header-part leaf's dead poll (official
+                // `checkUnreachableNode` fires through `analyzeExpression`
+                // — the init/updater slices are exactly the header's own
+                // `analyzeExpression` calls, so a leaf that DIES inside a
+                // live-entered header (`for (;; 0, throw 1, 2)`'s `2`) is
+                // the official's first dead node). Dead-at-entry headers
+                // fold through [`Interp::arm_dead_depth`]; an open interval
+                // keeps ownership — the poll folds into the enclosing dead
+                // range exactly like the official's `_firstDeadNode !=
+                // null` ignore.
+                if self.for_header_depth > self.header_cond_depth {
+                    self.dead_code(*span);
+                }
                 // The literal's static type is `int` — the same
                 // `matchedType` face `Ev::Bool` spells `bool` for
                 // (`num? n = 1` promotes `n` to `num`: `int <: num` makes
@@ -431,7 +458,11 @@ impl Interp<'_> {
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
-            Ev::Double { .. } => {
+            Ev::Double { span } => {
+                // The same header-part leaf poll `Ev::Int` carries.
+                if self.for_header_depth > self.header_cond_depth {
+                    self.dead_code(*span);
+                }
                 // `Ev::Int`'s `double` twin (`num? d = 1.5` promotes `d`
                 // to `num`).
                 let ty = self
@@ -459,7 +490,7 @@ impl Interp<'_> {
             Ev::This { span } => {
                 // The `this` read: a promotable property receiver (official
                 // `thisExpression()`'s `_thisVersion` reference,
-                // `flow_analysis.dart:8149-8153`). The token anchors the
+                // flow_analysis.dart:8149-8153). The token anchors the
                 // property rows keyed at `this._b`'s expression start. A
                 // staged type (#2292 — the extension/extension-type
                 // extended type the semantic layer resolved) replaces the
@@ -612,7 +643,28 @@ impl Interp<'_> {
                         } else {
                             (left_if_false, left_if_true)
                         };
-                        let rhs_dead_entry = !self.reach.overall_reachable(taken.reach);
+                        // Owned vs inherited dead entry (upstream
+                        // `checkUnreachableNode(rightOperand)`): the right
+                        // operand's dead mark stands only when it is the
+                        // FIRST dead node — a walk that already sits inside
+                        // a dead context ignores it (dead_code_verifier
+                        // .dart:440-443) and this binary's `flowEnd` stays
+                        // silent. Post-LHS `self.current` is `taken`'s
+                        // parent state: `!reachable(taken)` alone cannot
+                        // tell "the LHS killed the RHS" (`never() && y` —
+                        // owned, `&& y` row) from "the whole binary ran
+                        // dead" (`return; x && y;` — inherited, folds into
+                        // the enclosing interval). The discriminant is the
+                        // enclosing dead context: an open interval or a
+                        // claimed dead arm means this binary began dead —
+                        // the LHS's own poll would have opened the window
+                        // first (`x` in the dead statement); a clean ledger
+                        // with an unreachable RHS means the LHS itself
+                        // killed it.
+                        let rhs_dead_entry = !self.reach.overall_reachable(taken.reach)
+                            && self.dead.is_none()
+                            && self.arm_dead_depth == 0
+                            && !self.stmt_began_dead;
                         self.stack.push(Frame::Branch {
                             branch: other,
                             ifnull_ty: None,
@@ -690,13 +742,20 @@ impl Interp<'_> {
                         // `this` LHS is non-null by construction even
                         // though its flow face stays the opaque unknown —
                         // `1 ?? x`, `'s' ?? x`, `this ?? x` all dead
-                        // their right side officially.
+                        // their right side officially. The row is owned
+                        // only when no enclosing dead context claimed the
+                        // interval first — inside an open window or a dead
+                        // arm the whole `??` ran dead and the official
+                        // ignores the operand's mark (the same owned-vs-
+                        // inherited gate the `&&`/`||` arm above reads).
                         if self.sound_flow
                             && (self.classify(left.ty) == Classification::NonNullable
                                 || left.non_null_literal)
                         {
                             self.unreachable_cur();
-                            rhs_dead_entry = true;
+                            rhs_dead_entry = self.dead.is_none()
+                                && self.arm_dead_depth == 0
+                                && !self.stmt_began_dead;
                         }
                         // `??` types as the LHS's non-null form.
                         let result_ty = promoted;
@@ -734,7 +793,22 @@ impl Interp<'_> {
                         // entry-dead mark rides the same `rhs_dead_entry`
                         // latch the logical arms carry. The left operand's
                         // value stays on the stack — `BinaryEnd` pops both.
-                        let rhs_dead_entry = !self.reachable();
+                        // The latch is owned-only: `!reachable()` at this
+                        // point reads the LHS's exit state, which is dead
+                        // both when the LHS itself killed it (`never() + b`
+                        // — owned `+ b` row) and when the whole binary ran
+                        // inside a dead context (`return; a + b;` — the
+                        // LHS's own poll already opened the interval, and
+                        // the official's `visitNode` ignore-list folds the
+                        // operand mark, dead_code_verifier.dart:440-448).
+                        // An open window, a claimed arm, or a statement
+                        // that itself began dead separates the two — the
+                        // began-dead latch covers the leading operand that
+                        // never polled a window (`return; a + b;`).
+                        let rhs_dead_entry = !self.reachable()
+                            && self.dead.is_none()
+                            && self.arm_dead_depth == 0
+                            && !self.stmt_began_dead;
                         if rhs_dead_entry {
                             self.arm_dead_depth += 1;
                             self.dead_code(TokenSpan {
@@ -1387,12 +1461,44 @@ impl Interp<'_> {
                 }
             }
             Ev::IfNullAssignBegin { op } => {
+                // The RHS-null-path kill (official
+                // `ifNullExpression_rightBegin`'s nonNullable arm,
+                // flow_analysis.dart:5857-5864): a guaranteed-non-null LHS
+                // read type makes the null path the RHS runs on
+                // unreachable — `int x = 0; x ??= 0` rows `0` (the operand
+                // is the first dead node; `AssignmentExpression` carries
+                // no operator re-anchor in dead_code_verifier, so the
+                // window anchored by the operand's own poll IS the
+                // official extent). A member/index LHS stays the opaque
+                // unknown face — the resolved `readType` is the semantic
+                // layer's answer, and a `PotentiallyNullable` classify is
+                // the under-report direction. The `rhs_dead_entry` latch
+                // tells the write's restore to keep the window — an
+                // entry-dead arm reports, an exit-dead arm drops. Owned
+                // only: a `??=` inside an already-dead context folds its
+                // operand into the enclosing interval (the enclosing
+                // statement's poll anchored first — re-anchoring it to
+                // this operand would shrink the official row).
+                let rhs_dead_entry = self.sound_flow
+                    && self.dead.is_none()
+                    && self.arm_dead_depth == 0
+                    && !self.stmt_began_dead
+                    && self
+                        .exprs
+                        .last()
+                        .is_some_and(|left| {
+                            self.classify(left.ty) == Classification::NonNullable
+                                || left.non_null_literal
+                        });
                 // The `??=` skip-path snapshot (official
                 // `ifNullExpression_rightBegin`'s split, flattened): the
                 // RHS runs inline below, so the live pre-RHS state is
                 // parked here for the exiting-RHS restore at the write.
                 self.if_null_skips
-                    .push((op.range.end(), self.current.clone()));
+                    .push((op.range.end(), self.current.clone(), rhs_dead_entry, None));
+                if rhs_dead_entry {
+                    self.unreachable_cur();
+                }
             }
             Ev::Assign {
                 plain,
@@ -1423,13 +1529,45 @@ impl Interp<'_> {
                 // a dead window the exit's polls opened inside the RHS
                 // drops with a live restore — that path was never dead.
                 if *if_null
-                    && let Some((_, skip)) = self.if_null_skips.pop()
+                    && let Some((_, skip, rhs_dead_entry, operand_start)) =
+                        self.if_null_skips.pop()
                     && !self.reachable()
                 {
+                    if rhs_dead_entry {
+                        // The entry-dead `??=` RHS is the official's first
+                        // dead node itself — anchor the interval at the
+                        // operand's begin token (`AssignmentExpression`
+                        // carries no operator re-anchor in
+                        // dead_code_verifier). An inner poll's window folds
+                        // into the operand anchor (the interval's owner is
+                        // always the topmost dead node); no window means a
+                        // bare literal operand polled nothing — the poll
+                        // here opens it while the state is still the dead
+                        // null path (the restore below is live).
+                        let anchor = TokenSpan {
+                            id: 0,
+                            range: dartq_source::SourceRange {
+                                offset: operand_start.unwrap_or(0),
+                                length: 0,
+                            },
+                        };
+                        match &mut self.dead {
+                            Some(window) if window.anchor_from(anchor.range.offset) => {
+                                window.reanchor_to(anchor);
+                            }
+                            Some(_) => {}
+                            None => self.dead_code(anchor),
+                        }
+                    }
                     self.current = skip;
                     if self.reachable() {
                         self.exit_at = None;
-                        self.dead = None;
+                        if !rhs_dead_entry {
+                            // An exit-dead `??=` RHS's window drops with
+                            // the live restore — the skip path was never
+                            // dead (`x ??= throw e`).
+                            self.dead = None;
+                        }
                     }
                 }
                 // A condition-valued plain `=` RHS (`v = a != null;`) is a
@@ -1806,10 +1944,39 @@ impl Interp<'_> {
                 let cond = self.pop_value();
                 self.condition_operand(&cond);
                 let (if_true, if_false) = self.cond_split(&cond);
-                let then_dead_entry = !self.reach.overall_reachable(if_true.reach);
+                // The conditional's own dead entry (official
+                // `checkUnreachableNode(conditional)` at the node's
+                // pre-order visit — dead_code_verifier.dart:431-457): the
+                // state BEFORE the condition evaluated decides whether the
+                // conditional is the first dead node. A began-dead context
+                // (dead statement, claimed arm, or an interval a
+                // pre-condition poll opened) means the conditional
+                // INHERITS its deadness; otherwise — the condition's own
+                // exit killed the walk mid-node (`f(n, c ? x : y)` on a
+                // Never `n`) — the conditional IS the official's first
+                // dead node, anchored at its head token, and the arms fold
+                // into that interval (`flowEnd(arm)` early-returns while
+                // `_firstDeadNode` sits outside it).
+                let cond_began_dead = self.stmt_began_dead
+                    || self.arm_dead_depth > 0
+                    || self.dead.is_some();
+                let parent_live = !cond_began_dead;
+                if parent_live && !self.reachable() {
+                    let head = cond.read_span.or(cond.callee_span);
+                    if let Some(head) = head {
+                        self.dead_code(head);
+                    }
+                }
+                // An arm owns its dead row only when the parent was live
+                // (the arm itself is then the official first dead node); a
+                // dead-parent arm inherits and folds into the enclosing
+                // interval — no count, no row.
+                let then_dead_entry =
+                    parent_live && !self.reach.overall_reachable(if_true.reach);
                 self.stack.push(Frame::Cond {
                     branch: if_false,
                     then_state: None,
+                    parent_live,
                     then_dead_entry,
                     else_dead_entry: false,
                     never_cast: false,
@@ -1864,12 +2031,14 @@ impl Interp<'_> {
                 if let Some(Frame::Cond {
                     branch,
                     then_state,
+                    parent_live,
                     else_dead_entry,
                     ..
                 }) = self.stack.last_mut()
                 {
                     *then_state = Some(self.current.clone());
-                    *else_dead_entry = !self.reach.overall_reachable(branch.reach);
+                    *else_dead_entry =
+                        *parent_live && !self.reach.overall_reachable(branch.reach);
                     self.current = branch.clone();
                     // The else arm entered dead too: its own close row
                     // reports at `CondEnd` and interior polls fold the
@@ -2450,6 +2619,26 @@ impl Interp<'_> {
                 // own invocation node anchors the interval (`print('2')`
                 // rows at `print`, not at `(` — its callee walked as a
                 // plain `Expression` read).
+                //
+                // The callee that EXITED mid-expression is the other face:
+                // `x<int>(args)`'s instantiation completes with no event of
+                // its own (the type-argument group only sets the pending
+                // tree), so the event before `(` is the head identifier —
+                // `x` live-read, the exit landing at its end (`exit_at`),
+                // every later node dead. The official's argument-list poll
+                // re-anchors to `(` whatever the first dead child was
+                // (`parent is AnonymousMethodInvocation`,
+                // dead_code_verifier.dart:317-318), so `(` owns the row for
+                // a bare `x(...)`, a generic `x<int>(...)`, a parenthesized
+                // `(f)(...)`, or an index-call `a[i](...)` callee alike —
+                // and for a send callee whose `Ev::Exit` the engine
+                // injected between the send's close and `(` (`f()(x)` on a
+                // `Never f()` result: the exit IS the event before the
+                // list). A callee that BEGAN dead in an already-dead region
+                // folds the same way the member-send face does — the
+                // statement wrapper's re-anchor lifts the anchor to the
+                // statement's first node (`print('2')` still rows at
+                // `print`).
                 if self
                     .null_shorts
                     .last()
@@ -2460,11 +2649,12 @@ impl Interp<'_> {
                 } else if matches!(
                     events.get(i.wrapping_sub(1)),
                     Some(
-                        Ev::Ident {
-                            context: dartq_parser::IdentifierContext::ExpressionContinuation,
-                            ..
-                        } | Ev::Send { .. }
+                        Ev::Ident { .. }
+                            | Ev::Send { .. }
                             | Ev::SendNoArgs { .. }
+                            | Ev::ParenEnd
+                            | Ev::IndexAccess { .. }
+                            | Ev::Exit { .. }
                     )
                 ) && !self.exit_at.is_some_and(|at| at >= open.range.offset)
                 {
@@ -2473,6 +2663,35 @@ impl Interp<'_> {
                 self.args_bases.push(self.exprs.len());
             }
             Ev::ArgumentEnd => {
+                // The argument-node poll (official
+                // `checkUnreachableNode` on the argument expression): a
+                // sibling's exit before it makes the argument the first
+                // dead node — `a.clamp(b, c)` on a `Never b` rows `c);`
+                // (dead_code_verifier.dart's plain `node` arm; the
+                // `AssignmentExpression`/`BinaryExpression` re-anchors do
+                // not apply, so the operand's own span IS the official
+                // extent). An exit INSIDE the argument (`f(throw x)`, or a
+                // `Never`-typed read the argument itself is — `f(b)` on a
+                // `Never b`) is the argument's own death at or after its
+                // first token: the argument was live when the official's
+                // pre-order poll ran, so the next node anchors — the same
+                // `exit_at` boundary the member poll applies. Only a bare
+                // operand's own span is known here (`read_span` for a leaf
+                // read, `callee_span` for a completed send's head); a
+                // compound argument without either stays to its inner
+                // polls — the under-report direction.
+                let arg_span = self
+                    .exprs
+                    .last()
+                    .and_then(|arg| arg.read_span.or(arg.callee_span));
+                if let Some(arg_span) = arg_span
+                    && !self.reachable()
+                    && !self
+                        .exit_at
+                        .is_some_and(|at| at >= arg_span.range.offset)
+                {
+                    self.dead_code(arg_span);
+                }
                 // This argument's expression is complete: rejoin the
                 // null-shorting IT opened, at its own boundary — official
                 // finishes each argument's shorting before the next one
@@ -2872,11 +3091,13 @@ impl Interp<'_> {
                 self.exprs.pop();
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
             }
-            Ev::IfControlFlowBegin => {
+            Ev::IfControlFlowBegin { if_kw } => {
                 // Collection if-element begin: the parser fires it before
                 // the condition streams (the element step opens the `if`
                 // at the keyword), so the split waits for the condition's
-                // own `ThenControlFlow`.
+                // own `ThenControlFlow`. The keyword parks for that arm's
+                // dead-entry check — the element's own row anchor.
+                self.pending_if_kw = Some(*if_kw);
             }
             Ev::ThenControlFlow { arm_start } => {
                 // The collection-if condition ended: rejoin its open
@@ -2887,10 +3108,41 @@ impl Interp<'_> {
                 // `handle_ifElement_conditionEnd`, type_analyzer.dart:1161).
                 self.condition_operand(&cond);
                 let (if_true, if_false) = self.cond_split(&cond);
-                // The then-element entered dead: interior polls fold into
-                // the arm's own close row (the element is the official's
-                // first dead node); the count drops at `ElseControlFlow`.
-                let then_dead_entry = !self.reach.overall_reachable(if_true.reach);
+                // The if-element's own dead entry — the same
+                // pre-condition gate the `?:` face reads above: a
+                // began-dead context means the element inherited its
+                // deadness (the enclosing statement or arm owns the
+                // interval), while a condition that killed the walk itself
+                // (`[if (never()) y]` — the condition's own exit) leaves a
+                // LIVE parent and the then-element is the official's
+                // first dead node.
+                let cond_began_dead = self.stmt_began_dead
+                    || self.arm_dead_depth > 0
+                    || self.dead.is_some();
+                let parent_live = !cond_began_dead;
+                // The element itself is the official's first dead node
+                // when its own condition killed the walk (`[f(n, if (c)
+                // y)]` on a Never `n` — `checkUnreachableNode(ifElement)`
+                // marks the element, anchored at `if`): the interval opens
+                // at the keyword and the arms fold into it exactly like
+                // the `?:` conditional's own dead entry.
+                if parent_live && !self.reachable() {
+                    if let Some(if_kw) = self.pending_if_kw.take() {
+                        self.dead_code(if_kw);
+                    } else if let Some(head) = cond.read_span.or(cond.callee_span) {
+                        self.dead_code(head);
+                    }
+                } else {
+                    self.pending_if_kw = None;
+                }
+                // The then-element entered dead FROM A LIVE PARENT:
+                // interior polls fold into the arm's own close row (the
+                // element is the official's first dead node); the count
+                // drops at `ElseControlFlow`. A dead-parent element's
+                // deadness is inherited — it folds into the enclosing
+                // interval and reports nothing of its own.
+                let then_dead_entry =
+                    parent_live && !self.reach.overall_reachable(if_true.reach);
                 if then_dead_entry {
                     self.arm_dead_depth += 1;
                 }
@@ -2915,6 +3167,7 @@ impl Interp<'_> {
                     then_start: *arm_start,
                     else_start: None,
                     after_then: None,
+                    parent_live,
                     then_dead_entry,
                     else_dead_entry: false,
                 });
@@ -2931,23 +3184,32 @@ impl Interp<'_> {
                 // type_analyzer.dart:1163-1166) before the else-element
                 // runs under the condition-false branch.
                 self.exprs.pop();
+                let mut then_dead_entry = false;
                 if let Some(frame) = self.coll_if.last_mut() {
                     frame.else_start = Some(*else_start);
                     frame.after_then = Some(self.current.clone());
+                    then_dead_entry = frame.then_dead_entry;
                     // The then-element's dead-arm contribution drops at
                     // its close so the row gate reads the outer arms.
-                    if frame.then_dead_entry {
+                    if then_dead_entry {
                         self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
                     }
                 }
-                if let Some(then_start) = self.coll_if.last().map(|f| f.then_start) {
+                if then_dead_entry
+                    && let Some(then_start) = self.coll_if.last().map(|f| f.then_start)
+                {
                     self.dead_arm_row(then_start, *then_end);
                 }
                 if let Some(Frame::Branch { branch, .. }) = self.stack.last() {
                     // The else-element begins under the condition-false
                     // branch — its own entry deadness latches the same
-                    // way the then-element's did.
-                    let else_dead_entry = !self.reach.overall_reachable(branch.reach);
+                    // way the then-element's did (only a live parent makes
+                    // it an owned dead arm).
+                    let else_dead_entry = !self.reach.overall_reachable(branch.reach)
+                        && self
+                            .coll_if
+                            .last()
+                            .is_some_and(|frame| frame.parent_live);
                     if else_dead_entry {
                         self.arm_dead_depth += 1;
                     }
@@ -2966,7 +3228,11 @@ impl Interp<'_> {
                 let coll = self.coll_if.pop();
                 if let Some(frame) = &coll {
                     // The closing arm's own dead-arm contribution drops
-                    // before the row: the gate reads the outer arms.
+                    // before the row: the gate reads the outer arms. Only
+                    // an arm entered dead FROM A LIVE PARENT reports — a
+                    // dead-parent element folds into the enclosing
+                    // interval (its deadness is inherited, so
+                    // `flowEnd(element)` finds `_firstDeadNode` outside).
                     let arm_dead_entry = if *has_else {
                         frame.else_dead_entry
                     } else {
@@ -2974,8 +3240,6 @@ impl Interp<'_> {
                     };
                     if arm_dead_entry {
                         self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                    }
-                    if !self.reachable() {
                         let anchor = if *has_else {
                             frame.else_start.unwrap_or(frame.then_start)
                         } else {

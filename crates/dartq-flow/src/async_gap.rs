@@ -1911,7 +1911,7 @@ impl GapPass {
                 self.pop_val();
                 self.markers.push(Mk::OTHER);
             }
-            Ev::IfControlFlowBegin => self.stack.push(Frame::CollIf {
+            Ev::IfControlFlowBegin { .. } => self.stack.push(Frame::CollIf {
                 pre: self.slots,
                 base: self.markers.len(),
                 cond: NO_GUARD,

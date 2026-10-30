@@ -696,6 +696,7 @@ impl Interp<'_> {
                     body_depth: None,
                     dead_default: None,
                     arm_dead_entry: false,
+                    parent_live: self.reachable(),
                     reported_kw: None,
                     block,
                     labeled_effects: None,
@@ -757,6 +758,11 @@ impl Interp<'_> {
                 }
             }
             Ev::CaseExprBegin { span } => {
+                // One more clause head region opens (stacked heads of one
+                // group nest back-to-back; the registry survives across
+                // them — only a non-head event past the region clears it,
+                // see the dispatcher's lookahead in `Interp::step`).
+                self.case_head_depth += 1;
                 if self.collecting() {
                     return true;
                 }
@@ -779,6 +785,8 @@ impl Interp<'_> {
                 self.dead_code(*span);
             }
             Ev::CaseExprEnd { has_guard, kw } => {
+                // The clause head region closes with its head.
+                self.case_head_depth = self.case_head_depth.saturating_sub(1);
                 if self.collecting() {
                     return true;
                 }
@@ -893,6 +901,7 @@ impl Interp<'_> {
                     body_depth: None,
                     dead_default: None,
                     arm_dead_entry: false,
+                    parent_live: self.reachable(),
                     reported_kw: None,
                     block: i..i,
                     labeled_effects: None,
@@ -929,7 +938,23 @@ impl Interp<'_> {
                 // divergence from the official single-row rule: an or
                 // operand row inside an ALREADY-dead arm reports on its
                 // own instead of folding into the arm's row.
-                let arm_dead_entry = !self.reachable();
+                // Owned-vs-inherited (the same gate the binary arms read):
+                // `!reachable()` here measures the chained `unmatched`
+                // state — dead both when the chain itself ended inside a
+                // live switch (the arm owns its row, official
+                // `checkUnreachableNode(case_)` marks the arm the first
+                // dead node) and when the whole switch expression ran dead
+                // (the enclosing context's interval already owns the
+                // span). `parent_live` — latched when the frame pushed,
+                // before any clause ran — separates the two.
+                let parent_live = match self.switch_frame() {
+                    Some(index) => match &self.stack[index] {
+                        Frame::Switch { parent_live, .. } => *parent_live,
+                        _ => true,
+                    },
+                    None => true,
+                };
+                let arm_dead_entry = parent_live && !self.reachable();
                 if let Some(frame_index) = self.switch_frame()
                     && let Frame::Switch {
                         arm_dead_entry: slot,
@@ -1374,23 +1399,32 @@ impl Interp<'_> {
                     );
                 }
                 if let (Some(var), Some(rhs)) = (var, rhs) {
-                    // The proven-constant feed (official
-                    // `_getConstantValue` on a `final`/`const` local's
-                    // initializer — the fold's `bool_value` the read
-                    // adopts at `Ev::Ident`): a `final b = true;` (or a
-                    // condition-valuable fold like `final b = a != null;`
-                    // whose own `bool_value` the equality/test arms set)
-                    // makes `b`'s later condition reads fold exactly like
-                    // the literal. Only `final`/`const` carries it — a
-                    // mutable local can be reassigned before the read.
-                    // Stashed now and written after the initialization's
-                    // own `apply_write` below — that call clears
-                    // `const_bool` like any write, and the declaration's
-                    // initialization is the moment the constant lands.
+                    // The proven-constant feed: the fold's `bool_value`
+                    // the read adopts at `Ev::Ident`. A `final`/`const`
+                    // local carries it through official `_getConstantValue`
+                    // on the declarator; a NON-final local carries it
+                    // through `SsaNode.conditionVariableState` — the
+                    // initializer's non-trivial `booleanLiteral`
+                    // `ExpressionInfo` lands on the variable's SSA node at
+                    // `_initialize` and `restoreConditionVariableState`
+                    // rebases its arms at the read (language#1274's
+                    // "restore" half), so `bool b = true; if (!b)` folds
+                    // the arm exactly like the literal (the same upstream
+                    // mechanism the test-shaped `cond_vars` channel
+                    // mirrors for `x != null` initializers). The gate is
+                    // `!late` only: the official drops `expressionInfo`
+                    // for `late` (`_initialize`'s isLate arm — the value
+                    // binds at first touch, not at declaration), and every
+                    // later write/capture clears the slot (`apply_write`)
+                    // like the SSA node's own null-on-write. Stashed now
+                    // and written after the initialization's own
+                    // `apply_write` below — that call clears `const_bool`
+                    // like any write, and the declaration's initialization
+                    // is the moment the constant lands.
                     let const_feed = if self
                         .vars
                         .get(var as usize)
-                        .is_some_and(|meta| meta.is_final)
+                        .is_some_and(|meta| !meta.late)
                     {
                         rhs.bool_value
                     } else {
@@ -1714,17 +1748,21 @@ impl Interp<'_> {
         // A began-dead statement is itself the official first dead node
         // (the verifier walks top-down, so the statement precedes every
         // child, dead_code_verifier.dart:183-189). Inner expression polls
-        // (the dot-access member poll, the cast-type poll) ran EARLIER in
-        // this post-order stream and may have opened the interval on a
-        // sub-statement node — re-anchor it to the statement. An interval
-        // whose anchor sits before the statement belongs to an earlier
-        // dead statement (the one-row fold) and keeps ownership, as does a
-        // do-while split whose anchor is its `while` part.
+        // (the dot-access member poll, the argument-list `(` poll, the
+        // cast-type poll) ran EARLIER in this post-order stream and may
+        // have opened the interval on a sub-statement node — re-anchor it
+        // to the statement. An interval whose anchor sits before the
+        // statement belongs to an earlier dead statement (the one-row
+        // fold) and keeps ownership, as does a do-while split whose
+        // anchor is its `while` part — the split's tail start still snaps
+        // to this statement's first token the same way (an inner poll may
+        // have stamped it inside the statement).
         if let Some(window) = &mut self.dead {
             if window.anchor_from(span.range.offset) {
                 window.reanchor_to(span);
                 return;
             }
+            window.snap_split_start(span.range.offset);
         }
         self.dead_code(span);
     }

@@ -31,13 +31,19 @@ pub(crate) struct VarMeta {
     pub is_final: bool,
     /// Span of the declaration's name token, when declared locally.
     pub decl_span: Option<SourceRange>,
-    /// The proven constant boolean value a `final`/`const` local
-    /// initialized from a boolean-folded expression carries — `final b =
-    /// true;` makes `b`'s later reads condition-fold exactly like the
-    /// literal (official `_getConstantValue`/`visitNode`'s constant
-    /// evaluation, resolver_visitor.dart's `bool` local propagation).
-    /// `None` for mutable locals and for a `final`/`const` initialized
-    /// from a non-constant or non-boolean fold; any write clears it.
+    /// The proven constant boolean value a non-`late` local initialized
+    /// from a boolean-folded expression carries — `final b = true;` folds
+    /// `b`'s later condition reads exactly like the literal (official
+    /// `_getConstantValue`/`visitNode`'s constant evaluation), and a
+    /// mutable `bool b = true;` folds the same way through
+    /// `SsaNode.conditionVariableState`/`restoreConditionVariableState`
+    /// (the initializer's non-trivial `booleanLiteral` `ExpressionInfo`
+    /// rides the variable's SSA node; language#1274's restore half).
+    /// `None` for `late` locals (the official drops the initializer's
+    /// `expressionInfo` — it binds at first touch) and for any initializer
+    /// the fold could not value; every write clears it (`apply_write`,
+    /// the SSA node's null-on-write equivalent), so a reassigned local
+    /// folds nothing.
     pub const_bool: Option<bool>,
 }
 
@@ -86,9 +92,18 @@ pub(crate) struct CollIfFrame {
     /// The then-arm's exit state, saved at `ElseControlFlow` (official
     /// `_IfContext._afterThen`).
     pub(crate) after_then: Option<State>,
-    /// The then-element entered dead (a const-folded condition or a
-    /// dead enclosing state): its close row reports the element's own
-    /// extent and the arm counted one [`Interp::arm_dead_depth`].
+    /// The element's enclosing state was reachable at `ThenControlFlow` —
+    /// an arm that enters dead under it OWNS its dead row (the arm itself
+    /// is the official first dead node); an arm that enters dead under a
+    /// dead parent inherits the deadness and folds into the enclosing
+    /// interval (upstream: `_firstDeadNode` is already set to the outer
+    /// node, so `flowEnd(arm)` early-returns, dead_code_verifier.dart:223-
+    /// 235). Arms in a dead parent never count [`Interp::arm_dead_depth`].
+    pub(crate) parent_live: bool,
+    /// The then-element entered dead FROM A LIVE PARENT: its close row
+    /// reports the element's own extent and the arm counted one
+    /// [`Interp::arm_dead_depth`]. An arm dead under `parent_live == false`
+    /// is inherited dead — no count, no row.
     pub(crate) then_dead_entry: bool,
     /// Same latch for the else-element, taken at `ElseControlFlow`.
     pub(crate) else_dead_entry: bool,
@@ -251,11 +266,19 @@ pub(crate) enum Frame {
     Cond {
         branch: State,
         then_state: Option<State>,
-        /// The then arm's entry state was unreachable (a literal-folded
-        /// condition): the dead-arm row fires at the arm's close. An arm
-        /// that only ENDS unreachable (a `throw`/Never subexpression) is
-        /// live — the official rows only when a node inside was checked
-        /// unreachable, which a literal-folded entry guarantees.
+        /// The conditional's enclosing state was reachable at `CondBegin`:
+        /// an arm that enters dead under it owns its dead row (the arm is
+        /// the official first dead node); an arm dead under a dead parent
+        /// inherits and folds (upstream `flowEnd(arm)` early-returns when
+        /// `_firstDeadNode` sits outside, dead_code_verifier.dart:223-235).
+        /// Also gates [`Self::cast_tail`]'s row.
+        parent_live: bool,
+        /// The then arm's entry state was unreachable UNDER A LIVE PARENT
+        /// (a literal-folded condition): the dead-arm row fires at the
+        /// arm's close. An arm that only ENDS unreachable (a `throw`/Never
+        /// subexpression) is live — the official rows only when a node
+        /// inside was checked unreachable, which a literal-folded entry
+        /// guarantees. A dead-parent arm's deadness is inherited.
         then_dead_entry: bool,
         /// Same latch for the else arm, taken at the colon.
         else_dead_entry: bool,
@@ -398,12 +421,18 @@ pub(crate) enum Frame {
         /// group's opening consumes it — the chain marks unreachable, and a
         /// case-headed opener reports the default's keyword row.
         dead_default: Option<(TokenSpan, bool)>,
-        /// The open switch-expression arm entered dead (a dead chain the
-        /// unmatched state chained into it — official
+        /// The switch's enclosing state was reachable at `SwitchExprBegin`:
+        /// an arm entering dead under it owns its row; an arm dead under a
+        /// dead parent inherits and folds (upstream `flowEnd(case_)` early-
+        /// returns when `_firstDeadNode` sits outside the member,
+        /// dead_code_verifier.dart:223-235).
+        parent_live: bool,
+        /// The open switch-expression arm entered dead FROM A LIVE PARENT
+        /// (a dead chain the unmatched state chained into it — official
         /// `handleSwitchBeforeAlternative`'s `checkUnreachableNode(case_)`):
         /// its interior polls fold into the arm's own `SwitchExprCaseEnd`
         /// row through [`Interp::arm_dead_depth`], and the count drops at
-        /// the arm's close.
+        /// the arm's close. A dead-parent arm's deadness is inherited.
         arm_dead_entry: bool,
         /// The offset of the member keyword whose head-time row last fired
         /// in this switch (a member-anchored report): the next `CaseEnd`
@@ -969,6 +998,24 @@ impl DeadWindow {
         self.anchor.range.offset >= offset
     }
 
+    /// Snaps the do-while split's tail start to a began-dead statement's
+    /// first token (official `semicolon.next`, dead_code_verifier.dart:
+    /// the second row begins at the statement following the do-while). An
+    /// inner poll of that same statement (an argument list's `(`, an
+    /// argument node, a member name) fires earlier in the post-order
+    /// stream and may have stamped the tail start at its own sub-statement
+    /// token — the tail opens at the statement's head, never inside it.
+    /// No-op when the interval carries no split or the stamped start
+    /// already sits before the statement (an earlier dead statement owns
+    /// the tail).
+    pub(crate) fn snap_split_start(&mut self, offset: u32) {
+        if self.split.is_some()
+            && self.split_start.is_some_and(|start| start >= offset)
+        {
+            self.split_start = Some(offset);
+        }
+    }
+
     /// Attaches the do-while's `while (c);` part and records whether a
     /// break makes the post-do tail reachable (official
     /// `hasBreakStatement`).
@@ -1153,6 +1200,12 @@ pub(crate) struct Interp<'o> {
     /// and the close joins `afterThen` with `afterElse`, not the branch
     /// model.
     pub(crate) coll_if: Vec<CollIfFrame>,
+    /// The open collection-if element's `if` keyword token, parked by
+    /// `IfControlFlowBegin` for `ThenControlFlow`: the element's own
+    /// dead-row anchor (the official's `IfElement` first token) when the
+    /// element's condition killed the walk — the if-element is then the
+    /// first dead node itself (dead_code_verifier.dart:431-457).
+    pub(crate) pending_if_kw: Option<TokenSpan>,
     /// The name-binding undo journal ([`BindingUndo`]): one entry per
     /// `bind_name`, replayed backwards by `collect_ranges`' rollback for
     /// entries past the snapshot point.
@@ -1270,8 +1323,16 @@ pub(crate) struct Interp<'o> {
     /// Open `??=` skip-path snapshots (paired with [`crate::ev::Ev::
     /// IfNullAssignBegin`]): the state at the operator — the live path
     /// that skips the RHS. An RHS that exits (`x ??= throw e`) restores
-    /// its snapshot at the write, the official's post-state.
-    pub(crate) if_null_skips: Vec<(u32, State)>,
+    /// its snapshot at the write, the official's post-state. The `bool`
+    /// is `rhs_dead_entry`: the LHS read typed non-nullable, so the null
+    /// path the RHS ran on was unreachable from entry — its dead window
+    /// emits (the operand is the official's first dead node), unlike an
+    /// exit-driven window the live restore drops. The trailing
+    /// `Option<u32>` is the operand's begin offset — latched from the
+    /// first spanned event inside the RHS (the leftmost leaf IS the
+    /// operand's begin token), because a literal operand's expression
+    /// value carries no span of its own.
+    pub(crate) if_null_skips: Vec<(u32, State, bool, Option<u32>)>,
     /// A deferred object-pattern vacuous cover (see
     /// [`crate::patterns`]' `resolve_vacuous_object_cover`): the owner
     /// name id and the head-time state — the may-fail arm should the
@@ -1286,6 +1347,35 @@ pub(crate) struct Interp<'o> {
     /// bind precedes its object pattern's own event) — the defer's
     /// snapshot source. Cleared at every pattern-context open.
     pub(crate) pattern_binds: Vec<u32>,
+
+    /// Nesting depth inside switch-statement case HEAD regions (a region
+    /// spans one clause head's pattern and guard: `CaseExprBegin` raises,
+    /// `CaseExprEnd` lowers). While positive, a declared-variable pattern
+    /// is a case head's binder and participates in the stacked-head alias
+    /// ([`Interp::case_group_binders`]); maintained identically in collect
+    /// runs so the declaration id sequence never diverges between the
+    /// pre-pass and the replay.
+    pub(crate) case_head_depth: usize,
+
+    /// Nesting depth inside pattern guards (`GuardBegin` raises,
+    /// `GuardEnd` lowers): a guard's interior events are expression
+    /// events, not case-head events, yet they must not end the enclosing
+    /// head region — the dispatcher's group-boundary clear stays off
+    /// while either this or [`Interp::case_head_depth`] is positive.
+    pub(crate) guard_depth: usize,
+
+    /// The binder names a switch-statement case group's heads have
+    /// declared SO FAR, name id → the FIRST head's variable (official
+    /// `switchStatement_endAlternative`'s `patternVariablePromotionKeys`,
+    /// flow_analysis.dart:6660-6686: a name re-declared by a later head of
+    /// the same group aliases to the first head's promotion key via
+    /// `copyPromotionData`, so the shared body's reads and writes all
+    /// address ONE variable whose model joins assigned across every
+    /// matched head). Consulted only while [`Interp::case_head_depth`] is
+    /// positive and no guard is open; cleared at the first event past the
+    /// head region (the body's opening) — a body's own pattern
+    /// declarations shadow afresh, never alias.
+    pub(crate) case_group_binders: FxHashMap<u32, u32>,
 
     /// Open logical-or alternation frames ([`OrFrame`]), innermost last:
     /// a left branch that provably always matches walks the right
@@ -1345,7 +1435,6 @@ pub(crate) struct Interp<'o> {
     /// suppressed — the semantic layer's as-cast tail face reports that
     /// row, and a flow row of its own would duplicate it.
     pub(crate) init_exec_depth: Option<usize>,
-
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
 
@@ -1406,6 +1495,15 @@ struct Snapshot {
     null_shorts_len: usize,
     /// Open argument-list bases roll back with the collect run too.
     args_bases_len: usize,
+    /// The case-head/guard region depths roll back with the collect run:
+    /// a walk cropped at an extent boundary inside a head or guard must
+    /// not leave its region counters raised over the resuming replay.
+    case_head_depth: usize,
+    guard_depth: usize,
+    /// The stacked-head binder registry rolls back likewise — the walk's
+    /// own head regions (a closure's nested switch) must not pollute the
+    /// enclosing replay's group.
+    case_binders: FxHashMap<u32, u32>,
 }
 
 /// The direct-construction default for [`Interp::top_level`]: no unit face.
@@ -1491,6 +1589,7 @@ impl<'o> Interp<'o> {
             props: Vec::new(),
             scope_gen: 1,
             coll_if: Vec::new(),
+            pending_if_kw: None,
             binding_journal: Vec::new(),
             cond_split_var: None,
             if_branch_folded: false,
@@ -1530,6 +1629,9 @@ impl<'o> Interp<'o> {
             vacuous_object: None,
             vacuous_fields: Vec::new(),
             pattern_binds: Vec::new(),
+            case_head_depth: 0,
+            guard_depth: 0,
+            case_group_binders: FxHashMap::default(),
             or_frames: Vec::new(),
             or_join_epoch: 0,
             or_last_clean: None,
@@ -2493,10 +2595,21 @@ impl<'o> Interp<'o> {
             Some(Frame::Cond {
                 never_cast,
                 cast_tail,
+                parent_live,
                 ..
             }) => {
                 *never_cast = false;
-                cast_tail.take()
+                // An arm whose parent was already dead inherits the
+                // deadness: the cast's poll folds into the enclosing
+                // interval, never parks a row head (upstream
+                // `flowEnd(arm)` early-returns when `_firstDeadNode` sits
+                // outside the arm).
+                if !*parent_live {
+                    cast_tail.take();
+                    None
+                } else {
+                    cast_tail.take()
+                }
             }
             _ => None,
         };
@@ -2786,6 +2899,9 @@ impl<'o> Interp<'o> {
             init_exec_depth: self.init_exec_depth,
             null_shorts_len: self.null_shorts.len(),
             args_bases_len: self.args_bases.len(),
+            case_head_depth: self.case_head_depth,
+            guard_depth: self.guard_depth,
+            case_binders: self.case_group_binders.clone(),
         };
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
@@ -2841,6 +2957,9 @@ impl<'o> Interp<'o> {
         self.init_exec_depth = s.init_exec_depth;
         self.null_shorts.truncate(s.null_shorts_len);
         self.args_bases.truncate(s.args_bases_len);
+        self.case_head_depth = s.case_head_depth;
+        self.guard_depth = s.guard_depth;
+        self.case_group_binders = s.case_binders;
         self.collect = outer;
         frames.into_iter().next().unwrap_or_default()
     }
@@ -3624,8 +3743,37 @@ impl Interp<'_> {
             }
         }
         self.for_header_depth += 1;
+        // Dead-at-entry updaters form a claimed dead region (upstream
+        // `_firstDeadNode` latches onto the updater EXPRESSION — the node
+        // `checkUnreachableNode` is called on — so every interior node's
+        // poll is ignored, dead_code_verifier.dart:440-448; the whole-list
+        // `for_updaterBegin` row above owns the reporting). Interior dead
+        // polls — `m.Point`'s member, `i.toString()`'s `(`, a conditional's
+        // arm — fire in the post-order stream BEFORE the updater's own
+        // end and would otherwise anchor a window that the covering close
+        // merges through the loop body (`Point) { return; }`). The claimed
+        // arm folds them.
+        let upd_dead = !self.reachable();
+        if upd_dead {
+            self.arm_dead_depth += 1;
+        }
         self.run_range(events, bounds.upd.clone(), match_of);
+        if upd_dead {
+            self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+        }
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
+        // Updaters that began LIVE but died mid-list (`for (;; 0, throw 1,
+        // 2) {}`): the first dead node is an updater — `parent is ForParts`
+        // trims the row to the last updater's `node.end`
+        // (dead_code_verifier.dart:309-310), so a covering close never
+        // extends it past the header.
+        if bounds.upd_end > 0
+            && let Some(window) = &mut self.dead
+            && window.anchor.range.offset >= bounds.header_end
+            && window.anchor.range.offset < bounds.upd_end
+        {
+            window.freeze_end(bounds.upd_end);
+        }
         self.exprs.truncate(base);
         if !collection {
             // Exit: condition-false joined with breaks (no back-edge join).
@@ -3922,15 +4070,40 @@ impl Interp<'_> {
         }
         self.budget -= 1;
         let ev = &events[i];
+        // The entry-dead `??=` RHS's operand latch: the first spanned event
+        // inside the killed null path is the operand's begin token — the
+        // official `firstDeadNode`'s anchor (the row runs
+        // `operand.beginToken .. assignment.end`, no operator re-anchor on
+        // `AssignmentExpression`). A literal operand's expr value carries
+        // no span of its own, so the latch lives here rather than on the
+        // popped `Expr`.
+        if let Some(entry) = self.if_null_skips.last_mut()
+            && entry.2
+            && entry.3.is_none()
+            && let Some(span) = ev.span()
+        {
+            entry.3 = Some(span.range.offset);
+        }
         // One-event lookahead: a case group awaiting its body closes its
-        // alternatives before any non-case event processes.
+        // alternatives before any non-case event processes. The same
+        // boundary ends the head region: past it (outside any head or
+        // guard — the body's opening, the group's close) the stacked-head
+        // binder registry dies, so a body's own pattern declarations
+        // shadow afresh instead of aliasing a head binder
+        // ([`Interp::case_group_binders`]). Head-adjacent guard events are
+        // region events, not boundaries.
         if !matches!(
             ev,
             Ev::CaseBegin { .. }
                 | Ev::CaseExprBegin { .. }
                 | Ev::CaseNoWhen
                 | Ev::CaseExprEnd { .. }
+                | Ev::GuardBegin
+                | Ev::GuardEnd
         ) {
+            if self.case_head_depth == 0 && self.guard_depth == 0 {
+                self.case_group_binders.clear();
+            }
             self.maybe_close_case_group(events, match_of);
         }
         match ev {

@@ -434,6 +434,20 @@ impl<'t> Flow<'t> {
         })
     }
 
+    /// The scanned end of the token immediately before `token` — the true
+    /// end of an element whose close marker is `token` (the `else` keyword
+    /// or the `,`/`]` peek, neither of which carries the element's own
+    /// `node.end`). Falls back to `token`'s own offset when the table has
+    /// no predecessor (inserted ids index the parser's side table, never
+    /// this one).
+    fn prev_token_end(&self, token: Token) -> u32 {
+        token
+            .id
+            .checked_sub(1)
+            .and_then(|index| self.span_at(index as usize))
+            .map_or(token.range.offset, |span| span.range.end())
+    }
+
     /// Interns a written-argument list structurally: equal trees share one
     /// arena entry, so the interpreter's id equality is tree equality.
     /// Lists are tiny (the unit's distinct generic spellings) and
@@ -1648,7 +1662,19 @@ impl ParserListener for Flow<'_> {
         // duplicate-definition error's territory, not the read face's).
         let header = self.top_last_type.take();
         if self.buffer.is_none() && self.container_depth == 0 {
-            self.top_decl = header.map(|(ty, args)| TopVar { ty, args });
+            // An untyped `final`/`const` header still registers (with the
+            // unknown face — its inferred static type is the type layer's
+            // increment): the read otherwise resolves as an implicit-`this`
+            // candidate — never the declaration's real face. A `var`/`late`
+            // declarator keeps the old posture (an unknown-typed read would
+            // change member faces the unresolved read keeps).
+            let final_header = is_final && late_kw.is_none();
+            self.top_decl = header
+                .map(|(ty, args)| TopVar { ty, args })
+                .or(final_header.then_some(TopVar {
+                    ty: crate::ty::Ty::UNKNOWN,
+                    args: crate::ty::EMPTY_ARGS,
+                }));
         }
     }
 
@@ -2971,8 +2997,8 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::NullAwareElement);
     }
 
-    fn begin_if_control_flow(&mut self, _token: Token) {
-        self.record(Ev::IfControlFlowBegin);
+    fn begin_if_control_flow(&mut self, token: Token) {
+        self.record(Ev::IfControlFlowBegin { if_kw: token });
     }
 
     fn handle_then_control_flow(&mut self, token: Token) {
@@ -2983,7 +3009,11 @@ impl ParserListener for Flow<'_> {
 
     fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {
         self.record(Ev::ElseControlFlow {
-            then_end: else_kw.range.offset,
+            // The then-element's own end is the token before `else` —
+            // `else_kw`'s offset carries the trivia gap into the dead
+            // arm's row (the official `flowEnd(ifTrue)` reports the arm
+            // expression's `node.end`, dead_code_verifier.dart:253-279).
+            then_end: self.prev_token_end(else_kw),
             else_start: else_start.range.offset,
         });
     }
@@ -2991,14 +3021,14 @@ impl ParserListener for Flow<'_> {
     fn end_if_control_flow(&mut self, token: Token) {
         self.record(Ev::EndIfControlFlow {
             has_else: false,
-            arm_end: token.range.offset,
+            arm_end: self.prev_token_end(token),
         });
     }
 
     fn end_if_else_control_flow(&mut self, token: Token) {
         self.record(Ev::EndIfControlFlow {
             has_else: true,
-            arm_end: token.range.offset,
+            arm_end: self.prev_token_end(token),
         });
     }
 
@@ -3070,9 +3100,17 @@ impl ParserListener for Flow<'_> {
         _in_assignment_pattern: bool,
     ) {
         let name = self.name(variable);
+        // The parser parks BOTH `var` and `final` in `keyword` (a bare
+        // typed binder carries none), so presence alone would mark every
+        // `var` binder final — `UnassignedRead.is_final` would route
+        // `var`-binder reads to the `read_potentially_unassigned_final`
+        // consumer gate. Only the `final` spelling is final (oracle-probed
+        // 3.13.7: `if (v case var a) { a = 1; }` assigns legally while
+        // `case final a` reports `assignment_to_final_local`).
+        let is_final = keyword.is_some_and(|kw| self.token_text(kw) == Some("final"));
         self.record(Ev::DeclaredVarPattern {
             name,
-            is_final: keyword.is_some(),
+            is_final,
             token: variable,
         });
     }

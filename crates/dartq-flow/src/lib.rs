@@ -160,3 +160,27 @@ mod ticket_2475_tests;
 
 #[cfg(test)]
 mod ticket_2943_tests;
+
+#[cfg(test)]
+mod ticket_2944_tests;
+
+#[cfg(test)]
+mod ticket_2946_tests;
+
+#[cfg(test)]
+mod ticket_2964_tests;
+
+#[cfg(test)]
+mod ticket_2974_tests;
+
+#[cfg(test)]
+mod ticket_2994_tests;
+
+#[cfg(test)]
+mod ticket_3009_tests;
+
+#[cfg(test)]
+mod ticket_3027_tests;
+
+#[cfg(test)]
+mod ticket_3033_tests;

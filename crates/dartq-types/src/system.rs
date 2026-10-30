@@ -378,10 +378,11 @@ impl<'a> TypeSystem<'a> {
     /// the signatures' declared parameters positionally and compares the
     /// renamed bodies — the official instantiates both sides with one set
     /// of fresh variables and compares the results
-    /// (`relateTypeFormals`, type.dart:430-492; bounds are not modeled,
-    /// so the bounds-compatibility leg of the official relation is
-    /// vacuously satisfied — same declared omission as
-    /// [`Self::function_subtype`]).
+    /// (`relateTypeFormals`, type.dart:430-492), including its
+    /// bounds-compatibility leg (`(t, s) => t == s`, type.dart:271-273;
+    /// mirrored in [`Self::function_structurally_equal`] through
+    /// [`Self::is_structurally_equal`], armed by the facts snapshot
+    /// exactly like [`Self::function_subtype`]'s leg).
     #[must_use]
     pub fn is_structurally_equal(&self, a: TypeId, b: TypeId) -> bool {
         if a == b {
@@ -413,6 +414,36 @@ impl<'a> TypeSystem<'a> {
             || f.required_positional != g.required_positional
         {
             return false;
+        }
+        // The bounds leg of `relateTypeFormals` (type.dart:430-492): for
+        // each correlated pair, both declared bounds — missing reading
+        // `dynamic` (`DynamicTypeImpl.instance`, type.dart:459-460) — are
+        // substituted onto the shared fresh namespace (g's parameters, as
+        // above) and compared with the caller's relation, which `==`
+        // fixes at plain type equality (type.dart:271-273). Armed by the
+        // facts snapshot; without one every parameter reads unbounded
+        // and both sides collapse to `dynamic`, which is `==` to itself —
+        // the vacuous answer the snapshot-less system keeps.
+        if let Some(facts) = self.param_facts
+            && !f.type_parameters.is_empty()
+        {
+            let f_ids = self.table.function_type_parameters(f.type_parameters);
+            let g_ids = self.table.function_type_parameters(g.type_parameters);
+            let dynamic = self.table.intern(UninternedType::Dynamic, false);
+            for (&fp, &gp) in f_ids.iter().zip(&g_ids) {
+                let (f_bound, g_bound) = (facts.get(fp).bound, facts.get(gp).bound);
+                if f_bound.is_none() && g_bound.is_none() {
+                    continue;
+                }
+                let f_bound = self.table.substitute_rename(
+                    f_bound.unwrap_or(dynamic),
+                    f.type_parameters,
+                    g.type_parameters,
+                );
+                if !self.is_structurally_equal(f_bound, g_bound.unwrap_or(dynamic)) {
+                    return false;
+                }
+            }
         }
         let rename = |t: TypeId| {
             self.table
@@ -1317,10 +1348,12 @@ impl<'a> TypeSystem<'a> {
     }
 
     /// `_isFunctionSubtypeOf` (subtype.dart:86-182). Type-parameter
-    /// correlation is positional (`relateTypeParameters`, subtype.dart:87-96);
-    /// bound compatibility is M2. Pool payloads are read by index and the
-    /// correlation runs as a live `Rename` substitution, so the per-query
-    /// hot path materializes no `Vec` and clones no `String`.
+    /// correlation is positional with the bounds-compatibility leg of
+    /// `relateTypeParameters` (type_system.dart:1581-1635) — see below.
+    /// Pool payloads are read by index and the correlation runs as a live
+    /// `Rename` substitution, so the per-query hot path materializes no
+    /// `Vec` and clones no `String` (the bounds leg's two id vectors are
+    /// gated on generics actually being present).
     fn function_subtype(&self, f_id: FunctionSigId, g_id: FunctionSigId) -> bool {
         let f = self.table.signature(f_id);
         let g = self.table.signature(g_id);
@@ -1328,6 +1361,41 @@ impl<'a> TypeSystem<'a> {
         let (f_params, g_params) = (f.type_parameters, g.type_parameters);
         if f_params.len() != g_params.len() {
             return false;
+        }
+        // The bounds leg of the correlation (`relateTypeParameters`,
+        // type_system.dart:1594-1635): for each correlated pair, both
+        // declared bounds — a missing bound reading `dynamic`
+        // (`DynamicTypeImpl.instance`, type_system.dart:1610-1611) — must
+        // be substituted onto one shared fresh namespace and compared with
+        // `isEqualTo` (mutual subtyping, type_system.dart:924-926). g's
+        // parameters play the fresh namespace — the same role they play
+        // for the body legs below — so f's bound goes through the rename
+        // and g's bound is already home. A mismatch rejects before any
+        // body leg runs, the official's order (`_isFunctionSubtypeOf`
+        // returns `false` when `relateTypeParameters` answers null,
+        // subtype.dart:338-344). Bounds arrive through the injected facts
+        // snapshot like the left-type-variable-bound rule; without one
+        // every parameter reads unbounded and the leg is vacuously
+        // satisfied.
+        if let Some(facts) = self.param_facts
+            && !f_params.is_empty()
+        {
+            let f_ids = self.table.function_type_parameters(f_params);
+            let g_ids = self.table.function_type_parameters(g_params);
+            let dynamic = self.table.intern(UninternedType::Dynamic, false);
+            for (&fp, &gp) in f_ids.iter().zip(&g_ids) {
+                let (f_bound, g_bound) = (facts.get(fp).bound, facts.get(gp).bound);
+                if f_bound.is_none() && g_bound.is_none() {
+                    continue;
+                }
+                let f_bound =
+                    self.table
+                        .substitute_rename(f_bound.unwrap_or(dynamic), f_params, g_params);
+                let g_bound = g_bound.unwrap_or(dynamic);
+                if !(self.is_subtype(f_bound, g_bound) && self.is_subtype(g_bound, f_bound)) {
+                    return false;
+                }
+            }
         }
         // Return type is covariant (subtype.dart:98-100).
         if !self.is_subtype(
