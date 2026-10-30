@@ -25,30 +25,59 @@
 //!   `Found`/`Ambiguous`/`NotFound` lookup face the `undefined_*`
 //!   diagnostics consume; oracle chain order locals → prefixes → imports
 //!   first-come-wins.
+//! - [`export_graph`] — the export/re-export graph diagnostic faces over
+//!   the frozen graph: `ambiguous_export`'s cross-directive seen-map,
+//!   `duplicate_export`'s sorted adjacent-pair walk, the
+//!   `export_internal_library` and `invalid_export_of_internal_element`
+//!   gates, and the `deferred_import_of_extension` namespace probe.
+//! - [`cycles`] — the visited-set-bounded graph walks behind the element
+//!   recursion codes: self-reachability (`recursive_constructor_redirect`),
+//!   the on-stack dependency slice (`top_level_cycle`,
+//!   `recursive_compile_time_constant`), and Tarjan cyclic components in
+//!   the oracle's pop order (`recursive_interface_inheritance`).
 //! - [`codes`] — the frozen resolution diagnostic code table.
 //! - [`modifiers`] — the M2 class-modifier decisions (ticket #281):
 //!   declaration-site combination legality, cross-library use-site
 //!   restrictions, the base/final subtype requirement, induced modifiers,
 //!   and the official diagnostic code descriptors — pure functions over
 //!   resolved facts, ready for the semantic layer to wire to diagnostics.
+//! - [`file_role`] — the file-kind classification and part-of role matrix
+//!   (ticket #2981, the #119 file-role boundary): the role a file's
+//!   directives give it, the SDK-content probe for external `dart:`
+//!   targets, and the pure include-side row selection the part-family
+//!   emitters consume.
 //!
-//! The part/part-of family (`part_of_*`, `duplicate_part`) and its file-role
-//! graph remain ticket #119.
+//! The part/part-of emitter wiring (`part_of_*`, `duplicate_part` rows into
+//! diagnostics) lives with the engine's pipeline.
 
 pub mod codes;
 pub mod conditional;
+pub mod cycles;
 pub mod doc_import;
+pub mod export_graph;
+pub mod file_role;
 pub mod library_graph;
 pub mod modifiers;
 pub mod namespace;
 pub mod uri;
 
 pub use codes::{
-    DUPLICATE_EXPORT, DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT, DUPLICATE_SHOWN_NAME,
-    ResolutionCode, ResolutionCodeInfo, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
+    DEFERRED_IMPORT_OF_EXTENSION, DUPLICATE_EXPORT, DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT,
+    DUPLICATE_SHOWN_NAME, EXPORT_INTERNAL_LIBRARY, INVALID_EXPORT_OF_INTERNAL_ELEMENT,
+    INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY, RECURSIVE_COMPILE_TIME_CONSTANT,
+    RECURSIVE_CONSTRUCTOR_REDIRECT, RECURSIVE_INTERFACE_INHERITANCE,
+    RECURSIVE_INTERFACE_INHERITANCE_EXTENDS, RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS,
+    RECURSIVE_INTERFACE_INHERITANCE_ON, RECURSIVE_INTERFACE_INHERITANCE_WITH, ResolutionCode,
+    ResolutionCodeInfo, TOP_LEVEL_CYCLE, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
 };
 pub use conditional::{Configuration, SelectedUri, resolve_conditional};
+pub use cycles::{StronglyConnected, cycle_through, dependency_cycle, strongly_connected};
 pub use doc_import::{CommentLexeme, DocComment, DocImportDirective, doc_imports};
+pub use export_graph::{
+    AmbiguousExportFinding, InternalExportFinding, is_internal_sdk_library,
+};
+pub use file_role::{FileRole, PartOfRow, part_of_row};
+pub use uri::{SdkFileKind, SdkFileKinds, canonical_dart_uri};
 pub use library_graph::{
     CombinatorClause, Combinators, DuplicateCombinatorName, ExportEdge, ExportEntry, ImportEdge,
     LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,

@@ -1183,3 +1183,196 @@ fn type_init_formals_super_formal_selector_gate() {
         "class S { S(int y); }\nclass C extends S { C(int super.y) : super.named(); }\n";
     assert!(run_semantic(missing_target, "type_init_formals", None).is_empty());
 }
+
+// —— #2927 census pins (the shell-side suppression faces) ————————————
+
+/// `lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceGetter_reachable_overrides#0`
+/// — `INFO|unreachable_from_main|lib/test.dart|7:11|3`: the base
+/// declaration reports; the overriding member suppresses through the
+/// same-file `isOverride` arm (the override is itself a candidate the
+/// gatherer skips — the engine face carries no edge for it).
+#[test]
+fn overridden_getter_suppresses_the_override_reports_the_base() {
+    let source = concat!(
+        "void main() {\n",
+        "  B();\n",
+        "}\n",
+        "\n",
+        "class A {\n",
+        "  int get foo => 0;\n",
+        "}\n",
+        "\n",
+        "class B extends A {\n",
+        "  int get foo => 0;\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "A", 0, true),
+            flag(&f, "B", 0, true),
+            flag(&f, "foo", 0, false), // A.foo — the oracle row 7:11.
+            flag(&f, "foo", 1, false), // B.foo — override-suppressed.
+        ],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'foo' in an executable library."
+    );
+    assert_eq!(lints[0].range.start, flag(&f, "foo", 0, false).0);
+}
+
+/// `lints/unreachable_from_main/UnreachableFromMainTest/test_class_instanceField_reachable_overrides_local#0`
+/// — `INFO|unreachable_from_main|lib/test.dart|7:8|1`: the field arm of
+/// the same override read (`MemberQuery::Getter` over the field's
+/// accessor).
+#[test]
+fn overridden_field_suppresses_the_override_reports_the_base() {
+    let source = concat!(
+        "void main() {\n",
+        "  B();\n",
+        "}\n",
+        "\n",
+        "class A {\n",
+        "  int? f;\n",
+        "}\n",
+        "\n",
+        "class B extends A {\n",
+        "  int? f;\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "A", 0, true),
+            flag(&f, "B", 0, true),
+            flag(&f, "f", 0, false), // A.f — the oracle row 7:8.
+            flag(&f, "f", 1, false), // B.f — override-suppressed.
+        ],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].range.start, flag(&f, "f", 0, false).0);
+}
+
+/// `lints/unreachable_from_main/UnreachableFromMainTest/test_instanceMethod_reachable_toJson#0`
+/// — clean: a non-static `toJson` never gathers (the `dart:convert`
+/// dynamic-invocation auto-reach arm). The flag stays `false` to keep
+/// the arm honest — the suppression is the gather, not the face.
+#[test]
+fn non_static_to_json_never_gathers() {
+    let source = concat!(
+        "void main() {\n",
+        "  C();\n",
+        "}\n",
+        "\n",
+        "class C {\n",
+        "  List<Object> toJson() => ['c'];\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "C", 0, true),
+            flag(&f, "toJson", 0, false),
+        ],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+}
+
+/// A `static` `toJson` gathers again — the dynamic-invocation arm
+/// keys on the instance member.
+#[test]
+fn static_to_json_still_gathers() {
+    let source = concat!(
+        "void main() {\n",
+        "  C();\n",
+        "}\n",
+        "\n",
+        "class C {\n",
+        "  static Map<String, Object> toJson() => {};\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "C", 0, true),
+            flag(&f, "toJson", 0, false),
+        ],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'toJson' in an executable library."
+    );
+}
+
+/// `lints/unreachable_from_main/UnreachableFromMainTest/test_class_reachableViaComment#0`
+/// — clean: a doc-comment `[C]` reference counts as a use (the
+/// comment-reference edge the engine face does not carry — the
+/// `counting_uses` doc arm).
+#[test]
+fn doc_comment_reference_counts_as_use() {
+    let source = "/// See [C].\nvoid main() {}\n\nclass C {}\n";
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "C", 0, false)],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+}
+
+/// The anti-reach arm: an expression-position identifier use counts
+/// (the official `visitSimpleIdentifier` — the face's under-reach over
+/// a local call site reads reachable). A plain type annotation does
+/// not — `TypeReference` rows never enter the counting set.
+#[test]
+fn expression_use_counts_type_annotation_does_not() {
+    // The counted arm: `dead()` at the call site is an Expression
+    // context — the face flags it unreachable, the use suppresses.
+    let source = "void main() {}\nvoid dead() {}\nvoid live() { dead(); }\n";
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "live", 0, true),
+            flag(&f, "dead", 0, false),
+        ],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+
+    // The type-reference counterface: `Dead` appearing only in
+    // annotations keeps its report (the official's NamedType filter —
+    // a plain type reference never marks the declaration reachable).
+    let source = "void main() {}\nclass Dead {}\nvoid f(Dead d) {}\n";
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "Dead", 0, false),
+            flag(&f, "f", 0, true),
+        ],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'Dead' in an executable library."
+    );
+}

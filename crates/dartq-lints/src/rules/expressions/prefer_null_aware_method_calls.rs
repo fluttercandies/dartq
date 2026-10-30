@@ -42,13 +42,16 @@ use dartq_semantic::{Binding, BindingKind};
 /// prefixed or type-parameter target is not a plain callable) for the
 /// bare shape. Nullability (family (a)): a definitely-non-null bare
 /// read makes the null test provably dead and the suggestion vacuous.
-/// Approximations (documented, under-report directions): an
-/// unresolvable receiver (`dynamic`, unpublished member rows) and a
-/// multi-dot chain (the face resolves through the head container's
-/// member table) stay silent where the shape-only upstream reports —
-/// the dominant typed-receiver corpus resolves — and a dead-check
-/// bare shape stays silent for the same reason. Message:
+/// Approximations (documented, under-report directions): a dead-check
+/// bare shape stays silent (the definitely-non-null face) and an
+/// unresolved bare name keeps the binding gate — divergences the
+/// corpus pins register; the member-access operand needs no face at
+/// all (upstream resolves nothing). Message:
 /// `diagnostic.g.dart` `preferNullAwareMethodCalls`.
+///
+/// The member-access operand's verdict is shape-only (upstream `_check`
+/// resolves nothing); the bare-name operand keeps the two registered
+/// divergences (unresolved binding, definitely-non-null dead check).
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "prefer_null_aware_method_calls",
     &[NodeKind::Conditional, NodeKind::IfStatement],
@@ -131,18 +134,15 @@ fn check(c: &mut Check<'_>) {
     }
     let site = query_site(c, head);
     let fires = match chain.split_last() {
-        // `p.m!()`: the trailing `DotAccess` marker carries the
-        // selector right after its payload dot (`token_range`'s last
-        // token is the swallowed `!` follower, not the selector); the
-        // member face resolves the same-library member on the
-        // receiver's container.
-        Some((&marker, _)) if c.kind(marker) == NodeKind::DotAccess => {
-            let Some(selector) = c.field(marker, PayloadField::Operator).map(|dot| dot + 1) else {
-                return;
-            };
-            let name = analysis.strings().intern(c.lexeme(selector));
-            analysis.member_of(site, name).is_some()
-        }
+        // `p.m!()`: the member-access operand reports on the shape match
+        // alone — upstream `_check` is purely syntactic
+        // (`operand.toSource() == condition.leftOperand.toSource()`,
+        // prefer_null_aware_method_calls.dart:59-70) and resolves no
+        // member, so a `dynamic`/unresolvable receiver reports exactly
+        // like the typed one (the C7 coverage fix: the earlier
+        // `member_of` gate was the documented under-report the census
+        // flagged).
+        Some((&marker, _)) if c.kind(marker) == NodeKind::DotAccess => true,
         // `f!()`: the bare binding face — a plain `Decl`/`Local`/
         // `Member` target — plus the dead-check face (family (a)): a
         // definitely-non-null read cannot make the test succeed.

@@ -11,27 +11,31 @@ use crate::rules::utf16_token_span;
 /// or property access whose target carries the `dynamic` static type
 /// reports: compound-assignment reads (:55-67, `??=` exempt), binary
 /// user-definable operators over a `dynamic` left operand (:70-88,
-/// `==`/`!=` exempt), invocation functions typed `dynamic` or bare
-/// `Function` (:91-93, :174-181), member invocations over a `dynamic`
-/// receiver (:101-132, the `noSuchMethod`/`toString` exemptions and
-/// the explicit-cast bail), `!` never counts (:136-139), prefix and
-/// postfix operators over a `dynamic` operand (:134-155, :183-195),
-/// and property accesses over a `dynamic` target (:144-164, the
-/// `hashCode`/`noSuchMethod`/`runtimeType`/`toString` exemptions).
+/// `==`/`!=` exempt, reported at the left operand), function-expression
+/// invocations whose function is `dynamic` or bare `Function`
+/// (:91-93), index expressions over a `dynamic` target (:94-96),
+/// member invocations over a `dynamic` receiver (:101-132, the
+/// `noSuchMethod`/`toString` exemptions, the explicit-cast bail, and
+/// the `.call` special case — `a.call()` reports at `call` when the
+/// receiver is a function type), `!` never counts (:136-139), prefix
+/// and postfix operators (:140-155, the operand reports for plain
+/// operators, the whole expression for compounds), property accesses
+/// over a `dynamic` target (:156-164, the `hashCode`/`noSuchMethod`/
+/// `runtimeType`/`toString` exemptions), and cascade sections over a
+/// `dynamic` target (:166-181).
 ///
 /// dartq faces over the production tiling: the semantic faces decide —
-/// the read-type face at the operand's head identifier, the
-/// variable-read face for bare invocations, and the getter/field face
-/// for a single-name receiver (the receiver token must sit directly
-/// before the selector's dot; a method's tear-off is a typed function
-/// type and never answers). Approximations (documented,
-/// under-report): multi-piece receivers (`getD().m()`, `(d).m()`,
-/// chain receivers beyond the head) and index expressions stay
-/// silent, the `.call` receiver special-casing (:119-129) stays
-/// silent, declared-function and getter bare calls stay silent (no
-/// read-row face), and a member invocation on an unresolvable
-/// receiver keeps only the head-read verdict. Message:
-/// `diagnostic.g.dart` `avoidDynamicCalls`.
+/// the member faces read the receiver row directly before the selector
+/// (an identifier, a `!` row, a parenthesized expression — the
+/// upstream `realTarget` extent), the bare-invocation face reads the
+/// selector's flow type, and the function-expression-invocation face
+/// reads the piece before the argument list. Index, cascade, and the
+/// prefix/postfix faces read the operand run's static type.
+/// Approximations (documented, under-report): multi-piece receivers
+/// beyond the head row stay silent (the documented chain under-report),
+/// and a compound operand's read-type fallback reports whole only for
+/// `++`/`--` (the census-compound shape). Message: `diagnostic.g.dart`
+/// `avoidDynamicCalls`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "avoid_dynamic_calls",
     &[
@@ -41,6 +45,8 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
         NodeKind::DotAccess,
         NodeKind::UnaryPrefix,
         NodeKind::UnaryPostfix,
+        NodeKind::Indexed,
+        NodeKind::Cascade,
     ],
     check,
 );
@@ -57,19 +63,84 @@ fn check(c: &mut Check<'_>) {
         NodeKind::Assignment => assignment_face(c, analysis),
         NodeKind::BinaryExpression => binary_face(c, analysis),
         NodeKind::UnaryPrefix | NodeKind::UnaryPostfix => unary_face(c, analysis),
+        NodeKind::Indexed => index_face(c, analysis),
+        NodeKind::Cascade => cascade_face(c, analysis),
         _ => {}
     }
 }
 
+/// The receiver expression row directly before the selector's dot: the
+/// last non-marker piece — an identifier, a `!` row, or another
+/// expression root (the upstream `realTarget`) — within a one-or-two
+/// token gap of the selector (`.x`, `?.x`, `!.x`, `..x`).
+fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<u32> {
+    let run = slice::access_run(c, run);
+    let sel_span = utf16_token_span(c, selector);
+    // Drop the selector's own tail: the selector identifier rides its
+    // send group, whose pieces all open at the selector token.
+    let mut stripped = &run[..];
+    while let Some(&last) = stripped.last() {
+        if c.unit.ast.token_range(last).start >= selector {
+            stripped = &stripped[..stripped.len() - 1];
+            continue;
+        }
+        break;
+    }
+    let receiver = *stripped.last()?;
+    if matches!(
+        c.kind(receiver),
+        NodeKind::Send
+            | NodeKind::NoArguments
+            | NodeKind::Arguments
+            | NodeKind::NoTypeArguments
+            | NodeKind::TypeArguments
+    ) {
+        return None;
+    }
+    let span = c.utf16_span(receiver);
+    let gap = sel_span.start.checked_sub(span.end)?;
+    (gap == 1 || gap == 2).then_some(receiver)
+}
+
 /// The invocation faces (:91-132): a member receiver's `dynamic` read
-/// reports at the receiver (:116); otherwise the invocation function's
-/// tear-off type decides (:130) — a bare invocation reports at the
-/// selector, a member invocation over the receiver-through-selector
-/// window.
+/// reports at the receiver (:116); otherwise a `call` selector over a
+/// function-typed receiver reports at the selector (:119-129); a bare
+/// invocation reports at the selector; a function-expression
+/// invocation reports at its function (:91-93).
 fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some((kids, pos)) = slice::owner_slice(c) else {
         return;
     };
+    let Some(&args) = pos.checked_sub(1).and_then(|i| kids.get(i)) else {
+        return;
+    };
+    if !matches!(c.kind(args), NodeKind::Arguments | NodeKind::NoArguments) {
+        return;
+    }
+    // The function-expression invocation face (:91-93): the piece
+    // before the argument list is the invoked function itself when it
+    // is not a bare selector (`(f)()`, `(g1 ?? g2)()`).
+    if c.kind(args) == NodeKind::Arguments {
+        let Some(mut fi) = pos.checked_sub(2) else {
+            return;
+        };
+        while fi > 0
+            && matches!(
+                c.kind(kids[fi]),
+                NodeKind::TypeArguments | NodeKind::NoTypeArguments
+            )
+        {
+            fi -= 1;
+        }
+        let function = kids[fi];
+        if c.kind(function) != NodeKind::Identifier {
+            let ty = analysis.type_of(query_site(c, function));
+            if ty.is_some_and(|ty| faces::is_dynamic_or_function(analysis, ty)) {
+                c.report(c.utf16_span(function), &[]);
+            }
+            return;
+        }
+    }
     let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
         return;
     };
@@ -95,56 +166,50 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
             return;
         }
     }
-    // The receiver face (:116): one exact name read as `dynamic`.
+    let before = &kids[..head];
+    let selector = c.head_token(selector_row);
     let receiver = member
-        .then(|| faces::single_receiver(c, &kids[..head], c.head_token(selector_row)))
+        .then(|| chain_receiver(c, before, selector))
         .flatten();
     if let Some(receiver) = receiver
         && analysis.type_of(query_site(c, receiver)) == Some(Ty::Dynamic)
     {
-        let range = utf16_token_span(c, c.head_token(receiver));
-        c.report(range, &[]);
+        // The explicit-cast bail (:115).
+        if faces::is_explicit_cast(c, before) {
+            return;
+        }
+        c.report(c.utf16_span(receiver), &[]);
         return;
     }
-    // The tear-off face (:130): `a.m` / `m` typed `dynamic` or bare
-    // `Function`. The tear-off type is the member's own type — a
-    // getter's or field's declared type (a method's tear-off is a
-    // typed function type, never `dynamic`/`Function`) — and the bare
-    // name's flow read row (a variable read; a declared function's
-    // name carries no read row and cannot answer).
-    let tear_off = if member {
-        receiver.and_then(|receiver| {
-            let name = analysis
-                .strings()
-                .intern(c.lexeme(c.head_token(selector_row)));
-            let member_face = analysis.member_of(query_site(c, receiver), name)?;
-            match member_face.entry.kind {
-                dartq_semantic::model::MemberKind::Getter
-                | dartq_semantic::model::MemberKind::Field => {
-                    analysis.member_type(query_site(c, receiver), name)
-                }
-                _ => None,
-            }
-        })
-    } else if arguments.is_some() {
-        // A bare invocation; the plain name reference group (no
-        // arguments) is not a call site (:91-93 dispatches
-        // FunctionExpressionInvocation).
-        analysis.type_of(query_site(c, selector_row))
-    } else {
-        None
-    };
-    if tear_off.is_some_and(|ty| faces::is_dynamic_or_function(analysis, ty)) {
-        let range = if member {
-            let receiver_token = receiver.map_or(c.head_token(selector_row), |receiver| {
-                c.head_token(receiver)
-            });
-            utf16_token_span(c, receiver_token).start
-                ..utf16_token_span(c, c.head_token(selector_row)).end
-        } else {
-            utf16_token_span(c, c.head_token(selector_row))
-        };
-        c.report(range, &[]);
+    // The `.call` special case (:119-129): `a.call()` is `a()` — the
+    // receiver's own function type decides, and the report lands on
+    // the `call` selector.
+    if member
+        && c.lexeme(selector) == "call"
+        && let Some(receiver) = receiver
+        && !faces::is_explicit_cast(c, before)
+        && faces::is_dynamic_or_function(
+            analysis,
+            analysis
+                .type_of(query_site(c, receiver))
+                .unwrap_or(Ty::Unknown),
+        )
+    {
+        c.report(utf16_token_span(c, selector), &[]);
+        return;
+    }
+    // The bare-invocation face (:174-181): the selector's flow type is
+    // `dynamic` or bare `Function` (`function();`).
+    if arguments.is_some()
+        && !faces::is_explicit_cast(c, before)
+        && faces::is_dynamic_or_function(
+            analysis,
+            analysis
+                .type_of(query_site(c, selector_row))
+                .unwrap_or(Ty::Unknown),
+        )
+    {
+        c.report(utf16_token_span(c, selector), &[]);
     }
 }
 
@@ -162,7 +227,7 @@ fn single_positional(c: &Check<'_>, arguments: u32, expected: bool) -> bool {
     c.kind(raw[range.end - 1]) != NodeKind::NamedArgument
 }
 
-/// The property-access face (:144-164, the `PrefixedIdentifier` and
+/// The property-access face (:156-164, the `PrefixedIdentifier` and
 /// `PropertyAccess` dispatch): a `dynamic` target over a non-exempt
 /// member reports at the target. The invocation's own trailing
 /// whole-access marker dispatches here too — the piece directly before
@@ -187,12 +252,11 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     if faces::is_explicit_cast(c, &before) {
         return;
     }
-    let Some(receiver) = faces::single_receiver(c, &before, selector) else {
+    let Some(receiver) = chain_receiver(c, &before, selector) else {
         return;
     };
     if analysis.type_of(query_site(c, receiver)) == Some(Ty::Dynamic) {
-        let range = utf16_token_span(c, c.head_token(receiver));
-        c.report(range, &[]);
+        c.report(c.utf16_span(receiver), &[]);
     }
 }
 
@@ -229,8 +293,9 @@ fn assignment_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 }
 
 /// The binary face (:70-88): a user-definable operator (`==`/`!=`
-/// exempt) over a `dynamic` left operand reports at the operator
-/// expression; the right operand is an implicit cast, not a call.
+/// exempt) over a `dynamic` left operand reports at the LEFT OPERAND
+/// (`reportAtNode(node.leftOperand)`); the right operand is an
+/// implicit cast, not a call.
 fn binary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some(op) = c.field(c.node(), PayloadField::Operator) else {
         return;
@@ -258,51 +323,145 @@ fn binary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     {
         return;
     }
-    let Some((left, right)) = slice::binary_operands(c) else {
+    let Some((left, _right)) = slice::binary_operands(c) else {
         return;
     };
     if faces::is_explicit_cast(c, &left) {
         return;
     }
     if faces::expr_type(c, analysis, &left) == Some(Ty::Dynamic) {
-        // `reportAtNode(node)` spans the whole binary expression; the
-        // container row opens at the operator's tile anchor, so the
-        // extent runs from the left operand run's first token to the
-        // right run's last value row.
         let Some(start) = slice::operand_utf16_start(c, &left, op) else {
             return;
         };
-        c.report(start..value_run_end(c, &right, c.node()), &[]);
+        let end = value_run_end(c, &left, *left.last().unwrap_or(&c.node()));
+        c.report(start..end, &[]);
     }
 }
 
-/// The prefix and postfix faces (:134-155): a `dynamic` operand
-/// reports at the operator expression (the postfix `!` never
-/// dispatches here — it is its own token-leaf kind).
+/// The prefix and postfix faces (:140-155): a `dynamic` operand
+/// reports at the operand for plain operators (`-a`), at the whole
+/// expression for compounds (`++a` — the compound read-type fallback,
+/// :150-155); the postfix `!` never dispatches here (its own
+/// token-leaf kind).
 fn unary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some((kids, pos)) = slice::owner_slice(c) else {
         return;
     };
     let operand = slice::statement_run(c, &kids[..pos]);
-    if faces::is_explicit_cast(c, &operand) {
+    if operand.is_empty() || faces::is_explicit_cast(c, &operand) {
         return;
     }
-    if faces::expr_type(c, analysis, &operand) == Some(Ty::Dynamic) {
-        // `reportAtNode(node)` spans the whole operator expression; a
-        // postfix row anchors at its operator token (`x++` opens at
-        // `++`), so the extent runs from the operand run's first
-        // token — bounded at the operator, since the owner-side run
-        // can carry enclosing strays. A prefix row already opens at
-        // its operator.
-        let start = if c.kind(c.node()) == NodeKind::UnaryPostfix {
-            let floor = c.unit.ast.token_range(c.node()).end - 1;
-            let Some(start) = slice::operand_utf16_start(c, &operand, floor) else {
-                return;
-            };
-            start
-        } else {
-            c.utf16_span(c.node()).start
+    if faces::expr_type(c, analysis, &operand) != Some(Ty::Dynamic) {
+        return;
+    }
+    let compound = matches!(c.lexeme(c.head_token(c.node())), "++" | "--");
+    let last = *operand.last().unwrap();
+    let (start, end) = if compound {
+        // `reportAtNode(root)` — the whole operator expression: a
+        // prefix row (`++a`) opens at its operator, a postfix row
+        // (`a++`) opens at the operator too with the operand tiled
+        // before it — the extent runs from the operand run's first
+        // row to the node's own span end.
+        (c.utf16_span(operand[0]).start, c.utf16_span(c.node()).end)
+    } else {
+        // `reportAtNode(operand)`.
+        let Some(start) = slice::operand_utf16_start(
+            c,
+            &operand,
+            c.unit.ast.token_range(c.node()).next_back().unwrap_or(0),
+        ) else {
+            return;
         };
-        c.report(start..c.utf16_span(c.node()).end, &[]);
+        (start, value_run_end(c, &operand, last))
+    };
+    c.report(start..end, &[]);
+}
+
+/// The index face (:94-96): a `dynamic` target reports at the target
+/// (`reportAtNode(node.realTarget)`) — `a[1]` and the `a[1] = v`
+/// assignment target alike.
+fn index_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+    let node = c.node();
+    let Some((kids, pos)) = slice::owner_slice(c) else {
+        return;
+    };
+    // The target run sits before the index's own `[` (the first
+    // depth-zero bracket from the row's start).
+    let mut depth = 0i32;
+    let mut bracket = None;
+    for token in c.unit.ast.token_range(node) {
+        match c.lexeme(token) {
+            "[" => {
+                if depth == 0 {
+                    bracket = Some(token);
+                    break;
+                }
+            }
+            "(" | "{" => depth += 1,
+            ")" | "}" => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(bracket) = bracket else {
+        return;
+    };
+    let bracket_start = crate::rules::byte_span_of_token(c, bracket).start;
+    let before: Vec<u32> = kids[..pos]
+        .iter()
+        .copied()
+        .filter(|&kid| c.byte_span(kid).end <= bracket_start)
+        .collect();
+    let run = slice::statement_run(c, &before);
+    if run.is_empty() || faces::is_explicit_cast(c, &run) {
+        return;
+    }
+    if faces::expr_type(c, analysis, &run) == Some(Ty::Dynamic) {
+        let start = c.utf16_span(run[0]).start;
+        let end = value_run_end(c, &run, *run.last().unwrap());
+        c.report(start..end, &[]);
+    }
+}
+
+/// The cascade face (:166-181): a `dynamic` cascade target reports at
+/// the target once (`reportAtNode(node.target)`) — `a..b()` and
+/// `a..b` alike; the subsequent sections ride the same target.
+fn cascade_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+    let node = c.node();
+    let Some((kids, pos)) = slice::owner_slice(c) else {
+        return;
+    };
+    // The target run sits before the first depth-zero `..`.
+    let mut depth = 0i32;
+    let mut dots = None;
+    for token in c.unit.ast.token_range(node) {
+        match c.lexeme(token) {
+            ".." | "?.." => {
+                if depth == 0 {
+                    dots = Some(token);
+                    break;
+                }
+            }
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(dots) = dots else {
+        return;
+    };
+    let dots_start = crate::rules::byte_span_of_token(c, dots).start;
+    let before: Vec<u32> = kids[..pos]
+        .iter()
+        .copied()
+        .filter(|&kid| c.byte_span(kid).end <= dots_start)
+        .collect();
+    let run = slice::statement_run(c, &before);
+    if run.is_empty() || faces::is_explicit_cast(c, &run) {
+        return;
+    }
+    if faces::expr_type(c, analysis, &run) == Some(Ty::Dynamic) {
+        let start = c.utf16_span(run[0]).start;
+        let end = value_run_end(c, &run, *run.last().unwrap());
+        c.report(start..end, &[]);
     }
 }

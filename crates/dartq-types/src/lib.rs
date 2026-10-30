@@ -15,10 +15,16 @@
 //! Every type carries the two-state `?` projection; `T?` is the same kind
 //! with the question flag (`withNullability`, type.dart:1558/1567-1569).
 //! This mirrors the official model exactly — the suffix is per-class state,
-//! not an enum variant (type.dart:1558). The unit kinds normalize at
-//! interning: `dynamic`/`void`/`Invalid`/`Null` are stored non-`?` (their
-//! nullability is semantic; type.dart:90-92), and `Never?` is interned as
-//! `Null` (official `Never?` behaves as `Null`, type.dart:1207-1209). The
+//! not an enum variant (type.dart:1558). The fixed-projection unit kinds
+//! normalize at interning: `dynamic`/`void`/`Invalid`/`Null` are stored
+//! non-`?` (their nullability is semantic; type.dart:90-92). `Never` keeps
+//! both projections as distinct interned shapes (`NeverTypeImpl` carries
+//! its suffix, type.dart:1189-1193): `Never?` sits in the `Null`
+//! equivalence class for every subtype/nullability query
+//! (`isDartCoreNull`, type.dart:1201-1204) yet stays distinct from `Null`
+//! under structural equality — the distinction
+//! [`TypeSystem::is_structurally_equal`] preserves for the `==`-grade
+//! consumers (`unnecessary_cast`, exhaustiveness `getStaticType`). The
 //! legacy `*` suffix does not exist here: dartq rejects language versions
 //! below 2.12, so no legacy types can exist ([`NullabilitySuffix::Star`] is
 //! an explicit construction error).
@@ -52,27 +58,27 @@
 //! ## M1 boundaries
 //!
 //! Implemented: `T?` syntax and the two-state suffix, the subtype rules
-//! 0a/0c/1-7/10-13 of `subtype.dart:262-523` (rule 14 — record subtyping —
-//! is deferred to M2: every non-identical record/record pair is `false` and
-//! `record <: Record`-class is not answered yet; the vendored oracle's rule
-//! 14 at `subtype.dart:512-519` calls a fully implemented
-//! `_isRecordSubtypeOf`), `isAssignableTo`
+//! 0a/0c/1-7/10-14 of `subtype.dart:262-523` (rule 14 — record subtyping,
+//! including `record <: Record`-class and `_isRecordSubtypeOf`,
+//! subtype.dart:512-519) plus the left-type-variable-bound rule
+//! (subtype.dart:490-500, armed by [`TypeSystem::with_param_facts`]),
+//! `isAssignableTo`
 //! (type_system.dart:891-925) with the `strict-casts` gate, the `FutureOr`
 //! rules (subtype.dart:372-385/418-449), the interface walk with invariant
 //! arity/covariant arguments (subtype.dart:44-83, class parameters are
 //! covariant, element.dart:11560-11561), function subtyping with positional
 //! name-sorted correlation (subtype.dart:86-182), `isStrictlyNonNullable`
-//! (type_system.dart:1921-1951), and the LUB face (interface chain +
-//! nullability merge + `FutureOr` merging).
+//! (type_system.dart:1921-1951), the LUB face (interface chain +
+//! nullability merge + `FutureOr` merging + the record field merge), and
+//! the `==`-grade structural equality with function alpha-equivalence
+//! ([`TypeSystem::is_structurally_equal`], the `FunctionTypeImpl.==`
+//! port).
 //!
-//! Not implemented (M2): promoted bounds (flow), declared bounds and
-//! variance annotations, extension types, `UnknownInferredType`, record
-//! subtype/LUB rules — including the one-line `record <: Record`-class rule
-//! (subtype.dart:512-515) and the record/record LUB field merge
-//! (`_recordType`, least_upper_bound.dart:852-885; both-record LUB answers
-//! the `Record` class itself) — (records are construction + equality
-//! skeletons), function/function LUB merging (falls back to bare
-//! `Function`), and implicit `call` tear-offs in assignability. Each
+//! Not implemented (M2): promoted bounds (flow), declared bounds inside
+//! function-subtype correlation, variance annotations in the subtype walk,
+//! extension types, `UnknownInferredType`,
+//! function/function LUB merging (falls back to bare `Function`), and
+//! implicit `call` tear-offs in assignability. Each
 //! fallback is documented at its site and matches an official fallback path
 //! where one exists.
 //!

@@ -545,6 +545,10 @@ pub struct LibraryGraphBuilder<'t> {
     by_uri: FxHashMap<Box<str>, LibraryId>,
     /// The synthetic SDK face files ([`Self::face_unit`]).
     face_files: FxHashSet<FileId>,
+    /// Extension declarations as `(file, name)` pairs
+    /// ([`Self::declare_extension`]) — the element-kind facts the deferred
+    /// import-of-extension face consumes ([`crate::export_graph`]).
+    extensions: FxHashSet<(FileId, StringId)>,
 }
 
 struct NodeBuilder {
@@ -578,6 +582,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             nodes: Vec::new(),
             by_uri: FxHashMap::default(),
             face_files: FxHashSet::default(),
+            extensions: FxHashSet::default(),
         }
     }
 
@@ -673,6 +678,20 @@ impl<'t> LibraryGraphBuilder<'t> {
         self.nodes[lib.index() as usize]
             .classes
             .push((name, modifiers));
+    }
+
+    /// Records one `extension` declaration `name` of `lib`, declared in
+    /// `file`: [`Self::declare`] plus the element-kind mark the deferred
+    /// import-of-extension check consumes ([`LibraryGraph::is_extension`]
+    /// via [`crate::export_graph::LibraryGraph::
+    /// deferred_import_exports_extension`]). Unnamed extensions pass no
+    /// name and are never registered — they carry no export-scope name
+    /// (`createPublicNamespaceForLibrary` skips empty names,
+    /// `scope.dart:135-186`), so they can never surface through a
+    /// namespace.
+    pub fn declare_extension(&mut self, lib: LibraryId, name: StringId, file: FileId) {
+        self.declare(lib, name, file);
+        self.extensions.insert((file, name));
     }
 
     /// Records `lib`'s resolved `import` directive, in source order.
@@ -881,6 +900,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             declarations,
             file_lib,
             face_files,
+            extensions: self.extensions,
         }
     }
 }
@@ -1011,6 +1031,10 @@ pub struct LibraryGraph {
     file_lib: FxHashMap<FileId, LibraryId>,
     /// The synthetic SDK face files ([`LibraryGraph::is_face_file`]).
     face_files: FxHashSet<FileId>,
+    /// Extension declarations as `(file, name)` pairs
+    /// ([`LibraryGraphBuilder::declare_extension`]) — the kind facts behind
+    /// [`LibraryGraph::is_extension`].
+    extensions: FxHashSet<(FileId, StringId)>,
 }
 
 struct LibraryNode {
@@ -1120,6 +1144,16 @@ impl LibraryGraph {
     #[must_use]
     pub fn is_face_file(&self, file: FileId) -> bool {
         self.face_files.contains(&file)
+    }
+
+    /// Whether the element `name` declared in `file` is an `extension`
+    /// declaration ([`LibraryGraphBuilder::declare_extension`]) — the
+    /// element-kind fact keyed by declaration identity, so a re-exported
+    /// scope entry (which carries the original declaring file) answers
+    /// identically at any distance. One hash hit.
+    #[must_use]
+    pub fn is_extension(&self, file: FileId, name: StringId) -> bool {
+        self.extensions.contains(&(file, name))
     }
 
     /// The resolved import edges of `lib`, in directive source order.
@@ -2466,5 +2500,39 @@ mod tests {
 
         assert_eq!(graph.name(meta), "meta");
         assert_eq!(graph.name(vendored), "");
+    }
+
+    /// Extension-kind facts: the mark keys on the declaration identity
+    /// (file, name), an extension is also an ordinary declaration (both
+    /// faces answer), a plain declaration of the same name in another file
+    /// stays unmarked, and a re-exported scope entry — which carries the
+    /// original declaring file — answers `is_extension` at a distance.
+    #[test]
+    fn extension_facts_key_on_declaration_identity_and_flow_through_reexports() {
+        let mut rig = Rig::new();
+        let ext = rig.builder.intern("package:x/ext.dart");
+        let twin = rig.builder.intern("package:x/twin.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        let ext_file = rig.file("ext.dart");
+        let twin_file = rig.file("twin.dart");
+        let ext_name = rig.strings.intern("OnInt");
+        let twin_name = rig.strings.intern("OnInt");
+        rig.builder.declare_extension(ext, ext_name, ext_file);
+        rig.declare(twin, "OnInt", twin_file);
+        rig.export(app, Some(ext));
+        let graph = rig.builder.finish();
+
+        assert!(graph.is_extension(ext_file, ext_name));
+        // The same name declared plainly elsewhere is not an extension.
+        assert!(!graph.is_extension(twin_file, twin_name));
+        // The declaration also lands in both ordinary faces.
+        assert!(graph.exported(ext, ext_name).is_some());
+        // The re-exported entry points at the declaring file, so the kind
+        // answers through the chain.
+        let entry = graph.exported(app, ext_name).expect("re-export flows");
+        assert_eq!(entry.file, ext_file);
+        assert!(graph.is_extension(entry.file, ext_name));
+        // Unregistered pairs answer false.
+        assert!(!graph.is_extension(twin_file, ext_name));
     }
 }

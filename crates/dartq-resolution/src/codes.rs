@@ -25,17 +25,26 @@
 //! The six directive-combinator/duplicate static warnings
 //! ([`UNDEFINED_HIDDEN_NAME`]/[`UNDEFINED_SHOWN_NAME`],
 //! [`DUPLICATE_HIDDEN_NAME`]/[`DUPLICATE_SHOWN_NAME`],
-//! [`DUPLICATE_IMPORT`]/[`DUPLICATE_EXPORT`]) are registered as companion
-//! descriptor consts beside the table instead of variants, for one structural
-//! reason: the engine's persisted directive-code slot
-//! (`PersistedResolutionCode`) exhaustively mirrors [`ResolutionCode`] by
-//! design, and these codes never ride it — they are not URI-target outcomes
-//! but directive-combinator checks the semantic layer emits with the
-//! combinator name spans ([`crate::library_graph::
-//! LibraryGraph::undefined_combinator_names`]) or cross-directive duplicate
-//! findings a per-directive slot cannot express. Extending the frozen enum
-//! for them would trip the persistence tripwire in a foreign crate for a
-//! slot they can never occupy.
+//! [`DUPLICATE_IMPORT`]/[`DUPLICATE_EXPORT`]) and the export/re-export graph
+//! family ([`EXPORT_INTERNAL_LIBRARY`],
+//! [`DEFERRED_IMPORT_OF_EXTENSION`],
+//! [`INVALID_EXPORT_OF_INTERNAL_ELEMENT`]/[`.._INDIRECTLY`],
+//! [`RECURSIVE_COMPILE_TIME_CONSTANT`], [`RECURSIVE_CONSTRUCTOR_REDIRECT`],
+//! the [`RECURSIVE_INTERFACE_INHERITANCE`] clause family,
+//! [`TOP_LEVEL_CYCLE`]) are registered as companion descriptor consts beside
+//! the table instead of variants, for one structural reason: the engine's
+//! persisted directive-code slot (`PersistedResolutionCode`) exhaustively
+//! mirrors [`ResolutionCode`] by design, and these codes never ride it —
+//! they are not URI-target outcomes but directive-combinator checks the
+//! semantic layer emits with the combinator name spans ([`crate::
+//! library_graph::LibraryGraph::undefined_combinator_names`]),
+//! cross-directive duplicate findings a per-directive slot cannot express,
+//! or element-graph cycle findings ([`crate::export_graph`],
+//! [`crate::cycles`]). Extending the frozen enum for them would trip the
+//! persistence tripwire in a foreign crate for a slot they can never
+//! occupy. [`ResolutionCode::AmbiguousExport`] predates the family and
+//! stays a variant; its descriptor stays the single source for
+//! `ambiguous_export`.
 
 use dartq_diagnostics::DiagnosticType;
 
@@ -204,6 +213,227 @@ pub const DUPLICATE_EXPORT: ResolutionCodeInfo = ResolutionCodeInfo {
     message: "Duplicate export.",
     correction: Some("Try removing all but one export of the library."),
     dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// One export directive exports a name a previous export directive of the
+/// same library already exports as a **different** element — the frozen
+/// row is [`ResolutionCode::AmbiguousExport`]'s (registry row verbatim,
+/// `diagnostic.g.dart:264`, dart 3.13.7). `COMPILE_TIME_ERROR`,
+/// published; `{0}` the conflicting name, `{1}`/`{2}` the two elements'
+/// declaring-library URIs. One report per directive (the first conflicting
+/// name only), anchored at the directive, accumulated across the library's
+/// directives in source order (`error_verifier.dart:2593-2621`
+/// `_checkForAmbiguousExport` over `LibraryVerificationContext
+/// ._exportedElements`; the directive namespace is the target's export
+/// scope under the directive's combinators, `scope.dart:99-110`
+/// `createExportNamespaceForDirective2`). The decision face is
+/// [`crate::export_graph`]`::LibraryGraph::ambiguous_exports`.
+
+/// An export directive targets an internal SDK library (`dart:_…`) from a
+/// non-system library — registry row verbatim (`diagnostic.g.dart:5332`,
+/// dart 3.13.7). `COMPILE_TIME_ERROR`, published, no correction; `{0}` is
+/// the directive's written URI string. The gate: the exported library's
+/// canonical URI starts with `dart:_` (`element.dart:7042-7044`
+/// `isInternalSdkLibrary`) and the reporting library is not itself a
+/// `dart:`-scheme library (`error_verifier.dart:4651-4654`,
+/// `_isInSystemLibrary` set from `uri.isScheme('dart')`, `:320`). The
+/// decision face is
+/// [`crate::export_graph`]`::LibraryGraph::export_internal_library_directives`.
+pub const EXPORT_INTERNAL_LIBRARY: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "export_internal_library",
+    machine: "EXPORT_INTERNAL_LIBRARY",
+    message: "The library '{0}' is internal and can't be exported.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// A deferred import's namespace contains an extension — registry row
+/// verbatim (`diagnostic.g.dart:3628`, dart 3.13.7). `COMPILE_TIME_ERROR`,
+/// published; one report per directive at its URI, gated on the import
+/// carrying a deferred prefix (`error_verifier.dart:1339-1356`
+/// `visitImportDirective`'s `prefix?.isDeferred` probe) and any
+/// `ExtensionElement` surviving the combinators
+/// (`error_verifier.dart:4393-4405` `_checkForDeferredImportOfExtensions`).
+/// The decision face is
+/// [`crate::export_graph`]`::LibraryGraph::deferred_import_exports_extension`.
+pub const DEFERRED_IMPORT_OF_EXTENSION: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "deferred_import_of_extension",
+    machine: "DEFERRED_IMPORT_OF_EXTENSION",
+    message: "Deferred library imports must hide all extension declarations.",
+    correction: Some(
+        "Try adding either a show combinator listing the names you need to \
+         reference or a hide combinator listing all of the extension \
+         declarations.",
+    ),
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// A public-API library's export directive exports an `@internal`-annotated
+/// member — registry row verbatim (`diagnostic.g.dart:8644`, dart 3.13.7).
+/// `STATIC_WARNING`, published; the gate is the workspace-package public-API
+/// face (`best_practices_verifier.dart:96-99` `_inPackagePublicApi` over
+/// `workspace/pub.dart:543-570` `sourceIsInPublicApi` — under the package's
+/// `lib/`, not under `lib/src/`). The decision face is
+/// [`crate::export_graph`]`::LibraryGraph::invalid_internal_export_findings`.
+pub const INVALID_EXPORT_OF_INTERNAL_ELEMENT: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "invalid_export_of_internal_element",
+    machine: "INVALID_EXPORT_OF_INTERNAL_ELEMENT",
+    message: "The member '{0}' can't be exported as a part of a package's public API.",
+    correction: Some("Try using a hide clause to hide '{0}'."),
+    dtype: DiagnosticType::StaticWarning,
+    has_published: true,
+};
+
+/// The signature twin of [`INVALID_EXPORT_OF_INTERNAL_ELEMENT`]: an exported
+/// executable member's signature mentions an `@internal` type alias —
+/// registry row verbatim (`diagnostic.g.dart:8666`, dart 3.13.7).
+/// `STATIC_WARNING`, published; `{0}` the alias name, `{1}` the exported
+/// member. One report per matching signature type, no early exit
+/// (`best_practices_verifier.dart:1029-1049` walks parameter types, return
+/// type, and type-parameter bounds).
+pub const INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY: ResolutionCodeInfo =
+    ResolutionCodeInfo {
+        name: "invalid_export_of_internal_element_indirectly",
+        machine: "INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY",
+        message: concat!(
+            "The member '{0}' can't be exported as a part of a package's public ",
+            "API, but is indirectly exported as part of the signature of '{1}'."
+        ),
+        correction: Some("Try using a hide clause to hide '{1}'."),
+        dtype: DiagnosticType::StaticWarning,
+        has_published: true,
+    };
+
+/// A constant's value recursively depends on itself — registry row verbatim
+/// (`diagnostic.g.dart:14376`, dart 3.13.7). `COMPILE_TIME_ERROR`,
+/// published, no correction; one report at each **variable** on the cycle
+/// (`constant/evaluation.dart:433-459` `generateCycleError`; constructors on
+/// a cycle report elsewhere). The cycle face is
+/// [`crate::cycles::dependency_cycle`].
+pub const RECURSIVE_COMPILE_TIME_CONSTANT: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_compile_time_constant",
+    machine: "RECURSIVE_COMPILE_TIME_CONSTANT",
+    message: "The compile-time constant expression depends on itself.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// A generative constructor redirects to itself directly or indirectly —
+/// registry row verbatim (`diagnostic.g.dart:14404`, dart 3.13.7).
+/// `COMPILE_TIME_ERROR`, published; reported at the redirecting initializer
+/// when the successor walk from the constructor returns to **that
+/// constructor** (`error_verifier.dart:6831-6852`
+/// `_checkForRecursiveConstructorRedirect` over
+/// `_hasRedirectingFactoryConstructorCycle`'s visited-set walk — a walk that
+/// enters a cycle not containing the start stays silent). The face is
+/// [`crate::cycles::cycle_through`].
+pub const RECURSIVE_CONSTRUCTOR_REDIRECT: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_constructor_redirect",
+    machine: "RECURSIVE_CONSTRUCTOR_REDIRECT",
+    message: "Constructors can't redirect to themselves either directly or indirectly.",
+    correction: Some("Try changing one of the constructors in the loop to not redirect."),
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// An interface declaration is a superinterface of itself through a cycle —
+/// registry row verbatim (`diagnostic.g.dart:14465`, dart 3.13.7).
+/// `COMPILE_TIME_ERROR`, published, no correction; `{0}` the declaration's
+/// display name, `{1}` the cycle members joined `', '`. The generic clause
+/// form reports when no single clause names the element itself
+/// (`inheritance_override.dart:705-790` `_checkForRecursiveInterfaceInheritance`
+/// over `interfaceCycle`, computed as the Tarjan SCC in discovery-reversed
+/// pop order, `summary2/interface_cycles.dart` +
+/// `_fe_analyzer_shared/dependency_walker.dart`). The face is
+/// [`crate::cycles::StronglyConnected::cyclic_component`].
+///
+/// The four clause-specific variants below share this row's code **name**
+/// (the registry rows are all `recursive_interface_inheritance`; they differ
+/// only in `uniqueName` and message — `diagnostic.g.dart:14489/14513/14529/
+/// 14553`), so the (severity, code, file) tuple is this row's for the whole
+/// family.
+pub const RECURSIVE_INTERFACE_INHERITANCE: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_interface_inheritance",
+    machine: "RECURSIVE_INTERFACE_INHERITANCE",
+    message: "'{0}' can't be a superinterface of itself: {1}.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// The `extends`-clause variant of [`RECURSIVE_INTERFACE_INHERITANCE`] —
+/// `uniqueName` `recursive_interface_inheritance_extends`, registry row
+/// verbatim (`diagnostic.g.dart:14489`, dart 3.13.7). Same code name and
+/// machine form as the base row; the direct `extends Self` shape.
+pub const RECURSIVE_INTERFACE_INHERITANCE_EXTENDS: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_interface_inheritance",
+    machine: "RECURSIVE_INTERFACE_INHERITANCE",
+    message: "'{0}' can't extend itself.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// The `implements`-clause variant of [`RECURSIVE_INTERFACE_INHERITANCE`] —
+/// `uniqueName` `recursive_interface_inheritance_implements`, registry row
+/// verbatim (`diagnostic.g.dart:14513`, dart 3.13.7).
+pub const RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_interface_inheritance",
+    machine: "RECURSIVE_INTERFACE_INHERITANCE",
+    message: "'{0}' can't implement itself.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// The mixin `on`-clause variant of [`RECURSIVE_INTERFACE_INHERITANCE`] —
+/// `uniqueName` `recursive_interface_inheritance_on`, registry row verbatim
+/// (`diagnostic.g.dart:14529`, dart 3.13.7).
+pub const RECURSIVE_INTERFACE_INHERITANCE_ON: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_interface_inheritance",
+    machine: "RECURSIVE_INTERFACE_INHERITANCE",
+    message: "'{0}' can't use itself as a superclass constraint.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// The `with`-clause variant of [`RECURSIVE_INTERFACE_INHERITANCE`] —
+/// `uniqueName` `recursive_interface_inheritance_with`, registry row
+/// verbatim (`diagnostic.g.dart:14553`, dart 3.13.7).
+pub const RECURSIVE_INTERFACE_INHERITANCE_WITH: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "recursive_interface_inheritance",
+    machine: "RECURSIVE_INTERFACE_INHERITANCE",
+    message: "'{0}' can't use itself as a mixin.",
+    correction: None,
+    dtype: DiagnosticType::CompileTimeError,
+    has_published: true,
+};
+
+/// A non-const top-level declaration's inferred type depends on itself
+/// through a cycle — registry row verbatim (`diagnostic.g.dart:16012`, dart
+/// 3.13.7). `COMPILE_TIME_ERROR`, published; `{0}` the variable's name,
+/// `{1}` the cycle's member names joined `', '` (sorted,
+/// `top_level_inference.dart:271-273`). Const variables are excluded — they
+/// report [`RECURSIVE_COMPILE_TIME_CONSTANT`] instead
+/// (`resolver.dart:4552-4572` `_checkTopLevelCycle`). The face is
+/// [`crate::cycles::dependency_cycle`].
+pub const TOP_LEVEL_CYCLE: ResolutionCodeInfo = ResolutionCodeInfo {
+    name: "top_level_cycle",
+    machine: "TOP_LEVEL_CYCLE",
+    message: concat!(
+        "The type of '{0}' can't be inferred because it depends on itself ",
+        "through the cycle: {1}."
+    ),
+    correction: Some(
+        "Try adding an explicit type to one or more of the variables in the \
+         cycle in order to break the cycle.",
+    ),
+    dtype: DiagnosticType::CompileTimeError,
     has_published: true,
 };
 
@@ -571,5 +801,167 @@ mod tests {
         const {
             assert!(DUPLICATE_EXPORT.has_published);
         }
+    }
+
+    /// Registry-true descriptors of the export/re-export graph family,
+    /// verified against the pinned oracle registry (dart 3.13.7
+    /// `diagnostic.g.dart`; rows: ambiguousExport 264, deferredImportOf-
+    /// Extension 3628, exportInternalLibrary 5332, invalidExportOfInternal-
+    /// Element 8644, invalidExportOfInternalElementIndirectly 8666,
+    /// recursiveCompileTimeConstant 14376, recursiveConstructorRedirect
+    /// 14404, recursiveInterfaceInheritance 14465 + clause variants 14489 /
+    /// 14513 / 14529 / 14553, topLevelCycle 16012). All published;
+    /// `invalid_export_of_internal_element`(_indirectly) are
+    /// `STATIC_WARNING`, the rest `COMPILE_TIME_ERROR`.
+    #[test]
+    fn export_graph_rows_are_verbatim_oracle_descriptors() {
+        assert_eq!(
+            ResolutionCode::AmbiguousExport.info().message,
+            "The name '{0}' is defined in the libraries '{1}' and '{2}'."
+        );
+        assert_eq!(
+            ResolutionCode::AmbiguousExport.info().dtype,
+            DiagnosticType::CompileTimeError
+        );
+
+        assert_eq!(
+            EXPORT_INTERNAL_LIBRARY.message,
+            "The library '{0}' is internal and can't be exported."
+        );
+        assert_eq!(EXPORT_INTERNAL_LIBRARY.correction, None);
+        assert_eq!(
+            EXPORT_INTERNAL_LIBRARY.dtype,
+            DiagnosticType::CompileTimeError
+        );
+
+        assert_eq!(
+            DEFERRED_IMPORT_OF_EXTENSION.message,
+            "Deferred library imports must hide all extension declarations."
+        );
+        assert_eq!(
+            DEFERRED_IMPORT_OF_EXTENSION.correction,
+            Some(
+                "Try adding either a show combinator listing the names you need to \
+                 reference or a hide combinator listing all of the extension \
+                 declarations."
+            )
+        );
+        assert_eq!(
+            DEFERRED_IMPORT_OF_EXTENSION.dtype,
+            DiagnosticType::CompileTimeError
+        );
+
+        assert_eq!(
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT.message,
+            "The member '{0}' can't be exported as a part of a package's public API."
+        );
+        assert_eq!(
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT.correction,
+            Some("Try using a hide clause to hide '{0}'.")
+        );
+        assert_eq!(
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT.dtype,
+            DiagnosticType::StaticWarning
+        );
+
+        assert_eq!(
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY.message,
+            "The member '{0}' can't be exported as a part of a package's public \
+             API, but is indirectly exported as part of the signature of '{1}'."
+        );
+        assert_eq!(
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY.correction,
+            Some("Try using a hide clause to hide '{1}'.")
+        );
+        assert_eq!(
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY.dtype,
+            DiagnosticType::StaticWarning
+        );
+
+        assert_eq!(
+            RECURSIVE_COMPILE_TIME_CONSTANT.message,
+            "The compile-time constant expression depends on itself."
+        );
+        assert_eq!(RECURSIVE_COMPILE_TIME_CONSTANT.correction, None);
+
+        assert_eq!(
+            RECURSIVE_CONSTRUCTOR_REDIRECT.message,
+            "Constructors can't redirect to themselves either directly or indirectly."
+        );
+        assert_eq!(
+            RECURSIVE_CONSTRUCTOR_REDIRECT.correction,
+            Some("Try changing one of the constructors in the loop to not redirect.")
+        );
+
+        assert_eq!(
+            TOP_LEVEL_CYCLE.message,
+            "The type of '{0}' can't be inferred because it depends on itself \
+             through the cycle: {1}."
+        );
+        assert_eq!(
+            TOP_LEVEL_CYCLE.correction,
+            Some(
+                "Try adding an explicit type to one or more of the variables in the \
+                 cycle in order to break the cycle."
+            )
+        );
+
+        for row in [
+            EXPORT_INTERNAL_LIBRARY,
+            DEFERRED_IMPORT_OF_EXTENSION,
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT,
+            INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY,
+            RECURSIVE_COMPILE_TIME_CONSTANT,
+            RECURSIVE_CONSTRUCTOR_REDIRECT,
+            RECURSIVE_INTERFACE_INHERITANCE,
+            RECURSIVE_INTERFACE_INHERITANCE_EXTENDS,
+            RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS,
+            RECURSIVE_INTERFACE_INHERITANCE_ON,
+            RECURSIVE_INTERFACE_INHERITANCE_WITH,
+            TOP_LEVEL_CYCLE,
+        ] {
+            assert!(row.has_published, "{} must be published", row.name);
+            assert_eq!(row.machine, row.name.to_uppercase(), "{}", row.name);
+        }
+        assert!(ResolutionCode::AmbiguousExport.info().has_published);
+    }
+
+    /// The `recursive_interface_inheritance` clause family shares one code
+    /// name (the registry rows differ only in `uniqueName` and message —
+    /// dart 3.13.7 `diagnostic.g.dart:14465/14489/14513/14529/14553`), so
+    /// the (severity, code, file) parity tuple is identical across the five
+    /// messages and every row is `COMPILE_TIME_ERROR` with no correction.
+    #[test]
+    fn interface_inheritance_family_shares_one_code_name() {
+        let family = [
+            RECURSIVE_INTERFACE_INHERITANCE,
+            RECURSIVE_INTERFACE_INHERITANCE_EXTENDS,
+            RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS,
+            RECURSIVE_INTERFACE_INHERITANCE_ON,
+            RECURSIVE_INTERFACE_INHERITANCE_WITH,
+        ];
+        for row in family {
+            assert_eq!(row.name, "recursive_interface_inheritance");
+            assert_eq!(row.machine, "RECURSIVE_INTERFACE_INHERITANCE");
+            assert_eq!(row.dtype, DiagnosticType::CompileTimeError);
+            assert_eq!(row.correction, None);
+        }
+        assert_eq!(
+            RECURSIVE_INTERFACE_INHERITANCE.message,
+            "'{0}' can't be a superinterface of itself: {1}."
+        );
+        assert_eq!(RECURSIVE_INTERFACE_INHERITANCE_EXTENDS.message, "'{0}' can't extend itself.");
+        assert_eq!(
+            RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS.message,
+            "'{0}' can't implement itself."
+        );
+        assert_eq!(
+            RECURSIVE_INTERFACE_INHERITANCE_ON.message,
+            "'{0}' can't use itself as a superclass constraint."
+        );
+        assert_eq!(
+            RECURSIVE_INTERFACE_INHERITANCE_WITH.message,
+            "'{0}' can't use itself as a mixin."
+        );
     }
 }

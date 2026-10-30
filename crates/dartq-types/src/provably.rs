@@ -71,13 +71,16 @@ pub enum TypeCheckVerdict {
 
 impl TypeSystem<'_> {
     /// `unnecessary_cast`: `_isUnnecessaryCast`
-    /// (best_practices_verifier.dart:1708-1741). Decision order: either side
+    /// (best_practices_verifier.dart:1564-1595). Decision order: either side
     /// `Invalid` → no (already-reported errors); the operand type not equal
     /// to the target type → no (the cast is necessary); `dynamic` → no (the
     /// explicit cast is the recommended `avoid_dynamic_calls` form); bare
-    /// `Function` → no (same recommendation). Equality is structural type
-    /// identity including nullability (`x as int?` over `int` is necessary),
-    /// which interned ids answer in O(1).
+    /// `Function` → no (same recommendation). Equality is the official
+    /// structural `==` including nullability (`x as int?` over `int` is
+    /// necessary) *and* function alpha-equivalence (`<T>T -> T == <U>U -> U`,
+    /// [`TypeSystem::is_structurally_equal`]) — id equality alone would miss
+    /// the alpha-equivalent cast and, before `Never?` kept its own shape,
+    /// conflate it with `Null`.
     #[must_use]
     pub fn is_unnecessary_cast(&self, operand: TypeId, target: TypeId) -> bool {
         let operand_ty = self.table().get(operand);
@@ -87,7 +90,7 @@ impl TypeSystem<'_> {
         {
             return false;
         }
-        if operand != target {
+        if !self.is_structurally_equal(operand, target) {
             return false;
         }
         if matches!(target_ty.kind(), TypeKind::Dynamic) {
@@ -472,6 +475,165 @@ mod tests {
         // Already-reported errors on either side.
         assert!(!sys.is_unnecessary_cast(invalid, int));
         assert!(!sys.is_unnecessary_cast(int, invalid));
+
+        // The `Never?`/`Null` identity rows, pinned against the oracle
+        // (`dart analyze` 3.13.7 fires UNNECESSARY_CAST only on the
+        // same-type pairs): `Never?` is the `Null` equivalence class for
+        // subtyping but a distinct `==` identity, exactly like the
+        // official's `NeverTypeImpl(question)` vs `NullTypeImpl`.
+        let null = table.intern(UninternedType::Null, false);
+        let never_q = table.intern(UninternedType::Never, true);
+        assert!(sys.is_unnecessary_cast(null, null));
+        assert!(sys.is_unnecessary_cast(never_q, never_q));
+        assert!(!sys.is_unnecessary_cast(never_q, null));
+        assert!(!sys.is_unnecessary_cast(null, never_q));
+    }
+
+    /// The `==`-grade equality's function face: alpha-equivalence
+    /// (`<T>T -> T == <U>U -> U`, `FunctionTypeImpl.==` type.dart:219-243)
+    /// and the signature-shape distinctions the same `==` keeps —
+    /// required-named vs optional-named, required-positional vs optional,
+    /// and named-parameter reorder (which canonical interning already
+    /// absorbs). Oracle-pinned: `typedef A = T Function<T>(T); typedef B =
+    /// U Function<U>(U); a as B` fires UNNECESSARY_CAST on 3.13.7.
+    #[test]
+    fn structural_equality_alpha_equivalence_pins() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let string = itf(&table, STRING, &[]);
+        let (t_param, u_param, v_param) = (
+            TypeParamId::from_raw(50),
+            TypeParamId::from_raw(51),
+            TypeParamId::from_raw(52),
+        );
+        let fn_ty = |ret: TypeId, params: &[TypeParamId], positional: &[TypeId],
+                     named: &[NamedMember], required: u32| {
+            table
+                .intern_function(
+                    UninternedFunction {
+                        return_type: ret,
+                        type_parameters: params.to_vec(),
+                        positional: positional.to_vec(),
+                        named: named.to_vec(),
+                        required_positional: required,
+                    },
+                    false,
+                )
+                .expect("valid signature")
+        };
+        let t_of = |p: TypeParamId| table.intern(UninternedType::TypeParameter { parameter: p }, false);
+
+        // `<T> T -> T` vs `<U> U -> U`: distinct binder identities, one
+        // alpha-equivalence class.
+        let a = fn_ty(t_of(t_param), &[t_param], &[], &[], 0);
+        let b = fn_ty(t_of(u_param), &[u_param], &[], &[], 0);
+        assert_ne!(a, b, "distinct binders intern distinctly");
+        assert!(sys.is_structurally_equal(a, b));
+        assert!(sys.is_unnecessary_cast(a, b));
+
+        // `<T> T -> T` vs `<U> U -> String`: bodies differ after renaming.
+        let c = fn_ty(string, &[u_param], &[], &[], 0);
+        assert!(!sys.is_structurally_equal(a, c));
+        assert!(!sys.is_unnecessary_cast(a, c));
+
+        // `<T, V>` vs `<U>`: quantifier arity differs.
+        let d = fn_ty(int, &[t_param, v_param], &[], &[], 0);
+        assert!(!sys.is_structurally_equal(a, d));
+
+        // Nested alpha-equivalence: `<T> (T -> T) -> T` vs `<U> (U -> U) -> U`.
+        let t_to_t = fn_ty(t_of(t_param), &[], &[t_of(t_param)], &[], 1);
+        let u_to_u = fn_ty(t_of(u_param), &[], &[t_of(u_param)], &[], 1);
+        let nested_a = fn_ty(t_of(t_param), &[t_param], &[t_to_t], &[], 1);
+        let nested_b = fn_ty(t_of(u_param), &[u_param], &[u_to_u], &[], 1);
+        assert_ne!(nested_a, nested_b);
+        assert!(sys.is_structurally_equal(nested_a, nested_b));
+
+        // Signature-shape distinctions survive: required vs optional named,
+        // required vs optional positional, nullability.
+        let named_required = fn_ty(
+            int,
+            &[],
+            &[],
+            &[NamedMember {
+                name: "x".into(),
+                ty: int,
+                required: true,
+            }],
+            0,
+        );
+        let named_optional = fn_ty(
+            int,
+            &[],
+            &[],
+            &[NamedMember {
+                name: "x".into(),
+                ty: int,
+                required: false,
+            }],
+            0,
+        );
+        assert!(!sys.is_structurally_equal(named_required, named_optional));
+        let positional_all_required = fn_ty(int, &[], &[int, int], &[], 2);
+        let positional_with_optional = fn_ty(int, &[], &[int, int], &[], 1);
+        assert!(!sys.is_structurally_equal(
+            positional_all_required,
+            positional_with_optional
+        ));
+        let fn_q = table
+            .intern_function(
+                UninternedFunction {
+                    return_type: int,
+                    type_parameters: vec![t_param],
+                    positional: vec![t_of(t_param)],
+                    named: vec![],
+                    required_positional: 1,
+                },
+                true,
+            )
+            .expect("valid signature");
+        let fn_plain = fn_ty(t_of(t_param), &[t_param], &[t_of(t_param)], &[], 1);
+        assert!(!sys.is_structurally_equal(fn_q, fn_plain));
+
+        // Named reorder is canonical interning's job: `{a, b}` == `{b, a}`.
+        let reordered_a = fn_ty(
+            int,
+            &[],
+            &[],
+            &[
+                NamedMember {
+                    name: "a".into(),
+                    ty: int,
+                    required: false,
+                },
+                NamedMember {
+                    name: "b".into(),
+                    ty: string,
+                    required: false,
+                },
+            ],
+            0,
+        );
+        let reordered_b = fn_ty(
+            int,
+            &[],
+            &[],
+            &[
+                NamedMember {
+                    name: "b".into(),
+                    ty: string,
+                    required: false,
+                },
+                NamedMember {
+                    name: "a".into(),
+                    ty: int,
+                    required: false,
+                },
+            ],
+            0,
+        );
+        assert_eq!(reordered_a, reordered_b);
+        assert!(sys.is_structurally_equal(reordered_a, reordered_b));
     }
 
     #[test]
@@ -488,7 +650,7 @@ mod tests {
         );
         let dynamic = table.intern(UninternedType::Dynamic, false);
         let null = table.intern(UninternedType::Null, false);
-        let never_q = table.intern(UninternedType::Never, true); // interned as Null
+        let never_q = table.intern(UninternedType::Never, true); // its own shape
         let future_or_int = table.intern(UninternedType::FutureOr { base: int }, false);
         let future_or_int_q = table.intern(UninternedType::FutureOr { base: int_q }, false);
         let param = TypeParamId::from_raw(2);
@@ -523,16 +685,22 @@ mod tests {
         );
         let null = table.intern(UninternedType::Null, false);
         let never = table.intern(UninternedType::Never, false);
+        let never_q = table.intern(UninternedType::Never, true);
 
         // `x!` fails only on the Null class; `Never` is a different code.
+        // `Never?` is `isDartCoreNull` (type.dart:1201-1204), so it fails
+        // like `Null` does.
         assert!(sys.is_null_check_always_fails(null));
+        assert!(sys.is_null_check_always_fails(never_q));
         assert!(!sys.is_null_check_always_fails(never));
         assert!(!sys.is_null_check_always_fails(int));
         assert!(!sys.is_null_check_always_fails(int_q));
 
-        // A receiver is provably dead only at the bottom type. `Never?`
-        // interns as `Null`, whose member accesses are a different face.
+        // A receiver is provably dead only at the bottom type. `Never?` is
+        // the `Null` equivalence class, whose member accesses are a
+        // different face.
         assert!(sys.is_receiver_of_type_never(never));
+        assert!(!sys.is_receiver_of_type_never(never_q));
         assert!(!sys.is_receiver_of_type_never(null));
         assert!(!sys.is_receiver_of_type_never(int));
     }
@@ -697,14 +865,16 @@ mod tests {
             true,
         );
         let never = table.intern(UninternedType::Never, false);
-        let null = table.intern(UninternedType::Null, false); // `Never?`
+        let never_q = table.intern(UninternedType::Never, true);
 
         // Covariant parameter → the top type; `T?` unites to the same `?`.
         assert_eq!(sys.eliminate_to_greatest(t), object_question);
         assert_eq!(sys.eliminate_to_greatest(t_q), object_question);
 
         // Contravariant position → the bottom type; `T?` in a contravariant
-        // position is `Never?`, interned as `Null`.
+        // position unites to `Never?` — its own interned shape, exactly the
+        // official `uniteNullabilities(Never.none, question)`
+        // (least_greatest_closure.dart:121-128).
         let fn_of = |parameter: TypeId, nullable: bool| {
             table
                 .intern_function(
@@ -725,7 +895,7 @@ mod tests {
         );
         assert_eq!(
             sys.eliminate_to_greatest(fn_of(t_q, false)),
-            fn_of(null, false)
+            fn_of(never_q, false)
         );
 
         // Variance flips once per function visit: `T` inside

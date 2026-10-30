@@ -1,5 +1,6 @@
-use super::{Check, NodeKind, RuleSpec, written_type_sibling};
+use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, slice, written_type_sibling};
 use crate::rules::{TypeFace, type_face, utf16_token_span};
+use dartq_semantic::model::Ty;
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/unnecessary_null_checks.dart` — a `!`
@@ -8,24 +9,33 @@ use crate::rules::{TypeFace, type_face, utf16_token_span};
 /// change the program when the context accepts `null`). The expected
 /// type faces (:26-161) cover returns, arrow bodies, variable
 /// declarations, assignments, operator right sides, collection
-/// members, and arguments.
+/// members, yield values, and arguments.
 ///
 /// dartq faces over the production tiling: the decidable context slice
-/// ports — the variable/field-declaration initializer (the written
-/// type row tiles as the declaration's left sibling,
-/// [`written_type_sibling`]), the return statement, and the arrow
-/// body, each through the nearest enclosing declaration's written
-/// return type with the async flatten (:50-57 — a `Future`/
-/// `FutureOr` wrapper decides through its first type argument). The
-/// enclosing-declaration lookup keeps the official
-/// `thisOrAncestorOfType<FunctionExpression>` shape (:41): class
-/// methods, constructors and factories never satisfy it, so their
-/// return and arrow faces stay silent exactly like the oracle. The
-/// pattern arm (:183-205) belongs to the pattern family and stays
-/// unported; assignments, operator right sides, collection members,
-/// await wrappers, and arguments under-report (the promotable-LHS
-/// guard and the formal-table availability make them undecidable at
-/// M1). Message: `diagnostic.g.dart` `unnecessaryNullChecks`.
+/// ports — the variable/field/top-level-declaration initializer (the
+/// written type row tiles as the declaration's left sibling,
+/// [`written_type_sibling`], or among the declaration row's own
+/// children), the return statement, the arrow body and the await
+/// wrapper (:34-37), each through the nearest enclosing declaration's
+/// written return type with the async flatten (:50-53 — only a
+/// `Future`/`FutureOr` wrapper decides, through its first type
+/// argument; a same-file typedef alias resolves first), the yield
+/// statement (:59-72 — `Iterable`/`Stream` through the first type
+/// argument), collection members (:107-129 — the written return's
+/// iterable/map head; a map entry reads its side's argument, the
+/// for/if element nesting is transparent at this read), and arguments
+/// (:131-159 — the callee's bridge signature or constructor formal
+/// table; the official `Future.value`/`Completer.complete` exceptions
+/// fall out at the resolution boundary — SDK callees resolve to no
+/// indexed signature). The enclosing-declaration lookup keeps the
+/// official `thisOrAncestorOfType<FunctionExpression>` shape (:41):
+/// class methods, constructors and factories never satisfy it, so
+/// their return and arrow faces stay silent exactly like the oracle.
+/// The pattern arm (:183-205) belongs to the pattern family and stays
+/// unported; assignments and operator right sides under-report (the
+/// promotable-LHS guard and the operator-member formal face make them
+/// undecidable at M1). Message: `diagnostic.g.dart`
+/// `unnecessaryNullChecks`.
 pub(crate) static SPEC: RuleSpec =
     crate::spec!("unnecessary_null_checks", &[NodeKind::NonNullAssert], check,);
 
@@ -36,11 +46,15 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     let node = c.node();
-    // `getExpectedType`'s realNode (:30-33): the `!`'s nearest
-    // ancestor whose own parent is not a transparent `(...)` wrapper.
+    // `getExpectedType`'s realNode (:30-37): the `!`'s nearest
+    // ancestor whose own parent is not a transparent `(...)` or
+    // `await` wrapper.
     let mut real = node;
     while let Some(parent) = c.unit.ast.parent(real)
-        && c.kind(parent) == NodeKind::ParenthesizedExpression
+        && matches!(
+            c.kind(parent),
+            NodeKind::ParenthesizedExpression | NodeKind::AwaitExpression
+        )
     {
         real = parent;
     }
@@ -70,6 +84,28 @@ fn check(c: &mut Check<'_>) {
         NodeKind::ReturnStatement => {
             c.collect_direct(context).last() == Some(&real) && enclosing_return_admits(c)
         }
+        // `Iterable<int?> f() sync* { yield x!; }` — the generator's
+        // written return decides through its first type argument
+        // (:59-72).
+        NodeKind::YieldStatement => {
+            c.collect_direct(context).last() == Some(&real) && yield_admits(c)
+        }
+        // `List<int?> f() => [x!];` / `Set<int?> f() => {x!};` — the
+        // literal's context-inferred element type (:107-114), read as
+        // the written return's iterable head through its first type
+        // argument.
+        NodeKind::ListLiteral | NodeKind::SetOrMapLiteral => member_admits(c, 0),
+        // `Map<K, V> f() => {…: x!};` — the entry side's argument
+        // (:115-129); the colon splits key from value.
+        NodeKind::MapEntry => {
+            let side = c.field(context, PayloadField::Colon).is_some_and(|colon| {
+                c.unit.ast.token_range(real).end <= colon + 1
+            });
+            member_admits(c, if side { 0 } else { 1 })
+        }
+        // `f(x!);` / `A(x!);` — the callee's formal at the `!`'s own
+        // slot (:131-159).
+        NodeKind::Arguments => argument_admits(c, context),
         // `int? f() => x!;` — the childless `ExpressionBody` handle
         // leaves the arrow expression as the declaration's own tail
         // rows, so the arrow posture reads at the declaration row
@@ -95,17 +131,25 @@ fn check(c: &mut Check<'_>) {
 
 /// The written type row of the declaration an initializer belongs to:
 /// the local shape tiles the type as the declaration's left sibling
-/// ([`written_type_sibling`]); the field shape nests the declaration
-/// in a `Fields` row whose own type child heads the member group.
+/// ([`written_type_sibling`]); the top-level shape parks it among the
+/// declaration row's own children (`TopLevelFields`' flat window); the
+/// field shape nests the declaration in a `Fields` row whose own type
+/// child heads the member group.
 fn declaration_written_type(c: &Check<'_>, decl: u32) -> Option<u32> {
-    written_type_sibling(c, decl, &[NodeKind::Type]).or_else(|| {
-        let fields = c.unit.ast.parent(decl)?;
-        let type_row = c
-            .collect_direct(fields)
-            .into_iter()
-            .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::FunctionType));
-        (c.kind(fields) == NodeKind::Fields).then_some(type_row)?
-    })
+    written_type_sibling(c, decl, &[NodeKind::Type])
+        .or_else(|| {
+            c.collect_direct(decl)
+                .into_iter()
+                .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::FunctionType))
+        })
+        .or_else(|| {
+            let fields = c.unit.ast.parent(decl)?;
+            let type_row = c
+                .collect_direct(fields)
+                .into_iter()
+                .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::FunctionType));
+            (c.kind(fields) == NodeKind::Fields).then_some(type_row)?
+        })
 }
 
 /// The written type row's nullable verdict (the declaration-context
@@ -141,6 +185,148 @@ fn enclosing_return_admits(c: &Check<'_>) -> bool {
     false
 }
 
+/// The enclosing function's written return face, when the nearest
+/// function-like ancestor is a function shape (the same lookup cut as
+/// [`enclosing_return_admits`]).
+fn enclosing_return_face<'a>(c: &'a Check<'_>) -> Option<TypeFace<'a>> {
+    for &row in c.path.iter().rev().skip(1) {
+        match c.kind(row) {
+            NodeKind::TopLevelMethod
+            | NodeKind::LocalFunctionDeclaration
+            | NodeKind::FunctionExpression
+            | NodeKind::NamedFunctionExpression => {
+                return super::void_checks::written_return_face(c, row)
+            }
+            NodeKind::Method
+            | NodeKind::Constructor
+            | NodeKind::Factory
+            | NodeKind::CompilationUnit => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `isNullable` read on an argument position of a collection-shape
+/// return face (`:69-71`, `:108-129`): the head names the shape, the
+/// indexed type argument's own face decides.
+fn shape_argument_admits(face: &TypeFace<'_>, heads: &[&str], index: usize) -> bool {
+    face.name.is_some_and(|name| heads.contains(&name))
+        && face
+            .type_arguments
+            .get(index)
+            .is_some_and(|(argument, nullable)| *nullable || *argument == "dynamic")
+}
+
+/// The yield face (:59-72): `Iterable`/`Stream` decide through the
+/// first type argument.
+fn yield_admits(c: &Check<'_>) -> bool {
+    enclosing_return_face(c).is_some_and(|face| shape_argument_admits(&face, &["Iterable", "Stream"], 0))
+}
+
+/// The collection-member face (:107-129): the written return's head —
+/// `List`/`Set`/`Iterable` at the element index, `Map` at the entry
+/// side's index — decides through the indexed type argument.
+fn member_admits(c: &Check<'_>, index: usize) -> bool {
+    enclosing_return_face(c).is_some_and(|face| {
+        shape_argument_admits(&face, &["List", "Set", "Iterable", "Map"], index)
+    })
+}
+
+/// The argument face (:131-159): the callee's formal type at the
+/// dispatch node's own argument slot — a positional slot by index, a
+/// named slot by label — through the bridge signature (a bare callee)
+/// or the constructor formal table (a creation head). The official
+/// `Future.value`/`Completer.complete` exceptions (:138-157) need no
+/// port of their own: both are SDK callees, and the resolution faces
+/// answer `None` for every unindexed target.
+fn argument_admits(c: &Check<'_>, arguments: u32) -> bool {
+    argument_formal_ty(c, arguments).is_some_and(|ty| {
+        matches!(ty, Ty::Dynamic | Ty::Named { nullable: true, .. })
+    })
+}
+
+/// The callee's formal type at the dispatch node's own argument slot
+/// (`None` on every unresolvable or out-of-slot shape).
+fn argument_formal_ty(c: &Check<'_>, arguments: u32) -> Option<Ty> {
+    let analysis = c.semantics()?;
+    let parent = c.unit.ast.parent(arguments)?;
+    let kids = c.collect_direct(parent);
+    let pos = kids.iter().position(|&kid| kid == arguments)?;
+    // The invocation send is the sibling right after the argument list
+    // (the production tiling).
+    if c.kind(*kids.get(pos.checked_add(1)?)?) != NodeKind::Send {
+        return None;
+    }
+    let (head, _) = slice::send_parts(c, &kids, pos + 1)?;
+    // The dispatch node's argument slot: the operand rows end at the
+    // piece before the leaf (a bare-read operand tiles as a send group
+    // and strands the `!` leaf outside its argument range, so the slot
+    // range is the one covering `node_pos - 1`). A named argument
+    // pairs `name … NamedArgument` immediately before the value range —
+    // the formal reads by label there; otherwise positionally by the
+    // count of preceding positional ranges.
+    let raw = c.collect_direct(arguments);
+    let ranges = slice::arguments(c, &raw);
+    let node_pos = raw.iter().position(|&kid| kid == c.node())?;
+    let index = ranges
+        .iter()
+        .position(|range| range.contains(&(node_pos - 1)))?;
+    let named_pair = index
+        .checked_sub(1)
+        .and_then(|prev| ranges.get(prev))
+        .filter(|prev| c.kind(raw[prev.end - 1]) == NodeKind::NamedArgument)
+        .map(|prev| prev.end);
+    if let Some(end) = named_pair {
+        let name_idx = slice::named_arg_name(c, &raw, end - 1)?;
+        let label = c.lexeme(c.head_token(raw[name_idx]));
+        let signature = analysis.function_signature_of(query_site(c, kids[head]))?;
+        return Some(signature.formals.named_formal(analysis.strings().intern(label))?.ty);
+    }
+    let slot = ranges[..index]
+        .iter()
+        .filter(|range| c.kind(raw[range.end - 1]) != NodeKind::NamedArgument)
+        .count();
+    match analysis.function_signature_of(query_site(c, kids[head])) {
+        Some(signature) => Some(signature.formals.positional.get(slot)?.ty),
+        // A creation head (`A(x!)`): the constructor formal table at
+        // the unnamed selector.
+        None => {
+            let binding = analysis.resolve_constructor(query_site(c, kids[head]), None)?;
+            if !binding.exists {
+                return None;
+            }
+            Some(binding.formals?.positional.get(slot)?.ty)
+        }
+    }
+}
+
+/// A same-file typedef's aliased type face (`typedef F = Future<int?>;`
+/// — the `=` body's `Type` row), one level: the written return's head
+/// resolves through it before the async read (:45-56).
+fn alias_face<'a>(c: &'a Check<'_>, name: &str) -> Option<TypeFace<'a>> {
+    let root = c.path.first().copied()?;
+    for top in c.collect_direct(root) {
+        for inner in c.collect_direct(top) {
+            if c.kind(inner) != NodeKind::Typedef {
+                continue;
+            }
+            let is_named = c.collect_direct(inner).into_iter().any(|kid| {
+                c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name
+            });
+            if !is_named {
+                continue;
+            }
+            let body = c
+                .collect_direct(inner)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+            return Some(type_face(c, body));
+        }
+    }
+    None
+}
+
 /// The declaration's own written return type, read at the row.
 fn return_admits_at(c: &Check<'_>, declaration: u32) -> bool {
     let written = super::void_checks::written_return_face(c, declaration);
@@ -149,9 +335,13 @@ fn return_admits_at(c: &Check<'_>, declaration: u32) -> bool {
 
 /// The `isNullable` read on the flattened expected type (:50-57).
 fn admits_return(c: &Check<'_>, declaration: u32, written: Option<TypeFace<'_>>) -> bool {
-    let Some(face) = written else {
+    let Some(mut face) = written else {
         return false;
     };
+    // A same-file typedef alias resolves first (one level).
+    if let Some(alias) = face.name.and_then(|name| alias_face(c, name)) {
+        face = alias;
+    }
     let Some(name) = face.name else {
         return false;
     };
@@ -160,11 +350,10 @@ fn admits_return(c: &Check<'_>, declaration: u32, written: Option<TypeFace<'_>>)
         .ast
         .token_range(declaration)
         .any(|token| c.lexeme(token) == "async");
-    if async_marked && matches!(name, "Future" | "FutureOr") {
-        return match face.type_arguments.first() {
-            Some((arg, arg_nullable)) => *arg_nullable || *arg == "dynamic",
-            None => false,
-        };
+    if async_marked {
+        // Only the `Future`/`FutureOr` wrapper decides (:50-53) — a
+        // bare `dynamic` async return carries no expected type.
+        return shape_argument_admits(&face, &["Future", "FutureOr"], 0);
     }
     face.nullable || name == "dynamic"
 }

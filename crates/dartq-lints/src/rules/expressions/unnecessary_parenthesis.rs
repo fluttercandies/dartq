@@ -1,11 +1,117 @@
 use super::{Check, NodeKind, PayloadField, RuleSpec};
-use crate::rules::{first_child, slice};
+use crate::rules::slice;
 
-/// The source-head row of the paren's inner expression (the outermost
-/// container row when the inner is one — its subtree starts at the
-/// window start).
-fn inner_head(c: &Check<'_>, node: u32) -> Option<NodeKind> {
-    first_child(c, node).map(|head| c.kind(head))
+/// The kinds whose rows are completion wrappers or delimiters rather
+/// than semantic parents — excluded from the covering-container read.
+fn is_wrapper_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Send
+            | NodeKind::NoArguments
+            | NodeKind::Arguments
+            | NodeKind::NamedArgument
+            | NodeKind::NoTypeArguments
+            | NodeKind::TypeArguments
+    )
+}
+
+/// The innermost enclosing operator container of the paren: the
+/// smallest sibling row in the owner window whose span covers the
+/// paren's own (operator containers complete after their operands, so
+/// an adopted-begin container trails the paren row; a prefix container
+/// anchored at its operator may precede it). This is the upstream
+/// `parent` expression for the operator-family faces.
+fn container_parent(c: &Check<'_>, node: u32, owner_kids: &[u32], pos: usize) -> Option<NodeKind> {
+    let node_span = c.utf16_span(node);
+    let mut best: Option<(u32, NodeKind)> = None;
+    for (i, &sib) in owner_kids.iter().enumerate() {
+        if i == pos || is_wrapper_kind(c.kind(sib)) || c.kind(sib) == c.kind(node) {
+            continue;
+        }
+        let span = c.utf16_span(sib);
+        if span.start <= node_span.start
+            && span.end >= node_span.end
+            && span != node_span
+            && best.is_none_or(|(size, _)| span.end - span.start < size)
+        {
+            best = Some((span.end - span.start, c.kind(sib)));
+        }
+    }
+    best.map(|(_, kind)| kind)
+}
+
+/// Whether the paren's direct children carry a row of `kind` — the
+/// inner expression's shape read (the inner tiles as one or more
+/// sibling rows; the semantic inner kind can sit behind the head row,
+/// so the whole direct-child band answers, never a deeper descendant).
+fn inner_has_kind(c: &Check<'_>, node: u32, kind: NodeKind) -> bool {
+    c.collect_direct(node)
+        .into_iter()
+        .any(|kid| c.kind(kid) == kind)
+}
+
+/// The operator lexeme of the paren's inner binary expression (`(a ==
+/// b)`'s `==`), when the inner carries a [`NodeKind::BinaryExpression`]
+/// row with an `Operator` payload.
+fn binary_child_operator<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
+    c.collect_direct(node).into_iter().find_map(|kid| {
+        if c.kind(kid) != NodeKind::BinaryExpression {
+            return None;
+        }
+        c.field(kid, PayloadField::Operator).map(|op| c.lexeme(op))
+    })
+}
+
+/// Whether the paren's subtree carries a function expression — the
+/// upstream `containsFunctionExpression` deep read (a lambda anywhere
+/// inside, not only at the head).
+fn contains_function_expr(c: &Check<'_>, node: u32) -> bool {
+    let window = c.children(node);
+    (window.start..window.end).any(|row| {
+        matches!(
+            c.kind(row),
+            NodeKind::FunctionExpression | NodeKind::NamedFunctionExpression
+        )
+    })
+}
+
+/// Whether the paren's token range carries a cascade link (`..`/`?..`)
+/// — the `(a?..b = true)` shape whose inner cascade piece does not tile
+/// as a `Cascade` row under every owner.
+fn has_cascade_token(c: &Check<'_>, node: u32) -> bool {
+    c.unit
+        .ast
+        .token_range(node)
+        .any(|token| matches!(c.lexeme(token), ".." | "?.."))
+}
+
+/// Whether a `...`/`...?` spread token directly precedes the paren's
+/// `(` — the spread position's token-face spelling when the childless
+/// `Spread` piece does not tile as the preceding sibling.
+fn spread_token_before(c: &Check<'_>, node: u32) -> bool {
+    let Some(lparen) = c.unit.ast.token_range(node).next() else {
+        return false;
+    };
+    lparen > 0 && matches!(c.lexeme(lparen - 1), "..." | "...?")
+}
+
+/// Whether the paren sits directly inside a `${...}` interpolation —
+/// the upstream `InterpolationExpression` parent face (the `${` opener
+/// directly before `(`).
+fn interpolation_token_before(c: &Check<'_>, node: u32) -> bool {
+    let Some(lparen) = c.unit.ast.token_range(node).next() else {
+        return false;
+    };
+    lparen > 0 && c.lexeme(lparen - 1) == "${"
+}
+
+/// Whether a `!` postfix directly follows the paren's `)` — the
+/// `(a?[0])!` null-check face.
+fn postfix_bang_after(c: &Check<'_>, node: u32) -> bool {
+    let Some(rparen) = c.unit.ast.token_range(node).next_back() else {
+        return false;
+    };
+    matches!(c.lexeme(rparen + 1), "!")
 }
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_parenthesis.dart`
@@ -72,10 +178,6 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
     check,
 );
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one flat exemption ladder per parent shape; splitting it                   would scatter the official line citations"
-)]
 fn check(c: &mut Check<'_>) {
     let node = c.node();
     let Some(parent) = c.ancestor(1) else {
@@ -90,8 +192,12 @@ fn check(c: &mut Check<'_>) {
     let Some(pos) = owner_kids.iter().position(|&kid| kid == node) else {
         return;
     };
-    // `[...(p as List)]` (:45) — the childless spread piece precedes.
+    // `[...(p as List)]` (:45) — the childless spread piece precedes,
+    // spelled either by its row kind or the `...` token before `(`.
     if pos > 0 && c.kind(owner_kids[pos - 1]) == NodeKind::Spread {
+        return;
+    }
+    if spread_token_before(c, node) {
         return;
     }
     // `(int,) r = (3);` (:47-53) — the same-file written record type of
@@ -100,7 +206,7 @@ fn check(c: &mut Check<'_>) {
         parent_kind,
         NodeKind::VariableInitializer | NodeKind::InitializedIdentifier
     ) && variable_declares_record_type(c)
-        && inner_head(c, node) != Some(NodeKind::RecordLiteral)
+        && !inner_has_kind(c, node, NodeKind::RecordLiteral)
     {
         return;
     }
@@ -108,7 +214,7 @@ fn check(c: &mut Check<'_>) {
     // g({required (int,) i}) { }` (:75-86) — the same-file written
     // record type of the corresponding parameter keeps the parentheses.
     if parent_kind == NodeKind::Arguments
-        && inner_head(c, node) != Some(NodeKind::RecordLiteral)
+        && !inner_has_kind(c, node, NodeKind::RecordLiteral)
         && argument_parameter_declares_record_type(c, node, parent)
     {
         return;
@@ -117,18 +223,19 @@ fn check(c: &mut Check<'_>) {
     let Some(&inner_first) = inner.first() else {
         return;
     };
-    // Always-report set (:67-73): nested parens, single positional
-    // argument, and the condition segments (the upstream
-    // if/while/do/switch direct parents).
+    // Always-report set (:67-73, :93): nested parens, string
+    // interpolation, single positional argument, and the condition
+    // segments (the upstream if/while/do/switch direct parents).
     if parent_kind == NodeKind::ParenthesizedExpression
         || parent_kind == NodeKind::ParenthesizedCondition
         || (parent_kind == NodeKind::Arguments && slice::arguments(c, &owner_kids).len() == 1)
+        || interpolation_token_before(c, node)
     {
         report(c, node);
         return;
     }
     // `(foo ? bar : baz)` (:73).
-    if inner_head(c, node) == Some(NodeKind::Conditional) {
+    if inner_has_kind(c, node, NodeKind::Conditional) {
         return;
     }
     // `(List<int>).toString()` (:105-106): the inner is a type literal —
@@ -148,7 +255,11 @@ fn check(c: &mut Check<'_>) {
                 | NodeKind::LiteralNull
                 | NodeKind::StringLiteral
         );
-    let null_aware_chain = chain_head(c, inner_first) && has_null_aware_token(c, node);
+    // A cascade anywhere inside means the inner is a cascade section —
+    // the upstream chain walk answers `false` there (the cascade bail
+    // below owns it), so `?..` and the `?.` links inside one never open
+    // the null-aware block.
+    let null_aware_chain = has_null_aware_token(c, node) && !has_cascade_token(c, node);
     if one_token || null_aware_chain {
         // `(String).hashCode` / `(String).runtimeType` (:82-88).
         if let Some(name) = access_selector_name(c, &owner_kids, pos) {
@@ -175,65 +286,77 @@ fn check(c: &mut Check<'_>) {
                 return;
             }
         }
-        // `(p)!` (:93-95) is inert: the `UnaryPostfix` row carries no
-        // payload words, so an operator-word bail could never match and
-        // this shape always fell through to the report (the pinned
-        // behavior).
+        // `(p)!` / `(a?[0])!` / `(a?.sign)!` (:144-147): the `!` postfix
+        // parent keeps the parentheses — over a null-aware chain they
+        // stop the shorting, over a one-token inner they are the
+        // upstream unconditional bail.
+        if postfix_bang_after(c, node) {
+            return;
+        }
+        // `a ? (b?[c]) : d` / `{(a?[b]): c}` (:148-157): the null-aware
+        // index keeps the parens in the conditional-then and map-key
+        // positions (the second `?` would open a nested conditional).
+        if has_token_lexeme(c, node, "?[")
+            && matches!(
+                container_parent(c, node, &owner_kids, pos),
+                Some(NodeKind::Conditional) | Some(NodeKind::MapEntry)
+            )
+        {
+            return;
+        }
         report(c, node);
         return;
     }
-    // `(Foo.new)` (:103-108) — the invocation-with-type-arguments
-    // exemption is the documented corner.
-    if inner_head(c, node) == Some(NodeKind::ConstructorReference) {
+    // `(C.new)` / `(List<int>.filled)` (:210-216) — the
+    // invocation-with-type-arguments exemption is the documented corner.
+    if inner_has_kind(c, node, NodeKind::ConstructorReference) {
         report(c, node);
         return;
     }
-    // `a..b = (c..d)` (:104-107): any cascade position keeps the parens.
-    if c.kind(inner_first) == NodeKind::Cascade
+    // `a..b = (c..d)` (:218-222): any cascade position keeps the parens
+    // (a cascade inner row, a `..`/`?..` link token, or a cascade
+    // ancestor).
+    if inner_has_kind(c, node, NodeKind::Cascade)
+        || has_cascade_token(c, node)
         || c.path.iter().rev().any(|&a| c.kind(a) == NodeKind::Cascade)
     {
         return;
     }
-    // The constructor-field-initializer `=>` guard (:119-131).
-    if bare_in_initializer(c) && has_token_lexeme(c, node, "=>") {
+    // The constructor-field-initializer guard (:226-241): a bare
+    // initializer position over an inner function expression keeps the
+    // parens (a bare `=>` would read as the body delimiter).
+    if bare_in_initializer(c) && contains_function_expr(c, node) {
         return;
     }
-    // `foo = (a == b)` / `return (count != 0)` (:133-139).
-    if inner_head(c, node) == Some(NodeKind::BinaryExpression) {
-        let binary = first_child(c, node).expect("the head kind matched above");
-        let op = c
-            .field(binary, PayloadField::Operator)
-            .map(|op| c.lexeme(op))
-            .unwrap_or_default();
-        if matches!(op, "==" | "!=")
-            && (matches!(
-                parent_kind,
-                NodeKind::Assignment
-                    | NodeKind::InitializedIdentifier
-                    | NodeKind::VariableInitializer
-                    | NodeKind::ReturnStatement
-                    | NodeKind::YieldStatement
-            ) || c
-                .path
-                .iter()
-                .rev()
-                .any(|&a| c.kind(a) == NodeKind::Initializer))
-        {
-            return;
-        }
+    // `foo = (a == b)` / `return (count != 0)` (:243-253).
+    if binary_child_operator(c, node).is_some_and(|op| matches!(op, "==" | "!="))
+        && (matches!(
+            parent_kind,
+            NodeKind::Assignment
+                | NodeKind::InitializedIdentifier
+                | NodeKind::VariableInitializer
+                | NodeKind::ReturnStatement
+                | NodeKind::YieldStatement
+        ) || c
+            .path
+            .iter()
+            .rev()
+            .any(|&a| c.kind(a) == NodeKind::Initializer))
+    {
+        return;
     }
-    // A statement-initial switch expression (:146-149).
+    // `switch` at the beginning of a statement (:255-257).
     let statement_owned = owner_kids[pos + 1..].iter().any(|&sib| {
         c.kind(sib) == NodeKind::ExpressionStatement
             && c.utf16_span(sib).start <= c.utf16_span(node).start
             && c.utf16_span(sib).end >= c.utf16_span(node).end
     });
-    if statement_owned && inner_head(c, node) == Some(NodeKind::SwitchExpression) {
+    if statement_owned && inner_has_kind(c, node, NodeKind::SwitchExpression) {
         return;
     }
-    // The whitespace-readability family (:151-166): keep the parens
+    // The whitespace-readability family (:259-272): keep the parens
     // unless an exemption parent answers.
-    if whitespace_inner(c, first_child(c, node)) {
+    if whitespace_inner(c, node) {
         let exempt = matches!(
             parent_kind,
             NodeKind::Assignment
@@ -242,38 +365,39 @@ fn check(c: &mut Check<'_>) {
                 | NodeKind::YieldStatement
                 | NodeKind::InitializedIdentifier
                 | NodeKind::VariableInitializer
+                | NodeKind::Arguments
+                | NodeKind::NamedArgument
         ) || c
             .path
             .iter()
             .rev()
             .any(|&a| c.kind(a) == NodeKind::Initializer)
-            || parent_kind == NodeKind::Arguments
             || has_arrow_body(c, parent);
         if !exempt {
             return;
         }
     }
-    // The operator parents (:169-176).
+    // The operator parents (:274-281): binary, conditional, as, is.
     if matches!(
-        parent_kind,
-        NodeKind::BinaryExpression
-            | NodeKind::Conditional
-            | NodeKind::AsExpression
-            | NodeKind::IsExpression
+        container_parent(c, node, &owner_kids, pos),
+        Some(
+            NodeKind::BinaryExpression
+                | NodeKind::Conditional
+                | NodeKind::AsExpression
+                | NodeKind::IsExpression
+        )
     ) {
         return;
     }
-    // `(p++).toString()` / `(++p).toString()` (:188-192).
+    // `(p++).toString()` / `(++p).toString()` (:266-269).
     if access_selector_name(c, &owner_kids, pos).is_some()
-        && matches!(
-            c.kind(inner_first),
-            NodeKind::UnaryPostfix | NodeKind::UnaryPrefix
-        )
+        && (inner_has_kind(c, node, NodeKind::UnaryPostfix)
+            || inner_has_kind(c, node, NodeKind::UnaryPrefix))
     {
         return;
     }
     // Directly-invoked parens (the FunctionExpressionInvocation face,
-    // :178-180; the prefixed-identifier corner under-reports).
+    // :277-279; the prefixed-identifier corner under-reports).
     if owner_kids.get(pos + 1).is_some_and(|&piece| {
         matches!(
             c.kind(piece),
@@ -285,8 +409,10 @@ fn check(c: &mut Check<'_>) {
     }) {
         return;
     }
-    // `({1, 2, 3}).forEach(print);` (:195-197).
-    if statement_owned && inner_head(c, node) == Some(NodeKind::SetOrMapLiteral) {
+    // `({1, 2, 3}).forEach(print);` (:293-303): the parens cannot be
+    // removed because then the curly brackets are not interpreted as a
+    // set-or-map literal.
+    if statement_owned && inner_has_kind(c, node, NodeKind::SetOrMapLiteral) {
         return;
     }
     report(c, node);
@@ -472,24 +598,17 @@ fn type_literal_inner(c: &Check<'_>, node: u32) -> bool {
     !super::same_file::declares_value(c, node, c.lexeme(name))
 }
 
-/// Whether `inner_first` can head an access chain (the
-/// `containsNullAwareInvocationInChain` entry faces: a chain walks
-/// PropertyAccess/MethodInvocation/Index targets only — a container
-/// inner never qualifies, extensions.dart:211-224).
-fn chain_head(c: &Check<'_>, inner_first: u32) -> bool {
-    matches!(
-        c.kind(inner_first),
-        NodeKind::Identifier | NodeKind::ThisExpression | NodeKind::SuperExpression
-    )
-}
-
-/// Whether the paren's token range carries a null-aware link token
-/// (`?.`, `?..`, `?[` — the chain faces of the upstream walk).
+/// Whether the paren's token range carries a null-aware CHAIN link
+/// (`?.`, `?[` — the PropertyAccess/MethodInvocation/Index targets of
+/// the upstream `containsNullAwareInvocationInChain` walk,
+/// extensions.dart:130-143). `?..` is deliberately excluded: it opens
+/// a cascade section, which the walk answers `false` for and the
+/// cascade bail owns.
 fn has_null_aware_token(c: &Check<'_>, node: u32) -> bool {
     c.unit
         .ast
         .token_range(node)
-        .any(|token| matches!(c.lexeme(token), "?." | "?.." | "?["))
+        .any(|token| matches!(c.lexeme(token), "?." | "?["))
 }
 
 /// The name of the selector that follows the paren in the owner slice,
@@ -544,22 +663,38 @@ fn has_token_lexeme(c: &Check<'_>, node: u32, lexeme: &str) -> bool {
         .any(|token| c.lexeme(token) == lexeme)
 }
 
-/// The `directlyContainsWhitespace` faces (:216-233): the container
-/// inners plus the `new`-keyword and `const`-literal shapes.
-fn whitespace_inner(c: &Check<'_>, head: Option<u32>) -> bool {
-    let Some(head) = head else {
-        return false;
-    };
-    match c.kind(head) {
-        NodeKind::AsExpression
-        | NodeKind::Assignment
-        | NodeKind::AwaitExpression
-        | NodeKind::BinaryExpression
-        | NodeKind::IsExpression
-        | NodeKind::SwitchExpression
-        | NodeKind::NewExpression => true,
-        _ => crate::rules::const_keyword(c, head).is_some(),
+/// The `directlyContainsWhitespace` faces (:321-343): the container
+/// inners — `as`, assignment, await, binary, `is`, switch, function
+/// expression, `new`-creation — plus the `const`-literal shape and the
+/// access-chain recursion (`-(new List(3)).length`-family): a
+/// direct-child read over the paren's inner band answers the
+/// container shapes; a `const` head word or an explicit `new`/`const`
+/// keyword token inside covers the literal/creation arms.
+fn whitespace_inner(c: &Check<'_>, node: u32) -> bool {
+    for kid in c.collect_direct(node) {
+        match c.kind(kid) {
+            NodeKind::AsExpression
+            | NodeKind::Assignment
+            | NodeKind::AwaitExpression
+            | NodeKind::BinaryExpression
+            | NodeKind::FunctionExpression
+            | NodeKind::NamedFunctionExpression
+            | NodeKind::IsExpression
+            | NodeKind::SwitchExpression
+            | NodeKind::NewExpression => return true,
+            _ => {
+                if crate::rules::const_keyword(c, kid).is_some() {
+                    return true;
+                }
+            }
+        }
     }
+    // The `new`-keyword creation arm (`(new Foo())` tiles the creation
+    // through a generic head, not a `NewExpression` row).
+    c.unit
+        .ast
+        .token_range(node)
+        .any(|token| c.lexeme(token) == "new")
 }
 
 /// Whether the declaration row carries an arrow body (the childless

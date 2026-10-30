@@ -8,22 +8,27 @@ use crate::rules::utf16_token_span;
 
 /// Official: `pkg/linter/lib/src/rules/null_check_on_nullable_type_parameter.dart`
 /// — a `!` whose operand's static type is a nullable type parameter
-/// `T?`, in a context whose expected type is that same `T?`, reports
-/// at the operator (:55-67).
+/// `T?`, in a context whose expected type is that same `T` after
+/// promotion (`promoteToNonNull`) and potentially nullable (:62-68: a
+/// written `T?` always; a bare `T` whose bound does not pin it
+/// non-nullable — no bound, `dynamic`, `Object?` — while `T extends
+/// Object` stays silent), reports at the operator.
 ///
 /// The context face (`getExpectedType`, `unnecessary_null_checks.dart`)
-/// ports for four syntax/resolution-knowable sites: a `return` whose
-/// nearest function ancestor is a function shape — the official lookup
-/// is `thisOrAncestorOfType<FunctionExpression>` (:36-41), which class
-/// methods never satisfy (their returns carry no expected type, so
-/// `T? m() { return f!; }` stays silent exactly like the oracle) — a
-/// variable initializer whose declaration is written `T?`, an
-/// assignment whose bare/`this.` target is written `T?` (the official
-/// `writeType` face; a member-chain target under-reports), and an
-/// argument whose callee's bridge signature formal is written `T?`
-/// (positional by slot, named by label). The pattern face
-/// (`visitNullAssertPattern`, :60-64 — `matchedValueType`) rides
-/// [`Analysis::matched_value_type`] keyed at the switch scrutinee
+/// ports for five syntax/resolution-knowable sites: a `return` or
+/// arrow body whose nearest function ancestor is a function shape —
+/// the official lookup is `thisOrAncestorOfType<FunctionExpression>`
+/// (:36-41), which class methods never satisfy (their returns carry no
+/// expected type, so `T? m() { return f!; }` stays silent exactly like
+/// the oracle) — a variable initializer with the declaration's written
+/// type, an assignment whose bare/`this.` target carries the written
+/// type (the official `writeType` face; a member-chain target
+/// under-reports), and an argument whose callee's bridge signature
+/// formal declares it (positional by slot, named by label). The
+/// await-wrapper, async `Future<X>`/yield unwrap, and collection
+/// member faces of the official walk stay unported (under-report). The
+/// pattern face (`visitNullAssertPattern`, :52-56 — `matchedValueType`)
+/// rides [`Analysis::matched_value_type`] keyed at the switch scrutinee
 /// read's own span: the matched type must be the nullable type
 /// parameter itself. The operand face reads the written type: a bare
 /// name through the shadow-correct same-file binding walk (a local, a
@@ -101,10 +106,11 @@ fn check(c: &mut Check<'_>) {
     let Some((type_parameter, nullable)) = operand else {
         return;
     };
-    if !nullable || !in_scope_type_parameter_names(c).contains(&type_parameter) {
+    let parameters = in_scope_type_parameters(c);
+    if !nullable || !parameters.iter().any(|(n, _)| *n == type_parameter) {
         return;
     }
-    if !context_expects_same_nullable(c, type_parameter, (name, this_prefixed)) {
+    if !context_expects_same_nullable(c, &parameters, type_parameter, (name, this_prefixed)) {
         return;
     }
     let range = utf16_token_span(c, c.head_token(node));
@@ -193,7 +199,7 @@ fn check_pattern(c: &mut Check<'_>) {
     // The element-level `TypeParameterType` cut at the name level: any
     // in-scope type parameter (class-like and method-like ancestors)
     // — a same-named class is not a type parameter and stays silent.
-    if !in_scope_type_parameter_names(c).contains(&matched) {
+    if !in_scope_type_parameters(c).iter().any(|(n, _)| *n == matched) {
         return;
     }
     let range = utf16_token_span(c, c.head_token(c.node()));
@@ -216,32 +222,33 @@ fn operand_field_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<(&'a str, bo
     }
 }
 
-/// The type parameter names in scope at the dispatch node: every
+/// The type parameters in scope at the dispatch node — `(name, its
+/// TypeVariable row)` pairs (the row carries the bound): every
 /// class-like ancestor's type variables plus every method-like
 /// ancestor's — a method sees both its own and the class's (`T?` in a
 /// method body may name either; the same name answers the same verdict
-/// at the use). Class tiling per [`class_type_parameter_names`]; a
-/// method's `TypeVariables` tiles as the member row's immediate left
-/// sibling in the enclosing window (the production parser opens the
-/// member at the name, so `<T>` completes just before it), with
-/// hand-built trees nesting it inside the row.
-fn in_scope_type_parameter_names<'a>(c: &'a Check<'_>) -> Vec<&'a str> {
-    let ctx = dartq_parser::IdentifierContext::TypeVariableDeclaration as u32;
-    let variable_names = |c: &'a Check<'_>, variables: u32| -> Vec<&'a str> {
-        c.collect_direct(variables)
-            .into_iter()
-            .filter(|&kid| {
-                c.kind(kid) == NodeKind::Identifier
-                    && c.field(kid, PayloadField::Context) == Some(ctx)
-            })
-            .map(|name| c.lexeme(c.head_token(name)))
-            .collect()
-    };
-    let mut names = Vec::new();
+/// at the use). A method's `TypeVariables` tiles as the member row's
+/// immediate left sibling in the enclosing window (the production
+/// parser opens the member at the name, so `<T>` completes just before
+/// it), with hand-built trees nesting it inside the row.
+fn in_scope_type_parameters<'a>(c: &'a Check<'_>) -> Vec<(&'a str, Option<u32>)> {
+    let mut parameters = Vec::new();
     for &ancestor in c.path.iter() {
         match c.kind(ancestor) {
             NodeKind::ClassDeclaration | NodeKind::MixinDeclaration | NodeKind::EnumDeclaration => {
-                names.extend(class_type_parameter_names(c, ancestor));
+                let owner = c.unit.ast.parent(ancestor).unwrap_or(ancestor);
+                let variables = c
+                    .collect_direct(owner)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+                    .or_else(|| {
+                        c.collect_direct(ancestor)
+                            .into_iter()
+                            .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+                    });
+                if let Some(variables) = variables {
+                    parameters.extend(type_variable_pairs(c, variables));
+                }
             }
             NodeKind::TopLevelMethod | NodeKind::Method => {
                 let nested = c
@@ -249,7 +256,7 @@ fn in_scope_type_parameter_names<'a>(c: &'a Check<'_>) -> Vec<&'a str> {
                     .into_iter()
                     .find(|&kid| c.kind(kid) == NodeKind::TypeVariables);
                 if let Some(variables) = nested {
-                    names.extend(variable_names(c, variables));
+                    parameters.extend(type_variable_pairs(c, variables));
                     continue;
                 }
                 let Some(owner) = c.unit.ast.parent(ancestor) else {
@@ -262,91 +269,126 @@ fn in_scope_type_parameter_names<'a>(c: &'a Check<'_>) -> Vec<&'a str> {
                 // The immediate left sibling: the member's own
                 // `<T>` completes directly before its row.
                 if index > 0 && c.kind(members[index - 1]) == NodeKind::TypeVariables {
-                    names.extend(variable_names(c, members[index - 1]));
+                    parameters.extend(type_variable_pairs(c, members[index - 1]));
                 }
             }
             _ => {}
         }
     }
-    names
+    parameters
 }
 
-/// The enclosing class's type parameter names. Production tiling: the
-/// `TypeVariables` row is the `ClassDeclaration`'s left sibling under
-/// the `TopLevelDeclaration` wrapper, and each name `Identifier`
-/// (context `TypeVariableDeclaration`) tiles beside its span-only
-/// `TypeVariable` row; hand-built trees nest both inside the class row.
-fn class_type_parameter_names<'a>(c: &'a Check<'_>, class_row: u32) -> Vec<&'a str> {
-    let owner = c.unit.ast.parent(class_row).unwrap_or(class_row);
-    let variables = c
-        .collect_direct(owner)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
-        .or_else(|| {
-            c.collect_direct(class_row)
-                .into_iter()
-                .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
-        });
-    let Some(variables) = variables else {
-        return Vec::new();
-    };
+/// The `(name, TypeVariable row)` pairs of one `TypeVariables` run: the
+/// production tiling spells each name as a context-marked `Identifier`
+/// directly before its span-only `TypeVariable` row (the row holds only
+/// the bound, not the name); hand-built trees nest the name identifier
+/// inside the row. A name with no row at all keeps `None` (an unbounded
+/// parameter — the implicit `Object?` default).
+fn type_variable_pairs<'a>(c: &'a Check<'_>, variables: u32) -> Vec<(&'a str, Option<u32>)> {
     let ctx = dartq_parser::IdentifierContext::TypeVariableDeclaration as u32;
-    let names: Vec<&'a str> = c
-        .collect_direct(variables)
-        .into_iter()
-        .filter(|&kid| {
-            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
-        })
-        .map(|name| c.lexeme(c.head_token(name)))
-        .collect();
-    if !names.is_empty() {
-        return names;
+    let kids = c.collect_direct(variables);
+    let mut pairs = Vec::new();
+    for (index, &kid) in kids.iter().enumerate() {
+        match c.kind(kid) {
+            NodeKind::Identifier if c.field(kid, PayloadField::Context) == Some(ctx) => {
+                let variable = kids
+                    .get(index + 1)
+                    .copied()
+                    .filter(|&row| c.kind(row) == NodeKind::TypeVariable);
+                pairs.push((c.lexeme(c.head_token(kid)), variable));
+            }
+            NodeKind::TypeVariable => {
+                if let Some(name) = c
+                    .collect_direct(kid)
+                    .into_iter()
+                    .find(|&inner| c.kind(inner) == NodeKind::Identifier)
+                {
+                    pairs.push((c.lexeme(c.head_token(name)), Some(kid)));
+                }
+            }
+            _ => {}
+        }
     }
-    c.collect_direct(variables)
-        .into_iter()
-        .filter(|&param| c.kind(param) == NodeKind::TypeVariable)
-        .filter_map(|param| {
-            c.collect_direct(param)
-                .into_iter()
-                .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+    pairs
+}
+
+/// Whether the context at the site expects the same type parameter
+/// `expected` under the official predicate (:62-68): the expected type
+/// is potentially nullable (`isPotentiallyNullable` — a written `T?`
+/// always; a bare `T` when its bound does not pin it non-nullable) and
+/// `promoteToNonNull(type) == promoteToNonNull(expectedType)` — a
+/// written `T?` and the bare `T` both promote to `T`. `operand` is the
+/// `!`'s operand `(name, this-prefixed)` — the official assignment
+/// guard (`x = x!` promotes, so no expected type) needs it.
+fn context_expects_same_nullable(
+    c: &Check<'_>,
+    parameters: &[(&str, Option<u32>)],
+    expected: &str,
+    operand: (&str, bool),
+) -> bool {
+    let Some((name, written_nullable)) = expected_type_type_parameter(c, operand) else {
+        return false;
+    };
+    name == expected && (written_nullable || parameter_potentially_nullable(c, parameters, name))
+}
+
+/// `isPotentiallyNullable` at the name level (:66): a type parameter
+/// with no bound row, no bound (the implicit `Object?` default), or a
+/// `dynamic`/nullable-written bound is potentially nullable; a
+/// non-null `Object`/named bound (`T extends Object`) is not.
+fn parameter_potentially_nullable(
+    c: &Check<'_>,
+    parameters: &[(&str, Option<u32>)],
+    name: &str,
+) -> bool {
+    parameters
+        .iter()
+        .find(|(parameter, _)| *parameter == name)
+        .and_then(|&(_, variable)| variable)
+        .and_then(|variable| bound_face(c, variable))
+        .is_none_or(|(bound, bound_nullable)| bound == "dynamic" || bound_nullable)
+}
+
+/// The written `(name, nullable)` of a `TypeVariable` row's bound — the
+/// `Type` row under it (`walk_type_variables`' read); `None` when the
+/// parameter is unbounded.
+fn bound_face<'a>(c: &'a Check<'_>, variable: u32) -> Option<(&'a str, bool)> {
+    let bound = c
+        .children(variable)
+        .filter(|&row| {
+            c.kind(row) == NodeKind::Type && c.unit.ast.parent(row) == Some(variable)
         })
-        .map(|name| c.lexeme(c.head_token(name)))
-        .collect()
+        .next()?;
+    let token = c.head_token(bound);
+    let nullable = c.byte_span(bound).end > crate::rules::byte_span_of_token(c, token).end;
+    Some((c.lexeme(token), nullable))
 }
 
-/// Whether the context at the site expects the same nullable type
-/// parameter `expected` (`promoteToNonNull(type) ==
-/// promoteToNonNull(expectedType)`, :70-72): the nearest meaningful
-/// ancestor decides. `operand` is the `!`'s operand `(name,
-/// this-prefixed)` — the official assignment guard (`x = x!` promotes,
-/// so no expected type) needs it.
-fn context_expects_same_nullable(c: &Check<'_>, expected: &str, operand: (&str, bool)) -> bool {
-    expected_type_type_parameter(c, operand).is_some_and(|name| name == expected)
-}
-
-/// The context's expected type-parameter name, when written `T?`: the
-/// nearest meaningful ancestor decides — a `return` with the enclosing
-/// function's written return type, a variable initializer with the
-/// declaration's written type, an assignment whose target's written
-/// type is `T?` (the official `writeType` face), or an argument whose
-/// callee's formal table (the bridge signature face) declares `T?`.
-/// A body boundary first bails.
-fn expected_type_type_parameter<'a>(c: &'a Check<'_>, operand: (&str, bool)) -> Option<&'a str> {
+/// The context's expected type face `(name, written-nullable)`: the
+/// nearest meaningful ancestor decides — a `return` or arrow body with
+/// the enclosing function's written return type, a variable initializer
+/// with the declaration's written type, an assignment whose target's
+/// written type is the face (the official `writeType`), or an argument
+/// whose callee's formal table (the bridge signature face) declares
+/// it. The potentially-nullable question answers at the caller. A
+/// block body boundary first bails.
+fn expected_type_type_parameter<'a>(
+    c: &'a Check<'_>,
+    operand: (&str, bool),
+) -> Option<(&'a str, bool)> {
     for &ancestor in c.path.iter().rev().skip(1) {
         match c.kind(ancestor) {
             NodeKind::VariableInitializer => {
                 // `T? x = <e>!;` — the declaration's written type.
                 let decl = c.unit.ast.parent(ancestor)?;
-                let face = written_declaration_type(c, decl)?;
-                return if face.1 { Some(face.0) } else { None };
+                return written_declaration_type(c, decl);
             }
-            NodeKind::ReturnStatement => {
-                // `return <e>!;` — the enclosing method's written
-                // return type.
+            NodeKind::ReturnStatement | NodeKind::ExpressionBody => {
+                // `return <e>!;` / `=> <e>!` — the enclosing function's
+                // written return type (the official return and
+                // `ExpressionFunctionBody` faces share the lookup).
                 let function = enclosing_function(c, ancestor)?;
-                return written_return_type(c, function)
-                    .filter(|face| face.1)
-                    .map(|face| face.0);
+                return written_return_type(c, function);
             }
             NodeKind::Assignment => {
                 // `x = <e>!;` — the target's written type (the
@@ -360,15 +402,14 @@ fn expected_type_type_parameter<'a>(c: &'a Check<'_>, operand: (&str, bool)) -> 
                 if bare && !operand.1 && target == operand.0 {
                     return None;
                 }
-                let (name, nullable) = written_target_type(c, ancestor, target)?;
-                return nullable.then_some(name);
+                return written_target_type(c, ancestor, target);
             }
             NodeKind::Arguments => {
                 // `f(<e>!);` — the callee's formal table declares the
                 // expected type (the official `getExpectedType`).
                 return argument_context_type_parameter(c, ancestor);
             }
-            NodeKind::Block | NodeKind::BlockBody | NodeKind::ExpressionBody => {
+            NodeKind::Block | NodeKind::BlockBody => {
                 return None; // a body boundary — no written context face
             }
             _ => {}
@@ -411,8 +452,11 @@ fn written_target_type<'a>(c: &'a Check<'_>, use_node: u32, name: &str) -> Optio
 
 /// The argument context: the callee's bridge signature formal type at
 /// the dispatch node's own argument slot — a positional slot by index,
-/// a named slot by label; the formal written `T?` answers its `T`.
-fn argument_context_type_parameter<'a>(c: &'a Check<'_>, arguments: u32) -> Option<&'a str> {
+/// a named slot by label; the formal's face answers directly.
+fn argument_context_type_parameter<'a>(
+    c: &'a Check<'_>,
+    arguments: u32,
+) -> Option<(&'a str, bool)> {
     let analysis = c.semantics()?;
     let parent = c.unit.ast.parent(arguments)?;
     let kids = c.collect_direct(parent);
@@ -458,11 +502,9 @@ fn argument_context_type_parameter<'a>(c: &'a Check<'_>, arguments: u32) -> Opti
         sig.formals.positional.get(slot)?.ty
     };
     match ty {
-        dartq_semantic::model::Ty::Named {
-            name,
-            nullable: true,
-            ..
-        } => Some(analysis.strings().resolve(name)),
+        dartq_semantic::model::Ty::Named { name, nullable, .. } => {
+            Some((analysis.strings().resolve(name), nullable))
+        }
         _ => None,
     }
 }

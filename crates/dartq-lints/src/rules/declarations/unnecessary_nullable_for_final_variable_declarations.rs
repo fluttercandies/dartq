@@ -21,15 +21,27 @@ use dartq_semantic::model::Ty;
 /// conditional initializers, and multi-hop chains, carry no bridge face
 /// and under-report (the `no_duplicate_case_values` constant-evaluation
 /// precedent). Fields keep the official private-or-static gate
-/// (:83-88). Message: `diagnostic.g.dart`
+/// (:83-88). The `PatternVarDeclStatement` face
+/// (`visitPatternVariableDeclaration` :63-79) walks a `final`
+/// `ListPattern`/`RecordPattern`'s `DeclaredVariablePattern` leaves —
+/// the same verdict over the written type and the literal-initializer
+/// matched-type faces ([`check_pattern_decl`]). Message:
+/// `diagnostic.g.dart`
 /// `unnecessaryNullableForFinalVariableDeclarations`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "unnecessary_nullable_for_final_variable_declarations",
-    &[NodeKind::VariablesDeclaration],
+    &[
+        NodeKind::VariablesDeclaration,
+        NodeKind::PatternVarDeclStatement
+    ],
     check,
 );
 
 fn check(c: &mut Check<'_>) {
+    if c.kind(c.node()) == NodeKind::PatternVarDeclStatement {
+        check_pattern_decl(c);
+        return;
+    }
     let node = c.node();
     // `isFinal || isConst` (:97): the storage keyword — production rows
     // anchor a local declaration at the name, a field at the keyword;
@@ -219,4 +231,270 @@ fn is_non_null_literal(kind: NodeKind) -> bool {
             | NodeKind::ConstExpression
             | NodeKind::ConstLiteral
     )
+}
+
+/// `visitPatternVariableDeclaration`
+/// (unnecessary_nullable_for_final_variable_declarations.dart:63-79) — a
+/// `final` destructuring declaration walks its `ListPattern` elements /
+/// `RecordPattern` fields; each `DeclaredVariablePattern` reports at its
+/// name when the written type is nullable and the matched value type is
+/// provably non-nullable (`isNullable(declared) &&
+/// isNonNullable(matchedValueType)`, `check` :42-56).
+///
+/// The statement seals as a leaf row — the pattern pieces and the
+/// initializer tile flat in the owner window before it: the
+/// `ListPattern`/`RecordPattern` marker splits the run into pattern
+/// pieces (before it) and initializer pieces (after it). A
+/// `DeclaredVariablePattern` leaf's `Type` sibling is the piece
+/// immediately before it; the `?` tail marks the nullable declared type,
+/// and `dynamic` never reports (`type is DynamicType` bail, :48-50).
+///
+/// The matched value type answers over the initializer LITERAL shapes —
+/// the semantic face carries no per-`DeclaredVariablePattern`
+/// `matchedValueType` row (the flow's read rows ride identifier reads
+/// only, and `ArgListId` does not decompose through `Analysis`). A list
+/// pattern matched against a `ListLiteral` whose every top-level element
+/// is a non-null literal infers a non-nullable element type; a record
+/// pattern's positional field matched against the `RecordLiteral`'s
+/// positional literal of the same index answers that literal's
+/// nullability. Every other initializer shape — a bare name, an
+/// invocation, a non-literal element — stays silent (the under-report
+/// direction); nested patterns and named record fields bail whole.
+fn check_pattern_decl(c: &mut Check<'_>) {
+    let node = c.node();
+    let Some(parent) = c.ancestor(1) else { return };
+    let kids = c.collect_direct(parent);
+    let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+        return;
+    };
+    // The statement's own flat pieces: owner children before the
+    // statement row whose heads sit inside the statement's token span
+    // (the declaration keyword heads the range — earlier statements'
+    // rows all head before it).
+    let stmt_head = c.head_token(node);
+    let stmt_end = c.unit.ast.token_range(node).end;
+    let pieces: Vec<u32> = kids[..pos]
+        .iter()
+        .copied()
+        .filter(|&row| c.head_token(row) >= stmt_head && c.head_token(row) < stmt_end)
+        .collect();
+    // `node.keyword.keyword != Keyword.FINAL` bails (:64-65) — the
+    // `final`/`var` keyword is the statement's first real token (a
+    // metadata rider can head the range before it).
+    let keyword = (stmt_head..stmt_end).find(|&t| matches!(c.lexeme(t), "final" | "var"));
+    if !matches!(keyword.map(|t| c.lexeme(t)), Some("final")) {
+        return;
+    }
+    let Some(marker_pos) = pieces
+        .iter()
+        .position(|&row| matches!(c.kind(row), NodeKind::ListPattern | NodeKind::RecordPattern))
+    else {
+        return;
+    };
+    let marker = pieces[marker_pos];
+    let pattern_pieces = &pieces[..marker_pos];
+    // A nested pattern container inside the pattern window changes the
+    // matched-type level — bail rather than mix elements across levels
+    // (upstream recurses; the census face stays at the flat layer).
+    if pattern_pieces.iter().any(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::ListPattern
+                | NodeKind::RecordPattern
+                | NodeKind::MapPattern
+                | NodeKind::ObjectPattern
+                | NodeKind::CastPattern
+                | NodeKind::RelationalPattern
+                | NodeKind::ConstantPattern
+                | NodeKind::NullAssertPattern
+                | NodeKind::NullCheckPattern
+        )
+    }) {
+        return;
+    }
+    let elements: Vec<u32> = pattern_pieces
+        .iter()
+        .copied()
+        .filter(|&row| c.kind(row) == NodeKind::DeclaredVariablePattern)
+        .collect();
+    if elements.is_empty() {
+        return;
+    }
+    let initializer = &pieces[marker_pos + 1..];
+    match c.kind(marker) {
+        NodeKind::ListPattern => {
+            // `matchedValueType` for every element is the shared iterable
+            // element type — a `ListLiteral` of all-non-null literals
+            // infers a non-nullable element.
+            if !list_initializer_non_null_elements(c, initializer) {
+                return;
+            }
+            for &element in &elements {
+                if let Some(start) = nullable_pattern_name(c, pattern_pieces, element) {
+                    c.report(start..start, &[]);
+                }
+            }
+        }
+        NodeKind::RecordPattern => {
+            // A named `PatternField` (`name:` carries the `Colon` payload)
+            // takes the record's named-field type — unanswerable here;
+            // positional fields map to the initializer's positional
+            // literals by index. A named field or a named literal element
+            // skips its own slot without disturbing the positional count.
+            let Some(positional) = record_positional_literals(c, initializer) else {
+                return;
+            };
+            let mut position = 0usize;
+            for &element in &elements {
+                // The `PatternField` marker trailing the variable leaf
+                // carries the named field's `:` — its matched type is the
+                // record's named field, unanswerable here (skip without
+                // consuming a positional slot).
+                let piece_index = pattern_pieces
+                    .iter()
+                    .position(|&row| row == element)
+                    .unwrap_or(0);
+                let named = pattern_pieces.get(piece_index + 1).is_some_and(|&row| {
+                    c.kind(row) == NodeKind::PatternField
+                        && c.field(row, PayloadField::Colon)
+                            .is_some_and(|colon| colon != dartq_ast::TOKEN_NONE)
+                });
+                if named {
+                    continue;
+                }
+                let non_null = positional
+                    .get(position)
+                    .is_some_and(|&lit| is_non_null_literal(c.kind(lit)));
+                position += 1;
+                if !non_null {
+                    continue;
+                }
+                if let Some(start) = nullable_pattern_name(c, pattern_pieces, element) {
+                    c.report(start..start, &[]);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `ListLiteral` element-nullability face: the initializer's last
+/// piece is the literal container; its top-level element rows are the
+/// owner-window pieces inside its token span that no other element's
+/// span strictly contains (a nested `[[0]]`'s inner rows drop under the
+/// inner literal). `Some(true)` only when at least one element stands
+/// and every element is a non-null literal — the LUB-of-literals answer
+/// for the iterable element type.
+fn list_initializer_non_null_elements(c: &Check<'_>, initializer: &[u32]) -> bool {
+    let Some(&literal) = initializer.last() else {
+        return false;
+    };
+    if c.kind(literal) != NodeKind::ListLiteral {
+        return false;
+    }
+    let span = c.unit.ast.token_range(literal);
+    let candidates: Vec<u32> = initializer
+        .iter()
+        .copied()
+        .filter(|&row| row < literal && c.head_token(row) >= span.start)
+        .collect();
+    let elements: Vec<u32> = candidates
+        .iter()
+        .copied()
+        .filter(|&row| {
+            !candidates.iter().any(|&host| {
+                host != row && {
+                    let host_span = c.unit.ast.token_range(host);
+                    let row_span = c.unit.ast.token_range(row);
+                    row_span.start > host_span.start && row_span.end <= host_span.end
+                }
+            })
+        })
+        .filter(|&row| {
+            !matches!(
+                c.kind(row),
+                NodeKind::NoTypeArguments
+                    | NodeKind::TypeArguments
+                    | NodeKind::Arguments
+                    | NodeKind::NoArguments
+                    | NodeKind::Send
+                    | NodeKind::Spread
+                    | NodeKind::IfControlFlow
+                    | NodeKind::ForControlFlow
+            )
+        })
+        .collect();
+    // A control-flow/spread piece anywhere in the literal suspends the
+    // literal-LUB answer — bail whole rather than miscount.
+    if candidates.iter().any(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::Spread | NodeKind::IfControlFlow | NodeKind::ForControlFlow
+        )
+    }) {
+        return false;
+    }
+    !elements.is_empty() && elements.iter().all(|&row| is_non_null_literal(c.kind(row)))
+}
+
+/// The `RecordLiteral`'s positional element rows in order —
+/// `collect_direct` reaches its adopted members (`([], 1)` tiles its
+/// literals inside the record's own window). `None` on any named or
+/// control-flow element: the positional mapping is undecidable (named
+/// record fields join the pattern's named-field check instead).
+fn record_positional_literals(c: &Check<'_>, initializer: &[u32]) -> Option<Vec<u32>> {
+    let &literal = initializer.last()?;
+    if c.kind(literal) != NodeKind::RecordLiteral {
+        return None;
+    }
+    let kids = c.collect_direct(literal);
+    if kids.iter().any(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::NamedRecordField
+                | NodeKind::Spread
+                | NodeKind::IfControlFlow
+                | NodeKind::ForControlFlow
+        )
+    }) {
+        return None;
+    }
+    Some(
+        kids.into_iter()
+            .filter(|&row| {
+                !matches!(
+                    c.kind(row),
+                    NodeKind::NoTypeArguments
+                        | NodeKind::TypeArguments
+                        | NodeKind::Arguments
+                        | NodeKind::NoArguments
+                        | NodeKind::Send
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The report site of a nullable `DeclaredVariablePattern`: its `Type`
+/// sibling is the pattern piece immediately before it (the production
+/// tiling — `num? c` seals `Type` then the variable leaf), the `?` tail
+/// marks `isNullable`, and `dynamic` keeps the upstream `DynamicType`
+/// bail. `Some(offset)` of the variable name when the written type is
+/// nullable.
+fn nullable_pattern_name(c: &Check<'_>, pattern_pieces: &[u32], element: u32) -> Option<u32> {
+    let index = pattern_pieces.iter().position(|&row| row == element)?;
+    let ty = *pattern_pieces.get(index.wrapping_sub(1))?;
+    if c.kind(ty) != NodeKind::Type {
+        return None;
+    }
+    let range = c.unit.ast.token_range(ty);
+    if range.start >= range.end || c.lexeme(range.end - 1) != "?" {
+        return None;
+    }
+    if c.lexeme(range.start) == "dynamic" {
+        return None;
+    }
+    // `rule.reportAtToken(node.name)` (:54) — the variable leaf's own
+    // token is the name.
+    c.utf16_of_token(c.head_token(element))
 }

@@ -549,3 +549,20 @@ fn object_scrutinee_is_never_exhaustive() {
     ));
     assert_eq!(report.unreachable, Vec::<usize>::new());
 }
+
+#[test]
+fn never_question_scrutinee_models_as_never() {
+    // `getStaticType` maps any `NeverTypeImpl` — the question projection
+    // included — to the empty `never` static type (analyzer's
+    // `isNeverType` checks the class, not the suffix,
+    // exhaustiveness.dart:331-333), never to the `Null` space.
+    let w = world();
+    let sys = w.system();
+    let model = TypedModel::with_names(&sys, names(&w));
+    let never_q = w.table.intern(UninternedType::Never, true);
+    assert_eq!(model.static_type(never_q), TypedTy::Never);
+    assert_eq!(model.static_type(w.null()), TypedTy::Null);
+    // The empty space: no cases needed for exhaustiveness.
+    let report = compute(&model, &model.static_type(never_q), &[]);
+    assert!(matches!(report.exhaustiveness, Exhaustiveness::Exhaustive));
+}

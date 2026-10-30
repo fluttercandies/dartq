@@ -150,9 +150,9 @@ impl TypeTable {
     }
 
     /// Interns a non-signature, non-record type and returns its canonical id.
-    /// Infallible: the unit kinds normalize their nullability
-    /// (`dynamic`/`void`/`Invalid` are stored non-`?`, `Never?` becomes
-    /// `Null`) and nothing else here can violate a construction contract.
+    /// Infallible: the fixed-projection unit kinds normalize their
+    /// nullability (`dynamic`/`void`/`Invalid` are stored non-`?`), and
+    /// nothing here can violate a construction contract.
     #[must_use]
     pub fn intern(&self, ty: UninternedType, nullable: bool) -> TypeId {
         self.state.borrow_mut().intern_kind(ty, nullable)
@@ -193,9 +193,9 @@ impl TypeTable {
     /// primitive behind [`crate::TypeSystem::with_nullability`]. A nullability
     /// flip is one bit on the stored structure: the payload pools are already
     /// interned, so a dedup hit returns the existing id allocation-free and a
-    /// miss shares them instead of copying. Unit kinds normalize:
-    /// `dynamic` returns itself (type.dart:90-92), `Never?` collapses to
-    /// `Null` (type.dart:1207-1209).
+    /// miss shares them instead of copying. The fixed-projection unit kinds
+    /// return themselves (`dynamic`, type.dart:90-92); `Never` keeps both
+    /// projections as distinct interned shapes.
     #[must_use]
     pub(crate) fn with_nullability(&self, id: TypeId, nullable: bool) -> TypeId {
         self.state.borrow_mut().with_nullability(id, nullable)
@@ -406,19 +406,17 @@ impl TableState {
         // reclaims the appended tail.
         let mark = self.mark();
         let (kind, nullable) = match ty {
-            // `Never?` behaves as `Null` (type.dart:1207-1209): intern it as
-            // `Null` so the bottom type stays a single non-`?` shape.
-            UninternedType::Never => {
-                return self.commit(
-                    mark,
-                    if nullable {
-                        TypeKind::Null
-                    } else {
-                        TypeKind::Never
-                    },
-                    false,
-                );
-            }
+            // `Never?` keeps its own interned shape — a `Never` kind with
+            // the question projection, exactly the official storage
+            // (`NeverTypeImpl` carries the suffix, type.dart:1189-1193).
+            // The `Null` equivalence class is a *query* fact
+            // (`isDartCoreNull` is true of both, type.dart:1201-1204), not
+            // a storage collapse: collapsing here would erase the `==`
+            // distinction the official model keeps (`Never? != Null` under
+            // `==`, `NeverTypeImpl.==` vs `NullTypeImpl`), which
+            // `_isUnnecessaryCast` and the exhaustiveness `getStaticType`
+            // observe.
+            UninternedType::Never => (TypeKind::Never, nullable),
             // The analyzer stores `dynamic` non-`?` (`withNullability` returns
             // `this`, type.dart:90-92); `void`/`Invalid`/`Null` likewise carry
             // no suffix — nullability is semantic, handled by the rules.
@@ -766,10 +764,11 @@ impl TableState {
                     Some(replacement) => {
                         // The official substitutor unites nullabilities
                         // (type_algebra.dart:97-106): `T?=X!` is `X?`.
-                        // Unit-kind normalization still applies to the
-                        // promoted result (`T?=Never` is `Null`,
-                        // type.dart:1207-1209; `dynamic`/`Null` keep their
-                        // no-suffix projection).
+                        // The union keeps the stored projection verbatim
+                        // (`T?=Never` is `Never?`, its own interned shape),
+                        // and the fixed-projection unit kinds keep their
+                        // no-suffix form (`with_nullability` on them is the
+                        // identity).
                         let replacement_nullable =
                             self.types[replacement.raw() as usize].is_nullable();
                         if replacement_nullable || !t.is_nullable() {
@@ -853,10 +852,11 @@ impl TableState {
     /// structure: the payload pools are already interned, so the dedup
     /// probe hashes the target in place (no buffer build) and a hit returns
     /// the existing id allocation-free; a miss shares the source's pool
-    /// ranges / signature / shape instead of copying them. Unit-kind
-    /// normalization still applies: `Never?` collapses to `Null`
-    /// (type.dart:1207-1209) and `dynamic`/`void`/`Invalid`/`Null` keep
-    /// their fixed no-suffix projection (type.dart:90-92).
+    /// ranges / signature / shape instead of copying them. The
+    /// fixed-projection unit kinds keep their stored suffix
+    /// (`dynamic`/`void`/`Invalid`/`Null`, type.dart:90-92); `Never` flips
+    /// between its two projections like every payload-bearing kind
+    /// (`NeverTypeImpl.withNullability`, type.dart:1228-1237).
     fn with_nullability(&mut self, id: TypeId, nullable: bool) -> TypeId {
         let ty = self.types[id.raw() as usize];
         if ty.is_nullable() == nullable {
@@ -866,8 +866,8 @@ impl TableState {
             // Requesting the suffix on a fixed-projection kind lands back on
             // the same interned shape.
             TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => id,
-            // `Never?` is a different interned kind (`Null`), so this
-            // direction goes through the normalizing interner.
+            // `Never` has no payload: the flip goes through the interner,
+            // which keeps the (Never, projection) pair as its own shape.
             TypeKind::Never => self.intern_kind(UninternedType::Never, nullable),
             TypeKind::Interface { .. }
             | TypeKind::TypeParameter { .. }
@@ -1340,14 +1340,22 @@ mod tests {
         assert_eq!(table.with_nullability(fn_q, false), fn_t);
 
         // Fixed-projection unit kinds: `dynamic` keeps its no-suffix shape;
-        // `Never?` collapses to `Null` once and stays there.
+        // the `Null` kind ignores flips in both directions.
         let dynamic = table.intern(UninternedType::Dynamic, false);
         let never = table.intern(UninternedType::Never, false);
+        let null = table.intern(UninternedType::Null, false);
         assert_eq!(table.with_nullability(dynamic, true), dynamic);
-        let null = table.with_nullability(never, true);
-        assert_ne!(null, never);
         assert_eq!(table.with_nullability(null, true), null);
         assert_eq!(table.with_nullability(null, false), null);
+        // `Never` keeps both projections as distinct interned shapes
+        // (`NeverTypeImpl.withNullability`, type.dart:1228-1237): the
+        // question form is neither `Never` nor the `Null` kind, and flips
+        // are id-symmetric.
+        let never_q = table.with_nullability(never, true);
+        assert_ne!(never_q, never);
+        assert_ne!(never_q, null);
+        assert_eq!(table.with_nullability(never_q, false), never);
+        assert_eq!(table.with_nullability(never_q, true), never_q);
 
         // Repeated flips in both directions: identical ids, zero pool growth.
         let len = table.len();
@@ -1359,7 +1367,8 @@ mod tests {
             assert_eq!(table.with_nullability(fn_t, true), fn_q);
             assert_eq!(table.with_nullability(fn_q, false), fn_t);
             assert_eq!(table.with_nullability(dynamic, true), dynamic);
-            assert_eq!(table.with_nullability(never, true), null);
+            assert_eq!(table.with_nullability(never, true), never_q);
+            assert_eq!(table.with_nullability(never_q, false), never);
         }
         assert_eq!(table.len(), len, "flip dedup must not grow the type pool");
     }

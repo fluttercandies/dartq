@@ -112,6 +112,12 @@ fn top_and_bottom_types() {
         fx.int_question()
     );
     assert_eq!(sys.least_upper_bound(fx.never(), fx.null()), fx.null());
+    // UP(Never?, T) takes the same NULL arm (`isDartCoreNull`,
+    // type.dart:1201-1204): `T?`, never the bottom.
+    assert_eq!(
+        sys.least_upper_bound(fx.table.intern(UninternedType::Never, true), fx.int()),
+        fx.int_question()
+    );
 }
 
 #[test]

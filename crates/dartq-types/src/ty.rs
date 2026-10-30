@@ -18,10 +18,13 @@
 //!
 //! Nullability is a dimension carried by every type, not an independent
 //! variant: `T?` is `T` with the question projection (`withNullability`,
-//! type.dart:1558/1567-1569). The unit kinds normalize their nullability away
-//! at interning time: `dynamic` is always stored non-`?`
-//! (type.dart:90-92), and `Never?` is interned as `Null` (official `Never?`
-//! behaves as `Null`, type.dart:1207-1209).
+//! type.dart:1558/1567-1569). The fixed-projection unit kinds normalize
+//! their nullability away at interning time (`dynamic`, `void`, `Invalid`,
+//! `Null` are always stored non-`?`, type.dart:90-92); `Never` keeps both
+//! projections as distinct shapes, mirroring `NeverTypeImpl`'s stored
+//! suffix (type.dart:1189-1193) — the `Null` equivalence of `Never?`
+//! lives in the queries (`isDartCoreNull`, type.dart:1201-1204), not in
+//! storage.
 
 use crate::ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};
 use crate::suffix::NullabilitySuffix;
@@ -41,10 +44,11 @@ use crate::suffix::NullabilitySuffix;
 /// contract in the [`crate::TypeTable`] docs).
 #[derive(Clone, Copy, Debug)]
 pub enum TypeKind {
-    /// `Never` — the bottom type. Interning `Never` with `nullable = true`
-    /// yields [`TypeKind::Null`] (type.dart:1207-1209), so a stored `Never`
-    /// always has the no-suffix projection and `is_bottom` is exactly
-    /// "kind is `Never`".
+    /// `Never` — the bottom type. The question projection (`Never?`) is a
+    /// distinct interned shape in the `Null` equivalence class: `is_bottom`
+    /// is "kind is `Never` and not nullable" (type.dart:1199-1200) and
+    /// `is_null` additionally matches it (`isDartCoreNull`,
+    /// type.dart:1201-1204).
     Never,
     /// `dynamic` — a top type; semantically nullable despite the missing `?`.
     Dynamic,
@@ -194,7 +198,7 @@ pub struct NamedMember {
 /// form of [`crate::TypeTable::intern`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum UninternedType {
-    /// `Never`. Interning with `nullable = true` yields `Null`.
+    /// `Never`. The question projection interns as its own `Never?` shape.
     Never,
     /// `dynamic`. Always stored non-`?` (type.dart:90-92).
     Dynamic,

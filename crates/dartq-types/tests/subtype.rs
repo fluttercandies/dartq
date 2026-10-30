@@ -66,8 +66,25 @@ fn rule3_left_bottom() {
     assert!(sys.is_subtype(fx.never(), fx.animal()));
     assert!(sys.is_subtype(fx.never(), fx.future_or_of(fx.int(), false)));
     assert!(!sys.is_bottom(fx.null()));
-    // `Never?` is interned as `Null`, so `Null <: T?` covers it.
+    // `Null <: T?` (Right Nullable); `Never?` rides the same rule as a
+    // `Null`-equivalent left operand, while plain `Never` is Left Bottom.
     assert!(sys.is_subtype(fx.null(), fx.int_question()));
+    assert!(sys.is_subtype(
+        fx.table.intern(UninternedType::Never, true),
+        fx.int_question()
+    ));
+    assert!(!sys.is_subtype(
+        fx.table.intern(UninternedType::Never, true),
+        fx.int()
+    ));
+    assert!(sys.is_subtype(
+        fx.null(),
+        fx.table.intern(UninternedType::Never, true)
+    ));
+    assert!(!sys.is_subtype(
+        fx.table.intern(UninternedType::Never, true),
+        fx.never()
+    ));
 }
 
 #[test]

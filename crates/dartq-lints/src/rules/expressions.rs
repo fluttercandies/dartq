@@ -130,6 +130,12 @@ pub(crate) mod await_only_futures;
 /// cross-library closures.
 #[cfg(test)]
 mod b4_expr_pins;
+/// The C7 census wave's production-bridge pins: the nullable-safety
+/// lint faces whose operand coverage the census flagged red
+/// (`prefer_null_aware_operators`, `prefer_null_aware_method_calls`,
+/// `unnecessary_nullable_for_final_variable_declarations`).
+#[cfg(test)]
+mod c7_pins;
 pub(crate) mod cascade_invocations;
 pub(crate) mod cast_nullable_to_non_nullable;
 pub(crate) mod discarded_futures;

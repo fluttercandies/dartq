@@ -149,6 +149,16 @@ impl ParamFacts {
         variance: Variance::Covariant,
         bound: None,
     };
+
+    /// Returns these facts with the declared bound set — the builder form
+    /// of the `bound` field, for snapshot construction sites.
+    #[must_use]
+    pub const fn with_bound(self, bound: TypeId) -> Self {
+        Self {
+            variance: self.variance,
+            bound: Some(bound),
+        }
+    }
 }
 
 /// The injected facts snapshot for every type parameter a query may touch.

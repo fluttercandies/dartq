@@ -4705,7 +4705,7 @@ pub(crate) mod avoid_futureor_void {
         Check, NodeKind, PayloadField, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows,
         type_arguments_row, type_sibling_before,
     };
-    use crate::rules::NONE_TOKEN;
+    use crate::rules::{utf16_token_span, NONE_TOKEN};
 
     /// The variance of a type position (the upstream `VarianceChecker`
     /// walk): `Out` result positions, `In` contravariant positions, `InOut`
@@ -4960,11 +4960,18 @@ pub(crate) mod avoid_futureor_void {
     }
 
     /// `visitObjectPattern` (:125): the pattern's written type — the head
-    /// identifier with the type-argument rows that parsed before the fields
-    /// (siblings preceding the pattern row).
+    /// name (`FirstName` payload, the object-pattern face the pattern
+    /// rules read; a prefixed spelling carries its prefix there and stays
+    /// under-reported) with the type-argument rows that parsed before the
+    /// fields (siblings preceding the pattern row). The report covers the
+    /// head through the `<void>` argument run (`reportAtNode`'s whole
+    /// annotation, :70).
     fn object_pattern(c: &mut Check<'_>) {
         let node = c.node();
-        if c.lexeme(c.head_token(node)) != "FutureOr" {
+        let Some(head) = c.field(node, PayloadField::FirstName) else {
+            return;
+        };
+        if c.lexeme(head) != "FutureOr" {
             return;
         }
         let Some(parent) = c.unit.ast.parent(node) else {
@@ -4974,17 +4981,24 @@ pub(crate) mod avoid_futureor_void {
         let Some(pos) = siblings.iter().position(|&kid| kid == node) else {
             return;
         };
-        let has_void_argument = siblings[..pos].iter().rev().any(|&kid| {
-            c.kind(kid) == NodeKind::TypeArguments
-                && matches!(
-                    type_argument_rows(c, kid).as_slice(),
-                    [only] if c.kind(*only) == NodeKind::VoidType
-                )
-        });
-        if has_void_argument {
-            let range = c.utf16_span(node);
-            c.report(range, &[]);
-        }
+        let Some(args) = siblings[..pos]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&kid| {
+                c.kind(kid) == NodeKind::TypeArguments
+                    && matches!(
+                        type_argument_rows(c, kid).as_slice(),
+                        [only] if c.kind(*only) == NodeKind::VoidType
+                    )
+            })
+            .filter(|_| future_or_in_scope(c))
+        else {
+            return;
+        };
+        let start = utf16_token_span(c, head).start;
+        let end = c.utf16_span(args).end;
+        c.report(start..end, &[]);
     }
 
     /// The `check` walk (:38-110): named types recurse into their
@@ -5006,8 +5020,13 @@ pub(crate) mod avoid_futureor_void {
                     checked(c, variance, Some(arg));
                 }
                 if variance != Variance::In && is_future_or_void(c, row) {
-                    let range = c.utf16_span(row);
-                    c.report(range, &[]);
+                    // `reportAtNode(typeAnnotation)` pins the whole named
+                    // type — the head plus the `<void>` argument run (the
+                    // row's own span stops at the head name).
+                    let start = c.utf16_span(row).start;
+                    let end = type_arguments_row(c, row)
+                        .map_or(start, |args| c.utf16_span(args).end);
+                    c.report(start..end, &[]);
                 }
             }
             NodeKind::FunctionType => {
@@ -5042,7 +5061,11 @@ pub(crate) mod avoid_futureor_void {
     }
 
     /// The `FutureOr<void>` shape (:64-72): the unprefixed `FutureOr` head
-    /// with exactly one `void` argument.
+    /// with exactly one `void` argument, and the head resolving — the
+    /// official read answers on the element (`staticType
+    /// is ParameterizedType` … `isDartAsyncFutureOr`, :64-66), so an
+    /// undefined `FutureOr` (no `dart:async` import, `doc_bad_1`'s
+    /// `undefined_class` file) never reports.
     fn is_future_or_void(c: &Check<'_>, row: u32) -> bool {
         let head = c.head_token(row);
         if c.lexeme(head) != "FutureOr" {
@@ -5054,6 +5077,9 @@ pub(crate) mod avoid_futureor_void {
         {
             return false;
         }
+        if !future_or_in_scope(c) {
+            return false;
+        }
         let Some(args) = type_arguments_row(c, row) else {
             return false;
         };
@@ -5061,6 +5087,21 @@ pub(crate) mod avoid_futureor_void {
             type_argument_rows(c, args).as_slice(),
             [only] if c.kind(*only) == NodeKind::VoidType
         )
+    }
+
+    /// The resolution half of `checkNamedType` (:64-66): the bare head
+    /// must be able to enter scope through an import. The
+    /// [`dartq_semantic::Analysis::import_shadows`] face answers `false`
+    /// only when no indexed import carries the name — exactly the
+    /// undefined `FutureOr` silence — while the SDK targets sit outside
+    /// the indexed set and answer `true` conservatively (a re-exported
+    /// dart:async `FutureOr` is the same type). A file-local
+    /// `class FutureOr` without an import stays silent the same way. With
+    /// no semantic face (plain-run posture) the syntax predicate stands.
+    fn future_or_in_scope(c: &Check<'_>) -> bool {
+        c.semantics().is_none_or(|analysis| {
+            analysis.import_shadows(analysis.strings().intern("FutureOr"))
+        })
     }
 }
 

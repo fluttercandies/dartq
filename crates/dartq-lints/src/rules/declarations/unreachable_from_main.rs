@@ -2,7 +2,10 @@ use rustc_hash::FxHashSet;
 
 use super::{Check, PayloadField, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
-use crate::rules::{initialized_identifier_name, member_name, rows_with_parent, utf16_token_span};
+use crate::rules::{
+    MemberQuery, initialized_identifier_name, member_matches, member_name, rows_with_parent,
+    same_file_ancestors, utf16_token_span,
+};
 use dartq_ast::NodeKind;
 
 /// Official: upstream Dart SDK source,
@@ -32,21 +35,26 @@ use dartq_ast::NodeKind;
 /// official gatherer adds an enum body's `members`, never its
 /// constants).
 ///
-/// Approximations (documented): the official override exemptions
-/// (`isOverride` on field getters and methods) are not modeled — the
-/// face's reference rows carry no override relation and the shell never
-/// guesses, so an overridden-only base member reports where the
-/// official stays silent (the engine face's documented divergence
-/// family; the `toJson` auto-reachability and `@reflectiveTest`
-/// constructor edges under-reach in the same direction). Three
-/// substrate deltas lean the same under-report direction and stay
-/// engine-owned (the shell never compensates): the propagation graph is
-/// workspace-global where the official walk is per-library, the entry
-/// seeds admit every declaration kind where the official seeds only
-/// functions, and type-annotation references carry no `NamedType`
-/// filter. Annotation reads (`@visibleForTesting`, `@Preview`) are by
-/// spelling — a same-file annotation class of either name
-/// over-suppresses (the flutter-family approximation register). An
+/// Shell-side suppression faces (same-file approximations of the
+/// official's element queries): a member whose name resolves against a
+/// same-file ancestor's member table never gathers (the `isOverride`
+/// arm — `getOverridden` across the interface), a non-static method
+/// named `toJson` never gathers (the `dart:convert` dynamic-invocation
+/// auto-reach arm :293-303), and a declaration whose doc-comment
+/// `[Name]` references match its own name reads as referenced (the
+/// comment-reference edge the engine face does not carry).
+///
+/// Approximations (documented): the override read is same-file only —
+/// an override relation through an imported or SDK interface stays
+/// invisible, matching the face family's documented cross-file
+/// under-reach. Three substrate deltas lean the same under-report
+/// direction and stay engine-owned (the shell never compensates): the
+/// propagation graph is workspace-global where the official walk is
+/// per-library, the entry seeds admit every declaration kind where the
+/// official seeds only functions, and type-annotation references carry
+/// no `NamedType` filter. Annotation reads (`@visibleForTesting`,
+/// `@Preview`) are by spelling — a same-file annotation class of either
+/// name over-suppresses (the flutter-family approximation register). An
 /// unnamed extension has no name token to key a face flag with: it
 /// never reports, and its members judge on their own flags.
 pub(crate) static SPEC: RuleSpec =
@@ -77,6 +85,17 @@ fn check(c: &mut Check<'_>) {
     if !face.has_entry {
         return;
     }
+    // The lexical-use supplement: the name → counting-position index
+    // the doc-reference and anti-reach arms consult. Built once per
+    // unit — `Identifier` rows in a reference context (expression,
+    // expression-continuation, or constructor-reference position) count
+    // the candidate's written name; declaration-context names and
+    // `TypeReference`/`PrefixedTypeReference` rows do not (the
+    // official's `SimpleIdentifier`-vs-`NamedType` split :349-386,
+    // :307-346 — a plain type annotation never counts). Doc-comment
+    // `[Name]` references count through the same index (the official
+    // resolves comment references against the element model).
+    let uses = counting_uses(c);
     // The name offsets of the unreachable public containers: a member's
     // enclosing declaration in that set suppresses the member (the
     // outermost-container-wins gate).
@@ -94,10 +113,12 @@ fn check(c: &mut Check<'_>) {
                     judge(
                         c,
                         &face,
+                        &uses,
                         top,
                         row,
                         Shape::TopLevelFunction,
                         name,
+                        c.lexeme(name),
                         c.lexeme(name),
                         c.lexeme(name),
                     );
@@ -117,10 +138,12 @@ fn check(c: &mut Check<'_>) {
                             judge(
                                 c,
                                 &face,
+                                &uses,
                                 top,
                                 row,
                                 Shape::Other,
                                 name,
+                                c.lexeme(name),
                                 c.lexeme(name),
                                 c.lexeme(name),
                             );
@@ -132,7 +155,7 @@ fn check(c: &mut Check<'_>) {
                 | NodeKind::ExtensionDeclaration
                 | NodeKind::ExtensionTypeDeclaration
                 | NodeKind::EnumDeclaration => {
-                    judge_container(c, &face, top, row, &mut dead);
+                    judge_container(c, &face, &uses, top, row, &mut dead);
                 }
                 NodeKind::Typedef => {
                     let Some(name) = name_token_of(c, top, row) else {
@@ -141,10 +164,12 @@ fn check(c: &mut Check<'_>) {
                     judge(
                         c,
                         &face,
+                        &uses,
                         top,
                         row,
                         Shape::Other,
                         name,
+                        c.lexeme(name),
                         c.lexeme(name),
                         c.lexeme(name),
                     );
@@ -160,6 +185,7 @@ fn check(c: &mut Check<'_>) {
 fn judge_container(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
+    uses: &rustc_hash::FxHashMap<String, u32>,
     wrapper: u32,
     row: u32,
     dead: &mut FxHashSet<u32>,
@@ -181,10 +207,12 @@ fn judge_container(
         judge(
             c,
             face,
+            uses,
             wrapper,
             row,
             Shape::Other,
             name,
+            c.lexeme(name),
             c.lexeme(name),
             c.lexeme(name),
         );
@@ -197,6 +225,10 @@ fn judge_container(
     }
     let container = c.lexeme(name.expect("public implies a name")).to_owned();
     let is_enum = c.kind(row) == NodeKind::EnumDeclaration;
+    // The ancestor chain resolves once per container — every member's
+    // `isOverride` read consults the same table (the official gathers
+    // `members` per container element; the same-file approximation).
+    let ancestors = same_file_ancestors(c, row, false);
     for member in member_rows(c, row) {
         match c.kind(member) {
             NodeKind::Constructor | NodeKind::Factory => {
@@ -205,7 +237,7 @@ fn judge_container(
                 if is_enum {
                     continue;
                 }
-                judge_constructor(c, face, member, &container);
+                judge_constructor(c, face, uses, member, &container);
             }
             NodeKind::Fields => {
                 for variable in c.collect_direct(member) {
@@ -219,13 +251,24 @@ fn judge_container(
                         let Some(name) = initialized_identifier_name(c, var) else {
                             continue;
                         };
+                        // The `isOverride` arm (:101-116): a field
+                        // whose getter resolves against an ancestor
+                        // member never gathers. The getter/setter face
+                        // reads the field's own name — upstream keys on
+                        // `element.getter`, the accessor the variable
+                        // carries.
+                        if is_override_member(c, &ancestors, c.lexeme(name), MemberQuery::Getter) {
+                            continue;
+                        }
                         judge(
                             c,
                             face,
+                            uses,
                             member,
                             member,
                             Shape::Other,
                             name,
+                            c.lexeme(name),
                             c.lexeme(name),
                             c.lexeme(name),
                         );
@@ -251,13 +294,26 @@ fn judge_container(
                     continue;
                 }
                 let is_static = dartq_ast::mod_flags(c.unit.ast, member) & STATIC_BIT != 0;
+                // The `toJson` arm (:293-303): a non-static `toJson`
+                // is dynamically invoked by `dart:convert`, so it is
+                // automatically reachable — never a candidate.
+                if !is_static && lexeme == "toJson" {
+                    continue;
+                }
+                // The `isOverride` arm (:147): a method resolving
+                // against an ancestor's member table never gathers.
+                if is_override_member(c, &ancestors, lexeme, MemberQuery::Method) {
+                    continue;
+                }
                 judge(
                     c,
                     face,
+                    uses,
                     member,
                     member,
                     Shape::Method(is_static),
                     name,
+                    lexeme,
                     lexeme,
                     lexeme,
                 );
@@ -267,10 +323,26 @@ fn judge_container(
     }
 }
 
+/// Whether `name` resolves against any ancestor's member table — the
+/// `isOverride` approximation (`getOverridden` across the same-file
+/// interface chain). `concrete=false` joins `implements` links, the
+/// official `InterfaceElement.getOverridden` semantics.
+fn is_override_member(c: &Check<'_>, ancestors: &[u32], name: &str, query: MemberQuery) -> bool {
+    ancestors
+        .iter()
+        .any(|&ancestor| !member_matches(c, ancestor, query, name).is_empty())
+}
+
 /// Judges one constructor: the display name is `Type.written`, the
 /// unnamed face `Type.new` (upstream `nameForError`'s
 /// `self.name?.lexeme ?? 'new'`), anchored at the name token.
-fn judge_constructor(c: &mut Check<'_>, face: &ReachabilityFace<'_>, row: u32, container: &str) {
+fn judge_constructor(
+    c: &mut Check<'_>,
+    face: &ReachabilityFace<'_>,
+    uses: &rustc_hash::FxHashMap<String, u32>,
+    row: u32,
+    container: &str,
+) {
     let written = constructor_name_node(c, row);
     let (name_token, member) = match written {
         Some(node) => {
@@ -289,11 +361,13 @@ fn judge_constructor(c: &mut Check<'_>, face: &ReachabilityFace<'_>, row: u32, c
     judge(
         c,
         face,
+        uses,
         row,
         row,
         Shape::Constructor,
         name_token,
         member,
+        &display,
         &display,
     );
 }
@@ -311,17 +385,35 @@ fn judge_constructor(c: &mut Check<'_>, face: &ReachabilityFace<'_>, row: u32, c
 fn judge(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
+    uses: &rustc_hash::FxHashMap<String, u32>,
     wrapper: u32,
     annotation_row: u32,
     shape: Shape,
     name_token: u32,
     public: &str,
+    counted: &str,
     display: &str,
 ) {
     // 1. Unreachable (the face's flag; `None` — outside the face's
     // universe — never reports).
     let offset = utf16_token_span(c, name_token).start;
     if face.is_reachable(offset) != Some(false) {
+        return;
+    }
+    // 1.5. Counted use (the anti-reach arm): a candidate the face's
+    // under-reach flagged unreachable but whose name has a same-file
+    // counting position reads as reachable — a plain type reference or
+    // a pattern name never counts (upstream's visitor split), an
+    // expression or constructor use does. Constructors count under the
+    // qualified `C.name` key AND the bare member (a `: this.one()`
+    // redirect writes `one`, never `C.one`).
+    let counted_count = uses.get(counted).copied().unwrap_or(0)
+        + if counted == public {
+            0
+        } else {
+            uses.get(public).copied().unwrap_or(0)
+        };
+    if counted_count > 0 {
         return;
     }
     // 2. Public (`element.isPublic` — the written declaration name; a
@@ -471,3 +563,141 @@ fn carries_annotation(c: &Check<'_>, wrapper: u32, row: u32, name: &str) -> bool
 
 /// The `static` `ModSet` bit (bridge `mod_bits`, member family).
 const STATIC_BIT: u16 = 1 << 3;
+
+/// The name → counting-position index of the unit: every `Identifier`
+/// row whose [`dartq_parser::IdentifierContext`] marks a reference
+/// position (`Expression`, `ExpressionContinuation`,
+/// `ConstructorReference`, `ConstructorReferenceContinuation`,
+/// `ConstructorReferenceContinuationAfterTypeArguments`, or
+/// `PatternFieldName`) contributes its lexeme, plus every doc-comment
+/// `[Name]` reference (the official resolves comment references
+/// against the element model — a `/// See [C]` read marks `C` used).
+/// Declaration contexts, directive names, label positions, and plain
+/// `TypeReference`/`PrefixedTypeReference` rows do not count — the
+/// official's `SimpleIdentifier`-vs-`NamedType` split
+/// (`unreachable_from_main.dart` `visitNamedType` :307-346 keeps a
+/// plain type annotation out of the use set; `visitSimpleIdentifier`
+/// :386-394 keeps every expression reference in it).
+fn counting_uses(c: &Check<'_>) -> rustc_hash::FxHashMap<String, u32> {
+    use dartq_parser::IdentifierContext as Ctx;
+    const EXPRESSION: u32 = Ctx::Expression as u32;
+    const EXPRESSION_CONT: u32 = Ctx::ExpressionContinuation as u32;
+    const CTOR: u32 = Ctx::ConstructorReference as u32;
+    const PATTERN_FIELD: u32 = Ctx::PatternFieldName as u32;
+    let mut uses: rustc_hash::FxHashMap<String, u32> = rustc_hash::FxHashMap::default();
+    let count = |uses: &mut rustc_hash::FxHashMap<String, u32>, key: String| {
+        *uses.entry(key).or_default() += 1;
+    };
+    let Some(root) = c.unit.ast.root() else {
+        return uses;
+    };
+    for row in c.children(root) {
+        if c.kind(row) != NodeKind::Identifier {
+            continue;
+        }
+        let Some(ctx) = c.field(row, PayloadField::Context) else {
+            continue;
+        };
+        // Upstream's `_patternLevel` (:170, :237-243): a reference
+        // inside a `ConstantPattern` subtree never counts — a constant
+        // pattern's `C()` or `name` is matched against, never invoked.
+        // The pattern-field name is exempt (visitPatternField carries
+        // no level gate).
+        if ctx != PATTERN_FIELD && inside_constant_pattern(c, row) {
+            continue;
+        }
+        if ctx == EXPRESSION || ctx == EXPRESSION_CONT || ctx == PATTERN_FIELD {
+            count(&mut uses, c.lexeme(c.head_token(row)).to_owned());
+            continue;
+        }
+        // A `ConstructorReferenceContinuation` counts its written
+        // member name (the `: this.one()` redirect names `one` — the
+        // qualified `C.one` key is the head arm's job; the bare lexeme
+        // covers the redirect and the `super.name()` faces the head
+        // arm cannot key).
+        if ctx == Ctx::ConstructorReferenceContinuation as u32
+            || ctx == Ctx::ConstructorReferenceContinuationAfterTypeArguments as u32
+        {
+            count(&mut uses, c.lexeme(c.head_token(row)).to_owned());
+            continue;
+        }
+        if ctx != CTOR {
+            continue;
+        }
+        // A constructor head counts the class and its member: `C()`
+        // marks `C` and `C.new`, `C.two()` marks `C` and `C.two`. The
+        // tokens after the head's span decide the arm — `.name` reads
+        // the written continuation, `(`/`else` reads the unnamed form
+        // (upstream's `ConstructorName` element split: the
+        // constructor the invocation resolves is the use).
+        let lexeme = c.lexeme(c.head_token(row));
+        count(&mut uses, lexeme.to_owned());
+        // The member token sits after the head's own type arguments:
+        // `C<T>.named` reads the `.named`, `C()` and `C<T>()` read
+        // `new`. The scan walks the balanced `<…>` run off the token
+        // stream (the row's span ends at `C`; a `>` deeper than it
+        // opened closes the args).
+        let mut dot = c.unit.ast.token_range(row).end;
+        if c.lexeme(dot) == "<" {
+            let last = c.unit.tokens.len().saturating_sub(1) as u32;
+            let mut depth = 1i32;
+            while depth > 0 && dot < last {
+                dot += 1;
+                match c.lexeme(dot) {
+                    "<" | "<<" | "<<<" => depth += 1,
+                    ">" => depth -= 1,
+                    ">>" => depth -= 2,
+                    ">>>" => depth -= 3,
+                    _ => {}
+                }
+            }
+            dot = (dot + 1).min(last);
+        }
+        let member = if dot + 1 < c.unit.tokens.len() as u32 && c.lexeme(dot) == "." {
+            c.lexeme(dot + 1).to_owned()
+        } else {
+            "new".to_owned()
+        };
+        count(&mut uses, format!("{lexeme}.{member}"));
+    }
+    // The doc-comment `[Name]` face: a bracketed name in any comment
+    // reads as a reference. `Comment.range` is byte offsets into the
+    // source — the scan walks the comment text once per unit.
+    for comment in c.comments.all() {
+        let text = &c.unit.source[comment.range.start as usize..comment.range.end as usize];
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                if end > start && bytes.get(end) == Some(&b']') {
+                    *uses.entry(text[start..end].to_owned()).or_default() += 1;
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    uses
+}
+
+/// Whether `row` sits inside a `ConstantPattern` subtree — the
+/// `_patternLevel` arm the use index consults (parent walk; the
+/// subtree boundary is the pattern row's own completion window).
+fn inside_constant_pattern(c: &Check<'_>, row: u32) -> bool {
+    let mut current = row;
+    while let Some(parent) = c.unit.ast.parent(current) {
+        if c.kind(parent) == NodeKind::ConstantPattern {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}

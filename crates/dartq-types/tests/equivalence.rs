@@ -30,13 +30,21 @@ fn interning_is_canonical_for_identical_structures() {
 }
 
 #[test]
-fn never_question_collapses_to_null() {
+fn never_question_is_its_own_null_equivalent_shape() {
     let fx = fixture();
-    // Official `Never?` behaves as `Null` (type.dart:1207-1209).
+    // Official `Never?` carries its question suffix on the `NeverTypeImpl`
+    // (type.dart:1189-1193): a distinct `==` identity from `Null`, inside
+    // the `Null` equivalence class for the queries (`isDartCoreNull`,
+    // type.dart:1201-1204).
     let never_question = fx.table.intern(UninternedType::Never, true);
-    assert_eq!(never_question, fx.null());
+    assert_ne!(never_question, fx.null());
     assert_ne!(never_question, fx.never());
     assert!(fx.system().is_null(never_question));
+    assert!(!fx.system().is_bottom(never_question));
+    assert!(!fx.system().is_structurally_equal(never_question, fx.null()));
+    assert!(fx
+        .system()
+        .is_structurally_equal(never_question, never_question));
 }
 
 #[test]
@@ -234,12 +242,13 @@ fn substitute_unites_type_parameter_and_replacement_nullabilities() {
         fx.int_question()
     );
 
-    // Unit-kind normalization still applies to the united result:
-    // `T?=Never` is `Null` (type.dart:1207-1209), and `dynamic`/`Null`
-    // never grow a `?` twin.
+    // The united result keeps the replacement's shape under the `?`
+    // projection: `T?=Never` is `Never?` (its own interned shape, the
+    // official `uniteNullabilities`, type_algebra.dart:97-106), and
+    // `dynamic`/`Null` never grow a `?` twin.
     assert_eq!(
         fx.table.substitute(t_question, &[(t, fx.never())]),
-        fx.null()
+        fx.table.intern(UninternedType::Never, true)
     );
     assert_eq!(
         fx.table.substitute(t_question, &[(t, fx.dynamic())]),

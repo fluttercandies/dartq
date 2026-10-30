@@ -90,7 +90,8 @@ fn top_bottom_null_object_classes() {
     assert!(sys.is_bottom(fx.never()));
     assert!(!sys.is_bottom(fx.null()));
     assert!(sys.is_null(fx.null()));
-    // `Never?` interns as `Null`, hence null but not bottom.
+    // `Never?` is its own shape in the `Null` equivalence class: null but
+    // not bottom (`isDartCoreNull`, type.dart:1201-1204).
     assert!(sys.is_null(fx.table.intern(UninternedType::Never, true)));
     assert!(sys.is_object(fx.itf(fx.d.object, &[], false)));
     assert!(sys.is_object(fx.future_or_of(fx.itf(fx.d.object, &[], false), false)));

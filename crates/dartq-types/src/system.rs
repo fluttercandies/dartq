@@ -3,10 +3,13 @@
 //! Direct port of the analyzer's rule table
 //! (`pkg/analyzer/lib/src/dart/element/subtype.dart:262-523`): the rule order
 //! below is the source order, and short-circuiting matches it exactly.
-//! M1 omissions are marked inline: no promoted bounds, no declared
-//! bounds on type parameters, no variance annotations (class parameters are
-//! covariant, `element.dart:11560-11561`), no extension types, no
-//! `UnknownInferredType`.
+//! M1 omissions are marked inline: no promoted bounds, no variance
+//! annotations in the walk (class parameters are covariant,
+//! `element.dart:11560-11561`), no extension types, no
+//! `UnknownInferredType`. Declared bounds participate through the injected
+//! [`ParamFactsTable`](crate::ParamFactsTable)
+//! ([`TypeSystem::with_param_facts`]): the left-type-variable-bound rule
+//! is armed exactly when the caller binds the snapshot.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -17,6 +20,7 @@ use crate::hierarchy::{CoreDecls, DeclInfo, TypeHierarchy};
 use crate::ids::{FunctionSigId, TypeDeclId, TypeId};
 use crate::table::TypeTable;
 use crate::ty::{PoolRange, Type, TypeKind, UninternedType};
+use crate::variance::ParamFactsTable;
 
 /// Recursion guard, mirroring the analyzer's `TypeOperationDepthLimitExceeded`
 /// mechanism with the same limit (`type_system.dart:85`). One shared depth
@@ -165,6 +169,13 @@ impl WalkScratch {
 pub struct TypeSystem<'a> {
     table: &'a TypeTable,
     hierarchy: &'a TypeHierarchy,
+    /// Declared type-parameter bounds, when the caller binds them
+    /// ([`TypeSystem::with_param_facts`]): the left-type-variable-bound
+    /// rule consults this snapshot; `None` keeps the historical
+    /// unbounded answers (an unbound parameter defaults to `Object?`,
+    /// which subtypes nothing the earlier rules left undecided, so the
+    /// rule is inert).
+    param_facts: Option<&'a ParamFactsTable>,
     pub(crate) walk: RefCell<WalkScratch>,
     future_memo: RefCell<FxHashMap<TypeId, TypeId>>,
     type_operation_depth: Cell<u32>,
@@ -177,10 +188,24 @@ impl<'a> TypeSystem<'a> {
         Self {
             table,
             hierarchy,
+            param_facts: None,
             walk: RefCell::default(),
             future_memo: RefCell::default(),
             type_operation_depth: Cell::new(0),
         }
+    }
+
+    /// Binds the declared-bounds snapshot
+    /// ([`ParamFactsTable`](crate::ParamFactsTable)), arming the
+    /// left-type-variable-bound subtyping rule (`X0 <: T1` when
+    /// `bound(X0) <: T1`, subtype.dart:490-500 — the unpromoted face; the
+    /// promoted face is flow analysis). Bounds-aware callers — the
+    /// `type_argument_not_matching_bounds` family — construct the system
+    /// through this; every other consumer keeps the unbounded answers.
+    #[must_use]
+    pub const fn with_param_facts(mut self, facts: &'a ParamFactsTable) -> Self {
+        self.param_facts = Some(facts);
+        self
     }
 
     /// The underlying table (for interning the types being queried).
@@ -249,17 +274,23 @@ impl<'a> TypeSystem<'a> {
     }
 
     /// The bottom type: `Never` with the no-suffix projection
-    /// (`type.dart:1204`; `Never?` is interned as `Null`, so it is not bottom).
+    /// (`NeverTypeImpl.isBottom`, type.dart:1199-1200 — the question
+    /// projection is the `Null` equivalence class, not the bottom).
     #[must_use]
     pub fn is_bottom(&self, t: TypeId) -> bool {
-        matches!(self.table.get(t).kind(), TypeKind::Never)
+        let ty = self.table.get(t);
+        matches!(ty.kind(), TypeKind::Never) && !ty.is_nullable()
     }
 
-    /// Membership in the equivalence class of `Null` (`type_system.dart:1195-1213`).
-    /// `Never?` counts because it is interned as `Null` (type.dart:1207-1209).
+    /// Membership in the equivalence class of `Null` (`type_system.dart:1195-1213`):
+    /// the `Null` kind, or `Never?` — `isDartCoreNull` is true of both
+    /// (`NullTypeImpl`, type.dart:1283; `NeverTypeImpl` with the question
+    /// suffix, type.dart:1201-1204).
     #[must_use]
     pub fn is_null(&self, t: TypeId) -> bool {
-        matches!(self.table.get(t).kind(), TypeKind::Null)
+        let ty = self.table.get(t);
+        matches!(ty.kind(), TypeKind::Null)
+            || (matches!(ty.kind(), TypeKind::Never) && ty.is_nullable())
     }
 
     /// Membership in the equivalence class of `Object` with no suffix
@@ -333,6 +364,85 @@ impl<'a> TypeSystem<'a> {
         matches!(self.table.get(from).kind(), TypeKind::Dynamic)
     }
 
+    /// The analyzer's structural type equality `==` — the relation
+    /// `_isUnnecessaryCast` reads (`leftType != rightType`, the cast
+    /// necessity gate of best_practices_verifier.dart:1564-1595). This is
+    /// *not* mutual subtyping
+    /// (`isEqualTo`, type_system.dart:917-920): alpha-equivalent generic
+    /// function types are `==` without being one another's subtype ids.
+    ///
+    /// Every kind except the function type is canonical under interning,
+    /// so id equality is exact there (`FunctionTypeImpl.==`,
+    /// type.dart:219-243, is the one official `==` that relates distinct
+    /// identities: `<T>T -> T == <U>U -> U`). The function face correlates
+    /// the signatures' declared parameters positionally and compares the
+    /// renamed bodies — the official instantiates both sides with one set
+    /// of fresh variables and compares the results
+    /// (`relateTypeFormals`, type.dart:430-492; bounds are not modeled,
+    /// so the bounds-compatibility leg of the official relation is
+    /// vacuously satisfied — same declared omission as
+    /// [`Self::function_subtype`]).
+    #[must_use]
+    pub fn is_structurally_equal(&self, a: TypeId, b: TypeId) -> bool {
+        if a == b {
+            return true;
+        }
+        let (ta, tb) = (self.table.get(a), self.table.get(b));
+        if ta.is_nullable() != tb.is_nullable() {
+            return false;
+        }
+        match (ta.kind(), tb.kind()) {
+            (TypeKind::Function { signature: f }, TypeKind::Function { signature: g }) => {
+                self.function_structurally_equal(f, g)
+            }
+            _ => false,
+        }
+    }
+
+    /// The `FunctionTypeImpl.==` body (type.dart:219-243): rename `f`'s
+    /// declared parameters onto `g`'s (one shared namespace, the role the
+    /// official's fresh variables play) and compare the signatures part by
+    /// part, recursing through [`Self::is_structurally_equal`] so nested
+    /// generic function types alpha-relate too.
+    fn function_structurally_equal(&self, f: FunctionSigId, g: FunctionSigId) -> bool {
+        let f = self.table.signature(f);
+        let g = self.table.signature(g);
+        if f.type_parameters.len() != g.type_parameters.len()
+            || f.positional.len() != g.positional.len()
+            || f.named.len() != g.named.len()
+            || f.required_positional != g.required_positional
+        {
+            return false;
+        }
+        let rename = |t: TypeId| {
+            self.table
+                .substitute_rename(t, f.type_parameters, g.type_parameters)
+        };
+        if !self.is_structurally_equal(rename(f.return_type), g.return_type) {
+            return false;
+        }
+        for i in 0..f.positional.len() {
+            let fp = rename(self.table.arg(f.positional.offset() + i));
+            let gp = self.table.arg(g.positional.offset() + i);
+            if !self.is_structurally_equal(fp, gp) {
+                return false;
+            }
+        }
+        for i in 0..f.named.len() {
+            let (fi, gi) = (f.named.offset() + i, g.named.offset() + i);
+            if self.table.named_names_cmp(fi, gi) != Ordering::Equal
+                || self.table.named_required(fi) != self.table.named_required(gi)
+                || !self.is_structurally_equal(
+                    rename(self.table.named_ty(fi)),
+                    self.table.named_ty(gi),
+                )
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// `canBeSubtypeOf` (`type_system.dart:150-330`): whether an instance of
     /// `left` could possibly also be an instance of `right` — the disjointness
     /// question behind `pattern_never_matches_value_type`. Wider than
@@ -377,13 +487,14 @@ impl<'a> TypeSystem<'a> {
         let b = self.table.get(right);
 
         // If one is `Null`, then the other must be nullable
-        // (type_system.dart:164-169).
+        // (type_system.dart:164-169 — `isDartCoreNull`, which is true of
+        // both the `Null` kind and `Never?`).
         let left_nullable = !self.is_non_nullable(left);
         let right_nullable = !self.is_non_nullable(right);
-        if matches!(a.kind(), TypeKind::Null) {
+        if self.is_null(left) {
             return right_nullable;
         }
-        if matches!(b.kind(), TypeKind::Null) {
+        if self.is_null(right) {
             return left_nullable;
         }
         // If none is `Null`, but both are nullable, they match at `Null`
@@ -860,9 +971,10 @@ impl<'a> TypeSystem<'a> {
             return true;
         }
 
-        // Rule 3 Left Bottom (subtype.dart:299-301). `Never?` never reaches
-        // here — it is interned as `Null`.
-        if matches!(a.kind(), TypeKind::Never) {
+        // Rule 3 Left Bottom (subtype.dart:299-301): `Never` with the
+        // no-suffix projection only — `Never?` falls through to rule 7
+        // (Left Nullable: `Never <: T1 && Null <: T1`), the official route.
+        if matches!(a.kind(), TypeKind::Never) && !a.is_nullable() {
             return true;
         }
 
@@ -954,7 +1066,23 @@ impl<'a> TypeSystem<'a> {
             return self.interface_subtype(d0, a0, d1, a1);
         }
 
-        // Left Type Variable Bound (subtype.dart:490-500): M1 has no bounds.
+        // Left Type Variable Bound (subtype.dart:490-500, the unpromoted
+        // face): `X0 <: T1` when `X0`'s declared bound `B0 <: T1`. The
+        // bound comes from the injected facts snapshot
+        // ([`Self::with_param_facts`]); a system without one answers as an
+        // unbounded parameter — `Object?` — which no `T1` reaching here
+        // accepts. Nullable `X0?` was consumed by rule 7, whose
+        // `Null <: T1` conjunct already priced the null in. The promoted
+        // face (`X0 & S0`) is flow analysis (M2). Recursion is bounded by
+        // the shared depth cell exactly like the official's
+        // `_typeOperationDepth` (type_system.dart:372-382).
+        if let TypeKind::TypeParameter { parameter } = a.kind()
+            && let Some(facts) = self.param_facts
+            && let Some(bound) = facts.get(parameter).bound
+            && self.is_subtype(bound, t1)
+        {
+            return true;
+        }
 
         // Rule 13 Function (subtype.dart:502-510).
         if let TypeKind::Function { signature: f } = a.kind() {
@@ -1356,6 +1484,101 @@ mod tests {
             )
         };
         assert_eq!(forced, (true, false));
+    }
+
+    /// The `Never?` storage contract: its own interned shape, inside the
+    /// `Null` equivalence class for every query (`isDartCoreNull`,
+    /// type.dart:1201-1204), outside the bottom (`isBottom` consults the
+    /// suffix, type.dart:1199-1200). Subtyping routes it through rule 7
+    /// (Left Nullable: `Never <: T1 && Null <: T1`), the official path.
+    #[test]
+    fn never_question_is_null_equivalent_but_not_bottom() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let int = itf(&table, INT, &[]);
+        let int_q = table.intern(
+            UninternedType::Interface {
+                decl: INT,
+                args: Vec::new(),
+            },
+            true,
+        );
+        let null = table.intern(UninternedType::Null, false);
+        let never = table.intern(UninternedType::Never, false);
+        let never_q = table.intern(UninternedType::Never, true);
+
+        assert_ne!(never_q, null);
+        assert_ne!(never_q, never);
+        assert!(sys.is_null(never_q));
+        assert!(!sys.is_bottom(never_q));
+        assert!(sys.is_nullable(never_q));
+        assert!(!sys.is_non_nullable(never_q));
+        assert!(!sys.is_top(never_q));
+
+        assert!(sys.is_subtype(never_q, int_q));
+        assert!(!sys.is_subtype(never_q, int));
+        assert!(sys.is_subtype(null, never_q));
+        assert!(sys.is_subtype(never, never_q));
+        assert!(!sys.is_subtype(never_q, never));
+        assert!(sys.is_subtype(never_q, null));
+
+        assert!(sys.can_be_subtype_of(never_q, int_q));
+        assert!(!sys.can_be_subtype_of(never_q, int));
+        assert!(!sys.can_be_subtype_of(int, never_q));
+
+        assert_eq!(sys.least_upper_bound(never_q, int), int_q);
+    }
+
+
+    /// The left-type-variable-bound rule (subtype.dart:490-500): a type
+    /// variable satisfies a bound its declared bound satisfies — the
+    /// F-bounded `type_argument_not_matching_bounds` shape (an argument
+    /// that is itself a bounded type variable). Inert without the facts
+    /// snapshot, armed by [`TypeSystem::with_param_facts`].
+    #[test]
+    fn left_type_variable_bound_rule_uses_the_injected_facts() {
+        use crate::variance::{ParamFacts, ParamFactsTable};
+
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let num = itf(&table, NUM, &[]);
+        let string = itf(&table, STRING, &[]);
+        let (plain, bounded, f_bounded) = (
+            TypeParamId::from_raw(9),
+            TypeParamId::from_raw(10),
+            TypeParamId::from_raw(11),
+        );
+        let t_of =
+            |p: TypeParamId| table.intern(UninternedType::TypeParameter { parameter: p }, false);
+        let mut facts = ParamFactsTable::new();
+        facts.set(bounded, ParamFacts::LEGACY.with_bound(num));
+        facts.set(
+            f_bounded,
+            ParamFacts::LEGACY.with_bound(itf(&table, ITERABLE, &[t_of(f_bounded)])),
+        );
+        let bounded_sys = TypeSystem::new(&table, &hierarchy).with_param_facts(&facts);
+
+        // Without the snapshot the rule is inert: the parameter reads
+        // unbounded (`Object?`), which subtypes nothing here.
+        assert!(!sys.is_subtype(t_of(bounded), num));
+        // With it: `X extends num` gives `X <: num` — the D4 row
+        // (a bounded type variable as a type argument).
+        assert!(bounded_sys.is_subtype(t_of(bounded), num));
+        // The bound narrows but does not widen: `X <: String` still fails.
+        assert!(!bounded_sys.is_subtype(t_of(bounded), string));
+        // Unregistered parameters read unbounded either way.
+        assert!(!bounded_sys.is_subtype(t_of(plain), num));
+        // `X? <: num` keeps rule 7's `Null <: num` conjunct: false.
+        assert!(!bounded_sys.is_subtype(
+            table.intern(UninternedType::TypeParameter { parameter: bounded }, true),
+            num
+        ));
+        // F-bounded: `Y extends Iterable<Y>` gives `Y <: Iterable<Y>` —
+        // the bound's self-reference resolves through rule 12.
+        assert!(bounded_sys.is_subtype(
+            t_of(f_bounded),
+            itf(&table, ITERABLE, &[t_of(f_bounded)])
+        ));
     }
 
     /// The unregistered-declaration face: a declaration the hierarchy
@@ -1861,6 +2084,7 @@ mod can_be_subtype_tests {
             itf(&table, BOX, &[int]),
             table.intern(UninternedType::Null, false),
             table.intern(UninternedType::Never, false),
+            table.intern(UninternedType::Never, true),
             table.intern(UninternedType::Dynamic, false),
             table.intern(UninternedType::Void, false),
             table.intern(UninternedType::Invalid, false),
@@ -1887,6 +2111,12 @@ mod can_be_subtype_tests {
         let null = table.intern(UninternedType::Null, false);
         assert!(sys.is_subtype(never, null));
         assert!(!sys.can_be_subtype_of(never, null));
+        // The question projection is inside the `Null` class
+        // (`isDartCoreNull`), so both relations agree there — the corner
+        // above is the *bottom*-vs-`Null` pair only.
+        let never_q = table.intern(UninternedType::Never, true);
+        assert!(sys.is_subtype(never_q, null));
+        assert!(sys.can_be_subtype_of(never_q, null));
 
         for (i, &a) in corpus.iter().enumerate() {
             for &b in corpus.iter().skip(i) {

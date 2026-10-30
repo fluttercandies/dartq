@@ -71,21 +71,101 @@ pub enum UnresolvedKind {
     /// as `uri_has_not_been_generated` (the URI layer carries this in
     /// [`UriResolution::code`] while keeping the [`ResolvedUri::Package`]/[
     /// `ResolvedUri::File`] shape, so this variant is for upper layers).
-    /// Upper-layer-only contract: never constructed in this crate until the
-    /// file-role boundary lands (#119 lineage) — the gap is deliberate, not
-    /// an oversight.
+    /// Upper-layer-only contract: never constructed in this crate — the
+    /// code face rides [`UriResolution::code`] instead.
     Generated,
-    /// The target file exists but is a part file — decided by the
-    /// library-graph layer, which alone knows file roles; reported as
-    /// `import_of_non_library` / `export_of_non_library`. Upper-layer-only
-    /// contract: never constructed in this crate until the file-role
-    /// boundary lands (#119 lineage) — the gap is deliberate, not an
-    /// oversight.
+    /// The target file exists but is a part file; reported as
+    /// `import_of_non_library` / `export_of_non_library`. The is-part
+    /// decision is cross-file — the target's own classification — so it
+    /// belongs to the consumer over [`crate::FileRole`] (the workspace
+    /// target's role, or [`crate::SdkFileKinds`] for a `dart:` target),
+    /// never to this layer's per-directive resolution; the variant stays as
+    /// the upper-layer marker only.
     NotLibrary,
     /// The selected URI is `dart-ext:`; reported as
     /// `use_of_native_extension` (additive to the spec draft, which has no
     /// carrier for the row).
     DartExt,
+}
+
+/// The part-of role of one `dart:` SDK target file — the external half of
+/// the file-kind classification (`FileState._updateKind`,
+/// file_state.dart:928-949, decided there by parsing the file; SDK files
+/// have no [`FileId`] in dartq, so the classification is probed from
+/// content instead). The oracle-observable matrix over this face, pinned
+/// against `dart analyze` 3.13.7:
+///
+/// * no `part of` (entry files like `dart:math`, patch libraries like the
+///   `_internal` patch files) — a library: `part 'dart:math'` reports
+///   `part_of_non_part` with the `dart:` spelling; `import` stays silent;
+/// * `part of <dotted.name>;` (e.g. `dart:developer/creation_tracking.dart`,
+///   `part of dart.developer;`) — binds by library-name equality: a
+///   including library named the same attaches silently, a differently
+///   named one reports `part_of_different_library` with the two names, an
+///   unnamed one reports `part_of_unnamed_library`;
+/// * `part of '<uri>';` (e.g. `dart:async/future.dart`, `part of "dart:async"`)
+///   — binds by URI-file identity, which no workspace container can match:
+///   the include reports `part_of_different_library` with the two URIs, and
+///   an `import` reports `import_of_non_library`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SdkFileKind {
+    /// The directive prelude carries no `part of`.
+    Library,
+    /// `part of a.b.c;` — the dotted name as written.
+    NamePartOf(Box<str>),
+    /// `part of '<uri>';` — any string-literal form (quotes, raw, adjacent
+    /// concatenation all reduce to this marker: the binding target is an
+    /// SDK file, never a workspace container).
+    UriPartOf,
+}
+
+/// A session-stable cache of [`SdkFileKind`] probes keyed by the SDK file
+/// path. The probe reads the file and scans its directive prelude, so
+/// emitters asking after an external `dart:` part/import target (`fileKinds`
+/// walks, `_resolvePartDirective`-style include checks) pay the read once
+/// per SDK file per session — SDK content does not rewrite under a running
+/// analysis. Not persisted: a probe is a pure function of SDK content and
+/// the `(library, part)` spelling.
+#[derive(Debug, Default)]
+pub struct SdkFileKinds {
+    cache: FxHashMap<PathBuf, SdkFileKind>,
+}
+
+impl SdkFileKinds {
+    /// Probes (or re-reads from cache) the kind of `dart:<library>[/<part>]`.
+    /// A spelling the SDK table does not carry, or a file that cannot be
+    /// read, classifies as [`SdkFileKind::Library`] — the inert default for
+    /// a target the URI layer already coded missing, which no part-family
+    /// row reaches.
+    pub fn probe(&mut self, sdk: &SdkSnapshot, library: &str, part: &str) -> SdkFileKind {
+        let Some(path) = sdk.flat_library_to_path(library, part) else {
+            return SdkFileKind::Library;
+        };
+        if let Some(kind) = self.cache.get(&path) {
+            return kind.clone();
+        }
+        let kind = std::fs::read(&path)
+            .map(|bytes| scan_sdk_part_of(&bytes))
+            .unwrap_or(SdkFileKind::Library);
+        self.cache.insert(path, kind.clone());
+        kind
+    }
+}
+
+/// The canonical `dart:` spelling of a resolved `(library, part)` pair —
+/// `dart:async` for an entry, `dart:async/future.dart` for a sub-file. This
+/// is the `includedFile.uriStr` the oracle carries into the part-family and
+/// non-library rows of external targets (`part_of_non_part`,
+/// `part_of_different_library`, `import_of_non_library`/`export_of_non_
+/// library`), equal to the written spelling whenever the directive wrote a
+/// canonical form (the corpus shape).
+#[must_use]
+pub fn canonical_dart_uri(library: &str, part: &str) -> Box<str> {
+    if part.is_empty() {
+        format!("dart:{library}").into_boxed_str()
+    } else {
+        format!("dart:{library}/{part}").into_boxed_str()
+    }
 }
 
 /// Engine-facing projection of a [`ResolvedUri`]:
@@ -125,6 +205,14 @@ pub struct UriResolution {
 pub enum DirectiveKind {
     /// An `import` or `export` directive.
     ImportExport,
+    /// A `part of` directive. Its URI is resolved only to *bind* the part
+    /// against a library (`file_state.dart:938-953` `PartOfUriKnownFileKind`
+    /// /`PartOfUriUnknownFileKind`): a missing or unparseable target simply
+    /// leaves the part unattributed, and the oracle reports **no** URI
+    /// diagnostic for it — not `uri_does_not_exist`, not `invalid_uri`, not
+    /// `uri_with_interpolation`. The target still resolves (the part-of
+    /// graph needs it); [`UriResolution::code`] is always `None`.
+    PartOf,
     /// A documentation `@docImport` directive.
     DocImport,
 }
@@ -809,6 +897,10 @@ impl<'a> UriResolver<'a> {
         let resolution = self.resolve_uri(container, uri_str);
         match kind {
             DirectiveKind::ImportExport => resolution,
+            DirectiveKind::PartOf => UriResolution {
+                code: None,
+                ..resolution
+            },
             DirectiveKind::DocImport => UriResolution {
                 code: resolution.code.map(|code| match code {
                     ResolutionCode::UriDoesNotExist | ResolutionCode::UriHasNotBeenGenerated => {
@@ -863,6 +955,18 @@ impl<'a> UriResolver<'a> {
                 code: Some(ResolutionCode::InvalidUri),
             };
         };
+        // A fragment (even an empty `#`) makes the URI unresolvable
+        // upstream — `import 'q.dart#f'`, `part 'p.dart#f'`,
+        // `export`, `package:x/y#f`, `dart:core#f`, and `file:///x#f` all
+        // report `uri_does_not_exist` with the target's path on disk
+        // irrelevant.
+        if raw.has_fragment {
+            return UriResolution {
+                uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                target: ResolvedTarget::Missing,
+                code: Some(ResolutionCode::UriDoesNotExist),
+            };
+        }
         if !raw.scheme.is_empty() {
             let universe = self.universe_of(container);
             return self.land(compose_absolute(raw), universe);
@@ -921,21 +1025,29 @@ impl<'a> UriResolver<'a> {
                 code: Some(ResolutionCode::UseOfNativeExtension),
             },
             Composed::Dart { library, part } => {
-                // Existence is the SDK's flat face — the oracle's
+                // Library lookup is the SDK's flat face — the oracle's
                 // `libraries.dart` map, flat across all target segments
                 // (`SdkSnapshot::flat_library_to_path`); the oracle never
                 // consults platform flags or per-segment tables for `dart:`
                 // URI existence, so neither does resolution. Part paths join
-                // the same table's library path.
+                // the same table's library path — but the *file* still has
+                // to exist: `internalMapDartUri` (dart/sdk/sdk.dart:90-130)
+                // maps `dart:<lib>/<part>` to a FileSource unconditionally,
+                // and the oracle then checks `importedFile.exists`, so
+                // `dart:math/bar.dart` reports `uri_does_not_exist` even
+                // though `dart:math` is a known library.
                 match self.sdk.flat_library_to_path(&library, &part) {
-                    Some(file) => UriResolution {
-                        uri: ResolvedUri::Dart {
-                            library: library.into_owned().into_boxed_str(),
-                            file,
-                        },
-                        target: ResolvedTarget::External,
-                        code: None,
-                    },
+                    Some(file) => {
+                        let code = (!self.exists(&file)).then(|| missing_file_code(&file));
+                        UriResolution {
+                            uri: ResolvedUri::Dart {
+                                library: library.into_owned().into_boxed_str(),
+                                file,
+                            },
+                            target: ResolvedTarget::External,
+                            code,
+                        }
+                    }
                     // Unknown dart: library: source is null —
                     // `uri_does_not_exist` per the URI-layer contract.
                     None => UriResolution {
@@ -1089,9 +1201,19 @@ pub struct RawUri<'a> {
     pub scheme: Cow<'a, str>,
     /// Raw authority text (between `//` and the next `/`, `?`, `#`), `Some("")`
     /// for an empty authority as in `file:///x`.
-    pub authority: Option<&'a str>,
-    /// Raw path as written (percent-escapes intact).
+    pub authority: Option<Cow<'a, str>>,
+    /// The path in `Uri.parse` normalized form: every byte `Uri.parse`
+    /// would percent-escape is already an uppercase `%XX`, `\` is a `/`,
+    /// and escapes decode to their pchar (non-`/`) form
+    /// (`%41`→`A`, `%2f`→`%2F`). Borrowed verbatim when the source spelling
+    /// was already normalized — the overwhelmingly common shape.
     pub path: Cow<'a, str>,
+    /// Whether the URI spelled a `#fragment` (even an empty one). Directive
+    /// resolution treats a fragment as unresolvable — upstream every
+    /// fragment-carrying URI fails to map to a file (`uri_does_not_exist`
+    /// on `import 'q.dart#f'`, `export`, `part`, `dart:core#f`, and
+    /// `file:///x#f` alike).
+    pub has_fragment: bool,
 }
 
 /// Parses `uri` with Dart `Uri.tryParse` fidelity for the forms directive
@@ -1111,62 +1233,95 @@ pub fn parse_directive_uri(uri: &str) -> Result<RawUri<'_>, InvalidUriSyntax> {
     if uri.len() >= 5 && uri.as_bytes()[..5].eq_ignore_ascii_case(b"data:") {
         return parse_data_uri(uri);
     }
-    let bytes = uri.as_bytes();
+    // `Uri.parse` splits the string at the FIRST `?`/`#` before any
+    // normalization, so a `\` inside the query or fragment stays a literal
+    // (escaped to `%5C`), while a `\` in the head parses exactly like a `/`
+    // — `a\b.dart` is `a/b.dart` and `file://a\b/x` has authority `a`.
+    // Doing the same split here lets the head normalize `\`→`/` up front.
+    let head_end = uri
+        .as_bytes()
+        .iter()
+        .position(|&b| matches!(b, b'?' | b'#'))
+        .unwrap_or(uri.len());
+    // A `\`-folded head is a local String: nothing parsed out of it may
+    // borrow home, so every component materializes owned when `head_owned`
+    // and borrows `uri` (indices coincide — the fold is byte-wise 1:1).
+    let folded;
+    let (head_str, head_owned) = if uri.as_bytes()[..head_end].contains(&b'\\') {
+        folded = uri[..head_end].replace('\\', "/");
+        (folded.as_str(), true)
+    } else {
+        (&uri[..head_end], false)
+    };
+    let bytes = head_str.as_bytes();
 
-    // Scheme: `:` after a run of scheme characters; must start alphabetic
-    // ("Invalid empty scheme" / "Scheme not starting with alphabetic
-    // character" / "Illegal scheme character").
-    let mut scheme_end = 0;
-    while scheme_end < bytes.len() && is_scheme_char(bytes[scheme_end]) {
-        scheme_end += 1;
-    }
-    let (scheme, mut index) = if scheme_end < bytes.len() && bytes[scheme_end] == b':' {
-        if scheme_end == 0 || !bytes[0].is_ascii_alphabetic() {
+    // Scheme: a `:` before the first `/` makes its prefix a scheme candidate
+    // — every byte before it must satisfy the scheme grammar ("Invalid empty
+    // scheme" / "Scheme not starting with alphabetic character" / "Illegal
+    // scheme character": `a b:c`, `a%b:c`, `1a:b`, `:x` all throw upstream).
+    // A `:` reached only after a `/` (`a/b:c`) stays a path character.
+    let first_colon = bytes.iter().position(|&b| b == b':');
+    let first_slash = bytes.iter().position(|&b| b == b'/');
+    let has_scheme =
+        matches!(first_colon, Some(colon) if first_slash.is_none_or(|slash| colon < slash));
+    let (scheme, mut index) = if has_scheme {
+        let scheme_end = first_colon.expect("has_scheme implies a colon");
+        if scheme_end == 0
+            || !bytes[0].is_ascii_alphabetic()
+            || !bytes[..scheme_end].iter().all(|&b| is_scheme_char(b))
+        {
             return Err(InvalidUriSyntax);
         }
-        (lowered_scheme(&uri[..scheme_end]), scheme_end + 1)
+        // The folded head is a local: slice `uri` (the fold is byte-wise
+        // 1:1, so the indices coincide) for the borrowed shape.
+        let scheme = if head_owned {
+            Cow::Owned(head_str[..scheme_end].to_ascii_lowercase())
+        } else {
+            lowered_scheme(&uri[..scheme_end])
+        };
+        (scheme, scheme_end + 1)
     } else {
         (Cow::Borrowed(""), 0)
     };
 
-    // Authority: everything after `//` up to the next path/query/fragment
-    // delimiter.
+    // Authority: everything after `//` up to the next `/` (the head was
+    // already `\`-folded, so `\` can no longer appear inside it). The only
+    // rejection `Uri.parse` keeps is a malformed `[` IPv6 literal — every
+    // other byte, spaces and broken `%` escapes included, normalizes to
+    // escapes rather than throwing (`file://a%zz/` parses).
     let mut authority = None;
     if bytes.len() >= index + 2 && bytes[index] == b'/' && bytes[index + 1] == b'/' {
         let start = index + 2;
         let end = bytes[start..]
             .iter()
-            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .position(|&b| b == b'/')
             .map_or(bytes.len(), |offset| start + offset);
-        validate_authority(&uri[start..end])?;
-        authority = Some(&uri[start..end]);
+        validate_authority_shape(&head_str[start..end])?;
+        authority = Some(if head_owned {
+            Cow::Owned(head_str[start..end].to_owned())
+        } else {
+            Cow::Borrowed(&uri[start..end])
+        });
         index = end;
     }
 
-    // Path, then query, then fragment — each validated with its own table.
-    let path_end = bytes[index..]
-        .iter()
-        .position(|&b| matches!(b, b'?' | b'#'))
-        .map_or(bytes.len(), |offset| index + offset);
-    validate_component(&uri[index..path_end], PathOrQuery::Path)?;
-    let mut rest = path_end;
-    if rest < bytes.len() && bytes[rest] == b'?' {
-        rest += 1;
-        let query_end = bytes[rest..]
-            .iter()
-            .position(|&b| b == b'#')
-            .map_or(bytes.len(), |offset| rest + offset);
-        validate_component(&uri[rest..query_end], PathOrQuery::Query)?;
-        rest = query_end;
-    }
-    if rest < bytes.len() {
-        validate_component(&uri[rest + 1..], PathOrQuery::Query)?;
-    }
+    // Same slicing rule as the scheme: normalize the folded head when it is
+    // a local, `uri` when it is not (indices coincide).
+    let path = if head_owned {
+        Cow::Owned(normalize_component(&head_str[index..]).into_owned())
+    } else {
+        normalize_component(&uri[index..head_end])
+    };
+    // A fragment (even an empty `#`) makes the whole URI unresolvable
+    // upstream; the query never participates in file-target resolution.
+    let tail = &uri[head_end..];
+    let has_fragment = tail.contains('#');
 
     Ok(RawUri {
         scheme,
         authority,
-        path: Cow::Borrowed(&uri[index..path_end]),
+        path,
+        has_fragment,
     })
 }
 
@@ -1233,14 +1388,17 @@ fn parse_data_uri(uri: &str) -> Result<RawUri<'_>, InvalidUriSyntax> {
         scheme: lowered_scheme(&uri[..4]),
         authority: None,
         path: Cow::Borrowed(&uri[5..]),
+        // `UriData._parse` swallows everything after the `,` — a `#` is
+        // data, never a fragment delimiter.
+        has_fragment: false,
     })
 }
 
 /// Splits a raw path at its first `/` — the library/part pair of a `dart:`
 /// URI and the package/rel pair of a `package:` URI. A borrowed path (the
-/// only kind [`parse_directive_uri`] produces) splits into borrowed slices;
-/// the owned variant, constructible only outside the parse, is re-spliced
-/// owned so the helper is total over the public type.
+/// common shape out of [`parse_directive_uri`]) splits into borrowed slices;
+/// the owned variant (a path the parse normalized) is re-spliced owned so
+/// the helper is total over the public type.
 fn split_path_cow(path: Cow<'_, str>) -> (Cow<'_, str>, Cow<'_, str>) {
     match path {
         Cow::Borrowed(path) => match path.split_once('/') {
@@ -1307,12 +1465,44 @@ fn is_normalized_base64(bytes: &[u8]) -> bool {
     }
 }
 
-/// Path vs query/fragment character tables (`_pathCharOrSlashMask` vs
-/// `_queryCharMask`): the query table adds `?`, and fragments share it.
-#[derive(Clone, Copy)]
-enum PathOrQuery {
-    Path,
-    Query,
+/// The path character table (`_pathCharOrSlashMask`): pchar + `/`.
+/// `Uri.parse` never rejects a byte outside the table — it percent-escapes
+/// it — so the table decides *spelling*, not validity. Query/fragment text
+/// never reaches file resolution, so only the path table is needed.
+
+/// Whether `b` is legal in a path under `_pathCharOrSlashMask`
+/// (pchar + `/`); the authority table adds `:`/`@`, and the query table adds
+/// `?` on top of that — neither is needed here since the authority keeps its
+/// raw spelling and query/fragment text never reaches file resolution.
+fn is_path_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'/' | b':'
+                | b'@'
+                | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+        )
+}
+
+/// Whether `b` is RFC 3986 unreserved — the only class `Uri.parse` decodes
+/// a `%XX` escape to in the path (`%41`→`A`, `%2D`→`-`, but `%2F`/`%3A`
+////`%20` stay escapes).
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
 }
 
 fn is_scheme_char(b: u8) -> bool {
@@ -1331,92 +1521,124 @@ fn lowered_scheme(slice: &str) -> Cow<'_, str> {
     }
 }
 
-fn validate_component(text: &str, component: PathOrQuery) -> Result<(), InvalidUriSyntax> {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let b = bytes[index];
-        match b {
-            b'%' => {
-                let hex = bytes.get(index + 1..index + 3).ok_or(InvalidUriSyntax)?;
-                if !hex.iter().all(u8::is_ascii_hexdigit) {
-                    return Err(InvalidUriSyntax);
+/// `Uri.parse`'s lenient normalization of one component (`_normalize` +
+/// `_normalizeEscape`): never rejects — everything outside the component's
+/// table percent-encodes — and never decodes except an escape that names an
+/// unreserved byte. Bytes:
+///
+/// - legal per the table: verbatim;
+/// - `%XX` well-formed: unreserved decoded (`%41`→`A`), everything else
+///   re-spelled as uppercase `%XX` (`%2f`→`%2F`);
+/// - `%` not starting a valid escape: `%25` (`a%zz`→`a%25zz`);
+/// - non-table ASCII (space, `<`, `[`, `"`, `|`, `{`, `}`, `^`, `` ` ``):
+///   `%XX`;
+/// - non-ASCII: each UTF-8 byte `%XX` (`ü`→`%C3%BC`).
+///
+/// `\` never reaches here — the head folded it to `/` before scanning
+/// (a `\` inside the query/fragment escapes to `%5C`, which this would
+/// produce too if `Uri.parse` ever saw it here). Borrows `text` verbatim
+/// when it is already normalized — the overwhelmingly common shape.
+fn normalize_component(text: &str) -> Cow<'_, str> {
+    fn needs_normalization(bytes: &[u8]) -> bool {
+        let mut index = 0;
+        while index < bytes.len() {
+            let b = bytes[index];
+            if b == b'%' {
+                match bytes.get(index + 1..index + 3) {
+                    Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => {
+                        let value = (hex[0] as char).to_digit(16).unwrap() as u8 * 16
+                            + (hex[1] as char).to_digit(16).unwrap() as u8;
+                        if is_unreserved(value)
+                            || !hex[0].is_ascii_uppercase()
+                            || !hex[1].is_ascii_uppercase()
+                        {
+                            return true;
+                        }
+                    }
+                    _ => return true,
                 }
                 index += 3;
-            }
-            _ if b < 0x80 => {
-                let allowed = match component {
-                    PathOrQuery::Path => {
-                        matches!(
-                            b,
-                            b'/' | b':'
-                                | b'@'
-                                | b'-'
-                                | b'.'
-                                | b'_'
-                                | b'~'
-                                | b'!'
-                                | b'$'
-                                | b'&'
-                                | b'\''
-                                | b'('
-                                | b')'
-                                | b'*'
-                                | b'+'
-                                | b','
-                                | b';'
-                                | b'='
-                        ) || b.is_ascii_alphanumeric()
-                    }
-                    PathOrQuery::Query => {
-                        matches!(b, b'/' | b'?')
-                            || matches!(
-                                b,
-                                b':' | b'@'
-                                    | b'-'
-                                    | b'.'
-                                    | b'_'
-                                    | b'~'
-                                    | b'!'
-                                    | b'$'
-                                    | b'&'
-                                    | b'\''
-                                    | b'('
-                                    | b')'
-                                    | b'*'
-                                    | b'+'
-                                    | b','
-                                    | b';'
-                                    | b'='
-                            )
-                            || b.is_ascii_alphanumeric()
-                    }
-                };
-                if !allowed {
-                    return Err(InvalidUriSyntax);
+            } else {
+                if b >= 0x80 || !is_path_char(b) {
+                    return true;
                 }
                 index += 1;
             }
-            // Non-ASCII: accepted, as in Dart (normalized to escapes there).
-            _ => index += 1,
+        }
+        false
+    }
+    if !needs_normalization(text.as_bytes()) {
+        return Cow::Borrowed(text);
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let b = bytes[index];
+        if b == b'%' {
+            match bytes.get(index + 1..index + 3) {
+                Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => {
+                    let value = (hex[0] as char).to_digit(16).unwrap() as u8 * 16
+                        + (hex[1] as char).to_digit(16).unwrap() as u8;
+                    if is_unreserved(value) {
+                        out.push(value);
+                    } else {
+                        out.extend_from_slice(&[
+                            b'%',
+                            hex[0].to_ascii_uppercase(),
+                            hex[1].to_ascii_uppercase(),
+                        ]);
+                    }
+                    index += 3;
+                }
+                // Bad escape: `%` alone becomes `%25`, the tail rescans.
+                _ => {
+                    out.extend_from_slice(b"%25");
+                    index += 1;
+                }
+            }
+        } else if b < 0x80 && is_path_char(b) {
+            out.push(b);
+            index += 1;
+        } else {
+            // Non-table ASCII or non-ASCII UTF-8 byte: percent-encode.
+            out.extend_from_slice(&[b'%', HEX[(b >> 4) as usize], HEX[(b & 0xF) as usize]]);
+            index += 1;
         }
     }
-    Ok(())
+    // Every byte pushed is ASCII (`%`, hex digits, table chars, decoded
+    // unreserved), so the normalized form is UTF-8 by construction.
+    Cow::Owned(String::from_utf8(out).expect("normalized bytes are ASCII"))
 }
 
-/// Authority shape: optional IPv6 `[...]` host (with optional `:port`), else
-/// reg-name/userinfo characters (`_regNameMask`/`_userinfoMask` plus the `@`
-/// and port `:` delimiters).
-fn validate_authority(text: &str) -> Result<(), InvalidUriSyntax> {
+/// The only authority shapes `Uri.parse` still rejects: an authority
+/// beginning `[` must close as an IPv6 literal (`[hex:colons.dots]` plus an
+/// optional `:port`, nothing else after `]`), and a bare `]` — leading or
+/// mid-authority — is a `FormatException` (`file://]/x`, `file://a]/x`,
+/// `file://[::1]x/` all throw). Every other byte — spaces, broken `%`
+/// escapes, `:`/`@` delimiters — normalizes rather than throwing
+/// (`file://a%zz/` and `file://ho st/` both parse), so no character table
+/// applies here. The authority's text is never consulted for file targets
+/// (`file://host/x` drops it, `package://x/` is unresolvable regardless),
+/// so there is nothing else to validate.
+fn validate_authority_shape(text: &str) -> Result<(), InvalidUriSyntax> {
     let bytes = text.as_bytes();
     if bytes.first() == Some(&b'[') {
         let close = bytes
             .iter()
             .position(|&b| b == b']')
             .ok_or(InvalidUriSyntax)?;
-        if !bytes[1..close]
-            .iter()
-            .all(|&b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        // Empty literal (`[]`) throws; a literal without a `:` is no IPv6
+        // address either (`[x]`, `[ab]`, `[1.2.3.4]` — upstream rejects all
+        // as too-short/invalid IPv6). Full IPv6 grammar is unnecessary: the
+        // authority text never participates in file resolution.
+        let literal = &bytes[1..close];
+        if literal.is_empty()
+            || !literal.contains(&b':')
+            || !literal
+                .iter()
+                .all(|&b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
         {
             return Err(InvalidUriSyntax);
         }
@@ -1426,47 +1648,8 @@ fn validate_authority(text: &str) -> Result<(), InvalidUriSyntax> {
         }
         return Ok(());
     }
-    // Reg-name/userinfo characters (`_regNameMask`/`_userinfoMask` plus the
-    // `@` and port `:` delimiters), with percent escapes validated as 2-hex —
-    // Dart `Uri.parse` checks escape well-formedness in every component, so
-    // `file://a%zz/` throws (`invalid_uri` per `file_state.dart:445-451`).
-    let mut index = 0;
-    while index < bytes.len() {
-        let b = bytes[index];
-        let allowed = b >= 0x80
-            || b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-                    | b':'
-                    | b'@'
-                    | b'%'
-            );
-        if !allowed {
-            return Err(InvalidUriSyntax);
-        }
-        if b == b'%' {
-            let hex = bytes.get(index + 1..index + 3).ok_or(InvalidUriSyntax)?;
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return Err(InvalidUriSyntax);
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
+    if bytes.contains(&b'[') || bytes.contains(&b']') {
+        return Err(InvalidUriSyntax);
     }
     Ok(())
 }
@@ -1537,6 +1720,7 @@ fn compose_relative<'a>(base: &BaseUri, reference: RawUri<'a>) -> Composed<'a> {
                 scheme: Cow::Borrowed("file"),
                 authority: Some(authority),
                 path: reference.path,
+                has_fragment: false,
             }),
             BaseUri::Package { .. } => Composed::Other,
         };
@@ -1570,6 +1754,245 @@ fn compose_relative<'a>(base: &BaseUri, reference: RawUri<'a>) -> Composed<'a> {
             path,
             &reference.path,
         )))),
+    }
+}
+
+/// Scans one SDK file's directive prelude for its `part of` form — the
+/// content probe behind [`SdkFileKinds::probe`]. The prelude is the same
+/// region the grammar allows directives in: whitespace and comments, `@`
+/// annotations, then `library`/`import`/`export`/`part` keywords, each
+/// ending at its `;`. The first token outside that set is a declaration and
+/// ends the prelude (a library by then). The scanner is byte-level and
+/// string-aware (`;` inside a URI literal never terminates a directive);
+/// every shape the 3.13.7 SDK tree actually uses — plain and raw strings,
+/// single and double quotes, dotted names, license headers — classifies
+/// exactly as `FileState._updateKind` would over the parsed unit.
+fn scan_sdk_part_of(bytes: &[u8]) -> SdkFileKind {
+    let mut scan = Scan { bytes, at: 0 };
+    loop {
+        scan.skip_trivia();
+        let Some(word) = scan.word() else {
+            // `@` annotation (metadata precedes a directive) or the prelude's
+            // end: a declaration keyword, an identifier, any other token.
+            if scan.peek() == Some(b'@') {
+                scan.skip_annotation();
+                continue;
+            }
+            return SdkFileKind::Library;
+        };
+        match word.as_str() {
+            // A `library` directive classifies the file as a library outright
+            // (`_updateKind`'s first branch) — nothing later can change it.
+            "library" => return SdkFileKind::Library,
+            "import" | "export" | "part" => {
+                if word == "part" {
+                    scan.skip_trivia();
+                    if scan.peek_word_is(b"of") {
+                        scan.at += 2;
+                        return scan.part_of_payload();
+                    }
+                }
+                scan.skip_to_semicolon();
+            }
+            _ => return SdkFileKind::Library,
+        }
+    }
+}
+
+/// The shared cursor of [`scan_sdk_part_of`].
+struct Scan<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+impl<'b> Scan<'b> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
+    }
+
+    /// Reads an identifier (`[a-zA-Z_$][a-zA-Z0-9_$]*`), advancing past it;
+    /// `None` leaves the cursor untouched for the caller's byte dispatch.
+    fn word(&mut self) -> Option<String> {
+        let first = self.bytes.get(self.at).copied()?;
+        if !first.is_ascii_alphabetic() && first != b'_' && first != b'$' {
+            return None;
+        }
+        let start = self.at;
+        self.at += 1;
+        while let Some(&byte) = self.bytes.get(self.at) {
+            if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&self.bytes[start..self.at]).into_owned())
+    }
+
+    /// Whether the cursor sits on the exact word `word` (a word-boundary
+    /// check, no consumption on a miss).
+    fn peek_word_is(&self, word: &[u8]) -> bool {
+        self.bytes[self.at..].starts_with(word)
+            && !self
+                .bytes
+                .get(self.at + word.len())
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_' || *next == b'$')
+    }
+
+    /// Skips whitespace and both comment forms (block comments do not nest).
+    fn skip_trivia(&mut self) {
+        loop {
+            match self.peek() {
+                Some(byte) if byte.is_ascii_whitespace() => self.at += 1,
+                Some(b'/') if self.bytes.get(self.at + 1) == Some(&b'/') => {
+                    self.at += 2;
+                    while self.peek().is_some_and(|byte| byte != b'\n') {
+                        self.at += 1;
+                    }
+                }
+                Some(b'/') if self.bytes.get(self.at + 1) == Some(&b'*') => {
+                    self.at += 2;
+                    while self.peek().is_some() {
+                        if self.bytes[self.at..].starts_with(b"*/") {
+                            self.at += 2;
+                            break;
+                        }
+                        self.at += 1;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Skips one string literal (raw or plain, either quote) — escape-aware
+    /// for plain forms (`\$` never closes), backslash-inert for raw forms.
+    /// A lone `r` not before a quote is not a raw prefix and is left in
+    /// place (the caller's byte loop resumes from it).
+    fn skip_string(&mut self) {
+        let mut raw = false;
+        if self.peek() == Some(b'r')
+            && matches!(self.bytes.get(self.at + 1), Some(b'\'') | Some(b'"'))
+        {
+            raw = true;
+            self.at += 1;
+        }
+        let Some(quote) = self.peek() else { return };
+        if quote != b'\'' && quote != b'"' {
+            return;
+        }
+        self.at += 1;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'\\' if !raw => self.at = (self.at + 2).min(self.bytes.len()),
+                byte if byte == quote => {
+                    self.at += 1;
+                    return;
+                }
+                _ => self.at += 1,
+            }
+        }
+    }
+
+    /// Skips a directive's tail up to its `;`, string- and comment-aware.
+    fn skip_to_semicolon(&mut self) {
+        loop {
+            match self.peek() {
+                None | Some(b';') => {
+                    if self.peek().is_some() {
+                        self.at += 1;
+                    }
+                    return;
+                }
+                Some(b'/') if self.bytes.get(self.at + 1) == Some(&b'/') => self.skip_trivia(),
+                Some(b'/') if self.bytes.get(self.at + 1) == Some(&b'*') => self.skip_trivia(),
+                _ if self.at_string() => self.skip_string(),
+                _ => self.at += 1,
+            }
+        }
+    }
+
+    /// Skips `@` metadata: `@` qualified-name `[argument-list]` — trivia
+    /// allowed at each junction, the parens balanced with string awareness.
+    fn skip_annotation(&mut self) {
+        self.at += 1; // `@`
+        self.skip_trivia();
+        while self.word().is_some() {
+            if self.peek() != Some(b'.') {
+                break;
+            }
+            self.at += 1;
+            self.skip_trivia();
+        }
+        self.skip_trivia();
+        if self.peek() == Some(b'(') {
+            let mut depth = 0usize;
+            loop {
+                match self.peek() {
+                    None => return,
+                    Some(b'(') => {
+                        depth += 1;
+                        self.at += 1;
+                    }
+                    Some(b')') => {
+                        depth -= 1;
+                        self.at += 1;
+                        if depth == 0 {
+                            return;
+                        }
+                    }
+                    _ if self.at_string() => self.skip_string(),
+                    _ => self.at += 1,
+                }
+            }
+        }
+    }
+
+    /// The payload after `part of`: string literal(s) (raw, either quote,
+    /// adjacent concatenation) are the URI form; a dotted name is the name
+    /// form with its written spelling; anything else is a malformed part-of
+    /// the probe declines to honor (the file classifies as a library — the
+    /// part-family rows then behave as they would for a parse that never
+    /// produced a well-formed part-of directive).
+    fn part_of_payload(&mut self) -> SdkFileKind {
+        self.skip_trivia();
+        if self.at_string() {
+            while {
+                self.skip_trivia();
+                self.at_string()
+            } {
+                self.skip_string();
+            }
+            return SdkFileKind::UriPartOf;
+        }
+        match self.peek() {
+            Some(first) if first.is_ascii_alphabetic() || first == b'_' || first == b'$' => {
+                let mut name = self.word().expect("peeked an identifier head");
+                while self.peek() == Some(b'.') {
+                    self.at += 1;
+                    self.skip_trivia();
+                    match self.word() {
+                        Some(component) => {
+                            name.push('.');
+                            name.push_str(&component);
+                        }
+                        None => return SdkFileKind::Library,
+                    }
+                }
+                SdkFileKind::NamePartOf(name.into_boxed_str())
+            }
+            _ => SdkFileKind::Library,
+        }
+    }
+
+    /// Whether the cursor sits on a string literal (a quote, or `r` directly
+    /// before one).
+    fn at_string(&self) -> bool {
+        match self.peek() {
+            Some(b'\'') | Some(b'"') => true,
+            Some(b'r') => matches!(self.bytes.get(self.at + 1), Some(b'\'') | Some(b'"')),
+            _ => false,
+        }
     }
 }
 
@@ -1725,8 +2148,9 @@ mod tests {
         assert_eq!(dart.scheme.as_ref(), "dart");
 
         let file = parse_directive_uri("file:///tmp/x.dart").expect("file");
-        assert_eq!(file.authority, Some(""));
+        assert_eq!(file.authority.as_deref(), Some(""));
         assert_eq!(file.path.as_ref(), "/tmp/x.dart");
+        assert!(!file.has_fragment);
 
         let data = parse_directive_uri("data:text/plain,main(){}").expect("data");
         assert_eq!(data.scheme.as_ref(), "data");
@@ -1739,46 +2163,84 @@ mod tests {
         assert_eq!(upper.scheme.as_ref(), "package");
         let query = parse_directive_uri("a.dart?x=1#frag").expect("query");
         assert_eq!(query.path.as_ref(), "a.dart");
+        assert!(query.has_fragment);
         let escaped = parse_directive_uri("my%20lib/a.dart").expect("escaped");
         assert_eq!(escaped.path.as_ref(), "my%20lib/a.dart");
     }
 
+    /// `Uri.parse` rejects only the scheme grammar and malformed `[` IPv6
+    /// authorities — everything else *normalizes*: spaces, delimiters, and
+    /// broken `%` escapes become escapes rather than throwing (upstream pin:
+    /// `my file.dart` resolves `lib/my file.dart`, `a%zz`→`a%25zz`→file
+    /// `a%zz`, `a\b`→`a/b`).
     #[test]
-    fn rejects_uri_syntax_dart_rejects() {
+    fn rejects_only_what_uri_parse_throws_on() {
         // Empty scheme / non-alphabetic scheme start / illegal scheme char.
-        assert!(parse_directive_uri("::x").is_err());
-        assert!(parse_directive_uri("1a:b").is_err());
-        assert!(parse_directive_uri("a b:c").is_err());
-        // Space and general delimiters are not path characters.
-        assert!(parse_directive_uri("a b.dart").is_err());
-        assert!(parse_directive_uri("a<b.dart").is_err());
-        assert!(parse_directive_uri("a\\b.dart").is_err());
-        assert!(parse_directive_uri("a^b.dart").is_err());
-        assert!(parse_directive_uri("a`b.dart").is_err());
-        assert!(parse_directive_uri("a{b}.dart").is_err());
-        assert!(parse_directive_uri("a[b].dart").is_err());
-        // Broken percent escapes.
-        assert!(parse_directive_uri("a%zz.dart").is_err());
-        assert!(parse_directive_uri("a%.dart").is_err());
-        assert!(parse_directive_uri("a%2").is_err());
-        // …including inside an authority: Dart Uri.parse validates escapes in
-        // every component (`file://a%zz/` throws → invalid_uri).
-        assert!(parse_directive_uri("file://a%zz/x.dart").is_err());
-        assert!(parse_directive_uri("file://a%2/host.dart").is_err());
-        // Well-formed authority escapes still parse.
-        assert!(parse_directive_uri("file://a%2f/x.dart").is_ok());
-        // Authority shapes.
-        assert!(parse_directive_uri("file://ho[st]/x.dart").is_err());
-        assert!(parse_directive_uri("package://[::1/x.dart").is_err());
+        // A `:` before the first `/` validates its whole prefix as a scheme —
+        // `a%b:c` throws too (upstream pins: `a%b:c`, `a b:c`, `:x`, `1a:b`,
+        // `::x` all FormatException).
+        for uri in ["::x", ":x", "1a:b", "0a:c", "a b:c", "a%b:c", "a b.c:d"] {
+            assert!(parse_directive_uri(uri).is_err(), "{uri}");
+        }
+        // Malformed IPv6 authority shapes (and a stray `]` or `[`).
+        for uri in [
+            "file://ho[st]/x.dart",
+            "package://[::1/x.dart",
+            "file://]/x.dart",
+            "file://a]/x.dart",
+            "file://[x]/y.dart",
+            "file://[::1]x/y.dart",
+            "file://[]/x.dart",
+        ] {
+            assert!(parse_directive_uri(uri).is_err(), "{uri}");
+        }
+    }
+
+    /// `Uri.parse`'s lenient path normalization: non-table bytes escape,
+    /// `\` folds to `/`, a `%` not starting an escape becomes `%25`, and an
+    /// escape decoding to an unreserved byte decodes (everything else keeps
+    /// its escape, uppercased).
+    #[test]
+    fn parse_normalizes_path_like_uri_parse() {
+        let cases: [(&str, &str); 12] = [
+            ("my file.dart", "my%20file.dart"),
+            ("a<b.dart", "a%3Cb.dart"),
+            ("a^b.dart", "a%5Eb.dart"),
+            ("a`b.dart", "a%60b.dart"),
+            ("a{b}.dart", "a%7Bb%7D.dart"),
+            ("a[b].dart", "a%5Bb%5D.dart"),
+            ("a\\b.dart", "a/b.dart"),
+            ("a%zz.dart", "a%25zz.dart"),
+            ("a%.dart", "a%25.dart"),
+            ("a%2", "a%252"),
+            ("a%41b.dart", "aAb.dart"),
+            ("a%2fb.dart", "a%2Fb.dart"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_directive_uri(input).expect(input).path.as_ref(),
+                expected,
+                "{input}"
+            );
+        }
+        // Lenient authority: escapes and spaces normalize instead of
+        // throwing (`file://a%zz/` parses upstream too).
+        assert!(parse_directive_uri("file://a%zz/x.dart").is_ok());
+        assert!(parse_directive_uri("file://ho st/x.dart").is_ok());
+        // A `:` before any `/` is a scheme position; after a `/` it is a
+        // path char (`a/b:c` stays relative).
+        let nested = parse_directive_uri("a/b:c").expect("colon path");
+        assert_eq!(nested.scheme.as_ref(), "");
+        assert_eq!(nested.path.as_ref(), "a/b:c");
     }
 
     #[test]
     fn host_and_empty_authority_are_kept_for_dispatch() {
         let hosted = parse_directive_uri("package://host/a.dart").expect("hosted");
-        assert_eq!(hosted.authority, Some("host"));
+        assert_eq!(hosted.authority.as_deref(), Some("host"));
         assert_eq!(hosted.path.as_ref(), "/a.dart");
         let empty = parse_directive_uri("package:///a.dart").expect("empty");
-        assert_eq!(empty.authority, Some(""));
+        assert_eq!(empty.authority.as_deref(), Some(""));
         assert_eq!(empty.path.as_ref(), "/a.dart");
     }
 
@@ -1838,6 +2300,12 @@ mod tests {
             write("pkg_a/lib/..foo/x.dart", "// fixture\n");
             write("app/lib/main.dart", "// fixture\n");
             write("app/lib/util.dart", "// fixture\n");
+            // A literal space in the file name: `Uri.parse` escapes the raw
+            // spelling `'my file.dart'` to `my%20file.dart`, which decodes
+            // back to this file — the lenient parse lands it.
+            write("app/lib/my file.dart", "// fixture\n");
+            write("app/lib/a%zz.dart", "// fixture\n");
+            write("app/lib/a/b.dart", "// fixture\n");
             write("app/bin/tool.dart", "// fixture\n");
             write("hosted/lib/h.dart", "// fixture\n");
             write(
@@ -1907,6 +2375,34 @@ mod tests {
                 ALLOWED_EXPERIMENTS_JSON,
             );
             write("lib/core/core.dart", "library core;");
+            write("lib/core/bool.dart", "part of core;");
+            // The probe fixture set: every part-of shape the 3.13.7 SDK tree
+            // uses, plus the library-shaped sub-files (patch libraries) and
+            // the malformed tail.
+            write(
+                "lib/core/int.dart",
+                "// License header.\n\npart of \"dart:core\";\n",
+            );
+            write(
+                "lib/core/raw.dart",
+                "// License.\nimport 'dart:core';\n\npart of r'dart:core';\n",
+            );
+            write(
+                "lib/core/adjacent.dart",
+                "part of 'dart:' 'core';\n",
+            );
+            write(
+                "lib/io/patch.dart",
+                "// Patch file for dart:io.\n\nimport 'dart:async';\n\nvoid f() {}\n",
+            );
+            write(
+                "lib/io/broken.dart",
+                "// Malformed: the probe declines to honor a part-of with no\n// payload.\npart of ;\n",
+            );
+            write(
+                "lib/io/annotated.dart",
+                "@ pragma('vm:entry-point')\npart of io;\n",
+            );
             write("lib/io/io.dart", "library io;");
             Self { root }
         }
@@ -2341,11 +2837,16 @@ mod tests {
         assert_eq!(library.as_ref(), "core");
         assert_eq!(file, fixture.sdk.root.join("lib/core/bool.dart"));
         assert_eq!(part.target, ResolvedTarget::External);
+        assert_eq!(part.code, None);
 
         // Existence is the SDK's flat face, not the vm segment's table: the
         // synthetic SDK lists only core/io on `vm`, and `dart:mirrors`
-        // still resolves through the generated flat table (metadata-level
-        // resolution — the path need not exist on disk).
+        // still resolves through the generated flat table — but the mapped
+        // file must exist on disk, exactly as the oracle's
+        // `importedFile.exists` check requires (`dart:math/bar.dart`
+        // upstream pin). The fixture SDK ships no mirrors file, so the
+        // library name resolves while the diagnostic carries the
+        // missing-ness.
         let mirrors =
             resolver.resolve(container, Some("dart:mirrors"), DirectiveKind::ImportExport);
         assert_eq!(
@@ -2356,6 +2857,28 @@ mod tests {
             }
         );
         assert_eq!(mirrors.target, ResolvedTarget::External);
+        assert_eq!(code_of(&mirrors), ResolutionCode::UriDoesNotExist);
+
+        // A known library with a missing part file — `dart:io/nope.dart` —
+        // codes the same way; a generated suffix carries the
+        // hasn't-been-generated code (the same `isGenerated` suffix table,
+        // file_paths.dart:89-105).
+        let missing_part = resolver.resolve(
+            container,
+            Some("dart:io/nope.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(code_of(&missing_part), ResolutionCode::UriDoesNotExist);
+        assert_eq!(missing_part.target, ResolvedTarget::External);
+        let generated_part = resolver.resolve(
+            container,
+            Some("dart:io/nope.g.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            code_of(&generated_part),
+            ResolutionCode::UriHasNotBeenGenerated
+        );
 
         // `web_sql` is on disk in the SDK tree but tabulated by neither the
         // oracle's flat table nor dartq's: source null —
@@ -2368,6 +2891,79 @@ mod tests {
         );
         assert_eq!(code_of(&unknown), ResolutionCode::UriDoesNotExist);
         assert_eq!(unknown.target, ResolvedTarget::Missing);
+    }
+
+    /// The external kind probe over the shapes the 3.13.7 SDK tree uses
+    /// (`FileState._updateKind` decided from content, pinned against
+    /// `dart analyze` 3.13.7: `dart:math` is a library, `dart:async/
+    /// future.dart` is `part of "dart:async"`, `dart:developer/
+    /// creation_tracking.dart` is `part of dart.developer;`). The scanner
+    /// pins: license comments, an import before the part-of, plain/raw/
+    /// adjacent strings, dotted names, annotations, patch-shaped sub-files
+    /// with no part-of, malformed payloads, and the flat-table miss.
+    #[test]
+    fn sdk_file_kinds_probe_the_part_of_form() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.sdk.load();
+        let mut probe = SdkFileKinds::default();
+        // Entry libraries.
+        assert_eq!(probe.probe(&snapshot, "core", ""), SdkFileKind::Library);
+        assert_eq!(probe.probe(&snapshot, "io", ""), SdkFileKind::Library);
+        // Name-form part (single component, as `lib/core/bool.dart`).
+        assert_eq!(
+            probe.probe(&snapshot, "core", "bool.dart"),
+            SdkFileKind::NamePartOf("core".into())
+        );
+        // URI form: plain double-quoted behind a license header.
+        assert_eq!(
+            probe.probe(&snapshot, "core", "int.dart"),
+            SdkFileKind::UriPartOf
+        );
+        // URI form: raw string behind an import directive.
+        assert_eq!(
+            probe.probe(&snapshot, "core", "raw.dart"),
+            SdkFileKind::UriPartOf
+        );
+        // URI form: adjacent string concatenation.
+        assert_eq!(
+            probe.probe(&snapshot, "core", "adjacent.dart"),
+            SdkFileKind::UriPartOf
+        );
+        // A patch-shaped sub-file: imports and declarations, no part-of —
+        // a library, the part_of_non_part face of external includes.
+        assert_eq!(
+            probe.probe(&snapshot, "io", "patch.dart"),
+            SdkFileKind::Library
+        );
+        // A malformed part-of payload declines to a library.
+        assert_eq!(
+            probe.probe(&snapshot, "io", "broken.dart"),
+            SdkFileKind::Library
+        );
+        // Annotation metadata before the directive.
+        assert_eq!(
+            probe.probe(&snapshot, "io", "annotated.dart"),
+            SdkFileKind::NamePartOf("io".into())
+        );
+        // A name outside the flat table and a file that does not exist:
+        // the inert library default (the URI layer already coded the
+        // target missing).
+        assert_eq!(probe.probe(&snapshot, "web_sql", ""), SdkFileKind::Library);
+        assert_eq!(
+            probe.probe(&snapshot, "io", "nope.dart"),
+            SdkFileKind::Library
+        );
+    }
+
+    /// The canonical `dart:` spelling — the `includedFile.uriStr` the
+    /// oracle carries into the external part-family rows.
+    #[test]
+    fn canonical_dart_uri_spells_library_and_part() {
+        assert_eq!(canonical_dart_uri("math", "").as_ref(), "dart:math");
+        assert_eq!(
+            canonical_dart_uri("async", "future.dart").as_ref(),
+            "dart:async/future.dart"
+        );
     }
 
     #[test]
@@ -2511,11 +3107,25 @@ mod tests {
         assert_eq!(code_of(&bad), ResolutionCode::InvalidUri);
         assert_eq!(bad.target, ResolvedTarget::Missing);
 
-        // A broken escape inside an authority: Dart Uri.parse throws, so the
-        // oracle reports invalid_uri (file_state.dart:445-451).
-        let bad_authority = resolver.resolve(
+        // A broken escape inside an authority no longer throws: `Uri.parse`
+        // normalizes it to `%25` (`file://a%zz/` parses upstream), so the
+        // file: URI lands on `/x.dart` and reports `uri_does_not_exist`,
+        // not `invalid_uri`.
+        let lenient_authority = resolver.resolve(
             container,
             Some("file://a%zz/x.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            lenient_authority.uri,
+            ResolvedUri::File(PathBuf::from("/x.dart"))
+        );
+        assert_eq!(code_of(&lenient_authority), ResolutionCode::UriDoesNotExist);
+
+        // A malformed IPv6 authority is the residual `invalid_uri` shape.
+        let bad_authority = resolver.resolve(
+            container,
+            Some("file://[::1/x.dart"),
             DirectiveKind::ImportExport,
         );
         assert_eq!(
@@ -2594,6 +3204,132 @@ mod tests {
         // them before any target lookup).
         let interpolated = resolver.resolve(container, None, DirectiveKind::DocImport);
         assert_eq!(code_of(&interpolated), ResolutionCode::UriWithInterpolation);
+    }
+
+    /// The `part of` URI face (`file_state.dart:938-953`): the oracle binds
+    /// the part to a library through `PartOfUriKnownFileKind`/`UnknownFile-
+    /// Kind` and reports NO URI diagnostic for it — a missing target is an
+    /// `UnknownFileKind`, not a `uri_does_not_exist`; a broken or
+    /// interpolated string resolves the same way (`_fileForRelativeUri`
+    /// returns null, `isPartOf` is false). The target still resolves for
+    /// the part-of graph, so the face differs from `ImportExport` only on
+    /// [`UriResolution::code`].
+    #[test]
+    fn part_of_face_never_reports_uri_codes() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut resolver = resolver(&fixture, &mut files);
+
+        // Missing file: the ImportExport face reports `uri_does_not_exist`;
+        // the part-of face reports nothing while still interning the target
+        // (the library-attachment check needs the resolved path).
+        let missing = resolver.resolve(container, Some("nonexistent.dart"), DirectiveKind::PartOf);
+        assert_eq!(missing.code, None);
+        assert!(matches!(missing.target, ResolvedTarget::Resolved(_)));
+
+        // An existing file resolves silently too.
+        let hit = resolver.resolve(container, Some("util.dart"), DirectiveKind::PartOf);
+        assert_eq!(hit.code, None);
+        assert!(matches!(hit.target, ResolvedTarget::Resolved(_)));
+
+        // Unresolvable, invalid, and interpolated spellings all stay silent:
+        // the oracle's unknown-kind path emits nothing in every case.
+        for uri in [
+            Some("package:missing/a.dart"),
+            Some("dart:nolib"),
+            Some("a b:c"),
+            None,
+        ] {
+            let silent = resolver.resolve(container, uri, DirectiveKind::PartOf);
+            assert_eq!(silent.code, None, "{uri:?}");
+        }
+    }
+
+    /// A `#fragment` on a directive URI is unresolvable upstream no matter
+    /// what the path names — `import 'q.dart#f'` reports
+    /// `uri_does_not_exist` even with `lib/q.dart` on disk, and the same
+    /// holds for `package:`, `file:`, `dart:`, `part`, and `export` faces
+    /// (verified against the oracle pin on all of them). The query, by
+    /// contrast, is ignored: `'q.dart?x=1'` resolves the file.
+    #[test]
+    fn fragment_makes_any_uri_unresolvable() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut resolver = resolver(&fixture, &mut files);
+
+        for uri in [
+            "util.dart#f",
+            "package:pkg_a/a.dart#f",
+            "file:///nonexistent/x.dart#f",
+            "dart:core#f",
+            "util.dart#",
+        ] {
+            let resolution = resolver.resolve(container, Some(uri), DirectiveKind::ImportExport);
+            assert_eq!(
+                resolution.uri,
+                ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                "{uri}"
+            );
+            assert_eq!(
+                code_of(&resolution),
+                ResolutionCode::UriDoesNotExist,
+                "{uri}"
+            );
+            assert_eq!(resolution.target, ResolvedTarget::Missing, "{uri}");
+        }
+
+        // A query is dropped before the file lookup: the target exists.
+        let queried = resolver.resolve(
+            container,
+            Some("util.dart?x=1"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            queried.uri,
+            ResolvedUri::File(fixture.workspace.root.join("app/lib/util.dart"))
+        );
+        assert_eq!(queried.code, None);
+    }
+
+    /// `Uri.parse`'s lenient path normalization reaches the file lookup:
+    /// `'my file.dart'` escapes to `my%20file.dart` and lands the literal
+    /// file; `'a%zz.dart'` escapes the bare `%` to `%25` and lands
+    /// `a%zz.dart`; `'a\\b.dart'` folds to `a/b.dart`. Misses report
+    /// `uri_does_not_exist` — never `invalid_uri`.
+    #[test]
+    fn lenient_path_spellings_resolve_to_literal_files() {
+        let fixture = Fixture::new();
+        let mut files = FileTable::new();
+        let container = container(&fixture, &mut files, "app/lib/main.dart");
+        let mut resolver = resolver(&fixture, &mut files);
+
+        for (uri, expected) in [
+            ("my file.dart", "app/lib/my file.dart"),
+            ("my%20file.dart", "app/lib/my file.dart"),
+            ("a%zz.dart", "app/lib/a%zz.dart"),
+            ("a\\b.dart", "app/lib/a/b.dart"),
+        ] {
+            let resolution = resolver.resolve(container, Some(uri), DirectiveKind::ImportExport);
+            assert_eq!(
+                resolution.uri,
+                ResolvedUri::File(fixture.workspace.root.join(expected)),
+                "{uri}"
+            );
+            assert_eq!(resolution.code, None, "{uri}");
+        }
+
+        // The same spellings on a missing file report `uri_does_not_exist`
+        // — the oracle's exact outcome for `'[invalid uri]'`.
+        for uri in ["gone file.dart", "gone%zz.dart", "[invalid uri]"] {
+            let resolution = resolver.resolve(container, Some(uri), DirectiveKind::ImportExport);
+            assert_eq!(
+                code_of(&resolution),
+                ResolutionCode::UriDoesNotExist,
+                "{uri}"
+            );
+        }
     }
 
     #[test]

@@ -3016,11 +3016,11 @@ fn prefer_null_aware_method_calls_operand_head_is_the_identifier() {
     assert_eq!(lints[0].range.end, utf16_at(&f, bang) + 3);
 }
 
-/// The semantic faces decide: the member face resolves a typed
-/// receiver's member and the binding face resolves a bare variable;
-/// a `dynamic` receiver, an unresolved bare name, and a
-/// definitely-non-null dead-check read stay silent (the documented
-/// under-report register).
+/// The semantic faces decide the bare-name operand: the binding face
+/// resolves a bare variable, and a definitely-non-null dead-check read
+/// stays silent (the documented under-report register). The
+/// member-access operand's verdict is shape-only — upstream resolves
+/// nothing — so a `dynamic` receiver reports like the typed one.
 #[test]
 fn prefer_null_aware_method_calls_resolution_faces() {
     // The member face: `p.m` resolves on the receiver's container.
@@ -3036,9 +3036,14 @@ fn prefer_null_aware_method_calls_resolution_faces() {
     let source = "void f() {\n  Function func = () {};\n  func != null ? func!() : null;\n}\n";
     assert!(run_semantic(source, "prefer_null_aware_method_calls", None).is_empty());
 
-    // The dynamic receiver: no member face resolves (under-report).
+    // The member-access operand is shape-only (upstream `_check`
+    // resolves no member — prefer_null_aware_method_calls.dart:59-70):
+    // a `dynamic` receiver reports like the typed one.
     let source = "void f(dynamic p) {\n  p.m != null ? p.m!() : null;\n}\n";
-    assert!(run_semantic(source, "prefer_null_aware_method_calls", None).is_empty());
+    assert_eq!(
+        run_semantic(source, "prefer_null_aware_method_calls", None).len(),
+        1
+    );
 
     // The unresolved bare name: no binding face resolves (the
     // null-element arm keeps silent under the resolution posture).
