@@ -3590,7 +3590,7 @@ impl<'a> Engine<'a> {
             let Some(elements) = self.index.get(entry.file) else {
                 continue;
             };
-            for face in elements.extension_faces() {
+            for (face_index, face) in elements.extension_faces().iter().enumerate() {
                 if face.name != Some(export_name) {
                     continue;
                 }
@@ -3609,6 +3609,24 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 if face.members.keys().any(|member| used.contains(member)) {
+                    return true;
+                }
+                // The applied-face credit (`notifyExtensionUsed`,
+                // scope.dart:308-321): upstream marks the whole extension
+                // element used when the resolver APPLIES it, and the
+                // application shapes that resolve no selector spelling into
+                // the name pool — operators (`-e`, `a + b`), index
+                // (`e[i]`, `e[i] = v`), and setter writes (`e.foo = v`
+                // resolves the `foo=` spelling) — credit exactly this way.
+                // The resolve side records every unique application on
+                // `extension_member_used` keyed by (declaring file, face
+                // slot); a record on THIS face spares its defining edge.
+                if let Ok(slot) = u32::try_from(face_index)
+                    && self
+                        .extension_member_used
+                        .iter()
+                        .any(|&(file, index, _)| file == entry.file && index == slot)
+                {
                     return true;
                 }
             }
