@@ -16,6 +16,67 @@ use dartq_types::{ExhaustivenessWorld, Key, Single, Space};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 
+/// The open-switch context stack: a `Vec` face for every caller (the
+/// `Deref` chain keeps `last`/`last_mut`/`len`/`is_empty` verbatim), with
+/// one twist — `pop` RETAINS the closed context into `completed` so the
+/// teardown join can re-decide the exhaustiveness verdict against the
+/// flow-narrowed scrutinee type (#2345: upstream's
+/// `ExhaustivenessValidator` reads the scrutinee's `typeOrThrow`, the
+/// flow-narrowed `staticType` at the switch site, for every face —
+/// reachability, covering, default-reachability — not the declared type
+/// the push-time latch carries). `pop_discard` is the non-retaining twin
+/// for contexts that never carried an exhaustiveness question (the
+/// if-case window pops unreported).
+#[derive(Default)]
+pub(crate) struct SwitchStack {
+    open: Vec<SwitchCtx>,
+    /// Closed switch contexts in close order, retained by [`Self::pop`]
+    /// for the teardown's narrowed-scrutinee re-verdict.
+    pub(crate) completed: Vec<SwitchCtx>,
+}
+
+impl SwitchStack {
+    /// Closes the top context, retaining it for the teardown's
+    /// flow-narrowed re-decision. The `report_switch` caller consumes the
+    /// returned value exactly as `Vec::pop`'s.
+    pub(crate) fn pop(&mut self) -> Option<SwitchCtx> {
+        let ctx = self.open.pop();
+        if let Some(ctx) = &ctx {
+            self.completed.push(SwitchCtx {
+                is_expression: ctx.is_expression,
+                switch_kw: ctx.switch_kw,
+                scrutinee: ctx.scrutinee,
+                cases: ctx.cases.clone(),
+                default_kw: ctx.default_kw,
+                pending_root: None,
+                if_case_member_scrutinee: None,
+                has_invalid_type: ctx.has_invalid_type,
+            });
+        }
+        ctx
+    }
+
+    /// Closes the top context without retaining (the if-case window's own
+    /// close — an if-case reports no exhaustiveness face).
+    pub(crate) fn pop_discard(&mut self) -> Option<SwitchCtx> {
+        self.open.pop()
+    }
+}
+
+impl std::ops::Deref for SwitchStack {
+    type Target = Vec<SwitchCtx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.open
+    }
+}
+
+impl std::ops::DerefMut for SwitchStack {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.open
+    }
+}
+
 /// The open-switch/pattern state: one engine owns one tracker; the state
 /// and its update rules were engine fields/methods before the extraction
 /// (behavior byte-identical).
@@ -23,7 +84,7 @@ pub(crate) struct SwitchTracker {
     /// Open switch contexts (statements and expressions): the scrutinee's
     /// push-time type, the cases completed so far, and the anchors the
     /// diagnostics attach to.
-    pub(crate) switches: Vec<SwitchCtx>,
+    pub(crate) switches: SwitchStack,
     /// The open pattern-nesting stack (`begin_pattern`/`end_pattern`
     /// brackets); each frame collects the leaf restrictions it spans.
     pub(crate) pattern_stack: Vec<PatternFrame>,
@@ -55,7 +116,7 @@ pub(crate) struct SwitchTracker {
 impl SwitchTracker {
     pub(crate) fn new() -> Self {
         SwitchTracker {
-            switches: Vec::new(),
+            switches: SwitchStack::default(),
             pattern_stack: Vec::new(),
             pattern_depth: 0,
             pattern_roots: Vec::new(),
@@ -140,7 +201,7 @@ impl SwitchTracker {
     pub(crate) fn close_if_case(&mut self) {
         self.if_case_window = false;
         self.case_sink_open = false;
-        self.switches.pop();
+        self.switches.pop_discard();
     }
 
     /// Substitutes a captured root's type-free coverage with the
@@ -618,6 +679,7 @@ pub(crate) enum NameTy {
 /// the head's own `:` — the parser only reports the member colon at
 /// `end_switch_case` for a `default` head (`colon_after_default`), so the
 /// case-headed member's body boundary latches here.
+#[derive(Clone)]
 pub(crate) struct NameCase {
     pub(crate) space: Restriction,
     pub(crate) guarded: bool,

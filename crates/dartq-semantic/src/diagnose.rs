@@ -363,7 +363,7 @@ use crate::model::{
 };
 use crate::switch_tracker::{
     NameCase, NameScope, NameTy, NameWorld, ObjectField, PatternFrame, Restriction, SwitchTracker,
-    case_space, is_always_exhaustive, restriction_is_constant,
+    case_space, is_always_exhaustive, restriction_is_constant, restriction_is_null_only,
 };
 // The tests construct a `NameWorld` over the engine's interned core chain;
 // the lib build's only consumer is `MemberFace::new`, so this import is
@@ -1843,6 +1843,280 @@ pub fn fold_unit_with_ops<'t>(
         if let Some(row) = engine.teardown_covering(pending, matched) {
             report.usage.push(row);
         }
+    }
+    // The flow-narrowed scrutinee re-verdict (#2345): the oracle's
+    // `ExhaustivenessValidator` reads the scrutinee's `typeOrThrow` — the
+    // flow-narrowed static type at the switch site — for EVERY face
+    // (constant_verifier.dart:1001-1002's `scrutinee.typeOrThrow` feed,
+    // `:498`'s `isAlwaysExhaustive(node.expression.typeOrThrow)` on the
+    // statement side), while the parse-time pass judged over the
+    // push-time latch, the declared type. Every closed switch context is
+    // retained ([`crate::switch_tracker::SwitchStack::completed`]); each
+    // one whose flow `MatchedType` at the first clause narrows the
+    // baseline scrutinee re-runs the whole verdict against the narrowed
+    // `NameTy`, and the parse-time family rows the narrowed verdict does
+    // not reproduce drop out of `report.diagnostics` while the rows it
+    // adds stage into `report.usage`. A switch the covering deferral
+    // already staged (`pending_switch_coverings`, the #2538 face) keeps
+    // that row owned there — this pass still reconciles its reachability
+    // and default faces.
+    {
+        let completed = std::mem::take(&mut engine.switch.switches.completed);
+        let ne_statement = SemanticCode::NonExhaustiveSwitchStatement.code_info().name;
+        let ne_expression = SemanticCode::NonExhaustiveSwitchExpression.code_info().name;
+        let unreachable_case = SemanticCode::UnreachableSwitchCase.code_info().name;
+        let unreachable_default = SemanticCode::UnreachableSwitchDefault.code_info().name;
+        let dead_code = SemanticCode::DeadCode.code_info().name;
+        let mut staged_rows: Vec<Diagnostic> = Vec::new();
+        for ctx in &completed {
+            // The if-case windows retained nothing (`pop_discard`), so
+            // every completed context here is a real switch — still, the
+            // same early-outs `report_switch` applies hold: an unknown or
+            // invalid scrutinee gated the whole pass off at parse time,
+            // and there is nothing to re-decide.
+            if ctx.scrutinee == Ty::Unknown || ctx.has_invalid_type {
+                continue;
+            }
+            let Some(first) = ctx.cases.first() else {
+                continue;
+            };
+            let matched = matched_types
+                .iter()
+                .rev()
+                .find(|(range, _)| range.offset == first.flow_anchor.offset)
+                .map(|(_, ty)| *ty);
+            let world = engine.name_world();
+            let baseline =
+                crate::switch_tracker::enum_bound_scrutinee(&world, ctx).unwrap_or(ctx.scrutinee);
+            // The same decide gate `teardown_covering` applies: a matched
+            // spelling refines the verdict only when it differs from the
+            // baseline AND the world can decide it — anything else keeps
+            // the parse-time verdict verbatim.
+            let matched_decides = matched.is_some_and(|ty| {
+                ty != baseline
+                    && match NameTy::from_semantic(ty) {
+                        NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
+                            world.is_known_head(name)
+                        }
+                        NameTy::Unknown(_) => false,
+                        _ => true,
+                    }
+            });
+            if !matched_decides {
+                continue;
+            }
+            let scrutinee = matched.unwrap_or(baseline);
+            let value = NameTy::from_semantic(scrutinee);
+            let cases: Vec<Case<NameTy>> = ctx
+                .cases
+                .iter()
+                .map(|c| Case {
+                    space: case_space(&world, &c.space, value),
+                    guarded: c.guarded,
+                })
+                .collect();
+            let narrowed_report = compute(&world, &value, &cases);
+            // The intended row set under the narrowed scrutinee, mirroring
+            // `report_switch`'s faces in the oracle's order: per-case
+            // reachability, the dead member bodies (statements), then the
+            // covering gap at the `switch` keyword, and the unreachable
+            // default.
+            let mut intend_unreachable: Vec<SourceRange> = narrowed_report
+                .unreachable
+                .iter()
+                .filter_map(|index| ctx.cases.get(*index).map(|c| c.anchor))
+                .collect();
+            let mut intend_dead: Vec<SourceRange> = Vec::new();
+            if !ctx.is_expression && !cases.is_empty() {
+                let total = |index: usize| {
+                    matches!(
+                        compute(&world, &value, std::slice::from_ref(&cases[index]))
+                            .exhaustiveness,
+                        Exhaustiveness::Exhaustive
+                    )
+                };
+                let body_dies = |index: usize| {
+                    let space = &ctx.cases[index].space;
+                    if restriction_is_null_only(space) {
+                        !world.can_be_subtype_of(&NameTy::Null, &value)
+                    } else {
+                        matches!(value, NameTy::Null)
+                            && restriction_is_constant(space)
+                            && crate::switch_tracker::restriction_disjoint_from(
+                                &world, space, value,
+                            )
+                    }
+                };
+                let chain_start = (0..cases.len())
+                    .find(|&index| !ctx.cases[index].guarded && total(index))
+                    .map_or(cases.len(), |index| index + 1);
+                for (index, case) in ctx.cases.iter().enumerate().take(chain_start) {
+                    if !case.guarded
+                        && let Some(body) = case.body
+                        && body_dies(index)
+                    {
+                        intend_dead.push(body);
+                    }
+                }
+            }
+            let expression_face_decides = match value {
+                NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
+                    world.name_resolvable(name)
+                }
+                NameTy::Unknown(u64::MAX) => false,
+                _ => true,
+            };
+            let private_foreign_enum = match value {
+                NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)
+                    if world.is_enum_name(name) && world.is_foreign_library(name) =>
+                {
+                    strings.resolve(name).starts_with('_')
+                        || match &narrowed_report.exhaustiveness {
+                            Exhaustiveness::NonExhaustive(witnesses) => witnesses
+                                .iter()
+                                .all(|w| w.as_witness(&world).contains("._")),
+                            Exhaustiveness::Exhaustive => false,
+                        }
+                }
+                _ => false,
+            };
+            let must_be_exhaustive = !private_foreign_enum
+                && ((ctx.is_expression && expression_face_decides)
+                    || is_always_exhaustive(&world, value));
+            // The covering row: owned by the covering deferral when it
+            // staged one (#2538 — the pending re-decides the same matched
+            // type), re-decided here otherwise.
+            let covering_deferred = pending_coverings
+                .iter()
+                .any(|p| p.kw.offset == ctx.switch_kw.offset);
+            let mut intend_covering = false;
+            let mut covering_row = None;
+            if let Exhaustiveness::NonExhaustive(ref witnesses) = narrowed_report.exhaustiveness {
+                if must_be_exhaustive && ctx.default_kw.is_none() && !covering_deferred {
+                    intend_covering = true;
+                    let first_w = witnesses.first();
+                    let ty_text = engine.ty_display(scrutinee);
+                    let unmatched = first_w.map_or(String::new(), |w: &EngineWitness<NameTy>| {
+                        w.as_witness(&world)
+                    });
+                    let suggested = first_w.map_or(String::new(), |w| w.as_correction(&world));
+                    let code = if ctx.is_expression {
+                        SemanticCode::NonExhaustiveSwitchExpression
+                    } else {
+                        SemanticCode::NonExhaustiveSwitchStatement
+                    };
+                    covering_row = Some(Diagnostic::new(
+                        code.severity(),
+                        code.code_info(),
+                        code.message3(&ty_text, &unmatched, &suggested),
+                        file,
+                        ctx.switch_kw,
+                        code.correction_message(&suggested),
+                    ));
+                }
+            } else if must_be_exhaustive && let Some(default_at) = ctx.default_kw {
+                staged_rows.push(Diagnostic::new(
+                    SemanticCode::UnreachableSwitchDefault.severity(),
+                    SemanticCode::UnreachableSwitchDefault.code_info(),
+                    SemanticCode::UnreachableSwitchDefault.message("", ""),
+                    file,
+                    default_at,
+                    SemanticCode::UnreachableSwitchDefault.correction_message(""),
+                ));
+            }
+            // Retract the parse-time family rows the narrowed verdict does
+            // not reproduce: the anchor set is this switch's own — the
+            // keyword, every case anchor, the member body spans, the
+            // default keyword — so a nested or sibling switch's rows are
+            // never touched. `dead_code` retracts only on an exact member
+            // body span (the parse-time `body_dies` anchor shape); a
+            // covering row retracts only when this pass owns the covering
+            // (no deferral staged it).
+            let case_anchors: FxHashSet<u32> =
+                ctx.cases.iter().map(|c| c.anchor.offset).collect();
+            let body_spans: FxHashSet<(u32, u32)> = ctx
+                .cases
+                .iter()
+                .filter_map(|c| c.body.map(|b| (b.offset, b.length)))
+                .collect();
+            let keep_unreachable: FxHashSet<u32> =
+                intend_unreachable.iter().map(|r| r.offset).collect();
+            let keep_dead: FxHashSet<(u32, u32)> =
+                intend_dead.iter().map(|r| (r.offset, r.length)).collect();
+            report.diagnostics.retain(|row| {
+                let at = row.range.offset;
+                if row.code.name == unreachable_case && case_anchors.contains(&at) {
+                    return keep_unreachable.contains(&at);
+                }
+                if row.code.name == dead_code
+                    && body_spans.contains(&(at, row.range.length))
+                {
+                    return keep_dead.contains(&(at, row.range.length));
+                }
+                if (row.code.name == ne_statement || row.code.name == ne_expression)
+                    && at == ctx.switch_kw.offset
+                    && !covering_deferred
+                {
+                    return intend_covering;
+                }
+                if row.code.name == unreachable_default
+                    && ctx.default_kw.is_some_and(|d| d.offset == at)
+                {
+                    return false;
+                }
+                true
+            });
+            // The covering row stages when the narrowed verdict intends
+            // one: the retain above already dropped any parse-time
+            // covering anchored at this switch's keyword, so the staged
+            // row replaces it verbatim — rendered over the narrowed type
+            // (the oracle's `.withArguments(type: scrutineeType)` reads
+            // the same narrowed `typeOrThrow`, constant_verifier.dart:1103).
+            if let Some(row) = covering_row {
+                staged_rows.push(row);
+            }
+            // The retained rows already cover the kept verdict, so only
+            // the NEW faces stage: unreachable anchors the parse-time pass
+            // never reported, dead bodies it left live, the unreachable
+            // default, and the covering row already pushed above.
+            let emitted_unreachable: FxHashSet<u32> = report
+                .diagnostics
+                .iter()
+                .filter(|row| row.code.name == unreachable_case)
+                .map(|row| row.range.offset)
+                .collect();
+            for anchor in intend_unreachable.drain(..) {
+                if !emitted_unreachable.contains(&anchor.offset) {
+                    staged_rows.push(Diagnostic::new(
+                        SemanticCode::UnreachableSwitchCase.severity(),
+                        SemanticCode::UnreachableSwitchCase.code_info(),
+                        SemanticCode::UnreachableSwitchCase.message("", ""),
+                        file,
+                        anchor,
+                        SemanticCode::UnreachableSwitchCase.correction_message(""),
+                    ));
+                }
+            }
+            let emitted_dead: FxHashSet<(u32, u32)> = report
+                .diagnostics
+                .iter()
+                .filter(|row| row.code.name == dead_code)
+                .map(|row| (row.range.offset, row.range.length))
+                .collect();
+            for body in intend_dead.drain(..) {
+                if !emitted_dead.contains(&(body.offset, body.length)) {
+                    staged_rows.push(Diagnostic::new(
+                        SemanticCode::DeadCode.severity(),
+                        SemanticCode::DeadCode.code_info(),
+                        SemanticCode::DeadCode.message("", ""),
+                        file,
+                        body,
+                        SemanticCode::DeadCode.correction_message(""),
+                    ));
+                }
+            }
+        }
+        report.usage.extend(staged_rows);
     }
     let survivors = engine.filter_staged(&promotions, &condition_types, &prop_promotions);
     report.diagnostics = merge_source_ordered(report.diagnostics, survivors);
@@ -6111,3 +6385,10 @@ mod ticket_3161_tests;
 /// name, same feature gate).
 #[cfg(test)]
 mod ticket_3182_tests;
+
+/// The #2345 pins: the flow-narrowed scrutinee drives every
+/// exhaustiveness face — an `is`/`!= null`/guard-narrowed switch re-runs
+/// reachability and the covering gap against the matched type the flow
+/// facts publish, upstream's `scrutinee.typeOrThrow` feed.
+#[cfg(test)]
+mod ticket_2345_tests;
