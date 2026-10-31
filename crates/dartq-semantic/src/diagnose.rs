@@ -6392,3 +6392,10 @@ mod ticket_3182_tests;
 /// facts publish, upstream's `scrutinee.typeOrThrow` feed.
 #[cfg(test)]
 mod ticket_2345_tests;
+
+/// The #2464 pins: the statement-level `dead_code` anchor law — a dead
+/// block opens at its `{` and runs through its `}`, a dead statement opens
+/// at its first token and keeps its `;`, and a `finally` body stays live
+/// after a returning catch. Exact oracle `(offset, length)` triples.
+#[cfg(test)]
+mod ticket_2464_tests;
