@@ -563,7 +563,16 @@ impl<'a> Engine<'a> {
                     .dead_null_chains
                     .iter()
                     .any(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end);
-                let rooted = is_null_aware && was_local && Self::is_nullable_ty(receiver_ty);
+                // The dead-chain root's receiver nullability reads the
+                // written face AND the `FutureOr` argument's nullability
+                // (`FutureOr<int?>` is potentially nullable upstream —
+                // `?[i]`/`?..` reads through it — while `FutureOr<int>`
+                // stays non-nullable; `isNull`/`isPotentiallyNullable`,
+                // type_system.dart's `FutureOr` arm).
+                let rooted = is_null_aware
+                    && was_local
+                    && (Self::is_nullable_ty(receiver_ty)
+                        || self.future_or_potentially_nullable(receiver_ty));
                 if inside_chain || rooted {
                     // The root kind fixes the verifier face the chain answers
                     // (dead_code_verifier.dart's call-site split): a `?..`
@@ -1600,7 +1609,9 @@ impl<'a> Engine<'a> {
                 .is_some_and(|field| !Self::is_nullable_ty(*field));
             if !self.in_cascade
                 && self.null_aware_members.contains(&receiver_offset)
-                && (!Self::is_nullable_ty(merged_receiver_ty) || record_short)
+                && (!(Self::is_nullable_ty(merged_receiver_ty)
+                    || self.future_or_potentially_nullable(merged_receiver_ty))
+                    || record_short)
             {
                 self.null_aware_members.insert(member.range.offset);
             }

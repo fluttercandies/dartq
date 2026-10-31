@@ -6727,7 +6727,12 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
             } else if engine.local_hits.contains_key(&recv.offset) {
                 engine.null_aware_staged.push((recv, op_range, kind));
-                if Engine::is_nullable_ty(ty) {
+                // The dead-chain receiver nullability reads the written
+                // `?` face AND the `FutureOr` argument's own nullability
+                // (`FutureOr<int?>` is potentially nullable upstream —
+                // `?[i]` reads through it — while `FutureOr<int>` stays
+                // non-nullable; type_system.dart's `FutureOr` arm).
+                if Engine::is_nullable_ty(ty) || engine.future_or_potentially_nullable(ty) {
                     // The `c1?[0]` dead-chain candidate: a null-aware index
                     // over a local's nullable read, resolved at teardown
                     // (`_verifyUnassignedVariable`'s index face). The root

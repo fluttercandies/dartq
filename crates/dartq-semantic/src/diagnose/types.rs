@@ -6364,3 +6364,14 @@ mod ticket_3150_tests;
 #[cfg(test)]
 #[path = "ticket_3177_tests.rs"]
 mod ticket_3177_tests;
+
+// The #2496 pins (the `FutureOr`-aware receiver nullability + the
+// `FutureOr` member face — a `FutureOr<int>` receiver stays non-nullable,
+// `FutureOr<int?>`/dynamic/void/unresolved read nullable through the
+// dead-chain root gates, and `x.then(...)` over `FutureOr<T>` resolves
+// `defined` through the `Future` member set). Same `#[path]` registration
+// as #3150/#3177: the module stays inside the `diagnose` subtree so
+// `super::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_2496_tests.rs"]
+mod ticket_2496_tests;
