@@ -5566,6 +5566,36 @@ impl<'a> Engine<'a> {
         Some(self.tree_ty(&tree))
     }
 
+    /// A type-parameter head replaced by its captured bound (#2349): the
+    /// oracle types an operand by the parameter itself, whose interface IS
+    /// the bound's — `void f<T extends num>(T t)` reads `t + 1` as `num`,
+    /// `S extends int` as `int`, `U extends double` as `double` (probed
+    /// 3.13.1), and the operator lookup runs on that same interface. Every
+    /// other type passes through untouched. A parameter with NO captured
+    /// bound keeps its written spelling: the implicit `Object?` bound is no
+    /// `num` face, and those shapes stay on the under-report side (their
+    /// own row family is separate). The operand's written nullability rides
+    /// onto the bound (`T?` over `T extends num` reads `num?`).
+    pub(crate) fn bound_face(&self, ty: Ty) -> Ty {
+        let Ty::Named { name, nullable, .. } = ty else {
+            return ty;
+        };
+        if !self.is_scope_param(name) {
+            return ty;
+        }
+        let Some(bound) = self.param_bound(name) else {
+            return ty;
+        };
+        if bound == Ty::UNKNOWN || bound == Ty::Dynamic {
+            return ty;
+        }
+        if nullable {
+            Self::nullable_form(bound)
+        } else {
+            bound
+        }
+    }
+
     /// The post-walk counterpart of [`Engine::param_bound`]: the bound of
     /// the parameter `name` when the scope frames are already torn down
     /// (the extension-applicability row resolves a receiver argument
@@ -5924,6 +5954,19 @@ impl<'a> Engine<'a> {
         ty
     }
 
+    /// `ty` when the engine typed it, else the numeric literal face of the
+    /// row it came from (#2349): a literal's row carries no type at push,
+    /// so every numeric face that reads a value row would otherwise see a
+    /// gap — `3.clamp(0, i)` keeps the declared `num` instead of the
+    /// oracle's `int`, and the `int` sink reports a `num` it should not.
+    /// Anything that is not a numeric literal keeps `Ty::UNKNOWN`.
+    fn numeric_literal_or(&self, ty: Ty, range: SourceRange) -> Ty {
+        if ty != Ty::UNKNOWN {
+            return ty;
+        }
+        self.numeric_literal_face(range).unwrap_or(Ty::UNKNOWN)
+    }
+
     /// The primitive face of a token whose bytes spell a numeric literal:
     /// `int` for a hex or plain-digit run, `double` once a `.`, `e`, or
     /// `E` marker appears outside the hex prefix. The digit-first gate
@@ -6062,7 +6105,11 @@ impl<'a> Engine<'a> {
     /// reports its own row), `dynamic`, and `Never` answer `None` — the
     /// under-report direction.
     pub(crate) fn binary_operator_sig(&self, op: &str, left: &Row) -> Option<(Ty, Ty)> {
-        let left_ty = self.equality_operand_ty(left);
+        // A type-parameter receiver resolves the operator on its BOUND's
+        // interface (#2349: `S extends int` answers `int.+`, `T extends
+        // num` answers `num.+`); an unbound parameter keeps the written
+        // head and falls to the `None` below.
+        let left_ty = self.bound_face(self.equality_operand_ty(left));
         let Ty::Named { name, .. } = left_ty else {
             return None;
         };
@@ -6207,16 +6254,28 @@ impl<'a> Engine<'a> {
         let recv = match &below.shape {
             RowShape::Bare(info) => Engine::receiver_of_bare(*info),
             RowShape::Member { recv } => *recv,
+            // A literal receiver (`3.clamp(0, i)`, `2.5.remainder(x)`)
+            // rides a Value row — the literal face below answers it.
+            RowShape::Value => Receiver::Unknown,
             _ => return,
         };
+        // The receiver's static type (#2349): the declared face, a numeric
+        // literal's own primitive — a literal row carries no type at push,
+        // so `3.clamp(0, i)` would otherwise read the receiver as a gap and
+        // keep the declared `num` where the oracle answers `int` — or a
+        // type parameter's BOUND.
         let recv_ty = match recv {
-            Receiver::Typed { ty, .. } => ty,
-            _ => return,
+            Receiver::Typed { ty, .. } => self.numeric_literal_or(ty, below.range),
+            _ => match self.numeric_literal_face(below.range) {
+                Some(lit) => lit,
+                None => return,
+            },
         };
+        let recv_ty = self.bound_face(recv_ty);
         let positional: Vec<Ty> = args
             .iter()
             .filter(|(label, ..)| label.is_none())
-            .map(|(_, ty, ..)| *ty)
+            .map(|(_, ty, _, range)| self.numeric_literal_or(*ty, *range))
             .collect();
         let (int, double, num) = (
             self.members.primitive_ids[0],
@@ -6277,6 +6336,18 @@ impl<'a> Engine<'a> {
         if !matches!(op, "+" | "-" | "*" | "%" | "remainder") {
             return declared;
         }
+        // A type-parameter receiver refines through its BOUND (#2349): the
+        // oracle's gates (`T <: num?` / `T <: double?` / `T <: int?`) run
+        // on the parameter's interface, so `T extends num` over an `int`
+        // answers `num`, `S extends int` over an `int` answers `int`, and
+        // `U extends double` answers `double` (probed 3.13.1). The right
+        // operand canonicalizes the same way — the compound-assignment
+        // caller hands the written head through unreduced.
+        let left_ty = self.bound_face(left_ty);
+        let right = match right {
+            OperandFace::Typed(ty) => OperandFace::Typed(self.bound_face(ty)),
+            other => other,
+        };
         let (int, double, num) = (
             self.members.primitive_ids[0],
             self.members.primitive_ids[1],
@@ -6473,6 +6544,12 @@ impl<'a> Engine<'a> {
         let right = self.rows[right_index].clone();
         let left_ty = self.equality_operand_ty(&left);
         let right_ty = self.equality_operand_ty(&right);
+        // Both operands read through their BOUND when they are type
+        // parameters (#2349): the oracle's ladder and the argument check
+        // run on the parameter's interface (`T extends num` is `num`), and
+        // the argument row's message spells the bound the same way.
+        let left_ty = self.bound_face(left_ty);
+        let right_ty = self.bound_face(right_ty);
         let bool_id = self.members.primitive_ids[3];
         let result = if matches!(op, o if o == self.intern("==") || o == self.intern("!=") || o == self.intern("&&") || o == self.intern("||"))
         {
@@ -6586,11 +6663,22 @@ impl<'a> Engine<'a> {
         {
             return;
         }
-        if let Ty::Named { name: head, .. } = right_ty
+        // A type-parameter operand checks as its BOUND (#2349): the
+        // oracle's argument row spells the parameter but decides on its
+        // interface — `U extends String` reports `String` against `num`,
+        // `T extends num` reports nothing. A parameter with no captured
+        // bound keeps the suppression (the implicit `Object?` accepts no
+        // numeric formal, and the unbound family under-reports elsewhere).
+        let right_ty = if let Ty::Named { name: head, .. } = right_ty
             && unbound(self, head)
         {
-            return;
-        }
+            match self.param_bound(head) {
+                Some(bound) if !matches!(bound, Ty::Unknown | Ty::Dynamic) => bound,
+                _ => return,
+            }
+        } else {
+            right_ty
+        };
         // The `Object?` target degenerates (every value inhabits it —
         // `name_subtype`'s written-edge walk carries no implicit
         // `extends Object` row, so the top-type face answers first).

@@ -12065,3 +12065,10 @@ mod ticket_3089_tests;
 #[cfg(test)]
 #[path = "ticket_3085_tests.rs"]
 mod ticket_3085_tests;
+
+/// The #3087 pins (a null-aware access over a receiver whose bound spells
+/// an invalid type classifies null-or-equivalent — the `?.` right side and
+/// a `!= null` then-block are dead, subtype.dart:274 / classifyType).
+#[cfg(test)]
+#[path = "ticket_3087_tests.rs"]
+mod ticket_3087_tests;

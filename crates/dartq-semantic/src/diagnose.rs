@@ -5776,6 +5776,14 @@ mod ticket_3067_tests;
 #[cfg(test)]
 mod ticket_3063_tests;
 
+/// The #2349 pins — the numeric refinement's operand face at its error-
+/// recovery edges (InvalidType releases `double`, `dynamic` reads `num`,
+/// an invalid receiver stays silent, a bounded type parameter reads its
+/// BOUND) and the numeric CALL refinement's literal receiver
+/// (`3.clamp(0, i)` is `int`).
+#[cfg(test)]
+mod ticket_2349_tests;
+
 /// The #2499 pins: the unnamed extension face's members report exactly
 /// once — the `DeclKind::Member` arm defers every unnamed-face verdict to
 /// the extension face loop (the duplicate emission staged the row from
