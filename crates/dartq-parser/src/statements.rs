@@ -352,16 +352,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         | Keyword::Await
                 )
             );
-        // Statement-level assignment faces (ast_builder.dart:4209-4221):
-        // a statement whose whole expression is an assignment to a bare
-        // keyword target. The selector row for `this` and the
-        // `illegalAssignmentToNonAssignable` rider are pinned here — the
-        // shared assignment arm stays silent in the redirecting-initializer
-        // lane (`C() : this = 0;` carries neither), and this is the only
-        // context that distinguishes them. `super`'s selector row rides the
-        // assignment arm; the faces key on the statement head followed by
-        // an assignment operator (any compound form,
-        // `super += 3;`/`super ??= 3;` included).
+        // Statement-level `illegalAssignmentToNonAssignable` rider
+        // (ast_builder.dart:4209-4221): a statement whose whole expression
+        // is an assignment to a bare keyword target. The selector rows ride
+        // the assignment arm for both keyword targets; the rider is pinned
+        // here because the arm cannot see the statement context. The face
+        // keys on the statement head followed by an assignment operator (any
+        // compound form, `super += 3;`/`super ??= 3;` included).
         let head_assigns =
             matches!(head, TokenKind::Keyword(Keyword::Super | Keyword::This))
                 && self.precedence_of(self.cursor.look_kind(1))
@@ -376,9 +373,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::missing_assignable_selector(), begin);
         }
         if head_assigns {
-            if head == TokenKind::Keyword(Keyword::This) {
-                self.report(msg::missing_assignable_selector(), begin);
-            }
             self.report(msg::illegal_assignment_to_non_assignable(), begin);
         }
         let single_recovered_name =

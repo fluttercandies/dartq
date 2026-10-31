@@ -522,6 +522,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // (synthetic) token is read by id — its offset points at the
                 // real token it stands in for, never at itself.
                 let lhs_last = self.cursor.last_consumed_id().map(|id| self.span_kind(id));
+                let operator = self.peek_span();
                 match lhs_last {
                     // Official `_isAssignable` (ast_builder.dart:6607) tests
                     // the parsed EXPRESSION shape — a bare name qualifies,
@@ -536,14 +537,26 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // literal-topped `]` is a list literal and falls through
                     // to the non-assignable arm (`const [r] = g()`).
                     Some(TokenKind::CloseSquare) if lhs_ends_index => {}
-                    // `this` stays silent here: the statement-level bare
-                    // `this` target does carry the selector row (oracle
-                    // `this = 3;`), but the INITIALIZER lane routes its own
-                    // `this = …` recovery through this same arm (oracle
-                    // `C() : this = 0;` carries expected_token +
-                    // missing_assignment_in_initializer, never the selector)
-                    // and the distinguishing state lives in the initializer
-                    // lane (#2995 residual — needs the lane's context flag).
+                    // `missingAssignableSelector(lhs.beginToken,
+                    // lhs.endToken)` (ast_builder.dart:3831-3836): the bare
+                    // `this` target is non-assignable exactly like `super`
+                    // (`_isAssignable`, :6607 — names, property/index
+                    // extractions), so the row rides the arm
+                    // (`this = 3;`, `f(this = 3);`, `var x = this = 3;`,
+                    // `for (this = 3;;)`, `C() : x = this = 3;`). The
+                    // redirecting-initializer head recovery keeps its
+                    // silence: its spliced re-read `<synthetic> = this = 0`
+                    // builds a this-target assignment the oracle never tracks
+                    // (`C() : this = 0;` carries expected_token +
+                    // missing_assignment_in_initializer, never the selector),
+                    // and that formation is exactly the one whose DIRECTLY
+                    // enclosing assignment spliced its operator
+                    // ([`Parser::assignment_op_spliced`]).
+                    Some(TokenKind::Keyword(Keyword::This))
+                        if !self.assignment_op_spliced =>
+                    {
+                        self.report(msg::missing_assignable_selector(), left);
+                    }
                     Some(TokenKind::Keyword(Keyword::This)) => {}
                     Some(TokenKind::Keyword(Keyword::Super)) => {
                         self.report(msg::missing_assignable_selector(), left);
@@ -556,9 +569,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // The `>>=`-without-triple-shift recovery is dead at the pin
                 // (3.13.1 ships with triple shift on, and the scanner lexes
                 // `>>>=` natively then).
-                let operator = self.peek_span();
                 let is_if_null = self.peek_kind() == TokenKind::QuestionQuestionEq;
                 self.cursor.advance();
+                // The operator realness flows one frame down: a spliced `=`
+                // marks every assignment nested in this RHS as an artifact of
+                // the initializer head recovery's re-read (the field clears
+                // after the recursion, so it never goes stale).
+                self.assignment_op_spliced = (operator.id as usize) >= self.table.len();
                 // The `??=` RHS split's begin face (official
                 // `ifNullExpression_rightBegin`): the RHS runs on the null
                 // path alone, so the flow snapshots the live skip path
@@ -571,6 +588,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 } else {
                     self.parse_precedence(level, allow_cascades)
                 };
+                self.assignment_op_spliced = false;
                 // `reportErrorIfSuper(rhs)` (ast_builder.dart:3653): a bare
                 // `super` as the assigned value carries the selector-missing
                 // row (`x = super;`).

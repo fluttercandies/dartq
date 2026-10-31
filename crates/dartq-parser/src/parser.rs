@@ -112,6 +112,17 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// Official `_currentlyRecovering` (`parser_impl.dart:7008`): suppresses
     /// nested written-out-operator recovery while one is being speculated.
     pub(crate) currently_recovering: bool,
+    /// Whether the directly-enclosing assignment spliced its `=` operator
+    /// (an inserted token). The bare-`this` assignment target's selector row
+    /// keys on this: the redirecting-initializer head recovery re-reads
+    /// `<synthetic> = this …` through the expression engine, and the nested
+    /// `this = …` that formation builds is an artifact no oracle row tracks
+    /// (`C() : this = 0;` — expected_token + missing_assignment_in_initializer,
+    /// never the selector), while every real target keeps the row. Each
+    /// assignment arm writes its own operator's realness before the right
+    /// recursion and clears it afterwards, so the field reads the immediate
+    /// enclosing arm's value and never goes stale.
+    pub(crate) assignment_op_spliced: bool,
     /// `DirectiveContext.state` (`directive_context.dart:20`): where the
     /// unit is in the directive prelude (ordering checks, #300).
     pub(crate) directive_state: crate::directives::DirectiveState,
@@ -262,6 +273,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             loop_state: crate::listener::LoopState::OutsideLoop,
             pending_augment: None,
             currently_recovering: false,
+            assignment_op_spliced: false,
             directive_state: crate::directives::DirectiveState::Unknown,
             external_ctor_field_formals: false,
             unmatched_reported: Vec::new(),
@@ -615,6 +627,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             loop_state: self.loop_state,
             pending_augment: self.pending_augment,
             currently_recovering: self.currently_recovering,
+            assignment_op_spliced: self.assignment_op_spliced,
             directive_state: self.directive_state,
             external_ctor_field_formals: self.external_ctor_field_formals,
             unmatched_reported: Vec::new(),
