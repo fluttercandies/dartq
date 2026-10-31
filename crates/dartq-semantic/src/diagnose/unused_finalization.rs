@@ -3594,6 +3594,20 @@ impl<'a> Engine<'a> {
                 bare_decls.entry(name).or_default().insert(file);
             }
         }
+        // A resolved annotation credits its import the same way (the
+        // `check_annotation` use-face credit — `used_names` ∪
+        // `annotation_uses`), but the metadata events carry no row, so the
+        // head never reaches `refs`/`type_uses` and the element gate above
+        // would drop the credit a genuinely used `@UseResult` import owns.
+        // The top-level namespace answers the declaring file exactly as it
+        // does for the type-use loop.
+        for &name in &self.annotation_uses {
+            if let Lookup::Found(NamespaceEntry::Decl(file)) =
+                self.namespaces.lookup(self.graph, self.lib, name)
+            {
+                bare_decls.entry(name).or_default().insert(file);
+            }
+        }
         for (index, edge) in edges.iter().enumerate() {
             // Copied first: the emit below mutates the report.
             let (uri_text, uri_range, prefix, shown) = {

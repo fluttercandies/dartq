@@ -649,6 +649,55 @@ fn unless_non_const_reference_stays_silent() {
     );
 }
 
+// —— #3204: the annotation-only import is a used import ————————————————
+//
+// `generateUnusedImportWarnings` credits every resolved element the unit
+// used, and a resolved `@UseResult` is one (`check_annotation`'s use-face
+// credit). The metadata events carry no row, so the head never reaches
+// `refs`/`type_uses`; an element-attribution gate that read only those
+// two pools dropped the credit and reported a genuinely used
+// `package:meta` import as unused.
+
+/// `@UseResult()` — an import reached only through a class annotation.
+#[test]
+fn annotation_only_import_is_used() {
+    let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   @UseResult()\nint f() => 1;\n\
+                   void main() {\n  f();\n}";
+    let codes = code_names(&use_result_report(src));
+    assert!(!codes.contains(&"unused_import"), "{codes:?}");
+}
+
+/// `@UseResult.unless(parameterDefined: 'p')` — the same credit through
+/// the qualified annotation spelling.
+#[test]
+fn qualified_annotation_only_import_is_used() {
+    let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\nclass String {}\n\
+                   @UseResult.unless(parameterDefined: 'p')\nint g({int? p}) => 1;\n\
+                   void main() {\n  g(p: 1);\n}";
+    let codes = code_names(&use_result_report(src));
+    assert!(!codes.contains(&"unused_import"), "{codes:?}");
+}
+
+/// The nobler direction stays: an import with no use at all keeps its
+/// single `unused_import` row — the annotation credit is additive, never
+/// a blanket spare.
+#[test]
+fn unused_meta_import_still_reports() {
+    let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   int f() => 1;\n\
+                   void main() {\n  f();\n}";
+    let codes = code_names(&use_result_report(src));
+    assert_eq!(
+        codes.iter().filter(|c| **c == "unused_import").count(),
+        1,
+        "{codes:?}"
+    );
+}
+
 /// The for-parts split: the condition alone is a use (the official
 /// `ForParts` arm, `use_result_verifier.dart:168-172` — `return
 /// parent.condition2 == node` intercepts before `ForLoopParts`); the
