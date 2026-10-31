@@ -897,16 +897,35 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// there (official `moveSynthetic` moves only `ensureCloseParen`-style
     /// adoptions, `parser_impl.dart:12051-12064`); a real but distant closer
     /// reports `expectedButGot` here.
-    fn group_end_or_here(&mut self, begin: TokenSpan, expected: &str) -> TokenSpan {
+    fn group_end_or_here(&mut self, begin: TokenSpan, expected: &'static str) -> TokenSpan {
         if let Some(end) = self.cursor.table_matching_end(begin.id) {
             let (_, synthetic) = self.cursor.resolve(end);
-            if !synthetic {
+            if synthetic {
+                // Scanner-synthesized closer parked away from the stream (EOF
+                // for an unclosed `[`/`{`): adopt it at the resume point —
+                // official `parseListPatternSuffix`'s
+                // `rewriter.moveSynthetic(token, beginToken.endGroup!)`
+                // (parser_impl.dart:12051-12053) relocates the closer in front
+                // of the current token and re-offsets it to
+                // `next.offset` (token_stream_rewriter.dart:105-134), so the
+                // unmatched-begin row lands on the token the pattern resumes
+                // behind (`case [;:` → ']' @ the `:`), and the post-parse
+                // pass skips the pair.
+                let kind = if expected == "]" {
+                    TokenKind::CloseSquare
+                } else {
+                    TokenKind::CloseCurly
+                };
+                self.move_synthetic_close(begin, end, kind, expected)
+            } else {
+                // Real but distant closer: report on the follower and jump to
+                // the group's end (`parser_impl.dart:12054-12062`).
                 self.report(msg::expected_but_got(expected), self.peek_span());
+                self.skip_to_token(end);
+                let span = self.peek_span();
+                self.cursor.advance();
+                span
             }
-            self.skip_to_token(end);
-            let span = self.peek_span();
-            self.cursor.advance();
-            span
         } else {
             self.report(msg::expected_but_got(expected), self.peek_span());
             self.peek_span()

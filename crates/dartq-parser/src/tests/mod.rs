@@ -19,6 +19,8 @@ mod gate_2844_parameterized_bound;
 mod gate_2932_nameless_events;
 mod gate_2941_parser_residuals;
 mod gate_2942_junk_dispatch;
+mod gate_3135_lane_c;
+mod gate_3141_lane_b;
 mod gate_351;
 mod gate_410;
 mod gate_445;
