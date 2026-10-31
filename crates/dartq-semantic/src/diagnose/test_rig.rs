@@ -271,6 +271,27 @@ pub(super) fn report_ops_experiments_with(
 /// introductory declarations through the library graph). Returns the second
 /// unit's report: the augmentation rows land on the declaring file.
 pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport {
+    augment_rig(main, augment_source, &[]).1
+}
+
+/// [`report_ops_augment`] with experiments on, returning the INTRODUCING
+/// unit's report (the unit whose declarations the rows anchor at).
+#[allow(dead_code)] // used by the #3203 factory-completeness pins
+pub(super) fn report_ops_augment_intro_experiments(
+    main: &str,
+    augment_source: &str,
+    experiments: &[dartq_language::Feature],
+) -> FileReport {
+    augment_rig(main, augment_source, experiments).0
+}
+
+/// The shared two-unit augmentation rig: the intro unit's report first, the
+/// augment unit's second.
+fn augment_rig(
+    main: &str,
+    augment_source: &str,
+    experiments: &[dartq_language::Feature],
+) -> (FileReport, FileReport) {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
@@ -278,7 +299,10 @@ pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport
     let scanned = scan_fixture(&source, file);
     let aug_file = files.intern(Path::new("aug.dart"));
     let aug_scanned = scan_fixture(augment_source, aug_file);
-    let set = FeatureSet::for_language_version(fixture_language_version(&source));
+    let mut set = FeatureSet::for_language_version(fixture_language_version(&source));
+    for feature in experiments {
+        set = set.with_experiment(*feature);
+    }
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(&source, &scanned.tokens, features, &strings);
     let aug_elements = collect(augment_source, &aug_scanned.tokens, features, &strings);
@@ -352,7 +376,25 @@ pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport
     );
     let mut report = fold.report;
     report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
-    report
+    let intro_ops = ResolvedTypeOps::new(&types, &strings, file);
+    let intro_fold = fold_unit_with_ops(
+        &source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(Feature::InferenceUpdate2),
+        Some(&intro_ops),
+    );
+    let mut intro = intro_fold.report;
+    intro.diagnostics = merge_source_ordered(intro_fold.parse_diagnostics, intro.diagnostics);
+    (intro, report)
 }
 
 /// The diagnostic code names of `report` in source order.

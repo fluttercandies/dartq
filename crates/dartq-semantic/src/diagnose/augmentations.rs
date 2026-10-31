@@ -1459,14 +1459,29 @@ fn factory_body_diagnostics(
                 complete |= aug.is_complete;
             }
         }
-        if complete || fragments > 0 {
+        if complete {
             continue;
         }
         let Some(head) = target.head_range else {
             continue;
         };
-        let code = SemanticCode::FactoryWithoutBody;
-        out.push(row(file, head, code, code.message("", "")));
+        // A chain that grew past the introductory declaration is the
+        // `factory_not_complete_after_augmentations` face
+        // (error_verifier.dart:5101-5106): the same anchor, the message
+        // naming the selector (the unnamed face reads `new`).
+        let (code, message) = if fragments > 0 {
+            let spelled = strings.resolve(target.name);
+            let display = match target.container {
+                Some(container) if spelled == strings.resolve(container) => "new",
+                _ => spelled,
+            };
+            let code = SemanticCode::FactoryNotCompleteAfterAugmentations;
+            (code, code.message(display, ""))
+        } else {
+            let code = SemanticCode::FactoryWithoutBody;
+            (code, code.message("", ""))
+        };
+        out.push(row(file, head, code, message));
     }
     out
 }

@@ -513,6 +513,14 @@ pub enum SemanticCode {
     /// (`error_verifier.dart:5088-5107`, anchored at `node.errorRange`;
     /// `SYNTACTIC_ERROR` tier, diagnostic.g.dart:6194-6203, unpublished).
     FactoryWithoutBody,
+    /// `The factory constructor '{0}' must have a body or redirection after
+    /// all augmentations are applied.` — an introductory factory whose
+    /// fragment chain still has no complete fragment once every augment is
+    /// merged (`error_verifier.dart:5101-5106`, the same `node.errorRange`
+    /// anchor; `COMPILE_TIME_ERROR` tier, diagnostic.g.dart:6155-6166,
+    /// unpublished; `{0}` is the selector, the unnamed face reading
+    /// `new`).
+    FactoryNotCompleteAfterAugmentations,
     /// `The extension type representation can't depend on itself.` — the
     /// representation field's declared type is the extension type itself
     /// (`error_verifier.dart:5343-5354`; the M1 name-level approximation of
@@ -2129,6 +2137,10 @@ impl SemanticCode {
                 "REPRESENTATION_FIELD_TRAILING_COMMA",
             ),
             Self::FactoryWithoutBody => ("factory_without_body", "FACTORY_WITHOUT_BODY"),
+            Self::FactoryNotCompleteAfterAugmentations => (
+                "factory_not_complete_after_augmentations",
+                "FACTORY_NOT_COMPLETE_AFTER_AUGMENTATIONS",
+            ),
             Self::ExtensionTypeRepresentationDependsOnItself => (
                 "extension_type_representation_depends_on_itself",
                 "EXTENSION_TYPE_REPRESENTATION_DEPENDS_ON_ITSELF",
@@ -2787,6 +2799,9 @@ impl SemanticCode {
                 // carry none either (diagnostic.g.dart:6194-6203/:14963-14971).
                 | Self::FactoryWithoutBody
                 | Self::RepresentationFieldTrailingComma
+                // `factoryNotCompleteAfterAugmentations` carries none either
+                // (diagnostic.g.dart:6155-6166).
+                | Self::FactoryNotCompleteAfterAugmentations
                 // `inconsistentInheritanceGetterAndMethod` carries no
                 // published docs (`messages.yaml` hasPublishedDocs: false).
                 | Self::InconsistentInheritanceGetterAndMethod
@@ -3358,6 +3373,14 @@ impl SemanticCode {
                 registry_message("representation_field_trailing_comma")
             }
             Self::FactoryWithoutBody => registry_message("factory_without_body"),
+            // Outside the syntax-tier table (`analyzer-codes.tsv` carries
+            // it, `syntax-codes.tsv` does not): the text is local.
+            Self::FactoryNotCompleteAfterAugmentations => {
+                format!(
+                    "The factory constructor '{a0}' must have a body or redirection after all \
+                     augmentations are applied."
+                )
+            }
             // No-argument flow row (diagnostic.g.dart:3546).
             Self::DeadCode => "Dead code.".to_string(),
             Self::UseOfVoidResult => {
@@ -4911,6 +4934,7 @@ mod tests {
             SemanticCode::ExpectedRepresentationType,
             SemanticCode::RepresentationFieldTrailingComma,
             SemanticCode::FactoryWithoutBody,
+            SemanticCode::FactoryNotCompleteAfterAugmentations,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,
             SemanticCode::ExtensionTypeImplementsNotSupertype,
             SemanticCode::InheritsAbstractMemberOne,
@@ -5217,6 +5241,7 @@ mod tests {
         SemanticCode::ExpectedRepresentationType,
         SemanticCode::RepresentationFieldTrailingComma,
         SemanticCode::FactoryWithoutBody,
+        SemanticCode::FactoryNotCompleteAfterAugmentations,
         SemanticCode::ExtensionTypeRepresentationDependsOnItself,
         SemanticCode::InheritsAbstractMemberOne,
         SemanticCode::InheritsAbstractMemberTwo,
@@ -5361,6 +5386,13 @@ mod tests {
         assert_eq!(
             SemanticCode::FactoryWithoutBody.message("", ""),
             "A non-redirecting 'factory' constructor must have a body."
+        );
+        // #3203: the chain arm interpolates the selector (the unnamed face
+        // reading `new` — `diagnostic.g.dart:6155-6166`).
+        assert_eq!(
+            SemanticCode::FactoryNotCompleteAfterAugmentations.message("named", ""),
+            "The factory constructor 'named' must have a body or redirection after all \
+             augmentations are applied."
         );
         assert_eq!(
             SemanticCode::WrongNumberOfTypeArguments.message3("C", "2", "1"),
@@ -5760,6 +5792,7 @@ mod tests {
             | SemanticCode::ExpectedRepresentationType
             | SemanticCode::RepresentationFieldTrailingComma
             | SemanticCode::FactoryWithoutBody
+            | SemanticCode::FactoryNotCompleteAfterAugmentations
             | SemanticCode::ExtensionOverrideArgumentNotAssignable
             | SemanticCode::ExtensionTypeDeclaresMemberOfObject
             | SemanticCode::ExtensionTypeRepresentationDependsOnItself
@@ -6083,6 +6116,7 @@ mod tests {
             SemanticCode::ExpectedRepresentationType,
             SemanticCode::RepresentationFieldTrailingComma,
             SemanticCode::FactoryWithoutBody,
+            SemanticCode::FactoryNotCompleteAfterAugmentations,
             SemanticCode::ExtensionOverrideArgumentNotAssignable,
             SemanticCode::ExtensionTypeDeclaresMemberOfObject,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,

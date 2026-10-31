@@ -20,7 +20,9 @@
 //! `factory` keyword through the name, the unnamed spellings collapsing to
 //! the single token that is present.
 
-use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops, report_ops_experiments_with};
+use crate::diagnose::test_rig::{
+    CORE_PRELUDE, report_ops, report_ops_augment_intro_experiments, report_ops_experiments_with,
+};
 use crate::FileReport;
 use dartq_language::Feature;
 
@@ -129,6 +131,76 @@ fn factory_without_body_needs_the_augmentations_experiment() {
     let report = report_ops(source);
     assert!(
         rows(&report, "factory_without_body").is_empty(),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+/// The chain arm (#3203): an introductory factory plus a body-less
+/// `augment` leaves two incomplete fragments, so the sibling code fires at
+/// the same head with the selector named (oracle 3.13.7: "The factory
+/// constructor 'named' must have a body or redirection after all
+/// augmentations are applied.").
+#[test]
+fn factory_not_complete_after_augmentations_names_the_selector() {
+    let main = "class A {\n  factory named();\n}\n";
+    let aug = "augment class A {\n  augment factory named();\n}\n";
+    let report =
+        report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
+    assert_eq!(
+        rows(&report, "factory_not_complete_after_augmentations"),
+        vec![(at(main, "factory named"), 13)],
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range.offset, d.range.length, d.message.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let message = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "factory_not_complete_after_augmentations")
+        .map(|d| d.message.to_string())
+        .expect("row");
+    assert!(
+        message.contains("'named'") && message.ends_with("augmentations are applied."),
+        "{message}"
+    );
+}
+
+/// The unnamed face reads `new` (probe: `factory A();` + augment).
+#[test]
+fn factory_not_complete_after_augmentations_names_new() {
+    let main = "class A {\n  factory A();\n}\n";
+    let aug = "augment class A {\n  augment factory A();\n}\n";
+    let report =
+        report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
+    let message = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "factory_not_complete_after_augmentations")
+        .map(|d| d.message.to_string())
+        .expect("row");
+    assert!(message.contains("'new'"), "{message}");
+    assert_eq!(
+        rows(&report, "factory_not_complete_after_augmentations"),
+        vec![(at(main, "factory A()") + 8, 1)],
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+/// An `augment` that supplies a body completes the chain — no row at all.
+#[test]
+fn completing_augment_leaves_no_row() {
+    let main = "class A {\n  factory named();\n}\n";
+    let aug = "augment class A {\n  augment factory named() => throw 0;\n}\n";
+    let report =
+        report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
+    assert!(
+        rows(&report, "factory_without_body").is_empty()
+            && rows(&report, "factory_not_complete_after_augmentations").is_empty(),
         "{:?}",
         report.diagnostics
     );
