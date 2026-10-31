@@ -2757,6 +2757,13 @@ mod ticket_3066_tests;
 #[path = "ticket_3103_tests.rs"]
 mod ticket_3103_tests;
 
+/// #3146 pins: `duplicate_definition` statement-list rows — the fold must
+/// drop only the rows the `l1` bake re-issues, never the staged
+/// statement-list duplicates.
+#[cfg(test)]
+#[path = "ticket_3146_tests.rs"]
+mod ticket_3146_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

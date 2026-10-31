@@ -42,6 +42,11 @@
 //! duplicate log into its report front; the bake in
 //! `l1::duplicate_diagnostics` is the single source, so the fold drops the
 //! re-issued `duplicate_definition`s and passes everything else through.
+//! The statement-list rows (`stage_local_duplicate` — block bodies,
+//! for-head lists, pattern-decl elements) share the same code but never
+//! land in the element model's duplicate log, so the filter matches the
+//! bake's range set exactly: only rows whose range is an
+//! `elements.duplicates()` entry get dropped.
 //! The report's names rows ([`dartq_semantic::FileReport::names`]) stay
 //! unmounted until #122 moves the names table behind dartq-index.
 //!
@@ -665,10 +670,11 @@ pub(crate) struct FoldInputs {
 
 /// One member's memoized fold (#1384): the identity the product was folded
 /// under and the product itself — the duplicate-filtered diagnostic rows
-/// (the bake in `l1::duplicate_diagnostics` is the single source, and the
-/// filter is a pure function of the report) split into the rows that report
-/// outright and the `unused_element` candidates, plus the unit use face the
-/// substrate closes per library. `names` stays unmounted exactly as the
+/// (the bake in `l1::duplicate_diagnostics` is the single source for the
+/// element-model faces; the statement-list staged rows pass through — the
+/// filter matches the bake's range set exactly) split into the rows that
+/// report outright and the `unused_element` candidates, plus the unit use
+/// face the substrate closes per library. `names` stays unmounted exactly as the
 /// live fold leaves it (#122). The rows are refcounted once here (#1501):
 /// the per-library results hold handles to these very rows, so a fold's
 /// bytes exist once across the memo, its library's run, and the merged
@@ -1047,9 +1053,16 @@ impl SemanticDiagnoser for Diagnoser {
             );
             let dartq_semantic::UnitFold { report, face, .. } = fold;
             let member_refs = report.member_refs.into();
-            // The bake in `l1::duplicate_diagnostics` is the single source,
-            // so the fold drops the re-issued rows; the filtered set is
-            // what the memo stores. The `unused_element` candidates split
+            // The bake in `l1::duplicate_diagnostics` is the single source
+            // for the element-model duplicates (the capture-time
+            // `elements.duplicates()` log — top-level, member, formal,
+            // type-param, catch faces), so the fold drops the rows the
+            // bake re-issues. The statement-list rows
+            // (`stage_local_duplicate` — block bodies, for-head lists,
+            // pattern-decl elements) share the same code but never enter
+            // the capture log, so the drop matches the bake's range set
+            // exactly: a row whose range is not an `elements.duplicates()`
+            // entry passes through. The `unused_element` candidates split
             // off here (#2156) — the per-file verdict stays the fire
             // decision, the library close below owns the release — and
             // each candidate rides the declaration name its verdict
@@ -1060,8 +1073,22 @@ impl SemanticDiagnoser for Diagnoser {
             let mut candidates: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
             let mut field_rows: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
             let mut import_rows: Vec<Arc<Diagnostic>> = Vec::new();
+            // `SourceRange` is not `Hash`; pack the (offset, length) pair
+            // into a `u64` key — the bake's range set is tiny (one entry
+            // per capture-time duplicate), so the pack is free.
+            let baked_ranges: FxHashSet<u64> = facts
+                .elements
+                .duplicates()
+                .iter()
+                .map(|dup| (u64::from(dup.range.offset) << 32) | u64::from(dup.range.length))
+                .collect();
             for diagnostic in report.diagnostics {
-                if diagnostic.code.name == duplicate {
+                if diagnostic.code.name == duplicate
+                    && baked_ranges.contains(
+                        &((u64::from(diagnostic.range.offset) << 32)
+                            | u64::from(diagnostic.range.length)),
+                    )
+                {
                     continue;
                 }
                 let row = Arc::new(diagnostic);
