@@ -2057,12 +2057,17 @@ impl<'a> Engine<'a> {
         else {
             return false;
         };
-        // A nullable `this` (`on C?`, an unbounded `on T`) reads a
-        // possibly-null receiver — the `unchecked_use_of_nullable_value`
-        // family owns that face; a bare miss stays reportable there.
-        if receiver_nullable {
-            return false;
-        }
+        // A nullable `this` (`on C?`, an unbounded `on T`) resolves an
+        // extension member through the nullable type exactly like a
+        // non-null one: the official member lookup consults the `Object`
+        // members and then the extension pool against the potentially
+        // nullable receiver type itself, so a face whose `on` clause
+        // accepts the `?` spelling answers there (upstream Dart SDK
+        // source, pkg/analyzer/lib/src/dart/resolver/
+        // type_property_resolver.dart:96-112). A non-nullable `on C` face
+        // never applies to `C?` (`C?` is not a subtype of `C`), which the
+        // `probe` gate below enforces — such a miss keeps the
+        // `unchecked_use_of_nullable_value` face.
         // The oracle gates application on the receiver resolving at its
         // head — an `InvalidType` `this` applies no extension. The bare
         // head resolved to the enclosing container by construction, so
@@ -2166,8 +2171,43 @@ impl<'a> Engine<'a> {
             if !face.members.contains_key(&name) {
                 return false;
             }
-            // Receiver nullability already returned above; against a
-            // non-nullable `this` both `on` nullability faces apply.
+            // An `on` clause that names one of the face's own type
+            // parameters (`extension E<T> on T`) instantiates that parameter
+            // with the receiver's type, so the applicability question is the
+            // parameter's declared bound (`_getApplicable`'s
+            // `tryChooseFinalTypes` inference): an absent bound
+            // ([`Ty::Dynamic`], the unbounded marker — the implicit `Object?`
+            // the model reads) admits every receiver, nullable included; a
+            // written bound admits the receivers reaching its head, and under
+            // a nullable `this` only a bound that is itself nullable (`T
+            // extends C?`) keeps the face. A bound over the parameter's own
+            // face (`T extends Comparable<T>`) is beyond the head-level gate
+            // and keeps the miss.
+            if let Some(index) = face.type_param_names.iter().position(|&param| param == on) {
+                let Some(&bound) = face.type_param_bounds.get(index) else {
+                    return false;
+                };
+                return match bound {
+                    Ty::Dynamic => arg_applicable(face, file),
+                    Ty::Named {
+                        name: bound_head,
+                        nullable: bound_nullable,
+                        args,
+                    } => {
+                        args == ArgListId::EMPTY
+                            && (!receiver_nullable || bound_nullable)
+                            && reaches(receiver, bound_head)
+                            && arg_applicable(face, file)
+                    }
+                    _ => false,
+                };
+            }
+            // The clause's own nullability: a written `on C?` applies to both
+            // receiver spellings, a non-nullable `on C` only to the non-null
+            // one (`C?` is not a subtype of `C`).
+            if receiver_nullable && !face.on_type_nullable {
+                return false;
+            }
             reaches(receiver, on) && arg_applicable(face, file)
         };
         let unit_has = |file: FileId| -> bool {
@@ -4698,4 +4738,209 @@ fn trim_value_ws(bytes: &[u8], start: usize, end: usize) -> usize {
         start += 1;
     }
     start
+}
+
+/// The implicit-`this` extension-application verdicts of
+/// [`Engine::this_extension_member_applies`], with every face declared in an
+/// **imported** library: the bare name must then resolve through the
+/// extension pool (`resolve_bare`'s same-file `has_extension_member` guard
+/// stays out of the way), so the oracle's application verdict is the only
+/// decision under test.
+///
+/// Oracle provenance: `dart analyze` 3.13.1 over the two-file shapes below —
+/// `extension OnNullable on C? { int get extra => 42; }` read from inside
+/// another `on C?` body is silent, the same read through a non-nullable
+/// `on C` face reports `unchecked_use_of_nullable_value` +
+/// `undefined_identifier`, `extension Unbounded<T> on T` applies to a
+/// nullable `this` and to an ordinary class body alike, and
+/// `extension Bounded<T extends C> on T` rejects both the nullable `C?`
+/// spelling and a class outside `C`.
+#[cfg(test)]
+mod implicit_this_extension_tests {
+    use super::test_rig::{RigImport, code_names, report_ops_imports};
+
+    const FACES: &str = "class C {}\n\
+         extension OnNullable on C? {\n\
+         \x20 int get extra => 42;\n\
+         \x20 void poke() {}\n\
+         }\n\
+         extension OnPlain on C {\n\
+         \x20 int get plain => 7;\n\
+         }\n\
+         extension Unbounded<T> on T {\n\
+         \x20 int get mem => 0;\n\
+         }\n\
+         extension Bounded<T extends C> on T {\n\
+         \x20 int get bmem => 0;\n\
+         }\n\
+         extension NullableBound<T extends C?> on T {\n\
+         \x20 int get nmem => 0;\n\
+         }\n";
+
+    /// Diagnoses `source` (the main unit) against the shared face library.
+    fn report(source: &str) -> super::FileReport {
+        report_ops_imports(
+            source,
+            &[RigImport {
+                uri: "package:a/faces.dart",
+                prefix: None,
+                source: FACES,
+            }],
+        )
+    }
+
+    fn has(report: &super::FileReport, code: &str) -> bool {
+        code_names(report).contains(&code)
+    }
+
+    fn assert_silent_on(report: &super::FileReport, codes: &[&str]) {
+        let names = code_names(report);
+        for code in codes {
+            assert!(!names.contains(code), "unexpected {code}: {names:?}");
+        }
+    }
+
+    fn assert_reports(report: &super::FileReport, codes: &[&str]) {
+        let names = code_names(report);
+        for code in codes {
+            assert!(names.contains(code), "missing {code}: {names:?}");
+        }
+    }
+
+    /// A written `on C?` face applies to a nullable `this`: the property
+    /// read resolves, so neither the lexical miss nor the nullable
+    /// dereference reports.
+    #[test]
+    fn nullable_on_face_applies_to_nullable_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             extension E on C? {\n\
+             \x20 void g() {\n\
+             \x20   extra;\n\
+             \x20 }\n\
+             }\n");
+        assert_silent_on(
+            &report,
+            &["undefined_identifier", "unchecked_use_of_nullable_value"],
+        );
+    }
+
+    /// The same law for an invocation member.
+    #[test]
+    fn nullable_on_face_method_applies_to_nullable_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             extension E on C? {\n\
+             \x20 void g() {\n\
+             \x20   poke();\n\
+             \x20 }\n\
+             }\n");
+        assert_silent_on(
+            &report,
+            &["undefined_identifier", "undefined_method", "unchecked_use_of_nullable_value"],
+        );
+    }
+
+    /// An unbounded `on T` face instantiates to the nullable receiver (the
+    /// parameter's implicit `Object?` bound admits `C?`).
+    #[test]
+    fn unbounded_on_param_face_applies_to_nullable_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             extension E on C? {\n\
+             \x20 void g() {\n\
+             \x20   mem;\n\
+             \x20 }\n\
+             }\n");
+        assert_silent_on(
+            &report,
+            &["undefined_identifier", "unchecked_use_of_nullable_value"],
+        );
+    }
+
+    /// A nullable written bound (`T extends C?`) admits the nullable
+    /// receiver — the bound its own `?` spelling satisfies.
+    #[test]
+    fn nullable_bound_on_param_face_applies_to_nullable_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             extension E on C? {\n\
+             \x20 void g() {\n\
+             \x20   nmem;\n\
+             \x20 }\n\
+             }\n");
+        assert_silent_on(
+            &report,
+            &["undefined_identifier", "unchecked_use_of_nullable_value"],
+        );
+    }
+
+    /// A non-nullable `on C` face never applies to a nullable `this` (`C?`
+    /// is not a subtype of `C`): the dereference reports unchecked and the
+    /// name stays undefined.
+    #[test]
+    fn non_nullable_on_face_rejects_nullable_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             extension E on C? {\n\
+             \x20 void g() {\n\
+             \x20   plain;\n\
+             \x20 }\n\
+             }\n");
+        assert_reports(
+            &report,
+            &["undefined_identifier", "unchecked_use_of_nullable_value"],
+        );
+    }
+
+    /// A non-nullable written bound (`T extends C`) rejects the nullable
+    /// receiver the same way.
+    #[test]
+    fn non_nullable_bound_on_param_face_rejects_nullable_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             extension E on C? {\n\
+             \x20 void g() {\n\
+             \x20   bmem;\n\
+             \x20 }\n\
+             }\n");
+        assert_reports(
+            &report,
+            &["undefined_identifier", "unchecked_use_of_nullable_value"],
+        );
+    }
+
+    /// An unbounded `on T` face applies to an ordinary non-nullable `this`
+    /// too: the parameter instantiates to the receiver's type.
+    #[test]
+    fn unbounded_on_param_face_applies_to_class_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             class D {\n\
+             \x20 void m() {\n\
+             \x20   mem;\n\
+             \x20 }\n\
+             }\n");
+        assert_silent_on(&report, &["undefined_identifier"]);
+    }
+
+    /// The parameter's written bound still orders real receivers: a class
+    /// outside `C` applies no face, so the bare name stays undefined.
+    #[test]
+    fn bounded_on_param_face_rejects_out_of_bound_class_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             class D {\n\
+             \x20 void n() {\n\
+             \x20   bmem;\n\
+             \x20 }\n\
+             }\n");
+        assert_reports(&report, &["undefined_identifier"]);
+    }
+
+    /// A bound subtype reaches the bounded face: the reader class is
+    /// irrelevant — the *member* the face declares resolves the bare name
+    /// through the receiver's bound relation.
+    #[test]
+    fn unbounded_on_param_face_applies_to_bound_subtype_class_this() {
+        let report = report("import 'package:a/faces.dart';\n\
+             class Decl extends C {\n\
+             \x20 void m() {\n\
+             \x20   mem;\n\
+             \x20 }\n\
+             }\n");
+        assert_silent_on(&report, &["undefined_identifier"]);
+    }
 }
