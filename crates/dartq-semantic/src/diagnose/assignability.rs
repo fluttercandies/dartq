@@ -829,16 +829,20 @@ impl<'a> Engine<'a> {
     /// The `Never` type identity at name level: the non-nullable `Never`
     /// spelling (`identical(receiverType, NeverTypeImpl.instance)`;
     /// `Never?` interns as `Null`, so the nullable projection never
-    /// answers yes).
+    /// answers yes). Both interned faces answer — the `Ty::Named` written
+    /// spelling and the canonical [`Ty::Never`] variant (a `throw`'s row
+    /// rewrite, a normalized promotion staging, or the resolved seam's
+    /// `TypeKind::Never` fold, resolved_ops.rs:6606).
     pub(crate) fn is_never_ty(&self, ty: Ty) -> bool {
-        matches!(
-            ty,
+        match ty {
+            Ty::Never => true,
             Ty::Named {
                 name,
                 nullable: false,
                 ..
-            } if name == self.intern("Never")
-        )
+            } => name == self.intern("Never"),
+            _ => false,
+        }
     }
 
     /// The non-null face of a semantic type (#1409): the nullable named
@@ -1893,13 +1897,35 @@ impl<'a> Engine<'a> {
     /// Stages the never-receiver junction (`receiverOfTypeNever`,
     /// messages.yaml :29566). The staged check re-decides at the teardown
     /// join, where a promoted-read fact on the receiver's exact span
-    /// replaces the type — the official read's flow-aware staticType. Only
-    /// a parse-time `Never` receiver stages: a non-`Never` type could only
-    /// fire through a promotion substitution, and #477's drop rule keeps
-    /// promoted-to-`Never` facts out of the staging, so staging those rows
-    /// would be dead weight on every junction.
+    /// replaces the type — the official read's flow-aware staticType.
+    ///
+    /// Two gates reproduce the official decision order at its five entry
+    /// points (`property_element_resolver.dart:189` index,
+    /// `method_invocation_resolver.dart:195` send,
+    /// `function_expression_invocation_resolver.dart:81` function position,
+    /// `binary_expression_resolver.dart:454` operator, and the
+    /// prefix/postfix increment faces `prefix_expression_resolver.dart:183`
+    /// / `postfix_expression_resolver.dart:134`):
+    ///
+    /// * **Face** — the Never check exists only where upstream's resolver
+    ///   consults `identical(type, NeverTypeImpl.instance)`: a plain
+    ///   property read or write (`x.foo`, `x.foo = v`, `x.hashCode`) walks
+    ///   `_resolve`'s member path, which carries no Never arm — and the
+    ///   `!` operand routes through `_resolveNegation` the same way. Both
+    ///   stay silent upstream (the dead-code row reports instead), so the
+    ///   staging skips them; every other spelling (member invocation,
+    ///   index, operator, increment, function position) is a fire face.
+    /// * **Type** — the receiver's parse-time `Never` is the ordinary arm;
+    ///   a promotable local read (`local_hits`) stages too, so the join can
+    ///   substitute the flow's promoted `Never` — a local read's
+    ///   `typeOrThrow` answers the promoted static type (an inferred-`Never`
+    ///   `var x = throw` read, or a `Never` the staged `promotions` join
+    ///   carries).
     pub(crate) fn stage_receiver_of_type_never(&mut self, at: SourceRange, receiver: Ty) {
-        if !self.is_never_ty(receiver) {
+        if !(self.is_never_ty(receiver) || self.promotable_read_at(at)) {
+            return;
+        }
+        if !self.never_receiver_face(at) {
             return;
         }
         self.staged_checks.push(StagedCheck {
@@ -1909,6 +1935,113 @@ impl<'a> Engine<'a> {
             to: Ty::UNKNOWN,
             literal: false,
         });
+    }
+
+    /// Whether the receiver span is a promotable read the flow layer can
+    /// carry a `Never` promotion on — a bare local (or parameter) read,
+    /// `local_hits`-keyed. A parenthesized receiver's inner read (`(x).m()`)
+    /// hits inside the group's span. Only a local read can promote to
+    /// `Never` upstream (`PromotedPropertyRead` promotes to non-null only,
+    /// and `this` never promotes), so member/`this`/top-level receivers
+    /// need no staging for the flow arm.
+    fn promotable_read_at(&self, at: SourceRange) -> bool {
+        self.local_hits.contains_key(&at.offset)
+            || self
+                .local_hits
+                .keys()
+                .any(|offset| at.offset < *offset && *offset < at.end())
+    }
+
+    /// The face gate of [`Self::stage_receiver_of_type_never`]: reads the
+    /// source past the receiver span. A member-access continuation
+    /// (`recv.name` / `recv?.name` / `recv..name`) fires only when the
+    /// member is INVOKED (or carried through a type-argument group into a
+    /// call) — upstream's property `_resolve` reports nothing on a `Never`
+    /// receiver, its method/index/send resolvers do. Everything else
+    /// (operator operands, function-position `x(...)`, index `x[...]`,
+    /// prefix/postfix increments) is a fire face except the bare `!x`
+    /// operand, whose `_resolveNegation` path reports `non_bool_negation`,
+    /// never `receiver_of_type_never`.
+    fn never_receiver_face(&self, at: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(at.end());
+        // Member-access continuation: `.` or `?.` (plus the cascade `..`),
+        // whitespace-tolerant (`x\n.foo()` merges identically).
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let dot = match bytes.get(i) {
+            Some(b'.') => {
+                i += 1;
+                true
+            }
+            Some(b'?') if bytes.get(i + 1) == Some(&b'.') => {
+                i += 2;
+                true
+            }
+            _ => false,
+        };
+        if dot {
+            if bytes.get(i) == Some(&b'.') {
+                i += 1; // cascade section `..`
+            }
+            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            while bytes
+                .get(i)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+            {
+                i += 1;
+            }
+            // A generic send's type-argument group (`x.foo<T>(…)`) stands
+            // between the member and its `(` — the `<` is a generic group
+            // only when a `>(` closes it; `x.foo < y` is the operator face
+            // (upstream's own `<`-lookahead rule decides identically).
+            if bytes.get(i) == Some(&b'<') {
+                let mut depth = 0u32;
+                let mut j = i;
+                return loop {
+                    match bytes.get(j) {
+                        Some(b'<') => depth += 1,
+                        Some(b'>') => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break bytes.get(j + 1) == Some(&b'(');
+                            }
+                        }
+                        // A `(`/`;`/terminator inside the group means the
+                        // `<` was the binary operator — the member resolves
+                        // as a getter access upstream (silent), not a send.
+                        Some(b'(' | b')' | b';' | b'{' | b'}' | b'[' | b']') | None => {
+                            break false;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                };
+            }
+            return bytes.get(i) == Some(&b'(');
+        }
+        // The logical operators: `&&`/`||` resolve through
+        // `_resolveLogicalAnd`/`_resolveLogicalOr`, which carry no Never
+        // arm — the receiver read's flow state feeds the branch, not a
+        // member consult. (`&`/`|` single are user-definable operators and
+        // DO fire; only the doubled spellings are silent.)
+        if (bytes.get(i) == Some(&b'&') && bytes.get(i + 1) == Some(&b'&'))
+            || (bytes.get(i) == Some(&b'|') && bytes.get(i + 1) == Some(&b'|'))
+        {
+            return false;
+        }
+        // Not a member access: every remaining junction is a fire face
+        // (binary operators, prefix `-`/`~`/`++`/`--`, postfix `++`/`--`,
+        // function position, index) except the bare `!x` operand —
+        // distinguishable only by the `!` abutting the receiver's front.
+        let mut j = self.byte_of(at.offset);
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        bytes.get(j.wrapping_sub(1)) != Some(&b'!')
     }
 
     /// Arms the pending type head: the identifier just parsed a type

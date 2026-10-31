@@ -17796,3 +17796,15 @@ mod ticket_3255_tests;
 #[cfg(test)]
 #[path = "ticket_3250_tests.rs"]
 mod ticket_3250_tests;
+
+// The #3237 pins (the `receiver_of_type_never` receiver-read widening:
+// the canonical `Ty::Never` variant `is_never_ty` now covers — a `throw`
+// receiver's row rewrite, an inferred-`Never` `var x = throw`, a
+// `Never`-returning call — and the member-invoke face discrimination that
+// keeps the property read/write, `!`, `&&`/`||` faces silent upstream).
+// Registered here because `diagnose.rs` is a live-lane file out of this
+// ticket's write scope; `#[path]` keeps the module inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3237_tests.rs"]
+mod ticket_3237_tests;

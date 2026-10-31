@@ -5004,12 +5004,19 @@ pub(crate) fn staged_promotion_typed(
         // promoted type the nullability decision produces.
         FlowBase::Function => return Some(Ty::UNKNOWN),
         FlowBase::Unknown => return Some(Ty::UNKNOWN),
-        // The drop rule: the official promotion only subtype-narrows
-        // (`type_system.dart:1729` `tryPromoteToType`), so a `void`
-        // promotion cannot arise, and a `Never` promotion marks a path
-        // this verifier does not reach — the M1 lattice has no such source
-        // type, and staging one would decide from a fiction.
-        FlowBase::Void | FlowBase::Never => return None,
+        // A `void` promotion cannot arise (`tryPromoteToType` only
+        // subtype-narrows, type_system.dart:1729) — the drop rule stands.
+        FlowBase::Void => return None,
+        // `Never` is a real flow type the consumer faces read: a `Null`
+        // receiver promoted to non-null (`x != null` on `Null x` types the
+        // read `Never`, promote_to_non_null's `Base::Null → NEVER` arm), an
+        // `is Never` test, and an impossible-branch factor all stage it.
+        // `typeOrThrow` answers `Never` there, so the staged-check join —
+        // `receiver_of_type_never` first, and every assignability face the
+        // bottom-type vacuously cleans (`Never <: T`, subtype.dart Right
+        // Bottom) — needs the spelled type, not a drop. `Never?` spells
+        // `Null` at this layer (the same fold resolved_ops.rs:6606 makes).
+        FlowBase::Never => return Some(if ty.nullable { Ty::Null } else { Ty::Never }),
     };
     let args = intern_flow_args(args, flow, strings, invalid, pool)?;
     Some(Ty::Named {
