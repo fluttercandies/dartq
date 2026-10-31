@@ -918,6 +918,32 @@ impl Interp<'_> {
                 let cur = self.current.clone();
                 self.join_unmatched(cur);
             }
+            // The dotted-read channel: a promotable property scrutinee
+            // (`switch (x.y)` — official `promoteForPattern` runs the same
+            // type-test arm on the property's promotion key, whose upstream
+            // lattice promotes the slot to the required type). The
+            // name-level property chain spells only the non-null marker —
+            // a non-nullable head writes it on the matched arm exactly
+            // like `x.y != null`'s null check (`promote_prop_non_null`),
+            // and the receiver/slot capture gates refuse the same cases
+            // upstream's `info.writeCaptured` bail does.
+            if !known.nullable
+                && let Some(slot) = self.pattern_scrutinee_prop()
+            {
+                let receiver = self.props[slot as usize].0;
+                let captured = self.prop_target_captured(receiver)
+                    || self.current.prop(slot).captured();
+                if !captured {
+                    self.current = self.current.clone().promote_prop_non_null(
+                        self.ops,
+                        &mut self.lists,
+                        slot,
+                        Ty::UNKNOWN,
+                        self.args,
+                        self.names,
+                    );
+                }
+            }
             return;
         };
         let model = self.current.model(var);
@@ -1320,6 +1346,25 @@ impl Interp<'_> {
                 self.pattern.as_ref().and_then(|p| p.scrutinee)
             }
             None => None,
+        }
+    }
+
+    /// The matched value's property slot — the dotted-read scrutinee's
+    /// promotion key (`switch (x.y)`, [`Interp::prop_slot`]): the same
+    /// question [`Self::pattern_scrutinee`] answers for a bare-read
+    /// scrutinee, keyed on the property slot a promotable member read
+    /// latches. Only the switch kinds carry it — a standalone context's
+    /// `scrutinee` latch never names a property.
+    fn pattern_scrutinee_prop(&self) -> Option<u32> {
+        match self.pattern.as_ref().map(|p| p.kind) {
+            Some(PatternKind::Switch | PatternKind::SwitchExpr) => {
+                self.switch_frame()
+                    .and_then(|index| match &self.stack[index] {
+                        Frame::Switch { scrutinee_prop, .. } => *scrutinee_prop,
+                        _ => None,
+                    })
+            }
+            _ => None,
         }
     }
 

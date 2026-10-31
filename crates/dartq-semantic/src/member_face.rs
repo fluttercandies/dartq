@@ -294,7 +294,7 @@ pub(crate) fn core_member_return(head: &str, member: &str) -> Option<CoreRet> {
 /// `[]`/`[]=` on `Map`, the `num` arithmetic/comparison set plus `int`'s
 /// bit operators, `[]`/`+`/`*` on `String`, `&`/`|`/`^` on `bool`), or
 /// `undefined_operator` mis-decides a declared operator as absent (#2235).
-pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
+pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 14] = [
     (
         "Object",
         &["hashCode", "runtimeType", "noSuchMethod", "toString", "=="],
@@ -751,6 +751,30 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
             "whenComplete",
         ],
     ),
+    // The `FutureOr<T>` union typedef (sdk/lib/async/future.dart:29): the
+    // front end synthesizes its element face into `Future`'s interface
+    // plus `T`'s — at the name level the member set resolves to `Future`'s
+    // own row (`x.then(...)` over a `FutureOr<T>` receiver resolves
+    // `defined`, `type_property_resolver.dart`'s receiver-type member
+    // walk). Carrying the `Future` row verbatim is the oracle's
+    // `FutureOr`-member verdict: only `T`'s own members would differ, and
+    // the name level cannot see them.
+    (
+        "FutureOr",
+        &[
+            "asStream",
+            "catchError",
+            "hashCode",
+            "ignore",
+            "noSuchMethod",
+            "onError",
+            "runtimeType",
+            "then",
+            "timeout",
+            "toString",
+            "whenComplete",
+        ],
+    ),
     // The `dart:collection` interface faces (unindexed like `dart:core`):
     // `Queue`'s declared members plus the `Iterable` set it re-exports —
     // `class Q implements Queue { @override add }` must not over-report
@@ -828,8 +852,20 @@ pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", 
 /// is `(container, member, return head)` from the reference SDK
 /// (`sdk/lib/core/errors.dart:375`); the answer is the non-nullable named
 /// head the declared return spells.
-pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 1] =
-    [("RangeError", "checkValidRange", "int")];
+pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 3] = [
+    ("RangeError", "checkValidRange", "int"),
+    // `sdk/lib/core/errors.dart:117` — `static Never throwWithStackTrace`:
+    // the send types `Never`, so the assignment/return tail reads the
+    // flow's never-completion face (a `return Error.throwWithStackTrace`
+    // never needs the body's own return — http/riverpod/dio census rows).
+    ("Error", "throwWithStackTrace", "Never"),
+    // `sdk/lib/async/future.dart:392` — `factory Future.error(...)`: the
+    // declared return is `Future<T>`; at the name level the `Future` head
+    // spells it (the factory's `_Future<T>.immediateError` body never
+    // completes a value, but the send's TYPE is `Future<T>` — the
+    // tail's verdict reads the `Future` head, not `Never`).
+    ("Future", "error", "Future"),
+];
 
 /// The dart:core generic containers' own type parameters, in declaration
 /// order (`sdk/lib/core/map.dart`'s `abstract class Map<K, V>`, …). The

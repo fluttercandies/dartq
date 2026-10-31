@@ -33,6 +33,15 @@ mod ticket_2500_tests;
 #[path = "ticket_2516_tests.rs"]
 mod ticket_2516_tests;
 
+/// The #2498 pins (the A8-family handback consolidation's two landed
+/// faces: the `Error.throwWithStackTrace`/`Future.error` SDK static
+/// returns plus the object-pattern `NamedType` arity verdict —
+/// `case Box<int, String>():` emitting `wrong_number_of_type_arguments`
+/// through the `pending_pattern_type_args` latch).
+#[cfg(test)]
+#[path = "ticket_2498_tests.rs"]
+mod ticket_2498_tests;
+
 /// Where one merged constraint came from — upstream's
 /// `TypeConstraintOrigin` (`type_constraint.dart`), the error-message
 /// column identity. Each gather round stamps one origin; equal origins
@@ -12947,7 +12956,7 @@ impl<'a> Engine<'a> {
     /// the written prefix from the head's span and count against the
     /// prefix-scoped element when one exists; bare heads (and continuations
     /// whose prefix never registered) keep the ordinary lookup.
-    fn check_prefixed_annotation_arity(
+    pub(crate) fn check_prefixed_annotation_arity(
         &mut self,
         name: StringId,
         head_range: SourceRange,
@@ -13095,6 +13104,22 @@ impl<'a> Engine<'a> {
         // under-report posture as the merge drains' entry-drop rule).
         if head.is_none() && anchored {
             self.call_args_end(base.saturating_sub(1));
+        }
+        // A headless group inside a switch-case / if-case pattern with NO
+        // anchor row is the object pattern's own NamedType group —
+        // `case Box<int, String>():` whose `Box` head row pushes only at
+        // `handle_object_pattern` (after the group closed), leaving the
+        // arity verdict with no head to read. The group's count and span
+        // latch here for `handle_object_pattern` to consume — it anchors
+        // the group's `<` against the pattern head's token (the arity row
+        // the oracle emits as `wrong_number_of_type_arguments_element` on
+        // `NamedType`, named_type_resolver.dart `_buildTypeArguments`).
+        if head.is_none()
+            && !anchored
+            && (self.switch.case_sink_open || self.switch.pattern_depth > 0)
+        {
+            self.pending_pattern_type_args =
+                Some((count, begin.range.offset, range.end()));
         }
         // The clause-entry capture (#1289 E1): the group closed — an
         // outermost one re-arms the entry span's closer latch, consumed by

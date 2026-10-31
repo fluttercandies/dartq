@@ -387,6 +387,13 @@ pub(crate) enum Frame {
         /// key the matched-type rows answer against (#1349). Any other
         /// scrutinee shape carries no flow-visible promotion.
         scrutinee: Option<u32>,
+        /// The scrutinee's property slot when it is a promotable property
+        /// read (`switch (x.y)` — the dotted-read channel, the same
+        /// promotion target `x.y != null`'s null check writes): a matched
+        /// object pattern's non-nullable head promotes the property slot
+        /// exactly like a bare-read scrutinee's variable. Any other
+        /// scrutinee shape carries no flow-visible promotion.
+        scrutinee_prop: Option<u32>,
         /// The scrutinee's flow type at the block's open (the promoted type
         /// of a bare-read scrutinee — upstream's `scrutineeType` IS the
         /// promoted static type) beside its written-argument tree: the

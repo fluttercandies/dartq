@@ -156,6 +156,7 @@ impl<'a> Engine<'a> {
             factory_redirect_targets: FxHashSet::default(),
             group_heads: Vec::new(),
             pending_type_head: None,
+            pending_pattern_type_args: None,
             deferred_args: Vec::new(),
             arg_levels: Vec::new(),
             in_enum_element: None,

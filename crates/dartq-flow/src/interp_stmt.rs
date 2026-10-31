@@ -682,11 +682,11 @@ impl Interp<'_> {
                 // ([`Interp::is_always_exhaustive`]) — upstream's
                 // `scrutineeType` is the promoted static type, which the
                 // value's own row already carries.
-                let (scrutinee, scrutinee_ty, scrutinee_args) = self
+                let (scrutinee, scrutinee_prop, scrutinee_ty, scrutinee_args) = self
                     .exprs
                     .pop()
-                    .map_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS), |e| {
-                        (e.reference, e.ty, e.args)
+                    .map_or((None, None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS), |e| {
+                        (e.reference, e.prop, e.ty, e.args)
                     });
                 // An unmatched begin (parser recovery) scopes no block
                 // events: the block range stays empty.
@@ -701,6 +701,7 @@ impl Interp<'_> {
                     break_model: None,
                     case_shadowed: Vec::new(),
                     scrutinee,
+                    scrutinee_prop,
                     scrutinee_ty,
                     scrutinee_args,
                     pending_matched: None,
@@ -895,8 +896,13 @@ impl Interp<'_> {
                 // (`flush_null_shorts` keeps any enclosing `?` chain open).
                 self.flush_null_shorts_above(self.consumer_base(1));
                 // The scrutinee's variable is the matched-type rows'
-                // promotion key (#1349).
-                let scrutinee = self.exprs.pop().and_then(|e| e.reference);
+                // promotion key (#1349); its property slot is the
+                // dotted-read channel's promotion key (the same slot
+                // `x.y != null` promotes).
+                let (scrutinee, scrutinee_prop) = self
+                    .exprs
+                    .pop()
+                    .map_or((None, None), |e| (e.reference, e.prop));
                 let checkpoint = self.current.reach;
                 self.stack.push(Frame::Switch {
                     is_expr: true,
@@ -906,6 +912,7 @@ impl Interp<'_> {
                     break_model: None,
                     case_shadowed: Vec::new(),
                     scrutinee,
+                    scrutinee_prop,
                     scrutinee_ty: Ty::UNKNOWN,
                     scrutinee_args: crate::ty::EMPTY_ARGS,
                     pending_matched: None,

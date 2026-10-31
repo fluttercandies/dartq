@@ -7450,6 +7450,38 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(head) = head {
             engine.push_type_use(head, first_identifier.range, TypeHead::Bare);
         }
+        // The object pattern's NamedType arity face
+        // (`_buildTypeArguments`, named_type_resolver.dart — `.at(node)`):
+        // `case Box<int, String>():`'s head group closed before the head
+        // row pushed, so `end_type_arguments` latched the group's count
+        // for this close. The `<`'s offset abuts the head's own token end
+        // across trivia — consume it into the container-arity verdict
+        // (declared arity vs written count over the type node's
+        // head-through-`>` span). The container-only count keeps the
+        // resolve side-effect-free: `declared_type_params`'s `resolve_bare`
+        // arm binds the head as a resolution site (an extra resolution the
+        // oracle's pattern walk never runs — it would feed downstream
+        // verdicts the `as ValueT` cast reads differently).
+        if let Some(head) = head
+            && let Some((count, group_open, group_end)) =
+                engine.pending_pattern_type_args.take()
+            && engine.trivia_between(first_identifier.range.end(), group_open)
+            && let Some(declared) = engine.declared_type_params_of_container(head)
+            && declared != count
+        {
+            let span = SourceRange {
+                offset: first_identifier.range.offset,
+                length: group_end - first_identifier.range.offset,
+            };
+            let name_text = engine.strings.resolve(head).to_string();
+            engine.emit3(
+                SemanticCode::WrongNumberOfTypeArguments,
+                span,
+                &name_text,
+                &declared.to_string(),
+                &count.to_string(),
+            );
+        }
         // The pattern head is a `NamedType` reference (the oracle resolves
         // `ObjectPattern.type` through `visitNamedType` →
         // `_useIdentifierElement`): a resolved head counts as a name use —

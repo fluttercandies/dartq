@@ -2149,6 +2149,16 @@ pub(crate) struct Engine<'a> {
     /// The type head awaiting its group (`C` of `C<int>`), armed at the
     /// identifier and moved into `group_heads` at `begin_type_arguments`.
     pub(crate) pending_type_head: Option<(StringId, SourceRange)>,
+    /// A switch-case / if-case object pattern's NamedType type-argument
+    /// group, latched at `end_type_arguments` when its head row is not yet
+    /// on the stack (the pattern's `Box<int, String>` head pushes only at
+    /// `handle_object_pattern`, after its group closed): `(argument count,
+    /// the `<`'s offset, the `>`'s end offset)` consumed by
+    /// `handle_object_pattern` to emit the NamedType arity verdict the
+    /// oracle anchors on `NamedType` (`_buildTypeArguments`,
+    /// named_type_resolver.dart — `case Box<int, String>():` reports
+    /// `wrong_number_of_type_arguments_element` at the type node).
+    pub(crate) pending_pattern_type_args: Option<(u16, u32, u32)>,
     /// Expression type-argument groups awaiting their use: the callee row
     /// index, the given count, and the group span.
     pub(crate) deferred_args: Vec<(usize, u16, SourceRange)>,
