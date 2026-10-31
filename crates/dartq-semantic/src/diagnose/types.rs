@@ -3255,11 +3255,17 @@ pub(crate) struct Engine<'a> {
     /// them), so the set marks the names that must not answer there; it is
     /// cleared with the container frame.
     pub(crate) primary_formals: FxHashSet<StringId>,
-    /// A field group whose initializers cannot see the enclosing primary
-    /// constructor's formals is open: a `static` or `late` group
-    /// (`begin_fields` .. `end_fields`). With a non-static, non-`late`
-    /// group the formals ARE in scope ([`Self::primary_formals`]) — that
-    /// plane is the upstream `ConstructorInitializerScope`.
+    /// Whether the enclosing primary constructor's formals are OUT of scope
+    /// at the current position — the DEFAULT posture. Upstream scopes them
+    /// from two planes alone
+    /// (pkg/analyzer/lib/src/dart/resolver/scope_context.dart:406-461): the
+    /// `ConstructorInitializerScope` of a non-static, non-`late` instance
+    /// field initializer (`begin_fields` clears this for such a group) and
+    /// the `PrimaryParameterScope` of the `this : ...` body
+    /// (`begin_primary_constructor_body` clears it there). Every other
+    /// member plane — a method or getter body, a static or `late` field
+    /// initializer, a secondary constructor's initializer list — reads
+    /// `undefined_identifier` (oracle 3.13.7), so the flag stays set.
     pub(crate) primary_formals_muted: bool,
     /// The parameters of the executable declaration in flight attach to
     /// this declaration site (set at the site-creating begin events,

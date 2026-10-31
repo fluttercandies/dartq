@@ -350,7 +350,7 @@ impl<'a> Engine<'a> {
             null_check_binder_candidates: Vec::new(),
             pending_pattern_getters: Vec::new(),
             primary_formals: FxHashSet::default(),
-            primary_formals_muted: false,
+            primary_formals_muted: true,
             open_exec_site: None,
             decl_sites: Vec::new(),
             pending_annotations: Vec::new(),
@@ -2007,7 +2007,7 @@ impl<'a> Engine<'a> {
         // group after the class cannot read the stale names either).
         if matches!(&kind, FrameKind::Container { .. }) {
             self.primary_formals.clear();
-            self.primary_formals_muted = false;
+            self.primary_formals_muted = true;
         }
         self.frames.push(Frame {
             kind,
@@ -2032,7 +2032,7 @@ impl<'a> Engine<'a> {
             // them through the stale set.
             if matches!(&frame.kind, FrameKind::Container { .. }) {
                 self.primary_formals.clear();
-                self.primary_formals_muted = false;
+                self.primary_formals_muted = true;
             }
             // A block-bodied executable leaves `body_mark` latched (the
             // arrow-body arm `take`s it at close; the block body's own end

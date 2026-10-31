@@ -4236,6 +4236,12 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_primary_constructor_body(&mut self, token: Token, augment: Option<Token>) {
         self.flow().begin_primary_constructor_body(token, augment);
         self.engine.open_ctor_site = self.engine.primary_ctor_site;
+        // The `this : ...` body is one of the two scopes the primary
+        // constructor's formals live in (upstream `PrimaryParameterScope`,
+        // pkg/analyzer/lib/src/dart/resolver/scope_context.dart:406-430);
+        // every other member plane keeps them muted
+        // ([`Engine::primary_formals_muted`]).
+        self.engine.primary_formals_muted = false;
     }
 
     fn end_primary_constructor_body(
@@ -4248,6 +4254,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow()
             .end_primary_constructor_body(begin, this, begin_initializers, end);
         self.engine.open_ctor_site = None;
+        self.engine.primary_formals_muted = true;
     }
 
     fn begin_metadata(&mut self, token: Token) {
@@ -9382,7 +9389,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.field_group_open = false;
         engine.group_augment = false;
-        engine.primary_formals_muted = false;
+        engine.primary_formals_muted = true;
         engine.disarm_const_group();
         // The field group closed: an unclaimed signature stash dies here.
         engine.fn_stash_drop();

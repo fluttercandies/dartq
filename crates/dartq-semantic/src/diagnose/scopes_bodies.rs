@@ -1022,9 +1022,12 @@ impl<'a> Engine<'a> {
     /// `this : ...` body
     /// (pkg/analyzer/lib/src/dart/resolver/scope_context.dart:406-461) —
     /// while the container frame carries them as locals for the body's
-    /// sake. A STATIC or `late` field initializer is outside both scopes
-    /// and reads `undefined_identifier` (oracle 3.13.7:
-    /// `class A(int foo) { static var s = foo; }`).
+    /// sake. Every other member plane is outside both scopes and reads
+    /// `undefined_identifier` (oracle 3.13.7: a method body
+    /// `void m() { print(foo); }`, a getter `int get g => foo;`, a
+    /// `static` or `late` field initializer, and a secondary constructor's
+    /// initializer list all report `Undefined name 'foo'.`), which is what
+    /// the default-on [`Engine::primary_formals_muted`] window encodes.
     pub(crate) fn primary_formal_hidden(&self, name: StringId) -> bool {
         self.primary_formals_muted && self.primary_formals.contains(&name)
     }
