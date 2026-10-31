@@ -851,11 +851,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 colon = Some(name);
                 self.cursor.advance();
             }
-            let before = self.cursor.progress();
+            // No no-progress skip here (official :12249-12250 has none,
+            // unlike parseListPatternSuffix :12002 / parseMapPatternSuffix
+            // :12088): a field pattern that consumes nothing — the empty
+            // slot of `Foo(:)` or `Foo(a: , b: 1)` — must leave the
+            // blocking `)`/`,` in place so it closes or separates the
+            // field loop through the arms below. Skipping it strands the
+            // group in `ensureCloseParen` and mints spurious
+            // `expectedButGot(',')` rows at the next field.
             self.parse_pattern(context);
-            if self.no_progress(before) {
-                self.force_advance();
-            }
             self.listener.handle_pattern_field(colon);
             argument_count += 1;
             match self.peek_kind() {

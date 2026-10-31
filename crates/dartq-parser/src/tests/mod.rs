@@ -55,6 +55,7 @@ mod ticket_2880_tests;
 mod ticket_2884_tests;
 mod ticket_2991_tests;
 mod ticket_3011_tests;
+mod ticket_3023;
 mod ticket_3025_tests;
 mod ticket_3034_tests;
 mod ticket_3050;
