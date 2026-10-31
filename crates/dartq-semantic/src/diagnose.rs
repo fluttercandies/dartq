@@ -5861,6 +5861,17 @@ mod ticket_3124_tests;
 #[cfg(test)]
 mod ticket_3123_tests;
 
+/// The #3125 pins — the member-miss cascade/bound faces: a `..foo()`/
+/// `..foo = v` cascade section whose own receiver read latched `Unknown`
+/// inherits the newest prior section's recorded receiver (the target's
+/// `Created`/`Typed` face), and a `T`-spelled receiver in a generic scope
+/// escapes the invalid-container bail via the post-walk bound window
+/// (`param_bound_of`).
+#[cfg(test)]
+mod ticket_3125_tests;
+#[cfg(test)]
+mod dbg_probe;
+
 /// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
 /// type-check verdict under-emits on (function-type test spellings, type
 /// literals, typedef-folded checked types, dynamic operands).
@@ -5899,3 +5910,20 @@ mod ticket_3122_tests;
 /// `name=` marker strips).
 #[cfg(test)]
 mod ticket_3127_tests;
+
+/// The #3126 pins: `unnecessary_final` fires only inside a declaration
+/// formal list — the `FieldFormalParameter`/`SuperFormalParameter` reach —
+/// including the `[`/`{` optional/named group nested in it; it stays
+/// silent inside a `Function(…)` type list, a parenthesized expression, a
+/// call's argument list, and a statement context.
+#[cfg(test)]
+mod ticket_uf_tests;
+
+/// The #3119 pins — `unchecked_use_of_nullable_value`'s statement-form
+/// operand faces: the `yield*` operand arm
+/// (`uncheckedUseOfNullableValueInYieldEach`,
+/// yield_statement_resolver.dart:163-168) and the `?.`-shorted operand's
+/// own static type (the `bool?` of `a?.foo`) reading nullable for the
+/// condition/negation verdicts.
+#[cfg(test)]
+mod ticket_3119_tests;

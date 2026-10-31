@@ -63,8 +63,10 @@ use dartq_scanner::{Keyword, TokenKind};
 /// One open bracket group of the `unnecessary_final` walk.
 #[derive(Clone, Copy)]
 struct BracketFrame {
-    /// Whether the group is a parenthesis (the only group a formal's
-    /// `final` can sit directly in).
+    /// Whether the group is a parenthesis (a `final` inside a `[`/`{`
+    /// optional/named group still reports through its enclosing
+    /// formal-list `(`; only `paren` groups can open a fresh formal
+    /// context, but `[`/`{` nested in one inherit it).
     paren: bool,
     /// The token kind just before the opener (the `for`/`if` exclusion
     /// heads); meaningless for braces/brackets.
@@ -72,6 +74,25 @@ struct BracketFrame {
     /// A `case` keyword sat at the group's own level before now (the
     /// `if (x case …)` pattern arm).
     case_seen: bool,
+    /// The group is, or sits inside, a **declaration formal list** — the
+    /// `(…)` a `FieldFormalParameter`/`SuperFormalParameter` can live in
+    /// (best_practices_verifier.dart:1040-1049 reached only from
+    /// `visitFieldFormalParameter`/`visitSuperFormalParameter`
+    /// :496-504/:902-910). A `(` gets it from `formal_list_paren`; a
+    /// `[`/`{` inherits it from its parent (the optional/named group of
+    /// that formal list) — so `C({required final this.x})` reports while
+    /// `g(final this.x)` (a call's arg list) and `void Function(final
+    /// this.x)` (a function-type list, parsed as `FunctionTypedParameter`,
+    /// never visited) stay silent.
+    formal_list: bool,
+    /// The group is a **declaration body** — a class/enum/mixin/extension
+    /// body or the whole-unit top level — where an `Identifier(…)` opens a
+    /// declaration's formal list rather than a statement's call.
+    /// `check_unnecessary_final_parameters` feeds it to
+    /// `formal_list_paren`'s `)`-`;`/`Identifier` ambiguity resolution:
+    /// `class C { C(final this.x); }` (decl body) reports, `void m() {
+    /// g(final this.x); }` (statement body) stays silent.
+    decl_body: bool,
     /// The group sits inside a primary-constructor declaration head —
     /// the `_inPrimaryConstructorDeclaration` suppress
     /// (best_practices_verifier.dart:101/:818-824): a `class`/`enum`/
@@ -82,11 +103,16 @@ struct BracketFrame {
 
 impl Engine<'_> {
     /// The whole-unit `unnecessary_final` pass: every `final` keyword
-    /// token directly inside a parenthesis whose next two tokens spell
-    /// `this.`/`super.` — the `FieldFormalParameter`/`SuperFormalParameter`
-    /// gate (best_practices_verifier.dart:1040-1049, called only from
-    /// :496-504/:902-910) — minus the `for`/`if-case` head exclusions and
-    /// the primary-constructor suppression.
+    /// token inside a **declaration formal list** whose next two tokens
+    /// spell `this.`/`super.` — the `FieldFormalParameter`/
+    /// `SuperFormalParameter` gate (best_practices_verifier.dart:1040-1049,
+    /// called only from `visitFieldFormalParameter`/`visitSuperFormalParameter`
+    /// :496-504/:902-910). The formal-list reach mirrors the parser: the
+    /// `final` may sit directly in the `(` or inside its `[`/`{`
+    /// optional/named group (`C({required final this.x})`), and stays
+    /// silent inside a `Function(…)` type list, a parenthesized
+    /// expression, a call's argument list, a `for`/`if-case` head, and a
+    /// primary-constructor head.
     pub(crate) fn check_unnecessary_final_parameters(&mut self) {
         let tokens = self.tokens.as_slice();
         let mut stack: Vec<BracketFrame> = Vec::new();
@@ -97,20 +123,39 @@ impl Engine<'_> {
                         .checked_sub(1)
                         .map(|prev| tokens[prev].kind)
                         .unwrap_or(TokenKind::Eof);
+                    let parent = stack.last().copied();
                     stack.push(BracketFrame {
                         paren: true,
                         opener_prev,
                         case_seen: false,
-                        primary_ctor: stack.last().is_some_and(|f| f.primary_ctor)
+                        // A `(` opens a formal list by its own shape —
+                        // `formal_list_paren` — never by inheritance: the
+                        // `(final this.x,)` inside `f(…)` is a record type,
+                        // not a formal list (the parser lowers it to a
+                        // record, not a `FieldFormalParameter`).
+                        formal_list: self.formal_list_paren(tokens, index, parent),
+                        decl_body: false,
+                        primary_ctor: parent.is_some_and(|f| f.primary_ctor)
                             || primary_ctor_head(tokens, index),
                     });
                 }
-                TokenKind::OpenCurly | TokenKind::OpenSquare => stack.push(BracketFrame {
-                    paren: false,
-                    opener_prev: TokenKind::Eof,
-                    case_seen: false,
-                    primary_ctor: stack.last().is_some_and(|f| f.primary_ctor),
-                }),
+                TokenKind::OpenCurly | TokenKind::OpenSquare => {
+                    let parent = stack.last().copied();
+                    stack.push(BracketFrame {
+                        paren: false,
+                        opener_prev: TokenKind::Eof,
+                        case_seen: false,
+                        // A `[`/`{` inherits the formal-list flag only
+                        // when it nests DIRECTLY in a formal-list `(` —
+                        // the optional/named-parameter group of that
+                        // declaration's formals (`C({final this.x})`,
+                        // `C([final this.x])`). Inside any other group it
+                        // is a body/block, not a formal list.
+                        formal_list: parent.is_some_and(|f| f.paren && f.formal_list),
+                        decl_body: self.decl_body_brace(tokens, index, parent),
+                        primary_ctor: parent.is_some_and(|f| f.primary_ctor),
+                    });
+                }
                 TokenKind::CloseParen | TokenKind::CloseCurly | TokenKind::CloseSquare => {
                     stack.pop();
                 }
@@ -125,7 +170,15 @@ impl Engine<'_> {
                     let Some(frame) = stack.last() else {
                         continue;
                     };
-                    if !frame.paren || frame.primary_ctor {
+                    if frame.primary_ctor {
+                        continue;
+                    }
+                    // The `final` must sit inside a declaration formal
+                    // list — directly in the `(`, or in its `[`/`{`
+                    // optional/named group (both flagged `formal_list`).
+                    // Outside one there is no `FieldFormalParameter`/
+                    // `SuperFormalParameter` to visit.
+                    if !frame.formal_list {
                         continue;
                     }
                     // A `for` head declares loop variables, not formals;
@@ -157,6 +210,122 @@ impl Engine<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Whether the `(` at `open` opens a **declaration formal list** —
+    /// the `FormalParameterList` a `FieldFormalParameter`/`SuperFormalParameter`
+    /// is parsed into. Mirrors the parser's reach through two token
+    /// signatures:
+    ///
+    /// * **`)`-follow** — a formal list's `)` is followed by a declaration
+    ///   body or terminator the expression grammar never produces after a
+    ///   parenthesized group: `{` (block body), `=>` (arrow body), `async`
+    ///   /`sync`/`*` (async markers), `:` (constructor initializer list),
+    ///   `native`/`external`/`covariant` (decl modifiers). Any of these
+    ///   proves a formal list outright (`var f = (final this.x) => x` —
+    ///   a lambda — reports; upstream types it via
+    ///   visitFieldFormalParameter).
+    /// * **`(`-precede** — the remaining `)`-follows (`;`, `Identifier`,
+    ///   `}`, `covariant`) are ambiguous between a declaration's `;`
+    ///   (`C(final this.x);`) and a statement's `;` (`g(final this.x);`,
+    ///   `(final this.x);`). The `(` is a formal list iff it follows a
+    ///   declaration head — back over the `Identifier`/`.`/`<…>` name-run
+    ///   lands on a declaration introducer or a declaration-body boundary
+    ///   — and is NOT a `Function(…)` type-annotation list (whose
+    ///   parameters parse as `FunctionTypedParameter`, never visited:
+    ///   `void Function(final this.x)`, `void g(void Function(final
+    ///   this.x) cb)`).
+    ///
+    /// `parent` supplies the enclosing frame's `decl_body` for the
+    /// `;`/`Identifier`/`}` ambiguity (`class C { C(…); }` declares, a
+    /// method body's `g(…);` calls).
+    fn formal_list_paren(
+        &self,
+        tokens: &[dartq_scanner::Token],
+        open: usize,
+        parent: Option<BracketFrame>,
+    ) -> bool {
+        // The `(`-precede side: a `Function(…)` type-annotation list is
+        // never a declaration formal list. Walk back over the name-run
+        // (`Identifier`/`.`) and a balanced `<…>` group; `Function` as the
+        // immediate introducer is the function-type head.
+        let head = formal_head(tokens, open);
+        if matches!(head, Some(TokenKind::Keyword(Keyword::Function))) {
+            return false;
+        }
+        // The `)`-follow side.
+        let Some(close) = self.tokens.matching_end(open) else {
+            return false;
+        };
+        let follow = tokens.get(close + 1).map(|t| t.kind);
+        match follow {
+            // A declaration body or an explicit decl terminator — no
+            // expression/argument `(` is followed by these.
+            Some(
+                TokenKind::OpenCurly
+                | TokenKind::Function
+                | TokenKind::Colon
+                | TokenKind::Star
+                | TokenKind::Keyword(Keyword::Async)
+                | TokenKind::Keyword(Keyword::Sync)
+                | TokenKind::Keyword(Keyword::Native)
+                | TokenKind::Keyword(Keyword::External)
+                | TokenKind::Keyword(Keyword::Covariant),
+            ) => true,
+            // `;`/`}`/`Identifier`/end — a declaration's `;` (`C(…);`) and
+            // a statement's `;` (`g(…);`, `(…);`) both land here; split on
+            // the `(`-precede declaration head. A decl-head landing inside
+            // a declaration body (class/enum/extension/top-level) declares
+            // a member; one inside a statement body calls.
+            Some(TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::Identifier)
+            // A `(` at top level (no enclosing group) is a declaration's
+            // formal list — `parent == None` is the unit's own
+            // declaration region, so it defaults to declaration context.
+            | None => decl_head(head) && parent.map_or(true, |f| f.decl_body),
+            // Any other follower — a binary/unary operator, `,`, `)`, `]`,
+            // `?`, `.`, `in` — can only continue an expression, so the `(`
+            // is a parenthesized expression, an argument list, or a record.
+            _ => false,
+        }
+    }
+
+    /// Whether the `{`/`[` at `open` opens a **declaration body** — a
+    /// class/enum/mixin/extension body, or the unit's top level. A `{`
+    /// preceded by `)` or `=>` opens a function/method/lambda body (a
+    /// statement context — `Identifier(…)` inside it is a call, not a
+    /// formal list). Top level (no parent frame) is a declaration body.
+    /// A `[` is never a declaration body.
+    fn decl_body_brace(
+        &self,
+        tokens: &[dartq_scanner::Token],
+        open: usize,
+        parent: Option<BracketFrame>,
+    ) -> bool {
+        let Some(parent) = parent else {
+            // Top level: every `Identifier(…)` here is a declaration's
+            // formal list (a `;`-terminated `void f(…);` declares).
+            return tokens[open].kind == TokenKind::OpenCurly;
+        };
+        if tokens[open].kind == TokenKind::OpenSquare {
+            return false;
+        }
+        // A `{` inherits declaration-body context — a `{` inside a class
+        // body is still a declaration region only when it is a nested
+        // declaration's own group; a `{` after `)`/`=>`/`=` is a
+        // function/method body or initializer (a statement region).
+        match tokens.get(open.wrapping_sub(1)).map(|t| t.kind) {
+            // `) {` / `=> {` / `= {` open a function body, a lambda body,
+            // or an initializer — a statement region, never a declaration
+            // body even inside a class.
+            Some(TokenKind::CloseParen | TokenKind::Function | TokenKind::Eq) => false,
+            // Otherwise the `{` continues the enclosing body's role: a
+            // class body's nested `{` is a member's block only after a
+            // formal list — but the formal-list `(` is what reports, so a
+            // `{` not after `)`/`=>`/`=` inside a declaration body stays
+            // a declaration body (a nested `class`/`mixin`/`extension`
+            // body follows a declaration head directly).
+            _ => parent.decl_body,
         }
     }
 
@@ -530,6 +699,164 @@ impl<'a> Engine<'a> {
             self.strings.resolve(key)
         );
         Some((formals, cursor, file, owner))
+    }
+}
+
+/// The token kind of the declaration/head that introduces the `(` at
+/// `open`, walked back over the `Identifier`/`.` name-run, a balanced
+/// `<…>` type-parameter/argument group, and a trailing operator-symbol
+/// run (`operator +`, `operator []=`). `None` when `open` leads the unit.
+/// This is the `(`-precede signature `formal_list_paren` and `decl_head`
+/// share — the same backward shape `primary_ctor_head` walks.
+fn formal_head(tokens: &[dartq_scanner::Token], open: usize) -> Option<TokenKind> {
+    let mut cursor = open;
+    // A trailing operator-symbol run (`C operator +(` — the operator's
+    // own spelling sits just before `(`); `<`/`>` are excluded — those
+    // belong to a `<…>` group handled below.
+    while cursor > 0
+        && is_operator_spelling(tokens[cursor - 1].kind)
+        && !matches!(
+            tokens[cursor - 1].kind,
+            TokenKind::Lt | TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt
+        )
+    {
+        cursor -= 1;
+    }
+    // The `Identifier`/`.` run (the declaration or callee name, plus a
+    // `.named`/`.ctorName` selector).
+    while cursor > 0
+        && matches!(
+            tokens[cursor - 1].kind,
+            TokenKind::Identifier | TokenKind::Period
+        )
+    {
+        cursor -= 1;
+    }
+    // A balanced `<…>` group (declaration type parameters `f<T>(`,
+    // explicit type arguments `g<int>(`), skipped backward; `(`/ `{`/
+    // `;` aborts the skip (unbalanced recovery).
+    if cursor > 0 {
+        let width = |kind: TokenKind| -> i32 {
+            match kind {
+                TokenKind::Gt => 1,
+                TokenKind::GtGt => 2,
+                TokenKind::GtGtGt => 3,
+                _ => 0,
+            }
+        };
+        let mut depth = width(tokens[cursor - 1].kind);
+        if depth > 0 {
+            let mut i = cursor - 1;
+            while depth > 0 && i > 0 {
+                i -= 1;
+                match tokens[i].kind {
+                    TokenKind::Lt => depth -= 1,
+                    TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                        depth += width(tokens[i].kind);
+                    }
+                    TokenKind::OpenParen | TokenKind::OpenCurly | TokenKind::Semicolon => {
+                        return Some(tokens[i].kind);
+                    }
+                    _ => {}
+                }
+            }
+            if depth == 0 {
+                cursor = i;
+                // The declaration name ahead of the type parameters.
+                while cursor > 0
+                    && matches!(
+                        tokens[cursor - 1].kind,
+                        TokenKind::Identifier | TokenKind::Period
+                    )
+                {
+                    cursor -= 1;
+                }
+            }
+        }
+    }
+    (cursor > 0).then(|| tokens[cursor - 1].kind)
+}
+
+/// A token spelling usable as a user-defined `operator` name (`+`,
+/// `[]`, `==`, …) — the `operator` keyword itself is excluded (it
+/// introduces the name, never spells it).
+fn is_operator_spelling(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Tilde
+            | TokenKind::TildeSlash
+            | TokenKind::Ampersand
+            | TokenKind::Bar
+            | TokenKind::Caret
+            | TokenKind::LtLt
+            | TokenKind::GtGt
+            | TokenKind::GtGtGt
+            | TokenKind::Index
+            | TokenKind::IndexEq
+            | TokenKind::Lt
+            | TokenKind::LtEq
+            | TokenKind::Gt
+            | TokenKind::GtEq
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+    )
+}
+
+/// Whether the head introducing the `(` at `open` is a **declaration
+/// introducer or a declaration-body boundary** — the `(`-precede half of
+/// the `;`/`Identifier`/`}` ambiguity in `formal_list_paren`. `head` is
+/// `formal_head`'s answer: the token just before the name-run.
+///
+/// A declaration introducer: a return type or modifier (`void`, `set`,
+/// `get`, `operator`, `factory`, `typedef`, `external`, `static`,
+/// `abstract`, `covariant`, `late`, `final`, `const`, `var`, `extends`,
+/// `implements`, `with`, `on`), or a declaration-body boundary (`;`,
+/// `{`, `}`, a `<…>` group's `>`, the unit start `None`). A call or an
+/// expression lands on `=`, `,`, `(`, `?`, `return`, `await`, `case`,
+/// `in`, `=>`, a binary/unary operator, or `Function` — none declares.
+fn decl_head(head: Option<TokenKind>) -> bool {
+    match head {
+        // Unit start — a top-level declaration's `(`.
+        None => true,
+        Some(TokenKind::Keyword(
+            Keyword::Void
+            | Keyword::Set
+            | Keyword::Get
+            | Keyword::Operator
+            | Keyword::Factory
+            | Keyword::Typedef
+            | Keyword::External
+            | Keyword::Static
+            | Keyword::Abstract
+            | Keyword::Covariant
+            | Keyword::Late
+            | Keyword::Final
+            | Keyword::Const
+            | Keyword::Var
+            | Keyword::Extends
+            | Keyword::Implements
+            | Keyword::With
+            | Keyword::On
+            | Keyword::Class
+            | Keyword::Enum
+            | Keyword::Mixin
+            | Keyword::Extension,
+        )) => true,
+        // A declaration-body boundary — a member/`;` boundary inside a
+        // declaration body (`class C { C(…); }`, `; void m(…)`), or the
+        // closing `>` of a type-parameter group.
+        Some(TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::CloseCurly | TokenKind::Gt) => {
+            true
+        }
+        // Anything else — `=`, `,`, `(`, `?`, `return`, `await`, `case`,
+        // `in`, `=>`, `Function`, an operator, a literal — makes the `(`
+        // an expression, a call's argument list, or a function-type list.
+        _ => false,
     }
 }
 
