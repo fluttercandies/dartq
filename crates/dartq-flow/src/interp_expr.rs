@@ -372,9 +372,9 @@ impl Interp<'_> {
                     base: *base,
                     nullable: *nullable,
                 };
-                self.sink_type(ty, *args);
+                self.sink_type(ty, *args, true);
             }
-            Ev::NoType => self.sink_type(Ty::UNKNOWN, crate::ty::EMPTY_ARGS),
+            Ev::NoType => self.sink_type(Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false),
             // The function-type head sinks its written nullability over the
             // signature-less `Function` base: a nullable function-typed
             // declaration promotes exactly like a named one, and the
@@ -386,6 +386,7 @@ impl Interp<'_> {
                     nullable: *nullable,
                 },
                 crate::ty::EMPTY_ARGS,
+                true,
             ),
             Ev::VoidType => self.sink_type(
                 Ty {
@@ -393,6 +394,7 @@ impl Interp<'_> {
                     nullable: false,
                 },
                 crate::ty::EMPTY_ARGS,
+                true,
             ),
             Ev::Bool { value, span } => {
                 // The header-part leaf's dead poll — the same
@@ -3469,11 +3471,16 @@ impl Interp<'_> {
     /// identifier seals it — #1037), the pending formal, the open
     /// `is`-test, or the open `as`-cast. The written-argument id rides
     /// beside the type (#611 step 4) — every type row passes through
-    /// here, so each sink sees the pair as one fact.
-    fn sink_type(&mut self, ty: Ty, args: u32) {
+    /// here, so each sink sees the pair as one fact. `written` is the
+    /// declared/written marker (official `isImplicitlyTyped` inverted):
+    /// `true` from `Ev::Type`/`FunctionType`/`VoidType`, `false` from
+    /// `Ev::NoType` — the flag that decides, for the declaration sink,
+    /// whether the inferred-face adoption may fill the slot later.
+    fn sink_type(&mut self, ty: Ty, args: u32, written: bool) {
         if self.in_decl {
             self.decl.ty = ty;
             self.decl.args = args;
+            self.decl.written = written;
         } else if self.in_type_test {
             self.tested_ty = Some(ty);
             self.tested_args = args;
@@ -3483,6 +3490,7 @@ impl Interp<'_> {
         } else {
             self.pending_ty = Some(ty);
             self.pending_ty_args = args;
+            self.pending_ty_written = written;
         }
     }
 
