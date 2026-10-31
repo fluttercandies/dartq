@@ -518,6 +518,15 @@ impl ParserListener for DiagnoseListener<'_> {
         let container = engine.container_context().map(|(c, _)| c);
         engine.bounds.drop_header();
         engine.var_drop_header();
+        // The container's own static-vs-instance collisions report at the
+        // enum's body close, while the frame is still on the stack — the
+        // enum arm of the same `check_conflicting_static_and_instance`
+        // `end_class_or_mixin_or_extension_body` runs for classes/mixins/
+        // extensions. Upstream `_checkUnitStatic` dispatches
+        // `_checkEnumStatic` for an `EnumDeclarationImpl`, driven from
+        // `visitEnumDeclaration` at body close (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart:565).
+        engine.check_conflicting_static_and_instance();
         engine.pop_frame();
         // #1314 FAM14: the clause-spans capture drains here — a stale
         // capture would buffer file-level types as clause entries.
@@ -713,6 +722,14 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         engine.bounds.drop_header();
         engine.var_drop_header();
+        // The extension-type's own static-vs-instance collisions report at
+        // its body close, while the frame is still on the stack — upstream
+        // `_checkUnitStatic` routes an `ExtensionTypeDeclarationImpl`
+        // through `_checkClassStatic` (the class member face), driven from
+        // `visitExtensionTypeDeclaration` at body close (upstream Dart SDK
+        // source,
+        // pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart:569-571).
+        engine.check_conflicting_static_and_instance();
         engine.pop_frame();
     }
 

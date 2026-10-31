@@ -5833,6 +5833,17 @@ mod ticket_3118_tests;
 #[cfg(test)]
 mod ticket_3117_tests;
 
+/// The #3124 pins: the `conflicting_static_and_instance` body-close hook
+/// for `enum` and `extension type` — `end_enum_declaration` /
+/// `end_extension_type_declaration` now invoke
+/// `check_conflicting_static_and_instance` while the frame is still on
+/// the stack, mirroring `end_class_or_mixin_or_extension_body` (upstream
+/// Dart SDK source,
+/// pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart
+/// `_checkUnitStatic` :559-583).
+#[cfg(test)]
+mod ticket_3124_tests;
+
 /// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
 /// type-check verdict under-emits on (function-type test spellings, type
 /// literals, typedef-folded checked types, dynamic operands).
