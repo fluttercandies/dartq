@@ -40,21 +40,46 @@ impl<'a> Engine<'a> {
     /// unresolvable entry stays with the clause ledger's own faces.
     pub(crate) fn finalize_mixin_uses(&mut self) {
         for span in std::mem::take(&mut self.pending_mixin_uses) {
-            // The span is UTF-16; the slice reads source bytes (#2594).
+            // The span is UTF-16; the slice reads source bytes (#2594). It
+            // anchors the whole NamedType — `p.C`, `C<int>`, `C?` — so the
+            // resolvable head is the spelling up to the first `<` or `?`,
+            // not the full slice (`error_verifier.dart` `_checkForMixinIn
+            // WithClause` resolves the type's ELEMENT, never the written
+            // suffixes).
             let start = self.byte_of(span.offset);
             let end = self.byte_of(span.end()).min(self.source.len());
             if start >= end {
                 continue;
             }
-            let name = self.intern(&self.source[start..end]);
-            let Some((container, owner)) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                name,
-            ) else {
+            let text = &self.source[start..end];
+            let head_end = text
+                .find(['<', '?'])
+                .map(|i| start + i)
+                .unwrap_or(end);
+            let head = self.intern(&self.source[start..head_end]);
+            // A dotted spelling (`p.C`) resolves the leaf through the
+            // prefix's own table — the bare-scope walk would answer the
+            // diagnosing library's same-named container, the wrong scope.
+            let resolved = if self.strings.resolve(head).contains('.') {
+                resolve_joined_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.strings,
+                    head,
+                )
+            } else {
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    head,
+                )
+            };
+            let Some((container, owner)) = resolved else {
                 continue;
             };
             if container.kind != ContainerKind::Class
@@ -75,7 +100,17 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
-            let name_text = self.strings.resolve(name).to_string();
+            // The oracle's message names the resolved ELEMENT (the leaf of
+            // a prefixed spelling, the head of a parameterized one), not
+            // the whole written entry.
+            let name_text = {
+                let head_text = self.strings.resolve(head);
+                head_text
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(head_text)
+                    .to_string()
+            };
             self.emit(SemanticCode::ClassUsedAsMixin, span, &name_text, "");
         }
     }
@@ -6750,3 +6785,11 @@ mod pins {
 #[cfg(test)]
 #[path = "ticket_3152_tests.rs"]
 mod ticket_3152_tests;
+
+/// The #3159 `class_used_as_mixin` pins (the with-clause head-name
+/// resolution — `p.C` prefixed, `A<int>` parameterized, `A?` nullable, and
+/// the modifier exemptions), kept as a standalone module so the shared
+/// `pins` rig stays untouched while its lane is in flight.
+#[cfg(test)]
+#[path = "ticket_3159_tests.rs"]
+mod ticket_3159_tests;
