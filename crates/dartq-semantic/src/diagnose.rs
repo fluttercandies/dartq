@@ -5844,6 +5844,13 @@ mod ticket_3117_tests;
 #[cfg(test)]
 mod ticket_3124_tests;
 
+/// The #3123 pins: an untyped formal parameter is `dynamic`, not a
+/// poisoned function-type capture — `fn_capture_formal` pushes
+/// `Ty::Dynamic` for the unarmed `pending_formal` slot (upstream Dart SDK
+/// source, pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:808-813).
+#[cfg(test)]
+mod ticket_3123_tests;
+
 /// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
 /// type-check verdict under-emits on (function-type test spellings, type
 /// literals, typedef-folded checked types, dynamic operands).

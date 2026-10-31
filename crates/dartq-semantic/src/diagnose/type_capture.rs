@@ -1264,10 +1264,14 @@ impl<'a> Engine<'a> {
         if !capture.in_params {
             return;
         }
-        let Some(ty) = capture.pending_formal.take() else {
-            capture.poisoned = true;
-            return;
-        };
+        // An UNWRITTEN formal type (`void f(x)`, `f([x])`, `f({x})`, a
+        // nested `f(void g(x))` inner formal) arms nothing — the upstream
+        // default is `dynamic` (`visitRegularFormalParameter`:
+        // `node.type == null` → `element.type = _typeProvider.dynamicType`,
+        // resolution_visitor.dart:808-813), NOT a poisoned capture. The
+        // capture keeps the slot at `dynamic` so the function-type shape
+        // renders `Function(dynamic)` like the oracle.
+        let ty = capture.pending_formal.take().unwrap_or(Ty::Dynamic);
         match capture.section {
             FnFormalSection::Named => capture.named.push((name, ty, required)),
             FnFormalSection::Required => {
