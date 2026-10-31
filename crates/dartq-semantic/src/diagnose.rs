@@ -750,6 +750,13 @@ pub(crate) struct DiagnoseListener<'a> {
     pub(crate) pending_exit: Option<Token>,
     /// The unit's file, stamped onto every parse-recovery row.
     pub(crate) file: FileId,
+    /// The open pattern frames' deferred never-match candidates, in lockstep
+    /// with `SwitchTracker::pattern_stack` (one entry per
+    /// `begin_pattern`..`end_pattern` bracket): a container field's
+    /// sub-pattern is judged against that field's own column, which only the
+    /// container's close knows — so its row waits there
+    /// ([`listener::PatternNodeState`]).
+    pub(crate) pattern_rows: Vec<listener::PatternNodeState>,
     /// The parse-recovery rows (`handle_recoverable_error` /
     /// `handle_experiment_not_enabled`), in arrival order. The production
     /// pipeline serves the identical rows from the l1 collector's facts
@@ -1244,6 +1251,7 @@ pub fn fold_unit_with_ops<'t>(
         },
         pending_exit: None,
         file,
+        pattern_rows: Vec::new(),
         parse_diagnostics: Vec::new(),
     };
     // The parse runs inside the argument-aware fold window (#2462): the
@@ -1267,6 +1275,7 @@ pub fn fold_unit_with_ops<'t>(
         mut flow,
         pending_exit: _,
         file: _,
+        pattern_rows: _,
         parse_diagnostics,
     } = listener;
     // The flow layer's facts fold in exactly once, before the engine

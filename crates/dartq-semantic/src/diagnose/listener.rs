@@ -1,5 +1,66 @@
 use super::*;
 
+/// The deferred `pattern_never_matches_value_type` candidates of one open
+/// pattern frame (#3242). A container field's sub-pattern is judged against
+/// that field's own column, and a field's column is a property of the
+/// container's head — which arrives only at the container's close
+/// (`handle_object_pattern`), long after the sub-pattern's check ran. The
+/// candidates therefore park here, keyed to the frame whose field they sit
+/// in, and the object close re-judges them per field
+/// ([`Engine::judge_pattern_never_matches`] over the resolved column).
+///
+/// The stack runs in lockstep with `SwitchTracker::pattern_stack`: one
+/// entry pushed by `begin_pattern`, popped by `end_pattern`. A container
+/// kind that cannot turn a column back into a type (record, list, map)
+/// simply drops its buckets when the frame pops.
+pub(crate) struct PatternNodeState {
+    /// The record pattern's `(` token, when this frame IS a record pattern's
+    /// own bracket. The record row spans the whole `(...)` NODE (the official
+    /// `.at(pattern)`), whose closer is resolved through the scanner's group
+    /// table ([`Engine::group_span`]) — the frame's own `end_pattern` token
+    /// runs past the close whenever the pattern carries a `||`/`&&` operand
+    /// or a postfix.
+    pub(crate) pending_record_open: Option<Token>,
+    /// Candidates recorded since the last field boundary of this frame —
+    /// the field sub-pattern currently parsing.
+    pub(crate) pending: Vec<(SourceRange, Ty)>,
+    /// One bucket per `handle_pattern_field` boundary, index-aligned with the
+    /// frame's drained `ObjectField`s (both append once per boundary).
+    pub(crate) fields: Vec<Vec<(SourceRange, Ty)>>,
+}
+
+impl PatternNodeState {
+    fn new() -> Self {
+        Self {
+            pending_record_open: None,
+            pending: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+}
+
+/// A record pattern's required-type shape: the positional field count and the
+/// named field set (`analyzeRecordPattern`'s `recordType(positional:
+/// List.filled(positionalCount, objectQuestionType), named: ...)`, pkg/
+/// _fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:1841-1855).
+/// A duplicate name keeps its first occurrence only — the official excludes
+/// the later slots (`_reportDuplicateRecordPatternFields`).
+fn record_field_shape(fields: &[ObjectField]) -> (usize, Vec<StringId>) {
+    let mut positional = 0usize;
+    let mut named: Vec<StringId> = Vec::new();
+    for field in fields {
+        match field.name {
+            None => positional += 1,
+            Some(name) => {
+                if !named.contains(&name) {
+                    named.push(name);
+                }
+            }
+        }
+    }
+    (positional, named)
+}
+
 /// The frame-local function tear-off capture a bare read resolves to
 /// (#2852), innermost frame first: a frame whose `local_fn_sigs` holds the
 /// name answers the #2842 capture (joined at the declaring frame's close),
@@ -35,6 +96,77 @@ fn local_fn_tear_off_sig(engine: &Engine<'_>, name: StringId) -> Option<super::t
 /// `UnsafeSingle` verdict. The row anchors at the operator token, its
 /// length the lexeme's own width.
 impl DiagnoseListener<'_> {
+    /// Parks a never-match candidate whose matched type is the enclosing
+    /// container's column (the `Some` face of
+    /// [`Engine::check_pattern_never_matches`]) on the CONTAINER frame: the
+    /// node being checked is that frame's field sub-pattern, so the
+    /// container is the second frame from the top (`pattern_rows` runs in
+    /// lockstep with the pattern stack).
+    fn defer_pattern_row(rows: &mut [PatternNodeState], row: Option<(SourceRange, Ty)>) {
+        let Some((at, required)) = row else {
+            return;
+        };
+        if let Some(state) = rows.len().checked_sub(2).and_then(|i| rows.get_mut(i)) {
+            state.pending.push((at, required));
+        }
+    }
+
+    /// The record pattern's close: `handle_record_pattern` latched the `(`,
+    /// and the row spans the whole `(...)` node — the official
+    /// `.at(pattern)` on the `RecordPattern` node
+    /// (`checkPatternNeverMatchesValueType` falls through to the pattern
+    /// itself, pkg/analyzer/lib/src/generated/resolver.dart:642). The closer
+    /// comes from the scanner's group table rather than the frame's end
+    /// token, which also covers a `||`/`&&` operand or a postfix.
+    fn close_record_pattern(&mut self) {
+        let Some(open) = self
+            .pattern_rows
+            .last_mut()
+            .and_then(|state| state.pending_record_open.take())
+        else {
+            return;
+        };
+        let Some(frame) = self.engine.switch.pattern_stack.last() else {
+            return;
+        };
+        let (positional, named) = record_field_shape(&frame.fields);
+        // An unclosed group (recovery) keeps the `(` itself: the row anchors
+        // at the opener instead of the recovered node.
+        let at = self.engine.group_span(open).unwrap_or(open.range);
+        self.engine.check_record_pattern(at, positional, &named);
+    }
+
+    /// The per-field column face of a closing object pattern (#3242): each
+    /// field's deferred candidates are judged against the property column the
+    /// field reads ([`Engine::object_pattern_binder_ty`] — the official's
+    /// `resolveObjectPatternPropertyGet` receiver face, type_analyzer.dart:
+    /// 1674-1697). A field whose getter stays unresolvable, and a positional
+    /// field with no sub-pattern variable, keep the under-report.
+    fn judge_object_field_rows(&mut self, head: Option<StringId>, fields: &[ObjectField]) {
+        let Some(head) = head else {
+            return;
+        };
+        let buckets = match self.pattern_rows.last_mut() {
+            Some(state) => std::mem::take(&mut state.fields),
+            None => return,
+        };
+        for (field, rows) in fields.iter().zip(buckets) {
+            if rows.is_empty() {
+                continue;
+            }
+            let Some((getter, _)) = field.getter else {
+                continue;
+            };
+            let Some(column) = self.engine.object_pattern_binder_ty(head, getter) else {
+                continue;
+            };
+            for (at, required) in rows {
+                self.engine
+                    .judge_pattern_never_matches(at, required, column);
+            }
+        }
+    }
+
     fn check_relational_pattern_nullable(&mut self, operator: Token) {
         let engine = &mut self.engine;
         if !engine
@@ -7007,14 +7139,26 @@ impl ParserListener for DiagnoseListener<'_> {
             binary,
             wildcards: Vec::new(),
         });
+        self.pattern_rows.push(PatternNodeState::new());
     }
 
     fn end_pattern(&mut self, token: Token) {
         self.flow().end_pattern(token);
 
+        // The record close (#3242) runs while its frame is still open: the
+        // never-match verdict reads the frame's matched type off the pattern
+        // stack, and `handle_record_pattern` latched the `(` this row spans
+        // from.
+        self.close_record_pattern();
         let engine = &mut self.engine;
         engine.switch.pattern_depth = engine.switch.pattern_depth.saturating_sub(1);
-        let Some(frame) = engine.switch.pattern_stack.pop() else {
+        let popped = engine.switch.pattern_stack.pop();
+        if popped.is_some() {
+            // Lockstep with the pattern stack: the frame's deferred-row state
+            // dies with the frame.
+            self.pattern_rows.pop();
+        }
+        let Some(frame) = popped else {
             return;
         };
         if engine.switch.pattern_stack.is_empty() {
@@ -7273,7 +7417,7 @@ impl ParserListener for DiagnoseListener<'_> {
             offset: left.range.offset,
             length: right.range.end() - left.range.offset,
         };
-        self.engine.check_list_pattern(at);
+        Self::defer_pattern_row(&mut self.pattern_rows, self.engine.check_list_pattern(at));
         // A variable INSIDE a list pattern is no positional object field's
         // getter name (only the transparent wrappers unwrap,
         // ast.dart:6640/:39354/:39708/:40734): the latch dies with the
@@ -7328,6 +7472,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // failure arm into the unmatched chain so the statement after an
         // if-case stays live.
         self.flow().handle_record_pattern(left_paren, count);
+        // The `(` latches: the record kind's never-match row spans the whole
+        // `(...)` node, whose closer the scanner's group table answers
+        // (#3242).
+        if let Some(state) = self.pattern_rows.last_mut() {
+            state.pending_record_open = Some(left_paren);
+        }
         // Record shapes live in the interned lattice (`dartq-types`); the
         // name level has no record type, so the row is unknown-shaped and
         // the engine under-reports.
@@ -7580,10 +7730,15 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // The Object kind of `checkPatternNeverMatchesValueType`
         // (type_analyzer.dart:723-756): the head type is the pattern's
-        // required type.
+        // required type. A nested object head (`Box(value: Some(...))`) is a
+        // field sub-pattern — its matched type is the field's column, so the
+        // candidate defers to the enclosing object's close (#3242).
         if let Some(head) = head {
             let required = Ty::named(head);
-            engine.check_pattern_never_matches(first_identifier.range, required);
+            Self::defer_pattern_row(
+                &mut self.pattern_rows,
+                engine.check_pattern_never_matches(first_identifier.range, required),
+            );
         }
         // A case/if-case window's object head latches for the logical-and
         // binder face (`AsyncData() && final transformer` — the binder
@@ -7706,6 +7861,10 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // An object pattern's fields are member reads, not record slots.
         engine.pattern_bind_dirty = true;
+        // The per-field column face (#3242): the head and the drained field
+        // list are both in hand here, so every field's deferred never-match
+        // candidates are judged against the property column it reads.
+        self.judge_object_field_rows(head, &fields);
         // The bound variables' flow slots take the same declared face
         // (the #2140 staging, keyed on the binder's name token): the
         // flow's own `DeclaredVarPattern` typed the raw unknown.
@@ -7810,6 +7969,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 },
             });
         }
+        // The boundary closes the field's sub-pattern, so the never-match
+        // candidates it raised are exactly this field's (#3242): they drain
+        // into the bucket index-aligned with the `ObjectField` just pushed,
+        // and the object close judges each against its column.
+        if let Some(state) = self.pattern_rows.last_mut() {
+            let rows = std::mem::take(&mut state.pending);
+            state.fields.push(rows);
+        }
     }
 
     fn handle_declared_variable_pattern(
@@ -7863,7 +8030,10 @@ impl ParserListener for DiagnoseListener<'_> {
             let required = engine.armed_ty;
             if let Some(required) = required {
                 let at = engine.armed_ty_span.unwrap_or(variable.range);
-                engine.check_pattern_never_matches(at, required);
+                Self::defer_pattern_row(
+                    &mut self.pattern_rows,
+                    engine.check_pattern_never_matches(at, required),
+                );
             }
             // The bound declared type folds through a type alias first —
             // the pattern variable's frame type is the resolved interface
@@ -7962,7 +8132,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // type, anchored at `pattern.type` — the written type's span.
         if let Some(required) = engine.armed_ty {
             let at = engine.armed_ty_span.unwrap_or(wildcard.range);
-            engine.check_pattern_never_matches(at, required);
+            Self::defer_pattern_row(
+                &mut self.pattern_rows,
+                engine.check_pattern_never_matches(at, required),
+            );
         }
         let declared = engine.armed_ty;
         engine.armed_ty_span = None;

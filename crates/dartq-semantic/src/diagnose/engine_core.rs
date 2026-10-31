@@ -3123,6 +3123,21 @@ impl<'a> Engine<'a> {
             .all(|(&sub_arg, &sup_arg)| self.strict_subtype(sub_arg, sup_arg, depth + 1))
     }
 
+    /// The source span of the token group `open` opened — `open` through its
+    /// matching closer, resolved through the scanner's group table
+    /// (`TokenTable::matching_end`) rather than through an enclosing frame's
+    /// end token, which also covers a trailing `||`/`&&` operand or postfix
+    /// (`case (a, b) || (c, d):`). `None` for an unclosed group (recovery) or
+    /// a parser-inserted opener; the caller keeps its own fallback span.
+    pub(crate) fn group_span(&self, open: Token) -> Option<SourceRange> {
+        let close = self.tokens.get(self.tokens.matching_end(open.id as usize)?)?;
+        // The closer is one UTF-16 unit (`)`/`]`/`}`).
+        Some(SourceRange {
+            offset: open.range.offset,
+            length: (close.utf16_offset + 1).saturating_sub(open.range.offset),
+        })
+    }
+
     /// The name-level `canBeSubtypeOf`
     /// ([`NameWorld::can_be_subtype_of`], the mutual-exclusion companion).
     pub(crate) fn name_can_be_subtype(&self, sub: Ty, sup: Ty) -> bool {
@@ -7441,20 +7456,118 @@ impl<'a> Engine<'a> {
     /// `end_type_arguments` latch is the object pattern's arity face, not a
     /// type), so the row's required-type rendering could not say `List<T>` —
     /// the under-report direction.
-    pub(crate) fn check_list_pattern(&mut self, at: SourceRange) {
+    ///
+    /// `Some((at, required))` is the deferred candidate (the node is a
+    /// container field's sub-pattern, so its matched type is that column):
+    /// the required face rides along — it is written-type-free and needs no
+    /// frame.
+    pub(crate) fn check_list_pattern(&mut self, at: SourceRange) -> Option<(SourceRange, Ty)> {
+        let Some(matched) = self.pattern_matched_ty() else {
+            if !self.pattern_reads_container_column() {
+                return None;
+            }
+            return Some((at, self.list_pattern_required_ty()));
+        };
+        if matched == Ty::Unknown || self.pending_pattern_type_args.is_some() {
+            return None;
+        }
+        if self.name_can_be_subtype(matched, Ty::named(self.intern("List"))) {
+            return None;
+        }
+        let required = self.list_pattern_required_ty();
+        let a0 = self.ty_display(matched);
+        let a1 = self.ty_display(required);
+        self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
+        None
+    }
+
+    /// The List kind's required type: `List<Object?>` (`elementType` absent —
+    /// see [`Self::check_list_pattern`]).
+    fn list_pattern_required_ty(&mut self) -> Ty {
+        let element = Self::nullable_form(Ty::named(self.intern("Object")));
+        let head = self.intern("List");
+        self.boundary.args.borrow_mut().named(head, false, &[element])
+    }
+
+    /// `checkPatternNeverMatchesValueType`'s Record kind: the required type
+    /// is the record over the written fields with every slot `Object?`
+    /// (upstream `analyzeRecordPattern`'s `operations.recordType(
+    /// positional: List.filled(count, objectQuestionType), named: ...)`,
+    /// pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+    /// 1841-1855), and the verdict runs at the record node itself with the
+    /// node's own matched type (`resolvePattern`'s
+    /// `checkPatternNeverMatchesValueType`, pkg/analyzer/lib/src/generated/
+    /// resolver.dart:1632-1637, `canBeSubtypeOf`'s record arms at
+    /// pkg/analyzer/lib/src/dart/element/type_system.dart:269-330).
+    ///
+    /// `positional` is the written positional field count, `named` the
+    /// written named set (duplicates excluded, the official's
+    /// `_reportDuplicateRecordPatternFields` gate).
+    pub(crate) fn check_record_pattern(
+        &mut self,
+        at: SourceRange,
+        positional: usize,
+        named: &[StringId],
+    ) {
         let Some(matched) = self.pattern_matched_ty() else {
             return;
         };
-        if matched == Ty::Unknown || self.pending_pattern_type_args.is_some() {
+        if matched == Ty::Unknown || !self.record_pattern_disjoint(matched, positional, named) {
             return;
         }
-        if self.name_can_be_subtype(matched, Ty::named(self.intern("List"))) {
-            return;
-        }
-        let element = Self::nullable_form(Ty::named(self.intern("Object")));
+        let object = Self::nullable_form(Ty::named(self.intern("Object")));
+        let slots = vec![object; positional];
+        let names: Vec<(StringId, Ty)> = named.iter().map(|name| (*name, object)).collect();
+        let required = self.boundary.args.borrow_mut().record(&slots, &names, false);
         let a0 = self.ty_display(matched);
-        let a1 = format!("List<{}>", self.ty_display(element));
+        let a1 = self.ty_display(required);
         self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
+    }
+
+    /// Whether a record-shaped required type provably admits no value of
+    /// `matched` (`canBeSubtypeOf`'s record arms, type_system.dart:269-330):
+    /// against a record right an interface left answers `true` only for
+    /// `Object`/`Record`, a function left never does, and two record sides
+    /// compare their field shapes. An opaque or undecidable left keeps the
+    /// official's conservative `true` (a type parameter, a non-interface
+    /// shape).
+    fn record_pattern_disjoint(
+        &self,
+        matched: Ty,
+        positional: usize,
+        named: &[StringId],
+    ) -> bool {
+        match matched {
+            // The `Null` arm decides before the record arms
+            // (type_system.dart:150-154): the required record type is never
+            // nullable, so `null` can inhabit no value of it.
+            Ty::Null => true,
+            Ty::Function { .. } => true,
+            Ty::Named { name, .. } => match self.strings.resolve(name) {
+                "Object" | "Record" => false,
+                // `Function`'s interface face: `canBeSubtypeOf`'s
+                // interface-vs-record arm admits only `Object`/`Record`.
+                "Function" => true,
+                // A declared interface head is disjoint from every record;
+                // an opaque one (a scope parameter, an unresolvable name) is
+                // the official's non-interface fallthrough.
+                _ => self.name_world().is_known_head(name),
+            },
+            Ty::Record { shape, .. } => {
+                let pool = self.boundary.pool();
+                let shape = pool.record_shape(shape);
+                if shape.positional.len() != positional || shape.named.len() != named.len() {
+                    return true;
+                }
+                let mut matched_names: Vec<StringId> =
+                    shape.named.iter().map(|(name, _)| *name).collect();
+                matched_names.sort_unstable();
+                let mut required: Vec<StringId> = named.to_vec();
+                required.sort_unstable();
+                matched_names != required
+            }
+            Ty::Unknown | Ty::Dynamic | Ty::Never | Ty::Void => false,
+        }
     }
 
     /// The cast-pattern triple (shared_type_analyzer.dart:145-152 and
@@ -7503,22 +7616,47 @@ impl<'a> Engine<'a> {
     /// Object kinds (type_analyzer.dart:723-756): a required type no
     /// matched value can inhabit proves the pattern dead. Refutable
     /// contexts only (the official's `irrefutableContext == null` gate;
-    /// declaration patterns suppress), and every node whose matched type is
-    /// reachable at parse time ([`Self::pattern_matched_ty`]) — the root
-    /// and the logical operands, not a field sub-pattern.
+    /// declaration patterns suppress).
     /// The verdict reads the type folded through a non-parameterized
     /// alias first — the official `requiredType` carries the written
     /// alias into every kind and unwraps it for `canBeSubtypeOf` — while
     /// the message renders the written spelling (`'IntAlias'`, probed
     /// 3.13.1).
-    pub(crate) fn check_pattern_never_matches(&mut self, at: SourceRange, required: Ty) {
+    ///
+    /// `Some((at, required))` is the deferred candidate: the node's matched
+    /// type is its enclosing container's column
+    /// ([`Self::pattern_reads_container_column`]), which no parse-time face
+    /// carries — the caller parks it on the container frame and re-judges it
+    /// once that container closes ([`Self::judge_pattern_never_matches`]).
+    pub(crate) fn check_pattern_never_matches(
+        &mut self,
+        at: SourceRange,
+        required: Ty,
+    ) -> Option<(SourceRange, Ty)> {
         if required == Ty::Unknown || required == Ty::Dynamic {
-            return;
+            return None;
         }
         let Some(matched) = self.pattern_matched_ty() else {
-            return;
+            return self.pattern_reads_container_column().then_some((at, required));
         };
-        if matched == Ty::Unknown {
+        self.judge_pattern_never_matches(at, required, matched);
+        None
+    }
+
+    /// The [`Self::check_pattern_never_matches`] verdict over an EXPLICIT
+    /// matched face: the open scrutinee for a root/logical-operand node, the
+    /// property column for a deferred object-pattern field
+    /// (`analyzeObjectPattern` pushes each field's property type as that
+    /// sub-pattern's `matchedValueType`, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+    /// 1674-1697).
+    pub(crate) fn judge_pattern_never_matches(
+        &mut self,
+        at: SourceRange,
+        required: Ty,
+        matched: Ty,
+    ) {
+        if required == Ty::Unknown || required == Ty::Dynamic || matched == Ty::Unknown {
             return;
         }
         if !self.name_can_be_subtype(matched, self.fold_alias_ty(required)) {
@@ -7526,6 +7664,29 @@ impl<'a> Engine<'a> {
             let a1 = self.ty_display(required);
             self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
         }
+    }
+
+    /// Whether the running pattern node's matched type is its enclosing
+    /// container's column — a property type for an object-pattern field, a
+    /// slot/column for a record, list, or map field (the official pushes
+    /// each field's own face as the sub-pattern's `matchedValueType`;
+    /// [`Self::pattern_matched_ty`] answers `None` for exactly these nodes).
+    /// Only the object kind can turn the column back into a type
+    /// ([`Self::judge_pattern_never_matches`] over
+    /// [`Self::object_pattern_binder_ty`]); the other kinds drop their
+    /// deferrals, the established under-report.
+    ///
+    /// A node outside a refutable case window owes nothing (the official's
+    /// `irrefutableContext == null` gate), so it is never a deferral.
+    pub(crate) fn pattern_reads_container_column(&self) -> bool {
+        self.switch.case_sink_open
+            && self.switch.pattern_stack.len() >= 2
+            && !self
+                .switch
+                .pattern_stack
+                .iter()
+                .skip(1)
+                .all(|frame| frame.binary.is_some())
     }
 
     /// `unnecessary_wildcard_pattern` (`unnecessaryWildcardPattern`,

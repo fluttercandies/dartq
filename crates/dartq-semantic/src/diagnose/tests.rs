@@ -17628,3 +17628,14 @@ mod ticket_3247_tests;
 #[cfg(test)]
 #[path = "ticket_3252_tests.rs"]
 mod ticket_3252_tests;
+// The #3242 pins (#3235's two blocked residuals: the Record kind of
+// `pattern_never_matches_value_type`, whose required type is the record over
+// the written fields with every slot `Object?`, and the per-node field-column
+// supply, which judges an object pattern's field sub-pattern against the
+// property it reads instead of the scrutinee). Registered here because
+// `diagnose.rs` is a live-lane file out of this ticket's write scope;
+// `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3242_tests.rs"]
+mod ticket_3242_tests;
