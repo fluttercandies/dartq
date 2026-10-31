@@ -115,7 +115,7 @@ pub use exhaustive::{
 };
 pub use generic_function::{
     Boundedness, TypeArgumentIssue, instantiate_function, is_well_bounded, regular_bounded_issues,
-    replace_top_bottom,
+    replace_top_bottom, replace_top_bottom_with_facts,
 };
 pub use hierarchy::{CoreDecls, DeclInfo, DroppedEdge, TypeHierarchy, TypeHierarchyBuilder};
 pub use ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};

@@ -5866,3 +5866,15 @@ mod ticket_3038_tests;
 /// (pkg/analyzer/lib/src/generated/error_detection_helpers.dart:72-75).
 #[cfg(test)]
 mod ticket_3110_tests;
+
+/// The #3122 pins — the send-solve's instantiated return keeps its
+/// binding past the function-typed-callee arm (the `F<G>` the `toF`
+/// solve writes is the call's static type,
+/// function_expression_invocation_resolver.dart:55-78), the
+/// effective-clamp applies the declared bound to the inferred solution
+/// only — never to a written type argument
+/// (type_arguments_verifier.dart:570-633) — and the enum constant's
+/// argument verdict reads the instantiated formal
+/// (error_detection_helpers.dart:72-75).
+#[cfg(test)]
+mod ticket_3122_tests;

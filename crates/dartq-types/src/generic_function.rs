@@ -117,11 +117,41 @@ pub fn replace_top_bottom(sys: &TypeSystem<'_>, ty: TypeId) -> TypeId {
         true,
     );
     let never = sys.table().intern(UninternedType::Never, false);
-    process_top_bottom(sys, ty, Variance::Covariant, object_question, never, 0)
+    let facts = ParamFactsTable::new();
+    process_top_bottom(sys, &facts, ty, Variance::Covariant, object_question, never, 0)
+}
+
+/// The facts-carrying form of [`replace_top_bottom`]: each interface
+/// argument is processed under its own parameter's declared variance
+/// combined with the incoming position — the official
+/// `_instantiatedTypeAlias` arm folds `typeParameter.variance.combine`
+/// (replace_top_bottom_visitor.dart:78) while the plain interface arm
+/// passes the incoming variance only (:97-100). A legacy-covariant
+/// parameter reads `covariant.combine(variance) == variance`, so the arm
+/// is an identity extension over every declaration that spells no
+/// `in`/`inout` keyword — and the correct answer once the facts snapshot
+/// carries a computed variance. Callers without a populated snapshot keep
+/// the interface arm's incoming-only face.
+#[must_use]
+pub fn replace_top_bottom_with_facts(
+    sys: &TypeSystem<'_>,
+    facts: &ParamFactsTable,
+    ty: TypeId,
+) -> TypeId {
+    let object_question = sys.table().intern(
+        UninternedType::Interface {
+            decl: sys.hierarchy().core().object,
+            args: Vec::new(),
+        },
+        true,
+    );
+    let never = sys.table().intern(UninternedType::Never, false);
+    process_top_bottom(sys, facts, ty, Variance::Covariant, object_question, never, 0)
 }
 
 fn process_top_bottom(
     sys: &TypeSystem<'_>,
+    facts: &ParamFactsTable,
     ty: TypeId,
     variance: Variance,
     top: TypeId,
@@ -146,13 +176,27 @@ fn process_top_bottom(
             if args.is_empty() {
                 return ty;
             }
+            let parameters: Vec<TypeParamId> = sys
+                .hierarchy()
+                .decl(decl)
+                .map(|owner| owner.type_parameters.clone())
+                .unwrap_or_default();
             let new_args: Vec<TypeId> = (0..args.len())
                 .map(|i| {
                     let arg = sys.table().arg(args.offset() + i);
-                    // The incoming variance, unchanged per argument — the
-                    // official interface arm ignores the parameter's own
-                    // variance (:97-100).
-                    process_top_bottom(sys, arg, variance, top, bottom, depth + 1)
+                    // The declared variance of this argument's parameter
+                    // combines with the incoming position — the official
+                    // `_instantiatedTypeAlias` arm's
+                    // `typeParameter.variance.combine(variance)`
+                    // (replace_top_bottom_visitor.dart:78). A parameter the
+                    // facts snapshot does not carry reads legacy-covariant,
+                    // which combines to the incoming variance alone — the
+                    // plain interface arm's own face (:97-100).
+                    let combined = parameters
+                        .get(i)
+                        .map(|parameter| facts.get(*parameter).variance.combine(variance))
+                        .unwrap_or(variance);
+                    process_top_bottom(sys, facts, arg, combined, top, bottom, depth + 1)
                 })
                 .collect();
             sys.table().intern(
@@ -167,7 +211,8 @@ fn process_top_bottom(
         // (type.dart:518): the base is processed with the incoming
         // variance.
         TypeKind::FutureOr { base } => {
-            let new_base = process_top_bottom(sys, base, variance, top, bottom, depth + 1);
+            let new_base =
+                process_top_bottom(sys, facts, base, variance, top, bottom, depth + 1);
             if new_base == base {
                 ty
             } else {
@@ -179,13 +224,21 @@ fn process_top_bottom(
         }
         TypeKind::Function { signature } => {
             let sig = sys.table().signature(signature);
-            let new_return =
-                process_top_bottom(sys, sig.return_type, variance, top, bottom, depth + 1);
+            let new_return = process_top_bottom(
+                sys,
+                facts,
+                sig.return_type,
+                variance,
+                top,
+                bottom,
+                depth + 1,
+            );
             let new_positional: Vec<TypeId> = (0..sig.positional.len())
                 .map(|i| {
                     let p = sys.table().arg(sig.positional.offset() + i);
                     process_top_bottom(
                         sys,
+                        facts,
                         p,
                         variance.combine(Variance::Contravariant),
                         top,
@@ -201,6 +254,7 @@ fn process_top_bottom(
                 .map(|mut member| {
                     member.ty = process_top_bottom(
                         sys,
+                        facts,
                         member.ty,
                         variance.combine(Variance::Contravariant),
                         top,
@@ -319,8 +373,11 @@ pub fn is_well_bounded(
     }
     // `_isSuperBounded` (well_bounded.dart:121-129): re-run the regular
     // pass on the inverted type. A non-interface inversion (the type was
-    // itself top) reads regular-bounded, i.e. super-bounded.
-    let inverted = replace_top_bottom(sys, ty);
+    // itself top) reads regular-bounded, i.e. super-bounded. The inversion
+    // reads the same facts snapshot the regular pass did — the alias arm's
+    // declared-variance combine decides inverted arguments exactly as the
+    // official's (replace_top_bottom_visitor.dart:78).
+    let inverted = replace_top_bottom_with_facts(sys, facts, ty);
     let inverted_issues = regular_bounded_issues(sys, facts, inverted);
     if inverted_issues.is_empty() {
         Boundedness::SuperBounded

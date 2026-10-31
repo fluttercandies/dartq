@@ -228,10 +228,12 @@ void main() { argfn(topy); }
 /// `Never`: the mutual-bound typedef pair resolves `fsource` to a real
 /// `F<…>` face and both `invalid_assignment` rows fire at the RHS reads.
 /// dartq clobbers the `toF(source)` send's instantiated return to `Void`
-/// (invocation.rs's function-typed-callee arm, in-flight), so `fsource`
-/// binds `Void` and the pair is never asked.
+/// (invocation.rs's function-typed-callee arm — fixed by #3122, which
+/// now preserves `F<G>`), and the surviving `F<G<ITB>>` vs `F<G<…>>`
+/// pair verdict lives in assignability.rs's typedef-pair arm — a lane
+/// this ticket does not own.
 #[test]
-#[ignore = "root is the send-result clobber in invocation.rs + dartq-types replace_top_bottom — in-flight"]
+#[ignore = "pair verdict is assignability.rs's typedef-pair arm — in-flight lane; the invocation.rs clobber half is pinned in ticket_3122_tests::ia1_solved_send_return_feeds_the_callable_face"]
 fn ia1_mutual_bound_typedef_reports_both_assignments() {
     let fixture = "\
 typedef F<X> = void Function<Y extends X>();
@@ -262,7 +264,6 @@ void main() {}
 /// clean and `a<int>("1")` reports `String → int` — never `→ T`. dartq's
 /// send solve keeps the declared `T` (invocation.rs, in-flight).
 #[test]
-#[ignore = "root is the send solve's unsubstituted formal in invocation.rs — in-flight"]
 fn at2_enum_ctor_arg_uses_instantiated_formal() {
     let fixture = "\
 enum E<T> {
@@ -292,7 +293,6 @@ void main() {}
 /// String` asks no question — while the inferred solution would clamp.
 /// dartq's `effective` clamps both (invocation.rs, in-flight).
 #[test]
-#[ignore = "root is the explicit-arg clamp in invocation.rs — in-flight"]
 fn at2_explicit_bound_violation_reports_no_atna() {
     let fixture = "\
 void g<T extends num>(T t) {}

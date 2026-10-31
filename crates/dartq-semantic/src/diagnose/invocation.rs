@@ -6736,7 +6736,7 @@ impl<'a> Engine<'a> {
         positional: u16,
         close: SourceRange,
     ) {
-        let Some((_, selector)) = self.enum_const_call else {
+        let Some((name_range, selector)) = self.enum_const_call else {
             return;
         };
         let Some((enum_name, _)) = self.container_context() else {
@@ -6812,6 +6812,52 @@ impl<'a> Engine<'a> {
                     // The field's declared type shares the constructor
                     // table's foreign pool — project it too.
                     formal.ty = self.boundary.ty(owner, entry.var_ty);
+                }
+            }
+            // The constant's written type arguments instantiate the enum's
+            // own parameters (`enum E<T> { a<int>(...) }` — `T` is `int`):
+            // the oracle checks each argument against the constructor's
+            // INSTANTIATED formal
+            // (`correspondingParameter.type`, upstream Dart SDK source,
+            // pkg/analyzer/lib/src/generated/error_detection_helpers.dart
+            // :72-75), never the declared `T` leaf. The headless group's
+            // members ride the `PendingBoundedCheck::Site` capture queued
+            // at its close — `head` is the enum (the official
+            // `checkEnumConstantDeclaration` face), and this constant's
+            // own group is the nearest one at-or-after its name. A
+            // formal that spells no parameter substitutes to itself.
+            if !container.type_param_names.is_empty() {
+                let written = self
+                    .pending_bounded_checks
+                    .iter()
+                    .filter_map(|check| match check {
+                        PendingBoundedCheck::Site { head, args, site, .. }
+                            if *head == enum_name && site.offset >= name_range.end() =>
+                        {
+                            Some((site.offset, args))
+                        }
+                        _ => None,
+                    })
+                    .min_by_key(|(offset, _)| *offset)
+                    .map(|(_, args)| args.clone());
+                if let Some(written) = written {
+                    let map: Vec<(StringId, Ty)> = container
+                        .type_param_names
+                        .iter()
+                        .zip(written.iter())
+                        .map(|(param, tree)| (*param, self.tree_ty(tree)))
+                        .collect();
+                    if !map.is_empty() {
+                        for formal in formals
+                            .positional
+                            .iter_mut()
+                            .chain(formals.named.iter_mut())
+                        {
+                            if let Some(substituted) = self.subst_params(formal.ty, &map) {
+                                formal.ty = substituted;
+                            }
+                        }
+                    }
                 }
             }
             Some((formals, container.has_const_constructor))
@@ -10098,6 +10144,14 @@ impl<'a> Engine<'a> {
             .as_ref()
             .map(|params| vec![None; params.len()].into())
             .unwrap_or_default();
+        // The slots the invocation's own type-argument group fixed
+        // positionally: the oracle's downward phase writes them before any
+        // inference and the effective face keeps the WRITTEN argument even
+        // when it violates the declared bound (the bound check reports the
+        // violation separately — upstream Dart SDK source, pkg/analyzer/
+        // lib/src/error/type_arguments_verifier.dart:570-633); only an
+        // inferred slot clamps to its bound.
+        let mut explicit_fixed: FxHashSet<usize> = FxHashSet::default();
         // The slots whose upward candidates disagreed: upstream's LUB merge
         // solves them to a type this model cannot compute, so their formals
         // stay undecidable rather than reading the parameter's own spelling
@@ -10171,8 +10225,13 @@ impl<'a> Engine<'a> {
             let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
             // The explicit fix precedes every inference face.
             if let Some(explicit) = &explicit_args {
-                for (slot, ty) in solutions.iter_mut().zip(explicit.tys.iter()) {
+                for (index, (slot, ty)) in solutions
+                    .iter_mut()
+                    .zip(explicit.tys.iter())
+                    .enumerate()
+                {
                     *slot = Some(*ty);
+                    explicit_fixed.insert(index);
                 }
             }
             // The receiver's written instantiation seeds the declaring
@@ -10520,6 +10579,7 @@ impl<'a> Engine<'a> {
                 .map(
                     |(index, ((param, bound), solution))| match (solution, bound) {
                         _ if disagreed.contains(&index) => Ty::UNKNOWN,
+                        (Some(ty), _) if explicit_fixed.contains(&index) => *ty,
                         (Some(ty), None) => *ty,
                         (Some(ty), Some(bound))
                             if self.assignable(*ty, *bound, false) != Some(false) =>
@@ -11686,11 +11746,26 @@ impl<'a> Engine<'a> {
         // alias or the raw function type) — never the whole function type
         // the declared row carries. A nullable callee keeps its face (the
         // unchecked-use verdict owns the value then).
+        // The send-solve's instantiated return keeps its binding: a generic
+        // callee whose upward inference solved a parameter
+        // (`solved_call_params` holds the callee's offset — `toF(source)`
+        // binds `X := G` and :10907 already wrote the substituted `F<G>`)
+        // IS the call's static type; folding it to the generic function
+        // shape and reading `shape.return_ty` would clobber the solved
+        // face to `void` and starve every downstream assignability ask
+        // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+        // function_expression_invocation_resolver.dart:55-78 — the
+        // invocation's static type is the inference result's return).
+        let solve_written = self
+            .rows
+            .get(callee)
+            .is_some_and(|row| self.solved_call_params.contains_key(&row.range.offset));
         let callee_ty = self.rows.get(callee).map(|row| self.fold_alias_ty(row.ty));
-        if let Some(Ty::Function {
-            shape,
-            nullable: false,
-        }) = callee_ty
+        if !solve_written
+            && let Some(Ty::Function {
+                shape,
+                nullable: false,
+            }) = callee_ty
         {
             let ret = self.boundary.pool().function_shape(shape).return_ty;
             self.rows[callee].ty = ret;
