@@ -436,8 +436,11 @@ dependencies = [
 name = "dartq-fixture"
 version = "0.1.2"
 dependencies = [
+ "dartq-language",
  "dartq-lints",
+ "dartq-scanner",
  "dartq-source",
+ "rustc-hash",
 ]
 
 [[package]]

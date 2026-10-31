@@ -10,8 +10,11 @@ categories = ["development-tools"]
 keywords = ["dart", "linter", "testing", "fixtures"]
 
 [dependencies]
+dartq-language = { workspace = true }
 dartq-lints = { workspace = true, features = ["test-support"] }
+dartq-scanner = { workspace = true }
 dartq-source = { workspace = true }
+rustc-hash = { workspace = true }
 
 [lints]
 workspace = true

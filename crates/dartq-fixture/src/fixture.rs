@@ -4,6 +4,10 @@
 //! ```text
 //! //- lint: <rule machine name>     file-level, required once: the expected
 //!                                    code for inline ranges, which carry none
+//! //- language: <major.minor>       file-level, optional: the language version
+//!                                    the cases analyze under (the upstream
+//!                                    `testPackageLanguageVersion`); default =
+//!                                    the SDK default version
 //! //- case: <case name>            starts a case
 //! //- file: /lib/test.dart         starts a file block; the FIRST block of
 //!                                    a case is the analyzed unit, later
@@ -47,6 +51,8 @@
 //! converter rejects a case whose Dart source contains one.
 
 use core::ops::Range;
+
+use dartq_language::LanguageVersion;
 
 use crate::markup::{self, MarkedRange};
 
@@ -102,6 +108,11 @@ pub struct Case {
 #[derive(Clone, Debug)]
 pub struct FixtureDoc {
     pub lint: String,
+    /// The language version every case analyzes under (the upstream
+    /// `testPackageLanguageVersion`); `None` = the SDK default version. A
+    /// file's own `// @dart=` override still wins over this
+    /// ([`crate::runner::version_of`]).
+    pub language: Option<LanguageVersion>,
     pub cases: Vec<Case>,
 }
 
@@ -272,11 +283,13 @@ fn marker_shape(line: &str) -> Result<Option<MarkerShape>, String> {
 ///
 /// # Errors
 ///
-/// A missing or duplicate `lint` header, an unknown header key, a case
-/// without content, a duplicate case name, or markup failing the upstream
-/// validity rules — each with the 1-based line where the grammar broke.
+/// A missing or duplicate `lint` header, a malformed or misplaced
+/// `language` header, an unknown header key, a case without content, a
+/// duplicate case name, or markup failing the upstream validity rules —
+/// each with the 1-based line where the grammar broke.
 pub fn parse(text: &str) -> Result<FixtureDoc, ParseError> {
     let mut lint: Option<String> = None;
+    let mut language: Option<LanguageVersion> = None;
     let mut cases: Vec<Case> = Vec::new();
     let mut draft: Option<Draft> = None;
     let mut named: Vec<String> = Vec::new();
@@ -340,6 +353,29 @@ pub fn parse(text: &str) -> Result<FixtureDoc, ParseError> {
                     });
                 };
                 open.diverge = Some(value);
+            }
+            // The file-level language version the cases analyze under. It
+            // is a whole-file pin (the upstream `testPackageLanguageVersion`
+            // of the test class), so it must precede the first case: a
+            // per-case version belongs in the file's own `// @dart=`
+            // override, which wins over this value.
+            "language" => {
+                if draft.is_some() {
+                    return Err(ParseError {
+                        line: line_no,
+                        reason: "language header must precede the first case".into(),
+                    });
+                }
+                if language.is_some() {
+                    return Err(ParseError {
+                        line: line_no,
+                        reason: "duplicate language header".into(),
+                    });
+                }
+                language = Some(value.parse().map_err(|e| ParseError {
+                    line: line_no,
+                    reason: format!("{e}"),
+                })?);
             }
             "case" => {
                 if named.contains(&value) {
@@ -410,7 +446,11 @@ pub fn parse(text: &str) -> Result<FixtureDoc, ParseError> {
             reason: "no cases".into(),
         });
     }
-    Ok(FixtureDoc { lint, cases })
+    Ok(FixtureDoc {
+        lint,
+        language,
+        cases,
+    })
 }
 
 impl Case {

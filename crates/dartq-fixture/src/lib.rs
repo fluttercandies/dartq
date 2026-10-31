@@ -24,20 +24,25 @@
 //!
 //! # Grammar
 //!
-//! One `.fixture` file: a `//- lint:` header, then any number of
+//! One `.fixture` file: a `//- lint:` header, an optional `//- language:`
+//! header pinning the version the cases analyze under, then any number of
 //! `//- case:` blocks; each case holds one or more `//- file:` blocks of
 //! marked Dart (the first is the analyzed unit), in the upstream inline
 //! markup plus optional line-anchored `// ^^^ code` markers — see
 //! [`fixture`] for the full grammar. [`port`] and its `port_upstream`
-//! binary convert an upstream `*_test.dart` into this format, rejecting
-//! (never silently dropping) anything it cannot represent.
+//! binary convert an upstream `*_test.dart` into this format — including
+//! the class's `LanguageVersionNNNMixin` pin as the `//- language:` header
+//! — rejecting (never silently dropping) anything it cannot represent.
 //!
 //! # Runner contract
 //!
 //! [`runner::assert_case`] feeds the analyzed file through the production
-//! bridge — scan, parse, arena, registry enable set, engine run — with
-//! the semantic fold mounted exactly when the enabled rule consumes it,
-//! the driver's per-file shape. A new rule's behavioral test is one
+//! bridge — scan, parse, arena, registry enable set, engine run — with the
+//! version the case resolves to ([`runner::version_of`]: the file's own
+//! `// @dart=` override, else the fixture's `//- language:`, else the
+//! default) deriving both the parse surface and the rule gates, and the
+//! semantic fold mounted exactly when the enabled rule consumes it, the
+//! driver's per-file shape. A new rule's behavioral test is one
 //! `include_str!` data file and a call to [`runner::assert_doc`] (see
 //! `dartq-lints`' `tests/upstream_cases.rs` for the driver shape).
 
@@ -50,4 +55,4 @@ pub use fixture::{
     AnalyzedFile, Case, DEFAULT_FILE, Expectation, FileBlock, FixtureDoc, ParseError, parse,
 };
 pub use port::{Outcome, PortedCase, merge_divergences, port_file, render};
-pub use runner::{assert_case, assert_doc, run_case};
+pub use runner::{assert_case, assert_doc, run_case, version_of};

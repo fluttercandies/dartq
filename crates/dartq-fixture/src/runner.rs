@@ -1,15 +1,15 @@
 //! The runner: one case through the production lint pipeline, asserted
 //! against its folded expectations.
 //!
-//! The pipeline is the real one — [`dartq_lints::testsupport::Fixture`]
-//! (scanner → parser → arena through [`dartq_lints::parse_unit`]), the
-//! registry's enable set for the case's lint, and the engine run. When the
-//! enabled rule consumes the semantic fold
-//! ([`dartq_lints::mounts_semantics`]) the case runs through the
-//! production semantic mount ([`Fixture::run_semantic`]: the source folded
-//! as the sole analyzed file of `package:t`, dart:core seeded), the same
-//! shape the driver mounts per file; every other case runs the plain
-//! [`Fixture::run`].
+//! The pipeline is the real one — the production parse bridge
+//! ([`dartq_lints::parse_unit`], or [`Fixture::parse`] when the enabled
+//! rule consumes the semantic fold), the registry's enable set for the
+//! case's lint, and the engine run. The unit carries the language version
+//! the case resolves to ([`version_of`]: the file's own `// @dart=`
+//! override, else the fixture's `//- language:`, else the default), and
+//! both the parse surface and the rule gates derive from that version's
+//! [`dartq_language::FeatureSet`] — the production per-file posture, so a
+//! pre-3.0 fixture parses a legacy `case` head and a 3.0 one a pattern.
 //!
 //! Only the case's first file (the analyzed unit) is lint-run; supporting
 //! file blocks are parsed and retained for the future cross-file faces.
@@ -18,13 +18,15 @@
 //! `assertDiagnosticsFromMarkup` contract — plus the rendered message for
 //! expectations that pin one (the line-anchored marker's `: message`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use dartq_language::{DEFAULT_LANGUAGE_VERSION, FeatureSet, LanguageVersion};
 use dartq_lints::{
-    Lint, mounts_semantics, rules,
-    testsupport::{Fixture, one_rule},
+    Features, Lint, mounts_semantics, rules,
+    testsupport::{CONFIG, Fixture, one_rule},
 };
-use dartq_source::LineIndex;
+use dartq_scanner::scan;
+use dartq_source::{FileTable, LineIndex};
 
 use crate::fixture::{Case, Expectation, FixtureDoc};
 
@@ -50,9 +52,9 @@ pub fn assert_doc(doc: &FixtureDoc) {
             .analyzed(&doc.lint)
             .expect("parse re-validated")
             .expectations;
-        let emitted = run_case(case, &doc.lint);
+        let emitted = run_case(case, &doc.lint, doc.language);
         if let Err((missing, extra)) = match_rows(&expected, &emitted) {
-            failures.push(render_failure(case, lint, missing, extra));
+            failures.push(render_failure(case, lint, doc.language, missing, extra));
         }
     }
     assert!(
@@ -78,28 +80,61 @@ pub fn assert_case(case: &Case, doc_lint: &str) {
         .analyzed(doc_lint)
         .expect("parse re-validated")
         .expectations;
-    let emitted = run_case(case, doc_lint);
+    let emitted = run_case(case, doc_lint, None);
     match match_rows(&expected, &emitted) {
         Ok(()) => {}
-        Err((missing, extra)) => panic!("{}", render_failure(case, lint, missing, extra)),
+        Err((missing, extra)) => panic!("{}", render_failure(case, lint, None, missing, extra)),
     }
 }
 
-/// Runs `case` through the production pipeline: the parse bridge, the
-/// case's declared path, and the semantic mount when the enabled rule
-/// consumes the fold.
+/// The language version `case` analyzes under: the analyzed file's own
+/// `// @dart = <version>` header when it carries one (the official
+/// `LanguageVersionToken`, which the scanner reads and which wins over the
+/// package version), else the fixture-level `language` (the upstream test
+/// class's `testPackageLanguageVersion`), else
+/// [`DEFAULT_LANGUAGE_VERSION`].
 #[must_use]
-pub fn run_case(case: &Case, doc_lint: &str) -> Vec<Lint> {
+pub fn version_of(case: &Case, language: Option<LanguageVersion>) -> LanguageVersion {
+    let path = PathBuf::from(case.files[0].path.trim_start_matches('/'));
+    settled_version(&case.files[0].code, &path, language)
+}
+
+/// [`version_of`] over an already-resolved path — the two resolution steps
+/// share this body so the marker's precedence lives in one place.
+fn settled_version(code: &str, path: &Path, language: Option<LanguageVersion>) -> LanguageVersion {
+    let mut files = FileTable::new();
+    let file = files.intern(path);
+    scan(code, CONFIG, file)
+        .language_version_override
+        .or(language)
+        .unwrap_or(DEFAULT_LANGUAGE_VERSION)
+}
+
+/// Runs `case` through the production pipeline: the version-derived parse
+/// bridge, the case's declared path, and the semantic mount when the
+/// enabled rule consumes the fold.
+#[must_use]
+pub fn run_case(case: &Case, doc_lint: &str, language: Option<LanguageVersion>) -> Vec<Lint> {
     let lint = case.lint(doc_lint);
     let target = &case.files[0];
-    let mut fixture = Fixture::parse(&target.code);
-    fixture.path = PathBuf::from(target.path.trim_start_matches('/'));
+    let path = PathBuf::from(target.path.trim_start_matches('/'));
+    let version = settled_version(&target.code, &path, language);
+    let features = Features::from_feature_set(FeatureSet::for_language_version(version));
     let enabled = one_rule(lint);
     if mounts_semantics(&enabled) {
-        fixture.run_semantic(&enabled)
-    } else {
-        fixture.run(&enabled)
+        // The semantic mount's context build is the test bridge's fixed
+        // 3.15 surface; the version still rides the unit, so the rule
+        // registration and dispatch gates see the case's own version.
+        let mut fixture = Fixture::parse(&target.code);
+        fixture.path = path;
+        fixture.features = features;
+        fixture.version = Some(version);
+        return fixture.run_semantic(&enabled);
     }
+    let parsed = dartq_lints::parse_unit(&target.code, features);
+    let mut unit = parsed.unit(Some(path.as_path()));
+    unit.version = Some(version);
+    dartq_lints::run(&unit, &enabled, &rustc_hash::FxHashSet::default())
 }
 
 /// The analyzed file's code — the coordinate space expectations and lints
@@ -108,12 +143,19 @@ fn expected_source(case: &Case) -> String {
     case.files[0].code.clone()
 }
 
-/// The failure report: case, lint, both row sets (the missing expectations
-/// and the unexpected lints), and the analyzed source.
-fn render_failure(case: &Case, lint: &str, missing: Vec<Expectation>, extra: Vec<Lint>) -> String {
+/// The failure report: case, lint, analyzed version, both row sets (the
+/// missing expectations and the unexpected lints), and the analyzed source.
+fn render_failure(
+    case: &Case,
+    lint: &str,
+    language: Option<LanguageVersion>,
+    missing: Vec<Expectation>,
+    extra: Vec<Lint>,
+) -> String {
     format!(
-        "case `{}` (lint `{lint}`) diverged\nmissing expectations:\n{}\nunexpected lints:\n{}\nanalyzed file {}:\n{}",
+        "case `{}` (lint `{lint}`, language {}) diverged\nmissing expectations:\n{}\nunexpected lints:\n{}\nanalyzed file {}:\n{}",
         case.name,
+        version_of(case, language),
         rows(&missing, &expected_source(case)),
         rows_lints(&extra),
         case.files[0].path,

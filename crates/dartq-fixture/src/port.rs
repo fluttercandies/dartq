@@ -21,15 +21,18 @@
 //! `assertDiagnostics(code, [error(…)])` form (analyzer parse-error rows
 //! the lint DSL does not model), statements the converter does not know,
 //! content whose lines collide with the fixture header grammar, and a
-//! `code:` override naming anything but the class's lint. Whole-file
-//! rejects: a missing `lintRule` getter and the language-version-pinned
-//! class mixins (`LanguageVersion219Mixin` — the settled-version face the
-//! DSL does not carry yet). `@FailingTest` methods are skipped, not
-//! rejected: they assert behavior the upstream itself knows is broken.
+//! `code:` override naming anything but the class's lint. A class pinned to
+//! a language version (`with LanguageVersion219Mixin`) contributes the
+//! fixture-level `//- language:` header ([`pinned_version`]). The one
+//! whole-file reject is a missing `lintRule` getter. `@FailingTest`
+//! methods are skipped, not rejected: they assert behavior the upstream
+//! itself knows is broken.
 //!
 //! The rendered output keeps the Dart bodies byte-verbatim (markers and
 //! all); the analyzed file block is written first, the `newFile` support
 //! blocks after.
+
+use dartq_language::LanguageVersion;
 
 /// One ported case: the verbatim marked body of the analyzed unit plus its
 /// supporting files (path → verbatim content).
@@ -40,11 +43,13 @@ pub struct PortedCase {
     pub support: Vec<(String, String)>,
 }
 
-/// The port result: the rule, the ported cases, and every skipped or
-/// rejected test with its reason.
+/// The port result: the rule, the file-level language version the upstream
+/// test class pinned (`None` = unpinned, the SDK default), the ported
+/// cases, and every skipped or rejected test with its reason.
 #[derive(Clone, Debug)]
 pub struct Outcome {
     pub rule: String,
+    pub language: Option<LanguageVersion>,
     pub ported: Vec<PortedCase>,
     pub skipped: Vec<(String, String)>,
 }
@@ -62,11 +67,10 @@ impl Outcome {
 /// # Errors
 ///
 /// Whole-file rejects, with the reason: a missing `lintRule` getter, a
-/// language-version mixin, or a test method shape the walker cannot close.
+/// language-version mixin whose name does not spell a `major.minor`, or a
+/// test method shape the walker cannot close.
 pub fn port_file(text: &str) -> Result<Outcome, String> {
-    if text.contains("LanguageVersion") && text.contains("Mixin") {
-        return Err("language-version-pinned test class is unsupported".into());
-    }
+    let language = pinned_version(text)?;
     let rule = lint_rule(text).ok_or("no `lintRule => …` getter found")?;
     let lines: Vec<&str> = text.split('\n').collect();
     // Byte offset of each line start, to hand the walker text from the
@@ -106,9 +110,43 @@ pub fn port_file(text: &str) -> Result<Outcome, String> {
     }
     Ok(Outcome {
         rule,
+        language,
         ported,
         skipped,
     })
+}
+
+/// The class's language-version pin: the upstream test-support mixin
+/// (`mixin LanguageVersion219Mixin on PubPackageResolutionTest { String?
+/// get testPackageLanguageVersion => '2.19'; }`, upstream Dart SDK source,
+/// `pkg/linter/test/rule_test_support.dart:18-22`) is the file-level
+/// package language version, which the fixture DSL spells `//- language:`.
+/// The mixin name concatenates the major and minor parts (`219` → 2.19,
+/// `310` → 3.10), so a three-digit part is the only shape the converter
+/// accepts; anything else is rejected rather than guessed.
+fn pinned_version(text: &str) -> Result<Option<LanguageVersion>, String> {
+    const NAME: &str = "LanguageVersion";
+    let mut from = 0;
+    while let Some(at) = text[from..].find(NAME) {
+        let after_name = from + at + NAME.len();
+        let rest = &text[after_name..];
+        let digits =
+            &rest[..rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len()];
+        if rest[digits.len()..].starts_with("Mixin") {
+            let [major, tens, ones] = digits.as_bytes() else {
+                return Err(format!(
+                    "cannot read a language version from mixin `LanguageVersion{digits}Mixin`"
+                ));
+            };
+            let digit = |b: u8| u32::from(b - b'0');
+            return Ok(Some(LanguageVersion::new(
+                digit(*major),
+                digit(*tens) * 10 + digit(*ones),
+            )));
+        }
+        from = after_name;
+    }
+    Ok(None)
 }
 
 /// The `lintRule => …;` value: `LintNames.<name>`, `'<name>'`, or
@@ -384,6 +422,9 @@ pub fn render(out: &Outcome) -> String {
         "// supporting files.\n",
     ));
     text.push_str(&format!("//- lint: {}\n", out.rule));
+    if let Some(language) = out.language {
+        text.push_str(&format!("//- language: {language}\n"));
+    }
     for case in &out.ported {
         text.push_str(&format!("\n//- case: {}\n", case.name));
         text.push_str("//- file: /lib/test.dart\n");
@@ -528,7 +569,8 @@ mod tests {
         assert_eq!(doc.cases.len(), 3);
     }
 
-    /// Whole-file rejects: no lintRule, a version-pinned class.
+    /// Whole-file rejects: no lintRule. A version-pinned class ports with
+    /// the pin carried as the fixture-level `//- language:` header.
     #[test]
     fn whole_file_rejects() {
         assert_eq!(
@@ -537,10 +579,27 @@ mod tests {
         );
         let pinned = "class T extends LanguageVersion219Mixin on LintRuleTest {\n\
                       String get lintRule => 'x';\n}";
+        let out = port_file(pinned).expect("a version-pinned class ports");
+        assert_eq!(out.rule, "x");
+        assert_eq!(out.language, Some(LanguageVersion::new(2, 19)));
+        let rendered = render(&out);
         assert!(
-            port_file(pinned)
+            rendered.contains("//- lint: x\n//- language: 2.19\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("//- language: 2.19"), "{rendered}");
+    }
+
+    /// The mixin spelling is decoded, never guessed: a name whose digits are
+    /// not `major` + two `minor` digits rejects the file.
+    #[test]
+    fn unreadable_version_mixin_rejects() {
+        let source = "class T with LanguageVersion30Mixin {\n\
+                      String get lintRule => 'x';\n}";
+        assert!(
+            port_file(source)
                 .unwrap_err()
-                .contains("language-version-pinned")
+                .contains("LanguageVersion30Mixin")
         );
     }
 
