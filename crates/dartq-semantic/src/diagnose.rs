@@ -5825,3 +5825,13 @@ mod ticket_3118_tests;
 /// literals, typedef-folded checked types, dynamic operands).
 #[cfg(test)]
 mod ticket_3038_tests;
+/// The #3110 pins: `invalid_assignment`/`argument_type_not_assignable` —
+/// the untyped formal of a captured function type resolves `dynamic`
+/// (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:803-813), the
+/// instantiate-to-bounds fallback seeds the declared bound never `Never`
+/// (pkg/analyzer/lib/src/dart/element/generic_inferrer.dart:449), and the
+/// argument verdict reads the instantiated formal
+/// (pkg/analyzer/lib/src/generated/error_detection_helpers.dart:72-75).
+#[cfg(test)]
+mod ticket_3110_tests;

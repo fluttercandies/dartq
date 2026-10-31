@@ -2095,7 +2095,48 @@ impl<'a> Engine<'a> {
                 Receiver::This { container, .. } | Receiver::Super { container, .. } => {
                     self.member_write_ty(*container, row.name)
                 }
-                Receiver::Typed { type_name, .. } => self.member_write_ty(*type_name, row.name),
+                // A folded creation receiver (`C().x = e`, `C<T>().x = e`):
+                // the instance write face is the declaring container's —
+                // the setter's value formal or the field's declared type
+                // (upstream `getWriteType`, the same answer
+                // [`Engine::member_write_ty`] gives). The fold keeps no
+                // written arguments, so a generic head's `T` stands
+                // unsubstituted here (the under-instantiated residual the
+                // `Receiver::Typed` arm below solves where the receiver
+                // still spells its instantiation).
+                Receiver::Created { name, .. } => self.member_write_ty(*name, row.name),
+                Receiver::Typed { type_name, ty } => {
+                    let declared = self.member_write_ty(*type_name, row.name);
+                    // The instantiated write face (upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/generated/
+                    // error_detection_helpers.dart:72-75 — the verdict asks
+                    // `correspondingParameter.type`, the already-instantiated
+                    // formal): a generic receiver's declared member face
+                    // spells the container's `T`, but the oracle's write
+                    // type substitutes the receiver's written arguments —
+                    // `C<String>`'s `T? field` writes against `String?`,
+                    // never `T?`. The environment composes the same way the
+                    // member send's does
+                    // ([`Engine::member_recv_env`]): the field, else the
+                    // `name=` setter the write resolves against, supplies
+                    // the entry the parameter-name pairing needs.
+                    let member = self.setter_spelling(row.name);
+                    let entry = match self.walk_members(*type_name, row.name) {
+                        Walk::Found(entry) if entry.kind == MemberKind::Field => Some(entry),
+                        _ => match self.walk_members(*type_name, member) {
+                            Walk::Found(entry) if entry.kind == MemberKind::Setter => Some(entry),
+                            _ => None,
+                        },
+                    };
+                    let instantiated = entry
+                        .and_then(|entry| self.member_recv_env(*ty, *type_name, &entry))
+                        .map(|env| {
+                            let keys: FxHashMap<StringId, Ty> = env.into_iter().collect();
+                            self.substitute_ty(declared, &keys)
+                        })
+                        .unwrap_or(declared);
+                    instantiated
+                }
                 Receiver::Container {
                     name: container, ..
                 } => {
