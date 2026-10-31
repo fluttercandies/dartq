@@ -637,6 +637,8 @@ pub struct PersistedAugTarget {
     /// The intro fragment's completeness bit (`*FragmentImpl.isComplete`) —
     /// the `declaration_already_complete` chain walk.
     pub is_complete: bool,
+    /// The constructor head's `errorRange` ([`AugTarget::head_range`]).
+    pub head_range: Option<PersistedRange>,
 }
 
 /// The per-entry string slice under construction: every referenced
@@ -975,6 +977,7 @@ impl PersistedElements {
                 is_const: target.is_const,
                 is_factory: target.is_factory,
                 is_complete: target.is_complete,
+                head_range: target.head_range.map(PersistedRange::of),
             })
             .collect();
         let anon_methods = elements
@@ -1218,6 +1221,7 @@ impl PersistedElements {
                     is_const: target.is_const,
                     is_factory: target.is_factory,
                     is_complete: target.is_complete,
+                    head_range: target.head_range.map(PersistedRange::source_range),
                 })
                 .collect(),
             anon_methods: self

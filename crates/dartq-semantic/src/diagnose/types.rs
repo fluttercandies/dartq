@@ -2849,6 +2849,10 @@ pub(crate) struct Engine<'a> {
     /// `Feature.primary_constructors`; the expected-representation-type row
     /// lives in the disabled arm only).
     pub(crate) primary_constructors_enabled: bool,
+    /// `isAugmentationsFeatureEnabled`: the `augment` declaration family.
+    /// `_checkForFactoryBodyCompleteness` gates on it
+    /// (error_verifier.dart:5079-5081).
+    pub(crate) augmentations_enabled: bool,
     /// The `variance` experiment grant (`FeatureSet::is_enabled(Feature::
     /// Variance)`): the #612 capture runs regardless of it (#742 — the
     /// legacy superinterface face answers in the default posture), so the

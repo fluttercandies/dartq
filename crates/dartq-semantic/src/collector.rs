@@ -530,6 +530,9 @@ struct Builder<'src, 'tab> {
     /// The open constructor/factory wrote `const` (drained at the end into
     /// the constructor's own target-kind row).
     pending_ctor_const: Option<bool>,
+    /// The `external` keyword on the factory head in flight — a complete
+    /// fragment for the factory-body completeness check (#3201).
+    pending_ctor_external: bool,
     /// The formal parameter under capture inside an `augment` executable:
     /// its start span and the `covariant`/`required` keyword spans, latched
     /// at `begin_formal_parameter`, drained at `end_formal_parameter`.
@@ -537,6 +540,9 @@ struct Builder<'src, 'tab> {
     /// A factory declaration is open (`begin_factory`..`end_factory`): its
     /// name event is a constructor shape, not a method one.
     factory_ctor_open: bool,
+    /// The `factory` keyword's span of the constructor head in flight — the
+    /// base of the constructor row's `head_range` anchor.
+    factory_kw_range: Option<SourceRange>,
     /// A mismatched factory selector (`factory H` in `class G`) latched at
     /// the name event — `end_factory` registers it unless a `.name`
     /// continuation already did (`factory G.named` keeps only `named`).
@@ -750,8 +756,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_typedef: None,
             ctor_open: None,
             pending_ctor_const: None,
+            pending_ctor_external: false,
             aug_formal_start: None,
             factory_ctor_open: false,
+            factory_kw_range: None,
             factory_ctor_head: None,
             pending_ctor_formals: None,
             pending_ctor_annotations: Vec::new(),
@@ -2708,6 +2716,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_const: false,
                     is_factory: false,
                     is_complete: false,
+                    head_range: None,
                 });
             }
         }
@@ -3598,6 +3607,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 // are `external || !abstract` — top-level
                                 // spellings carry neither, so complete.
                                 is_complete: true,
+                                head_range: None,
                             });
                         }
                         if let Some(augment_kw) = builder.field_augment {
@@ -4458,6 +4468,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // incomplete: the augmentation legitimately supplies the
                     // body and `declaration_already_complete` must not fire.
                     is_complete: pending.is_external || pending.has_body,
+                    head_range: None,
                 });
             }
             if let Some(mut augment) = builder.pending_aug.take() {
@@ -4563,10 +4574,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _kind: DeclarationKind,
         _last_consumed: Token,
         augment_kw: Option<Token>,
-        _external_kw: Option<Token>,
+        external_kw: Option<Token>,
         const_keyword: Option<Token>,
     ) {
         let builder = &mut self.builder;
+        builder.pending_ctor_external = external_kw.is_some();
         // A factory's star is the declaration's own — same claim as
         // `begin_constructor` (the factory's use-face joins the
         // `ctor_annotations` side-map under its formal-table key).
@@ -4600,6 +4612,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 offset: t.utf16_offset,
                 length: t.byte_len,
             });
+        builder.factory_kw_range = factory_kw;
         builder.declaring_augment = augment_kw.is_some();
         if let Some(kw) = augment_kw
             && let Some(open) = builder.containers.last()
@@ -4629,7 +4642,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 const_kw: const_keyword.map(|t| builder.span_of(t)),
                 factory_kw,
                 has_body: false,
-                is_external: _external_kw.is_some(),
+                is_external: external_kw.is_some(),
                 ctor_completion: false,
             });
         }
@@ -4667,7 +4680,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 }
             }
             capture_unnamed = capture.has_unnamed;
-            factory_complete = capture.completion;
+            factory_complete = capture.completion || std::mem::take(&mut builder.pending_ctor_external);
             for name in &named {
                 if !open.ctor_named.contains(name) {
                     open.ctor_named.push(*name);
@@ -4683,6 +4696,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if !builder.declaring_augment
             && let Some((container, _)) = builder.containers.last().and_then(|open| open.name)
         {
+            // The head's `errorRange` anchor, computed once per ctor head
+            // from the open's `factory` keyword.
+            let head = builder
+                .factory_kw_range
+                .take()
+                .and_then(|kw| ctor_head_range(builder.source, builder.strings, kw, container));
             let push = |builder: &mut Builder, name: StringId| {
                 builder.decl_kinds.push(AugTarget {
                     container: Some(container),
@@ -4693,6 +4712,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_const: factory_const,
                     is_factory: true,
                     is_complete: factory_complete,
+                    head_range: head,
                 });
             };
             if capture_named.is_empty() {
@@ -4948,6 +4968,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_const: ctor_const,
                     is_factory: false,
                     is_complete: ctor_complete,
+                    head_range: None,
                 });
             };
             if ctor_selectors.is_empty() && ctor_unnamed {
@@ -5164,6 +5185,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_const: false,
                 is_factory: false,
                 is_complete: false,
+                head_range: None,
             });
             let _ = builder.declare_top(
                 name,
@@ -7259,5 +7281,66 @@ fn numeric_literal_shape(bytes: &[u8]) -> Option<LiteralShape> {
         LiteralShape::Double
     } else {
         LiteralShape::Int
+    })
+}
+
+/// The constructor head's `errorRange` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/dart/ast/ast.dart` `ConstructorDeclarationImpl
+/// .errorRange`): the `typeName` token through the selector name when a
+/// type name is written, else the `factory` keyword through the name. The
+/// unnamed spellings collapse to the token that is present — `factory A()`
+/// reads `A`, `factory ()` reads `factory` alone. ASCII sources only: the
+/// reverse byte↔UTF-16 mapping is not worth a hop for a head, and a
+/// non-ASCII file keeps the row silent.
+fn ctor_head_range(
+    source: &str,
+    strings: &StringTable,
+    factory_kw: SourceRange,
+    container: StringId,
+) -> Option<SourceRange> {
+    if !source.is_ascii() {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let skip_trivia = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut at = skip_trivia(factory_kw.end() as usize);
+    if bytes.get(at).is_none_or(|b| !is_name(*b)) {
+        return Some(factory_kw);
+    }
+    let head_start = at;
+    while at < bytes.len() && is_name(bytes[at]) {
+        at += 1;
+    }
+    let spelled = source.get(head_start..at)?;
+    let after = skip_trivia(at);
+    if bytes.get(after) == Some(&b'.') {
+        let mut name = skip_trivia(after + 1);
+        let name_start = name;
+        while name < bytes.len() && is_name(bytes[name]) {
+            name += 1;
+        }
+        if name == name_start {
+            return None;
+        }
+        return Some(SourceRange {
+            offset: head_start as u32,
+            length: (name - head_start) as u32,
+        });
+    }
+    if spelled == strings.resolve(container) {
+        return Some(SourceRange {
+            offset: head_start as u32,
+            length: (at - head_start) as u32,
+        });
+    }
+    Some(SourceRange {
+        offset: factory_kw.offset,
+        length: (at as u32) - factory_kw.offset,
     })
 }

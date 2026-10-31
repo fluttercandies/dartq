@@ -1920,6 +1920,14 @@ pub struct AugTarget {
     /// nonEmptyBody`; a variable-induced accessor's `external ||
     /// !abstract`). Container rows always carry `false`.
     pub is_complete: bool,
+    /// The constructor head's `errorRange` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/ast/ast.dart` `ConstructorDeclarationImpl
+    /// .errorRange`: the `typeName` through the name when a type name is
+    /// written, else the `factory` keyword through the name). The unnamed
+    /// spellings collapse to the single token that is present
+    /// (`factory A()` reads `A`, `factory ()` reads `factory`). `None` for
+    /// every non-constructor target.
+    pub head_range: Option<SourceRange>,
 }
 
 /// One formal parameter of an `augment` declaration: the written facts the

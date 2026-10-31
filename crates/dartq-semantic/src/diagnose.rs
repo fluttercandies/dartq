@@ -1210,6 +1210,7 @@ pub fn fold_unit_with_ops<'t>(
             file,
             lib,
             features.primary_constructors_enabled,
+            features.augmentations_enabled,
             features.variance_enabled,
             field_promotion_enabled,
             features.patterns_enabled,
@@ -2009,7 +2010,13 @@ pub fn fold_unit_with_ops<'t>(
         // declarations against the whole library's declaration space
         // (fragment-chain merge semantics — #2784).
         diagnostics.extend(augmentations::augmentation_diagnostics(
-            file, elements, graph, index, strings, lib,
+            file,
+            elements,
+            graph,
+            index,
+            strings,
+            lib,
+            features.augmentations_enabled,
         ));
     }
     diagnostics.append(&mut report.diagnostics);

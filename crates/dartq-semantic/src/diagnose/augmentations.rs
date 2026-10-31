@@ -302,9 +302,18 @@ pub(super) fn augmentation_diagnostics(
     index: &ElementIndex,
     strings: &StringTable,
     lib: LibraryId,
+    augmentations_enabled: bool,
 ) -> Vec<Diagnostic> {
+    // `_checkForFactoryBodyCompleteness` (error_verifier.dart:5078-5107)
+    // runs for every factory constructor of the unit, augmentation chains or
+    // none — and only with the `augmentations` experiment on (`:5079-5081`).
+    let mut out = if augmentations_enabled {
+        factory_body_diagnostics(file, own, index, graph, lib, strings)
+    } else {
+        Vec::new()
+    };
     if own.augmentations().is_empty() {
-        return Vec::new();
+        return out;
     }
     let mut table: FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>> =
         FxHashMap::default();
@@ -313,7 +322,6 @@ pub(super) fn augmentation_diagnostics(
             populate(&mut table, unit, elements, strings);
         }
     }
-    let mut out = Vec::new();
     for (aug_index, aug) in own.augmentations().iter().enumerate() {
         // A type alias augmentation never merges: the parser reports the
         // shape outright (upstream `parser_impl.dart` reports
@@ -1408,3 +1416,63 @@ fn row(file: FileId, range: SourceRange, code: SemanticCode, message: String) ->
         None,
     )
 }
+
+/// `_checkForFactoryBodyCompleteness` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/generated/error_verifier.dart:5078-5107`): a
+/// factory constructor with no body in a fragment chain that never
+/// completes reports `factory_without_body` at the constructor's
+/// `errorRange`. The experiment gate is the caller's (`:5079-5081`); an
+/// `augment` fragment never reports (`:5083-5086` — the introductory
+/// declaration owns the row); a chain with more than one fragment that
+/// stays incomplete is `factory_not_complete_after_augmentations`
+/// (`:5101-5106`), which has no registry row yet — that arm stays silent,
+/// since `factory_without_body` there would be an extra.
+fn factory_body_diagnostics(
+    file: FileId,
+    own: &FileElements,
+    index: &ElementIndex,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+    strings: &StringTable,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for target in own.decl_kinds() {
+        if target.kind != AugKind::Constructor || !target.is_factory || target.is_complete {
+            continue;
+        }
+        let key = (
+            target.container,
+            property_name(target.name, target.kind, strings),
+            Space::Ctor,
+        );
+        let mut fragments = 0usize;
+        let mut complete = false;
+        for &unit in graph.unit_files(lib) {
+            let Some(elements) = index.get(unit) else {
+                continue;
+            };
+            for aug in elements.augmentations() {
+                if augment_key(aug, strings) != key {
+                    continue;
+                }
+                fragments += 1;
+                complete |= aug.is_complete;
+            }
+        }
+        if complete || fragments > 0 {
+            continue;
+        }
+        let Some(head) = target.head_range else {
+            continue;
+        };
+        let code = SemanticCode::FactoryWithoutBody;
+        out.push(row(file, head, code, code.message("", "")));
+    }
+    out
+}
+
+// The #3201 pins — the factory-body completeness face
+// (`factory_without_body`) with the augmentations experiment on.
+#[cfg(test)]
+#[path = "ticket_3201_tests.rs"]
+mod ticket_3201_tests;

@@ -126,11 +126,26 @@ pub(super) fn report_ops_with(
     imports: &[RigImport<'_>],
     wildcards: Option<bool>,
 ) -> FileReport {
+    report_ops_experiments_with(source, imports, wildcards, &[])
+}
+
+/// [`report_ops_with`] plus `--enable-experiment` opt-ins (the corpus's
+/// `analysis_options` `enable-experiment` list): each entry switches on an
+/// experimental feature the language version alone does not.
+pub(super) fn report_ops_experiments_with(
+    source: &str,
+    imports: &[RigImport<'_>],
+    wildcards: Option<bool>,
+    experiments: &[dartq_language::Feature],
+) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
     let scanned = scan_fixture(source, file);
-    let set = FeatureSet::for_language_version(fixture_language_version(source));
+    let mut set = FeatureSet::for_language_version(fixture_language_version(source));
+    for feature in experiments {
+        set = set.with_experiment(*feature);
+    }
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(source, &scanned.tokens, features, &strings);
     let mut builder = LibraryGraphBuilder::new(&strings);
