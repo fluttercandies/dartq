@@ -97,7 +97,7 @@ fn check(c: &mut Check<'_>) {
                 }
                 return;
             }
-            walk(c, analysis, &run);
+            walk(c, analysis, &run, None);
         }
         NodeKind::ForStatement => check_for(c, analysis),
         NodeKind::Cascade => check_cascade(c, analysis),
@@ -108,7 +108,17 @@ fn check(c: &mut Check<'_>) {
 /// The expression-form dispatch over a piece run (:114-116 `visitNode`
 /// verdicts). The root is the row whose span covers every other row of
 /// the run — the outermost completion of the expression.
-fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) {
+///
+/// `bound` is the enclosing comma segment's exclusive UTF-16 end when the
+/// run is one segment of a `for`-header list: a container's own seal may
+/// reach past the separator (`a == s, c = 0` seals the binary over the
+/// comma), so the report extent is capped at the segment.
+fn walk(
+    c: &mut Check<'_>,
+    analysis: &dartq_semantic::Analysis<'_>,
+    run: &[u32],
+    bound: Option<u32>,
+) {
     let Some(root) = root_of(c, run) else {
         return;
     };
@@ -130,7 +140,7 @@ fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32])
             // strip and dispatch on what remains (an `Identifier` walks
             // the getter face).
             let stripped = slice::access_run(c, run);
-            walk(c, analysis, &stripped);
+            walk(c, analysis, &stripped, bound);
         }
         NodeKind::Assignment
         | NodeKind::PatternAssignment
@@ -181,15 +191,15 @@ fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32])
                 .is_some_and(|op| matches!(c.lexeme(op), "??" | "||" | "&&"));
             if controls {
                 let right = binary_right_run(c, run, root);
-                walk(c, analysis, &right);
+                walk(c, analysis, &right, bound);
             } else {
-                report(c, root, run);
+                report(c, root, run, bound);
             }
         }
         // The arms walk; the condition does not (:91-94).
         NodeKind::Conditional => {
             for arm in arm_runs(c, run, root) {
-                walk(c, analysis, &arm);
+                walk(c, analysis, &arm, bound);
             }
         }
         // The const literal is a `visitNode` face upstream — the whole
@@ -240,13 +250,13 @@ fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32])
         | NodeKind::IsExpression
         | NodeKind::Indexed
         | NodeKind::ParenthesizedExpression
-        | NodeKind::ConstructorReference => report(c, root, run),
+        | NodeKind::ConstructorReference => report(c, root, run, bound),
         // The getter faces (:129-176): a bare name and a member chain.
         NodeKind::Identifier
         | NodeKind::ThisExpression
         | NodeKind::SuperExpression
         | NodeKind::DotAccess
-        | NodeKind::Qualified => walk_access(c, analysis, run, root),
+        | NodeKind::Qualified => walk_access(c, analysis, run, root, bound),
         // Unmodeled shapes stay silent (the conservative family).
         _ => {}
     }
@@ -314,15 +324,27 @@ fn statement_window_end(c: &Check<'_>) -> Option<u32> {
 /// hand the dispatch a `CascadeAccess`/`DotAccess` follower instead of
 /// the expression.
 fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
-    let root = *run.last()?;
-    let span = c.byte_span(root);
-    let covers = run.iter().all(|&other| {
-        let other = c.byte_span(other);
-        other.start >= span.start && other.end <= span.end
+    // The covering scan is order-independent: a run normally seals its
+    // wrapper last, but the recovered comma initializer completes its
+    // binary *before* the parser's recovery scaffold rows tile beside it
+    // (`a == s, c = 0`), so the row that covers the run is not last there.
+    // Marker rows are scaffolding, never an expression: the degenerate
+    // empty literal anchors a zero-width `ListLiteral` beside a piece row
+    // that *covers* it (`[]` lexes as one token), and picking the piece
+    // would lose the literal's own face.
+    let covering = run.iter().copied().rev().find(|&candidate| {
+        !is_marker_row(c, candidate) && {
+            let span = c.byte_span(candidate);
+            run.iter().all(|&other| {
+                let other = c.byte_span(other);
+                other.start >= span.start && other.end <= span.end
+            })
+        }
     });
-    if covers {
+    if let Some(root) = covering {
         return Some(root);
     }
+    let root = *run.last()?;
     // The bridge stamps the prefix leaf over the operator *after* the
     // operand completes, so its span covers the operator alone and the
     // containment test fails on `~1;` / `!x.isEven;`. The leaf is the
@@ -344,6 +366,11 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
     // bracket pair while the literal's text rides a sibling piece row
     // (`[]` lexes as one token), so the row neither covers the run nor is
     // covered by anything — `visitNode` still reports at the literal.
+    //
+    // The conditional anchors at its `?` (the delta-tile head) with the
+    // condition tiled to its left, so it never covers the run that made
+    // it; upstream's `visitConditionalExpression` walks the arms and the
+    // conditional is the run's root (`t ? x : y` reports per arm).
     matches!(
         c.kind(root),
         NodeKind::UnaryPrefix
@@ -352,6 +379,7 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
             | NodeKind::ListLiteral
             | NodeKind::SetOrMapLiteral
             | NodeKind::RecordLiteral
+            | NodeKind::Conditional
     )
     .then_some(root)
 }
@@ -359,8 +387,10 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
 /// Reports at the whole expression `root`: the run's earliest head
 /// token bounds the start — a container root's own covered span opens
 /// at its delta-tile anchor (the operator or the trailing leaf), never
-/// at the operand head.
-fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
+/// at the operand head. `bound` caps the end at the enclosing comma
+/// segment's separator (the recovered `for` initializer's binary seals
+/// over the comma).
+fn report(c: &mut Check<'_>, root: u32, run: &[u32], bound: Option<u32>) {
     let start = slice::run_utf16_start(c, run).unwrap_or(c.utf16_span(root).start);
     // A function literal's body tiles beside it as owner siblings —
     // the content runs to the statement follower, so the token scan
@@ -391,8 +421,27 @@ fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
             _ => token_content_end(c, root, start),
         };
     }
+    // A container's seal reaches past its follower on the recovery shapes
+    // (`a == s, c = 0` returns the comma as the expression end), so the
+    // segment separator caps the extent.
+    if let Some(bound) = bound {
+        end = end.min(bound);
+    }
+    if end <= start {
+        return;
+    }
     let range = start..end;
     c.report(range, &[]);
+}
+
+/// Whether `row` is a zero-width parser sentinel (or recovery scaffold)
+/// rather than an expression. `Send` is deliberately NOT one: it is the
+/// bare-name/tear-off completion row and a legitimate covering root.
+fn is_marker_row(c: &Check<'_>, row: u32) -> bool {
+    matches!(
+        c.kind(row),
+        NodeKind::NoTypeArguments | NodeKind::NoArguments | NodeKind::RecoverableError
+    )
 }
 
 /// The content end of a degenerate row: the token at/just before the
@@ -477,7 +526,13 @@ fn content_end_row(c: &Check<'_>, root: u32, run: &[u32]) -> u32 {
 /// upstream `visitNode` verdict), and a cross-file top-level
 /// declaration stays silent (the binding face cannot split a getter
 /// from a value — the conservative family).
-fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32], root: u32) {
+fn walk_access(
+    c: &mut Check<'_>,
+    analysis: &dartq_semantic::Analysis<'_>,
+    run: &[u32],
+    root: u32,
+    bound: Option<u32>,
+) {
     // A bare name: no access marker seals the run.
     let marker = run
         .iter()
@@ -495,7 +550,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
         // A local/parameter/field/top-level variable binding reports
         // (`test_localVariable`, `test_topLevelVariable`).
         if same_file::binding(c, root, name).is_some() {
-            report(c, root, run);
+            report(c, root, run, bound);
             return;
         }
         // An origin getter stays silent (:167-176 — the top-level and
@@ -506,7 +561,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
         // Every other same-file declaration (function tear-off, setter,
         // class) reports (:114-116).
         if same_file::declares_name(c, name) {
-            report(c, root, run);
+            report(c, root, run, bound);
             return;
         }
         // The semantic cross-file tail: a resolved type-parameter or
@@ -521,10 +576,10 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
                     dartq_semantic::BindingKind::TypeParam | dartq_semantic::BindingKind::Prefix
                 ) =>
             {
-                report(c, root, run);
+                report(c, root, run, bound);
             }
             Some(_) => {}
-            None => report(c, root, run),
+            None => report(c, root, run, bound),
         }
         return;
     };
@@ -544,7 +599,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
             matches!(class_member(c, class_row, name), Some(Member::Getter))
         });
         if !getter {
-            report(c, root, run);
+            report(c, root, run, bound);
         }
         return;
     }
@@ -579,7 +634,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
                     // the same-file class — inherited or imported —
                     // joins the conservative silent face.
                     Some(Member::Getter) | None => {}
-                    Some(_) => report(c, root, run),
+                    Some(_) => report(c, root, run, bound),
                 }
                 return;
             }
@@ -590,12 +645,12 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
             match analysis.member_of(query_site(c, head), interned) {
                 Some(member) => {
                     if member.entry.kind != MemberKind::Getter {
-                        report(c, root, run);
+                        report(c, root, run, bound);
                     }
                 }
                 // An unresolved member is not a getter — the upstream
                 // `visitNode` face reports (:113-116).
-                None => report(c, root, run),
+                None => report(c, root, run, bound),
             }
         }
         return;
@@ -609,7 +664,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
         analysis.binding_of(query_site(c, run[name_index - 1])),
         Some(binding) if binding.kind == dartq_semantic::BindingKind::Decl
     ) {
-        report(c, root, run);
+        report(c, root, run, bound);
         return;
     }
     let Some(receiver) = slice::bare_receiver(c, run, name_index) else {
@@ -623,7 +678,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
             // A field read, a setter reference, or a method tear-off
             // reports (:117-155).
             MemberKind::Method | MemberKind::Field | MemberKind::Setter => {
-                report(c, root, run);
+                report(c, root, run, bound);
                 return;
             }
         }
@@ -641,7 +696,7 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
         Some(Member::Getter) | None => {}
         // A field or a method tear-off reports (:117-121, :139-147 —
         // `test_instanceField`, `test_methodTearoff`).
-        Some(_) => report(c, root, run),
+        Some(_) => report(c, root, run, bound),
     }
 }
 
@@ -777,20 +832,45 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     ) else {
         return;
     };
-    // The initialization run: the pieces before the first separator. The
-    // content bound (not the row's own seal — a bare-send-tailed
-    // initialization seals past the separator) keeps the row inside the
-    // initialization window. A comma-separated expression list (the
-    // oracle's `ForPartsWithExpression` recovery: `a == s, c = 0`)
-    // walks each segment separately — the whole run carries no single
-    // covering root.
+    // The initialization window's own end, in report units: the separator
+    // token's start caps a container whose seal reaches past it.
+    let left_bound = crate::rules::utf16_token_span(c, left_sep).start;
+    // The initialization run: the pieces that OPEN before the header's
+    // first comma — a comma list is never a valid initializer, so the
+    // parser's recovery splices a `;` after the first segment and hands
+    // the tail to the updater list (upstream `parseForLoopPartsRest` →
+    // `ensureSemicolon`). Membership is start-anchored, not seal-anchored:
+    // a container seals past its last operand (`a == s, c = 0` returns the
+    // comma as the expression end), so a content-end test drops the very
+    // row that carries the initialization.
+    let init_end = {
+        let parts_start = c.byte_span(parts).start;
+        c.unit
+            .tokens
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| {
+                let at = token.byte_offset as usize;
+                (at >= parts_start && at < left_start && c.lexeme(index as u32) == ",")
+                    .then_some(at)
+            })
+            .min()
+            .unwrap_or(left_start)
+    };
+    // The header's own container and the body are not expressions: the
+    // parts leaf opens at the `for` keyword, so a start-anchored window
+    // would adopt it and lose the covering root.
     let init: Vec<u32> = fragments
         .iter()
         .copied()
-        .filter(|&row| c.byte_span(content_end_row(c, row, &[row])).end <= left_start)
+        .filter(|&row| {
+            c.byte_span(row).start < init_end
+                && !matches!(c.kind(row), NodeKind::ForParts | NodeKind::Block)
+        })
         .collect();
     for run in comma_groups(c, &init) {
-        walk(c, analysis, &run);
+        walk(c, analysis, &run, Some(left_bound));
     }
     // Each comma-delimited updater walks separately (:212-215).
     let parts_end = c.byte_span(parts).end;
@@ -799,11 +879,13 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         .copied()
         .filter(|&row| {
             let span = c.byte_span(row);
-            span.start >= right_start && span.end <= parts_end
+            span.start >= right_start
+                && span.end <= parts_end
+                && !matches!(c.kind(row), NodeKind::ForParts | NodeKind::Block)
         })
         .collect();
     for run in comma_groups(c, &updater_rows) {
-        walk(c, analysis, &run);
+        walk(c, analysis, &run, None);
     }
 }
 
@@ -1151,4 +1233,9 @@ fn arm_runs(c: &Check<'_>, run: &[u32], root: u32) -> Vec<Vec<u32>> {
 #[cfg(test)]
 #[path = "ticket_3157_tests.rs"]
 mod ticket_3157_tests;
+
+#[cfg(test)]
+#[path = "ticket_3194_tests.rs"]
+mod ticket_3194_tests;
+
 
