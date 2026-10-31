@@ -147,8 +147,10 @@ pub(crate) mod msg {
         PREFIX_AFTER_COMBINATOR,
     };
     use dartq_diagnostics::{
-        EXTENSION_AUGMENTATION_HAS_ON_CLAUSE, EXTRANEOUS_MODIFIER, MISSING_KEYWORD_OPERATOR,
-        MIXIN_WITH_CLAUSE, MULTIPLE_IMPLEMENTS_CLAUSES, MULTIPLE_ON_CLAUSES, MULTIPLE_WITH_CLAUSES,
+        EXTENSION_AUGMENTATION_HAS_ON_CLAUSE, EXTRANEOUS_MODIFIER,
+        EXTRANEOUS_MODIFIER_IN_EXTENSION_TYPE, EXTRANEOUS_MODIFIER_IN_PRIMARY_CONSTRUCTOR,
+        MISSING_KEYWORD_OPERATOR, MIXIN_WITH_CLAUSE, MULTIPLE_IMPLEMENTS_CLAUSES,
+        MULTIPLE_ON_CLAUSES, MULTIPLE_WITH_CLAUSES,
         PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD,
     };
 
@@ -578,6 +580,25 @@ pub(crate) mod msg {
         Message::new(
             EXTRANEOUS_MODIFIER,
             format!("Can't have modifier '{lexeme}' here."),
+        )
+    }
+
+    /// `extraneousModifierInExtensionType` (modifier_context.dart:711-718):
+    /// a `covariant` formal modifier on an extension-type member.
+    pub(crate) fn extraneous_modifier_in_extension_type(modifier: &str) -> Message {
+        Message::new(
+            EXTRANEOUS_MODIFIER_IN_EXTENSION_TYPE,
+            format!("Can't have modifier '{modifier}' in an extension type."),
+        )
+    }
+
+    /// `extraneousModifierInPrimaryConstructor`
+    /// (modifier_context.dart:720-727): a `covariant` formal modifier in a
+    /// primary constructor while the primary-constructors feature is off.
+    pub(crate) fn extraneous_modifier_in_primary_constructor(modifier: &str) -> Message {
+        Message::new(
+            EXTRANEOUS_MODIFIER_IN_PRIMARY_CONSTRUCTOR,
+            format!("Can't have modifier '{modifier}' in a primary constructor."),
         )
     }
 

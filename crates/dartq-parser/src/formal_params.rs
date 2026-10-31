@@ -457,18 +457,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.report(msg::invalid_use_of_covariant_in_extension("covariant"), t);
                     }
                 }
-                TokenKind::Keyword(Keyword::Covariant)
-                    if !matches!(
-                        member_kind,
-                        MemberKind::ExtensionTypeNonStaticMethod
-                            | MemberKind::ExtensionTypeStaticMethod
-                    ) && self.is_modifier_at(0) =>
-                {
+                TokenKind::Keyword(Keyword::Covariant) if self.is_modifier_at(0) => {
                     // Official `_parseCovariant` (:470-502): the accepted
                     // face records with the order chain, the recovery face
                     // reports per the recorded set. The walk-end gate
-                    // (:223-233) reports `extraneous_modifier` for the
-                    // method flavors that forbid `covariant`.
+                    // (:223-247) picks the report by member kind:
+                    // `extraneous_modifier` for the method flavors, the
+                    // dedicated extension-type code for the extension-type
+                    // member flavors, and the primary-constructor arm.
                     let t = self.peek_span();
                     self.cursor.advance();
                     if const_kw.is_none() && covariant.is_none() && static_kw.is_none() {
@@ -706,19 +702,39 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.report(msg::extraneous_modifier("required"), t);
             }
         }
-        // Walk-end covariant gate (modifier_context.dart:223-233): the
-        // method flavors that forbid `covariant` report `extraneous_modifier`
-        // once, on the first token. The extension flavors report
-        // `invalid_use_of_covariant_in_extension` in the walk, the
-        // primary-constructor face is gated below, and the extension-type
-        // flavors never record (`extraneous_modifier_in_extension_type` is
-        // not minted in dartq-diagnostics yet — those stay in the name lane).
-        if matches!(
-            member_kind,
-            MemberKind::StaticMethod | MemberKind::TopLevelMethod | MemberKind::AnonymousMethod
-        ) && let Some(t) = covariant
-        {
-            self.report(msg::extraneous_modifier("covariant"), t);
+        // Walk-end covariant switch (`modifier_context.dart:223-247`): one
+        // report per member-kind family on the first recorded `covariant`
+        // token. The plain-extension flavors report
+        // `invalid_use_of_covariant_in_extension` in the walk instead.
+        if let Some(t) = covariant {
+            match member_kind {
+                MemberKind::StaticMethod
+                | MemberKind::TopLevelMethod
+                | MemberKind::AnonymousMethod => {
+                    self.report(msg::extraneous_modifier("covariant"), t);
+                }
+                // `reportExtraneousModifierInExtensionType` (:230-234): the
+                // extension-type member flavors mint the dedicated code.
+                MemberKind::ExtensionTypeNonStaticMethod
+                | MemberKind::ExtensionTypeStaticMethod => {
+                    self.report(msg::extraneous_modifier_in_extension_type("covariant"), t);
+                }
+                // `reportExtraneousModifierInPrimaryConstructor` (:236-248):
+                // with the feature off the modifier is plain extraneous; with
+                // the feature on, only a `var` formal keeps `covariant`
+                // (`invalid_covariant_modifier_in_primary_constructor`).
+                MemberKind::PrimaryConstructor => {
+                    if !self.features.primary_constructors_enabled {
+                        self.report(
+                            msg::extraneous_modifier_in_primary_constructor("covariant"),
+                            t,
+                        );
+                    } else if var_final_or_const.is_none_or(|v| self.cursor.lexeme(v.id) != "var") {
+                        self.report(msg::invalid_covariant_modifier_in_primary_constructor(), t);
+                    }
+                }
+                _ => {}
+            }
         }
         // Walk-end extraneous gates for the never-legal formal modifiers
         // (modifier_context.dart:271-274, in the upstream order).
@@ -738,18 +754,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             && let Some(t) = var_final_or_const
         {
             self.report(msg::function_typed_parameter_var(), t);
-        }
-        // `invalidCovariantModifierInPrimaryConstructor`
-        // (modifier_context.dart:238-246): with the feature on, `covariant`
-        // in a primary-constructor formal is only legal alongside `var`
-        // (oracle 3.13.1, `class P(covariant int x) {}` → the face on the
-        // `covariant` token).
-        if member_kind == MemberKind::PrimaryConstructor
-            && let Some(t) = covariant
-            && self.features.primary_constructors_enabled
-            && var_final_or_const.is_none_or(|v| self.cursor.lexeme(v.id) != "var")
-        {
-            self.report(msg::invalid_covariant_modifier_in_primary_constructor(), t);
         }
         self.listener.begin_formal_parameter(
             start,
