@@ -1210,9 +1210,12 @@ impl ComplexTypeParamOrArg {
             {
                 let at = parser.peek_span();
                 parser.skip_metadata_silent();
-                type_info = parser.compute_type(true, self.in_declaration);
-                let end_span = parser.peek_span();
+                // Official end = `skipMetadata`'s return — the metadata's
+                // own last token (type_info_impl.dart:1441-1447), never the
+                // follower token (the next `@` head or the type).
+                let end_span = parser.last_consumed_span();
                 parser.report_with_end(msg::annotation_on_type_argument(), at, end_span);
+                type_info = parser.compute_type(true, self.in_declaration);
             }
             type_info.ensure_type_or_void(parser);
             // Official `next = token.next!`: the NoType ensure path returns
@@ -1508,10 +1511,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// Consuming `skipMetadata` (util.dart:96): skips `@`-annotation-shaped
     /// tokens without emitting events. The cursor advances past the
-    /// annotation when the shape matches.
+    /// annotation; upstream consumes at least the bare `@` even when no
+    /// identifier follows it (the unconditional `token = token.next!`),
+    /// so the skip is never zero-length.
     pub(crate) fn skip_metadata_silent(&mut self) {
         // Compute the length from the `@`'s offset, then consume it.
-        let len = self.metadata_skip_len(self.cursor.real_pos());
+        let len = self.metadata_skip_len(self.cursor.real_pos()).max(1);
         for _ in 0..len {
             if self.cursor.at_eof() {
                 break;
