@@ -161,6 +161,12 @@ struct ContainerCapture {
     /// `_shouldAllowSuperBoundedTypes` denies the super pass on all the
     /// clause contexts, `type_arguments_verifier.dart:737-748`).
     bound_sites: Vec<TypeTree>,
+    /// A named plain `extension`'s `on` trees: no clause event claims
+    /// them, so the header claims them at its close. `ExtensionOnClause`
+    /// is NOT in `_shouldAllowSuperBoundedTypes`' deny list
+    /// (`type_arguments_verifier.dart:739-748`), unlike `MixinOnClause` —
+    /// these sites keep the super pass.
+    on_sites: Vec<TypeTree>,
     /// The supertype capture is unfaithful.
     open: bool,
     /// `extension type` elements forbid the super pass
@@ -194,6 +200,13 @@ struct BoundsIndex {
     /// opened under its header). Non-generic ones register in the snapshot
     /// as bare declarations so a face's type argument can name them.
     ext_names: Vec<StringId>,
+    /// Every outermost `<...>` window as written (container, alias, and
+    /// function type variables alike). The container/alias windows the
+    /// captures adopt are matched back out at the bound-annotation face;
+    /// the remaining windows are executable type parameters
+    /// (`void f<T extends B>() {}`), whose bound trees `checkNamedType`
+    /// still walks.
+    param_windows: Vec<Vec<(StringId, Option<TypeTree>, bool)>>,
 }
 
 /// One extension type `implements` face, decided where the snapshot can:
@@ -444,6 +457,7 @@ struct AliasSink {
 }
 
 /// A mapped ITB violation: what to emit and where.
+#[derive(Debug)]
 pub(crate) struct BoundedIssue {
     /// The offending argument's span (the official argument-node anchor).
     pub range: SourceRange,
@@ -470,6 +484,30 @@ pub(crate) struct BoundedIssue {
     /// (`type_arguments_verifier.dart:441-446`). `None` at every
     /// written-argument site.
     pub(crate) raw_instantiated: Option<String>,
+}
+
+/// Which declared-bound source a check's in-scope type-parameter
+/// arguments read through — the official `X <: B` decides as `bound(X)
+/// <: B` (subtype.dart:490-500), so every face answers where `bound(X)`
+/// comes from.
+#[derive(Clone, Copy)]
+enum ScopeKind<'w> {
+    /// A use-site scope (`param_scope` ids carry no facts): a non-nullable
+    /// bounded argument keeps suppressing, a nullable one decides on the
+    /// `Null <: B` conjunct alone, and every other in-scope name reads the
+    /// implicit `Object?` bound.
+    Lazy,
+    /// The declaring declaration's own scope: the ids carry their written
+    /// bounds in `facts` (containers, alias parameters, extension on).
+    Decl,
+    /// A captured type-variables window (executables' type parameters and
+    /// a function-type signature's own `<…>` group): the ids are lazy, but
+    /// the window's written bound trees stand in for `facts` — a bound
+    /// that fails to map suppresses, an unbounded parameter reads the
+    /// implicit `Object?` bound, and a name the window does not declare
+    /// falls back to the `facts` face (an alias's own parameters inside an
+    /// RHS signature's bounds).
+    Window(&'w FxHashMap<StringId, Option<TypeTree>>),
 }
 
 /// One raw-constructor inference failure (the [`Bounds::
@@ -706,9 +744,18 @@ impl<'a> Bounds<'a> {
         self.window = outer_window;
         self.bound_sink = outer_sink;
         if !self.frames.is_empty() {
+            // A nested group's window is a function signature's own
+            // variables (`T extends void Function<U extends B>`): the
+            // enclosing group's in-flight capture resumes, and the
+            // signature's bounds still answer `checkNamedType` — the
+            // bound-annotation face reads them as an unclaimed window.
+            self.index.param_windows.push(window);
             return;
         }
         self.alias_type_variables(&window);
+        if !window.is_empty() {
+            self.index.param_windows.push(window.clone());
+        }
         self.pending = (!window.is_empty()).then_some(window);
     }
 
@@ -756,6 +803,7 @@ impl<'a> Bounds<'a> {
                 bounds: Vec::new(),
                 supers: Vec::new(),
                 bound_sites: Vec::new(),
+                on_sites: Vec::new(),
                 open: false,
                 is_extension_type,
                 is_enum,
@@ -781,6 +829,7 @@ impl<'a> Bounds<'a> {
                 bounds: Vec::new(),
                 supers: Vec::new(),
                 bound_sites: Vec::new(),
+                on_sites: Vec::new(),
                 open: false,
                 is_extension_type,
                 is_enum,
@@ -865,6 +914,7 @@ impl<'a> Bounds<'a> {
         let Some((name, header)) = self.header.take() else {
             return;
         };
+        self.claim_extension_on(name, &header);
         let (supers, open, extension) = header.finish();
         if let Some(extension) = extension
             && extension.rep.is_some()
@@ -882,10 +932,33 @@ impl<'a> Bounds<'a> {
         }
     }
 
+    /// Claims a header's unclaimed roots as a named plain extension's
+    /// `on` sites: `extension E on T` fires no clause event, so its `on`
+    /// type is the one shape that lands in the header sink and stays
+    /// unclaimed — a class/mixin/enum header's every clause claims its
+    /// roots, and zero claims with completed roots is the extension
+    /// shape. `ExtensionOnClause` keeps the super pass (it is not in
+    /// `_shouldAllowSuperBoundedTypes`' deny list,
+    /// `type_arguments_verifier.dart:739-748` — `MixinOnClause`, which
+    /// `header_clause` claims as a denied `bound_sites` entry, is).
+    fn claim_extension_on(&mut self, name: StringId, header: &HeaderSink) {
+        if header.claimed != 0 {
+            return;
+        }
+        if let Some(capture) = self.index.containers.get_mut(&name) {
+            capture
+                .on_sites
+                .extend(header.sink.unclaimed(0).iter().cloned());
+        }
+    }
+
     /// Declaration end: a safety-net drop (the capture normally closed
-    /// at the body).
+    /// at the body). The extension `on` claim still runs — an
+    /// extension's `;` body never opens the close path the claim rides.
     pub(crate) fn drop_header(&mut self) {
-        self.header = None;
+        if let Some((name, header)) = self.header.take() {
+            self.claim_extension_on(name, &header);
+        }
         self.rep_mark = None;
     }
 
@@ -895,7 +968,9 @@ impl<'a> Bounds<'a> {
             header.sink.leaf(head, nullable, range);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.leaf(head, nullable, range);
-        } else if let Some(site) = self.site.as_mut() {
+        } else if self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
             site.leaf(head, nullable, range);
         }
     }
@@ -903,18 +978,22 @@ impl<'a> Bounds<'a> {
     /// A type-argument group opened. `head` is `Some` for annotation
     /// heads; the outermost such group outside the capture windows opens
     /// the site capture, and a group inside an open capture nests into
-    /// its sink.
+    /// its sink. An open typedef RHS owns its trees through the
+    /// `alias_*` arms and its own finalize face — a site capture here
+    /// would double-check every written argument.
     pub(crate) fn begin_group(&mut self, head: Option<(StringId, SourceRange)>, in_site: bool) {
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.begin_group(head);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.begin_group(head);
-        } else if let Some(site) = self.site.as_mut() {
-            site.begin_group(head);
-        } else if in_site && head.is_some() {
-            let mut site = TreeSink::default();
-            site.begin_group(head);
-            self.site = Some(site);
+        } else if self.alias.is_none() {
+            if let Some(site) = self.site.as_mut() {
+                site.begin_group(head);
+            } else if in_site && head.is_some() {
+                let mut site = TreeSink::default();
+                site.begin_group(head);
+                self.site = Some(site);
+            }
         }
     }
 
@@ -951,7 +1030,9 @@ impl<'a> Bounds<'a> {
             header.sink.begin_function();
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.begin_function();
-        } else if let Some(site) = self.site.as_mut() {
+        } else if self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
             site.begin_function();
         }
     }
@@ -964,7 +1045,9 @@ impl<'a> Bounds<'a> {
             header.sink.end_function(nullable, end);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.end_function(nullable, end);
-        } else if let Some(site) = self.site.as_mut() {
+        } else if self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
             site.end_function(nullable, end);
         }
     }
@@ -977,7 +1060,9 @@ impl<'a> Bounds<'a> {
             header.sink.function_formals_begin();
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_formals_begin();
-        } else if let Some(site) = self.site.as_mut() {
+        } else if self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
             site.function_formals_begin();
         }
     }
@@ -989,7 +1074,9 @@ impl<'a> Bounds<'a> {
             header.sink.function_formal_end(named, name);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_formal_end(named, name);
-        } else if let Some(site) = self.site.as_mut() {
+        } else if self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
             site.function_formal_end(named, name);
         }
     }
@@ -1002,7 +1089,9 @@ impl<'a> Bounds<'a> {
         if let Some(sink) = self.bound_sink.as_mut() {
             sink.poison();
         }
-        if let Some(site) = self.site.as_mut() {
+        if self.alias.is_none()
+            && let Some(site) = self.site.as_mut()
+        {
             site.poison();
         }
     }
@@ -1011,8 +1100,13 @@ impl<'a> Bounds<'a> {
     /// model cannot represent (a record type). The RHS's own function
     /// type poisons through [`Self::alias_formal_boundary`] instead —
     /// [`Self::poison`] deliberately leaves the alias alone, or every
-    /// `X Function(...)` RHS would die at its own `Function(`.
+    /// `X Function(...)` RHS would die at its own `Function(`. A shape
+    /// inside an open bound window is the bound's own debris — the window
+    /// gates the same as [`Self::alias_leaf`].
     pub(crate) fn alias_poison(&mut self) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         if let Some(alias) = self.alias.as_mut() {
             alias.poisoned = true;
         }
@@ -1116,8 +1210,13 @@ impl<'a> Bounds<'a> {
     /// so the return's trees keep joining the sink; the return is claimed
     /// at the formals' open. A second head event inside the RHS is a
     /// nested function type (a function-typed formal) — outside the
-    /// capture's model.
+    /// capture's model. A `Function` inside an open bound window is the
+    /// bound's own shape (`typedef H<T extends void Function<U>()>`), not
+    /// the RHS's — the window gates the same as [`Self::alias_leaf`].
     pub(crate) fn alias_formal_boundary(&mut self) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         let Some(alias) = self.alias.as_mut() else {
             return;
         };
@@ -1131,8 +1230,12 @@ impl<'a> Bounds<'a> {
     /// The RHS function type's formal list opened: the trees completed so
     /// far are the return type (none written — bare `Function` — reads
     /// `dynamic` at the expansion). Non-function RHS formals lists and
-    /// already-closed captures leave the cursor alone.
+    /// already-closed captures leave the cursor alone. Bound windows gate
+    /// the same as [`Self::alias_leaf`].
     pub(crate) fn alias_formals_region_open(&mut self) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         let Some(alias) = self.alias.as_mut() else {
             return;
         };
@@ -1149,8 +1252,12 @@ impl<'a> Bounds<'a> {
 
     /// `[` or `{` opened inside the formals region: the group's spelling
     /// selects the named list; the positional group latches the
-    /// required-positional count (optional formals follow it).
+    /// required-positional count (optional formals follow it). Bound
+    /// windows gate the same as [`Self::alias_leaf`].
     pub(crate) fn alias_optional_group(&mut self, opener: &str) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         let Some(alias) = self.alias.as_mut() else {
             return;
         };
@@ -1171,11 +1278,39 @@ impl<'a> Bounds<'a> {
     /// One formal completed: the trees since the previous formal are its
     /// type (exactly one; nested groups merged through the sink). A
     /// named-group formal whose "name" token is the type head itself (the
-    /// same offset — `{int}`) reads back positional.
+    /// same offset — `{int}`) reads back positional. Bound windows gate
+    /// the same as [`Self::alias_leaf`].
     pub(crate) fn alias_formal_end(&mut self, name: StringId, name_offset: u32, required: bool) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         let Some(alias) = self.alias.as_mut() else {
             return;
         };
+        // The old-style `typedef void F(int x)` spelling fires no
+        // `Function(` head and no formals-list `(` event the capture can
+        // see — its first completed formal is the signature's only
+        // function-type marker. `region == Ret` with `fn_seen` still
+        // clear is uniquely that shape (a modern `typedef F = void
+        // Function(...)` already latched both at the head and the list
+        // open). The formal's own tree is the sink's last completion;
+        // everything before it is the written return type.
+        if !alias.fn_seen && alias.region == Some(AliasRegion::Ret) {
+            alias.fn_seen = true;
+            // The formal's tree is the last completion; lift it out so
+            // what remains is the return type, then the normal routing
+            // below claims the formal from a single-root sink.
+            let formal = alias.sink.done.pop();
+            match alias.sink.done.len() {
+                0 => alias.ret = None,
+                1 => alias.ret = alias.sink.done.pop(),
+                _ => alias.poisoned = true,
+            }
+            if let Some(formal) = formal {
+                alias.sink.done.push(formal);
+            }
+            alias.region = Some(AliasRegion::Formals { named: false });
+        }
         if !matches!(alias.region, Some(AliasRegion::Formals { .. })) {
             alias.poisoned = true;
             return;
@@ -1196,7 +1331,11 @@ impl<'a> Bounds<'a> {
     }
 
     /// The formals region closed: stray trees past this point poison.
+    /// Bound windows gate the same as [`Self::alias_leaf`].
     pub(crate) fn alias_formals_closed(&mut self) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         if let Some(alias) = self.alias.as_mut() {
             alias.region = None;
         }
@@ -1206,8 +1345,12 @@ impl<'a> Bounds<'a> {
     /// suffix (`end_function_type`'s question token): only the outermost
     /// function type's own close answers — the formals region is already
     /// closed and `fn_seen` holds; a nested function-typed formal's close
-    /// (region still open) leaves the latch alone.
+    /// (region still open) leaves the latch alone. Bound windows gate the
+    /// same as [`Self::alias_leaf`].
     pub(crate) fn alias_rhs_question(&mut self, nullable: bool) {
+        if self.bound_sink.is_some() {
+            return;
+        }
         let Some(alias) = self.alias.as_mut() else {
             return;
         };
@@ -1306,12 +1449,14 @@ impl<'a> Bounds<'a> {
     /// clause contexts — `ClassTypeAlias`/`ExtendsClause`/
     /// `ImplementsClause`/`MixinOnClause`/`WithClause`,
     /// `type_arguments_verifier.dart:737-748` — so a regular violation
-    /// reports with no inverted-type context row). A bare clause head
+    /// reports with no inverted-type context row). A named plain
+    /// extension's `on` sites join the same batch with the super pass ON
+    /// (`ExtensionOnClause` is not in the deny list). A bare clause head
     /// resolves to its instantiate-to-bounds form and still answers the
     /// verdict (the raw-type context row rides the report). Declaration
     /// order (the sites' own offsets) decides the report order.
     pub(crate) fn check_clause_sites(&mut self, strings: &'a StringTable) -> Vec<BoundedIssue> {
-        let mut sites: Vec<(u32, TypeTree, StringId)> = self
+        let mut sites: Vec<(u32, TypeTree, StringId, bool)> = self
             .index
             .containers
             .iter()
@@ -1320,12 +1465,19 @@ impl<'a> Bounds<'a> {
                     .bound_sites
                     .iter()
                     .filter(|tree| !tree.poisoned)
-                    .map(move |tree| (tree.range.offset, tree.clone(), name))
+                    .map(move |tree| (tree.range.offset, tree.clone(), name, false))
+                    .chain(
+                        capture
+                            .on_sites
+                            .iter()
+                            .filter(|tree| !tree.poisoned)
+                            .map(move |tree| (tree.range.offset, tree.clone(), name, true)),
+                    )
             })
             .collect();
-        sites.sort_by_key(|(offset, _, _)| *offset);
+        sites.sort_by_key(|(offset, _, _, _)| *offset);
         let mut issues = Vec::new();
-        for (_, tree, owner) in sites {
+        for (_, tree, owner, allow_super) in sites {
             let Some(scope) = self.owner_scope(strings, owner) else {
                 continue;
             };
@@ -1335,10 +1487,10 @@ impl<'a> Bounds<'a> {
                 &tree.args,
                 tree.range,
                 &scope,
-                true,
-                false,
+                ScopeKind::Decl,
+                allow_super,
             ));
-            self.walk_named_args(strings, &tree.args, &scope, true, false, &mut issues);
+            self.walk_children(strings, &tree, &scope, ScopeKind::Decl, false, &mut issues);
         }
         issues
     }
@@ -1382,11 +1534,78 @@ impl<'a> Bounds<'a> {
     /// then `X?` against their own heads' bounds — #2936).
     /// Declaration order (the sites' own offsets) decides the report
     /// order.
+    ///
+    /// Three owner shapes share the batch: a container's or an alias's
+    /// declaring parameters (decl-scoped — their written bounds read
+    /// through `facts`); a function-type alias RHS signature's own
+    /// variables (`typedef F<X> = void Function<Y extends X>()` — the RHS
+    /// window's bound trees stand in for the `facts` the signature's lazy
+    /// ids do not carry, with the alias's own parameters reading `facts`
+    /// through the fallback); and every captured `<...>` window no
+    /// declaration adopted — the executable type parameters
+    /// (`void f<T extends G<B>>() {}`), whose bounds answer the same
+    /// `bound(X) <: B` through their window's written trees.
     pub(crate) fn check_bound_annotation_sites(
         &mut self,
         strings: &'a StringTable,
     ) -> Vec<BoundedIssue> {
-        let mut sites: Vec<(u32, TypeTree, StringId)> = Vec::new();
+        /// Fingerprint one captured window: the `(name, bound range
+        /// offset)` pairs — identical between a `<...>` window and the
+        /// capture that adopted it (`params`/`bounds`/`type_params` all
+        /// clone the window verbatim).
+        fn fingerprint(window: &[(StringId, Option<TypeTree>, bool)]) -> Vec<(StringId, u32)> {
+            window
+                .iter()
+                .map(|(name, bound, _)| (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset)))
+                .collect()
+        }
+        let adopted: Vec<Vec<(StringId, u32)>> = self
+            .index
+            .containers
+            .values()
+            .map(|capture| {
+                capture
+                    .params
+                    .iter()
+                    .zip(&capture.bounds)
+                    .map(|(name, (bound, _))| {
+                        (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                    })
+                    .collect()
+            })
+            .chain(self.index.aliases.values().map(|capture| {
+                capture
+                    .params
+                    .iter()
+                    .map(|(name, bound, _)| {
+                        (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                    })
+                    .collect()
+            }))
+            .chain(self.index.aliases.values().filter_map(|capture| {
+                match &*capture.rhs {
+                    AliasRhs::Fn { type_params, .. } => Some(
+                        type_params
+                            .iter()
+                            .map(|(name, bound, _)| {
+                                (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                            })
+                            .collect(),
+                    ),
+                    AliasRhs::Named(_) => None,
+                }
+            }))
+            .collect();
+        // (bound range offset, bound tree, owner declaration, adopted
+        // window) — `owner` drives the decl scope for container/alias
+        // sites; `window` carries the adopted-window scope facts for the
+        // unclaimed and RHS-signature arms.
+        let mut sites: Vec<(
+            u32,
+            TypeTree,
+            Option<StringId>,
+            Option<Vec<(StringId, Option<TypeTree>, bool)>>,
+        )> = Vec::new();
         for (name, capture) in &self.index.containers {
             for (bound, poisoned) in &capture.bounds {
                 let Some(tree) = bound else {
@@ -1395,7 +1614,7 @@ impl<'a> Bounds<'a> {
                 if *poisoned || tree.poisoned {
                     continue;
                 }
-                sites.push((tree.range.offset, tree.clone(), *name));
+                sites.push((tree.range.offset, tree.clone(), Some(*name), None));
             }
         }
         for (name, capture) in &self.index.aliases {
@@ -1406,25 +1625,87 @@ impl<'a> Bounds<'a> {
                 if *poisoned || tree.poisoned {
                     continue;
                 }
-                sites.push((tree.range.offset, tree.clone(), *name));
+                sites.push((tree.range.offset, tree.clone(), Some(*name), None));
+            }
+            if let AliasRhs::Fn { type_params, .. } = &*capture.rhs {
+                for (_, bound, poisoned) in type_params {
+                    let Some(tree) = bound else {
+                        continue;
+                    };
+                    if *poisoned || tree.poisoned {
+                        continue;
+                    }
+                    sites.push((
+                        tree.range.offset,
+                        tree.clone(),
+                        Some(*name),
+                        Some(type_params.clone()),
+                    ));
+                }
             }
         }
-        sites.sort_by_key(|(offset, _, _)| *offset);
-        let mut issues = Vec::new();
-        for (_, tree, owner) in sites {
-            let Some(scope) = self.owner_scope(strings, owner) else {
+        for window in &self.index.param_windows {
+            if adopted.iter().any(|print| *print == fingerprint(window)) {
                 continue;
+            }
+            for (_, bound, _) in window {
+                let Some(tree) = bound else {
+                    continue;
+                };
+                if tree.poisoned {
+                    continue;
+                }
+                sites.push((tree.range.offset, tree.clone(), None, Some(window.clone())));
+            }
+        }
+        sites.sort_by_key(|(offset, _, _, _)| *offset);
+        let mut issues = Vec::new();
+        for (_, tree, owner, window) in sites {
+            let (scope, map) = match (owner, window) {
+                // The RHS-signature arm: the alias's own decl scope
+                // (its parameters read `facts` through the `Window`
+                // fallback) plus lazy ids for the signature's own
+                // variables.
+                (Some(owner), Some(window)) => {
+                    let Some(mut scope) = self.owner_scope(strings, owner) else {
+                        continue;
+                    };
+                    let names: Vec<StringId> = window.iter().map(|(name, _, _)| *name).collect();
+                    scope.extend(self.snapshot(strings).ctx().param_scope(&names));
+                    let map = window
+                        .iter()
+                        .map(|(name, bound, _)| (*name, bound.clone()))
+                        .collect();
+                    (scope, Some(map))
+                }
+                (Some(owner), None) => {
+                    let Some(scope) = self.owner_scope(strings, owner) else {
+                        continue;
+                    };
+                    (scope, None)
+                }
+                // The unclaimed-window arm (`void f<T extends …>`): lazy
+                // ids, the window's written bounds as the `bound(X)`
+                // source.
+                (None, Some(window)) => {
+                    let names: Vec<StringId> = window.iter().map(|(name, _, _)| *name).collect();
+                    let scope = self.snapshot(strings).ctx().param_scope(&names);
+                    let map = window
+                        .iter()
+                        .map(|(name, bound, _)| (*name, bound.clone()))
+                        .collect();
+                    (scope, Some(map))
+                }
+                (None, None) => continue,
             };
+            let kind = map
+                .as_ref()
+                .map(ScopeKind::Window)
+                .unwrap_or(ScopeKind::Decl);
             issues.extend(self.check_named(
-                strings,
-                tree.head,
-                &tree.args,
-                tree.range,
-                &scope,
-                true,
-                true,
+                strings, tree.head, &tree.args, tree.range, &scope, kind, true,
             ));
-            self.walk_named_args(strings, &tree.args, &scope, true, false, &mut issues);
+            self.walk_children(strings, &tree, &scope, kind, false, &mut issues);
         }
         issues
     }
@@ -1476,10 +1757,10 @@ impl<'a> Bounds<'a> {
                 &tree.args,
                 tree.range,
                 &scope,
-                true,
+                ScopeKind::Decl,
                 allow_super,
             ));
-            self.walk_named_args(strings, &tree.args, &scope, true, false, &mut issues);
+            self.walk_children(strings, &tree, &scope, ScopeKind::Decl, false, &mut issues);
         }
         issues
     }
@@ -1491,8 +1772,11 @@ impl<'a> Bounds<'a> {
     /// `X extends FutureOr<A<X?>>` or the `G<U>` of `extends X<G<U>>`.
     /// An argument position's parent is a `TypeArgumentList`/`NamedType`,
     /// never in `_shouldAllowSuperBoundedTypes`' deny list, so the super
-    /// pass always runs at nested depth. A poisoned subtree suppresses
-    /// its whole descent (the under-report direction).
+    /// pass always runs at nested depth — including the named types a
+    /// record or function node carries in its columns and the bound a
+    /// signature's own type parameter spells (a `TypeParameter` parent is
+    /// not denied either). A poisoned subtree suppresses its whole
+    /// descent (the under-report direction).
     ///
     /// `from_site` marks the written-site faces whose trees the engine
     /// also feeds through the #2831 P2 nested-site queue
@@ -1511,27 +1795,106 @@ impl<'a> Bounds<'a> {
         strings: &'a StringTable,
         args: &[TypeTree],
         scope: &FxHashMap<StringId, TypeParamId>,
-        decl_scoped: bool,
+        kind: ScopeKind<'_>,
         from_site: bool,
         issues: &mut Vec<BoundedIssue>,
     ) {
         for arg in args {
-            if arg.poisoned {
-                continue;
+            self.walk_named_tree(strings, arg, scope, kind, from_site, issues);
+        }
+    }
+
+    /// One tree's whole descent: a named node checks its own head then
+    /// recurses through its arguments; a record node recurses through its
+    /// fields; a function node recurses through its columns and its own
+    /// type parameters' written bounds (the signature's parameters join
+    /// the scope and read their bound trees — [`ScopeKind::Window`]).
+    fn walk_named_tree(
+        &mut self,
+        strings: &'a StringTable,
+        tree: &TypeTree,
+        scope: &FxHashMap<StringId, TypeParamId>,
+        kind: ScopeKind<'_>,
+        from_site: bool,
+        issues: &mut Vec<BoundedIssue>,
+    ) {
+        if tree.poisoned {
+            return;
+        }
+        if let Some((positional, named)) = &tree.record {
+            for field in positional.iter().chain(named.iter().map(|(_, ty)| ty)) {
+                // A column descent never rides the site queue — the
+                // engine's nested-site feed reaches named arguments only.
+                self.walk_named_tree(strings, field, scope, kind, false, issues);
             }
-            let queued = from_site && !arg.args.is_empty() && self.has_capture(arg.head);
-            if !queued {
-                issues.extend(self.check_named(
-                    strings,
-                    arg.head,
-                    &arg.args,
-                    arg.range,
-                    scope,
-                    decl_scoped,
-                    true,
-                ));
+            return;
+        }
+        if let Some(function) = &tree.function {
+            if !function.type_params_named.is_empty() {
+                let names: Vec<StringId> = function
+                    .type_params_named
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect();
+                let mut sig_scope = scope.clone();
+                sig_scope.extend(self.snapshot(strings).ctx().param_scope(&names));
+                let map: FxHashMap<StringId, Option<TypeTree>> = function
+                    .type_params_named
+                    .iter()
+                    .map(|(name, bound)| (*name, bound.clone()))
+                    .collect();
+                for bound in function
+                    .type_params_named
+                    .iter()
+                    .filter_map(|(_, bound)| bound.as_ref())
+                {
+                    self.walk_named_tree(
+                        strings,
+                        bound,
+                        &sig_scope,
+                        ScopeKind::Window(&map),
+                        false,
+                        issues,
+                    );
+                }
             }
-            self.walk_named_args(strings, &arg.args, scope, decl_scoped, from_site, issues);
+            let columns = function
+                .ret
+                .iter()
+                .map(|ret| &**ret)
+                .chain(function.positional.iter())
+                .chain(function.named.iter().map(|(_, ty)| ty));
+            for ty in columns {
+                self.walk_named_tree(strings, ty, scope, kind, false, issues);
+            }
+            return;
+        }
+        let queued = from_site && !tree.args.is_empty() && self.has_capture(tree.head);
+        if !queued {
+            issues.extend(self.check_named(
+                strings, tree.head, &tree.args, tree.range, scope, kind, true,
+            ));
+        }
+        self.walk_named_args(strings, &tree.args, scope, kind, from_site, issues);
+    }
+
+    /// The non-root descent a checked site keeps: the root's own verdict
+    /// ran at its face's `allow_super` posture; every subtree — argument,
+    /// record field, function column, signature bound — walks as a nested
+    /// `NamedType` (super pass always on).
+    fn walk_children(
+        &mut self,
+        strings: &'a StringTable,
+        tree: &TypeTree,
+        scope: &FxHashMap<StringId, TypeParamId>,
+        kind: ScopeKind<'_>,
+        from_site: bool,
+        issues: &mut Vec<BoundedIssue>,
+    ) {
+        if tree.record.is_some() || tree.function.is_some() {
+            self.walk_named_tree(strings, tree, scope, kind, false, issues);
+        } else {
+            self.walk_named_args(strings, &tree.args, scope, kind, from_site, issues);
         }
     }
 
@@ -1550,14 +1913,17 @@ impl<'a> Bounds<'a> {
     /// type_arguments_verifier.dart:441-446).
     ///
     /// `scope` maps the in-scope type-parameter names to their snapshot
-    /// ids. `decl_scoped` says the ids are the declaring declaration's own
-    /// (clause, bound-annotation, and alias-RHS sites): their declared
-    /// bounds live in `facts`, so a type-parameter argument decides `X <:
-    /// B` as `bound(X) <: B` — the official left-variable-bound rule. A
-    /// lazy `param_scope` carries no declared bounds: a NON-nullable
-    /// bounded in-scope argument keeps suppressing (the unmodelable `X <:
-    /// B` direction) and a nullable `X?` decides on the `Null <: B`
-    /// conjunct alone (#2936).
+    /// ids. `kind` says where a type-parameter argument's declared bound
+    /// reads from (`X <: B` as `bound(X) <: B` — the official
+    /// left-variable-bound rule): `Decl` ids carry their written bounds in
+    /// `facts` (clause, bound-annotation, alias-RHS, extension-on sites);
+    /// `Window` reads a captured type-variables window's written bound
+    /// trees (executable type parameters, a signature's own group), falling
+    /// back to `facts` for names the window does not declare; `Lazy`
+    /// (`param_scope`) carries no declared bounds — a NON-nullable bounded
+    /// in-scope argument keeps suppressing (the unmodelable `X <: B`
+    /// direction) and a nullable `X?` decides on the `Null <: B` conjunct
+    /// alone (#2936).
     fn check_named(
         &mut self,
         strings: &'a StringTable,
@@ -1565,7 +1931,7 @@ impl<'a> Bounds<'a> {
         args: &[TypeTree],
         site: SourceRange,
         scope: &FxHashMap<StringId, TypeParamId>,
-        decl_scoped: bool,
+        kind: ScopeKind<'_>,
         allow_super: bool,
     ) -> Vec<BoundedIssue> {
         // A type parameter shadows any container of the same name, and
@@ -1632,16 +1998,16 @@ impl<'a> Bounds<'a> {
             // A NON-nullable in-scope type-parameter argument declared
             // with a bound suppresses at LAZY scopes (`X <: B` rides X's
             // declared bound, which lazy ids do not carry — the
-            // under-report direction); decl-scoped ids decide it in the
-            // post-verdict filter instead. A NULLABLE bounded argument
-            // always runs (`X? <: B` conjuncts `Null <: B`, which the
-            // snapshot answers exactly — #2936, `class A<X extends
-            // FutureOr<A<X?>>>`'s `X?`).
+            // under-report direction); decl-scoped and window-scoped ids
+            // decide it in the post-verdict filter instead. A NULLABLE
+            // bounded argument always runs (`X? <: B` conjuncts `Null <:
+            // B`, which the snapshot answers exactly — #2936, `class A<X
+            // extends FutureOr<A<X?>>>`'s `X?`).
             if args.len() != head_params.len()
                 || head_bounds.iter().any(|(_, poisoned)| *poisoned)
                 || args.iter().any(|arg| arg.poisoned)
                 || args.iter().any(|arg| {
-                    !decl_scoped
+                    matches!(kind, ScopeKind::Lazy)
                         && !arg.nullable
                         && scope.contains_key(&arg.head)
                         && self.index.bounded_params.contains(&arg.head)
@@ -1683,6 +2049,10 @@ impl<'a> Bounds<'a> {
                 // * a DECL-scoped id reads its declared bound from `facts`
                 //   (`dynamic`-mapped reads as the implicit `Object?`), so
                 //   `X <: B` is honest both ways;
+                // * a WINDOW-scoped name reads its written bound tree from
+                //   the captured window (an unbounded parameter reads the
+                //   implicit `Object?`, a name the window does not declare
+                //   falls back to the `facts` face);
                 // * a lazy-scope bounded name is unmodelable — non-nullable
                 //   args never reach here (pre-gate), and a nullable `X?`
                 //   keeps only when `Null <: B` fails;
@@ -1698,22 +2068,41 @@ impl<'a> Bounds<'a> {
                     },
                     true,
                 );
-                let bound_of = |arg: &TypeTree| -> Option<TypeId> {
-                    if decl_scoped {
-                        let &id = scope.get(&arg.head)?;
-                        snapshot.facts.get(id).bound.and_then(|bound| {
-                            if matches!(
-                                snapshot.table.get(bound).kind(),
-                                TypeKind::Dynamic
-                            ) {
-                                None
-                            } else {
-                                Some(bound)
-                            }
-                        })
-                    } else {
-                        None
+                // `None`: the declared bound is unmodelable — drop the
+                // issue (under-report). `Some(None)`: the implicit
+                // `Object?` bound decides. `Some(Some(bound))`: `X <: B`
+                // rides the parameter's own bound.
+                let bound_of = |arg: &TypeTree| -> Option<Option<TypeId>> {
+                    if let ScopeKind::Window(map) = kind
+                        && let Some(bound_tree) = map.get(&arg.head)
+                    {
+                        let Some(tree) = bound_tree else {
+                            return Some(None);
+                        };
+                        return match ctx.map_tree(tree, scope) {
+                            Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
+                            _ => None,
+                        };
                     }
+                    if !matches!(kind, ScopeKind::Lazy) {
+                        let Some(&id) = scope.get(&arg.head) else {
+                            return Some(None);
+                        };
+                        return match snapshot.facts.get(id).bound {
+                            Some(bound)
+                                if matches!(
+                                    snapshot.table.get(bound).kind(),
+                                    TypeKind::Dynamic
+                                ) =>
+                            {
+                                Some(None)
+                            }
+                            Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
+                            Some(_) => None,
+                            None => Some(None),
+                        };
+                    }
+                    Some(None)
                 };
                 let issues: Vec<_> = issues
                     .into_iter()
@@ -1724,13 +2113,15 @@ impl<'a> Bounds<'a> {
                         if !scope.contains_key(&arg.head) {
                             return true;
                         }
-                        if !decl_scoped && self.index.bounded_params.contains(&arg.head) {
+                        if matches!(kind, ScopeKind::Lazy)
+                            && self.index.bounded_params.contains(&arg.head)
+                        {
                             return arg.nullable && !system.is_subtype(null, issue.bound);
                         }
                         let param_bound = match bound_of(arg) {
-                            Some(bound) if snapshot.type_is_safe(bound) => bound,
-                            Some(_) => return false,
-                            None => object_q,
+                            Some(Some(bound)) => bound,
+                            Some(None) => object_q,
+                            None => return false,
                         };
                         !system.is_subtype(param_bound, issue.bound)
                             || (arg.nullable && !system.is_subtype(null, issue.bound))
@@ -1784,8 +2175,9 @@ impl<'a> Bounds<'a> {
             let snapshot = self.snapshot(strings);
             snapshot.ctx().param_scope(in_scope_params)
         };
-        let mut issues = self.check_named(strings, head, args, site, &scope, false, allow_super);
-        self.walk_named_args(strings, args, &scope, false, true, &mut issues);
+        let mut issues =
+            self.check_named(strings, head, args, site, &scope, ScopeKind::Lazy, allow_super);
+        self.walk_named_args(strings, args, &scope, ScopeKind::Lazy, true, &mut issues);
         issues
     }
 
@@ -3604,3 +3996,11 @@ mod tests {
         assert!(bare_issues.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "diagnose/ticket_3153_tests.rs"]
+mod ticket_3153_tests;
+
+#[cfg(test)]
+#[path = "diagnose/ticket_3154_tests.rs"]
+mod ticket_3154_tests;
