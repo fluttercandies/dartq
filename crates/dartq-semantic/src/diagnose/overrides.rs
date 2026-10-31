@@ -801,6 +801,13 @@ impl<'a> Engine<'a> {
         let Some(decl) = elements.container(container) else {
             return;
         };
+        // The clause gate, the first thing the oracle's `verify()` does
+        // (:312-314): a disallowed direct-supertype clause reports there and
+        // returns, so the declared-face loop below never runs on this
+        // container's members.
+        if self.disallowed_clause_suppresses_members(decl, kind) {
+            return;
+        }
         let Some(entry) = decl.members.get(&spelling) else {
             return;
         };
@@ -1304,6 +1311,13 @@ impl<'a> Engine<'a> {
             return;
         };
         if decl.with_clause.is_empty() {
+            return;
+        }
+        // The same `verify()` clause gate (`:312-314`) that stands
+        // `check_override` down: the mixin-member checks ride the verifier's
+        // later `_checkDeclaredMembers` loop, one statement past the early
+        // return, so a broken header suppresses them too.
+        if self.disallowed_clause_suppresses_members(decl, decl.kind) {
             return;
         }
         // The written mixin spans, in application order — the tail window
@@ -3631,6 +3645,16 @@ impl<'a> Engine<'a> {
     /// the gate counts it where `finalize_disallowed_subtypes`'s report arm
     /// does not.
     fn non_subtypable_clause_head(&self, entry: StringId) -> bool {
+        self.non_subtypable_clause_head_spelling(entry).is_some()
+    }
+
+    /// The head name `entry` resolves to when it spells a non-subtypable SDK
+    /// face — [`Self::non_subtypable_clause_head`]'s resolution decision,
+    /// split out so the override gate
+    /// ([`Self::disallowed_clause_suppresses_members`]) can tell the
+    /// core-`Enum` arm (container-kind sensitive) from the plain disallowed
+    /// name arm.
+    fn non_subtypable_clause_head_spelling(&self, entry: StringId) -> Option<StringId> {
         let mut head = entry;
         // The same resolution decision [`Self::disallowed_subtype_head`]
         // makes: `resolve_container` first (a user typedef named `int`
@@ -3650,7 +3674,7 @@ impl<'a> Engine<'a> {
                     .library_of_file(owner_file)
                     .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
                 if !is_sdk {
-                    return false;
+                    return None;
                 }
             }
             None => {
@@ -3662,12 +3686,12 @@ impl<'a> Engine<'a> {
                 // contract).
                 if let Some(decl) = self.index.get(self.file).and_then(|f| f.decl(entry)) {
                     if decl.kind != MicroKind::TypeAlias || decl.type_params != 0 {
-                        return false;
+                        return None;
                     }
                     match decl.var_ty {
                         Ty::Named { name, .. } => head = name,
                         Ty::Null => head = self.intern("Null"),
-                        _ => return false,
+                        _ => return None,
                     }
                     // The chased head rides the same decision: a user
                     // element under that name is never restricted.
@@ -3684,15 +3708,57 @@ impl<'a> Engine<'a> {
                             .library_of_file(owner_file)
                             .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
                         if !is_sdk {
-                            return false;
+                            return None;
                         }
                     }
                 }
             }
         }
         let spelling = self.strings.resolve(head);
-        spelling == "Enum"
-            || super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&spelling)
+        (spelling == "Enum"
+            || super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&spelling))
+        .then_some(head)
+    }
+
+    /// Whether the container's written direct-supertype clauses make the
+    /// oracle's verifier return before EVERY member check — the
+    /// `_checkDirectSuperTypes` early return (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/inheritance_override.dart` `verify`
+    /// :312-314, `_checkDirectSuperTypes` :649-688, `_checkDirectSuperType`
+    /// :590-620): one disallowed name in the written `extends` / `with` /
+    /// `implements` (and, for a mixin, `on`) clause reports that clause
+    /// error and stands the signature checks down, so no `invalid_override`
+    /// row fires on the container's members at all — the rows would compare
+    /// against supertype faces the broken header never established.
+    fn disallowed_clause_suppresses_members(
+        &self,
+        decl: &Container,
+        kind: ContainerKind,
+    ) -> bool {
+        // `_checkDirectSuperType`'s first arm: a `dart:*` library returns
+        // before any probe — the SDK's own declarations legitimately subtype
+        // the restricted faces (`_Smi implements int`).
+        if self.graph.uri(self.lib).starts_with("dart:") {
+            return false;
+        }
+        // The core-`Enum` arm's container carve-out (:610-620): an abstract
+        // class, an enum, and a mixin may name `Enum` freely — only a
+        // CONCRETE class's `Enum` face is the clause error
+        // (`concrete_class_has_enum_superinterface`). Every other restricted
+        // name errors on any container kind. The element model folds
+        // `sealed` into abstractness (`isAbstract = isAbstract || isSealed`,
+        // element.dart:150) — the same split `check_face_inheritance`'s
+        // concrete-target gate applies.
+        let enum_is_clause_error =
+            kind == ContainerKind::Class && !decl.is_abstract && !decl.sealed;
+        let gated = |entry: StringId| {
+            self.non_subtypable_clause_head_spelling(entry)
+                .is_some_and(|head| self.strings.resolve(head) != "Enum" || enum_is_clause_error)
+        };
+        decl.superclass.is_some_and(gated)
+            || decl.with_clause.iter().copied().any(gated)
+            || decl.implements_clause.iter().copied().any(gated)
+            || decl.on_clause.iter().copied().any(gated)
     }
 
     /// The written `with` entries' spans of `container`, read from the clause

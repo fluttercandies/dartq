@@ -17681,3 +17681,16 @@ mod ticket_3267_tests;
 #[cfg(test)]
 #[path = "ticket_3238_tests.rs"]
 mod ticket_3238_tests;
+
+// The #3253 pins (the C2 disallowed-supertype clause gate:
+// `CorrectOverrideHelper.verify()` returns from `_checkDirectSuperTypes`
+// before EVERY member check, so a container whose written `extends` /
+// `with` / `implements` / `on` clause names a non-subtypable SDK face emits
+// no `invalid_override` row on its members — the core-`Enum` arm stays keyed
+// to concrete classes and a user declaration shadowing the name never
+// gates). Registered here because `diagnose.rs` is a live-lane file out of
+// this ticket's write scope; `#[path]` keeps the module inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3253_tests.rs"]
+mod ticket_3253_tests;
