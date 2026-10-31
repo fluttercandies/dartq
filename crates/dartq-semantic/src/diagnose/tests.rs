@@ -17547,6 +17547,17 @@ mod ticket_3219_tests;
 #[path = "ticket_3224_tests.rs"]
 mod ticket_3224_tests;
 
+// The #3227 pins (F9-D same-library `base`/`final` superdeclaration loses its
+// whole modifier plan — local `abstract base class`/`final class` emit zero
+// rows where the imported twin fires, the `basic_restrictions_A04_t04`
+// discriminator shape). Registered here because the brief's named host
+// (`diagnose.rs`) is a live-lane file out of this ticket's write scope;
+// `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::*` resolves.
+#[cfg(test)]
+#[path = "ticket_3227_tests.rs"]
+mod ticket_3227_tests;
+
 // The #3234 pins (`fold_binary`'s operand locator only accepted
 // `mark_operator`'s `Read`-gated mark, so a `void` invocation used as a
 // non-relation binary operand — `v() + 1` — never reached the void check;
