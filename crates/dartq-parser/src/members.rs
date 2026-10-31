@@ -2860,8 +2860,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             n += 1;
         }
         let next = self.cursor.look_kind(n);
-        if next != TokenKind::OpenParen {
-            if next == TokenKind::QuestionPeriod {
+        // The `=`/`(`/`?.` dispatch reads the token FOLLOWING the name slot —
+        // and a name spliced at a keyword/literal head sits at that token's
+        // own offset, so its follower is the keyword/literal itself
+        // (`insertParens(includeIdentifier: false)`, parser_impl.dart:4918:
+        // the spliced identifier's `next` is `var`, never the `=` after it).
+        // A spliced name therefore always routes to the `(`-expect arm — the
+        // `=` declaring-class rider only fires when the name was real
+        // (`super. foo =`), never for a recovered one (`super. var =`).
+        let dispatch = if spliced_name_span.is_some() {
+            self.cursor.look_kind(n - 1)
+        } else {
+            next
+        };
+        if dispatch != TokenKind::OpenParen {
+            if dispatch == TokenKind::QuestionPeriod {
                 // `super?.` (:4936-4953) — the official consumes `?.`,
                 // splices a missing member name silently, re-runs the
                 // `=`/`(` checks on the follower, then re-reads the
@@ -2923,7 +2936,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 self.listener.end_initializer(operand);
                 return operand;
             }
-            if next == TokenKind::Eq {
+            if dispatch == TokenKind::Eq {
                 let before_eq = self.cursor.look_kind(n - 1);
                 if before_eq == TokenKind::Keyword(Keyword::Super) {
                     // Bare `super = ...`: the parser stays silent ("parseExpression
@@ -2940,7 +2953,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.look_span_at(n - 1),
                     );
                 }
-            } else if next != TokenKind::OpenParen {
+            } else if dispatch != TokenKind::OpenParen {
                 // `expectedAfterButGot('(')` + `insertParens(includeIdentifier:
                 // false)` (:4948-4952): wrap the follower in empty parens.
                 // The report anchors on the token after the name: a real
@@ -2981,7 +2994,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     let operand = self.parse_primary(
                         IdentifierContext::ExpressionContinuation,
                     );
-                    if matches!(
+                    let junk_literal = matches!(
                         operand_kind,
                         TokenKind::Int
                             | TokenKind::Hexadecimal
@@ -3005,7 +3018,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                                 | Keyword::Void
                                 | Keyword::Assert
                         )
-                    ) {
+                    );
+                    if junk_literal {
                         self.report(msg::missing_identifier(), operand);
                     }
                     // `(`-expect on the name slot's follower — `peek` is the
@@ -3018,6 +3032,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     self.report(msg::expected_after_but_got("("), at);
                     self.synthetic(TokenKind::OpenParen, at.range.offset);
                     self.synthetic(TokenKind::CloseParen, at.range.offset);
+                    // A literal/bracket operand (`super. 3`) is not a
+                    // `super()`/`super.named()` head — `buildInitializer`
+                    // rejects the node, so `endInitializers` reports
+                    // `invalid_super_in_initializer` at `super`
+                    // (ast_builder.dart:786-800) and the `;` body position
+                    // carries `missing_function_body` (the rejected
+                    // initializer leaves no valid constructor body). A
+                    // keyword-spliced name stays a valid super call — the
+                    // member reparse reports its own `missing_function_body`.
+                    if junk_literal {
+                        self.report(msg::invalid_super_in_initializer(), head);
+                        self.report(msg::expected_body(), at);
+                    }
                     self.listener.handle_dot_access(dot, operand, false);
                     let end = self.parse_arguments_rest();
                     self.listener.handle_send(operand, end);
