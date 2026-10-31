@@ -6008,6 +6008,13 @@ mod ticket_3143_tests;
 #[cfg(test)]
 mod ticket_3158_tests;
 
+/// The #3167 pins — the `undefined_class` emit faces: the bare-head
+/// message, the prefixed continuation, the explicit-creation replacement,
+/// the additive `on`-clause miss, and the type-argument context
+/// replacement.
+#[cfg(test)]
+mod ticket_3167_tests;
+
 /// The #3142 pins — `unnecessary_type_check`'s residual faces after
 /// #3129: the `core.`/`p.` head canonicalization, the generic
 /// member-tear-off operand, the raw generic alias's bounds fold, and the
