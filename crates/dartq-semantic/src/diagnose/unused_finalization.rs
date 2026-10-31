@@ -319,6 +319,11 @@ impl<'a> Engine<'a> {
         // member's declaration flips to `unused_element`.
         resolved.extend(self.inferred_recv_used_members.iter().copied());
         resolved.extend(self.member_read_owners.keys().copied());
+        // `member_refs` records every resolved `.member` access — reads,
+        // invokes, and writes alike. Their target spellings are resolved
+        // member-only uses: `member_reads` alone misses non-read intents
+        // (an `Invoke` never enters the field-read index).
+        resolved.extend(self.report.member_refs.iter().map(|r| r.target_name));
         for read in &self.member_reads {
             let recv = self.promoted_receiver(read.offset, read.recv);
             let found = match recv {
@@ -992,8 +997,17 @@ impl<'a> Engine<'a> {
         // also a non-member resolved use (a bare `RefTarget::Decl`/`Member`
         // reference, a type-use position) stays — it resolves through a
         // path that is not the member access.
-        let member_accessed: FxHashSet<StringId> =
-            self.member_reads.iter().map(|read| read.name).collect();
+        // Every `.member` access name — `member_reads` covers read intents;
+        // `member_refs` covers resolved invokes and writes the read index
+        // never records (an `Invoke` is not a field read). Both pools are
+        // needed: without `member_refs` an invoked-only name stays in
+        // `element_used` and over-credits same-spelling siblings.
+        let member_accessed: FxHashSet<StringId> = self
+            .member_reads
+            .iter()
+            .map(|read| read.name)
+            .chain(self.report.member_refs.iter().map(|r| r.target_name))
+            .collect();
         let resolved = self.resolved_member_uses();
         let non_member_resolved: FxHashSet<StringId> = self
             .refs
@@ -1030,6 +1044,51 @@ impl<'a> Engine<'a> {
             .iter()
             .map(|r| (r.target_file, r.target_container, r.target_name))
             .collect();
+        // The implicit-this setter face (upstream `preferSetter`,
+        // lexical_lookup.dart:22-35): a bare `_s = 1` resolves
+        // `RefTarget::Missing` at push time (the plain-name `_s` is not in
+        // `A.members` — only `_s=` is), and `bare_write_target_exists`
+        // rescues the write silently without a `member_refs` edge. The
+        // write still credits the setter element — `rows` carries the
+        // `Missing` arm's `this_type` snapshot, and the setter's `name=`
+        // spelling is the `member_found` probe.
+        let missing_write_rows: Vec<(Option<StringId>, StringId)> = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row.intent, Intent::Write | Intent::ReadWrite))
+            .filter_map(|row| match &row.shape {
+                RowShape::Bare(BareInfo::Missing { this_type, .. }) => {
+                    Some((*this_type, row.name))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut missing_write_setters: FxHashSet<(FileId, StringId, StringId)> =
+            FxHashSet::default();
+        let mut missing_write_top_levels: FxHashSet<StringId> = FxHashSet::default();
+        for (this_type, name) in missing_write_rows {
+            let setter = self.setter_spelling(name);
+            match this_type {
+                Some(container) if self.member_found(container, setter, false) => {
+                    missing_write_setters.insert((self.file, container, setter));
+                }
+                // A top-level write's `this_type` is `None` — the setter's
+                // `name=` spelling resolves through the scope lookup
+                // (`resolve_bare` at push time already tried it and missed:
+                // `BareInfo::Missing` is the push-time result, not the
+                // write-upgraded second chance `bare_write_target_exists`
+                // ran). Re-resolve the setter spelling live: a `RefTarget::Decl`
+                // hit means the top-level setter exists and the write used it.
+                None if matches!(
+                    self.resolve_bare(setter).1,
+                    RefTarget::Decl { .. } | RefTarget::Member { .. }
+                ) =>
+                {
+                    missing_write_top_levels.insert(name);
+                }
+                _ => {}
+            }
+        }
         // `element_used`'s Member-arm view: names that resolved ONLY through
         // a `.member` access (no bare `Decl`/`Member`/`TypeParam` ref, no
         // type-use) are the `member_refs` set's domain — a `_B._m` use must
@@ -1041,9 +1100,96 @@ impl<'a> Engine<'a> {
             .filter(|name| !non_member_resolved.contains(name))
             .copied()
             .collect();
+        // The setter-twin read face: `C()._p` on a class declaring ONLY
+        // `set _p` resolves no getter (`undefined_getter` reports), but
+        // the oracle's `usedElements.members` still carries the SETTER
+        // element — `visitSimpleIdentifier`'s `node.element` binds the
+        // induced property's setter member when the getter face misses
+        // (probed: `set _p` + `C()._p` read spares the setter). The read
+        // reaches `member_reads` with no `member_refs` edge (nothing
+        // resolved), so the same receiver walk `resolved_member_uses`
+        // applies re-decides the container, and a plain-member miss paired
+        // with a `name=` hit credits the setter element — the
+        // getter+setter pair never lands here (the getter resolves, no
+        // `member_found` miss).
+        let read_containers: Vec<(StringId, StringId, bool)> = self
+            .member_reads
+            .iter()
+            .filter_map(|read| {
+                let recv = self.promoted_receiver(read.offset, read.recv);
+                match recv {
+                    Receiver::This { container, .. }
+                    | Receiver::Typed {
+                        type_name: container,
+                        ..
+                    }
+                    | Receiver::Created {
+                        name: container, ..
+                    }
+                    | Receiver::Container {
+                        name: container, ..
+                    } => Some((container, read.name, false)),
+                    Receiver::Super { container, .. } => Some((container, read.name, true)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut setter_twin_uses: FxHashSet<(FileId, StringId, StringId)> =
+            FxHashSet::default();
+        for (container, name, super_walk) in read_containers {
+            if !self.member_found(container, name, super_walk) {
+                let setter = self.setter_spelling(name);
+                if setter != name && self.member_found(container, setter, super_walk) {
+                    setter_twin_uses.insert((self.file, container, setter));
+                }
+            }
+        }
+        // The `missing_write_setters` and `setter_twin_uses` rows join the
+        // element set — the `member_refs` edge missed them (the push-time
+        // `RefTarget::Missing` never reached `note_member_ref`; the
+        // setter-only read resolved no getter), but the oracle's
+        // `usedElements.members` carries the setter element.
+        let member_used_elements: FxHashSet<(FileId, StringId, StringId)> =
+            member_used_elements
+                .union(&missing_write_setters)
+                .copied()
+                .chain(setter_twin_uses.iter().copied())
+                .collect();
         let member_element_used: FxHashSet<StringId> = element_used
             .difference(&member_only_resolved)
             .copied()
+            .collect();
+        // `_isUsedElement` for top-level declarations is element-level: a
+        // local `_f` shadows the top-level `_f`, and the local's use credits
+        // `LocalFunctionElement`, never the top-level `TopLevelFunctionElement`.
+        // `element_used`'s name-level set would spare the top-level decl
+        // because both share the `_f` spelling. Restrict the check to names
+        // that resolved to a top-level declaration (`RefTarget::Decl`) or a
+        // type-annotation position — the same paths the upstream element
+        // check resolves through.
+        //
+        // `_isReadIdentifier` (upstream :429): a write `v = 3` adds the
+        // SETTER element, never the variable — `v` reports `unused_element`
+        // unless a read also credits it. `refs` carries the resolution
+        // without intent; `rows` records the finalized write — a `Decl`
+        // name whose every `refs` row pairs a `Write` intent row at the
+        // same offset is write-only and reports.
+        let write_offsets: FxHashSet<u32> = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row.intent, Intent::Write))
+            .map(|row| row.range.offset)
+            .collect();
+        let top_level_used: FxHashSet<StringId> = self
+            .refs
+            .iter()
+            .filter(|r| {
+                matches!(r.target, RefTarget::Decl { .. })
+                    && !write_offsets.contains(&r.range.offset)
+            })
+            .map(|r| r.name)
+            .chain(self.type_uses.iter().map(|(_, name)| *name))
+            .chain(missing_write_top_levels.iter().copied())
             .collect();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
@@ -1091,10 +1237,13 @@ impl<'a> Engine<'a> {
             match site.kind {
                 DeclKind::TopLevelFn | DeclKind::TopLevelVar | DeclKind::TypeAlias => {
                     // `_isUsedElement`'s else arm: a public name is used;
-                    // otherwise any indexed use spares the declaration.
+                    // otherwise a resolved top-level use spares it —
+                    // `top_level_used` excludes locals, members, and
+                    // parameters (element-level check, upstream
+                    // `usedElements.elements`).
                     if !site.annotated
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
-                        && !element_used.contains(&bare)
+                        && !top_level_used.contains(&bare)
                     {
                         // A nameless recovery declaration anchors at the file
                         // start — the spliced synthetic name never reaches
@@ -1126,9 +1275,45 @@ impl<'a> Engine<'a> {
                     // `ElementImpl` (top-level fns/vars/type aliases, the
                     // arm above) and to extension fragments; neither is a
                     // `Container` site.
+                    //
+                    // The enum-constructor self-reference leak: upstream
+                    // `visitClassDeclaration` alone sets `_enclosingClass`
+                    // (unused_local_elements_verifier.dart:94) — the enum,
+                    // mixin, and extension-type visitors never do — so a
+                    // constructor declaration's own `returnType` NamedType
+                    // (`const _E(this._f)`'s `_E`) visits
+                    // `visitNamedType` → `_useIdentifierElement` with
+                    // `_enclosingClass == null`, and
+                    // `identical(element, _enclosingClass)` fails open:
+                    // the enum element joins `usedElements.elements`
+                    // (:243-246, :396-422). Only the ENUM surface shows
+                    // the leak — a mixin's constructors are a syntax error
+                    // (`mixin_declares_constructor`), and an extension
+                    // type's representation declaration never repeats the
+                    // head as a `NamedType` child — so an enum that
+                    // declares any constructor (named or unnamed) reads
+                    // used; an enum with constants but no constructors
+                    // still reports (the constant's implicit invocation
+                    // resolves the SYNTHETIC constructor, which declares
+                    // no `NamedType` — probed: `a(0)` over a
+                    // constructor-less enum reports `_E`, over a declared
+                    // `const _E(int i)` does not).
+                    let enum_declares_ctor = self
+                        .container_kind_of(site.name)
+                        .is_some_and(|kind| kind == ContainerKind::Enum)
+                        && self
+                            .index
+                            .get(self.file)
+                            .and_then(|f| f.container(site.name))
+                            .is_some_and(|c| {
+                                c.constructors.len()
+                                    + usize::from(c.has_unnamed_constructor)
+                                    > 0
+                            });
                     if !site.annotated
                         && self.is_private_name(site.name)
                         && !element_used.contains(&bare)
+                        && !enum_declares_ctor
                     {
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
                     }
@@ -1180,7 +1365,12 @@ impl<'a> Engine<'a> {
                     // spelling for every read row, while a resolved read
                     // also records its owner; a spelling that never
                     // resolved an owner is the oracle's unresolved set.
+                    // A name that resolved through a non-member path (a
+                    // bare `_f` inside `B` resolves `B._f` via
+                    // `RefTarget::Member`) is NOT unresolved — its owner
+                    // resolution lives in `refs`, not `member_read_owners`.
                     let unresolved_read = self.read_names.contains(&bare)
+                        && !non_member_resolved.contains(&bare)
                         && self
                             .member_read_owners
                             .get(&bare)

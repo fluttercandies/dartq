@@ -5965,6 +5965,14 @@ mod ticket_3129_tests;
 #[cfg(test)]
 mod ticket_3132_tests;
 
+/// The #3138 pins — `unused_element`'s residual faces after the
+/// element-level partition: the enum-constructor self-reference leak
+/// (upstream `_enclosingClass` is set by `visitClassDeclaration` alone),
+/// the setter-twin read credit, the implicit-this setter write rescue,
+/// and the `member_refs` invoke/write union.
+#[cfg(test)]
+mod ticket_3138_tests;
+
 /// The #3139 pins — `unnecessary_final`'s field/super-formal gate over
 /// the parser's full `fieldFormalParameter` shape: the optional type
 /// annotation between the keyword and the receiver (`final int this.x`,
