@@ -17568,3 +17568,16 @@ mod ticket_3234_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
+#[path = "ticket_3229_tests.rs"]
+mod ticket_3229_tests;
+
+// The #3235 pins (the never-matches supply gate: `pattern_stack.len() != 1`
+// replaced by `Engine::pattern_matched_ty`, so a `||`/`&&` right operand —
+// its own pattern frame, still matched against the enclosing scrutinee —
+// runs the verdict, while a container field sub-pattern (matched type = a
+// property column) stays silent). Registered here because `diagnose.rs` is a
+// live-lane file out of this ticket's write scope; `#[path]` keeps the module
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3235_tests.rs"]
+mod ticket_3235_tests;

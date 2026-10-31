@@ -7405,71 +7405,107 @@ impl<'a> Engine<'a> {
         );
     }
 
-    /// The cast-pattern pair (shared_type_analyzer.dart:145-152 and
-    /// `checkPatternNeverMatchesValueType`'s Cast kind,
-    /// type_analyzer.dart:723-756): a matched type already below the
-    /// target makes the cast dead (`unnecessary_cast_pattern`); a matched
-    /// type no value of which can inhabit the target proves the pattern
-    /// dead (`pattern_never_matches_value_type`). The two are exclusive
-    /// (`canBeSubtypeOf ⊇ isSubtypeOf`). Root patterns only: a nested
-    /// pattern's matched type is the enclosing property's column, which
-    /// the name level does not descend (the under-report).
-    pub(crate) fn check_cast_pattern(&mut self, at: SourceRange, cast: Option<Ty>) {
-        let Some(cast) = cast else { return };
-        if cast == Ty::Unknown {
-            return;
+    /// The matched value type of the pattern node whose check is running
+    /// (`DartPatternImpl.resolvePattern`'s `context.matchedValueType`,
+    /// ast.dart:4138/8564/24753/27989/35197 and
+    /// list_pattern_resolver.dart:45): the open case/if-case scrutinee while
+    /// every frame above the root is TRANSPARENT for the matched type — a
+    /// logical operand (`analyzeLogicalOrPattern`/`analyzeLogicalAndPattern`
+    /// dispatch both operands with the enclosing matched type) keeps it.
+    ///
+    /// `None` = the node's matched type is not reachable at parse time: a
+    /// container field/element sub-pattern reads its property column or
+    /// slot type, which the name level does not descend into. Callers stay
+    /// silent there — the pre-#3235 posture for every nested node, now
+    /// limited to exactly those nodes instead of all of them.
+    pub(crate) fn pattern_matched_ty(&self) -> Option<Ty> {
+        if !self.switch.case_sink_open || self.switch.pattern_stack.is_empty() {
+            return None;
         }
-        if !self.switch.case_sink_open || self.switch.pattern_stack.len() != 1 {
-            return;
+        if !self.switch.pattern_stack.iter().skip(1).all(|f| f.binary.is_some()) {
+            return None;
         }
-        let Some(ctx) = self.switch.switches.last() else {
+        self.switch.switches.last().map(|ctx| ctx.scrutinee)
+    }
+
+    /// `checkPatternNeverMatchesValueType`'s List kind (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/resolver/list_pattern_resolver.dart:
+    /// 45, fed by `analyzeListPattern`, pkg/_fe_analyzer_shared/lib/src/
+    /// type_inference/type_analyzer.dart:979-1009): the required type is
+    /// `List<elementType>` — the written element type, else the matched
+    /// list's element type, else `Object?` — so a matched face that cannot be
+    /// a `List` at all proves the pattern dead.
+    ///
+    /// Only the element-type-free spelling runs here: a written `<T>` is not
+    /// carried into a resolved pattern type at parse time (the
+    /// `end_type_arguments` latch is the object pattern's arity face, not a
+    /// type), so the row's required-type rendering could not say `List<T>` —
+    /// the under-report direction.
+    pub(crate) fn check_list_pattern(&mut self, at: SourceRange) {
+        let Some(matched) = self.pattern_matched_ty() else {
             return;
         };
-        let matched = ctx.scrutinee;
-        if matched == Ty::Unknown {
+        if matched == Ty::Unknown || self.pending_pattern_type_args.is_some() {
             return;
         }
+        if self.name_can_be_subtype(matched, Ty::named(self.intern("List"))) {
+            return;
+        }
+        let element = Self::nullable_form(Ty::named(self.intern("Object")));
+        let a0 = self.ty_display(matched);
+        let a1 = format!("List<{}>", self.ty_display(element));
+        self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
+    }
+
+    /// The cast-pattern triple (shared_type_analyzer.dart:145-152 and
+    /// `checkPatternNeverMatchesValueType`'s Cast kind,
+    /// type_analyzer.dart:723-756, plus `visitCastPattern`'s null face,
+    /// best_practices_verifier.dart:227-239): a matched `Null` against a
+    /// non-nullable target always fails (`cast_from_null_always_fails`), a
+    /// matched type already below the target makes the cast dead
+    /// (`unnecessary_cast_pattern`), and a matched type no value of which
+    /// can inhabit the target proves the pattern dead
+    /// (`pattern_never_matches_value_type`) — the last two exclusive
+    /// (`canBeSubtypeOf ⊇ isSubtypeOf`).
+    ///
+    /// The matched type is the node's own
+    /// ([`Self::pattern_matched_ty`]): a root or logical-operand node reads
+    /// the open scrutinee. A field sub-pattern's matched type is its
+    /// property column, unreadable at parse time, so the call stays silent
+    /// there (the under-report).
+    pub(crate) fn check_cast_pattern(&mut self, at: SourceRange, cast: Option<Ty>) {
+        let Some(cast) = cast else { return };
+        let Some(matched) = self.pattern_matched_ty() else {
+            return;
+        };
+        if cast == Ty::Unknown || matched == Ty::Unknown {
+            return;
+        }
+        let null_face = matched == Ty::Null && matches!(cast, Ty::Named { nullable: false, .. });
         if self.name_subtype(matched, cast) {
             // The official gate is `isSubtypeOf && castType is not
             // InvalidType` — a `dynamic` target reports like any other.
             self.stage_usage(SemanticCode::UnnecessaryCastPattern, at, "");
-            return;
-        }
-        if !self.name_can_be_subtype(matched, cast) {
+        } else if !self.name_can_be_subtype(matched, cast) {
             let a0 = self.ty_display(matched);
             let a1 = self.ty_display(cast);
             self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
         }
-    }
-
-    /// `cast_from_null_always_fails`'s pattern face (`visitCastPattern`,
-    /// best_practices_verifier.dart:227-239): a cast pattern whose matched
-    /// value type is `Null` and whose target is non-nullable. The matched
-    /// type is the open switch's scrutinee — the proxy
-    /// [`Engine::check_cast_pattern`] consumes — under the same root gate.
-    pub(crate) fn check_cast_pattern_null(&mut self, at: SourceRange, cast: Option<Ty>) {
-        let Some(Ty::Named {
-            nullable: false, ..
-        }) = cast
-        else {
-            return;
-        };
-        if !self.switch.case_sink_open || self.switch.pattern_stack.len() != 1 {
-            return;
-        }
-        let Some(ctx) = self.switch.switches.last() else {
-            return;
-        };
-        if ctx.scrutinee == Ty::Null {
+        // `visitCastPattern`'s face (best_practices_verifier.dart:227-239),
+        // staged after the pair as before: a matched `Null` can inhabit no
+        // non-nullable target, so the row rides beside the never-match one.
+        if null_face {
             self.stage_usage(SemanticCode::CastFromNullAlwaysFails, at, "");
         }
     }
 
     /// `checkPatternNeverMatchesValueType`'s DeclaredVariable/Wildcard/
     /// Object kinds (type_analyzer.dart:723-756): a required type no
-    /// matched value can inhabit proves the pattern dead. Root patterns
-    /// and refutable contexts only (the official's
-    /// `irrefutableContext == null` gate; declaration patterns suppress).
+    /// matched value can inhabit proves the pattern dead. Refutable
+    /// contexts only (the official's `irrefutableContext == null` gate;
+    /// declaration patterns suppress), and every node whose matched type is
+    /// reachable at parse time ([`Self::pattern_matched_ty`]) — the root
+    /// and the logical operands, not a field sub-pattern.
     /// The verdict reads the type folded through a non-parameterized
     /// alias first — the official `requiredType` carries the written
     /// alias into every kind and unwraps it for `canBeSubtypeOf` — while
@@ -7479,13 +7515,9 @@ impl<'a> Engine<'a> {
         if required == Ty::Unknown || required == Ty::Dynamic {
             return;
         }
-        if !self.switch.case_sink_open || self.switch.pattern_stack.len() != 1 {
-            return;
-        }
-        let Some(ctx) = self.switch.switches.last() else {
+        let Some(matched) = self.pattern_matched_ty() else {
             return;
         };
-        let matched = ctx.scrutinee;
         if matched == Ty::Unknown {
             return;
         }
@@ -7582,16 +7614,14 @@ impl<'a> Engine<'a> {
     /// (shared_type_analyzer.dart:129-139): over a non-nullable matched
     /// type both forms are dead. The official's irrefutable-context error
     /// takes precedence there, so only refutable contexts (open switch
-    /// cases) report; root patterns only, as in
-    /// [`Self::check_pattern_never_matches`].
+    /// cases) report, and only nodes whose matched type is reachable at
+    /// parse time ([`Self::pattern_matched_ty`]) — the root and the logical
+    /// operands, as in [`Self::check_pattern_never_matches`].
     pub(crate) fn check_null_pattern(&mut self, at: SourceRange, is_assert: bool) {
-        if !self.switch.case_sink_open || self.switch.pattern_stack.len() != 1 {
-            return;
-        }
-        let Some(ctx) = self.switch.switches.last() else {
+        let Some(matched) = self.pattern_matched_ty() else {
             return;
         };
-        if !self.strictly_non_nullable(ctx.scrutinee) {
+        if !self.strictly_non_nullable(matched) {
             return;
         }
         let code = if is_assert {
@@ -7682,28 +7712,18 @@ impl<'a> Engine<'a> {
     /// The visitor descends into logical-or/and operands with the same
     /// matched type, so constant leaves under binary-operand frames check
     /// like root leaves (`case true || null:`); field sub-pattern frames
-    /// suppress — their matched type is the property column, which the
-    /// name level does not descend into (the under-report). A passing
+    /// stay silent — their matched type is the property column, which the
+    /// name level does not descend into (the under-report, exactly the
+    /// nodes [`Self::pattern_matched_ty`] answers `None` for). A passing
     /// candidate defers to the teardown join when a clause anchor stands
     /// (the flow's promoted matched type can narrow the verdict, #1351).
     pub(crate) fn check_constant_pattern(&mut self, constant: Option<Ty>, at: Option<SourceRange>) {
         let (Some(constant), Some(at)) = (constant, at) else {
             return;
         };
-        if !self.switch.case_sink_open
-            || !self
-                .switch
-                .pattern_stack
-                .iter()
-                .skip(1)
-                .all(|f| f.binary.is_some())
-        {
-            return;
-        }
-        let Some(ctx) = self.switch.switches.last() else {
+        let Some(matched) = self.pattern_matched_ty() else {
             return;
         };
-        let matched = ctx.scrutinee;
         if matched == Ty::Unknown {
             return;
         }

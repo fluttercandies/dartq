@@ -7158,14 +7158,12 @@ impl ParserListener for DiagnoseListener<'_> {
             Some(Ty::Named { name, nullable, .. }) => Restriction::Named(name, nullable),
             _ => Restriction::Unknown,
         };
-        // The still-armed type is the cast target: the pair at
-        // shared_type_analyzer.dart:129-152 (and the Cast kind of
-        // `checkPatternNeverMatchesValueType`).
+        // The still-armed type is the cast target: the triple at
+        // shared_type_analyzer.dart:129-152 (the Cast kind of
+        // `checkPatternNeverMatchesValueType`), plus `visitCastPattern`'s
+        // matched-`Null` face (best_practices_verifier.dart:227-239).
         let cast_ty = engine.armed_ty;
         engine.check_cast_pattern(operator.range, cast_ty);
-        // `visitCastPattern`'s face (best_practices_verifier.dart:227-239):
-        // the matched-value proxy is the same scrutinee pair.
-        engine.check_cast_pattern_null(operator.range, cast_ty);
         engine.pattern_leaf(leaf);
         // The armed type was the cast pattern's — never a declaration's.
         engine.armed_ty = None;
@@ -7267,6 +7265,15 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {
         self.flow().handle_list_pattern(count, left, right);
+        // The List kind of `checkPatternNeverMatchesValueType`
+        // (list_pattern_resolver.dart:45): the pattern's required type is a
+        // `List`, so a matched value that cannot be one proves it dead. The
+        // row spans the whole `[...]` node (`.at(pattern)`).
+        let at = SourceRange {
+            offset: left.range.offset,
+            length: right.range.end() - left.range.offset,
+        };
+        self.engine.check_list_pattern(at);
         // A variable INSIDE a list pattern is no positional object field's
         // getter name (only the transparent wrappers unwrap,
         // ast.dart:6640/:39354/:39708/:40734): the latch dies with the
