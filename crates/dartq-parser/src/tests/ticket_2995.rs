@@ -147,26 +147,30 @@ fn report_error_if_super_faces_match_oracle() {
 }
 
 /// Built-in keep-set members: `typedef`/`get`/`set`/`required` splice the
-/// synthetic name (`missing_identifier`), never the built-in consume face.
+/// synthetic name (`missing_identifier`), never the built-in consume face —
+/// including the immediate-closer shapes (`class A<set> {}`,
+/// `void b< set>();`, `Function< get >()`; the Simple1 scan gate admits
+/// only identifier/pseudo names, so those groups take the Complex loop and
+/// the keep face is safe there — #3093 closed the carve-out residual).
 #[test]
 fn builtin_type_variable_heads_take_the_keep_face() {
-    // The single-token `< set >` group shape stays on the consume face —
-    // upstream classifies it Complex (type_info.dart:445 admits only
-    // IDENTIFIER/pseudo names) and keeps the keyword, but dartq's Simple1
-    // fast path asserts a closer directly after the name; mirroring the
-    // upstream gate is the type_args.rs owner's face (#2995 residual).
     assert_eq!(
         sorted_rows("class A<set> {}\n"),
-        vec![code("built_in_identifier_in_declaration", 8, 11)],
-        "oracle `missing_identifier` blocked on the Simple1 scan gate"
+        vec![code("missing_identifier", 8, 11)],
+        "oracle: the keep face on the immediate-closer shape"
     );
     assert_eq!(
         sorted_rows("void b< set>();\n"),
         vec![
-            code("built_in_identifier_in_declaration", 8, 11),
             code("missing_function_body", 14, 15),
+            code("missing_identifier", 8, 11),
         ],
-        "oracle `missing_identifier` blocked on the Simple1 scan gate"
+        "oracle: keep face plus the body row"
+    );
+    assert_eq!(
+        sorted_rows("typedef F = void Function< get >();\n"),
+        vec![code("missing_identifier", 27, 30)],
+        "oracle: keep face, the group closes, no cascade"
     );
     // The keep face lands (`missing_identifier` at `get`, no built-in row);
     // the bound-region second row and the missing-closer cascade pre-date
@@ -178,11 +182,6 @@ fn builtin_type_variable_heads_take_the_keep_face() {
             && !sorted_rows("class A<get extends int> {}\n")
                 .contains(&code("built_in_identifier_in_declaration", 8, 11)),
         "oracle: keep face, the bound parses, the `>` closes"
-    );
-    assert_eq!(
-        sorted_rows("typedef F = void Function< get >();\n"),
-        vec![code("built_in_identifier_in_declaration", 27, 30)],
-        "oracle `missing_identifier` blocked on the Simple1 scan gate"
     );
 }
 

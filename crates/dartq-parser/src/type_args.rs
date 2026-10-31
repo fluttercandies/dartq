@@ -292,14 +292,23 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 }
 
 /// The fast-shape guard of `_computeTypeParamOrArgImpl` (`type_info.dart:446)`:
-/// `<` followed by a single name-ish token and a `>`-family closer.
+/// `<` followed by a single name-ish token and a `>`-family closer. The name
+/// admission mirrors the official `next.kind == IDENTIFIER_TOKEN ||
+/// next.isPseudo` (`type_info.dart:445`) exactly — a real identifier or a
+/// pseudo keyword, never a built-in/reserved keyword (`class A<set> {}` /
+/// `void b<typedef>() {}` classify Complex, where the TV-list recovery keeps
+/// the keyword; dartq's `is_identifier` is wider than the official gate and
+/// would otherwise route the keep face into the Simple1 arm's closer assert).
 pub(crate) fn simple1_closer(
     parser: &Parser<'_, '_, '_, impl ParserListener>,
     lt_offset: usize,
 ) -> Option<SimpleCloser> {
     let first = parser.kind_at(lt_offset + 1);
-    let first_is_nameish = is_identifier(first)
-        || matches!(first, TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Pseudo);
+    let first_is_nameish = matches!(first, TokenKind::Identifier)
+        || matches!(
+            first,
+            TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Pseudo
+        );
     if !first_is_nameish {
         return None;
     }
@@ -1294,6 +1303,11 @@ impl ComplexTypeParamOrArg {
         let mut starts: Vec<TokenSpan> = Vec::new();
         let mut supers: Vec<Option<(TokenSpan, TypeInfo)>> = Vec::new();
         let mut variances: Vec<Option<TokenSpan>> = Vec::new();
+        // A bound that recovered (`expected_type_name` already covers the
+        // group) silences the missing-closer cascade exactly like a spliced
+        // synthetic name — at most one group-level row (the official
+        // `errorReported`, type_info_impl.dart:1589).
+        let mut bound_recovered = false;
 
         loop {
             if parser.is_bailed() {
@@ -1346,6 +1360,11 @@ impl ComplexTypeParamOrArg {
                 // (`computeType(next, required: true, inDeclaration)`,
                 // type_info_impl.dart:1526-1531).
                 let info = parser.compute_type(true, self.in_declaration);
+                if matches!(info, TypeInfo::NoType)
+                    || matches!(&info, TypeInfo::Complex(c) if c.recovered)
+                {
+                    bound_recovered = true;
+                }
                 // Official `token = typeInfo.skipType(next)`
                 // (type_info_impl.dart:1530): the scan position moves to the
                 // supertype's last token. `NoType` keeps the official
@@ -1370,8 +1389,18 @@ impl ComplexTypeParamOrArg {
                 k if is_closer(k) => break,
                 _ => {
                     // Recovery: keep going over parameter-like shapes with a
-                    // synthesized comma, otherwise stop at the closer.
+                    // synthesized comma, otherwise stop at the closer. When
+                    // the just-completed name is a spliced synthetic, the
+                    // kept keyword that follows is junk for the group's
+                    // unexpected-end absorb, never a missing-comma member
+                    // (the official re-read falls to `parseUnexpectedEnd`
+                    // with token3 synthetic, type_info_impl.dart:1589) —
+                    // synthesizing a comma here would cascade rows the
+                    // oracle silences (`void b<typedef>() {}`).
                     if parser.cursor.peek_is_closer() {
+                        break;
+                    }
+                    if starts.last().is_some_and(|s| s.range.length == 0) {
                         break;
                     }
                     if looks_like_type_param_member(parser) {
@@ -1452,7 +1481,15 @@ impl ComplexTypeParamOrArg {
             // anchors on token3 (the last completed variable's end), walks
             // the extends/type/nested-group/`(` recovery arms in order, and
             // returns the group end (a consumed closer or a synthetic `>`).
-            parser.parse_type_args_unexpected_end(self.in_declaration, false, begin)
+            // `errorReported = token3.isSynthetic` (type_info_impl.dart:1589,
+            // the `range.length == 0` face): when the keep face spliced a
+            // synthetic name, the keep rows already cover the group — the
+            // `>`-cascade is silenced (`void b<super int>() {}` carries only
+            // the `missing_identifier` row). A recovered bound counts as the
+            // group's row the same way.
+            let cascade_reported = bound_recovered
+                || starts.last().is_some_and(|s| s.range.length == 0);
+            parser.parse_type_args_unexpected_end(self.in_declaration, cascade_reported, begin)
         };
         parser.listener.end_type_variables(begin, end);
         parser.leave_type_depth();

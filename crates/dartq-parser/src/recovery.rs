@@ -367,22 +367,18 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         // heads a top-level declaration, class member, or
                         // statement (`typedef`/`get`/`set`/`required`/...)
                         // splices the synthetic name instead of being eaten
-                        // (oracle `void b< typedef int>();`:
-                        // `missing_identifier` at the `typedef`, never the
+                        // (oracle `void b< typedef int>();` and the
+                        // immediate-closer shapes `void b<typedef>() {}` /
+                        // `class A<set> {}` / `void b< get >() {}`: all
+                        // `missing_identifier` at the keyword, never the
                         // `builtInIdentifierInDeclaration` consume). The
-                        // single-token `< set >` group shape stays on the
-                        // consume face: upstream classifies it Complex
-                        // (`_computeTypeParamOrArgImpl`, type_info.dart:445
-                        // admits only IDENTIFIER/pseudo names) whose recovery
-                        // loop absorbs the kept keyword, while dartq's
-                        // Simple1 fast path asserts a closer directly after
-                        // the name — a kept keyword would break that
-                        // invariant (the gate lives in type_args.rs).
-                        || (context == crate::listener::IdentifierContext::TypeVariableDeclaration
-                            && !matches!(
-                                self.cursor.look_kind(1),
-                                TokenKind::Gt | TokenKind::GtGt | TokenKind::GtEq
-                            ))
+                        // keep face is safe for the single-token `< set >`
+                        // group shape too: the Simple1 scan gate
+                        // (`simple1_closer`) admits only identifier/pseudo
+                        // names (type_info.dart:445), so those groups take
+                        // the Complex recovery loop and the closer assert in
+                        // the Simple1 arm is unreachable for them.
+                        || context == crate::listener::IdentifierContext::TypeVariableDeclaration
                 }
                 _ => false,
             },
