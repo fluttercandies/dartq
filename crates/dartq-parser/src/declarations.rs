@@ -1574,19 +1574,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // (:573) — and the `=` only surfaces once the `<...>` group is
         // consumed. ensure_identifier consumes the keyword silently (the
         // keyword-name gate carries no arm for this context).
-        let built_in_name = if self.is_built_in_name_token(0) {
+        let built_in_name = if self.is_built_in_or_reserved_name_token(0) {
             Some(self.peek_span())
         } else {
-            // Reserved keywords carry the same verifier face: the gate is
-            // `isKeyword && isPseudo != true` (error_verifier.dart:846-849),
-            // so `class if {}` reports built_in_identifier_in_declaration on
-            // the keyword alongside the parser's
-            // expected_identifier_but_got_keyword (oracle 1:7 len 2).
-            matches!(
-                self.peek_kind(),
-                TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
-            )
-            .then(|| self.peek_span())
+            None
         };
         let name =
             self.ensure_declaration_name(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
@@ -1742,6 +1733,24 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
             self.skip_single_type_raw();
         }
+    }
+
+    /// The verifier's built-in-name gate extended to reserved words: the
+    /// report fires on every keyword that is not a pseudo keyword
+    /// (`error_verifier.dart:846-849`, gate `isKeyword && isPseudo != true`
+    /// at :3372). Oracle probes: `class if {}`, `mixin if {}`, and
+    /// `extension type if(int i) {}` each carry
+    /// `BUILT_IN_IDENTIFIER_IN_DECLARATION` on the keyword beside the
+    /// parser's `expected_identifier_but_got_keyword`; `extension if on int
+    /// {}` does not — its header junk recovery never makes the keyword the
+    /// name, so the verifier has no name token to fire on, and the
+    /// extension lane keeps its identifier-shaped gate.
+    fn is_built_in_or_reserved_name_token(&self, n: usize) -> bool {
+        self.is_built_in_name_token(n)
+            || matches!(
+                self.cursor.look_kind(n),
+                TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
+            )
     }
 
     /// Official `parseClass`; the cursor sits after the type variables.
@@ -2080,10 +2089,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         // Mixin names take the type-name face unconditionally
         // (visitMixinDeclaration, error_verifier.dart:1840 — mixin
-        // declarations have no `=` mixin-application form). ensure_identifier
-        // consumes the keyword silently (no keyword-name gate arm for this
-        // context).
-        if self.is_built_in_name_token(0) {
+        // declarations have no `=` mixin-application form). Reserved heads
+        // carry the row like built-in ones (oracle `mixin if {}`: keyword
+        // row + built-in row, both 1:7 len 2). ensure_identifier consumes
+        // the keyword silently (no keyword-name gate arm for this context).
+        if self.is_built_in_or_reserved_name_token(0) {
             self.report(
                 msg::built_in_identifier_as_name(
                     msg::BuiltInNameKind::Type,
@@ -2410,7 +2420,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let name = if self.peek_is_identifier() {
             // Extension-type names take the extension-type-name face
             // (visitExtensionTypeDeclaration, error_verifier.dart:1150).
-            if self.is_built_in_name_token(0) {
+            if self.is_built_in_or_reserved_name_token(0) {
                 self.report(
                     msg::built_in_identifier_as_name(
                         msg::BuiltInNameKind::ExtensionType,
@@ -2423,6 +2433,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
             n
         } else {
+            // Reserved heads fail the identifier probe but still become the
+            // name (ensure_declaration_name's keyword-name gate), and the
+            // verifier face rides the keyword exactly as on the identifier
+            // route (oracle `extension type if(int i) {}`: both rows at
+            // 1:16 len 2, representation parsed cleanly).
+            if self.is_built_in_or_reserved_name_token(0) {
+                self.report(
+                    msg::built_in_identifier_as_name(
+                        msg::BuiltInNameKind::ExtensionType,
+                        self.cursor.lexeme(self.peek_id()),
+                    ),
+                    self.peek_span(),
+                );
+            }
             self.ensure_declaration_name(IdentifierContext::ClassOrMixinOrExtensionDeclaration)
         };
         // The token right after the name, pre-type-parameters: the
@@ -2923,6 +2947,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // one row at the stray `}` — the synthetic closer's re-anchored row
         // and the real brace's row share the anchor, and the shared dedup
         // (`unmatched_seen`) drops the second.
+        let mut boundary_carried = false;
         while !self.cursor.at_eof() {
             if !matches!(
                 self.peek_kind(),
@@ -2933,35 +2958,59 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // recovery still opens a remnant member at the boundary —
                 // `expected_executable` on the follower token
                 // (class_member_parser junk-member face) — and the follower
-                // itself re-parses cleanly at top level. Paired shapes
-                // (`class C({}) x`) carry the face on their real closers
-                // instead, so the arm is gated on the head paren's own
-                // pairing, not the `{`-remnant's closer.
+                // itself re-parses cleanly at top level. When a closer
+                // precedes the follower, that closer already carried the
+                // boundary face and the follower stays silent (oracle
+                // `class C( {} } void f() {}`: the face at the stray `}`,
+                // nothing on `void`). Paired shapes (`class C({}) x`) carry
+                // the face on their real closers instead, so the arm is
+                // gated on the head paren's own pairing, not the
+                // `{`-remnant's closer.
                 if paren_unpaired {
                     // moveSynthetic relocation (`ensureCloseParen`'s
                     // `begin.endGroup!.isSynthetic` bailout,
-                    // parser_impl.dart:1985 via :5028-5037): the official
-                    // parse re-offsets the parked closer to the first token
-                    // past the formals junk (`_setOffset(endGroup,
-                    // next.offset)`) and the translation reads
-                    // `begin.endGroup.charOffset` post-parse, so the
-                    // `expected_token ')'` row lands on the follower
-                    // (oracle `class C( {} void f() {}` → 1:13 on `void`,
-                    // not the EOF park). Adopting the pair here latches
-                    // `unmatched_reported`, so the parse-end pass skips it.
-                    if let Some(parked) = parked_close {
-                        self.report_unmatched_row(")", self.peek_span());
-                        self.unmatched_reported.push(lparen.id);
-                        self.cursor.hide(parked);
+                    // parser_impl.dart:1985 via :5028-5037) — eof-parked
+                    // closers only (oracle `class C( {} void f() {}` → `)`
+                    // 1:13 on `void`; `class C( {} } void f() {}` keeps the
+                    // stray-`}` park), see
+                    // [`Self::adopt_paren_at_relocation`].
+                    self.adopt_paren_at_relocation(lparen, parked_close, self.peek_span());
+                    if !boundary_carried {
+                        self.report(msg::expected_executable(), self.find_non_zero_span());
                     }
-                    self.report(msg::expected_executable(), self.find_non_zero_span());
                 }
                 break;
             }
             self.report(msg::expected_executable(), self.find_non_zero_span());
+            boundary_carried = true;
             self.cursor.advance();
         }
         false
+    }
+
+    /// Batch-B relocation adoption, gated to the EOF-parked pending `(`: the
+    /// formals-bail `moveSynthetic` (`parser_impl.dart:1985` via
+    /// `:5028-5037`) re-anchors only an eof-parked closer at the resume
+    /// point; a closer parked at a mismatching bracket stays put (oracle
+    /// `class C( {} } void f() {}` and `class C( [x] }`: `)` at the stray
+    /// `}`, not the follower). Reports the `expected_token ')'` row at
+    /// `at`, latches [`Parser::unmatched_reported`] so the parse-end pass
+    /// skips the pair, and hides the parked synthetic.
+    fn adopt_paren_at_relocation(
+        &mut self,
+        lparen: TokenSpan,
+        parked: Option<crate::token_id::TokenId>,
+        at: TokenSpan,
+    ) {
+        let Some(parked) = parked else {
+            return;
+        };
+        if self.span_of(parked).range.offset < self.table.last().utf16_offset {
+            return;
+        }
+        self.report_unmatched_row(")", at);
+        self.unmatched_reported.push(lparen.id);
+        self.cursor.hide(parked);
     }
 
     /// `findNonZeroLengthToken` (`parser/util.dart:56`) from the cursor:
@@ -2997,11 +3046,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// next remnant member takes `expected_executable` +
     /// `missing_const_final_var_or_type` at the tail (EOF keeps the
     /// zero-width anchor; a real follower anchors on itself, oracle `class
-    /// C(; void f() {}` rows on `void`). The synthetic closers are never
-    /// adopted, so the scanner's post-parse unmatched-group rows
-    /// (`]` at a mismatching closer, `)`/`]` at EOF) carry their own faces
-    /// exactly as the oracle pins them. Returns `false`: the tail was
-    /// consumed.
+    /// C(; void f() {}` rows on `void`). The eof-parked pending `(` adopts
+    /// at a follower ([`Self::adopt_paren_at_relocation`]); the
+    /// bracket's park-position row keeps flowing through the un-latched
+    /// scanner pair, with the relocation/EOF row added alongside
+    /// (`]` at a mismatching closer AND on the follower / at EOF). Returns
+    /// `false`: the tail was consumed.
     fn recover_class_head_paren_junk(&mut self, name: TokenSpan) -> bool {
         // `endPrimaryConstructor` (outline_builder.dart:1810-1818): the
         // experiment face fires for Class whenever the head parsed — the
@@ -3018,6 +3068,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             name,
         );
         let lparen = self.peek_span();
+        let paren_parked = self.cursor.table_matching_end(lparen.id);
         self.report(msg::expected_executable(), lparen);
         self.cursor.advance(); // the junk `(` head
         if self.peek_kind() == TokenKind::OpenSquare {
@@ -3030,6 +3081,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // over it onto the real `}` (`findNonZeroLengthToken`,
             // parser/util.dart:56) before both closers are consumed.
             let open_sq = self.peek_span();
+            let bracket_synthetic = self
+                .cursor
+                .table_matching_end(open_sq.id)
+                .is_some_and(|end| self.cursor.resolve(end).1);
             self.report(msg::expected_executable(), open_sq);
             self.report(msg::expected_token(";"), open_sq);
             self.cursor.advance();
@@ -3043,11 +3098,52 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             ) {
                 self.cursor.advance();
             }
-            // The `}` remnant already carried the field faces; the oracle's
-            // EOF tail is the bare `expected_executable` only (probe p08:
-            // no `missing_const` at 2:1).
+            // The `}` remnant already carried the field faces. The bracket
+            // family closes at EOF whether or not a follower follows: the
+            // oracle anchors the tail member and the pending-group rows at
+            // the eof position (oracle `class C( [}`: 1|12|0 + 1|12|1 x2;
+            // the twin with a follower renders the same rows on the
+            // newline's line, `class C( [} void f() {}`: 2|1|0 + 2|1|1 x2)
+            // — never on the follower. The pending `(` keeps its scanner
+            // park (post-parse row; `adopt_paren_at_relocation` is the
+            // semicolon arm's law, not this one).
             let tail = self.find_non_zero_span();
-            self.report(msg::expected_executable(), tail);
+            let eof_off = self.table.last().utf16_offset;
+            let at_eof = tail.range.offset >= eof_off;
+            let eof_span = TokenSpan::new(
+                (self.table.len() - 1) as crate::token_id::TokenId,
+                SourceRange {
+                    offset: eof_off,
+                    length: 0,
+                },
+            );
+            if bracket_synthetic {
+                // The unmatched `[` rows ride two channels at once: the
+                // un-latched scanner pair keeps the park-position row
+                // (post-parse `]` at the mismatching `}`), and the
+                // relocation/EOF channel adds one more — on the follower's
+                // newline line with a follower (oracle `class C( [} void
+                // f() {}`: 2|1|1 beside the 1|11|1 park row), at EOF for
+                // the drain (oracle `class C( [}`: 1|12|1; the `class C( [`
+                // drain dedups into the eof-parked pair's row). Latching
+                // the pair would kill the park row the oracle keeps.
+                if at_eof {
+                    self.report_unmatched_row("]", tail);
+                } else {
+                    self.report_unmatched_row("]", eof_span);
+                }
+            }
+            if at_eof {
+                // The `class C( [` drain anchors the remnant faces at EOF
+                // too — the tail member IS the remnant, so the bare
+                // `expected_executable` would double-report (oracle
+                // `class C( [`: one row per face).
+                if tail.range.offset != remnant.range.offset {
+                    self.report(msg::expected_executable(), tail);
+                }
+            } else {
+                self.report(msg::expected_executable(), eof_span);
+            }
         } else {
             // `;` remnant member: the field-remnant faces all land on the
             // `;` (oracle `class C(;`: `missing_identifier`,
@@ -3059,8 +3155,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::unexpected_token(self.cursor.lexeme(semi.id)), semi);
             self.cursor.advance();
             // The next remnant member opens at the tail (EOF keeps the
-            // zero-width anchor; a real follower anchors on itself).
+            // zero-width anchor; a real follower anchors on itself), and
+            // the eof-parked pending `(` relocates to the follower (oracle
+            // `class C(; void f() {}`: `)` 1|11|1 on `void`; the EOF
+            // variant keeps the parked row, re-emitted through the shared
+            // dedup).
             let tail = self.find_non_zero_span();
+            self.adopt_paren_at_relocation(lparen, paren_parked, tail);
             self.report(msg::expected_executable(), tail);
             self.report(msg::missing_const_final_var_or_type(), tail);
         }

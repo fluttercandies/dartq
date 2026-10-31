@@ -1228,9 +1228,12 @@ fn class_head_semicolon_junk_face() {
             ("missing_identifier".to_string(), 8, 9),
             ("expected_token".to_string(), 8, 9),
             ("unexpected_token".to_string(), 8, 9),
+            // The eof-parked `(` adopts at the tail before the tail member
+            // rows report (adopt_paren_at_relocation; the row is identical
+            // to the old parse-end pass row, just earlier).
+            ("expected_token".to_string(), 9, 10),
             ("expected_executable".to_string(), 9, 9),
             ("missing_const_final_var_or_type".to_string(), 9, 9),
-            ("expected_token".to_string(), 9, 10),
         ],
         "{:?}",
         c.texts
@@ -1266,9 +1269,9 @@ fn class_head_spaced_semicolon_junk_face() {
             ("missing_identifier".to_string(), 9, 10),
             ("expected_token".to_string(), 9, 10),
             ("unexpected_token".to_string(), 9, 10),
+            ("expected_token".to_string(), 10, 11),
             ("expected_executable".to_string(), 10, 10),
             ("missing_const_final_var_or_type".to_string(), 10, 10),
-            ("expected_token".to_string(), 10, 11),
         ],
         "{:?}",
         c.texts
@@ -1288,7 +1291,7 @@ fn class_head_spaced_semicolon_junk_face() {
 fn class_head_bracket_junk_face() {
     let (c, _scanner) = parse_latest_with_scanner("class C( [}");
     assert_eq!(
-        &c.errors[..8],
+        &c.errors[..11],
         &[
             ("expected_body".to_string(), 6, 7),
             ("expected_executable".to_string(), 7, 8),
@@ -1297,11 +1300,78 @@ fn class_head_bracket_junk_face() {
             ("expected_executable".to_string(), 10, 11),
             ("missing_identifier".to_string(), 10, 11),
             ("missing_const_final_var_or_type".to_string(), 10, 11),
+            // The unmatched `[`'s relocation/EOF row, then the bare tail
+            // member; the un-latched park row and the eof-parked `)` trail
+            // via the parse-end pass.
+            ("expected_token".to_string(), 11, 12),
             ("expected_executable".to_string(), 11, 11),
+            ("expected_token".to_string(), 10, 11),
+            ("expected_token".to_string(), 11, 12),
         ],
         "{:?}",
         c.texts
     );
+    assert_eq!(c.texts[7], "Expected to find ']'.");
+    assert_eq!(c.texts[10], "Expected to find ')'.");
+}
+
+/// Bracket-arm follower face (`class C( [} void f() {}`, oracle 3.13.7
+/// probe): the shared `[`-junk head and `}`-remnant faces, then the whole
+/// tail closes at the eof anchor — the `[`'s twin rows ride both channels
+/// (the un-latched park row 1|11|1 trails via the parse-end pass, the
+/// relocation row joins the eof anchor), the eof-parked `)` rides the
+/// parse-end pass at the same anchor, and the tail member anchors
+/// zero-width. With the trailing newline the eof anchor renders on the
+/// newline's line (oracle rows 2|1|0 + 2|1|1 x2); nothing lands on the
+/// follower.
+#[test]
+fn class_head_bracket_follower_face() {
+    let (c, _scanner) = parse_latest_with_scanner("class C( [} void f() {}");
+    assert_eq!(
+        &c.errors[..11],
+        &[
+            ("expected_body".to_string(), 6, 7),
+            ("expected_executable".to_string(), 7, 8),
+            ("expected_executable".to_string(), 9, 10),
+            ("expected_token".to_string(), 9, 10),
+            ("expected_executable".to_string(), 10, 11),
+            ("missing_identifier".to_string(), 10, 11),
+            ("missing_const_final_var_or_type".to_string(), 10, 11),
+            ("expected_token".to_string(), 23, 24),
+            ("expected_executable".to_string(), 23, 23),
+            ("expected_token".to_string(), 10, 11),
+            ("expected_token".to_string(), 23, 24),
+        ],
+        "{:?}",
+        c.texts
+    );
+    assert_eq!(c.texts[7], "Expected to find ']'.");
+    assert_eq!(c.texts[10], "Expected to find ')'.");
+}
+
+/// Semicolon-arm follower face (`class C(; void f() {}`, oracle 3.13.7
+/// probe): the `;`-remnant faces on the `;`, the tail member rows
+/// full-width on `void`, and the eof-parked pending `(` relocating its
+/// `expected_token ')'` onto `void` (1|11|1 — `parser_impl.dart:1985`).
+#[test]
+fn class_head_semicolon_follower_face() {
+    let (c, _scanner) = parse_latest_with_scanner("class C(; void f() {}");
+    assert_eq!(
+        &c.errors[..8],
+        &[
+            ("expected_body".to_string(), 6, 7),
+            ("expected_executable".to_string(), 7, 8),
+            ("missing_identifier".to_string(), 8, 9),
+            ("expected_token".to_string(), 8, 9),
+            ("unexpected_token".to_string(), 8, 9),
+            ("expected_token".to_string(), 10, 11),
+            ("expected_executable".to_string(), 10, 14),
+            ("missing_const_final_var_or_type".to_string(), 10, 14),
+        ],
+        "{:?}",
+        c.texts
+    );
+    assert_eq!(c.texts[5], "Expected to find ')'.");
 }
 
 /// Unpaired `(` + `{}` remnant with a follower (`class C( {} void f() {}`,
@@ -1424,6 +1494,58 @@ fn enum_reserved_name_keyword_face() {
     assert_eq!(
         c.texts[1],
         "The built-in identifier 'if' can't be used as a type name."
+    );
+}
+
+/// Reserved keyword heads on the sibling container lanes (oracle 3.13.7
+/// probes): `mixin if {}` carries the built-in row beside the keyword row
+/// (both 1|7|2 — visitMixinDeclaration's type-name face), and
+/// `extension type if(int i) {}` carries it on the keyword-name recovery
+/// route (both 1|16|2 — the representation parses cleanly). The extension
+/// lane is the deliberate exception: `extension if on int {}` never makes
+/// the keyword the name, so no built-in row exists there.
+#[test]
+fn sibling_container_reserved_name_faces() {
+    let (table, text) = scan_ok("mixin if {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    // The capture reports before the keyword-name gate consumes the head,
+    // so the built-in row precedes the parser's keyword row.
+    assert_eq!(
+        c.errors,
+        [
+            ("built_in_identifier_in_declaration".to_string(), 6, 8),
+            (
+                "expected_identifier_but_got_keyword".to_string(),
+                6, 8
+            ),
+        ]
+    );
+    assert_eq!(
+        c.texts[0],
+        "The built-in identifier 'if' can't be used as a type name."
+    );
+
+    let (table, text) = scan_ok("extension type if(int i) {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(
+        c.errors,
+        [
+            ("built_in_identifier_in_declaration".to_string(), 15, 17),
+            (
+                "expected_identifier_but_got_keyword".to_string(),
+                15, 17
+            ),
+        ]
+    );
+    assert_eq!(
+        c.texts[0],
+        "The built-in identifier 'if' can't be used as an extension type name."
     );
 }
 
