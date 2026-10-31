@@ -30,6 +30,26 @@
 //! The interface entry point is `instantiateInterfaceToBounds`
 //! (type_system.dart:719-731) with `_defaultTypeArguments`
 //! (type_system.dart:1811-1820) reading each parameter's computed default.
+//!
+//! The fixed point IS the dependency-graph step the language spec spells out
+//! per stage (the `-->m` relation and its strongly connected components):
+//! a parameter whose bound mentions a peer completes only once that peer
+//! defaults (`X extends Y`, `Y extends num` ground both to `num`), and a
+//! bound that mentions its own parameter — `X extends A<X>`,
+//! `X extends FutureOr<X>`, `X extends Comparable<X>`; a one-parameter SCC —
+//! never completes, so the Phi substitution rewrites every member of the
+//! cycle to the already-completed defaults (`dynamic` for the stuck ones).
+//! The answer for `X` is therefore its *substituted* bound (`A<dynamic>`),
+//! reached without ever recursing on the bound itself. [`get_free_parameters`]
+//! is what keeps the walk finite: it never descends through a parameter leaf.
+//!
+//! [`instantiate_type_formals_to_bounds_with`] takes the bound lookup as a
+//! closure because a declaration's bounds do not always live in one facts
+//! table: parameters are keyed by element upstream, while dartq's element
+//! model spells them name-keyed in shared snapshots, so a consumer holding
+//! the declaration's own bound list (a type alias's shape, for one) must ask
+//! the algorithm directly instead of seeding a shared table with a value
+//! another same-spelled parameter would then read.
 
 use rustc_hash::FxHashSet;
 
@@ -53,8 +73,27 @@ pub struct BoundsInstantiation {
     pub malbounded: bool,
 }
 
-/// `instantiateTypeFormalsToBounds` (`type_system.dart:762-838`). See the
-/// module docs for the algorithm and the iteration-order note.
+/// `instantiateTypeFormalsToBounds` (`type_system.dart:762-838`) over the
+/// facts snapshot — the bound of each parameter is its declared bound, or
+/// the unbounded `dynamic` face. See the module docs for the algorithm and
+/// the iteration-order note.
+#[must_use]
+pub fn instantiate_type_formals_to_bounds(
+    table: &TypeTable,
+    facts: &ParamFactsTable,
+    parameters: &[TypeParamId],
+) -> BoundsInstantiation {
+    instantiate_type_formals_to_bounds_with(table, parameters, |parameter| {
+        facts.get(parameter).bound
+    })
+}
+
+/// The same fixed point with the bound lookup supplied by the caller —
+/// `None` for an unbounded parameter (the implicit `dynamic`,
+/// type_system.dart:786). The algorithm is identical: no SCC is materialized,
+/// the progress loop completes every parameter reachable through ground
+/// peers, and the survivors are exactly the cycle members, rewritten by the
+/// Phi substitution (see the module docs).
 ///
 /// # Panics
 ///
@@ -62,10 +101,10 @@ pub struct BoundsInstantiation {
 /// defaulted parameter always came from the input list, and every input
 /// parameter completes; both are pinned by `expect`s.
 #[must_use]
-pub fn instantiate_type_formals_to_bounds(
+pub fn instantiate_type_formals_to_bounds_with(
     table: &TypeTable,
-    facts: &ParamFactsTable,
     parameters: &[TypeParamId],
+    bound_of: impl Fn(TypeParamId) -> Option<TypeId>,
 ) -> BoundsInstantiation {
     let count = parameters.len();
     if count == 0 {
@@ -83,7 +122,7 @@ pub fn instantiate_type_formals_to_bounds(
     let mut partials: Vec<(TypeParamId, TypeId)> = Vec::with_capacity(count);
 
     for &parameter in parameters {
-        let bound = facts.get(parameter).bound.unwrap_or(dynamic);
+        let bound = bound_of(parameter).unwrap_or(dynamic);
         partials.push((parameter, bound));
     }
 
@@ -501,6 +540,99 @@ mod tests {
         );
         let free = get_free_parameters(&table, &candidates, ty).expect("outer is free");
         assert_eq!(free, vec![outer]);
+    }
+
+    /// The explicit-bound entry, one-parameter cycle: `X extends A<X>`
+    /// never grounds, so the SCC step's Phi substitution rewrites the
+    /// occurrence of `X` in its own bound — the default is the substituted
+    /// bound `A<dynamic>`, reached without recursing on `X`.
+    #[test]
+    fn explicit_self_bound_defaults_to_the_substituted_bound() {
+        let table = fixture();
+        let x = TypeParamId::from_raw(19);
+        let x_ty = table.intern(UninternedType::TypeParameter { parameter: x }, false);
+        let bound = a_of(&table, x_ty);
+        let result = instantiate_type_formals_to_bounds_with(&table, &[x], |p| {
+            (p == x).then_some(bound)
+        });
+        assert!(result.malbounded);
+        assert!(
+            matches!(table.get(result.defaults[0]).kind(), TypeKind::Interface { decl: A, args } if args.len() == 1 && matches!(table.get(table.arg(args.offset())).kind(), TypeKind::Dynamic)),
+            "the default is the substituted bound `A<dynamic>`"
+        );
+    }
+
+    /// The same cycle under `FutureOr` — the head survives
+    /// (`FutureOr<dynamic>`); the answer is never the bare `dynamic` a
+    /// declined self-bound leaves behind.
+    #[test]
+    fn explicit_future_or_self_bound_keeps_its_head() {
+        let table = fixture();
+        let x = TypeParamId::from_raw(20);
+        let x_ty = table.intern(UninternedType::TypeParameter { parameter: x }, false);
+        let bound = table.intern(UninternedType::FutureOr { base: x_ty }, false);
+        let result = instantiate_type_formals_to_bounds_with(&table, &[x], |p| {
+            (p == x).then_some(bound)
+        });
+        assert!(result.malbounded);
+        assert!(
+            matches!(table.get(result.defaults[0]).kind(), TypeKind::FutureOr { base } if matches!(table.get(base).kind(), TypeKind::Dynamic)),
+            "the default is `FutureOr<dynamic>`"
+        );
+    }
+
+    /// `T extends Comparable<T>` — the F-bound shape the co19 super-bounds
+    /// family spells; the head and its argument position survive.
+    #[test]
+    fn explicit_comparable_self_bound_keeps_its_head() {
+        let table = fixture();
+        let comparable = TypeDeclId::from_raw(7);
+        let t = TypeParamId::from_raw(21);
+        let t_ty = table.intern(UninternedType::TypeParameter { parameter: t }, false);
+        let bound = table.intern(
+            UninternedType::Interface {
+                decl: comparable,
+                args: vec![t_ty],
+            },
+            false,
+        );
+        let result = instantiate_type_formals_to_bounds_with(&table, &[t], |p| {
+            (p == t).then_some(bound)
+        });
+        assert!(result.malbounded);
+        assert!(
+            matches!(table.get(result.defaults[0]).kind(), TypeKind::Interface { decl, args } if decl == comparable && args.len() == 1 && matches!(table.get(table.arg(args.offset())).kind(), TypeKind::Dynamic)),
+            "the default is `Comparable<dynamic>`"
+        );
+    }
+
+    /// The peer-grounded regression for the explicit-bound entry: `X
+    /// extends Y`, `Y extends int` grounds both to `int` and reports no
+    /// malboundedness — the SCC step must not disturb the acyclic path.
+    #[test]
+    fn explicit_peer_bounds_ground_without_malboundedness() {
+        let table = fixture();
+        let (x, y) = (TypeParamId::from_raw(22), TypeParamId::from_raw(23));
+        let y_ty = table.intern(UninternedType::TypeParameter { parameter: y }, false);
+        let int = int_type(&table);
+        let result = instantiate_type_formals_to_bounds_with(&table, &[x, y], |p| {
+            if p == x {
+                Some(y_ty)
+            } else if p == y {
+                Some(int)
+            } else {
+                None
+            }
+        });
+        assert!(!result.malbounded);
+        assert!(matches!(
+            table.get(result.defaults[0]).kind(),
+            TypeKind::Interface { decl: INT, .. }
+        ));
+        assert!(matches!(
+            table.get(result.defaults[1]).kind(),
+            TypeKind::Interface { decl: INT, .. }
+        ));
     }
 
     /// `instantiateInterfaceToBounds` builds `A<…defaults…>` from the

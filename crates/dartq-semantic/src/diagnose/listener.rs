@@ -1376,6 +1376,17 @@ impl ParserListener for DiagnoseListener<'_> {
             .end_formal_parameter_default_value_expression(token);
 
         self.engine.default_value_depth -= 1;
+        // The default value's own assignability face (#3251): upstream
+        // `_checkForDefaultValueAssignableAtType` (error_verifier.dart —
+        // `checkForAssignableExpressionAtType` over the formal's declared
+        // type with the assignment reporter, so a `void` value
+        // short-circuits to `use_of_void_result` and every other mismatch
+        // answers `invalid_assignment`). The formal's written type rides
+        // `formal_written` from its annotation bind; an untyped formal
+        // infers `dynamic` and stays silent.
+        if let Some(to) = self.engine.formal_written {
+            self.engine.check_default_value_assignable(to);
+        }
         let _ = token;
     }
 
@@ -4509,6 +4520,14 @@ impl ParserListener for DiagnoseListener<'_> {
                         | dartq_scanner::TokenKind::OpenSquare
                 )
             });
+        // The `void`-receiver face (#3249): resolved before the merge folds
+        // the receiver row away — `v().m`, `x?.m` and `x.m` over a `void`
+        // local all consume the receiver's value.
+        if let Some(pos) = engine.access_receiver_index(token.range.offset)
+            && let Some(selector) = engine.access_selector_span(token)
+        {
+            engine.emit_void_member_receiver(pos, selector);
+        }
         engine.merge_member(is_null_aware, token.range, chain_end, member_ident);
         // The explicit-receiver member read's declared face stages for the
         // flow's member-access fold (the implicit-this stage's sibling):
@@ -4596,6 +4615,15 @@ impl ParserListener for DiagnoseListener<'_> {
                         | dartq_scanner::TokenKind::OpenSquare
                 )
             });
+        // The `void`-receiver face (#3249): a cascade section's target is
+        // consumed exactly like a plain member access's receiver
+        // (`a..m()` reports at the target, `a..m` at the member). Resolved
+        // before the merge folds the target row away.
+        if let Some(pos) = engine.access_receiver_index(operator.range.offset)
+            && let Some(selector) = engine.access_selector_span(operator)
+        {
+            engine.emit_void_member_receiver(pos, selector);
+        }
         engine.merge_member(is_null_aware, operator.range, chain_end, member_ident);
         // The merged row is the section's selector: its discarded value
         // reports at this token even when the target's type is unknown to
@@ -4702,6 +4730,38 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
+        // The compound operator's `void` read face (#3249): upstream
+        // `_resolveOperator` reports `use_of_void_result` at the operator
+        // when a read-modify-write target's READ type is `void` — `x.g += 1`
+        // over a `void` getter (upstream Dart SDK source, pkg/analyzer/lib/
+        // src/dart/resolver/assignment_expression_resolver.dart's
+        // `operatorType != EQ` gate; the plain `x.g = 1` stays silent). The
+        // target is the closest non-value row before the operator, the same
+        // row the assignability faces read.
+        let compound_void = {
+            let engine = &mut self.engine;
+            let limit = operator.range.offset;
+            match engine.text_of(operator) {
+                Some(text) if text != "=" => engine
+                    .rows
+                    .iter()
+                    .rposition(|row| {
+                        row.range.end() <= limit && !matches!(row.shape, RowShape::Value)
+                    })
+                    .is_some_and(|target| {
+                        engine.receiver_static_ty(&engine.rows[target]) == Ty::Void
+                    }),
+                _ => false,
+            }
+        };
+        if compound_void {
+            let range = operator.range;
+            if !self.engine.void_result_reported_at(range) {
+                self.engine
+                    .emit(SemanticCode::UseOfVoidResult, range, "", "");
+            }
+        }
+
         // #2174/#2360: a spellable write's resolved RHS type stages into the
         // flow layer before the assignment folds there — the name-level flow
         // walk reads an SDK static's return as unknown (`RangeError
@@ -5256,7 +5316,20 @@ impl ParserListener for DiagnoseListener<'_> {
             // `non_bool_condition` checkpoint's top row sits inside it.
             Some("&&" | "||") => {
                 if let Some(right) = engine.rows.last().cloned() {
-                    engine.classify_condition(&right);
+                    // #3240: the fold below reports BOTH operands of the
+                    // lazy boolean operators (`fold_binary` runs
+                    // `checkForUseOfVoidResult` on the pair), so a `void`
+                    // right operand must not be classified here as well —
+                    // `classify_condition` emits the same
+                    // `use_of_void_result` a second time while the oracle
+                    // answers one row for `flag && v()`. The operand's
+                    // other faces never fire on a `void` row
+                    // (`known_non_bool(void)` is false and no nullable
+                    // `void` spelling exists), so the fold's single report
+                    // is the whole decision.
+                    if engine.operand_static_ty(&right) != Ty::Void {
+                        engine.classify_condition(&right);
+                    }
                 }
                 let left = engine
                     .rows
@@ -6750,6 +6823,23 @@ impl ParserListener for DiagnoseListener<'_> {
         else {
             return;
         };
+        // The `void`-receiver face (#3249): an index access consumes the
+        // receiver's value, and the oracle anchors the report on the
+        // bracket pair (`_reportUnresolvedIndex`, property_element_resolver
+        // .dart) for the read and the write form alike. Any other receiver
+        // type is a no-op.
+        {
+            let row = &engine.rows[pos];
+            let ty = Engine::receiver_row_ty(row);
+            let ty = if ty == Ty::UNKNOWN {
+                engine.receiver_static_ty(row)
+            } else {
+                ty
+            };
+            if ty == Ty::Void && !engine.void_result_reported_at(bracket) {
+                engine.emit(SemanticCode::UseOfVoidResult, bracket, "", "");
+            }
+        }
         // `?..[i]`'s index section carries no `?` of its own — the `?`
         // rode the `?..` operator, so the pending cascade-op range stands
         // in as the question token's span (consumed: only the FIRST
@@ -9394,6 +9484,29 @@ impl ParserListener for DiagnoseListener<'_> {
         let fields = engine.record_field_tys(count, names);
         match fields {
             Some((mark, positional, named)) => {
+                // The field's `void` face (#3249): a record literal's field
+                // value is consumed by the literal, so the oracle reports
+                // `use_of_void_result` at each `void` field (upstream Dart
+                // SDK source, pkg/analyzer/lib/src/dart/resolver/
+                // record_literal_resolver.dart:160 `.at(field)`). The field
+                // window drains below, so the reports happen while its rows
+                // still stand — one per `void` field, in source order.
+                let void_fields = positional.iter().filter(|ty| **ty == Ty::Void).count()
+                    + named.iter().filter(|entry| entry.1 == Ty::Void).count();
+                if void_fields > 0 {
+                    let anchors: Vec<SourceRange> = engine.rows[mark..]
+                        .iter()
+                        .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+                        .filter(|row| engine.operand_static_ty(row) == Ty::Void)
+                        .map(|row| row.range)
+                        .take(void_fields)
+                        .collect();
+                    for anchor in anchors {
+                        if !engine.void_result_reported_at(anchor) {
+                            engine.emit(SemanticCode::UseOfVoidResult, anchor, "", "");
+                        }
+                    }
+                }
                 // The literal's row replaces its field residue: the fields
                 // already emitted their own walk-time diagnostics, so the
                 // window drains into one typed record row — the same fold
@@ -12635,6 +12748,79 @@ impl Engine<'_> {
         match rows.as_slice() {
             [row] => Some((row.ty, row.range)),
             _ => None,
+        }
+    }
+
+    /// The selector span of a member access: the token right after the
+    /// access operator (`x.m` → `m`, `x?.m` → `m`, the recovered `x.{` →
+    /// `{`). The oracle anchors member reports on it (`.at(propertyName)`).
+    fn access_selector_span(&self, operator: Token) -> Option<SourceRange> {
+        let member = self.tokens.get(operator.id as usize + 1)?;
+        let raw = &self.source[member.byte_range()];
+        let length: u32 = raw.chars().map(char::len_utf16).sum::<usize>() as u32;
+        Some(SourceRange {
+            offset: member.utf16_offset,
+            length,
+        })
+    }
+
+    /// Whether a call's `(` opens at `end` (whitespace skipped): the access
+    /// is a member send rather than a read/write.
+    fn call_opens_at(&self, end: u32) -> bool {
+        self.byte_at(self.skip_whitespace(end)) == Some(b'(')
+    }
+
+    /// The receiver row of an access whose operator sits at `at` — the
+    /// closest row wholly before it (the row `merge_member` is about to
+    /// fold). `None` for a recovery shape with no operand row.
+    fn access_receiver_index(&self, at: u32) -> Option<usize> {
+        self.rows
+            .iter()
+            .rposition(|row| row.range.end() <= at)
+    }
+
+    /// Whether a `use_of_void_result` row already sits at `range`. The
+    /// operand-consumption faces fold the same node from more than one seam
+    /// (a compound operator's read target, a member send's target and its
+    /// receiver), and the oracle answers one row per consumed value.
+    fn void_result_reported_at(&self, range: SourceRange) -> bool {
+        self.report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == range && d.code.name == "use_of_void_result")
+    }
+
+    /// The `void`-receiver face of a member access (#3249): a `void`
+    /// receiver's value is consumed by the access, so the oracle reports
+    /// `use_of_void_result` there — at the member's own name for a read or
+    /// a write (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+    /// resolver/property_element_resolver.dart `_resolve`'s
+    /// `targetType is VoidType` arm) and at the receiver node for a member
+    /// *send* (error_verifier.dart `visitAnonymousMethodInvocation`'s
+    /// `checkForUseOfVoidResult(node.target2)`). Any other receiver type is
+    /// a no-op.
+    fn emit_void_member_receiver(&mut self, receiver: usize, selector: SourceRange) {
+        let row = &self.rows[receiver];
+        let ty = Engine::receiver_row_ty(row);
+        let ty = if ty == Ty::UNKNOWN {
+            self.receiver_static_ty(row)
+        } else {
+            ty
+        };
+        if ty != Ty::Void {
+            return;
+        }
+        let anchor = if self.call_opens_at(selector.end()) {
+            // The send's own node is the receiver expression: a bare read
+            // keeps its span (`a` of `a.m()`), a member chain widens to the
+            // whole access (`b.g` of `b.g.m()`).
+            self.property_access_span(self.rows[receiver].range)
+                .unwrap_or(self.rows[receiver].range)
+        } else {
+            selector
+        };
+        if !self.void_result_reported_at(anchor) {
+            self.emit(SemanticCode::UseOfVoidResult, anchor, "", "");
         }
     }
 }

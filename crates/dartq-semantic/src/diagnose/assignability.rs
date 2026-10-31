@@ -2935,9 +2935,34 @@ impl<'a> Engine<'a> {
         // `writeType is! VoidType && _checkForUseOfVoidResult(right)`
         // short-circuits the whole ask): `x = v()` into a non-`void`
         // target reports `use_of_void_result` at the right operand and
-        // answers no `invalid_assignment`.
-        if to != Ty::Void && from == Ty::Void {
+        // answers no `invalid_assignment`. A constructor field initializer
+        // resolves through the initializer helper instead, which asks
+        // assignability FIRST — its void face rides the granted verdict
+        // below.
+        if !in_initializer && to != Ty::Void && from == Ty::Void {
             self.emit_use_of_void_result(from, &rhs_row);
+            return;
+        }
+        // The constructor field initializer's `void` face (upstream
+        // `checkForFieldInitializerNotAssignable` — error_detection_helpers
+        // .dart — asks assignability FIRST and only then the void use): a
+        // `void` source fits the top hosts alone (`dynamic`, `Object?`), so
+        // those answer `use_of_void_result` at the initializer while every
+        // other field type answers `field_initializer_not_assignable`.
+        if in_initializer && from == Ty::Void && to != Ty::Void {
+            if self.name_subtype(Ty::Void, to) {
+                self.emit_use_of_void_result(from, &rhs_row);
+            } else {
+                let (from_text, to_text) = (self.ty_display(from), self.ty_display(to));
+                let range = self.property_access_span(rhs_row.range).unwrap_or(rhs_row.range);
+                self.emit_non_promotion(
+                    SemanticCode::FieldInitializerNotAssignable,
+                    range,
+                    &from_text,
+                    &to_text,
+                    rhs_row.range.offset,
+                );
+            }
             return;
         }
         let stashed = self.stashed_fn_pair(&rhs_row, Some(&target_row), from, to);
@@ -3291,6 +3316,15 @@ impl<'a> Engine<'a> {
             from = self.fn_sig_ty(&sig);
         }
         if self.written_ty_invalid(from) {
+            return;
+        }
+        // The `void` value's own face (upstream
+        // `checkForAssignableExpressionAtType`'s
+        // `expectedStaticType is! VoidType && checkForUseOfVoidResult(...)`
+        // short-circuit): a `void` default reports `use_of_void_result` at
+        // the value and answers no `invalid_assignment`.
+        if to != Ty::Void && from == Ty::Void {
+            self.emit_use_of_void_result(from, &rhs_row);
             return;
         }
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);

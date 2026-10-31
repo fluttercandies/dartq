@@ -24,7 +24,11 @@
 //! a type-variable window, the boundedness checks' only subjects — the
 //! ledger here records every named container: a non-generic
 //! `class IntHolder extends Holder<int>` is exactly the shape the clause
-//! trees exist for.
+//! trees exist for. A type alias keeps its own row too (no supertype, the
+//! declaring `<...>` group as the payload): its raw uses instantiate to
+//! bounds, and a self-referential bound (`typedef G<X extends A<X>>`) is
+//! the fixed point's SCC step, which the consumer cannot run without the
+//! written bound trees.
 
 use rustc_hash::FxHashMap;
 
@@ -97,6 +101,12 @@ struct CaptureListener<'src, 'tab> {
     /// duplicate's second header is the `duplicate_definition` face's
     /// business, same as the element model).
     containers: FxHashMap<StringId, Row>,
+    /// Every type alias whose declaring `<...>` group carried a written
+    /// bound, keep-last (a recovery duplicate's final group is the
+    /// declaration's). A row's `supers` stays empty — an alias declares no
+    /// supertype — and its `param_bounds` are the payload the
+    /// instantiate-to-bounds step reads for a raw alias use.
+    alias_rows: FxHashMap<StringId, Row>,
     /// The open container header: its name and its clause cursor.
     header: Option<(StringId, HeaderCapture)>,
     /// The open `<...>` type-variables group's bound capture: completed
@@ -117,6 +127,13 @@ struct CaptureListener<'src, 'tab> {
     /// The just-closed window's names, bounds, and close offset, awaiting
     /// the container begin event that adopts them.
     pending: Option<(Vec<StringId>, Vec<Option<TypeTree>>, u32)>,
+    /// The type alias whose declaring `<...>` window is open: the name and
+    /// its offset, latched at the `typedefDeclaration` identifier and
+    /// cleared once the right-hand side begins. The window that closes
+    /// last before the RHS is the declaring group (a nested group inside a
+    /// bound closes first and is overwritten), so the ledger's alias row
+    /// keeps the written parameter order and bounds.
+    pending_alias: Option<(StringId, u32)>,
     /// The type head the parser arms at a type reference and re-fires
     /// after its argument group (`Box` of `Box<int>`) — the group's head.
     pending_head: Option<(StringId, SourceRange)>,
@@ -134,6 +151,10 @@ impl<'src, 'tab> CaptureListener<'src, 'tab> {
     /// precedes the group's close (the token-order guard — a foreign
     /// window never adopts).
     fn note_container(&mut self, name: Option<Token>, is_extension_type: bool) {
+        // A container header starts here: any alias declaration latched
+        // before it is stale (`typedef` is top-level, so this is only a
+        // malformed-recovery shape).
+        self.pending_alias = None;
         let Some(token) = name else {
             return;
         };
@@ -190,9 +211,23 @@ impl ParserListener for CaptureListener<'_, '_> {
         {
             self.pending_head = Some((name, token.range));
         }
+        // The type alias's own name: its declaring `<...>` group follows,
+        // and no begin event of its own ever arrives (a `typedef` has no
+        // header to finalize), so the window adopts under this latch.
+        if context == IdentifierContext::TypedefDeclaration
+            && let Some(name) = self.name_of(token)
+        {
+            self.pending_alias = Some((name, token.range.offset));
+        }
     }
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
+        // A type outside every header and every `<...>` window is a
+        // declaration's right-hand side (an alias's `= <type>`), so the
+        // alias latch is spent — the declaring group already closed.
+        if self.header.is_none() && self.bound_sink.is_none() {
+            self.pending_alias = None;
+        }
         self.pending_head = None;
         let Some(head) = self.name_of(name) else {
             return;
@@ -218,6 +253,11 @@ impl ParserListener for CaptureListener<'_, '_> {
     }
 
     fn handle_void_keyword(&mut self, token: Token) {
+        // The same right-hand-side arm as `handle_type`: a `void`-headed
+        // alias RHS (`typedef F<T> = void Function(T)`) spends the latch.
+        if self.header.is_none() && self.bound_sink.is_none() {
+            self.pending_alias = None;
+        }
         let void_id = self.strings.intern("void");
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.leaf(void_id, false, token.range);
@@ -341,6 +381,25 @@ impl ParserListener for CaptureListener<'_, '_> {
         let mut window = std::mem::take(&mut self.window);
         window.reverse();
         let (names, bounds): (Vec<StringId>, Vec<Option<TypeTree>>) = window.into_iter().unzip();
+        // A type alias's declaring group: no begin event follows, so the
+        // row lands here under the latched name. Each later close
+        // overwrites (the declaring group is the outermost, so it closes
+        // last — a nested group inside a bound never wins), and the
+        // consumer re-checks the names against the declaration before it
+        // reads them.
+        if let Some((alias, offset)) = self.pending_alias
+            && offset < end.range.offset
+        {
+            self.alias_rows.insert(
+                alias,
+                Row {
+                    params: names.clone(),
+                    param_bounds: bounds.clone(),
+                    supers: Vec::new(),
+                    open: false,
+                },
+            );
+        }
         self.pending = (!names.is_empty()).then_some((names, bounds, end.range.offset));
     }
 
@@ -528,13 +587,15 @@ impl ParserListener for CaptureListener<'_, '_> {
 }
 
 /// Parses one compilation unit and threads every faithfully captured
-/// container clause set into `into`, keyed by `file` and the container
-/// name. `tokens` must be the scan of `source` and `strings` the table the
-/// ids resolve against — the same pairing the element collection runs on.
+/// container clause set and type-alias parameter set into `into`, keyed by
+/// `file` and the declaration name. `tokens` must be the scan of `source`
+/// and `strings` the table the ids resolve against — the same pairing the
+/// element collection runs on.
 ///
-/// A capture lands only when its clause set parsed faithfully (`open`
-/// clear, non-empty supertype set): every other container keeps the
-/// name-level edges, the transport's under-report posture.
+/// A capture lands only when it parsed faithfully (`open` clear) and carries
+/// something the name-level face lacks — an argument-bearing supertype tree
+/// or a written parameter bound: every other declaration keeps the
+/// name-level face, the transport's under-report posture.
 pub fn capture_clause_trees(
     file: FileId,
     source: &str,
@@ -548,15 +609,19 @@ pub fn capture_clause_trees(
         tokens,
         strings,
         containers: FxHashMap::default(),
+        alias_rows: FxHashMap::default(),
         header: None,
         bound_sink: None,
         var_names: Vec::new(),
         window: Vec::new(),
         pending: None,
+        pending_alias: None,
         pending_head: None,
     };
     Parser::new(source, tokens, features, &mut listener).parse_unit();
-    for (name, row) in listener.containers {
+    let containers = listener.containers.into_iter();
+    let aliases = listener.alias_rows.into_iter();
+    for (name, row) in containers.chain(aliases) {
         // A capture lands when its header parsed faithfully (`open` clear)
         // and carries something the name-level face lacks: argument-bearing
         // supertype trees, or written parameter bounds (`class C<T

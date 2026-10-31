@@ -4106,6 +4106,20 @@ impl<'a> Engine<'a> {
         // the source bytes; find it by walking the bytes back over the
         // selector and the balanced `<...>` group).
         let written = written_args.or_else(|| self.receiver_group_args(row));
+        // A receiver that SPELLS a type-argument group (`C<int>.new`) whose
+        // written arguments the walk could not recover must not fall back to
+        // the bare receiver's form. The two spell DIFFERENT types — the bare
+        // `C.new` on `class C<T>` is the official generic tear-off
+        // `C Function<T>()`, while `C<int>.new` is the non-generic
+        // `C<int> Function()` — so the fallback would hand the verdict a
+        // branch whose return head and own `<T>` group are both wrong. The
+        // group is unrecoverable here (its entry never keys `call_type_args`,
+        // and the #610 latch is a single slot the statement's later heads
+        // overwrite), so the honest answer is the undecidable one: no type,
+        // the under-report direction every unresolved operand face takes.
+        if written.is_none() && self.receiver_spells_group(row) {
+            return None;
+        }
         let subst: FxHashMap<StringId, Ty> = written
             .as_deref()
             .into_iter()
@@ -4686,6 +4700,29 @@ impl<'a> Engine<'a> {
             return None;
         }
         Some(true)
+    }
+
+    /// Whether the receiver head before a constructor selector's `.` closes
+    /// a written type-argument group (`C<int>` of `C<int>.constr`) — the
+    /// presence half of [`Self::receiver_group_args`]'s byte walk, without
+    /// the recovery. A `true` with no recovered arguments is the
+    /// undecidable shape (see [`Self::ctor_selector_ty`]): the receiver
+    /// spells an instantiation, so the bare-receiver form is a different
+    /// type and must not stand in for it.
+    fn receiver_spells_group(&self, row: &Row) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut p = self.byte_of(row.range.offset);
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p == 0 || bytes[p - 1] != b'.' {
+            return false;
+        }
+        p -= 1;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        p > 0 && bytes[p - 1] == b'>'
     }
 
     /// The receiver head's written type-argument list at a constructor

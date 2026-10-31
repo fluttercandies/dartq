@@ -125,7 +125,7 @@ pub use inference::{
 };
 pub use instantiate_to_bound::{
     BoundsInstantiation, get_free_parameters, instantiate_interface_to_bounds,
-    instantiate_type_formals_to_bounds,
+    instantiate_type_formals_to_bounds, instantiate_type_formals_to_bounds_with,
 };
 pub use provably::TypeCheckVerdict;
 pub use suffix::NullabilitySuffix;

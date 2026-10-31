@@ -17639,6 +17639,18 @@ mod ticket_3252_tests;
 #[cfg(test)]
 #[path = "ticket_3242_tests.rs"]
 mod ticket_3242_tests;
+
+// The #3248 pins (the #3221 recon's invocation faces: the record-argument
+// `additionalInfo` appendix — positional/named arity and unexpected named
+// fields, error_detection_helpers.dart:405-441 — the unindexed `Map`/`List`
+// index formal `checkIndexExpressionIndex` resolves, and a closure literal's
+// stub return re-typed under a function-typed formal). Registered here
+// because `diagnose.rs` is a live-lane file out of this ticket's write scope;
+// `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3248_tests.rs"]
+mod ticket_3248_tests;
 // The #3230 pins (wave-B cluster B: the function-identifier receiver face —
 // `recv_expression_ty` answered no face for a bare function-declaration
 // read, so the operator/member verdicts on a tear-off stayed silent).
@@ -17708,3 +17720,50 @@ mod ticket_3253_tests;
 #[cfg(test)]
 #[path = "ticket_3271_tests.rs"]
 mod ticket_3271_tests;
+
+// The #3244 pins (the constructor tear-off's WRITTEN type-argument group at
+// the `unnecessary_type_check` verdict: an instantiated `C<int>.new` is the
+// non-generic `C<int> Function()` and must never be read as the bare
+// receiver's `C Function<T>()`; the bare `C.new` keeps that generic form).
+// Registered here because `diagnose.rs` is a live-lane file out of this
+// ticket's write scope; `#[path]` keeps the module inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3244_tests.rs"]
+mod ticket_3244_tests;
+
+// The #3245 pins (the `unused_local_variable` supply faces that are already
+// green on HEAD: `if-case`/`switch-case` pattern binders, the `&& var`
+// guard composite, and the catch clause's stack-trace parameter staying on
+// its own `unused_catch_stack` code). Registered here because `diagnose.rs`
+// is a live-lane file out of this ticket's write scope; `#[path]` keeps the
+// module inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3245_tests.rs"]
+mod ticket_3245_tests;
+
+// The #3240 pins (the lazy boolean operators' single `use_of_void_result`
+// row for `flag && v()`: the junction arm's `classify_condition` and
+// `fold_binary`'s operand pair reported the same right-operand row twice).
+// Registered here because `diagnose.rs` is a live-lane file out of this
+// ticket's write scope; `#[path]` keeps the module inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3240_tests.rs"]
+mod ticket_3240_tests;
+
+// The #3249 pins (the member-read/-write/-send and index `void`-receiver
+// faces plus the record-literal field face — the anchors follow the access
+// shape: member name for a read/write, receiver node for a send, bracket
+// pair for an index).
+#[cfg(test)]
+#[path = "ticket_3249_tests.rs"]
+mod ticket_3249_tests;
+
+// The #3251 pins (the constructor field initializer's assignability-first
+// ordering, the formal parameter's default-value assignability and void
+// faces, and the for-part declaration initializer).
+#[cfg(test)]
+#[path = "ticket_3251_tests.rs"]
+mod ticket_3251_tests;

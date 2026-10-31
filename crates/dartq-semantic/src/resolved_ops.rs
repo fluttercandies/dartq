@@ -63,6 +63,7 @@ use dartq_types::{
     CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy, TypeId,
     TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedRecord,
     UninternedType, Variance, instantiate_type_formals_to_bounds,
+    instantiate_type_formals_to_bounds_with,
 };
 
 use crate::bounds::TypeTree;
@@ -802,7 +803,8 @@ impl LibraryTypes {
             decl_owner,
             non_containers,
             typedef_targets,
-            typedef_shapes,
+            mut typedef_shapes,
+            aliases,
             fn_shapes,
             type_params,
             type_param_scope,
@@ -913,6 +915,80 @@ impl LibraryTypes {
                         bound,
                     },
                 );
+            }
+        }
+        // —— the aliases' instantiate-to-bounds defaults ————————————————
+        // A raw alias use instantiates every parameter to its to-bounds
+        // default (`instantiateToBounds` over the resolved alias element,
+        // type_system.dart:719-731): `typedef G<X extends num> = X
+        // Function()` reads `num Function()`, and a self-referential bound
+        // resolves through the fixed point's SCC step to its substituted
+        // instantiation (`X extends FutureOr<X>` reads `FutureOr<dynamic>`),
+        // never by recursing on the bound. The alias's own bound trees ride
+        // the clause capture; they stay local to the shape instead of
+        // mutating `facts`, because an alias's parameters are name-keyed in
+        // this snapshot and shared with every same-spelled declaration. A
+        // declaration the capture missed keeps the seeded `dynamic` face
+        // (the under-report direction).
+        {
+            for &(name, file) in &aliases {
+                let Some(shape) = typedef_shapes.get_mut(&name) else {
+                    continue;
+                };
+                if shape.params.is_empty() {
+                    continue;
+                }
+                let Some(elements) = index.get(file) else {
+                    continue;
+                };
+                let Some(decl) = elements.decl(name) else {
+                    continue;
+                };
+                let Some(capture) = clauses.get(file, name) else {
+                    continue;
+                };
+                // The row must be THIS declaration's declaring group — a
+                // nested `<...>` window inside a bound, or a stale row of a
+                // same-spelled declaration, keeps the under-report face.
+                if capture.params != decl.type_param_names
+                    || capture.param_bounds.len() != shape.params.len()
+                {
+                    continue;
+                }
+                let params: Vec<TypeParamId> = shape.params.to_vec();
+                let scope: FxHashMap<StringId, TypeParamId> = decl
+                    .type_param_names
+                    .iter()
+                    .copied()
+                    .zip(params.iter().copied())
+                    .collect();
+                let mut bounds: Vec<Option<TypeId>> = Vec::with_capacity(params.len());
+                for tree in capture.param_bounds.iter() {
+                    let bound = tree.as_ref().and_then(|tree| {
+                        clause_arg_ty(
+                            strings,
+                            &table,
+                            &registry,
+                            &decl_params,
+                            &facts,
+                            &scope,
+                            tree,
+                        )
+                    });
+                    bounds.push(bound);
+                }
+                if bounds.iter().all(Option::is_none) {
+                    continue;
+                }
+                let defaults = instantiate_type_formals_to_bounds_with(&table, &params, |param| {
+                    params
+                        .iter()
+                        .position(|candidate| *candidate == param)
+                        .and_then(|at| bounds[at])
+                })
+                .defaults;
+                debug_assert_eq!(defaults.len(), shape.params.len());
+                shape.defaults = defaults.into_boxed_slice();
             }
         }
         // Pass 2 — the supertype edges.
@@ -1144,6 +1220,16 @@ struct TypedefShape {
     /// zip the written arguments substitute against. Empty for a
     /// non-parameterized alias.
     params: Box<[TypeParamId]>,
+    /// Each parameter's instantiate-to-bounds default, parallel to
+    /// [`Self::params`] (`instantiateTypeFormalsToBounds`,
+    /// type_system.dart:719-731): a raw alias use instantiates every
+    /// parameter to this, and a self-referential bound resolves through
+    /// the fixed point's Phi substitution to its instantiated form
+    /// (`typedef G<X extends FutureOr<X>>` reads `FutureOr<dynamic>`)
+    /// instead of recursing. `dynamic` where the declaration's own bound
+    /// list did not reach this snapshot (the under-report face — the
+    /// unbounded default).
+    defaults: Box<[TypeId]>,
 }
 
 impl Registry {
@@ -1332,17 +1418,25 @@ impl Registry {
                 ) else {
                     continue;
                 };
-                let params = decl
+                let params: Box<[TypeParamId]> = decl
                     .type_param_names
                     .iter()
                     .filter_map(|spelling| self.type_params.get(spelling).copied())
                     .collect();
+                // Seeded unbounded; the alias's written bounds land once
+                // the registered heads' facts exist (`install_alias_defaults`
+                // in `LibraryTypes::build_with_clauses`), because a bound
+                // may spell another declaration raw and that raw use
+                // instantiates to bounds itself.
+                let dynamic = table.intern(UninternedType::Dynamic, false);
+                let defaults = vec![dynamic; params.len()].into_boxed_slice();
                 self.typedef_shapes.insert(
                     name,
                     TypedefShape {
                         shape,
                         nullable,
                         params,
+                        defaults,
                     },
                 );
                 progress = true;
@@ -1636,14 +1730,22 @@ impl Registry {
                 if entry.params.is_empty() {
                     return args.is_empty().then_some((shape, nullable));
                 }
-                if args.len() != entry.params.len() {
+                // A raw alias use (`F<G>`) instantiates every parameter to
+                // its to-bounds default — the same `instantiateToBounds`
+                // posture the registered heads keep (type_system.dart:
+                // 719-731), self-referential bounds included.
+                let mapped: &[TypeId] = if args.is_empty() {
+                    &entry.defaults
+                } else if args.len() == entry.params.len() {
+                    args
+                } else {
                     return None;
-                }
+                };
                 let map: Vec<(TypeParamId, TypeId)> = entry
                     .params
                     .iter()
                     .copied()
-                    .zip(args.iter().copied())
+                    .zip(mapped.iter().copied())
                     .collect();
                 return Some((table.substitute(shape, &map), nullable));
             }
@@ -1908,6 +2010,27 @@ fn clause_arg_ty(
         && let Some(builtin) = clause_builtin_ty(table, strings.resolve(tree.head), tree.nullable)
     {
         return Some(builtin);
+    }
+    // `FutureOr<T>` is the kind-level union, not a registered container: a
+    // declared bound spells it (`T extends FutureOr<T>`, the
+    // instantiate-to-bounds family), and the fixed point must see the real
+    // kind — a miss here reads the bound `dynamic` and hands the SCC step
+    // nothing to substitute, so a raw alias use would keep the unbounded
+    // default. The flow layer's own precedence (`map_name_walk`) places
+    // `FutureOr` between the scope face and the registry.
+    if strings.resolve(tree.head) == "FutureOr"
+        && let [base] = tree.args.as_slice()
+        && let Some(base) = clause_arg_ty(
+            strings,
+            table,
+            registry,
+            decl_params,
+            facts,
+            scope,
+            base,
+        )
+    {
+        return Some(table.intern(UninternedType::FutureOr { base }, tree.nullable));
     }
     let &decl = registry.get(&tree.head)?;
     let args = if tree.args.is_empty() {
@@ -2423,11 +2546,14 @@ impl<'a> ResolvedTypeOps<'a> {
         }
         if let Some(entry) = self.snapshot.typedef_shapes.get(&name) {
             // No written arguments stand at this face: every parameter
-            // reads its to-bounds default (the unbounded `dynamic`).
+            // reads its to-bounds default (`instantiateToBounds` over the
+            // resolved alias, type_system.dart:719-731 — `dynamic` only
+            // for a parameter whose bound did not reach this snapshot).
             let map: Vec<(TypeParamId, TypeId)> = entry
                 .params
                 .iter()
-                .map(|&parameter| (parameter, self.dynamic))
+                .copied()
+                .zip(entry.defaults.iter().copied())
                 .collect();
             let shape = self.snapshot.table.substitute(entry.shape, &map);
             let non_null = self.with_question(shape, entry.nullable);
@@ -2703,9 +2829,18 @@ impl<'a> ResolvedTypeOps<'a> {
                 let written = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
                 let mut mapped: Vec<TypeId> = written
                     .iter()
+                    .take(entry.params.len())
                     .map(|arg| self.map_node(arg, arena, names))
                     .collect();
-                mapped.resize(entry.params.len(), self.dynamic);
+                // A missing tail argument reads its to-bounds default
+                // (`instantiateToBounds` over the alias element,
+                // type_system.dart:719-731): `G` raw over
+                // `typedef G<X extends num> = X Function()` reads
+                // `num Function()`, and a self-referential bound reads its
+                // SCC instantiation (`FutureOr<dynamic>`), never a bare
+                // `dynamic`.
+                let mapped_len = mapped.len();
+                mapped.extend_from_slice(&entry.defaults[mapped_len..]);
                 let map: Vec<(TypeParamId, TypeId)> =
                     entry.params.iter().copied().zip(mapped).collect();
                 let shape = self.snapshot.table.substitute(entry.shape, &map);
@@ -4555,6 +4690,121 @@ mod tests {
             LanguageVersion::new(3, 15),
         ));
         collect(source, tokens, features, strings)
+    }
+
+    /// The raw-alias instantiate-to-bounds face (#3266): a bare alias use
+    /// reads each parameter's to-bounds default
+    /// (`instantiateTypeFormalsToBounds`, type_system.dart:719-731) — a
+    /// plain bound instantiates to itself (`T extends num` reads `num`) and
+    /// a self-referential bound resolves through the fixed point's SCC step
+    /// to its substituted instantiation (`T extends A<T>` reads
+    /// `A<dynamic>`, `T extends FutureOr<T>` reads `FutureOr<dynamic>`),
+    /// never the bare `dynamic` the face used to fill for every parameter.
+    /// The alias's own written bound trees ride the clause capture into the
+    /// shape ([`ClauseTrees`]); an alias whose bounds the capture missed
+    /// keeps the unbounded `dynamic` (the under-report direction).
+    #[test]
+    fn raw_alias_use_maps_to_its_instantiate_to_bounds_defaults() {
+        let source = "\
+class A<X> {}
+typedef G<T extends num> = T Function();
+typedef H<T extends A<T>> = T Function();
+typedef F<T extends FutureOr<T>> = T Function();
+typedef U<T> = T Function();
+";
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "{source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut clauses = ClauseTrees::empty();
+        crate::capture_clause_trees(
+            file,
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            &mut clauses,
+        );
+        let types =
+            LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
+        // The declaring groups reach the ledger with their written bounds —
+        // the transport the defaults are computed from.
+        for alias in ["G", "H", "F"] {
+            let capture = clauses
+                .get(file, strings.intern(alias))
+                .unwrap_or_else(|| panic!("`{alias}`'s declaring group is captured"));
+            assert_eq!(capture.params.len(), 1, "`{alias}` keeps its parameter");
+            assert!(
+                capture.param_bounds.iter().all(Option::is_some),
+                "`{alias}`'s written bound is captured: {:?}",
+                capture.param_bounds
+            );
+            assert!(
+                capture.supers.is_empty(),
+                "an alias declares no supertype"
+            );
+        }
+        let ops = ResolvedTypeOps::new(&types, &strings, file);
+        let table = &types.table;
+        let alias_return = |alias: &str| -> TypeId {
+            let mapped = ops.map_name(alias, EMPTY_ARGS, &[], &[], false);
+            match table.get(mapped).kind() {
+                TypeKind::Function { signature } => table.signature(signature).return_type,
+                other => panic!("`{alias}` must map to its function shape, got {other:?}"),
+            }
+        };
+        let num_decl = *types
+            .registry
+            .get(&strings.intern("num"))
+            .expect("`num` registers");
+        let a_decl = *types
+            .registry
+            .get(&strings.intern("A"))
+            .expect("`A` registers");
+        let g_return = table.get(alias_return("G")).kind();
+        assert!(
+            matches!(g_return, TypeKind::Interface { decl, args } if decl == num_decl && args.len() == 0),
+            "`T extends num` must read `num Function()`, got {g_return:?}"
+        );
+        let h_return = table.get(alias_return("H")).kind();
+        assert!(
+            matches!(h_return, TypeKind::Interface { decl, args } if decl == a_decl && args.len() == 1 && matches!(table.get(table.arg(args.offset())).kind(), TypeKind::Dynamic)),
+            "`T extends A<T>` must read `A<dynamic> Function()` (the SCC substitution), got {h_return:?}"
+        );
+        let f_return = table.get(alias_return("F")).kind();
+        assert!(
+            matches!(f_return, TypeKind::FutureOr { base } if matches!(table.get(base).kind(), TypeKind::Dynamic)),
+            "`T extends FutureOr<T>` must read `FutureOr<dynamic> Function()`, got {f_return:?}"
+        );
+        let u_return = table.get(alias_return("U")).kind();
+        assert!(
+            matches!(u_return, TypeKind::Dynamic),
+            "an unbounded parameter keeps its `dynamic` default, got {u_return:?}"
+        );
     }
 
     /// The unit's flow-driven diagnostic code names — the same harness

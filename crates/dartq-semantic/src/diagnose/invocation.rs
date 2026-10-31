@@ -7520,8 +7520,12 @@ impl<'a> Engine<'a> {
                         message,
                     );
                 }
-                let message =
-                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, "");
+                let note = self.record_arity_note(flow_ty, formal.ty);
+                let message = SemanticCode::ArgumentTypeNotAssignable.message3(
+                    &from_text,
+                    &to_text,
+                    &note,
+                );
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -7573,13 +7577,23 @@ impl<'a> Engine<'a> {
             .rebound_read_face(face.index_range)
             .or_else(|| self.read_type_at(face.index_range))
             .unwrap_or(face.index_ty);
+        // The unindexed SDK collection heads (`Map`, `List`) carry no
+        // element model in the graph, so their index formal resolves off
+        // the written receiver type instead (#3248).
+        let recv_ty = self
+            .index_receiver_ty(bracket_open)
+            .map(|ty| self.fold_alias_ty(ty));
         for spelling in [read, write_op].into_iter().flatten() {
-            let Some(param_ty) = self.resolved_member(recv, spelling).and_then(|entry| {
-                entry
-                    .formals
-                    .as_ref()
-                    .and_then(|formals| formals.positional.first().map(|formal| formal.ty))
-            }) else {
+            let Some(param_ty) = self
+                .resolved_member(recv, spelling)
+                .and_then(|entry| {
+                    entry
+                        .formals
+                        .as_ref()
+                        .and_then(|formals| formals.positional.first().map(|formal| formal.ty))
+                })
+                .or_else(|| recv_ty.and_then(|ty| self.core_index_formal_ty(ty, spelling)))
+            else {
                 continue;
             };
             if self.argument_verdict(flow_ty, param_ty, face.literal) == Some(false) {
@@ -7594,6 +7608,125 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    /// The index expression's receiver type, read off its operator row: the
+    /// `[]` fold leaves the receiver's own row on the stack carrying the
+    /// bracket span, so the written arguments the head-only
+    /// [`IndexArgFace`] spelling drops (`Map<K, V>`'s key) stay reachable.
+    /// `None` once the row folded away — the unit-end drain of a pure read
+    /// (`a[i]`), whose core formals (`int`, `Object?`) reject nothing.
+    fn index_receiver_ty(&self, bracket_open: u32) -> Option<Ty> {
+        let index_op = self.intern("[]");
+        self.rows.iter().find_map(|row| match &row.intent {
+            Intent::Operator(op, bracket) if *op == index_op && bracket.offset == bracket_open => {
+                let ty = Self::receiver_row_ty(row);
+                (ty != Ty::UNKNOWN).then_some(ty)
+            }
+            _ => None,
+        })
+    }
+
+    /// The unindexed SDK collection heads' index formal (#3248): `Map` and
+    /// `List` carry no element model in the graph, so
+    /// [`Self::resolved_member`] answers nothing for them and the argument
+    /// check never ran — `Map<int, int> m; m['x'] = 0` stayed silent.
+    /// Upstream resolves the elements and reports the key mismatch through
+    /// `checkIndexExpressionIndex` (error_detection_helpers.dart:260-289):
+    /// `Map<K, V>` declares `V? operator [](Object? key)` / `void operator
+    /// []=(K key, V value)` and `List<E>` declares `E operator [](int
+    /// index)` / `void operator []=(int index, E value)` (upstream Dart SDK
+    /// source, sdk/lib/core/map.dart:288-306 and list.dart:375-395). Only
+    /// `Map`'s write spelling is a claim here — its read key is `Object?`,
+    /// which rejects nothing. A receiver without written arguments, or with
+    /// any other head, answers nothing (the under-report direction); a
+    /// same-file `Map<K, V>`/`List<E>` shadow is not distinguished from the
+    /// core head, which costs nothing the corpus carries (no unit declares
+    /// either spelling) and would only pair a row with the
+    /// `undefined_operator` such a shadow already reports.
+    fn core_index_formal_ty(&self, receiver: Ty, spelling: StringId) -> Option<Ty> {
+        let Ty::Named { name, args, .. } = receiver else {
+            return None;
+        };
+        let written: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+        if name == self.intern("Map") {
+            return (spelling == self.intern("[]=") && written.len() == 2).then(|| written[0]);
+        }
+        if name == self.intern("List") && written.len() == 1 {
+            return Some(Ty::named(self.intern("int")));
+        }
+        None
+    }
+
+    /// The oracle's argument-report appendix
+    /// (`NonAssignabilityReporterForArgument.createDiagnostic`,
+    /// error_detection_helpers.dart:405-441): between two record types the
+    /// positional and named arity mismatches — and every named field the
+    /// formal does not carry under the same name and type — join the
+    /// message after its clause, space-separated. The alias folds decide
+    /// (`typedef A = ({int b, int c})` counts as its record), the written
+    /// spellings display. Empty for every non-record pair, so the
+    /// `message3` slot keeps the template's own terminal space.
+    fn record_arity_note(&self, actual: Ty, expected: Ty) -> String {
+        let (
+            Ty::Record {
+                shape: actual_shape,
+                ..
+            },
+            Ty::Record {
+                shape: expected_shape,
+                ..
+            },
+        ) = (self.fold_alias_ty(actual), self.fold_alias_ty(expected))
+        else {
+            return String::new();
+        };
+        let (actual_positional, actual_named, expected_positional, expected_named, unexpected) = {
+            let pool = self.boundary.pool();
+            let actual = pool.record_shape(actual_shape);
+            let expected = pool.record_shape(expected_shape);
+            let unexpected: Vec<(StringId, Ty)> = if expected.named.is_empty() {
+                Vec::new()
+            } else {
+                actual
+                    .named
+                    .iter()
+                    .filter(|(name, ty)| {
+                        !expected
+                            .named
+                            .iter()
+                            .any(|(other, other_ty)| other == name && other_ty == ty)
+                    })
+                    .copied()
+                    .collect()
+            };
+            (
+                actual.positional.len(),
+                actual.named.len(),
+                expected.positional.len(),
+                expected.named.len(),
+                unexpected,
+            )
+        };
+        let mut note = Vec::new();
+        if expected_positional != 0 && actual_positional != expected_positional {
+            note.push(format!(
+                "Expected {expected_positional} positional arguments, but got {actual_positional} instead."
+            ));
+        }
+        if expected_named != 0 && actual_named != expected_named {
+            note.push(format!(
+                "Expected {expected_named} named arguments, but got {actual_named} instead."
+            ));
+        }
+        for (name, ty) in unexpected {
+            note.push(format!(
+                "Unexpected named argument `{}` with type `{}`.",
+                self.strings.resolve(name),
+                self.ty_display(ty)
+            ));
+        }
+        note.join(" ")
     }
 
     /// The annotation's argument walk (#2937, upstream Dart SDK source,
@@ -7704,8 +7837,9 @@ impl<'a> Engine<'a> {
                         message,
                     );
                 }
+                let note = self.record_arity_note(flow_ty, formal.ty);
                 let message = SemanticCode::ArgumentTypeNotAssignable
-                    .message3(&from_text, &to_text, "");
+                    .message3(&from_text, &to_text, &note);
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -8662,8 +8796,12 @@ impl<'a> Engine<'a> {
             if rejects {
                 let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
-                let message =
-                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, "");
+                let note = self.record_arity_note(flow_ty, formal.ty);
+                let message = SemanticCode::ArgumentTypeNotAssignable.message3(
+                    &from_text,
+                    &to_text,
+                    &note,
+                );
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -11360,18 +11498,29 @@ impl<'a> Engine<'a> {
                     // and SDK callees the `fn_formal_sigs` capture never
                     // sees), on a row that stayed Unknown (no matched
                     // context at the literal's capture — the ordinary face
-                    // below cannot ask `Unknown` against anything). The
-                    // stub re-types from the formal shape's return (the cap
-                    // posture) and the pair decides through the ordinary
-                    // ask — `assignable` unfolds the formal's function
-                    // shape and runs the same `_isFunctionSubtypeOf`
-                    // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
-                    // element/subtype.dart) the direct arm decides with;
-                    // the arity and parameter slots produce the row
-                    // (resolver.dart:522). A tear-off's real return needs
-                    // no re-typing.
+                    // below cannot ask `Unknown` against anything), or on a
+                    // CLOSURE LITERAL's resolved row whose captured face is
+                    // still the stub. The stub re-types from the formal
+                    // shape's return (the cap posture) and the pair decides
+                    // through the ordinary ask — `assignable` unfolds the
+                    // formal's function shape and runs the same
+                    // `_isFunctionSubtypeOf` (upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/dart/element/subtype.dart) the
+                    // direct arm decides with; the arity and parameter slots
+                    // produce the row (resolver.dart:522). A tear-off's real
+                    // return needs no re-typing.
+                    //
+                    // The closure arm is the #3248 face: a block-bodied
+                    // literal's captured `void` return is never an
+                    // inference (`inferLocalFunction`'s cap — the formal's
+                    // return is the context the body re-infers under), so a
+                    // row that resolved to the stub `void Function()`
+                    // against a `T Function()` formal would report a
+                    // mismatch the oracle never makes. Re-typing here is the
+                    // direct arm's own posture, applied to the row the
+                    // signature table could not pair.
                     let folded_formal = self.fold_alias_ty(formal_ty);
-                    if *ty == Ty::Unknown
+                    if (*ty == Ty::Unknown || closure_sig.is_some())
                         && matches!(
                             folded_formal,
                             Ty::Function {
@@ -11386,17 +11535,19 @@ impl<'a> Engine<'a> {
                         {
                             decided.return_ty = ret;
                         }
-                        if self.assignable(self.fn_sig_ty(&decided), folded_formal, false)
-                            == Some(false)
-                        {
-                            let code = SemanticCode::ArgumentTypeNotAssignable;
-                            let from_text = self.fn_sig_display(&decided);
-                            let to_text = self.ty_display(formal_ty);
-                            let message = code.message3(&from_text, &to_text, "");
-                            let index = self.report.diagnostics.len();
-                            self.emit_message_with_correction(code, *range, message);
-                            self.pending_non_promotion.push((index, range.offset));
-                            continue;
+                        match self.assignable(self.fn_sig_ty(&decided), folded_formal, false) {
+                            Some(true) => continue,
+                            Some(false) => {
+                                let code = SemanticCode::ArgumentTypeNotAssignable;
+                                let from_text = self.fn_sig_display(&decided);
+                                let to_text = self.ty_display(formal_ty);
+                                let message = code.message3(&from_text, &to_text, "");
+                                let index = self.report.diagnostics.len();
+                                self.emit_message_with_correction(code, *range, message);
+                                self.pending_non_promotion.push((index, range.offset));
+                                continue;
+                            }
+                            None => {}
                         }
                     }
                 }
