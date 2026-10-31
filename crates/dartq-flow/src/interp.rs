@@ -1266,19 +1266,6 @@ pub(crate) struct Interp<'o> {
     /// ([`Interp::exec_end`]) for the deferred contexts the recorder
     /// frames no executable for.
     pub(crate) late_init_saved: Vec<Option<State>>,
-    /// Whether the declarator just opened by `InitializedIdent` is a `late`
-    /// LOCAL wildcard (`_`): its initializer is never evaluated, so the
-    /// `dead_code_late_wildcard_variable_initializer` row reports there
-    /// (`DeadCodeVerifier.visitVariableDeclaration`, upstream
-    /// dead_code_verifier.dart:119-135 — a reachability-independent
-    /// report). Consumed by the next `InitializerBegin` and cleared by a
-    /// declarator without an initializer.
-    pub(crate) wildcard_late_decl: bool,
-    /// Open initializers' `InitializerBegin` event indices for the
-    /// wildcard face above (one per `InitializerBegin`, `None` for every
-    /// non-wildcard pair so a nested declaration pops without emitting —
-    /// the `late_init_saved` pairing).
-    pub(crate) wildcard_init_begin: Vec<Option<usize>>,
     pub(crate) pattern: Option<PatternState>,
     pub(crate) pattern_depth: usize,
     /// The open logical-or alternation's latch (depth-1 refutable
@@ -1661,8 +1648,6 @@ impl<'o> Interp<'o> {
             pending_writes: Vec::new(),
             pending_inits: Vec::new(),
             late_init_saved: Vec::new(),
-            wildcard_late_decl: false,
-            wildcard_init_begin: Vec::new(),
             pending_decl_bases: Vec::new(),
             pattern: None,
             pattern_depth: 0,
@@ -2200,13 +2185,22 @@ impl<'o> Interp<'o> {
     /// row never runs into the statement's trailing `;`, and the window
     /// resets so a later dead node of the same statement opens fresh. An
     /// interval opened BEFORE the receiver is not the chain's (upstream
-    /// `_containsFirstDeadNode` fails) and keeps running; a suppressed
-    /// interval (the semantic as-cast tail face's row) retires silently.
+    /// `_containsFirstDeadNode` fails) and keeps running.
+    ///
+    /// So does an interval anchored AT the receiver start: the official
+    /// walk is top-down, so a statement (or arm/expression) that entered
+    /// dead latches ITSELF as `_firstDeadNode` before the receiver read
+    /// is visited — the anchor offset only coincides with the receiver's
+    /// here, and the chain row would swallow the enclosing close
+    /// (`return; a?.b;` reports `a?.b;` whole, not `a?.b`). Only an anchor
+    /// strictly inside the chain (`n?.p;`'s member poll, `n?[i];`'s index
+    /// operand) is the chain's own first dead node. A suppressed interval
+    /// (the semantic as-cast tail face's row) retires silently.
     pub(crate) fn null_short_end(&mut self) -> Option<NullShort> {
         let short = self.null_shorts.pop()?;
         let close = short.dead_at_open
             && self.dead.as_ref().is_some_and(|window| {
-                !window.suppressed && window.anchor.range.offset >= short.recv_offset
+                !window.suppressed && window.anchor.range.offset > short.recv_offset
             });
         if close {
             let window = self.dead.take().expect("close gate checked the window");
@@ -2242,12 +2236,15 @@ impl<'o> Interp<'o> {
     /// expression's `node.end` — a send's `)`, an index's `]`, a plain
     /// member's identifier). The face counts only while the innermost open
     /// short runs dead from its open. A live window whose anchor sits
-    /// inside that chain (at or after the receiver read) FREEZES at the
+    /// strictly inside that chain (past the receiver read) FREEZES at the
     /// face — the statement's own `;` end must not grow the row past the
     /// chain (the official row ends at `flowEnd(expression)`, before the
-    /// statement's terminator). A face that arrives before any window
-    /// (the send fires before the member poll, post-order stream) rides
-    /// the short to the close.
+    /// statement's terminator). An anchor AT the receiver belongs to the
+    /// enclosing construct, which the top-down official walk latched
+    /// before the receiver read (see [`Interp::null_short_end`]), so it is
+    /// never frozen here. A face that arrives before any window (the send
+    /// fires before the member poll, post-order stream) rides the short to
+    /// the close.
     pub(crate) fn chain_face_end(&mut self, end: u32) {
         let Some(short) = self.null_shorts.last_mut() else {
             return;
@@ -2259,7 +2256,7 @@ impl<'o> Interp<'o> {
         let recv = short.recv_offset;
         if let Some(window) = &mut self.dead
             && !window.suppressed
-            && window.anchor.range.offset >= recv
+            && window.anchor.range.offset > recv
         {
             window.freeze_end(end);
         }

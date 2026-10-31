@@ -316,6 +316,23 @@ pub struct Flow<'t> {
     /// local's end fired the world's `exec_end` mid-closure-body and the
     /// replay popped the closure's frame and scope at the local's `=`).
     initializer_world: u32,
+    /// The open variable-declaration list carries `late`
+    /// (`begin_variables_declaration`'s keyword): the declaration-level
+    /// gate of the `late` wildcard face below.
+    decl_late: bool,
+    /// The declarator just opened is a `late` local named `_` (official
+    /// `DeadCodeVerifier.visitVariableDeclaration`,
+    /// dead_code_verifier.dart:119-135: a `late` `LocalVariableElement`
+    /// spelled `_` never evaluates its initializer, so the initializer IS
+    /// dead code). Consumed by the next `begin_variable_initializer` and
+    /// cleared by a declarator without one.
+    wildcard_declarator: bool,
+    /// Open variable initializers' `late`-wildcard starts, one per
+    /// `begin_variable_initializer` (`None` for every declarator that is
+    /// not the wildcard, so a nested declaration pops without emitting —
+    /// the `initializer_world` pairing, without the depth guard a single
+    /// latch would lose). `end_variable_initializer` pops and reports.
+    wildcard_inits: Vec<Option<TokenSpan>>,
     /// Buffer indices of open constructor initializer entries
     /// (`begin_initializer` pushes, `end_initializer` pops): the field
     /// write `f = e` (or `this.f = e`) parses as a plain expression whose
@@ -399,6 +416,9 @@ impl<'t> Flow<'t> {
             ops: None,
             sound_flow: true,
             initializer_world: 0,
+            decl_late: false,
+            wildcard_declarator: false,
+            wildcard_inits: Vec::new(),
             init_starts: Vec::new(),
             facts: Vec::new(),
             bail_count: 0,
@@ -447,16 +467,33 @@ impl<'t> Flow<'t> {
     /// The parser answers the *follower's* span for an expression whose
     /// last token is a bare leaf (a read or a member chain): the official
     /// AST's `node.end` there is the leaf's end, the parser's is one token
-    /// past it. Scanning the arm's token run from its first token (the one
-    /// after `colon`) to `end` and stopping at the first depth-0 `;`/`,`
-    /// or a closer the run never opened backs the row off to the arm's
-    /// true last token; a compound arm (`f(x)`, `(x)`, `a + b`, a function
-    /// literal) already ends on its own last token and keeps `end`.
+    /// past it. The run's scan backs the row off to the arm's true last
+    /// token; a compound arm (`f(x)`, `(x)`, `a + b`, a function literal)
+    /// already ends on its own last token and keeps `end`.
     fn else_arm_end(&self, colon: Token, end: Token) -> u32 {
+        self.scan_expression_end(colon.id + 1, Some(end.id))
+            .unwrap_or_else(|| end.range.end())
+    }
+
+    /// The end offset of the expression token run beginning at `start`.
+    ///
+    /// A depth-tracked walk that stops at the first depth-0 `;`/`,` or at
+    /// a closer the run never opened — the syntax that ends an expression
+    /// wherever the dead-code faces need its extent (a conditional's arm, a
+    /// variable initializer). `limit` bounds the walk to the run ending at
+    /// that token (the parser's tiled end span); `None` leaves the bound to
+    /// the source's own terminators. Answers the last accepted token's own
+    /// utf16 end, `None` when the run holds no token.
+    fn scan_expression_end(&self, start: u32, limit: Option<u32>) -> Option<u32> {
         let mut depth = 0u32;
         let mut last = None;
-        let mut index = colon.id as usize + 1;
-        while index <= end.id as usize {
+        let mut index = start as usize;
+        loop {
+            if let Some(limit) = limit
+                && index > limit as usize
+            {
+                break;
+            }
             let Some(token) = self.tokens.get(index) else {
                 break;
             };
@@ -477,7 +514,7 @@ impl<'t> Flow<'t> {
             last = Some(token_end(self.source, token));
             index += 1;
         }
-        last.unwrap_or_else(|| end.range.end())
+        last
     }
 
     /// Interns a written-argument list structurally: equal trees share one
@@ -1663,6 +1700,11 @@ impl ParserListener for Flow<'_> {
         late_kw: Option<Token>,
         var_final_or_const: Option<Token>,
     ) {
+        // The `late` wildcard declarator face's declaration-level gate
+        // (see [`Flow::wildcard_declarator`]); a fresh list starts
+        // unarmed.
+        self.decl_late = late_kw.is_some();
+        self.wildcard_declarator = false;
         let is_final = var_final_or_const.is_some_and(|token| {
             matches!(
                 self.kind(token),
@@ -1716,6 +1758,8 @@ impl ParserListener for Flow<'_> {
     fn end_variables_declaration(&mut self, _count: usize, end: Option<Token>) {
         self.record(Ev::VarDeclEnd);
         self.top_decl = None;
+        self.decl_late = false;
+        self.wildcard_declarator = false;
         if let Some(end) = end {
             self.record(Ev::StmtEnd {
                 end: end.range.end(),
@@ -1730,6 +1774,13 @@ impl ParserListener for Flow<'_> {
         if let Some(header) = self.top_decl {
             self.top_level.entry(name).or_insert(header);
         }
+        // A `late` declarator spelled `_`: its initializer is the `late`
+        // wildcard face's row target (`begin_variable_initializer` arms and
+        // `end_variable_initializer` reports). Field initializers never
+        // come through this hook (they open through
+        // `begin_field_initializer`), which is exactly upstream's
+        // `LocalVariableElement` restriction.
+        self.wildcard_declarator = self.decl_late && self.name_lexeme(name) == "_";
         self.record(Ev::InitializedIdent { name, token });
     }
 
@@ -1739,10 +1790,29 @@ impl ParserListener for Flow<'_> {
     }
 
     fn handle_no_variable_initializer(&mut self, _token: Token) {
+        // A declarator without `= e` never reaches the wildcard's row.
+        self.wildcard_declarator = false;
         self.record(Ev::NoInitializer);
     }
 
-    fn begin_variable_initializer(&mut self, _token: Token) {
+    fn begin_variable_initializer(&mut self, token: Token) {
+        // The `late var _ = e` row (official `DeadCodeVerifier.visitVariableDeclaration`,
+        // dead_code_verifier.dart:119-135): the initializer is never
+        // evaluated, so it is dead code over its OWN node extent, at any
+        // reachability (a plain-verifier row, not a flow window). The
+        // parser hands this hook the `=` both times, so the initializer's
+        // first token is the one after it; the close scans to the
+        // expression's last token. Locals only — a field/top-level
+        // initializer opens its own world here (`self.buffer` empty), and
+        // upstream's gate reads a `LocalVariableElement`.
+        let local = self.buffer.is_some();
+        let wildcard = std::mem::take(&mut self.wildcard_declarator);
+        let start = if local && wildcard {
+            self.span_at(token.id as usize + 1)
+        } else {
+            None
+        };
+        self.wildcard_inits.push(start);
         // A declaration outside any executable folds its initializer as
         // its own executable (the official analyzes field and top-level
         // initializers): the buffer opens here, and reads of earlier
@@ -1759,6 +1829,22 @@ impl ParserListener for Flow<'_> {
     }
 
     fn end_variable_initializer(&mut self, token: Token) {
+        // The armed `late` wildcard row emits here, from the initializer's
+        // first token through the scanned expression end.
+        if let Some(Some(start)) = self.wildcard_inits.pop()
+            && let Some(end) = self.scan_expression_end(start.id, None)
+            && end > start.range.offset
+        {
+            self.facts.push(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: start.id,
+                    range: dartq_source::SourceRange {
+                        offset: start.range.offset,
+                        length: end - start.range.offset,
+                    },
+                },
+            });
+        }
         self.record(Ev::InitializerEnd);
         // Only the bracket that opened the world closes it: a nested
         // bracket's end must not fire `exec_end` mid-body and desync the

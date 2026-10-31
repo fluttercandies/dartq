@@ -1304,16 +1304,6 @@ impl Interp<'_> {
                 self.pending_decl_bases.push(self.pending_inits.len());
             }
             Ev::InitializedIdent { name, token } => {
-                // The `late` LOCAL wildcard declarator (`late var _ = e;`):
-                // its initializer is never evaluated, and the official
-                // reports that at the INITIALIZER independently of
-                // reachability (`DeadCodeVerifier.visitVariableDeclaration`,
-                // upstream dead_code_verifier.dart:119-135 — a `late`
-                // `LocalVariableElement` named `_` under the
-                // `wildcard_variables` feature). Latch the declarator here;
-                // `InitializerBegin` pairs it with the initializer slice.
-                self.wildcard_late_decl = self.decl.late
-                    && self.names.get(*name as usize).is_some_and(|n| &**n == "_");
                 let meta = VarMeta {
                     ty: self.decl.ty,
                     args: self.decl.args,
@@ -1373,30 +1363,17 @@ impl Interp<'_> {
                 } else {
                     self.late_init_saved.push(None);
                 }
-                // The `late _ = e` declarator's initializer slice: latch the
-                // slice's begin so `InitializerEnd` can report the row at its
-                // first spanned event (the official anchors at the
-                // INITIALIZER node).
-                let wildcard = std::mem::take(&mut self.wildcard_late_decl);
-                self.wildcard_init_begin.push(wildcard.then_some(i));
             }
             Ev::LocalFnName { name } => {
                 self.local_fns.insert(*name);
             }
             Ev::InitializerEnd => {
                 self.init_exec_depth = None;
-                // The `late var _ = e` row (latch at `InitializerBegin`):
-                // the initializer is never evaluated, so it is dead code at
-                // its own extent — reported at the initializer node, i.e.
-                // the slice's first spanned event. Reachability-independent
-                // (the official runs this in the plain `DeadCodeVerifier`,
-                // not the flow verifier), hence a direct fact, never a dead
-                // window.
-                if let Some(Some(begin)) = self.wildcard_init_begin.pop()
-                    && let Some(span) = events[begin + 1..i].iter().find_map(|ev| ev.span())
-                {
-                    self.emit(FlowFact::DeadCode { span });
-                }
+                // The `late var _ = e` row is the recorder's (the parser
+                // hands it the initializer's own tokens —
+                // `DeadCodeVerifier.visitVariableDeclaration`,
+                // dead_code_verifier.dart:119-135), so the replay adds
+                // nothing here.
                 // An annotation that survived to the initializer's end was
                 // written INSIDE it (a local function's return type, a
                 // test/cast the consumer already dropped) — it never was
@@ -1623,9 +1600,6 @@ impl Interp<'_> {
                 // outermost list's restore yields the default — the same
                 // value the previous unconditional reset wrote.
                 self.decl = self.decl_stack.pop().unwrap_or_default();
-                // No declarator of this list can still be awaiting its
-                // initializer slice.
-                self.wildcard_late_decl = false;
                 // The slot is closed with the list: a nested list can only
                 // begin inside an initializer, and every list's first
                 // identifier precedes its initializers, so the enclosing

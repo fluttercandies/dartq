@@ -1,7 +1,8 @@
 //! #3137 — flow dead-window gates: the C-style `for` condition's post-death
-//! anchor and the conditional's else-arm extent.
+//! anchor, the conditional's else-arm extent, null-shorted chains inside a
+//! dead window, and the `late` wildcard initializer row.
 //!
-//! Two upstream faces are pinned here.
+//! The upstream faces pinned here.
 //!
 //! 1. A `for` condition that kills the flow with no node after the kill
 //!    anchors nothing: the official parses the condition as a bare
@@ -149,4 +150,85 @@ fn conditional_dead_then_arm_stays_unchanged() {
     // colon boundary.
     let src = "void f(int b) { false ? b : 1; }";
     assert_eq!(dead_of(src), vec!["b".to_string()]);
+}
+
+// —— null-shorted chains inside a dead window ————————————————————————————
+//
+// The official verifier walks the AST top-down, so a statement (or arm)
+// that entered dead latches ITSELF as `_firstDeadNode` before the receiver
+// is visited; the chain's `handleNullShortingFinished` → `flowEnd(expression)`
+// then fails `_containsFirstDeadNode` and the interval keeps running to the
+// enclosing close (dead_code_verifier.dart:408-414, :223-235). Only an
+// anchor strictly inside the chain is the chain's own first dead node.
+//
+// The pins below cover the chain faces whose record-time receiver span is
+// the same in both paths (the engine mounts resolved reads; a `?.` whose
+// receiver is itself a shorted value carries no receiver span, so the
+// member-chain rows of `a?.b.c` are the corpus's to check).
+
+#[test]
+fn dead_statement_null_aware_index_chain_keeps_the_statement_extent() {
+    let src = "void f(a) {\n  return;\n  a?[0];\n}";
+    assert_eq!(dead_of(src), vec!["a?[0];".to_string()]);
+}
+
+#[test]
+fn dead_statement_null_aware_cascade_keeps_the_statement_extent() {
+    let src = "void f(a) {\n  return;\n  a?..b()..c();\n}";
+    assert_eq!(dead_of(src), vec!["a?..b()..c();".to_string()]);
+}
+
+#[test]
+fn live_statement_null_aware_chain_still_reports_the_chain_extent() {
+    // `Null n; n?.p;` — the statement is live, the access path dies at the
+    // `?.`, and the member poll is strictly inside the chain: the row is
+    // the chain expression's own extent, never the statement's `;`.
+    let src = "void f(Null n) {\n  n?.p;\n}";
+    assert_eq!(dead_of(src), vec!["p".to_string()]);
+}
+
+// —— `late` wildcard initializers ————————————————————————————————————————
+//
+// `DeadCodeVerifier.visitVariableDeclaration` (dead_code_verifier.dart
+// :119-135): a `late` LOCAL named `_` never evaluates its initializer, so
+// the initializer NODE is dead code — reported at the node's own extent,
+// independently of reachability.
+
+#[test]
+fn late_wildcard_initializer_reports_the_expression_extent() {
+    let src = "void f() {\n  late var _ = 1 + 2;\n}";
+    assert_eq!(dead_of(src), vec!["1 + 2".to_string()]);
+}
+
+#[test]
+fn late_wildcard_initializer_collection_literal_extent() {
+    // The anchor is the initializer's first token, not its first leaf: the
+    // `[` carries no event of its own.
+    let src = "void f() {\n  late var _ = [1, 2];\n}";
+    assert_eq!(dead_of(src), vec!["[1, 2]".to_string()]);
+}
+
+#[test]
+fn late_wildcard_initializer_send_extent() {
+    let src = "void f(int g) {\n  late var _ = g(1, 2);\n}";
+    assert_eq!(dead_of(src), vec!["g(1, 2)".to_string()]);
+}
+
+#[test]
+fn late_wildcard_field_initializer_stays_silent() {
+    // Upstream's gate is a `LocalVariableElement`: a field spelled `_`
+    // reports nothing.
+    let src = "class A {\n  late var _ = 1 + 2;\n}";
+    assert_eq!(dead_of(src), Vec::<String>::new());
+}
+
+#[test]
+fn dead_statement_late_wildcard_rows_both_extents() {
+    // The dead statement's own row and the reachability-independent
+    // initializer row coexist (oracle 20|15 and 33|1).
+    let src = "void f() {\n  return;\n  late var _ = 0;\n}";
+    assert_eq!(
+        dead_of(src),
+        vec!["late var _ = 0;".to_string(), "0".to_string()]
+    );
 }
