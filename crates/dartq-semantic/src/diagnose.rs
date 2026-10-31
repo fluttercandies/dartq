@@ -1345,6 +1345,87 @@ pub fn fold_unit_with_ops<'t>(
                         range.length = rhs_end - range.offset;
                     }
                 }
+                // Two span-shape faces the official `flowEnd` reports but
+                // the flow interval's fact range can miss:
+                //
+                // * a block entered dead reports the BLOCK node whole —
+                //   `A() : x = throw 0 { x; }` rows `{ x; }`, `return;`
+                //   `{ x; }` rows `{ x; }` (`checkUnreachableNode(block)`
+                //   latches the block itself as the first dead node, so
+                //   `flowEnd` reports `{`..`}`). A fact that anchors at
+                //   the block's FIRST statement while the block stands
+                //   entered dead re-anchors to the `{` and extends
+                //   through `}` — the anchor's previous real token IS the
+                //   `{` (a statement's first dead node inside a
+                //   live-entered block follows `;`/`}`, never `{`).
+                // * a dead run that reaches the END of a list/argument/
+                //   map literal reports the literal's closer too —
+                //   `[1, 2, f(), 4]` rows `4]`, `g(1, dead, 3)` rows
+                //   `dead, 3)` (`flowEnd(literal)` covers the whole
+                //   node). A mid-expression anchor whose row stops one
+                //   token short of the group's `]`/`)`/`}` extends
+                //   through it — statement tails never qualify (their
+                //   anchor is statement-initial).
+                let prev = (span.id > 0).then(|| tokens.get(span.id as usize - 1)).flatten();
+                let mid_expression_anchor = prev.is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        dartq_scanner::TokenKind::Period
+                            | dartq_scanner::TokenKind::PeriodPeriod
+                            | dartq_scanner::TokenKind::Question
+                            | dartq_scanner::TokenKind::QuestionPeriod
+                            | dartq_scanner::TokenKind::OpenSquare
+                            | dartq_scanner::TokenKind::OpenParen
+                            | dartq_scanner::TokenKind::Comma
+                            | dartq_scanner::TokenKind::Eq
+                    )
+                });
+                if let Some(t) = prev
+                    && t.kind == dartq_scanner::TokenKind::OpenCurly
+                {
+                    // The anchor is the block's first statement and the
+                    // block stands entered dead: the row re-anchors at
+                    // `{` and runs through the block's `}` — the token at
+                    // or just past the fact's end that closes the group.
+                    if let Some(close) = tokens.as_slice().iter().find(|t| {
+                        !t.is_synthetic()
+                            && t.kind == dartq_scanner::TokenKind::CloseCurly
+                            && t.utf16_offset == range.end()
+                    }) {
+                        range.offset = t.utf16_offset;
+                        range.length = close.utf16_offset + close.byte_len - range.offset;
+                    }
+                } else {
+                    // A marker row's `;` spill: `n?.p = i` rows `p = i`,
+                    // never `p = i;` (the statement's terminator is not
+                    // part of the dead NODE the official reports).
+                    if mid_expression_anchor
+                        && tokens.as_slice().iter().any(|t| {
+                            !t.is_synthetic()
+                                && t.kind == dartq_scanner::TokenKind::Semicolon
+                                && t.utf16_offset + t.byte_len == range.end()
+                        })
+                    {
+                        range.length -= 1;
+                    }
+                    // The group-closer fold: the row covers the dead run
+                    // up to the literal's `]`/`)`/`}` — only when the
+                    // closer immediately follows the fact's end.
+                    if mid_expression_anchor
+                        && let Some(close) = tokens.as_slice().iter().find(|t| {
+                            !t.is_synthetic()
+                                && matches!(
+                                    t.kind,
+                                    dartq_scanner::TokenKind::CloseSquare
+                                        | dartq_scanner::TokenKind::CloseParen
+                                        | dartq_scanner::TokenKind::CloseCurly
+                                )
+                                && t.utf16_offset == range.end()
+                        })
+                    {
+                        range.length += close.byte_len;
+                    }
+                }
                 let code = SemanticCode::DeadCode;
                 flow_diagnostics.push(Diagnostic::new(
                     code.severity(),
