@@ -1511,14 +1511,20 @@ impl<'a> Engine<'a> {
         // re-typed `int Function()`). A suspends literal skips the stub —
         // the argument channel then decides through the ordinary ask on
         // the typed row's wrapped face.
-        let (suspends, is_async, generator) =
+        let (suspends, is_async, generator, arrow_body) =
             match self.frames.last().map(|frame| &frame.kind) {
                 Some(FrameKind::Executable {
                     is_async,
                     generator,
+                    body_brace,
                     ..
-                }) => (*is_async || *generator, *is_async, *generator),
-                _ => (false, false, false),
+                }) => (
+                    *is_async || *generator,
+                    *is_async,
+                    *generator,
+                    body_brace.is_none(),
+                ),
+                _ => (false, false, false, false),
             };
         // The upstream match gate closes at the literal's own group count
         // (`typeContext.typeParameters.length == functionTypeParameters
@@ -1532,13 +1538,70 @@ impl<'a> Engine<'a> {
             return None;
         }
         if !suspends {
+            // The `=>` body's inferred return: the body's own expression row
+            // still sits on the stack (the listener drains it only after
+            // this close — `end_function_expression`'s `deferred_miss_rows`
+            // hand-off), so its resolved static type answers the captured
+            // signature's return where the `void` STUB stood. Upstream's
+            // `staticType` is that same answer: `xs.map((t) => t.element)`
+            // feeds `int Function(Element)` to the enclosing send's
+            // upward constraint, solving `map`'s own `R` — the downward
+            // formal inference's fixpoint return leg (`generic_inferrer`'s
+            // `constrainArgument` on the literal's inferred type). The
+            // `=>` body's top-level row is its LAST completed expression
+            // row (merges fold receiver rows into the member/send row); a
+            // block body's `return` tally keeps the `void` stub (the
+            // `S = R` re-type mechanism its consumers already run). A row
+            // that resolves `Unknown` — a deferred-formal re-bind the
+            // pass-2 schema will only correct later — keeps the stub too,
+            // the same under-report the face carried before.
+            let return_ty = if arrow_body {
+                let row = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|row| {
+                        row.range.offset >= capture.offset
+                            && matches!(
+                                row.intent,
+                                Intent::Read | Intent::Invoke | Intent::Operator(..)
+                            )
+                            && !matches!(row.shape, RowShape::TypeUse(..))
+                            && !self
+                                .interpolation_child_rows
+                                .contains(&row.range.offset)
+                            // A cascade body's static type is the TARGET
+                            // (`x..add(1)` reads `x`) — the section rows
+                            // sit last but answer only their own selector,
+                            // so they never speak for the body.
+                            && !self.cascade_sections.contains(&row.range.offset)
+                    })
+                    .cloned();
+                match row {
+                    // A member READ row's `ty` is lazily empty (the merge
+                    // leaves the declared-type write to the read faces) —
+                    // `initializer_read_ty` re-derives the accessor answer
+                    // through the classified receiver; sends/operators read
+                    // the folded face `expression_row_ty` carries.
+                    Some(row) if row.intent == Intent::Read => {
+                        match self.initializer_read_ty(&row) {
+                            Ty::UNKNOWN => self.expression_row_ty(&row),
+                            ty => ty,
+                        }
+                    }
+                    Some(row) => self.expression_row_ty(&row),
+                    None => Ty::Void,
+                }
+            } else {
+                Ty::Void
+            };
             let required = capture.optional_from.unwrap_or(capture.positional.len());
             let sig = Box::new(FnVarSig {
                 params: Box::default(),
                 required_positional: u16::try_from(required).unwrap_or(u16::MAX),
                 positional: capture.positional.clone().into_boxed_slice(),
                 named: Box::default(),
-                return_ty: Ty::Void,
+                return_ty,
             });
             if let Some(level) = self.arg_levels.last_mut() {
                 level.closures.push((capture.offset, end, sig));

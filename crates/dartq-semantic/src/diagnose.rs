@@ -5796,3 +5796,11 @@ mod ticket_2499_tests;
 /// `CovariantParametersVerifier` relatedness gate.
 #[cfg(test)]
 mod ticket_3109_tests;
+
+/// The #3111 pins: the context-free closure `=>` body's resolved return
+/// bakes into the captured signature — the downward-inference fixpoint's
+/// return leg — so a generic callee's own parameter solves off the
+/// body's inferred `staticType` (`xs.map((t) => t.element)` answers
+/// `Iterable<int>`).
+#[cfg(test)]
+mod ticket_3111_tests;

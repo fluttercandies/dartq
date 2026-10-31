@@ -5459,14 +5459,15 @@ impl<'a> Engine<'a> {
     }
 
     /// The literal closure's inferred return for the constraint gather
-    /// (#2516): `FnVarSig.return_ty` is a `void` STUB
-    /// (`closure_capture_end` hardcodes it — the capture never runs
-    /// return-type inference), while upstream's `staticType` reads the
-    /// body's inferred return (`(double x) => 0` is `int
-    /// Function(double)`, and the oracle's origin line prints THAT). The
-    /// body rows inside the literal's own span carry the expression
-    /// types — the last expression row answers for an `=>` literal and
-    /// approximates a block literal's tail. `None` keeps the stub.
+    /// (#2516): `closure_capture_end` now bakes the `=>` body's resolved
+    /// expression type into `FnVarSig.return_ty` (the body's last
+    /// completed row still sits on the stack at capture close — the
+    /// listener drains it only after). A BLOCK body's captured return
+    /// stays the `void` STUB and keeps arriving here; upstream's
+    /// `staticType` reads the body's inferred return (`(double x) => 0`
+    /// is `int Function(double)`, and the oracle's origin column prints
+    /// THAT), so a surviving stub still re-reads the tail. `None` keeps
+    /// the stub.
     fn literal_inferred_return(&self, start: u32, end: u32) -> Option<Ty> {
         // The body's expression row, when it survived the fold (`=> expr`
         // literals leave the expression's own row inside the literal
@@ -10622,9 +10623,12 @@ impl<'a> Engine<'a> {
             // `correspondingParameter` walk (resolver.dart:522,
             // `checkForArgumentTypesNotAssignableInList`) — a `() => 0`
             // against `void Function(int)` reports exactly like a
-            // tear-off. The closure capture's `FnVarSig` return is a
-            // `void` STUB (`closure_capture_end` hardcodes `Ty::Void`),
-            // never a real inference: the formal's return is the downward
+            // tear-off. A block-bodied closure capture's `FnVarSig`
+            // return stays the `void` STUB (`closure_capture_end` bakes
+            // the `=>` body's resolved expression type instead — an
+            // `=>` literal's own inference is overwritten by the re-type
+            // below either way), never a real inference for the ask:
+            // the formal's return is the downward
             // context the literal re-infers under (`inferLocalFunction`'s
             // cap — the `S = R` posture the capture's own Value row
             // carries), so the stub re-types BEFORE the ask and the
