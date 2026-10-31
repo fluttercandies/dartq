@@ -1342,3 +1342,7 @@ mod ticket_2467_tests {
 /// for-each faces over production-parse shapes).
 #[cfg(test)]
 mod ticket_3148_tests;
+
+/// The #3148 fold-in (`prefer_is_empty` report-span) pins.
+#[cfg(test)]
+mod ticket_3148b_tests;

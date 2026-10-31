@@ -10,9 +10,8 @@
 //! language version (probed with a hand-written `package_config.json`
 //! pinning `languageVersion: 3.0`) the loop arms and reports every `final`
 //! formal, typed or not, from `this`/`super` field formals to plain
-//! parameters — the fixtures below run that armed face, which is the
-//! fixture's default posture (`Features::default()` leaves
-//! `primary_constructors` off).
+//! parameters — the pins below mount that armed face by clearing the
+//! fixture's default `primary_constructors` bit (`[`assert_armed_report`]`).
 //!
 //! The for-each face is version-independent: the oracle registers
 //! `visitForStatement` and reports the loop variable at every language
@@ -27,9 +26,13 @@ fn at(f: &Fixture, needle: &str, nth: usize) -> u32 {
 
 /// Pins one armed-face shape: exactly one row, anchored at the `final`
 /// keyword (`rule.reportAtToken(node.constFinalOrVarKeyword)`,
-/// unnecessary_final.dart:73-77).
+/// unnecessary_final.dart:73-77). The fixture's default posture carries
+/// `primary_constructors` (the shipped 3.13 feature), which gates the
+/// parameter loop, so the pin mounts the pre-3.13 posture the face arms
+/// under.
 fn assert_armed_report(source: &str) {
-    let f = Fixture::parse(source);
+    let mut f = Fixture::parse(source);
+    f.features.primary_constructors = false;
     let lints = f.run(&one_rule("unnecessary_final"));
     assert_eq!(lints.len(), 1, "{source:?}: {lints:?}");
     assert_eq!(lints[0].range.start, at(&f, "final", 0), "{source:?}");

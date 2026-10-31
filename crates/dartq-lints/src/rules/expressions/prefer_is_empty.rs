@@ -91,10 +91,14 @@ fn check(c: &mut Check<'_>) {
     // the run bounds: the left operand's token-adjacent tail's earliest
     // head (a constructor-initializer's `x = ` target group tiles ahead
     // of the operand — the contiguous tail drops it) through the right
-    // operand's last value row.
-    let start = slice::operand_utf16_start(c, &left, op_token)
-        .or_else(|| slice::run_utf16_start(c, &left))
-        .unwrap_or_else(|| c.utf16_span(node).start);
+    // operand's last value row. That head can still be a member row's own
+    // start (`[].length` anchors at `length`), so the chain walks back to
+    // the receiver — the expression's first token, which is what the
+    // oracle reports.
+    let start = match slice::operand_start_token(c, &left, op_token) {
+        Some(token) => crate::rules::utf16_token_span(c, receiver_chain_start(c, token)).start,
+        None => slice::run_utf16_start(c, &left).unwrap_or_else(|| c.utf16_span(node).start),
+    };
     let end = match right.last() {
         Some(&tail) if c.kind(tail) == NodeKind::DotAccess => {
             crate::rules::utf16_token_span(c, c.head_token(tail)).end
@@ -103,6 +107,63 @@ fn check(c: &mut Check<'_>) {
         None => c.utf16_span(node).end,
     };
     c.report_texts(start..end, problem, correction.unwrap_or_default(), &[]);
+}
+
+/// Extends an operand anchor left over the member chain's receiver: a
+/// delta-tile member row begins at the member name (`[].length` anchors at
+/// `length`, `a.b.length` at `b`), while the official span opens at the
+/// expression's first token (`reportAtNode(expression)`). The walk takes
+/// every token that can sit inside an operand — names, literals, the
+/// `[]` empty-list token, `.`/`?.`/`?`, the operand-position keywords, and
+/// the interior of a balanced group (a closer opens the group, its opener
+/// closes it) — and stops at the first token that cannot: a separator, an
+/// assignment, an operator, or a statement keyword (`var x = [].length` →
+/// `[`; `return i.length` → `i`; `for (; i.length …` → `i`).
+fn receiver_chain_start(c: &Check<'_>, from: u32) -> u32 {
+    use dartq_scanner::{Keyword, TokenKind};
+
+    let mut token = from;
+    let mut depth = 0u32;
+    while token > 0 {
+        let prev = token - 1;
+        let Some(entry) = c.unit.tokens.get(prev as usize) else {
+            break;
+        };
+        match entry.kind {
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => depth += 1,
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                // A group the operand already left behind is a boundary
+                // (an argument list, an index); a group the walk is inside
+                // dates back to its opener.
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ if depth > 0 => {}
+            TokenKind::Identifier
+            | TokenKind::Int
+            | TokenKind::Double
+            | TokenKind::Hexadecimal
+            | TokenKind::String
+            | TokenKind::Index
+            | TokenKind::Period
+            | TokenKind::QuestionPeriod
+            | TokenKind::Question => {}
+            TokenKind::Keyword(
+                Keyword::This
+                | Keyword::Super
+                | Keyword::True
+                | Keyword::False
+                | Keyword::Null
+                | Keyword::New
+                | Keyword::Const,
+            ) => {}
+            _ => break,
+        }
+        token = prev;
+    }
+    token
 }
 
 /// The operand's `.length` access marker (`_isLengthAccess`,
