@@ -1946,27 +1946,14 @@ fn keyword_as_name_message(
                 None
             }
         }
-        // Typedef names ride the official recovered-identifier template
-        // (parseTypedef passes `isIdentifierRecovered = true` for any
-        // non-identifier head heading a `(`/`=` group, parser_impl.dart:1494/
-        // :1585, so the base recovered variant fires
-        // `expectedIdentifierButGotKeyword` for every keyword name — built-in
-        // and reserved alike; oracle keyword_named_typedefs.dart 1|14). The
-        // second face at the same token (the typedef-name built-in text) is
-        // the caller's (`parse_typedef`). A built-in kept by the plain
-        // `_isOneOfFollowingValues` gate on `;`/`<`/EOF stays the name with
-        // only the caller's built-in row (`typedef int get;`), so the
-        // keyword-name face is gated to the `(`/`=` followers that mark the
-        // recovered shapes.
-        dartq_scanner::KeywordStyle::BuiltIn
-            if context == crate::listener::IdentifierContext::TypedefDeclaration
-                && matches!(
-                    cursor.look_kind(1),
-                    TokenKind::OpenParen | TokenKind::Eq
-                ) =>
-        {
-            Some(msg::expected_identifier_but_got_keyword(lexeme))
-        }
+        // Typedef names: the `(`/`=` recovered shapes route through
+        // `ensureIdentifierPotentiallyRecovered` (which reports
+        // `expectedIdentifierButGotKeyword` itself), and a built-in kept by
+        // the `_isOneOfFollowingValues` gate on `;`/`<`/EOF emits only the
+        // caller's `builtInIdentifierInDeclaration` verifier row
+        // (`builtin_typedef_name_row`); oracle `typedef int get;` carries the
+        // single built-in face, never the keyword-name row. Reaching this
+        // fallthrough means the head stayed the name, so nothing is added.
         _ => None,
     }
 }

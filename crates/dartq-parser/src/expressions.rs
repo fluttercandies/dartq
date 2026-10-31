@@ -1317,6 +1317,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // (skip-to-endGroup :8028-8030).
                     let (_, synthetic) = self.cursor.resolve(close_id);
                     if synthetic {
+                        // Upstream fires `reportRecoverableError(next,
+                        // expectedButGot(']'))` (parser_impl.dart:8010-8013)
+                        // at the follower BEFORE `moveSynthetic` relocates the
+                        // scanner's synthetic `]` (:8018) — two rows land on
+                        // the follower: the full-width `expectedButGot` and
+                        // the relocated closer's length-1 unmatched-token row
+                        // (`translate_error_token` `unmatchedToken` arm). The
+                        // real-`]` and no-pair branches carry their own
+                        // `expectedButGot`; the synthetic path needs it here.
+                        self.report(msg::expected_but_got("]"), self.peek_span());
                         close = self.move_synthetic_close(
                             open,
                             close_id,

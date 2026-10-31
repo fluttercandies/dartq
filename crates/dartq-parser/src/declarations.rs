@@ -1075,7 +1075,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // splices a synthetic name and stays for the declaration loop
             // (oracle `typedef var a;`: `missing_identifier` at `var`,
             // `expected_token ';'` anchored on `typedef`).
-            let is_recovered = !self.peek_is_identifier()
+            // Official `isIdentifierRecovered` (parser_impl.dart:1593):
+            // `next.kind != IDENTIFIER_TOKEN` is the RAW token kind — a
+            // built-in or pseudo keyword (`get`/`set`/`mixin`) is NOT an
+            // `IDENTIFIER_TOKEN`, so it is recovered exactly like a reserved
+            // word. `peek_is_identifier` (which admits built-ins) would route
+            // `typedef void get();` to the plain `ensureIdentifier` template
+            // and lose the keyword-name face; the raw-kind test keeps the
+            // `(`/`=` shapes on the recovered variant.
+            let is_recovered = self.peek_kind() != TokenKind::Identifier
                 && self.kind_at(self.offset_of(type_param.skip(self.peek_id())) + 1)
                     == TokenKind::OpenParen;
             if is_recovered {
@@ -1587,7 +1595,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // same entry).
         let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
-        if let Some(at) = built_in_name {
+        // Emit the built-in-name row only when the keyword was actually
+        // consumed as the declaration name — the captured token id survives
+        // in `name.id`. When the recovery arm splices a synthetic name at the
+        // keyword's offset (`class enum E { v }`: `enum` stays for the enum
+        // reparse) `name.id` is the synthetic identifier, not the keyword —
+        // the keyword never became the class name, so the verifier's
+        // `_checkForBuiltInIdentifierAsName` has no name to report.
+        if let Some(at) = built_in_name
+            && at.id == name.id
+        {
             let kind = if self.peek_kind() == TokenKind::Eq {
                 msg::BuiltInNameKind::Typedef
             } else {
