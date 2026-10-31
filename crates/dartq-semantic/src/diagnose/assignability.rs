@@ -2775,6 +2775,16 @@ impl<'a> Engine<'a> {
         if self.written_ty_invalid(from) {
             return;
         }
+        // The void-operand use (upstream
+        // `assignment_expression_resolver.dart:136` —
+        // `writeType is! VoidType && _checkForUseOfVoidResult(right)`
+        // short-circuits the whole ask): `x = v()` into a non-`void`
+        // target reports `use_of_void_result` at the right operand and
+        // answers no `invalid_assignment`.
+        if to != Ty::Void && from == Ty::Void {
+            self.emit_use_of_void_result(from, &rhs_row);
+            return;
+        }
         let stashed = self.stashed_fn_pair(&rhs_row, Some(&target_row), from, to);
         let verdict = stashed
             .as_ref()
@@ -3024,6 +3034,20 @@ impl<'a> Engine<'a> {
         // written annotation is the question's own face (the projected
         // foreign-type posture [`Self::check_assignment` records).
         if self.written_ty_invalid(from) {
+            self.init_mark = None;
+            return;
+        }
+        // The void-operand use (upstream
+        // `assignment_expression_resolver.dart:136` reached through
+        // `variable_declaration_resolver.dart` —
+        // `writeType is! VoidType && _checkForUseOfVoidResult(right)`
+        // short-circuits): `Object a = v()` reports `use_of_void_result`
+        // at the initializer and answers no `invalid_assignment`. `var a`
+        // never reaches here — `pending_decl_ty` is `None` for an
+        // inferred slot.
+        if to != Ty::Void && from == Ty::Void {
+            let row = row.clone();
+            self.emit_use_of_void_result(from, &row);
             self.init_mark = None;
             return;
         }
@@ -4538,8 +4562,12 @@ impl<'a> Engine<'a> {
         let Some((ty, literal, range)) = self.single_row_since(mark) else {
             return;
         };
-        // `use_of_void_result`'s row.
+        // `use_of_void_result`'s row (upstream `_checkForEachParts` →
+        // `checkForUseOfVoidResult(node.iterable)` at error_verifier.dart:
+        // 4442 — the void use reports and short-circuits the iterable
+        // assignability ask).
         if ty == Ty::Void {
+            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
             return;
         }
         // The strict-casts dynamic arm reports ahead of the nullable arm.
@@ -4945,12 +4973,22 @@ impl<'a> Engine<'a> {
     /// oracle's `InvalidType` gate), so the latch gap suppresses instead
     /// of mis-answering.
     pub(crate) fn open_switch(&mut self, is_expression: bool, kw: SourceRange) {
-        let scrutinee = self
-            .rows
-            .last()
-            .filter(|row| !self.is_index_key_row(row))
-            .map_or(Ty::Unknown, |row| row.ty);
-
+        let scrutinee_row = self.rows.last().filter(|row| !self.is_index_key_row(row));
+        let scrutinee = scrutinee_row.map_or(Ty::Unknown, |row| row.ty);
+        // The void-operand use (upstream `visitSwitchExpression`/
+        // `visitSwitchStatement` → `checkForUseOfVoidResult(node.
+        // expression)` at error_verifier.dart:2024/:2038): `switch (v())`
+        // reports `use_of_void_result` at the scrutinee's span. The
+        // operand's static type resolves the invoke's return — a `v()`
+        // call's row spells `Unknown` until `operand_static_ty` reads the
+        // callee's `void` return.
+        if let Some(row) = scrutinee_row {
+            let ty = self.operand_static_ty(row);
+            if ty == Ty::Void {
+                let range = row.range;
+                self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+            }
+        }
         self.switch.open_switch(scrutinee, is_expression, kw);
     }
 

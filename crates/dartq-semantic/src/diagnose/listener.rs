@@ -5140,6 +5140,16 @@ impl ParserListener for DiagnoseListener<'_> {
             let at = row.range;
             let receiver_ty = engine.receiver_static_ty(&row);
             engine.stage_receiver_of_type_never(at, receiver_ty);
+            // The void-operand use (upstream `visitPrefixExpression` —
+            // `operatorType != BANG` → `checkForUseOfVoidResult(operand)` at
+            // error_verifier.dart:1727): `-v()`/`~v()`/`++v()`/`--v()`
+            // consume the void operand's value and report at its span. The
+            // operand's static type resolves the invoke's `void` return —
+            // `receiver_static_ty` answers the operator method's receiver,
+            // not the consumed value.
+            if op != UnOp::Not && engine.operand_static_ty(&row) == Ty::Void {
+                engine.emit(SemanticCode::UseOfVoidResult, at, "", "");
+            }
             // The `!` operand runs the negation face
             // (`checkForNonBoolNegationExpression`,
             // bool_expression_verifier.dart:76-88): the operand's
@@ -5207,10 +5217,16 @@ impl ParserListener for DiagnoseListener<'_> {
         // The prefix `++`/`--` junction (`increment_or_decrement_resolver.
         // dart:273`, the prefix face): the operand's row is complete — the
         // parser fires this event after the operand parses.
-        if let Some(row) = engine.operand_row() {
+        if let Some(row) = engine.operand_row().cloned() {
             let at = row.range;
-            let receiver_ty = engine.receiver_static_ty(row);
+            let receiver_ty = engine.receiver_static_ty(&row);
             engine.stage_receiver_of_type_never(at, receiver_ty);
+            // The void-operand use (upstream `visitPrefixExpression` —
+            // `operatorType != BANG` → `checkForUseOfVoidResult(operand)`):
+            // `++v()`/`--v()` consume the void operand's value.
+            if engine.operand_static_ty(&row) == Ty::Void {
+                engine.emit(SemanticCode::UseOfVoidResult, at, "", "");
+            }
         }
         // The index operand's compound write (`++a[0]` — the same
         // `resolveForWrite(hasRead: true)` consult the postfix face runs):
@@ -5227,10 +5243,16 @@ impl ParserListener for DiagnoseListener<'_> {
         // The postfix `++`/`--` junction (`increment_or_decrement_resolver.
         // dart:273`, the postfix face): the operand's row precedes the
         // operator token.
-        if let Some(row) = engine.operand_row() {
+        if let Some(row) = engine.operand_row().cloned() {
             let at = row.range;
-            let receiver_ty = engine.receiver_static_ty(row);
+            let receiver_ty = engine.receiver_static_ty(&row);
             engine.stage_receiver_of_type_never(at, receiver_ty);
+            // The void-operand use (upstream `visitPostfixExpression` —
+            // `operatorType != BANG` → `checkForUseOfVoidResult(operand)`):
+            // `v()++`/`v()--` consume the void operand's value.
+            if engine.operand_static_ty(&row) == Ty::Void {
+                engine.emit(SemanticCode::UseOfVoidResult, at, "", "");
+            }
         }
         // The index operand's compound write (`a[0]++` — upstream Dart SDK
         // source, postfix_expression_resolver.dart:35-37
@@ -5784,6 +5806,20 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.leave_non_type_pos();
         engine.is_type_pos -= 1;
+        // The void-operand use (upstream `visitIsExpression` →
+        // `checkForUseOfVoidResult(node.expression)`): `x is T` on a
+        // `void`-typed `x` reports at the operand's own span — the operand
+        // is the row just below the type-argument window (`is_type_mark`
+        // latches `rows.len()` after it parses).
+        if let Some(mark) = engine.is_type_mark
+            && let Some(operand) = mark
+                .checked_sub(1)
+                .and_then(|index| engine.rows.get(index))
+            && engine.operand_static_ty(operand) == Ty::Void
+        {
+            let range = operand.range;
+            engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        }
     }
 
     fn begin_as_operator_type(&mut self, operator: Token) {
@@ -7464,6 +7500,12 @@ impl ParserListener for DiagnoseListener<'_> {
             .pattern_stack
             .last_mut()
             .map_or(Vec::new(), |frame| std::mem::take(&mut frame.fields));
+        if std::env::var_os("DQ_PROBE_OPBT").is_some() {
+            eprintln!("OPBT_CLOSE head={:?} nfields={}", head, fields.len());
+            for f in &fields {
+                eprintln!("  field getter={:?} binder={:?}", f.getter, f.binder);
+            }
+        }
         if let Some(head) = head {
             for field in &fields {
                 if let Some((getter, at)) = field.getter {
@@ -8471,11 +8513,21 @@ impl ParserListener for DiagnoseListener<'_> {
             && engine.rows.len() > 0
         {
             let mark = mark.min(engine.rows.len() - 1);
-            engine.interpolation_child_rows.extend(
-                engine.rows[mark..engine.rows.len() - 1]
-                    .iter()
-                    .map(|row| row.range.offset),
-            );
+            let children = &engine.rows[mark..engine.rows.len() - 1];
+            // The void-operand use (upstream `visitInterpolationExpression`
+            // → `checkForUseOfVoidResult(node.expression)`): `"$x"`/`"${e}"`
+            // consumes the element's value — every `void`-typed operand row
+            // reports at its own span.
+            let void_rows: Vec<SourceRange> = children
+                .iter()
+                .filter(|row| engine.operand_static_ty(row) == Ty::Void)
+                .map(|row| row.range)
+                .collect();
+            let offsets: Vec<u32> = children.iter().map(|row| row.range.offset).collect();
+            for range in void_rows {
+                engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+            }
+            engine.interpolation_child_rows.extend(offsets);
         }
         // A plain string literal's constant-pattern static type; an
         // interpolated one is not a `hasPrimitiveEquality` constant
@@ -8565,6 +8617,11 @@ impl ParserListener for DiagnoseListener<'_> {
                 payload,
             );
         }
+        // The void-operand use (upstream `literal_element_verifier.dart`
+        // :95 — `checkElement` → `checkForUseOfVoidResult(element)`): a
+        // `void`-typed element expression reports at its own span. Runs on
+        // the live element rows before the fold drains them below.
+        engine.check_collection_void_elements(left, right);
         engine.check_list_literal_elements(left, right);
         // The literal folds to one expression node upstream: its element
         // rows belong to the node, not the stack — drain them into the
@@ -8743,6 +8800,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // parse cannot spell (a function-typed argument) keeps the row
         // opaque and silent — the written group decided the shape
         // upstream either way.
+        // The void-operand use over the literal's elements and entry
+        // key/value pairs (upstream `literal_element_verifier.dart` :95/
+        // :151/:166 — `checkElement`/`_verifyMapLiteralEntry*` →
+        // `checkForUseOfVoidResult`): runs for every literal — typed and
+        // untyped alike — before the typed arm below takes its early
+        // return, so `check_map_literal_entries` stays assignability-only.
+        engine.check_collection_void_elements(left, right);
         let nested = engine.group_has_nested_args(left);
         let helper_typed = engine.typed_set_or_map_literal_ty(left);
         let typed_args = if nested {
@@ -9450,11 +9514,18 @@ impl ParserListener for DiagnoseListener<'_> {
         // keyword) is the operand's; a rowless operand leaves an older
         // outer row on top and the rewrite skips it — the same shape the
         // `end_const_literal` guard uses.
-        let flat_ty = engine
+        let operand = engine
             .rows
             .last()
             .filter(|row| row.range.offset >= begin.range.end())
-            .map(|row| engine.flatten(engine.operand_static_ty(row)));
+            .map(|row| (engine.operand_static_ty(row), row.range));
+        // The void-operand use (upstream `visitAwaitExpression` →
+        // `checkForUseOfVoidResult(node.expression)`): `await x` on a
+        // `void`-typed `x` reports at the operand's span.
+        if let Some((Ty::Void, range)) = operand {
+            engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        }
+        let flat_ty = operand.map(|(ty, _)| engine.flatten(ty));
         if let (Some(row), Some(ty)) = (engine.rows.last_mut(), flat_ty) {
             row.ty = ty;
         }
@@ -9489,7 +9560,19 @@ impl ParserListener for DiagnoseListener<'_> {
         // the operand's row is the stack top and carries the throw's value
         // downstream, so the assignment/argument checks read the bottom type
         // and never report its operand's own type (`b = throw 'x'` assigns
-        // into `bool` — `subtype.dart` Right Bottom).
+        // into `bool` — `subtype.dart` Right Bottom). The void-operand use
+        // fires first (upstream `visitThrowExpression` →
+        // `checkForUseOfVoidResult(node.expression)`): `throw x` on a
+        // `void`-typed `x` reports at the operand before the row's type is
+        // rewritten to `Never`.
+        let void_operand = engine
+            .rows
+            .last()
+            .filter(|row| engine.operand_static_ty(row) == Ty::Void)
+            .map(|row| row.range);
+        if let Some(range) = void_operand {
+            engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        }
         if let Some(row) = engine.rows.last_mut() {
             row.ty = Ty::Never;
         }
@@ -11748,15 +11831,77 @@ impl Engine<'_> {
                 let Some((ty, range)) = self.leaf_completion_row(start, end) else {
                     continue;
                 };
-                // A `void` key/value short-circuits to the use-of-void
-                // face upstream (`_verifyMapLiteralEntryKey`) — no entry
-                // row; an unspellable completion row suppresses.
+                // A `void` key/value already reported through
+                // [`Self::check_collection_void_elements`] — it short-
+                // circuits the assignability ask here (upstream
+                // `_verifyMapLiteralEntry*` gates on `entry.key|value
+                // .typeOrThrow is VoidType` before the use-of-void
+                // early-return); an unspellable completion row suppresses.
                 if ty == Ty::Void || ty == Ty::UNKNOWN {
                     continue;
                 }
                 if self.assignable(ty, expected, false) == Some(false) {
                     let (a0, a1) = (self.ty_display(ty), self.ty_display(expected));
                     self.emit(code, range, &a0, &a1);
+                }
+            }
+        }
+    }
+
+    /// The void-operand use over a list/set/map literal's value elements
+    /// (upstream `literal_element_verifier.dart` :95 — `checkElement` →
+    /// `checkForUseOfVoidResult(element)`, and the entry arms :151/:156/
+    /// :166/:171 — `_verifyMapLiteralEntryKey`/`_Value` →
+    /// `checkForUseOfVoidResult(entry.key|entry.value)`): each `void`-typed
+    /// leaf expression reports at its own span. A `:`-led map entry splits
+    /// at its top-level colon and checks the key and value independently;
+    /// a `...`/`...?`-led spread operand answers its own face
+    /// (`_verifySpreadForListOrSet` runs no void check) and is left to it.
+    /// Runs for every literal — typed and untyped alike — so the entry
+    /// arms in [`Self::check_map_literal_entries`] stay assignability-only.
+    pub(crate) fn check_collection_void_elements(&mut self, left: Token, right: Token) {
+        let bytes = self.source.as_bytes();
+        for (s, e) in self.literal_leaves(left, right) {
+            let s = trim_ws(bytes, s, e);
+            // A spread operand (`...x`/`...?x`) is not a value element —
+            // its iterable-compatibility face owns the operand.
+            if bytes[s..].starts_with(b"...") {
+                continue;
+            }
+            // A map entry checks its key and value independently (the
+            // `?`-key/value promote non-null upstream, which a `void` leaf
+            // never reaches — the void use fires on the operand first).
+            let leaves: &[(usize, usize)] = &[(s, e)];
+            let mut sides: Vec<(usize, usize)> = Vec::new();
+            if let Some(colon) = top_level_colon(bytes, s, e) {
+                // A conditional element's `? :` splits inside the
+                // condition — the whole leaf stays one expression; only a
+                // `?`-free entry is a key/value pair.
+                if top_level_question(bytes, s, colon).is_none() {
+                    sides.push((s, colon));
+                    sides.push((colon + 1, e));
+                } else {
+                    sides.extend_from_slice(leaves);
+                }
+            } else {
+                sides.extend_from_slice(leaves);
+            }
+            for (ls, le) in sides {
+                let (ls, le) = (self.utf16_of(ls), self.utf16_of(le));
+                let Some((ty, range)) = self.leaf_completion_row(ls, le) else {
+                    continue;
+                };
+                // The leaf's `v()` invoke spells `Unknown` until
+                // `operand_static_ty` resolves the callee's `void` return.
+                let operand_ty = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.range == range)
+                    .map(|row| self.operand_static_ty(row))
+                    .unwrap_or(ty);
+                if operand_ty == Ty::Void {
+                    self.emit(SemanticCode::UseOfVoidResult, range, "", "");
                 }
             }
         }
@@ -12122,11 +12267,30 @@ impl Engine<'_> {
         }
         let Some(ret) = ret else { return };
         let is_sync = !*is_async;
+        // Pull the owned return type out of the frame borrow — `emit` needs
+        // `&mut self`, so the `&frame`/`&ret` borrow cannot outlive this.
+        let ret_ty = ret.ty;
         let Some((expr_ty, range)) =
             self.single_value_row_between(begin.range.end(), end.range.offset)
         else {
             return;
         };
+        // The void-operand use (upstream `yield_statement_resolver.dart`
+        // `_checkForUseOfVoidResult(node.expression)` at :181/:198 — both
+        // the `yield` and `yield*` arms): `yield x` on a `void`-typed `x`
+        // reports at the yielded expression. The row's raw `ty` spells an
+        // invoke's return `Unknown` — `operand_static_ty` resolves the
+        // callee's `void` face.
+        let operand_ty = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range == range)
+            .map(|row| self.operand_static_ty(row))
+            .unwrap_or(expr_ty);
+        if operand_ty == Ty::Void {
+            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        }
         let iterable = self.collection_heads[3];
         let stream = self.intern("Stream");
         let seq_head = if is_sync { iterable } else { stream };
@@ -12138,18 +12302,18 @@ impl Engine<'_> {
             // (`XPathSequence extends Iterable<XPathItem>`) answers through
             // its clause, while a wrap would ask the element-vs-element
             // covariance question the oracle never asks.
-            if self.assignable(expr_ty, ret.ty, false) == Some(false) {
+            if self.assignable(expr_ty, ret_ty, false) == Some(false) {
                 // Staged, not emitted: the oracle's verdict reads the
                 // source's flow-aware static type
                 // (`yield_statement_resolver.dart` `expression.typeOrThrow`
                 // — probe2484: a null-guard-promoted `yield* src` stays
                 // silent), so the promoted read re-decides at the teardown
                 // join with the promoted type as the implied return.
-                self.stage(StagedKind::YieldEach, range, expr_ty, ret.ty, false);
+                self.stage(StagedKind::YieldEach, range, expr_ty, ret_ty, false);
             }
             return;
         }
-        let Ty::Named { name, args, .. } = ret.ty else {
+        let Ty::Named { name, args, .. } = ret_ty else {
             return;
         };
         if name != seq_head {
@@ -12567,3 +12731,13 @@ mod ticket_3165_tests;
 #[cfg(test)]
 #[path = "ticket_3179_tests.rs"]
 mod ticket_3179_tests;
+
+/// The #3176 `use_of_void_result` pins — the assignability-driven operand
+/// seams folded onto the #3164 set (assignment right operand, declaration
+/// initializer, generic argument, for-in iterable, switch scrutinee, `??`
+/// left, `is` operand, interpolation, `await`, `throw`, `yield`, non-`!`
+/// unary, collection/map-entry elements, anonymous-invocation callee;
+/// error_detection_helpers.dart:245-258).
+#[cfg(test)]
+#[path = "ticket_3176_tests.rs"]
+mod ticket_3176_tests;

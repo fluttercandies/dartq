@@ -521,7 +521,7 @@ impl<'a> Engine<'a> {
                     if let Some((&inner_offset, _)) = self
                         .local_hits
                         .iter()
-                        .find(|(&off, _)| recv_span.offset < off && off < recv_span.end())
+                        .find(|&(&off, _)| recv_span.offset < off && off < recv_span.end())
                     {
                         // The inner read's own span: the identifier token at
                         // the hit offset (`local_hits` keys the read's
@@ -10801,6 +10801,29 @@ impl<'a> Engine<'a> {
                 }
                 _ => formal.ty,
             };
+            // The void-operand use (upstream `checkForUseOfVoidResult`
+            // over the argument expression, error_detection_helpers.dart:
+            // 245-258): `g(v())` consumes the void value unless the formal
+            // is itself `void` (`g(void x)` accepts it). The row reports
+            // at the argument's own span. `operand_static_ty` resolves the
+            // callee's `void` return — the level arg's `ty` spells an
+            // invoke `Unknown`.
+            let operand_ty = self
+                .rows
+                .iter()
+                .rev()
+                .find(|row| row.range == *range)
+                .map(|row| self.operand_static_ty(row))
+                .unwrap_or(*ty);
+            if operand_ty == Ty::Void && formal_ty != Ty::Void {
+                self.emit(
+                    SemanticCode::UseOfVoidResult,
+                    *range,
+                    "",
+                    "",
+                );
+                continue;
+            }
             // The function-subtype face (`_isFunctionSubtypeOf`,
             // upstream Dart SDK source, pkg/analyzer/lib/src/dart/element/
             // subtype.dart): a formal carrying a written generic
@@ -11920,6 +11943,17 @@ impl<'a> Engine<'a> {
         {
             let ret = self.boundary.pool().function_shape(shape).return_ty;
             self.rows[callee].ty = ret;
+        }
+        // The void-operand use on the invoked expression (upstream
+        // `function_expression_invocation_resolver.dart:56` —
+        // `_checkForUseOfVoidResult(function, receiverType)`): `v()()` —
+        // invoking a `void`-returning call's result — reports
+        // `use_of_void_result` at the callee's span.
+        if let Some(row) = self.rows.get(callee)
+            && row.ty == Ty::Void
+        {
+            let range = row.range;
+            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
         // The function-position face (`function_expression_invocation_
         // resolver.dart:131`): the invoked expression's own static type —
