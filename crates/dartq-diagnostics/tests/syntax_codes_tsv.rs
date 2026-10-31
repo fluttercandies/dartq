@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-/// blake3 digest of the pinned TSV snapshot (dart 3.13.1 oracle;
-/// analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 registries; 2026-10-08
-/// capture, 7 measured-dead rows pruned 2026-10-09 — #222). The surviving
+/// blake3 digest of the pinned TSV snapshot (dart 3.13.7 oracle — the pinned
+/// SDK registry `diagnostic.g.dart`; refreshed 2026-11-01 from the 2026-10-08
+/// dart 3.13.1 capture, 7 measured-dead rows pruned 2026-10-09 — #222). The
 /// table is 259 data rows: 255 registry-gated codes + 4 supplemental rows
 /// (the 3-code language-version family plus
 /// `invalid_covariant_modifier_in_primary_constructor`).
@@ -12,7 +12,7 @@ use std::path::Path;
 /// Any content edit changes the generated registry: re-verify the full table
 /// against the pinned registry sources first, then re-pin this digest
 /// deliberately. This test exists so a wrong text cannot ship green.
-const PINNED_BLAKE3: &str = "7d40c06d5e3b198c769da17837921e0a19daa5a80e8c40c3b2bb7b690a6c5740";
+const PINNED_BLAKE3: &str = "0ca513794ac5b1523688affcb62e93b523288880fa377a23d59b0b16099dbb8b";
 
 #[test]
 fn syntax_codes_tsv_matches_pinned_blake3() {

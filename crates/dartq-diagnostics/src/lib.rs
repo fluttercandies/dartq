@@ -12,7 +12,7 @@
 //! - [`CodeInfo`] and [`CodeRegistry`]: stable official code names
 //!   and
 //!   dartq-own `dartq/`-prefixed codes. The official table is generated at
-//!   build time from `data/syntax-codes.tsv` (dart 3.13.1 oracle lock).
+//!   build time from `data/syntax-codes.tsv` (dart 3.13.7 oracle lock).
 //! - [`Diagnostic`]: one diagnostic located by a [`FileId`] plus a
 //!   UTF-16-unit [`SourceRange`].
 //! - [`write_machine`] / [`write_json`]: byte-exact oracle output writers.

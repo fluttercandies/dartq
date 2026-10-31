@@ -8,7 +8,7 @@
 //!   pinned SDK tree's consolidated registry) — backs [`OFFICIAL_CODES`],
 //!   the per-code constants outside the syntax tier, and the published-docs
 //!   name list behind `analyzer_docs`;
-//! - `data/syntax-codes.tsv` — the dart 3.13.1 oracle-locked syntax tier —
+//! - `data/syntax-codes.tsv` — the dart 3.13.7 oracle-locked syntax tier —
 //!   backs [`SYNTAX_CODES`] (the prefix of [`OFFICIAL_CODES`]), the
 //!   syntax-tier constants, [`OFFICIAL_CODE_DATA`], and
 //!   [`message_template`].
