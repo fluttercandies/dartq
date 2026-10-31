@@ -499,9 +499,20 @@ pub enum SemanticCode {
     ExtensionTypeDeclaresMemberOfObject,
     /// `Expected a representation type.` — the representation formal
     /// declares no type (`error_verifier.dart:5450-5452`, the
-    /// primary-constructors-disabled arm; `SYNTACTIC_ERROR` tier,
-    /// `diagnostic.g.dart:5334-5345`).
+    /// primary-constructors-disabled arm; `SYNTAX_ERROR` tier,
+    /// diagnostic.g.dart:5334-5345).
     ExpectedRepresentationType,
+    /// `The representation field can't have a trailing comma.` — the
+    /// extension type's representation formal list closes with a comma
+    /// (`error_verifier.dart:5009-5015`, anchored at that comma;
+    /// `SYNTACTIC_ERROR` tier, diagnostic.g.dart:14963-14971,
+    /// unpublished).
+    RepresentationFieldTrailingComma,
+    /// `A non-redirecting 'factory' constructor must have a body.` — a
+    /// factory declaration whose head ends at `;` in a concrete class
+    /// (`error_verifier.dart:5088-5107`, anchored at `node.errorRange`;
+    /// `SYNTACTIC_ERROR` tier, diagnostic.g.dart:6194-6203, unpublished).
+    FactoryWithoutBody,
     /// `The extension type representation can't depend on itself.` — the
     /// representation field's declared type is the extension type itself
     /// (`error_verifier.dart:5343-5354`; the M1 name-level approximation of
@@ -2113,6 +2124,11 @@ impl SemanticCode {
                 "expected_representation_type",
                 "EXPECTED_REPRESENTATION_TYPE",
             ),
+            Self::RepresentationFieldTrailingComma => (
+                "representation_field_trailing_comma",
+                "REPRESENTATION_FIELD_TRAILING_COMMA",
+            ),
+            Self::FactoryWithoutBody => ("factory_without_body", "FACTORY_WITHOUT_BODY"),
             Self::ExtensionTypeRepresentationDependsOnItself => (
                 "extension_type_representation_depends_on_itself",
                 "EXTENSION_TYPE_REPRESENTATION_DEPENDS_ON_ITSELF",
@@ -2767,6 +2783,10 @@ impl SemanticCode {
             Self::WrongNumberOfTypeArgumentsFunction
                 | Self::MemberWithClassName
                 | Self::ExpectedRepresentationType
+                // `factoryWithoutBody` and `representationFieldTrailingComma`
+                // carry none either (diagnostic.g.dart:6194-6203/:14963-14971).
+                | Self::FactoryWithoutBody
+                | Self::RepresentationFieldTrailingComma
                 // `inconsistentInheritanceGetterAndMethod` carries no
                 // published docs (`messages.yaml` hasPublishedDocs: false).
                 | Self::InconsistentInheritanceGetterAndMethod
@@ -2807,7 +2827,12 @@ impl SemanticCode {
             Self::AnonymousMethodWrongParameterList
             | Self::WrongNumberOfParametersForSetter
             | Self::MemberWithClassName
-            | Self::ExpectedRepresentationType => DiagnosticType::SyntacticError,
+            | Self::ExpectedRepresentationType
+            // The representation-field and factory-head rows are syntax-tier
+            // upstream (`DiagnosticType.SYNTACTIC_ERROR`,
+            // diagnostic.g.dart:6194-6203 / :14963-14971).
+            | Self::RepresentationFieldTrailingComma
+            | Self::FactoryWithoutBody => DiagnosticType::SyntacticError,
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
@@ -3326,6 +3351,13 @@ impl SemanticCode {
             // Registry-backed rows, same face as the setter row above.
             Self::MemberWithClassName => registry_message("member_with_class_name"),
             Self::ExpectedRepresentationType => registry_message("expected_representation_type"),
+            // The #3196 rows: both live in the syntax-tier registry table
+            // (`crates/dartq-diagnostics/data/syntax-codes.tsv`), so the
+            // message renders from there.
+            Self::RepresentationFieldTrailingComma => {
+                registry_message("representation_field_trailing_comma")
+            }
+            Self::FactoryWithoutBody => registry_message("factory_without_body"),
             // No-argument flow row (diagnostic.g.dart:3546).
             Self::DeadCode => "Dead code.".to_string(),
             Self::UseOfVoidResult => {
@@ -4877,6 +4909,8 @@ mod tests {
             SemanticCode::MemberWithClassName,
             SemanticCode::ExtensionTypeDeclaresMemberOfObject,
             SemanticCode::ExpectedRepresentationType,
+            SemanticCode::RepresentationFieldTrailingComma,
+            SemanticCode::FactoryWithoutBody,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,
             SemanticCode::ExtensionTypeImplementsNotSupertype,
             SemanticCode::InheritsAbstractMemberOne,
@@ -5034,6 +5068,32 @@ mod tests {
         );
     }
 
+    /// The #3196 registration: both rows resolve their official descriptor
+    /// (name, machine form, syntax tier, unpublished). The registry twin is
+    /// `crates/dartq-diagnostics/data/syntax-codes.tsv` — the message
+    /// renders through `registry_message`, never an inline literal.
+    #[test]
+    fn ticket_3196_rows_resolve_their_descriptor() {
+        for (code, name, machine) in [
+            (
+                SemanticCode::RepresentationFieldTrailingComma,
+                "representation_field_trailing_comma",
+                "REPRESENTATION_FIELD_TRAILING_COMMA",
+            ),
+            (
+                SemanticCode::FactoryWithoutBody,
+                "factory_without_body",
+                "FACTORY_WITHOUT_BODY",
+            ),
+        ] {
+            let info = code.code_info();
+            assert_eq!(info.name, name);
+            assert_eq!(info.machine, machine);
+            assert_eq!(info.dtype, DiagnosticType::SyntacticError);
+            assert!(!info.has_published_docs, "{name}");
+        }
+    }
+
     /// The severity pin's coverage list — grows with each implemented batch
     /// (a data table, so it lives outside the test body).
     const SEVERITY_CODES: &[SemanticCode] = &[
@@ -5155,6 +5215,8 @@ mod tests {
         SemanticCode::MemberWithClassName,
         SemanticCode::ExtensionTypeDeclaresMemberOfObject,
         SemanticCode::ExpectedRepresentationType,
+        SemanticCode::RepresentationFieldTrailingComma,
+        SemanticCode::FactoryWithoutBody,
         SemanticCode::ExtensionTypeRepresentationDependsOnItself,
         SemanticCode::InheritsAbstractMemberOne,
         SemanticCode::InheritsAbstractMemberTwo,
@@ -5288,6 +5350,17 @@ mod tests {
         assert_eq!(
             SemanticCode::ExpectedRepresentationType.message("", ""),
             "Expected a representation type."
+        );
+        // The #3196 rows — the syntax-tier registry's own texts
+        // (`data/syntax-codes.tsv`, from diagnostic.g.dart:6194-6203 /
+        // :14963-14971).
+        assert_eq!(
+            SemanticCode::RepresentationFieldTrailingComma.message("", ""),
+            "The representation field can't have a trailing comma."
+        );
+        assert_eq!(
+            SemanticCode::FactoryWithoutBody.message("", ""),
+            "A non-redirecting 'factory' constructor must have a body."
         );
         assert_eq!(
             SemanticCode::WrongNumberOfTypeArguments.message3("C", "2", "1"),
@@ -5605,6 +5678,8 @@ mod tests {
         "wrong_number_of_parameters_for_setter",
         "member_with_class_name",
         "expected_representation_type",
+        "representation_field_trailing_comma",
+        "factory_without_body",
     ];
 
     /// The exhaustive enum walk: one arm per `SemanticCode` variant, no
@@ -5683,6 +5758,8 @@ mod tests {
             | SemanticCode::EqualKeysInConstMap
             | SemanticCode::EqualKeysInMap
             | SemanticCode::ExpectedRepresentationType
+            | SemanticCode::RepresentationFieldTrailingComma
+            | SemanticCode::FactoryWithoutBody
             | SemanticCode::ExtensionOverrideArgumentNotAssignable
             | SemanticCode::ExtensionTypeDeclaresMemberOfObject
             | SemanticCode::ExtensionTypeRepresentationDependsOnItself
@@ -6004,6 +6081,8 @@ mod tests {
             SemanticCode::EqualElementsInSet,
             SemanticCode::EqualKeysInMap,
             SemanticCode::ExpectedRepresentationType,
+            SemanticCode::RepresentationFieldTrailingComma,
+            SemanticCode::FactoryWithoutBody,
             SemanticCode::ExtensionOverrideArgumentNotAssignable,
             SemanticCode::ExtensionTypeDeclaresMemberOfObject,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,

@@ -720,6 +720,17 @@ mod tests {
             message_template("expected_representation_type"),
             Some("Expected a representation type.")
         );
+        // The #3196 emit rows (dartq-semantic's `RepresentationFieldTrailingComma`
+        // / `FactoryWithoutBody`): both resolve from this table, so the
+        // semantic side renders them through `registry_message`.
+        assert_eq!(
+            message_template("representation_field_trailing_comma"),
+            Some("The representation field can't have a trailing comma.")
+        );
+        assert_eq!(
+            message_template("factory_without_body"),
+            Some("A non-redirecting 'factory' constructor must have a body.")
+        );
     }
 
     /// Audit F1: exactly 15 published codes among the 259 table rows — the 13
