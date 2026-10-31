@@ -302,14 +302,15 @@ fn typedef_old_style_no_name() {
     );
 }
 
-/// Type arguments alone after `=` recover as a missing `Function` alias and
-/// report the missing parameter list on the group's closer (official
-/// parseTypedef :1596-1605).
+/// Type arguments alone after `=` recover as a missing `Function` alias:
+/// the synthetic `Function` keyword reports `expectedButGot('Function')`
+/// re-anchored onto the `<` (official parseTypedef :1560-1568) and the
+/// missing parameter list lands on the group's closer (:1551).
 #[test]
 fn typedef_type_arguments_only() {
     assert_codes(
         "typedef i = <F, G, H, I, J>;\n",
-        &["missing_typedef_parameters"],
+        &["expected_token", "missing_typedef_parameters"],
         "typedef type arguments only",
     );
 }
@@ -426,5 +427,17 @@ fn annotation_space_before_parenthesis() {
         "@metadata (x, y)\nclass C {}\n",
         &["annotation_space_before_parenthesis"],
         "spaced annotation arguments",
+    );
+}
+
+/// The single-argument variant (`typedef i = <int>;`, oracle 3.13.7):
+/// identical missing-`Function` face — the builtin-argument group takes the
+/// same recovery as the multi-argument one.
+#[test]
+fn typedef_type_arguments_only_single_builtin_arg() {
+    assert_codes(
+        "typedef i = <int>;\n",
+        &["expected_token", "missing_typedef_parameters"],
+        "typedef single type argument",
     );
 }

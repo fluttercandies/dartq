@@ -143,10 +143,11 @@ fn enum_clean_body_silent() {
 /// An extension type with no static×instance name overlap emits nothing.
 #[test]
 fn extension_type_clean_body_silent() {
-    assert_silent(
+    let report = report_ops(
         "extension type M(int x) {\n\
          \x20 static void m() {}\n\
          \x20 void n() {}\n\
          }\n",
     );
+    assert_silent(&report);
 }

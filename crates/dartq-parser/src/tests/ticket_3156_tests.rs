@@ -172,3 +172,4 @@ fn super_initializer_keyword_name_paren_anchor() {
          `foo`; got {rows:?}"
     );
 }
+

@@ -106,4 +106,3 @@ fn index_close_reports_expected_but_got_and_unmatched() {
          the length-3 expectedButGot; got {rows:?}"
     );
 }
-

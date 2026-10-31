@@ -158,12 +158,13 @@ fn typedef_rhs_type_arguments_only_with_params() {
 }
 
 /// `<typeArgs>;` keeps the missing-parameter report on the group's closer
-/// (official :1596-1605, pinned in wave 2 and kept green).
+/// (official :1551) beside the missing-`Function` row on the `<`
+/// (:1560-1568, pinned in wave 2 and kept green).
 #[test]
 fn typedef_rhs_type_arguments_only_semicolon() {
     assert_codes(
         "typedef i = <F, G, H, I, J>;\n",
-        &["missing_typedef_parameters"],
+        &["expected_token", "missing_typedef_parameters"],
         "typedef type arguments only",
     );
 }
