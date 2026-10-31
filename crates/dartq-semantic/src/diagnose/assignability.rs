@@ -2124,9 +2124,46 @@ impl<'a> Engine<'a> {
     /// the field's declared type or the setter's value formal
     /// (`writeAcceptedType`); executables and unknown receivers stay
     /// `Unknown`.
+    ///
+    /// A bare read's push-time snapshot is the GETTER's face when the name
+    /// names an accessor pair or an implicit-this member, never the write
+    /// type the oracle checks (`AssignmentExpressionImpl.writeType` is
+    /// `writeElement.type` — the `name=` setter's value formal, or the
+    /// field/variable's declared type). So the bare arm re-derives the write
+    /// face from the name's resolution ([`Self::member_write_ty`] for an
+    /// implicit-this member, [`Self::top_level_write_ty`] for a library
+    /// name): a local binding keeps its snapshot (the flow layer owns the
+    /// local's read face), and every other face answers the write target the
+    /// setter/field walk gives.
     pub(crate) fn assignment_target_ty(&mut self, row: &Row) -> Ty {
         match &row.shape {
-            RowShape::Bare(BareInfo::Plain { ty }) => *ty,
+            RowShape::Bare(BareInfo::Plain { ty }) => {
+                let snapshot = *ty;
+                match self.resolve_bare(row.name).1 {
+                    // A local binding (and every face that is no write
+                    // target at all) keeps its push-time capture: the local's
+                    // declared type IS its write type, and the other faces
+                    // report through their own codes (`undefined_setter`,
+                    // `assignment_to_type`).
+                    RefTarget::Local
+                    | RefTarget::TypeParam
+                    | RefTarget::Prefix
+                    | RefTarget::This
+                    | RefTarget::Opaque
+                    | RefTarget::Missing => snapshot,
+                    // An implicit-this member read (`b ??= e` inside the
+                    // class that declares the pair): the write resolves
+                    // through `name=`/the field, exactly like `this.b = e`.
+                    RefTarget::Member { container } => self.member_write_ty(container, row.name),
+                    // A top-level name: the setter's value formal first (the
+                    // `void set b(B? value)` write face), else the variable's
+                    // own declared type; a getter-only name keeps the empty
+                    // face (upstream's `InvalidType` write type accepts
+                    // everything, so the assignment check stays silent and
+                    // `undefined_setter` owns the report).
+                    RefTarget::Decl { .. } => self.top_level_write_ty(row.name),
+                }
+            }
             RowShape::Bare(BareInfo::Container { name, kind }) => {
                 // A container name is never a valid assignment target — the
                 // oracle reports assignment-to-`this`-prefix shapes with
@@ -2215,6 +2252,39 @@ impl<'a> Engine<'a> {
                 }
                 _ => Ty::UNKNOWN,
             },
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// A top-level name's write face (`getWriteType` over the library's
+    /// declaration table): the `name=` setter's single value formal when the
+    /// pair declares one (the `void set b(B? value)` arm — `b ??= e` and
+    /// `b = e` both check against `B?`), else a top-level variable's declared
+    /// type (the inferred overlay included). Getters, functions, and type
+    /// aliases answer nothing: their assignment reports through
+    /// `undefined_setter`/`assignment_to_function`, never the assignability
+    /// face (upstream's write element is `InvalidType` there, which accepts
+    /// every source).
+    ///
+    /// Strays stay under-report: a name the scoped lookup missed, a broken
+    /// chain, and an untyped declaration all answer `Unknown`.
+    fn top_level_write_ty(&mut self, name: StringId) -> Ty {
+        let setter = self.setter_spelling(name);
+        if let Some(decl) = self.top_level_decl(setter)
+            && decl.kind == MicroKind::TopLevelFn
+            && let Some(formal) = decl
+                .formals
+                .as_deref()
+                .and_then(|formals| formals.positional.first())
+        {
+            let ty = formal.ty;
+            return self.fold_alias_ty(ty);
+        }
+        match self.top_level_decl(name) {
+            Some(decl) if decl.kind == MicroKind::TopLevelVar => {
+                let model = decl.var_ty;
+                self.fold_alias_ty(self.top_var_model_ty(name, model))
+            }
             _ => Ty::UNKNOWN,
         }
     }
@@ -4744,12 +4814,11 @@ impl<'a> Engine<'a> {
         // report). A parameter SOURCE re-enters [`Self::assignable`], whose
         // same-head matrix decides the reflexive and nullable spellings
         // (`t = t` silent, `T?` into `T` reporting); a bound-chained
-        // parameter source (`S extends T`, probed silent) is not separable
-        // here — the face's frames are popped and the bound is not
-        // name-addressable — so it rides the rejection with the interface
-        // sources (the over-report residual). Everything else (`dynamic`,
-        // `Never`, `Unknown`, `void`) keeps the generic matrix. The
-        // decl-table predicate decides param-ness in BOTH passes — the
+        // parameter source (`S extends T`, probed silent) answers through its
+        // declared bound (the Left Type Variable Bound arm below), so the
+        // bound chain no longer rides the interface refusal. Everything else
+        // (`dynamic`, `Never`, `Unknown`, `void`) keeps the generic matrix.
+        // The decl-table predicate decides param-ness in BOTH passes — the
         // staged row and the teardown re-decision agree, which the live
         // frame sets alone cannot (empty once the frames pop).
         if let Ty::Named {
@@ -4764,6 +4833,21 @@ impl<'a> Engine<'a> {
                 Ty::Named {
                     name: from_name, ..
                 } if from_name == to_name => self.assignable(from, to, false),
+                // A distinct parameter source answers through its declared
+                // bound (subtype.dart:336-350's Left Type Variable Bound —
+                // `S <: T` iff `bound(S) <: T`, and `bound(S) == T` is the
+                // same-head reflexive arm), so `S extends T` no longer rides
+                // the interface refusal (the over-report this ticket lifts).
+                Ty::Named { name: from_name, .. } if self.is_scope_param(from_name) => {
+                    match self.param_bound(from_name) {
+                        Some(bound) if bound != Ty::Unknown => {
+                            self.assignable(bound, to, false)
+                        }
+                        // No written bound captured: the interface refusal
+                        // stands (the under-report-safe side).
+                        _ => Some(false),
+                    }
+                }
                 Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
                 _ => self.assignable(from, to, false),
             };
@@ -6031,6 +6115,39 @@ impl<'a> Engine<'a> {
                 _ => None,
             };
         }
+        // The type-variable SOURCE arms (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/element/subtype.dart:82-131 — the Right
+        // Object arm's `X0` leg — and :336-350 — Left Type Variable Bound):
+        // a bare, non-nullable in-scope parameter `T` subtypes a target `T1`
+        // exactly when its declared bound does. `T <: Object` is `B <: Object`
+        // (an unbounded `T` carries the implicit `Object?`, so it does NOT
+        // subtype `Object`), and `T extends num` subtypes neither `String`
+        // nor `String?`. A parameter TARGET is the Left Variable arm's own
+        // business ([`Self::assignment_verdict`] and the `to_is_param` block
+        // below decide it), so this arm defers on one.
+        //
+        // The bound read is the WRITTEN capture ([`Engine::param_bound`]): an
+        // unwritten bound keeps the matrix's answer rather than assuming the
+        // implicit `Object?` (the capture cannot tell an unwritten bound from
+        // a missed one, and guessing it would overturn every unbounded
+        // parameter's clean pair). A bound that mentions the parameter itself
+        // (`X extends FutureOr<X>`) declines — recursing into it would cycle
+        // — and a promoted read's narrowing is not modeled here (the rows
+        // carry the declared parameter type; the flow layers re-derive at the
+        // read).
+        if let Ty::Named {
+            name: from_name,
+            nullable: false,
+            args: ArgListId::EMPTY,
+        } = from
+            && self.is_scope_param(from_name)
+            && !matches!(to, Ty::Named { name: to_name, .. } if self.is_scope_param(to_name))
+            && let Some(bound) = self.param_bound(from_name)
+            && bound != Ty::Unknown
+            && !self.bound_mentions_param(bound, from_name, 0)
+        {
+            return self.assignable(bound, to, from_literal);
+        }
         // The cross-family arms below read `from_fn`/`to_fn` computed at
         // entry (the written pair — the alias faces' signature capture).
         if let Some(verdict) = to.assignable_from(from) {
@@ -6365,6 +6482,37 @@ impl<'a> Engine<'a> {
             return Some(from_literal);
         }
         Some(false)
+    }
+
+    /// Whether a parameter's declared bound mentions the parameter itself
+    /// anywhere in its shape — the `X extends FutureOr<X>` / `X extends A<X>`
+    /// spellings. The type-variable source arm refuses such a bound: asking
+    /// `B <: T1` would meet the same `X` again and re-enter the arm forever.
+    /// A function- or record-shaped bound declines outright (arbitrarily
+    /// nested, and the shape pools make an exact walk dear for a face this
+    /// rare); the depth cap is the belt-and-braces guard for a self-referential
+    /// argument list.
+    fn bound_mentions_param(&self, ty: Ty, name: StringId, depth: u32) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        match ty {
+            Ty::Named {
+                name: head, args, ..
+            } => {
+                if head == name {
+                    return true;
+                }
+                // Own the list before recursing: the pool guard borrows the
+                // args cell, and the walk re-enters it (`assignable`'s own
+                // invariant, #2594).
+                let args = self.boundary.pool().get(args).to_vec();
+                args.iter()
+                    .any(|arg| self.bound_mentions_param(*arg, name, depth + 1))
+            }
+            Ty::Function { .. } | Ty::Record { .. } => true,
+            _ => false,
+        }
     }
 
     /// The 'call' tearoff arm of the cross-family function face

@@ -17604,3 +17604,17 @@ mod ticket_3235_tests;
 #[cfg(test)]
 #[path = "ticket_3236_tests.rs"]
 mod ticket_3236_tests;
+// The #3247 pins (the #3221 recon's assignability faces: the assignment
+// write type is the WRITE element's own face — `AssignmentExpressionImpl
+// .writeType` — so a getter/setter pair and an implicit-this member answer
+// through `name=`/the field's declared type instead of the read row, and a
+// top-level variable answers its declared type; plus the type-variable
+// SOURCE arms of the subtype relation, subtype.dart's Right Object `X0` leg
+// and Left Type Variable Bound, so a bounded parameter's pair decides
+// through its bound and `S extends T` writes into `T` clean). Registered
+// here because `diagnose.rs` is a live-lane file out of this ticket's write
+// scope; `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3247_tests.rs"]
+mod ticket_3247_tests;
