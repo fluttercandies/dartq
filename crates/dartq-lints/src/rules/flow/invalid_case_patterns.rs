@@ -1,32 +1,40 @@
-use core::ops::Range;
-
 use dartq_ast::NodeKind;
+use dartq_scanner::{Keyword, TokenKind};
 
 use super::{Check, PayloadField, RuleSpec};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/invalid_case_patterns.dart` — a legacy
 /// `case` head whose expression is not a valid 3.0 constant-pattern
-/// spelling reports at the expression (:50-88): a non-`const`
-/// list/set-or-map literal, a `dart:core` `identical(...)` call, a
-/// unary prefix whose operand is not an integer literal, any binary
-/// or conditional expression, a `dart:core` `length` property access,
-/// an `is` check, or the bare `_` identifier.
+/// spelling reports at the head's unparenthesized extent (:50-88). The
+/// arms: a non-`const` list or set/map literal (:52-59), a `dart:core`
+/// `identical(...)` call (:60-63), a prefix expression whose operand is
+/// not an integer literal (:64-67), any binary expression (:68-70), any
+/// conditional expression (:71-73), a `dart:core` `length` property
+/// access (:72-75), an `is` check (:76-77), an implicit-const instance
+/// creation (:78-81), and the bare `_` identifier (:82-87).
 ///
 /// Gate: the official registration bails WITH the feature (:41 — the
 /// lint exists for pre-3.0 libraries only); the same
-/// [`crate::engine::Features::patterns`] bit keys the parser's
-/// case-head branch, so with patterns on the operands are patterns
-/// and the rule is silent.
+/// [`crate::engine::Features::patterns`] bit keys this rule's
+/// registration, so with patterns on the rule never runs.
 ///
-/// Faces: the legacy case operand sits in a [`NodeKind::CaseExpression`]
-/// wrapper whose window's last row is the expression root (the fixed
-/// parse surface wraps every operand; the parenthesized wrappers peel
-/// the same way). The dart:core membership of `identical`/`length` is
-/// name-level (a user `identical`/`length` over-reports). The
-/// implicit-const constructor-call face (`C()` where the constructor
-/// is const, :78-81) needs constructor resolution and under-reports.
-/// Message: `diagnostic.g.dart` `invalidCasePatterns`.
+/// The head is classified from its TOKENS, not from the arena rows. The
+/// lint bridge parses every unit on the fixed Dart 3.15 surface
+/// ([`crate::bridge`] `PARSE_FEATURES`), so a 2.19 head is parsed as a
+/// *pattern*, and the pattern grammar truncates the legacy expression
+/// surface (`case 1 + 2:` folds to the constant pattern `1`, the `+ 2`
+/// tail recovered) — the rows cannot answer the official arms. The token
+/// run between `case` and the head's own `:` is exactly the surface the
+/// official expression parse consumed, so every arm reads off it; the
+/// report range is that run's extent (the official
+/// `reportAtNode(expression)`).
+///
+/// Boundaries: the `identical`/`length` membership faces are name-level
+/// (a user `identical`/`length` over-reports); the implicit-const
+/// constructor-call arm (`C()` where the constructor is const, :78-81)
+/// needs constructor resolution the rule context cannot reach and
+/// under-reports. Message: `diagnostic.g.dart` `invalidCasePatterns`.
 pub(crate) static SPEC: RuleSpec =
     crate::spec!("invalid_case_patterns", &[NodeKind::SwitchCase], check,);
 
@@ -51,122 +59,301 @@ fn check(c: &mut Check<'_>) {
         .take(count)
         .collect();
     for wrapper in wrappers {
-        // The run bound is the case clause's own extent: the adopted
-        // window anchors at earlier statements' tail tokens on the
-        // recovery shapes, and their rows must not join the head.
-        let Some((operand, run)) = operand_root(c, wrapper, c.byte_span(c.node())) else {
+        let Some(head) = head_tokens(c, wrapper) else {
             continue;
         };
-        if is_invalid(c, &run, operand) {
-            // The unary-recovery face reports the whole head run (the
-            // `-o` operator is a bare recovery marker, so the operand
-            // row carries only the operand); every other face reports
-            // the operand row (the official `reportAtNode(expression)`).
-            let range = if unary_recovery(c, &run) {
-                let mut span = c.utf16_span(run[0]);
-                for &row in &run[1..] {
-                    let other = c.utf16_span(row);
-                    span.start = span.start.min(other.start);
-                    span.end = span.end.max(other.end);
-                }
-                span
-            } else {
-                c.utf16_span(operand)
-            };
-            c.report(range, &[]);
+        let head = unparenthesized(c, &head);
+        if head.is_empty() || !is_invalid(c, head) {
+            continue;
         }
-    }
-}
-
-/// The operand root and the row run that holds it: the wrapper
-/// window's rows within the wrapper's own extent (earlier statements'
-/// rows leak into the adopted window), peeling the parenthesized
-/// wrappers and the constant-pattern wrap the patterns parse adds
-/// (`unParenthesized`, :51). A wrap whose window is empty seals
-/// childless — its rows precede it in the run — so the peel pops the
-/// wrap row in place.
-fn operand_root(c: &Check<'_>, wrapper: u32, extent: Range<usize>) -> Option<(u32, Vec<u32>)> {
-    let mut run: Vec<u32> = c
-        .children(wrapper)
-        .filter(|&row| {
-            let span = c.byte_span(row);
-            span.start >= extent.start && span.end <= extent.end
-        })
-        .collect();
-    loop {
-        let Some(&last) = run.last() else {
-            return None;
+        let (Some(start), Some(end)) = (
+            c.utf16_of_token(head[0]),
+            c.utf16_end_of_token(head[head.len() - 1]),
+        ) else {
+            continue;
         };
-        match c.kind(last) {
-            NodeKind::ParenthesizedExpression
-            | NodeKind::ParenthesizedPattern
-            | NodeKind::ConstantPattern => {
-                // The `ConstantPattern` row is payload-free — the
-                // explicit-const skip (:52-59, :78-81) had no word to
-                // read and never fired, so a const operand peels like
-                // any parenthesized wrapper (the pinned behavior).
-                run.pop();
+        c.report(start..end, &[]);
+    }
+}
+
+/// The head's token run: every token between the `case` keyword and the
+/// head's own `:`.
+///
+/// The run is read off the token table (source order), never the arena:
+/// the parse recovers the legacy tail as junk (`expect_kind` splices a
+/// synthetic colon AT the offending token and consumes it), so the case
+/// row's extent stops short of the surface the official rule inspects. A
+/// depth-0 `:` ends the head, a ternary's colon is consumed by its
+/// pending `?`, and a `when` clause (`when` is a 3.0 suffix, outside this
+/// rule's gate) ends it too.
+fn head_tokens(c: &Check<'_>, wrapper: u32) -> Option<Vec<u32>> {
+    let case_token = c.head_token(wrapper);
+    if c.token_is_synthetic(case_token) {
+        return None;
+    }
+    let tokens = c.unit.tokens;
+    let mut run = Vec::new();
+    let mut depth = 0usize;
+    let mut ternary = 0usize;
+    let mut index = case_token + 1;
+    while let Some(token) = tokens.get(index as usize) {
+        let kind = token.kind;
+        if depth == 0 {
+            match kind {
+                TokenKind::Eof
+                | TokenKind::CloseCurly
+                | TokenKind::Keyword(Keyword::Case | Keyword::Default | Keyword::When) => break,
+                TokenKind::Colon if ternary == 0 => break,
+                TokenKind::Question => ternary += 1,
+                TokenKind::Colon => ternary -= 1,
+                _ => {}
             }
-            _ => return Some((last, run)),
+        }
+        match kind {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if !token.is_synthetic() {
+            run.push(index);
+        }
+        index += 1;
+    }
+    Some(run)
+}
+
+/// The official `unParenthesized` (:51): enclosing parenthesized groups
+/// peel, so the report stays inside the parens.
+fn unparenthesized<'r>(c: &Check<'_>, mut run: &'r [u32]) -> &'r [u32] {
+    while run.len() >= 2 && kind(c, run[0]) == TokenKind::OpenParen {
+        let Some(close) = group_close(c, run) else {
+            break;
+        };
+        if close + 1 != run.len() {
+            break;
+        }
+        run = &run[1..close];
+    }
+    run
+}
+
+/// The run index where the group opened at `run[0]` closes.
+fn group_close(c: &Check<'_>, run: &[u32]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, &token) in run.iter().enumerate() {
+        match kind(c, token) {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
         }
     }
+    None
 }
 
-/// Whether the peeled run opens with a unary-prefix recovery (the
-/// `-`/`!` operator tiles as a leading [`NodeKind::UnaryPrefix`]
-/// marker or a bare [`NodeKind::RecoverableError`]).
-fn unary_recovery(c: &Check<'_>, run: &[u32]) -> bool {
-    run.len() > 1
-        && matches!(
-            c.kind(run[0]),
-            NodeKind::UnaryPrefix | NodeKind::RecoverableError
-        )
+/// Whether a head run matches one of the official reporting arms.
+fn is_invalid(c: &Check<'_>, run: &[u32]) -> bool {
+    // The explicit-`const` spellings are never invalid: the literals'
+    // `constKeyword == null` guard (:53-57) and the instance-creation
+    // `keyword?.type != CONST` guard (:79-81).
+    if kind(c, run[0]) == TokenKind::Keyword(Keyword::Const) {
+        return false;
+    }
+    if is_non_const_literal(c, run) {
+        return true;
+    }
+    if let Some(operand) = prefix_operand(c, run) {
+        // `-1` is the one exempt prefix spelling (:64-67): its operand is
+        // an integer literal.
+        return !(operand.len() == 1
+            && matches!(kind(c, operand[0]), TokenKind::Int | TokenKind::Hexadecimal));
+    }
+    if is_identical_call(c, run) {
+        return true;
+    }
+    // The bare `_` identifier (:82-87).
+    if run.len() == 1 && kind(c, run[0]) == TokenKind::Identifier && c.lexeme(run[0]) == "_" {
+        return true;
+    }
+    has_invalid_top_level_operator(c, run)
 }
 
-/// The official visitor's expression faces (:52-87). The patterns
-/// parse spells the legacy heads under other names: the collection
-/// literals become list/map patterns, `&&`/`||` become a binary
-/// pattern, an `is` check recovers as an `IsExpression`, the `-`/`!`
-/// prefix recovers into a leading marker, `_` becomes the wildcard
-/// pattern, and `identical(...)` becomes an object pattern whose type
-/// names the callee. A `ListLiteral`/`SetOrMapLiteral` row is the
-/// `const`-expression form (`const [1, 2]`) — the official
-/// const-literal face, never invalid.
-fn is_invalid(c: &Check<'_>, run: &[u32], operand: u32) -> bool {
-    // The unary prefix face (:64-67 — `-1` is valid, `-o`/`!b` are
-    // not): the recovered operator marker leads the run and only a
-    // single integer-literal operand is exempt.
-    if unary_recovery(c, run) {
-        return !(run.len() == 2 && c.kind(run[1]) == NodeKind::LiteralInt);
+/// The non-`const` list / set-or-map literal arm (:52-59).
+fn is_non_const_literal(c: &Check<'_>, run: &[u32]) -> bool {
+    let Some(start) = literal_start(c, run) else {
+        return false;
+    };
+    match kind(c, run[start]) {
+        // `[]` scans as one self-closed token.
+        TokenKind::Index => start + 1 == run.len(),
+        _ => group_close(c, &run[start..]) == Some(run.len() - start - 1),
     }
-    match c.kind(operand) {
-        // A non-`const` collection literal (:52-59), any binary or
-        // conditional expression, any `is` check (:68-77).
-        NodeKind::ListPattern
-        | NodeKind::MapPattern
-        | NodeKind::BinaryExpression
-        | NodeKind::BinaryPattern
-        | NodeKind::Conditional
-        | NodeKind::IsExpression
-        | NodeKind::CastPattern => true,
-        // `identical(...)` (:60-63) — the name-level dart:core face
-        // over the object-pattern spelling of the call.
-        NodeKind::ObjectPattern => c
-            .field(operand, PayloadField::FirstName)
-            .is_some_and(|head| c.lexeme(head) == "identical"),
-        // `.length` (:72-75) — the name-level dart:core face.
-        NodeKind::DotAccess => c.lexeme(c.head_token(operand)) == "length",
-        // The bare `_` identifier (:82-87) — the wildcard spelling
-        // under the patterns parse.
-        NodeKind::Identifier => c.lexeme(c.head_token(operand)) == "_",
-        NodeKind::WildcardPattern => true,
-        // The pattern grammar rejects the head's tail outright (the
-        // `true ? 1 : 2` ternary recovers into a `?`-marker and error
-        // rows) — under the official 2.19 parse the same head is an
-        // expression face this rule reports (:50-88).
-        NodeKind::RecoverableError => true,
-        _ => false,
+}
+
+/// The index of the literal's opening bracket, past optional type
+/// arguments (`<int>[1, 2]` — the official literal's extent covers them,
+/// so the report does too).
+fn literal_start(c: &Check<'_>, run: &[u32]) -> Option<usize> {
+    let start = if kind(c, run[0]) == TokenKind::Lt {
+        type_arguments_end(c, run, 0)? + 1
+    } else {
+        0
+    };
+    matches!(
+        kind(c, *run.get(start)?),
+        TokenKind::OpenSquare | TokenKind::OpenCurly | TokenKind::Index
+    )
+    .then_some(start)
+}
+
+/// The run index of the closer for the type-argument group opened at
+/// `open` (`<<`/`>>`/`>>>` count as two/three, so a nested
+/// `<List<int>>` closes at the combined token).
+fn type_arguments_end(c: &Check<'_>, run: &[u32], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (index, &token) in run.iter().enumerate().skip(open) {
+        match kind(c, token) {
+            TokenKind::Lt => depth += 1,
+            TokenKind::LtLt => depth += 2,
+            TokenKind::Gt => depth -= 1,
+            TokenKind::GtGt => depth -= 2,
+            TokenKind::GtGtGt => depth -= 3,
+            _ => {}
+        }
+        if depth <= 0 && index > open {
+            return Some(index);
+        }
     }
+    None
+}
+
+/// The operand run of a leading prefix operator (`-`/`!`/`~`/`++`/`--`).
+fn prefix_operand<'r>(c: &Check<'_>, run: &'r [u32]) -> Option<&'r [u32]> {
+    if run.len() < 2 {
+        return None;
+    }
+    match kind(c, run[0]) {
+        TokenKind::Minus
+        | TokenKind::Bang
+        | TokenKind::Tilde
+        | TokenKind::PlusPlus
+        | TokenKind::MinusMinus => Some(&run[1..]),
+        _ => None,
+    }
+}
+
+/// The `dart:core` `identical(...)` call arm (:60-63) — the name-level
+/// face over the call's spelling.
+fn is_identical_call(c: &Check<'_>, run: &[u32]) -> bool {
+    if run.len() < 3
+        || kind(c, run[0]) != TokenKind::Identifier
+        || kind(c, run[1]) != TokenKind::OpenParen
+        || c.lexeme(run[0]) != "identical"
+    {
+        return false;
+    }
+    group_close(c, &run[1..]) == Some(run.len() - 2)
+}
+
+/// The expression arms read off the head's top level: `is` (:76-77), the
+/// binary operators (:68-70), the conditional `?` (:71-73), and the
+/// trailing `.length` property access (:72-75).
+fn has_invalid_top_level_operator(c: &Check<'_>, run: &[u32]) -> bool {
+    // `run[0]` is the operand head; a leading operator is the prefix arm.
+    let mut index = 1;
+    while index < run.len() {
+        let token = run[index];
+        // A type-argument group ahead of a call or literal is part of that
+        // expression, not a comparison (`f<int>(1)` is a method invocation
+        // the official rule leaves alone).
+        if kind(c, token) == TokenKind::Lt
+            && let Some(close) = type_arguments_end(c, run, index)
+            && let Some(&after) = run.get(close + 1)
+            && matches!(
+                kind(c, after),
+                TokenKind::OpenParen
+                    | TokenKind::OpenSquare
+                    | TokenKind::OpenCurly
+                    | TokenKind::Index
+            )
+        {
+            index = close + 1;
+            continue;
+        }
+        // Nested groups keep their operators off the head's top level.
+        if matches!(
+            kind(c, token),
+            TokenKind::OpenParen
+                | TokenKind::OpenSquare
+                | TokenKind::OpenCurly
+                | TokenKind::StringInterpolationExpression
+        ) {
+            index = group_close(c, &run[index..]).map_or(run.len(), |close| index + close + 1);
+            continue;
+        }
+        match kind(c, token) {
+            TokenKind::Keyword(Keyword::Is) => return true,
+            // A bare `?` at the head's top level is the conditional
+            // operator (`?.`/`??`/`?..` scan as their own tokens, and the
+            // legacy expression parse reads a lone `?` as the ternary).
+            TokenKind::Question => return true,
+            TokenKind::Period | TokenKind::QuestionPeriod
+                if index + 2 == run.len() && c.lexeme(run[index + 1]) == "length" =>
+            {
+                return true;
+            }
+            kind if is_binary_operator(kind) => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The operators that make the head a `BinaryExpression`. `as` is a
+/// cast (the official rule has no arm for it), `..` a cascade and the
+/// assignment forms are neither.
+fn is_binary_operator(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::TildeSlash
+            | TokenKind::LtLt
+            | TokenKind::GtGt
+            | TokenKind::GtGtGt
+            | TokenKind::Ampersand
+            | TokenKind::Bar
+            | TokenKind::Caret
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::Gt
+            | TokenKind::LtEq
+            | TokenKind::GtEq
+            | TokenKind::AmpersandAmpersand
+            | TokenKind::BarBar
+            | TokenKind::QuestionQuestion
+    )
+}
+
+fn kind(c: &Check<'_>, token: u32) -> TokenKind {
+    c.token(token).map_or(TokenKind::Eof, |token| token.kind)
 }
 
 #[cfg(test)]
@@ -176,9 +363,9 @@ mod tests {
     use crate::engine::{Features, Unit};
     use crate::testsupport::one_rule;
 
-    /// The legacy parse posture: the bridge parses with the patterns
-    /// bit off, so the `case` heads are plain expressions (the same
-    /// face the official `LanguageVersion219` corpus runs under).
+    /// The 2.19 posture: the bit gates the rule's registration (the
+    /// official `LanguageVersion219` corpus), while the grammar stays the
+    /// bridge's fixed 3.15 surface — the head is read off its tokens.
     fn legacy(source: &str) -> Vec<crate::engine::Lint> {
         let features = Features {
             patterns: false,

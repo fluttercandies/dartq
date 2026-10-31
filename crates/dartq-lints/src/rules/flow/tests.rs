@@ -2776,6 +2776,281 @@ fn anonymous_function_call_multiline_own_args_reports() {
     );
 }
 
+// —— invalid_case_patterns ————————————————————————————————————————————
+
+/// The whole upstream corpus (`InvalidCasePatternsTestLanguage219`, 25
+/// cases, plus the three `messages.yaml` doc examples) pinned against the
+/// oracle rows of `conformance/expected.tsv`: each entry is the case
+/// source verbatim (the materialized file carries a leading blank line,
+/// so the upstream `4:10` rows land as written) and the oracle's
+/// `(line, column, length)` for every `invalid_case_patterns` row. The
+/// harness cases run at the 2.19 posture (the registration bails with
+/// `Feature.patterns` on); the doc examples run at the default posture,
+/// where the same gate keeps the rule silent. Every mismatch is collected
+/// before the single panic so one run shows the whole deviation set.
+#[test]
+fn invalid_case_patterns_oracle_corpus_pins() {
+    // `InvalidCasePatternsTestLanguage219` (2.19 — patterns off).
+    let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+        (
+            "test_binaryExpression_logicalAnd",
+            "\nf(bool b) {\n  switch (b) {\n    case true && false:\n  }\n}\n",
+            &[(4, 10, 13)],
+        ),
+        (
+            "test_binaryExpression_plus",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case 1 + 2:\n  }\n}\n",
+            &[(4, 10, 5)],
+        ),
+        (
+            "test_conditionalExpression",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case true ? 1 : 2:\n  }\n}\n",
+            &[(4, 10, 12)],
+        ),
+        (
+            "test_constConstructorCall",
+            "\nclass C {\n  const C();\n}\n\nf(C c) {\n  switch (c) {\n    case C():\n  }\n}\n",
+            &[(8, 10, 3)],
+        ),
+        (
+            "test_constConstructorCall_explicitConst_ok",
+            "\nclass C {\n  const C();\n}\nf(C c) {\n  switch (c) {\n    case const C():\n  }\n}\n",
+            &[],
+        ),
+        (
+            "test_identicalCall",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case identical(1, 2):\n  }\n}\n",
+            &[(4, 10, 15)],
+        ),
+        (
+            "test_isExpression",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case 1 is int:\n  }\n}\n",
+            &[(4, 10, 8)],
+        ),
+        (
+            "test_isNotExpression",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case 1 is! int:\n  }\n}\n",
+            &[(4, 10, 9)],
+        ),
+        (
+            "test_lengthCall",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case ''.length:\n  }\n}\n",
+            &[(4, 10, 9)],
+        ),
+        (
+            "test_listLiteral",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case [1, 2]:\n  }\n}\n",
+            &[(4, 10, 6)],
+        ),
+        (
+            "test_listLiteral_ok",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case const [1, 2]:\n  }\n}\n",
+            &[],
+        ),
+        (
+            "test_listLiteral_typeArgs",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case <int>[1, 2]:\n  }\n}\n",
+            &[(4, 10, 11)],
+        ),
+        (
+            "test_mapLiteral",
+            "\nvoid f(Object o) {\n  switch (o) {\n   case {'k': 'v'}:\n  }\n}\n",
+            &[(4, 9, 10)],
+        ),
+        (
+            "test_mapLiteral_ok",
+            "\nvoid f(Object o) {\n  switch (o) {\n   case const {'k': 'v'}:\n  }\n}\n",
+            &[],
+        ),
+        (
+            "test_mapLiteral_parenthesized",
+            "\nvoid f(Object o) {\n  switch (o) {\n   case ({'k': 'v'}):\n  }\n}\n",
+            &[(4, 10, 10)],
+        ),
+        (
+            "test_mapLiteral_parenthesized_twice",
+            "\nvoid f(Object o) {\n  switch (o) {\n   case (({'k': 'v'})):\n  }\n}\n",
+            &[(4, 11, 10)],
+        ),
+        (
+            "test_mapLiteral_typeArgs",
+            "\nvoid f(Object o) {\n  switch (o) {\n   case <String,String>{'k': 'v'}:\n  }\n}\n",
+            &[(4, 9, 25)],
+        ),
+        (
+            "test_parenthesizedExpression_ok",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case (1):\n  }\n}\n",
+            &[],
+        ),
+        (
+            "test_prefixedExpression_intLiteral_ok",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case -1:\n  }\n}\n",
+            &[],
+        ),
+        (
+            "test_setLiteral",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case {1}:\n  }\n}\n",
+            &[(4, 10, 3)],
+        ),
+        (
+            "test_setLiteral_ok",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case const {1}:\n  }\n}\n",
+            &[],
+        ),
+        (
+            "test_setLiteral_typeArgs",
+            "\nvoid f(Object o) {\n  switch (o) {\n    case <int>{1}:\n  }\n}\n",
+            &[(4, 10, 8)],
+        ),
+        (
+            "test_unaryOperator_minus",
+            "\nvoid f() {\n  const o = 1;\n  switch (1) {\n    case -o:\n  }\n}\n",
+            &[(5, 10, 2)],
+        ),
+        (
+            "test_unaryOperator_not",
+            "\n  void f() {\n    const b = false;\n    switch (true) {\n      case !b:\n    }\n  }\n",
+            &[(5, 12, 2)],
+        ),
+        (
+            "test_wildcard",
+            "\nf(int n) {\n  const _ = 3;\n  switch (n) {\n    case _:\n  }\n}\n",
+            &[(5, 10, 1)],
+        ),
+    ];
+    // The `messages.yaml` doc examples: the default (3.13) posture, where
+    // the registration bail makes every head silent — the snippets do not
+    // even parse as statements.
+    let doc_cases: &[(&str, &str)] = &[
+        (
+            "doc_bad_0",
+            "case [1, 2]:\ncase {'k': 'v'}:\ncase {1, 2}:\ncase Point(1, 2):\n",
+        ),
+        ("doc_bad_1", "switch (n) {\n  case 1 + 2: ...\n}\n"),
+        (
+            "doc_good_0",
+            "case const [1, 2]:\ncase const {'k': 'v'}:\ncase const {1, 2}:\n\
+             case const Point(1, 2):\n",
+        ),
+    ];
+
+    /// The UTF-16 offset of an oracle `(line, column)` pair (the corpus
+    /// sources are ASCII, so a byte walk matches).
+    fn offset(source: &str, line: u32, column: u32) -> u32 {
+        let line_start: usize = source
+            .split_inclusive('\n')
+            .take(line as usize - 1)
+            .map(str::len)
+            .sum();
+        (line_start + column as usize - 1) as u32
+    }
+    /// The `(line, column)` pair of a UTF-16 offset — the oracle's own
+    /// spelling, so a mismatch reads without arithmetic.
+    fn position(source: &str, offset: u32) -> (u32, u32) {
+        let offset = offset as usize;
+        let mut line = 1;
+        let mut line_start = 0;
+        for (index, ch) in source.char_indices() {
+            if index >= offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                line_start = index + 1;
+            }
+        }
+        (line, (offset - line_start) as u32 + 1)
+    }
+
+    // The oracle rows this rule's context cannot reach, with the reason:
+    // the implicit-const instance-creation arm (:78-81) reports on
+    // `InstanceCreationExpression.isConst`, i.e. the constructor's
+    // resolved constness — the element model, not a token face. Each
+    // entry must STILL deviate (as this documented under-report), and
+    // each deviation must stay the documented one (a lone missing row):
+    // an exemption that starts passing, or one that starts over-reporting,
+    // fails the pin instead of rotting.
+    let known_divergences: &[(&str, &str)] = &[(
+        "test_constConstructorCall",
+        "`case C()` — the const constructor's resolved constness is out of \
+         the rule context's reach (documented under-report)",
+    )];
+
+    let mut mismatches = Vec::new();
+    let mut stricken = 0usize;
+    let expected_of = |oracle: &[(u32, u32, u32)], source: &str| -> Vec<(u32, u32)> {
+        oracle
+            .iter()
+            .map(|&(line, column, length)| {
+                let start = offset(source, line, column);
+                (start, start + length)
+            })
+            .collect()
+    };
+    let record = |mismatches: &mut Vec<String>, case: &str, source: &str, got: &[(u32, u32)]| {
+        let want = |ranges: &[(u32, u32)]| -> Vec<(u32, u32, u32)> {
+            ranges
+                .iter()
+                .map(|&(start, end)| {
+                    let (line, column) = position(source, start);
+                    (line, column, end - start)
+                })
+                .collect()
+        };
+        mismatches.push(format!(
+            "{case}: got {:?} {:?}",
+            want(got),
+            got.iter()
+                .map(|&(start, end)| &source[start as usize..end as usize])
+                .collect::<Vec<_>>()
+        ));
+    };
+    for (case, source, oracle) in cases {
+        let f = legacy(Fixture::parse(source));
+        let mut lints = f.run(&one_rule("invalid_case_patterns"));
+        lints.sort_by_key(|lint| lint.range.start);
+        let got: Vec<(u32, u32)> = lints
+            .iter()
+            .map(|lint| (lint.range.start, lint.range.end))
+            .collect();
+        if got != expected_of(oracle, source) {
+            if known_divergences.iter().any(|(name, _)| name == case) {
+                assert!(
+                    got.is_empty(),
+                    "{case}: the documented under-report now reports {got:?}"
+                );
+                stricken += 1;
+                continue;
+            }
+            record(&mut mismatches, case, source, &got);
+        }
+    }
+    for (case, source) in doc_cases {
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("invalid_case_patterns"));
+        if !lints.is_empty() {
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            record(&mut mismatches, case, source, &got);
+        }
+    }
+    assert_eq!(
+        stricken,
+        known_divergences.len(),
+        "a documented divergence stopped deviating — drop its exemption"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} cases deviate:\n{}",
+        mismatches.len(),
+        cases.len() + doc_cases.len(),
+        mismatches.join("\n")
+    );
+}
+
+// —— sort_constructors_first —————————————————————————————————————————————
 
 /// The whole upstream corpus (`SortConstructorsFirstTest`, 18 cases, plus
 /// the four `messages.yaml` doc examples) pinned against the oracle rows
