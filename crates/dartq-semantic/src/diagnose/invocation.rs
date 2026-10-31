@@ -42,6 +42,14 @@ mod ticket_2516_tests;
 #[path = "ticket_2498_tests.rs"]
 mod ticket_2498_tests;
 
+/// The #2463 pins (the census ⑨ small-family handback: A9 arity on a
+/// pattern-promoted receiver, A10 extension selection, A11 `.map` name
+/// shadowing, A12's three const shapes, A14's mixin/implements slice, A15's
+/// cross-library super formal).
+#[cfg(test)]
+#[path = "ticket_2463_tests.rs"]
+mod ticket_2463_tests;
+
 /// Where one merged constraint came from — upstream's
 /// `TypeConstraintOrigin` (`type_constraint.dart`), the error-message
 /// column identity. Each gather round stamps one origin; equal origins
