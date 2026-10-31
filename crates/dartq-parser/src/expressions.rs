@@ -1590,76 +1590,141 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// Official `parseCascadeExpression`; the cursor sits on the `..`/`?..`
     /// operator, `left` the cascade target expression span.
+    ///
+    /// The section chain is ONE cascade with a single `begin_cascade` /
+    /// `end_cascade` pair: every send-headed section fires its own
+    /// `handle_cascade_access` and carries its own optional assignment, so
+    /// the sections resolve against the cascade target, never against the
+    /// previous section's RHS (`a..x = t..y = s` — upstream keeps one
+    /// `CascadeExpression` whose sections each nest their own
+    /// `AssignmentExpression`; `parser_impl.dart:7756-7849` per-section
+    /// parsing plus the AST builder's cascade merge at `beginCascade`,
+    /// ast_builder.dart:207-224 / 1176-1191). An index (`..[i]`) or
+    /// anonymous-method section head fires no `handle_cascade_access`, so it
+    /// keeps its own cascade chunk: the flow layer's per-section receiver
+    /// discipline keys on the frame boundary for those heads.
     fn parse_cascade_expression(&mut self, left: TokenSpan) -> TokenSpan {
         let cascade_operator = self.peek_span();
         let is_null_aware_cascade = self.peek_kind() == TokenKind::QuestionPeriodPeriod;
         self.cursor.advance();
         self.listener.begin_cascade(cascade_operator);
-        let mut end = if self.peek_kind() == TokenKind::OpenSquare {
-            self.parse_argument_or_index_star(left, TypeParamOrArg::None, false)
-                .0
-        } else if self.features.anonymous_methods_enabled && self.begins_anonymous_method() {
-            // Anonymous-methods experiment (:7770-7774): the initial
-            // section's member is an anonymous method; no
-            // handleCascadeAccess fires for it.
-            self.parse_anonymous_method(cascade_operator)
-        } else {
-            let sent = self.parse_send_continuation();
-            self.listener
-                .handle_cascade_access(cascade_operator, sent, is_null_aware_cascade);
-            sent
-        };
-        // Cascade sections until no progress (:7121-7161).
+        // Cascade sections until no progress (:7121-7161), each section
+        // followed by its own optional assignment; a following send-headed
+        // `..`/`?..` section joins the same cascade.
+        let mut section_operator = cascade_operator;
+        let mut section_is_null_aware = is_null_aware_cascade;
+        let mut end;
         loop {
-            let before = self.cursor.peek_id();
-            if self.peek_kind() == TokenKind::Period
-                || self.peek_kind() == TokenKind::QuestionPeriod
-            {
-                let period = self.peek_span();
-                let is_null_aware = self.peek_kind() == TokenKind::QuestionPeriod;
-                self.cursor.advance();
-                if self.features.anonymous_methods_enabled && self.begins_anonymous_method() {
-                    // Anonymous-methods experiment (:7795-7798): a later
-                    // section's member is an anonymous method; no
-                    // null-aware split and no dot-access fire for it.
-                    end = self.parse_anonymous_method(period);
-                } else {
-                    if is_null_aware {
-                        self.listener.handle_null_aware_member_begin(period);
+            end = if self.peek_kind() == TokenKind::OpenSquare {
+                self.parse_argument_or_index_star(left, TypeParamOrArg::None, false)
+                    .0
+            } else if self.features.anonymous_methods_enabled && self.begins_anonymous_method() {
+                // Anonymous-methods experiment (:7770-7774): the initial
+                // section's member is an anonymous method; no
+                // handleCascadeAccess fires for it.
+                self.parse_anonymous_method(section_operator)
+            } else {
+                let sent = self.parse_send_continuation();
+                self.listener
+                    .handle_cascade_access(section_operator, sent, section_is_null_aware);
+                sent
+            };
+            loop {
+                let before = self.cursor.peek_id();
+                if self.peek_kind() == TokenKind::Period
+                    || self.peek_kind() == TokenKind::QuestionPeriod
+                {
+                    let period = self.peek_span();
+                    let is_null_aware = self.peek_kind() == TokenKind::QuestionPeriod;
+                    self.cursor.advance();
+                    if self.features.anonymous_methods_enabled && self.begins_anonymous_method() {
+                        // Anonymous-methods experiment (:7795-7798): a later
+                        // section's member is an anonymous method; no
+                        // null-aware split and no dot-access fire for it.
+                        end = self.parse_anonymous_method(period);
+                    } else {
+                        if is_null_aware {
+                            self.listener.handle_null_aware_member_begin(period);
+                        }
+                        end = self.parse_send_continuation();
+                        self.listener.handle_dot_access(period, end, is_null_aware);
                     }
-                    end = self.parse_send_continuation();
-                    self.listener.handle_dot_access(period, end, is_null_aware);
+                } else if self.peek_kind() == TokenKind::Bang {
+                    let bang = self.peek_span();
+                    self.listener.handle_non_null_assert_expression(bang);
+                    self.cursor.advance();
+                    end = bang;
                 }
-            } else if self.peek_kind() == TokenKind::Bang {
-                let bang = self.peek_span();
-                self.listener.handle_non_null_assert_expression(bang);
+                let (ta_end, ta) = self.parse_method_type_args_block(end);
+                end = ta_end;
+                let type_arg = ta;
+                if self.peek_kind() == TokenKind::Index {
+                    // Split `[]` here or the cascade stops parsing (:7145-7151).
+                    self.rewrite_square_brackets();
+                }
+                let (sel_end, _, _) = self.parse_argument_or_index_star(end, type_arg, false);
+                end = sel_end;
+                if self.cursor.peek_id() == before {
+                    break;
+                }
+            }
+            if let Some(level) = self.precedence_of(self.peek_kind())
+                && level == ASSIGNMENT_PRECEDENCE
+            {
+                let assignment = self.peek_span();
                 self.cursor.advance();
-                end = bang;
+                let rhs = self.parse_expression_without_cascade();
+                self.listener.handle_assignment_expression(assignment, rhs);
+                end = rhs;
             }
-            let (ta_end, ta) = self.parse_method_type_args_block(end);
-            end = ta_end;
-            let type_arg = ta;
-            if self.peek_kind() == TokenKind::Index {
-                // Split `[]` here or the cascade stops parsing (:7145-7151).
-                self.rewrite_square_brackets();
-            }
-            let (sel_end, _, _) = self.parse_argument_or_index_star(end, type_arg, false);
-            end = sel_end;
-            if self.cursor.peek_id() == before {
+            // The next section joins THIS cascade only when its head is a
+            // send: `handle_cascade_access` is the event every downstream
+            // layer anchors a section on, and the index/anonymous-method
+            // heads fire none (their chunk boundary carries the receiver).
+            let kind = self.peek_kind();
+            if kind != TokenKind::PeriodPeriod && kind != TokenKind::QuestionPeriodPeriod {
                 break;
             }
-        }
-        if let Some(level) = self.precedence_of(self.peek_kind())
-            && level == ASSIGNMENT_PRECEDENCE
-        {
-            let assignment = self.peek_span();
+            if !self.cascade_section_head_is_send() {
+                break;
+            }
+            let section_op = self.peek_span();
+            let is_null_aware = kind == TokenKind::QuestionPeriodPeriod;
+            if is_null_aware {
+                // `?..` after a previous cascade section is out of order
+                // (:6665-6669).
+                self.report(msg::null_aware_cascade_out_of_order(), section_op);
+            }
             self.cursor.advance();
-            let rhs = self.parse_expression_without_cascade();
-            self.listener.handle_assignment_expression(assignment, rhs);
-            end = rhs;
+            section_operator = section_op;
+            section_is_null_aware = is_null_aware;
         }
         self.listener.end_cascade();
         end
+    }
+
+    /// Whether the `..`/`?..` at the cursor is followed by a send-headed
+    /// section (the shape that fires `handle_cascade_access`) instead of an
+    /// index (`..[i]`) or anonymous-method head. The last two keep their own
+    /// cascade chunk — no cascade-access event delimits them for the flow
+    /// layer's section-scoped receiver stack.
+    fn cascade_section_head_is_send(&self) -> bool {
+        match self.cursor.look_kind(1) {
+            TokenKind::OpenSquare => false,
+            TokenKind::OpenCurly | TokenKind::Function
+                if self.features.anonymous_methods_enabled =>
+            {
+                false
+            }
+            TokenKind::OpenParen if self.features.anonymous_methods_enabled => {
+                let after = self
+                    .cursor
+                    .table_matching_end(self.cursor.look_id(1))
+                    .map(|close| self.kind_at(self.offset_of(close) + 1));
+                !matches!(after, Some(TokenKind::OpenCurly | TokenKind::Function))
+            }
+            _ => true,
+        }
     }
 }
 
