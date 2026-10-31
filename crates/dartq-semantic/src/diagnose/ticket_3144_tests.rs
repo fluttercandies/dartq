@@ -28,6 +28,7 @@
 //!   VALUE` arm is a separate code — :222-226).
 
 use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_bare};
+use crate::FileReport;
 
 /// The `(offset, length)` pairs of one code's rows, source-ordered — the
 /// fold's exact answer set for a shape, prelude-shifted.
