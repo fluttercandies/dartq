@@ -4881,16 +4881,6 @@ impl<'a> Engine<'a> {
             })
     }
 
-    /// Instance access through a declaration-typed receiver (`this.m`, `c.m`
-    /// on a `C c`). A clean walk that misses reports the member family
-    /// (`undefined_method`/`_getter`/`_setter` by access intent); a broken
-    /// chain, the extension pool, enum synthesized members, and `Object`
-    /// members suppress. Operator intents are the member-result shape
-    /// (`c.j + 1`, `c.j[i]`): the member itself is the operator's receiver —
-    /// a found member hands the operator check to its result type, a clean
-    /// miss reports the getter read (the operator's invalid type never
-    /// cascades). Mixin `on` constraints and extension `on` types are
-    /// invisible to the model, so bodies of those containers record only.
     /// The type-literal receiver face: a receiver head that spells a TYPE —
     /// the `dynamic` keyword, `Never`, or an ungrounded type alias (a
     /// function or record target; upstream Dart SDK source,
@@ -4903,8 +4893,10 @@ impl<'a> Engine<'a> {
     /// 'Type'." — the cascade sections' twin, `Receiver::Container`'s gate
     /// above). A receiver head spelling a variable, field, or getter (a
     /// VALUE of function/record type — `cb.gone` over a `void Function()`
-    /// formal) keeps the shape face's own display. True when the row was
-    /// answered here.
+    /// formal) keeps the shape face's own display. The alias INVOKE twin
+    /// (`Cb.bar()`) is reported by the invocation walk's
+    /// `report_alias_selector_face`; here it is only claimed, so the shape
+    /// dispatch stays quiet. True when the row was answered here.
     fn check_type_literal_receiver(&mut self, row: &Row) -> bool {
         let span = self
             .member_reads
@@ -4918,18 +4910,24 @@ impl<'a> Engine<'a> {
         let end = self.byte_of(span.offset + span.length);
         let text = self.source.get(start..end).unwrap_or("");
         let head = self.intern(text);
-        let is_literal = text == "dynamic"
-            || text == "Never"
-            || matches!(
-                self.top_level_decl(head).as_deref(),
-                Some(decl) if decl.kind == MicroKind::TypeAlias
-            );
-        if !is_literal {
+        let is_alias = matches!(
+            self.top_level_decl(head).as_deref(),
+            Some(decl) if decl.kind == MicroKind::TypeAlias
+        );
+        if !(is_alias || text == "dynamic" || text == "Never") {
             return false;
         }
         if !self.members.object_members.contains(&row.name) && row.name != self.intern("==") {
             let name_text = self.strings.resolve(row.name);
             match row.intent {
+                // The alias invoke (`Cb.bar()`) is the invocation walk's
+                // own face (`report_alias_selector_face`, its no-callee
+                // branch), which already names `Type` at the selector:
+                // this face only quiets the shape dispatch there (which
+                // would otherwise read the head as a `Function` VALUE).
+                // The keyword heads have no invocation-side twin — that
+                // face is alias-gated — so their invoke reports here.
+                Intent::Invoke if is_alias => {}
                 Intent::Invoke => self.emit(
                     SemanticCode::UndefinedMethod,
                     row.range,
@@ -4955,6 +4953,16 @@ impl<'a> Engine<'a> {
         true
     }
 
+    /// Instance access through a declaration-typed receiver (`this.m`, `c.m`
+    /// on a `C c`). A clean walk that misses reports the member family
+    /// (`undefined_method`/`_getter`/`_setter` by access intent); a broken
+    /// chain, the extension pool, enum synthesized members, and `Object`
+    /// members suppress. Operator intents are the member-result shape
+    /// (`c.j + 1`, `c.j[i]`): the member itself is the operator's receiver —
+    /// a found member hands the operator check to its result type, a clean
+    /// miss reports the getter read (the operator's invalid type never
+    /// cascades). Mixin `on` constraints and extension `on` types are
+    /// invisible to the model, so bodies of those containers record only.
     pub(crate) fn check_instance_member(
         &mut self,
         promotions: &PromotionStaging,
