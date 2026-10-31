@@ -1337,3 +1337,8 @@ mod ticket_2467_tests {
         );
     }
 }
+
+/// The #3148 lint pins (cfg(test): the `unnecessary_final` parameter and
+/// for-each faces over production-parse shapes).
+#[cfg(test)]
+mod ticket_3148_tests;

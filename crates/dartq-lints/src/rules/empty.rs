@@ -909,8 +909,8 @@ pub(crate) mod unnecessary_final {
     ///
     /// - `ForEachPartsWithDeclaration` (`for (final int x in xs)`): the loop
     ///   variable tiles as a [`NodeKind::VariablesDeclaration`] sibling of
-    ///   the parts row inside `ForIn` (the parts row seals AFTER the
-    ///   iterable, so adjacency is not the read — the declaration is the
+    ///   the parts row inside the loop container (the parts row seals AFTER
+    ///   the iterable, so adjacency is not the read — the declaration is the
     ///   parts row's only `VariablesDeclaration` sibling); the keyword and
     ///   the written-type gap are read off it like the local-declaration
     ///   face. The parts' own `PatternKeyword` word is absent here — it is
@@ -926,12 +926,12 @@ pub(crate) mod unnecessary_final {
         // for-element (`[for (final x in xs) x]`, `{for (…) k: v}`) is a
         // `ForElement`, never a `ForStatement`, so it is unvisited
         // (unnecessary_final.dart:86, oracle 3.13.7: zero lint rows on
-        // collection for-elements). dartq tiles the same `ForIn`/`ForInParts`
-        // pair inside a `ForControlFlow` marker, so the gate is the
-        // grandparent kind: `ForStatement` only.
-        if c.ancestor(2)
-            .is_none_or(|gp| c.kind(gp) != NodeKind::ForStatement)
-        {
+        // collection for-elements). The statement's loop container seals as
+        // `ForIn` (`begin_for_statement` + `end_for_in`) and the element's
+        // as `ForControlFlow` (`begin_for_control_flow`), and both the parts
+        // row and the loop variable nest in that one container — so the
+        // container kind is the gate.
+        if c.kind(parent) != NodeKind::ForIn {
             return;
         }
         let kids = c.collect_direct(parent);
