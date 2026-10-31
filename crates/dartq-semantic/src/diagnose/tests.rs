@@ -17655,3 +17655,16 @@ mod ticket_3230_tests;
 #[cfg(test)]
 #[path = "ticket_3231_tests.rs"]
 mod ticket_3231_tests;
+// The #3267 pins (`Engine::member_write_ty`'s type-parameter SLOT face: a
+// member declared `T slot` in `class Box<T extends A>` answers the parameter
+// `T`, never its bound — the oracle's write check asks
+// `isSubtypeOf(right, T)` and a bare type variable admits no interface
+// source, so the bound rescues nothing, subtype.dart:175-274). A
+// bound-collapsed slot would silence every `<bound subtype> <: T` rejection;
+// the pins fail on that collapse and on any leak into non-parameter members.
+// Registered here because `diagnose.rs` is a live-lane file out of this
+// ticket's write scope; `#[path]` keeps the module inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3267_tests.rs"]
+mod ticket_3267_tests;

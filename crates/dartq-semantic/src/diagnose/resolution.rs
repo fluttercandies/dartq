@@ -841,6 +841,22 @@ impl<'a> Engine<'a> {
     /// resolves against `name=`, never the getter's return). `Unknown` for
     /// executables, accessors with uncaptured formals, and broken chains —
     /// the under-report direction.
+    ///
+    /// The answer is the DECLARED face and must stay uninstantiated: a
+    /// member whose declared type is a bounded type parameter
+    /// (`class Box<T extends A> { T slot; }`) answers `T`, NEVER its bound.
+    /// The oracle checks the write against the parameter itself (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+    /// assignment_expression_resolver.dart:361 —
+    /// `_checkForInvalidAssignment(node.writeType!, ...)`), and a bare type
+    /// variable admits no interface source at all — not even a subtype of
+    /// its own bound, since the "Left Type Variable Bound" leg needs the
+    /// SOURCE to be a type variable (pkg/analyzer/lib/src/dart/element/
+    /// subtype.dart:175-274). A slot collapsed to `A` would therefore
+    /// silence every `<bound subtype> <: T` rejection, so instantiation
+    /// belongs to the RECEIVER face its callers hold: a written `C<B>`
+    /// substitutes `B`, a raw `C` is `C<bounds>` (`instantiateToBounds`),
+    /// and an implicit-this slot keeps the bare parameter.
     pub(crate) fn member_write_ty(&mut self, container: StringId, member: StringId) -> Ty {
         match self.walk_members(container, member) {
             Walk::Found(entry) if entry.kind == MemberKind::Field => {
