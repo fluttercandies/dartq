@@ -3247,7 +3247,26 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn end_formal_parameter_default_value_expression(&mut self, _token: Token) {
-        self.builder.formal_default_depth = self.builder.formal_default_depth.saturating_sub(1);
+        let builder = &mut self.builder;
+        builder.formal_default_depth = builder.formal_default_depth.saturating_sub(1);
+        // The default value is an expression, never the formal's annotation:
+        // `handle_type` suppresses the capture inside this window (a
+        // construction's `<...>` is an argument position), so a
+        // `const Foo<List<int>>()` completes an argument group whose root
+        // nobody claims. Drain it here, at the window's own close — a root
+        // left standing is a stale sibling for the NEXT annotation's window
+        // (`complete_type_site` then sees two roots and drops the tree, and
+        // the formal closes that arm from `done` must skip it past a
+        // leftover). Dropping, never arming: the expression's shape is not
+        // the declared type (the pre-#1482 lie the suppression exists to
+        // prevent). An open level keeps its nodes (`void f({void
+        // Function(int x = ...)? g})` — the construction folds into the
+        // shape's column), so only a stack-empty window drains.
+        if let Some(site) = builder.capture.as_mut()
+            && site.stack.is_empty()
+        {
+            let _ = site.take_done();
+        }
     }
 
     fn begin_type_arguments(&mut self, _token: Token) {

@@ -75,6 +75,24 @@ fn ctor_formal_ty(
         .ty
 }
 
+/// The named formal `name` of the unnamed constructor on `container`.
+fn named_ctor_formal_ty(
+    elements: &FileElements,
+    strings: &StringTable,
+    container: &str,
+    name: &str,
+) -> Ty {
+    elements
+        .container(id(strings, container))
+        .unwrap_or_else(|| panic!("container {container}"))
+        .ctor_formals
+        .get(&id(strings, container))
+        .unwrap_or_else(|| panic!("unnamed ctor formal table for {container}"))
+        .named_formal(id(strings, name))
+        .unwrap_or_else(|| panic!("named formal {name} on {container}"))
+        .ty
+}
+
 /// The ticket's shape with a named return type: `bool Function()?` must
 /// stay a first-class `Ty::Function` even though the class header's bound
 /// completed its own root first. Degrades to a bare `bool` (`Ty::Named`)
@@ -204,13 +222,7 @@ fn fn_typed_formal_survives_a_preceding_default_value_type() {
          class C { C({bool a = const Foo<List<int>>(), void Function()? f}); }",
         &strings,
     );
-    let table = elements
-        .container(id(&strings, "C"))
-        .expect("C")
-        .ctor_formals
-        .get(&id(&strings, "C"))
-        .expect("unnamed ctor formal table");
-    let ty = table.named_formal(id(&strings, "f")).expect("f").ty;
+    let ty = named_ctor_formal_ty(&elements, &strings, "C", "f");
     assert_eq!(
         ty.render(&strings, elements.type_args()),
         "void Function()?"
@@ -226,16 +238,52 @@ fn fn_typed_formal_survives_a_preceding_default_value_in_positional_optional() {
          class C { C([bool a = const Foo<List<int>>(), bool Function(int)? f]); }",
         &strings,
     );
-    let table = elements
+    let ty = elements
         .container(id(&strings, "C"))
         .expect("C")
         .ctor_formals
         .get(&id(&strings, "C"))
-        .expect("unnamed ctor formal table");
-    let f = table.positional.last().expect("f");
+        .expect("unnamed ctor formal table")
+        .positional
+        .last()
+        .expect("f")
+        .ty;
     assert_eq!(
-        f.ty.render(&strings, elements.type_args()),
+        ty.render(&strings, elements.type_args()),
         "bool Function(int)?"
+    );
+}
+
+/// The stale root is drained at its source (#3097): a following
+/// parameterized annotation in the same list keeps its argument list. An
+/// undrained root made `complete_type_site` read a two-root window and drop
+/// the capture, so `b` degraded to a bare `List`.
+#[test]
+fn default_value_construction_does_not_strand_the_next_annotation() {
+    let strings = StringTable::new();
+    let elements = build(
+        "class Foo<T> { const Foo(); }\n\
+         class C { C({bool a = const Foo<List<int>>(), List<int>? b}); }",
+        &strings,
+    );
+    let ty = named_ctor_formal_ty(&elements, &strings, "C", "b");
+    assert_eq!(ty.render(&strings, elements.type_args()), "List<int>?");
+}
+
+/// The same drain holds for a multi-argument following annotation, and the
+/// default value's position (positional-optional) makes no difference.
+#[test]
+fn positional_default_value_does_not_strand_the_next_annotation() {
+    let strings = StringTable::new();
+    let elements = build(
+        "class Foo<T> { const Foo(); }\n\
+         class C { C([bool a = const Foo<List<int>>(), Map<String, int>? b]); }",
+        &strings,
+    );
+    let ty = ctor_formal_ty(&elements, &strings, "C", 1);
+    assert_eq!(
+        ty.render(&strings, elements.type_args()),
+        "Map<String, int>?"
     );
 }
 
