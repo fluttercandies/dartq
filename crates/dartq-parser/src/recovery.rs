@@ -484,14 +484,20 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         // the Simple1 arm is unreachable for them.
                         || context == crate::listener::IdentifierContext::TypeVariableDeclaration
                         // `EnumValueDeclarationIdentifierContext.ensureIdentifier`
-                        // (:346-357): a built-in top-level-declaration head
-                        // (`typedef`/`extension`/`mixin`/`export`/`import`/
-                        // `library`/`part`/`get`/`set`) in the value-name slot
-                        // takes the same synthetic-insert arm as a reserved
-                        // head — `enum E { typedef }` reports
-                        // `missing_identifier` at `typedef`, never
-                        // `builtInIdentifierInDeclaration`.
-                        || context == crate::listener::IdentifierContext::EnumValueDeclaration
+                        // (:346-357) early-returns `identifier.isIdentifier`
+                        // BEFORE the recovery arm, so a built-in
+                        // top-level-declaration head (`mixin`/`typedef`/`get`/
+                        // `set`/`export`/`import`/`library`/`part`/`extension`)
+                        // is a legal enum value name with ZERO reports —
+                        // `enum E { mixin }` parses clean (token.dart:794:
+                        // `isIdentifier => isPseudo || isBuiltIn`). The
+                        // recovery arm's `looksLikeStartOfNextTopLevelDeclaration`
+                        // disjunct is reachable only for RESERVED heads
+                        // (`class`/`const`/`enum`/`final`/`var`/`void`), which
+                        // the Reserved arm above already covers — admitting
+                        // this context here splices a synthetic at a built-in
+                        // head the enum-elements loop never consumes and spins
+                        // forever on (#3184).
                         // `ClassOrMixinOrExtensionIdentifierContext`
                         // (:80-86): a built-in top-level-declaration head
                         // (`enum`/`mixin`/`typedef`/`extension`/`import`/
