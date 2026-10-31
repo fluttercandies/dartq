@@ -131,10 +131,40 @@ impl Engine<'_> {
         if args != crate::model::ArgListId::EMPTY {
             return ty;
         }
-        let Some(defaults) = self.bounds.itb_default_args(self.strings, name) else {
+        if let Some(defaults) = self.bounds.itb_default_args(self.strings, name) {
+            let filled: Vec<Ty> = defaults.iter().map(|tree| self.tree_ty(tree)).collect();
+            return self
+                .boundary
+                .args
+                .borrow_mut()
+                .named(name, nullable, &filled);
+        }
+        // A head the same-file bounds snapshot never registered — a FOREIGN
+        // generic (`Circle<T extends MetricUnits>` living in the pattern
+        // helper's own unit): `itb_default_args` misses its snapshot
+        // registry, but the container's declared `type_param_bounds` carry
+        // the same instantiate-to-bounds defaults (the receiver-declaration
+        // bounds row_resolution.rs:8398's raw-head arm reads), projected
+        // across the file boundary into the diagnosing pool. A genuinely
+        // non-generic or unindexed head keeps the bare face.
+        let Some((decl, owner)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) else {
             return ty;
         };
-        let filled: Vec<Ty> = defaults.iter().map(|tree| self.tree_ty(tree)).collect();
+        if decl.type_param_bounds.is_empty() {
+            return ty;
+        }
+        let filled: Vec<Ty> = decl
+            .type_param_bounds
+            .iter()
+            .map(|&bound| self.boundary.ty(owner, bound))
+            .collect();
         self.boundary
             .args
             .borrow_mut()
@@ -186,3 +216,14 @@ impl Engine<'_> {
         })
     }
 }
+
+// The #3180 pins (the foreign generic object-pattern head's
+// instantiate-to-bounds fill — `Circle<T extends MetricUnits>` reaches
+// the bound row's face as `Circle<MetricUnits>` through the container's
+// declared `type_param_bounds` projected across the file boundary, and
+// `bind_var_type` applies the same I2B). Registered here, not in
+// `diagnose.rs` (other lanes' file), via `#[path]`: the module stays
+// inside the `diagnose` subtree so `super::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3180_tests.rs"]
+mod ticket_3180_tests;

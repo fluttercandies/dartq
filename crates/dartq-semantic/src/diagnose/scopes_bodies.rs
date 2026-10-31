@@ -1112,8 +1112,17 @@ impl<'a> Engine<'a> {
     }
 
     /// Binds a local's declared type in the innermost frame (the
-    /// declared-variable-pattern binding face).
+    /// declared-variable-pattern binding face). A bare parameterized head
+    /// (`Named{_, EMPTY}`) binds its instantiate-to-bounds face — the
+    /// oracle's resolved `staticType` for a written `G` is `G<A<dynamic>>`
+    /// (`type.dart` `instantiateTypeFormalsToBounds`), the same fill
+    /// [`Self::bind_declared_type`]/[`Self::bind_parameter_type`] apply.
+    /// A pattern binder's head-named write (`Head() && final x`, a
+    /// null-check binder's `Circle` scrutinee) reaches the row's
+    /// `undefined_operator`/matched-type face with the declaration's own
+    /// arguments — never the raw `Circle` head.
     pub(crate) fn bind_var_type(&mut self, name: StringId, ty: Ty) {
+        let ty = self.instantiated_head_ty(ty);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
         }
