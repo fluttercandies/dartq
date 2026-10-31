@@ -21,19 +21,24 @@ use super::test_rig::{code_names, report_ops, report_ops_wildcards};
 
 /// Both arm positions of the least-upper-bound corpus shape: the dead
 /// cast tail reports in each arm that holds the cast, from the cast type's
-/// head token to the arm's own end.
+/// head token to the arm's own end. The condition is a TOP-LEVEL `var` —
+/// the corpus's own posture — because a provably-true LOCAL is a
+/// non-trivial write (`isNonTrivial`, flow_analysis.dart:155), so
+/// `conditionVariableState` folds both arms and the else arms report dead
+/// alongside the cast tails.
 #[test]
 fn dead_cast_tail_reports_in_conditional_arms() {
     let source = r#"
+class C1<X> {}
+var condition = true;
 void main() {
-  bool condition = true;
-  int x1 = 1;
-  var z1 = condition ? x1 : ((throw 0) as int);
-  use(z1);
-  var z4 = condition ? ((throw 0) as C2) : x1;
-  use(z4);
+  void f<X1 extends C1<X1>>(X1 x1) {
+    var z1 = condition ? x1 : ((throw 0) as int);
+    use(z1);
+    var z4 = condition ? ((throw 0) as C1<X1>) : x1;
+    use(z4);
+  }
 }
-class C2 {}
 void use(Object? x) {}
 "#;
     // The rig prepends its core prelude (ASCII), so rows index the joined
@@ -48,7 +53,7 @@ void use(Object? x) {}
             full[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string()
         })
         .collect();
-    assert_eq!(dead, ["int)", "C2)"], "{:?}", report.diagnostics);
+    assert_eq!(dead, ["int)", "C1<X1>)"], "{:?}", report.diagnostics);
 }
 
 /// The bare initializer face stays reported (the probed shape,
