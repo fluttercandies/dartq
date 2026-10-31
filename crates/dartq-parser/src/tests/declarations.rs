@@ -955,6 +955,22 @@ fn switch_expression_missing_body_reports_on_close_paren() {
 /// `unclosed_formal_relocation`, whose rig is
 /// `gate_m0_wave3.rs::assert_codes_with_scanner`).
 fn parse_off_with_scanner(source: &'static str) -> (super::collector::Collector, Vec<String>) {
+    parse_version_with_scanner(source, 3, 9)
+}
+
+/// Same rig at an explicit version — the latest-version twin of
+/// [`parse_off_with_scanner`] for shapes whose scanner channel carries the
+/// unbalanced-group rows (`class C(;`, `class C( [}`) while the parse runs
+/// at the default language version.
+fn parse_latest_with_scanner(source: &'static str) -> (super::collector::Collector, Vec<String>) {
+    parse_version_with_scanner(source, 3, 15)
+}
+
+fn parse_version_with_scanner(
+    source: &'static str,
+    major: u32,
+    minor: u32,
+) -> (super::collector::Collector, Vec<String>) {
     let config = dartq_scanner::ScanConfig {
         enable_triple_shift: true,
         enable_augmentations: true,
@@ -970,7 +986,7 @@ fn parse_off_with_scanner(source: &'static str) -> (super::collector::Collector,
         .map(|d| d.code.name.to_owned())
         .collect();
     let features = crate::ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-        LanguageVersion::new(3, 9),
+        LanguageVersion::new(major, minor),
     ));
     let mut collector = super::collector::Collector::default();
     let mut p = Parser::new(text, table, features, &mut collector);
@@ -980,16 +996,18 @@ fn parse_off_with_scanner(source: &'static str) -> (super::collector::Collector,
 
 #[test]
 fn class_head_paren_off_matches_oracle_face_set() {
-    // 3.13.1 oracle probe of the minimal file `class C( {}`: the paren is
-    // not a parameter list at a feature-off class head (3.15 main parses
-    // class-head formals unconditionally, parser_impl.dart:3782-3838 — that
-    // is our feature-on path). The `{}`-remnant parses as a member with no
-    // type and no name, and the pending paren closes at EOF. Full face set
-    // over the merged scanner+parser channel: expected_token(';') at the
-    // `{`, missing_identifier + missing_const_final_var_or_type at the `}`,
-    // expected_executable at the pending paren's EOF position, and the
-    // scanner's unbalanced-group expected_token(')') pinned at the same
-    // spot (diag.rs:22).
+    // 3.13.7 oracle probe of the minimal file `class C( {}` (pinned at the
+    // feature-off language version, matching the `// @dart=2.12` oracle
+    // probe u01): the head `(` is skipped junk at any feature state, the
+    // `{}-remnant parses as a member with no type and no name, and the
+    // pending paren closes at EOF. Full face set over the merged
+    // scanner+parser channel: experiment_not_enabled on the `(` (the
+    // `endPrimaryConstructor` gate, outline_builder.dart:1810-1818 — the
+    // junk route keeps the listener end event), unexpected_token on the
+    // skipped `(`, expected_token(';') at the `{`, missing_identifier +
+    // missing_const_final_var_or_type at the `}`, expected_executable at
+    // the pending paren's EOF position, and the scanner's unbalanced-group
+    // expected_token(')') pinned at the same spot (diag.rs:22).
     let (c, scanner) = parse_off_with_scanner("class C( {}");
     let mut codes = c.error_codes();
     codes.extend(scanner);
@@ -1000,8 +1018,10 @@ fn class_head_paren_off_matches_oracle_face_set() {
             "expected_executable",
             "expected_token",
             "expected_token",
+            "experiment_not_enabled",
             "missing_const_final_var_or_type",
             "missing_identifier",
+            "unexpected_token",
         ]
     );
     c.assert_sequence(&[
@@ -1010,18 +1030,20 @@ fn class_head_paren_off_matches_oracle_face_set() {
         ("end", "body"),
         ("end", "class_declaration"),
     ]);
-    // Follower fixture (3.13.1 oracle probe of `class C( {}\nclass D {}`,
-    // verbatim): the oracle consumes D's keyword as a junk member inside
-    // C — `unexpected_token` "Unexpected text '('." at the `(`, the shared
-    // remnant faces, then `expected_executable` spanning `class` with the
-    // pending paren's `expected_token(')')` anchored at the same boundary.
-    // Merged 6-row multiset: [unexpected_token, expected_token(';'),
-    // missing_identifier, missing_const_final_var_or_type,
-    // expected_executable, expected_token(')')]. Our parser carries the
-    // `)`-face count via the scanner's EOF row (the scanner runs eagerly,
-    // so its unbalanced-group row is unconditional) and lets D parse as
-    // its own declaration — observably identical at (code, file): the
-    // oracle emits no rows for D either.
+    // Follower fixture (3.13.7 oracle probe of `class C( {}\nclass D {}`,
+    // verbatim): the head `(` is skipped junk — `unexpected_token`
+    // "Unexpected text '('." at the `(` — then the shared remnant faces,
+    // and the pending paren's junk-member face lands on the boundary
+    // keyword: `expected_executable` spanning `class` alone (2:1 5) with
+    // the scanner's `expected_token(')')` anchored at the same spot.
+    // Merged 7-row multiset: [experiment_not_enabled, unexpected_token,
+    // expected_token(';'), missing_identifier,
+    // missing_const_final_var_or_type, expected_executable,
+    // expected_token(')')]. Our parser carries the `)`-face count via the
+    // scanner's parked-closer row (the scanner runs eagerly, so its
+    // unbalanced-group row is unconditional) and lets D parse as its own
+    // declaration — observably identical at (code, file): the oracle emits
+    // no rows for D either.
     let (c2, scanner2) = parse_off_with_scanner("class C( {}\nclass D {}");
     let mut codes2 = c2.error_codes();
     codes2.extend(scanner2);
@@ -1032,6 +1054,7 @@ fn class_head_paren_off_matches_oracle_face_set() {
             "expected_executable",
             "expected_token",
             "expected_token",
+            "experiment_not_enabled",
             "missing_const_final_var_or_type",
             "missing_identifier",
             "unexpected_token",
@@ -1040,11 +1063,331 @@ fn class_head_paren_off_matches_oracle_face_set() {
     // Span + text parity (oracle rows 1|8|1 and 2|1|5): the
     // unexpected_token spans the `(` token alone with the analyzer's
     // re-worded text, and the junk-member face spans the boundary keyword
-    // alone (parser-channel order: the three remnant faces, then the two
-    // follower faces).
-    assert_eq!(c2.errors[3], ("unexpected_token".to_string(), 7, 8));
-    assert_eq!(c2.texts[3], "Unexpected text '('.");
-    assert_eq!(c2.errors[4], ("expected_executable".to_string(), 12, 17));
+    // alone (parser-channel order: the experiment gate row, then the skip
+    // face, then the three remnant faces, then the boundary face).
+    assert_eq!(
+        c2.errors[0],
+        ("experiment_not_enabled".to_string(), 7, 7)
+    );
+    assert_eq!(c2.errors[1], ("unexpected_token".to_string(), 7, 8));
+    assert_eq!(c2.texts[0], "Unexpected text '('.");
+    assert_eq!(c2.errors[5], ("expected_executable".to_string(), 12, 17));
+}
+
+// —— class-head `(` junk family, paired-empty sub-shape (3.13.7) —————————
+
+/// Paired empty named section with no body (`class C({})` at EOF): the
+/// oracle junks the head — unexpected_token on the `(` (1|8|1),
+/// expected_token(';') on the `{` (1|9|1), missing_identifier +
+/// missing_const_final_var_or_type on the `}` (1|10|1 each), and
+/// expected_executable on the real `)` (1|11|1).
+#[test]
+fn class_head_paired_empty_named_section_junks_at_eof() {
+    let (table, text) = scan_ok("class C({})\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(
+        c.errors,
+        [
+            ("unexpected_token".to_string(), 7, 8),
+            ("expected_token".to_string(), 8, 9),
+            ("missing_identifier".to_string(), 9, 10),
+            ("missing_const_final_var_or_type".to_string(), 9, 10),
+            ("expected_executable".to_string(), 10, 11),
+        ]
+    );
+    assert_eq!(c.texts[1], "Expected to find ';'.");
+}
+
+/// The same junk face with a top-level follower (`class C({}) void f()
+/// {}`): the `)` closer carries the boundary face (1|11|1) and the
+/// follower keeps its own clean parse — the oracle emits no rows for it.
+#[test]
+fn class_head_paired_empty_follower_reparses_clean() {
+    let (table, text) = scan_ok("class C({}) void f() {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(
+        c.errors,
+        [
+            ("unexpected_token".to_string(), 7, 8),
+            ("expected_token".to_string(), 8, 9),
+            ("missing_identifier".to_string(), 9, 10),
+            ("missing_const_final_var_or_type".to_string(), 9, 10),
+            ("expected_executable".to_string(), 10, 11),
+        ]
+    );
+}
+
+/// A stray closer after the real `)` adds its own row (oracle `class
+/// C({}) }`: expected_executable at both closers, 1|11|1 and 1|13|1).
+#[test]
+fn class_head_paired_empty_stray_closer_gets_own_row() {
+    let (table, text) = scan_ok("class C({}) }\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(
+        c.errors,
+        [
+            ("unexpected_token".to_string(), 7, 8),
+            ("expected_token".to_string(), 8, 9),
+            ("missing_identifier".to_string(), 9, 10),
+            ("missing_const_final_var_or_type".to_string(), 9, 10),
+            ("expected_executable".to_string(), 10, 11),
+            ("expected_executable".to_string(), 12, 13),
+        ]
+    );
+}
+
+// —— class-head `(` junk family, `;`/`[` tails + formals routing (3.13.7) ——
+
+/// Paired empty named section with a real body (`class C({}) {}`, oracle
+/// p01): the `({})` parses as primary-constructor formals — the empty
+/// named section takes `missing_identifier` on the `}` (1|10|1) and the
+/// body is clean. Upstream: `parseFormalParametersRest`
+/// (parser_impl.dart:1916) → `parseOptionalNamedParameters` empty-section
+/// arm; the junk discriminator walks past the group's own `)` closer.
+#[test]
+fn class_head_paired_empty_with_body_parses_formals() {
+    let (table, text) = scan_ok("class C({}) {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(c.errors, [("missing_identifier".to_string(), 9, 10)]);
+}
+
+/// Paired empty named section with a `;` body (`class C({}) ;`, oracle
+/// r04): formals parse (the single `missing_identifier` on the `}`) and
+/// the `;` no-body form is silent at the default language version
+/// (parser_impl.dart:3092-3099 gates only the experiment row).
+#[test]
+fn class_head_paired_empty_semicolon_body_parses_formals() {
+    let (table, text) = scan_ok("class C({}) ;\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(c.errors, [("missing_identifier".to_string(), 9, 10)]);
+}
+
+/// Paired empty named section ahead of a clause + body (`class C({})
+/// extends B {}`, oracle r06): formals parse, the extends clause parses —
+/// the parser face is the single `missing_identifier` on the `}` (the
+/// `extends_non_class` row on `B` is the semantic tier's).
+#[test]
+fn class_head_paired_empty_extends_body_parses_formals() {
+    let (table, text) = scan_ok("class C({}) extends B {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(c.errors, [("missing_identifier".to_string(), 9, 10)]);
+}
+
+/// Scanner-unpaired `(` with a `;` tail (`class C(;`, oracle c22): the
+/// formals bail (missing first-formal name over the `;`,
+/// parser_impl.dart:1916/:1985), `ensureBlock` anchors `expected_body` on
+/// the name, and the junk re-parses as members — `expected_executable` on
+/// the `(`, the field-remnant triple on the `;`, then the EOF remnant
+/// member (`expected_executable` + `missing_const_final_var_or_type`,
+/// zero-width at EOF). The scanner's unbalanced-`(` pair closes the face
+/// with `expected_token(')')` at the EOF anchor (post-parse
+/// unmatched-group row, len 1).
+#[test]
+fn class_head_semicolon_junk_face() {
+    let (c, scanner) = parse_latest_with_scanner("class C(;");
+    let mut codes = c.error_codes();
+    codes.extend(scanner);
+    codes.sort();
+    assert_eq!(
+        codes,
+        [
+            "expected_body",
+            "expected_executable",
+            "expected_executable",
+            "expected_token",
+            "expected_token",
+            "missing_const_final_var_or_type",
+            "missing_identifier",
+            "unexpected_token",
+        ]
+    );
+    assert_eq!(
+        c.errors,
+        [
+            ("expected_body".to_string(), 6, 7),
+            ("expected_executable".to_string(), 7, 8),
+            ("missing_identifier".to_string(), 8, 9),
+            ("expected_token".to_string(), 8, 9),
+            ("unexpected_token".to_string(), 8, 9),
+            ("expected_executable".to_string(), 9, 9),
+            ("missing_const_final_var_or_type".to_string(), 9, 9),
+            ("expected_token".to_string(), 9, 10),
+        ],
+        "{:?}",
+        c.texts
+    );
+}
+
+/// The spaced twin (`class C( ;`, oracle p05): identical face with the
+/// `;`-anchored rows shifted one column.
+#[test]
+fn class_head_spaced_semicolon_junk_face() {
+    let (c, scanner) = parse_latest_with_scanner("class C( ;");
+    let mut codes = c.error_codes();
+    codes.extend(scanner);
+    codes.sort();
+    assert_eq!(
+        codes,
+        [
+            "expected_body",
+            "expected_executable",
+            "expected_executable",
+            "expected_token",
+            "expected_token",
+            "missing_const_final_var_or_type",
+            "missing_identifier",
+            "unexpected_token",
+        ]
+    );
+    assert_eq!(
+        c.errors,
+        [
+            ("expected_body".to_string(), 6, 7),
+            ("expected_executable".to_string(), 7, 8),
+            ("missing_identifier".to_string(), 9, 10),
+            ("expected_token".to_string(), 9, 10),
+            ("unexpected_token".to_string(), 9, 10),
+            ("expected_executable".to_string(), 10, 10),
+            ("missing_const_final_var_or_type".to_string(), 10, 10),
+            ("expected_token".to_string(), 10, 11),
+        ],
+        "{:?}",
+        c.texts
+    );
+}
+
+/// Scanner-unpaired `(` with a `[`-junk tail (`class C( [}`, oracle p08):
+/// the `[` opener takes the junk-member face plus the field-terminator
+/// face (both on the `[`), the `}` remnant member takes
+/// `expected_executable` + `missing_identifier` + 
+/// `missing_const_final_var_or_type` (all on the `}`, width 1), and the
+/// EOF remnant member closes with a zero-width `expected_executable`. The
+/// parser-channel prefix below is the walk's own rows; the trailing
+/// unmatched-group rows (`]` at the mismatching `}`, `)`/`]` at EOF) are
+/// scanner-pair-determined and pinned by the scanner suite.
+#[test]
+fn class_head_bracket_junk_face() {
+    let (c, _scanner) = parse_latest_with_scanner("class C( [}");
+    assert_eq!(
+        &c.errors[..8],
+        &[
+            ("expected_body".to_string(), 6, 7),
+            ("expected_executable".to_string(), 7, 8),
+            ("expected_executable".to_string(), 9, 10),
+            ("expected_token".to_string(), 9, 10),
+            ("expected_executable".to_string(), 10, 11),
+            ("missing_identifier".to_string(), 10, 11),
+            ("missing_const_final_var_or_type".to_string(), 10, 11),
+            ("expected_executable".to_string(), 11, 11),
+        ],
+        "{:?}",
+        c.texts
+    );
+}
+
+/// Unpaired `(` + `{}` remnant with a follower (`class C( {} void f() {}`,
+/// oracle c08): the pending paren's junk-member face lands on the follower
+/// token — `expected_executable` spanning `void` (1|13|4) — and the
+/// follower re-parses cleanly at top level.
+#[test]
+fn class_head_paren_follower_exec_face() {
+    let (c, _scanner) = parse_latest_with_scanner("class C( {} void f() {}");
+    assert_eq!(
+        &c.errors[..5],
+        &[
+            ("unexpected_token".to_string(), 7, 8),
+            ("expected_token".to_string(), 9, 10),
+            ("missing_identifier".to_string(), 10, 11),
+            ("missing_const_final_var_or_type".to_string(), 10, 11),
+            ("expected_executable".to_string(), 12, 16),
+        ],
+        "{:?}",
+        c.texts
+    );
+    assert_eq!(c.texts[4], "Expected a method, getter, setter or operator declaration.");
+}
+
+/// Feature-off paired-empty at EOF (`// @dart=2.12 class C({})`, oracle
+/// u02): the junk route carries the `endPrimaryConstructor` experiment row
+/// on the `(` (outline_builder.dart:1810-1818) ahead of the shared junk
+/// face — `expected_executable` on the real `)` closes it (1|11|1).
+#[test]
+fn class_head_paired_empty_off_experiment_row() {
+    let (c, scanner) = parse_off_with_scanner("class C({})");
+    let mut codes = c.error_codes();
+    codes.extend(scanner);
+    codes.sort();
+    assert_eq!(
+        codes,
+        [
+            "expected_executable",
+            "expected_token",
+            "experiment_not_enabled",
+            "missing_const_final_var_or_type",
+            "missing_identifier",
+            "unexpected_token",
+        ]
+    );
+    // The experiment row anchors zero-width in the collector channel (the
+    // analyze translation re-anchors it to the `(`'s width-1 span, the same
+    // convention as the formals-route pins above).
+    assert_eq!(c.errors[0], ("experiment_not_enabled".to_string(), 7, 7));
+    assert_eq!(c.errors[1], ("unexpected_token".to_string(), 7, 8));
+    assert_eq!(c.errors[5], ("expected_executable".to_string(), 10, 11));
+}
+
+// —— enum name keyword face (3.13.7) —————————————————————————————————————
+
+/// `enum if {}` (oracle c06): a reserved word that does not start a
+/// top-level declaration takes `expectedIdentifierButGotKeyword` and IS
+/// the name (identifier_context_impl.dart:328-334), and the verifier's
+/// built-in-name face rides the keyword name
+/// (error_verifier.dart:846-849, gate `isKeyword && isPseudo != true` at
+/// :3372). The semantic tier adds enum_without_constants over the
+/// keyword-name span downstream.
+#[test]
+fn enum_reserved_name_keyword_face() {
+    let (table, text) = scan_ok("enum if {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(
+        c.errors,
+        [
+            (
+                "expected_identifier_but_got_keyword".to_string(),
+                5, 7
+            ),
+            ("built_in_identifier_in_declaration".to_string(), 5, 7),
+        ]
+    );
+    assert_eq!(
+        c.texts[0],
+        "'if' can't be used as an identifier because it's a keyword."
+    );
+    assert_eq!(
+        c.texts[1],
+        "The built-in identifier 'if' can't be used as a type name."
+    );
 }
 
 /// `class C(int x);` at 2.12 (#961 recorded oracle face): a scanner-paired

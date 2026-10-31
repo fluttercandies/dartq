@@ -927,11 +927,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     let closer = self.span_of(self.real_id(end_group));
                     match self.kind_at(end_group + 1) {
                         TokenKind::Semicolon => {
-                            // Official :1596-1605: `typedef i = <...>;` — the
+                            // Official :1560-1568: `typedef i = <...>;` — the
                             // type arguments belong to a missing `Function`.
-                            // The missing parameter list is reported on the
-                            // group's closer and the alias parses as
-                            // `Function<...>();`.
+                            // The synthetic `Function` keyword is inserted
+                            // ahead of the group (`insertSyntheticKeyword`,
+                            // :1561) and reports `expectedButGot('Function')`
+                            // — re-anchored onto the `<` by the zero-width
+                            // walk (oracle `typedef i = <int>;`: the row sits
+                            // on the `<`, len 1) — then the missing parameter
+                            // list is reported on the group's closer (:1551)
+                            // and the alias parses as `Function<...>();`.
+                            let lt = self.peek_span();
+                            self.report(msg::expected_token("Function"), lt);
                             self.report(msg::missing_typedef_parameters(), closer);
                             self.skip_to_token(self.real_id(end_group));
                             self.cursor.advance(); // the closer
@@ -1190,14 +1197,49 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             const_keyword = Some(self.peek_span());
             self.cursor.advance();
         }
-        // The 3.13 oracle's enumDeclaration context rejects a reserved head
-        // with a missing identifier and a synthetic name (the real token is
-        // left for the body recovery below).
-        let name = if matches!(self.peek_kind(), TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved)
+        // Official `EnumDeclarationIdentifierContext.ensureIdentifier`
+        // (identifier_context_impl.dart:298-337): a reserved word that
+        // starts the next top-level declaration (arm 2,
+        // `looksLikeStartOfNextTopLevelDeclaration`) splices a synthetic
+        // name and leaves the keyword for the declaration loop; any other
+        // reserved word takes `expectedIdentifierButGotKeyword` and IS the
+        // name (arm 5 — oracle `enum if {}`); built-in keywords are consumed
+        // as the name over the converter-suppressed parser face (arm 3);
+        // pseudo keywords pass through (arm 1). Non-keyword junk keeps the
+        // generic `ensure_declaration_name` path (arm 4).
+        let reserved_head = matches!(
+            self.peek_kind(),
+            TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
+        );
+        let built_in_name = if matches!(
+            self.peek_kind(),
+            TokenKind::Keyword(kw) if kw.style() != dartq_scanner::KeywordStyle::Pseudo
+                || (self.features.variance_enabled
+                    && matches!(kw, Keyword::Inout | Keyword::Out))
+        ) && !(reserved_head && Self::starts_next_top_level_declaration(self.peek_kind()))
         {
+            // The verifier's built-in-name face (error_verifier.dart:846-849,
+            // `_checkForBuiltInIdentifierAsName(node.namePart.typeName,
+            // builtInIdentifierAsTypeName)`; the gate at :3372 is
+            // `isKeyword && isPseudo != true` — reserved words carry the row
+            // exactly like built-in ones). Captured ahead of the name parse,
+            // emitted after the type-parameter parse (the class-lane
+            // pattern): the name must already be consumed so the capture
+            // reads the token about to take the name position.
+            Some(self.peek_span())
+        } else {
+            None
+        };
+        let name = if reserved_head && Self::starts_next_top_level_declaration(self.peek_kind()) {
             let at = self.peek_span();
             self.report(msg::missing_identifier(), at);
             self.synthetic(TokenKind::Identifier, at.range.offset)
+        } else if reserved_head {
+            let at = self.peek_span();
+            let lexeme = self.cursor.lexeme(at.id).to_owned();
+            self.report(msg::expected_identifier_but_got_keyword(&lexeme), at);
+            self.cursor.advance();
+            at
         } else {
             self.ensure_declaration_name(IdentifierContext::EnumDeclaration)
         };
@@ -1205,9 +1247,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // (parser_impl.dart:2629): the header accepts variance modifiers.
         let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
+        if let Some(at) = built_in_name {
+            let lexeme = self.cursor.lexeme(at.id).to_owned();
+            self.report(
+                msg::built_in_identifier_as_name(msg::BuiltInNameKind::Type, &lexeme),
+                at,
+            );
+        }
         self.listener
             .begin_enum_declaration(begin, augment, enum_keyword, name);
-        self.parse_primary_constructor_opt(DeclarationKind::Enum, const_keyword, true);
+        self.parse_primary_constructor_opt(DeclarationKind::Enum, Some(name), const_keyword, true);
         self.parse_enum_header_opt(enum_keyword);
 
         let mut left_brace = self.peek_span();
@@ -1699,7 +1748,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // restarts from here, so an unconsumed-looking `(` ahead of a `{`
         // takes the skipped-junk face (`class C({var int a})` at EOF).
         let header_start = self.cursor.mark();
-        if self.parse_primary_constructor_opt(DeclarationKind::Class, const_keyword, true) {
+        if self.parse_primary_constructor_opt(DeclarationKind::Class, Some(name), const_keyword, true)
+        {
             // The "params consumed" fact must be captured here — before the
             // clause walk advances the cursor. Measured at recovery time the
             // clause tokens (`extends A`, …) have already moved the cursor
@@ -1741,7 +1791,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 self.parse_class_or_mixin_or_extension_body(DeclarationKind::Class, name);
             }
         } else {
-            // The feature-off `(` head recovery consumed the tail; the
+            // The class-head `(` junk walk consumed the tail; the
             // declaration still ends with a balanced empty body. The queued
             // synthetic braces must be drained after their events: a full
             // inserted queue would resurface at the unit loop as a phantom
@@ -2043,7 +2093,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             .begin_mixin_declaration(begin, augment, base, mixin_keyword, name);
 
         // header: primary constructor (reported), on, implements.
-        self.parse_primary_constructor_opt(DeclarationKind::Mixin, const_keyword, true);
+        self.parse_primary_constructor_opt(DeclarationKind::Mixin, Some(name), const_keyword, true);
         let mut clauses = HeaderClauses::default();
         // on
         if self.peek_kind() == TokenKind::Keyword(Keyword::On) {
@@ -2241,7 +2291,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         type_param.parse_variables(self, false);
         self.listener
             .begin_extension_declaration(augment, extension_keyword, name);
-        self.parse_primary_constructor_opt(DeclarationKind::Extension, const_keyword, true);
+        self.parse_primary_constructor_opt(DeclarationKind::Extension, name, const_keyword, true);
 
         let mut on_keyword: Option<TokenSpan> = Some(self.peek_span());
         if augment.is_some() {
@@ -2379,6 +2429,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             .begin_extension_type_declaration(augment, extension_keyword, name);
         self.parse_primary_constructor_opt(
             DeclarationKind::ExtensionType,
+            Some(name),
             const_keyword,
             augment.is_none(),
         );
@@ -2421,25 +2472,53 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Official `parsePrimaryConstructorOpt`. Returns `true` when the caller
     /// must continue with the header/body tail, `false` when this function
     /// already consumed the whole declaration tail (feature-off `(` recovery
-    /// below).
+    /// below). `name` is the declaration's name span — only the Class junk
+    /// walks use it (the `expected_body` anchor).
     fn parse_primary_constructor_opt(
         &mut self,
         kind: DeclarationKind,
+        name: Option<TokenSpan>,
         const_keyword: Option<TokenSpan>,
         allow_representation: bool,
     ) -> bool {
         if kind == DeclarationKind::Class
-            && !self.features.primary_constructors_enabled
+            && name.is_some()
+            && self.peek_kind() == TokenKind::OpenParen
+            && !self.peek_is_possible_record_type()
+            && matches!(
+                self.cursor.look_kind(1),
+                TokenKind::Semicolon | TokenKind::OpenSquare
+            )
+        {
+            // The scanner-unpaired `(` with a `;`/`[` tail (`class C(;`,
+            // `class C( ;`, `class C( [}`): upstream `parseFormalParametersRest`
+            // (`parser_impl.dart:1916`) attempts the formal list, the junk
+            // token takes the missing-first-formal-name face
+            // (`parseFormalParameter` → `ensureIdentifier`), and the
+            // never-closing group bails via the synthetic-closer move
+            // (`:1985` — `begin.endGroup!.isSynthetic` →
+            // `rewriter.moveSynthetic`); the unconsumed junk then re-parses
+            // as class members (`parseClass` :3105-3114 → `ensureBlock` +
+            // `parseClassOrMixinOrExtensionBody`), which is the face the
+            // walks below reproduce.
+            return self.recover_class_head_paren_junk(name.unwrap());
+        }
+        if kind == DeclarationKind::Class
             && self.peek_kind() == TokenKind::OpenParen
             && self.cursor.look_kind(1) == TokenKind::OpenCurly
-            && !self.peek_is_possible_record_type()
+            && self.class_head_paren_junk_tail()
         {
-            // The probed junk shape (`class C( {}`): the `(` cannot close
-            // at a real `)` (the scanner's EOF synthetic does not count),
-            // so the oracle leaves it as skipped junk ahead of the
-            // `{}`-remnant class body. A really-paired `(` — including a
-            // named-section opener like `class C({int a})` — parses as
-            // primary-constructor formals even with the feature off.
+            // The probed junk shape: the head `(` never becomes a primary
+            // constructor, so the oracle leaves it as skipped junk ahead of
+            // the `{}`-remnant class body and the face is the junk walk
+            // below. Two sub-shapes share it (3.13.7 probes): the
+            // scanner-unpaired `(` (`class C( {}` — the formals can never
+            // close, at any language version or feature state) and the
+            // paired empty `({})` with no `;`/body `{` ahead (`class C({})`
+            // at EOF — the oracle junks it, while `class C({}) ;`,
+            // `class C({}) {}` and `class C({}) extends B {}` parse it as
+            // real formals). A paired non-empty `(` (`class C({int a})`)
+            // parses as primary-constructor formals.
             return self.recover_class_head_paren_off();
         }
         if self.peek_kind() == TokenKind::OpenParen || self.peek_kind() == TokenKind::Period {
@@ -2703,28 +2782,86 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         true
     }
 
-    /// Feature-off `(` face at a class head for the probed `class C( {}`
-    /// junk shape (routed only when the `(` is scanner-unpaired — see the
-    /// caller), probe-verified against the 3.13.1 oracle at its default
-    /// language version. A scanner-paired `(` is NOT a junk shape: the
-    /// oracle parses those formals at any language version and the face is
-    /// the two-row experiment set (`class C(int x);` at 2.12). For `class
-    /// C( {}` the oracle's full ordered face set is `expected_token(';')`
-    /// at the `{`, `missing_identifier` + `missing_const_final_var_or_type`
-    /// at the `}` (the empty `{}`-remnant parses as a member with no type
-    /// and no name), then `expected_executable` at the pending paren's EOF
-    /// position; the `)` face itself is carried by the scanner's
-    /// unbalanced-group diagnostic (`lexer/mod.rs:908-917`), not by the
-    /// parser. With a real follower token instead of EOF, the oracle
-    /// consumes the follower's keyword as a junk member inside this class:
-    /// the `(` surfaces as skipped junk (`unexpected_token` on the skipped
-    /// token, `parser_impl.dart:2889`) and the boundary token carries the
-    /// `expected_executable` junk-member face. Returns `false`: the tail
-    /// was consumed.
+    /// Whether the `(` + `{` at the cursor is the junk shape routed to
+    /// [`Self::recover_class_head_paren_off`] (see the caller for the two
+    /// sub-shapes). The paired case needs a bounded lookahead: `class
+    /// C({}) extends B {}` (r06) is clean formals while `class C({})
+    /// extends B` (t01) is junk — the discriminator is whether a `;` body
+    /// or a real `{` body ever appears across the clause list.
+    fn class_head_paren_junk_tail(&self) -> bool {
+        if !self.peek_is_possible_record_type() {
+            // The `(` has no real closer: the formals can never close, so
+            // the shape is junk regardless of the language version or the
+            // primary-constructors state.
+            return true;
+        }
+        // Paired: only the empty `{}` named-section remnant is a junk
+        // candidate (`class C({int a})` parses its formals).
+        if self.cursor.look_kind(2) != TokenKind::CloseCurly {
+            return false;
+        }
+        let mut clause = false;
+        for n in 3..128 {
+            match self.cursor.look_kind(n) {
+                // n == 3 is the group's own `)` closer (`(`,`{`,`}`,`)`) —
+                // part of the formals group, never a junk discriminator
+                // (oracle probes: `class C({}) ;` and `class C({}) {}` parse
+                // the formals; without this arm the closer fell into the
+                // catch-all below and junked them).
+                TokenKind::CloseParen if n == 3 => {}
+                TokenKind::Semicolon | TokenKind::OpenCurly => return false,
+                TokenKind::Eof => return true,
+                TokenKind::Keyword(Keyword::Extends | Keyword::With | Keyword::Implements) => {
+                    clause = true;
+                }
+                TokenKind::Identifier
+                | TokenKind::Period
+                | TokenKind::Comma
+                | TokenKind::Lt
+                | TokenKind::Gt
+                | TokenKind::Question
+                | TokenKind::Ampersand
+                    if clause => {}
+                _ => return true,
+            }
+        }
+        true
+    }
+
+    /// Junk walk for the class-head `(` + `{` shapes (`class C( {}`,
+    /// `class C({})` at EOF) — the 3.13.7 oracle face, probe-pinned per
+    /// shape. The full ordered face set: `unexpected_token` on the skipped
+    /// `(` (`parser_impl.dart` skip face), `expected_token(';')` at the
+    /// `{`, `missing_identifier` + `missing_const_final_var_or_type` at
+    /// the `}` (the empty `{}`-remnant parses as a member with no type and
+    /// no name), then `expected_executable` carried by the closer that
+    /// follows the remnant — a scanner-parked synthetic `)` re-anchored
+    /// forward over the zero-width walk (`findNonZeroLengthToken`,
+    /// util.dart:56; EOF keeps the zero-width anchor) or the real `)`. The
+    /// scanner's own unbalanced-group row (`lexer/mod.rs:908-917`) carries
+    /// the `expected_token(')')` face; identical re-anchored rows collapse
+    /// through the shared dedup (`admit_row`). The token after the closers
+    /// re-parses at top level (the follower `void f() {}` keeps its own
+    /// clean parse — observably identical to the oracle, which emits no
+    /// rows for it either). Returns `false`: the tail was consumed.
     fn recover_class_head_paren_off(&mut self) -> bool {
         let lparen = self.peek_span();
-        let lparen_lexeme = self.cursor.lexeme(lparen.id);
-        self.cursor.advance(); // `(` — silent on the EOF path (see tail)
+        // The head `(` is scanner-unpaired on this route only when no `)`
+        // follows anywhere (the caller's `{`-tail probe admits scanner-paired
+        // empties too — `class C({})` at EOF); the pending-paren arm below
+        // splits its faces on exactly this fact.
+        let paren_unpaired = !self.peek_is_possible_record_type();
+        // `endPrimaryConstructor` (outline_builder.dart:1810-1818): the
+        // Class/Enum arm runs `reportIfNotEnabled(primaryConstructors,
+        // beginPrimaryConstructor)` whenever the `(` head parsed — the junk
+        // route included (oracle `// @dart=2.12 class C( {}`: the
+        // experiment row on the `(` precedes the junk face).
+        if !self.features.primary_constructors_enabled {
+            self.report_experiment_not_enabled(lparen);
+        }
+        let lparen_lexeme = self.cursor.lexeme(lparen.id).to_owned();
+        self.report(msg::unexpected_token(&lparen_lexeme), lparen);
+        self.cursor.advance(); // the skipped junk `(`
         let open = self.peek_span();
         self.report(msg::expected_token(";"), open);
         let group_close = self.current_matching_end();
@@ -2753,41 +2890,146 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // the scanner reports the unbalanced group itself
         // (`expected_token(')')` pinned at EOF, lexer/mod.rs:908-917) and
         // appends a zero-width synthetic `)` before the EOF token
-        // (lexer/mod.rs:140-141); the oracle anchors its missing-member face
-        // at that same spot as `expected_executable`, and the closer is
-        // consumed — together with any residual recovery synthetics — so
-        // the top-level junk path cannot re-parse it. Follower path
-        // (`class C( {}` + a real next token): the oracle consumes the
-        // follower's keyword as a junk member inside this class — the head
-        // `(` surfaces as skipped junk (`unexpectedToken` anchored on the
-        // skipped token, parser_impl.dart:2889), and the boundary token
-        // carries the junk-member face (`expected_executable` spans it);
-        // the paren-close `)` row is then covered by the scanner's EOF
-        // diagnostic (the (code, file) multiset is identical). The follower
-        // declaration itself keeps its own clean parse — observably
-        // identical to the oracle's junk-member shape, which emits no rows
-        // for it either. The merged scanner+parser channel is the
-        // established rig for this fixture class (`unclosed_formal_relocation`,
-        // tests/gate_m0_wave3.rs `assert_codes_with_scanner`).
-        let mut reported = false;
+        // (lexer/mod.rs:140-141); the parser's `expected_executable` rides
+        // that synthetic and keeps the zero-width EOF anchor (2:1 0).
+        // Follower path (`class C( {} void f() {}`): the scanner parks the
+        // synthetic `)` ahead of the boundary token, so the re-anchored row
+        // lands on the boundary itself (oracle: `expected_executable` on
+        // `void`, len 4) and the follower keeps a clean top-level parse.
+        // With a real `)` the closer carries the row on its own span
+        // (oracle `class C({})`: `expected_executable` at the `)`), and a
+        // trailing stray `}` adds its own row (oracle `class C({}) }` rows
+        // at both closers); the unpaired twin `class C( {} }` collapses to
+        // one row at the stray `}` — the synthetic closer's re-anchored row
+        // and the real brace's row share the anchor, and the shared dedup
+        // (`admit_row`) drops the second. The merged scanner+parser channel
+        // is the established rig for this fixture class
+        // (`unclosed_formal_relocation`, tests/gate_m0_wave3.rs
+        // `assert_codes_with_scanner`).
         while !self.cursor.at_eof() {
             if !matches!(
                 self.peek_kind(),
                 TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly
             ) {
+                // Follower path with the `(` never closed (`class C( {} void
+                // f() {}`, `class C( {}\nclass D {}`): the oracle's body
+                // recovery still opens a remnant member at the boundary —
+                // `expected_executable` on the follower token
+                // (class_member_parser junk-member face) — and the follower
+                // itself re-parses cleanly at top level. Paired shapes
+                // (`class C({}) x`) carry the face on their real closers
+                // instead, so the arm is gated on the head paren's own
+                // pairing, not the `{`-remnant's closer.
+                if paren_unpaired {
+                    self.report(msg::expected_executable(), self.find_non_zero_span());
+                }
                 break;
             }
-            if !reported {
-                self.report(msg::expected_executable(), self.peek_span());
-                reported = true;
-            }
+            self.report(msg::expected_executable(), self.find_non_zero_span());
             self.cursor.advance();
         }
-        if !reported && !self.cursor.at_eof() {
-            // Follower continuation: the head `(` was skipped junk and the
-            // boundary token is the junk-member face anchor.
-            self.report(msg::unexpected_token(lparen_lexeme), lparen);
-            self.report(msg::expected_executable(), self.peek_span());
+        false
+    }
+
+    /// `findNonZeroLengthToken` (`parser/util.dart:56`) from the cursor:
+    /// the first token at or after the current position carrying a
+    /// non-zero length; a zero-width anchor with no non-zero successor
+    /// falls through to the EOF token's own span (the zero-width anchor
+    /// survives at EOF).
+    fn find_non_zero_span(&self) -> TokenSpan {
+        let mut n = 0usize;
+        while !matches!(self.cursor.look_kind(n), TokenKind::Eof) {
+            let span = self.look_span_at(n);
+            if span.range.length > 0 {
+                return span;
+            }
+            n += 1;
+        }
+        self.look_span_at(n)
+    }
+
+    /// Junk walk for the scanner-unpaired class-head `(` with a `;`/`[` tail
+    /// (`class C(;`, `class C( ;`, `class C( [}`) — the 3.13.7 oracle face,
+    /// probe-pinned per shape. Upstream route: `parseFormalParametersRest`
+    /// (`parser_impl.dart:1916`) reports the missing first-formal name over
+    /// the junk token (`parseFormalParameter` → `ensureIdentifier`) and
+    /// bails the never-closing group at `:1985` (`begin.endGroup!.isSynthetic`
+    /// → `rewriter.moveSynthetic` — the scanner's synthetic `)` stays for the
+    /// post-parse unmatched-group row); `parseClass` (:3105-3114) then runs
+    /// `ensureBlock` (the `expected_body` row on the class name) and the body
+    /// loop, where the junk re-parses as members: the `(` head and a `[`
+    /// opener take the junk-member `expected_executable` face, the `;`
+    /// remnant takes the field-remnant faces (`missing_identifier` +
+    /// `expected_token(';')` + `unexpected_token`, all on the `;`), and the
+    /// next remnant member takes `expected_executable` +
+    /// `missing_const_final_var_or_type` at the tail (EOF keeps the
+    /// zero-width anchor; a real follower anchors on itself, oracle `class
+    /// C(; void f() {}` rows on `void`). The synthetic closers are never
+    /// adopted, so the scanner's post-parse unmatched-group rows
+    /// (`]` at a mismatching closer, `)`/`]` at EOF) carry their own faces
+    /// exactly as the oracle pins them. Returns `false`: the tail was
+    /// consumed.
+    fn recover_class_head_paren_junk(&mut self, name: TokenSpan) -> bool {
+        // `endPrimaryConstructor` (outline_builder.dart:1810-1818): the
+        // experiment face fires for Class whenever the head parsed — the
+        // formals bail does not skip the listener end event.
+        if !self.features.primary_constructors_enabled {
+            self.report_experiment_not_enabled(self.peek_span());
+        }
+        // `ensureBlock` (parser_impl.dart:3110) — the class never grows a
+        // body, and the oracle anchors `expected_body` on the name. The
+        // per-kind block-body message keeps the analyzer registry name
+        // `expected_body` (message.rs `expected_block_body`).
+        self.report(
+            msg::expected_block_body(msg_block_kind_class(), ""),
+            name,
+        );
+        let lparen = self.peek_span();
+        self.report(msg::expected_executable(), lparen);
+        self.cursor.advance(); // the junk `(` head
+        if self.peek_kind() == TokenKind::OpenSquare {
+            // `[` junk member: the head face plus the field-terminator face
+            // (oracle `class C( [}`: `expected_executable` + `expected ';'`
+            // both on the `[`), then the `}` remnant member with the
+            // unclosed-section closer face. The scanner splices its
+            // synthetic `]` at the mismatching `}`'s offset
+            // (`report_unmatched_begin`), so the remnant faces re-anchor
+            // over it onto the real `}` (`findNonZeroLengthToken`,
+            // parser/util.dart:56) before both closers are consumed.
+            let open_sq = self.peek_span();
+            self.report(msg::expected_executable(), open_sq);
+            self.report(msg::expected_token(";"), open_sq);
+            self.cursor.advance();
+            let remnant = self.find_non_zero_span();
+            self.report(msg::expected_executable(), remnant);
+            self.report(msg::missing_identifier(), remnant);
+            self.report(msg::missing_const_final_var_or_type(), remnant);
+            while matches!(
+                self.peek_kind(),
+                TokenKind::CloseSquare | TokenKind::CloseCurly
+            ) {
+                self.cursor.advance();
+            }
+            // The `}` remnant already carried the field faces; the oracle's
+            // EOF tail is the bare `expected_executable` only (probe p08:
+            // no `missing_const` at 2:1).
+            let tail = self.find_non_zero_span();
+            self.report(msg::expected_executable(), tail);
+        } else {
+            // `;` remnant member: the field-remnant faces all land on the
+            // `;` (oracle `class C(;`: `missing_identifier`,
+            // `expected_token(';')`, `unexpected_token` — one row each, all
+            // width 1 on the `;`).
+            let semi = self.peek_span();
+            self.report(msg::missing_identifier(), semi);
+            self.report(msg::expected_token(";"), semi);
+            self.report(msg::unexpected_token(self.cursor.lexeme(semi.id)), semi);
+            self.cursor.advance();
+            // The next remnant member opens at the tail (EOF keeps the
+            // zero-width anchor; a real follower anchors on itself).
+            let tail = self.find_non_zero_span();
+            self.report(msg::expected_executable(), tail);
+            self.report(msg::missing_const_final_var_or_type(), tail);
         }
         false
     }
