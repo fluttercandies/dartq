@@ -1715,6 +1715,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             {
                 self.report(msg::const_factory(), c);
             }
+            // `allowAbstract` is the augmentations flag itself (official
+            // `parseFactoryMethod`, parser_impl.dart:6232-6235): a `;` body
+            // is parse-legal under the feature and the parser stays silent.
+            // The completeness verdict belongs to the verifier
+            // (`_checkForFactoryBodyCompleteness`, error_verifier.dart:
+            // 5078-5107), which reports `factory_without_body` over the
+            // constructor head — `typeName` (else `factory`) through `name`
+            // — only when the whole augmentation chain has no complete
+            // fragment, and `factory_not_complete_after_augmentations`
+            // otherwise. That chain is not visible per unit (augmentations
+            // may live in another part file), so this lane must not emit.
             end = self.parse_function_body(false, self.features.augmentations_enabled);
         }
         match kind {
