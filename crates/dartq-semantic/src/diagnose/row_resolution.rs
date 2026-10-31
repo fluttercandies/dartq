@@ -4597,6 +4597,13 @@ impl<'a> Engine<'a> {
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
                 }
+                // An instantiated type literal's method send (`C<T>.sm<T>()`)
+                // is a `MethodInvocation` on the `Type` instance, never the
+                // container's static face — see
+                // [`Self::check_instantiated_literal_member`].
+                if self.check_instantiated_literal_member(row) {
+                    return;
+                }
                 self.check_container_member(row, name, kind);
             }
             // The prefix-resolved container (`io.Directory.gone`): the
@@ -4969,6 +4976,116 @@ impl<'a> Engine<'a> {
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
         true
+    }
+
+    /// An instantiated type-literal receiver used as a member target
+    /// (`C<T>.sel<T>()`, `Alias<T>.sel<T>()`). The selector's own type
+    /// arguments keep the send a `MethodInvocation` — without them the
+    /// spelling is the CREATION face (`C<T>.sel()` is a named-constructor
+    /// call, `C<T>.sel` a constructor reference: the
+    /// `new_with_undefined_constructor` / `class_instantiation_access_to_member`
+    /// families, which this face must not claim). Upstream
+    /// `_resolveReceiverTypeLiteral` (pkg/analyzer/lib/src/dart/resolver/
+    /// method_invocation_resolver.dart:1212-1268) then resolves `sel`
+    /// against the `Type` INSTANCE: the class's (or alias's) own statics
+    /// never answer, only the `Object` face resolves, and a clean miss
+    /// reports `undefined_method` naming `Type` (probe 3.13.7:
+    /// `A<int>.sm<num>()` over a `static void sm<Y>()` reports "The method
+    /// 'sm' isn't defined for the type 'Type'."; the alias-of-class twin
+    /// `T<int>.sm<num>()` the same). True when the row was answered here.
+    fn check_instantiated_literal_member(&mut self, row: &Row) -> bool {
+        if row.intent != Intent::Invoke || !self.method_type_arguments_after(row.range) {
+            return false;
+        }
+        if !self.receiver_closes_type_arguments(row.range) {
+            return false;
+        }
+        if !self.members.object_members.contains(&row.name) && row.name != self.intern("==") {
+            let name_text = self.strings.resolve(row.name);
+            self.emit(SemanticCode::UndefinedMethod, row.range, name_text, "Type");
+        }
+        self.record_miss(row.name, row.range, true, NameUse::Invoke);
+        true
+    }
+
+    /// Whether the selector is followed (across trivia) by its own `<` —
+    /// the written method type arguments that make the send a
+    /// `MethodInvocation` rather than a creation.
+    fn method_type_arguments_after(&self, selector: SourceRange) -> bool {
+        let at = self.skip_trivia_forward(self.byte_of(selector.end()));
+        self.source.as_bytes().get(at) == Some(&b'<')
+    }
+
+    /// `at` advanced past whitespace and comments (the forward twin of the
+    /// backward walk in [`Self::receiver_closes_type_arguments`]).
+    fn skip_trivia_forward(&self, mut at: usize) -> usize {
+        let bytes = self.source.as_bytes();
+        loop {
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            if bytes.get(at) != Some(&b'/') {
+                return at;
+            }
+            match bytes.get(at + 1) {
+                Some(b'/') => {
+                    while at < bytes.len() && bytes[at] != b'\n' {
+                        at += 1;
+                    }
+                }
+                Some(b'*') => {
+                    let Some(close) = self.source.get(at + 2..).and_then(|s| s.find("*/")) else {
+                        return bytes.len();
+                    };
+                    at += 2 + close + 2;
+                }
+                _ => return at,
+            }
+        }
+    }
+
+    /// Whether the receiver expression's `.` follows (across trivia) the
+    /// type-argument group's `>` — the instantiated type-literal spelling
+    /// (`C<T>.sel`, `Alias<T>.sel`). A value receiver ends in `)`/`]` or a
+    /// name (`f<T>().sel`, `xs[0].sel`, `c.sel`), so its send keeps the
+    /// shape face.
+    fn receiver_closes_type_arguments(&self, selector: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(selector.offset);
+        // Back over trivia to the receiver's `.` (block comments both
+        // between the `.` and the selector, and between the `>` and the
+        // `.`).
+        loop {
+            while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+                at -= 1;
+            }
+            if at >= 2 && &bytes[at - 2..at] == b"*/" {
+                let Some(open) = self.source.get(..at - 2).and_then(|s| s.rfind("/*")) else {
+                    return false;
+                };
+                at = open;
+                continue;
+            }
+            break;
+        }
+        if at == 0 || bytes[at - 1] != b'.' {
+            return false;
+        }
+        at -= 1;
+        loop {
+            while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+                at -= 1;
+            }
+            if at >= 2 && &bytes[at - 2..at] == b"*/" {
+                let Some(open) = self.source.get(..at - 2).and_then(|s| s.rfind("/*")) else {
+                    return false;
+                };
+                at = open;
+                continue;
+            }
+            break;
+        }
+        at > 0 && bytes[at - 1] == b'>'
     }
 
     /// Instance access through a declaration-typed receiver (`this.m`, `c.m`
@@ -11749,3 +11866,11 @@ mod ticket_3183_tests;
 #[cfg(test)]
 #[path = "ticket_3186_tests.rs"]
 mod ticket_3186_tests;
+
+// The #3187 pins — the instantiated type literal as a MEMBER target:
+// `C<T>.sel<T>()` / `Alias<T>.sel<T>()` resolve `sel` on the `Type`
+// instance (the send's own type arguments keep it out of the creation
+// face), so a static miss reports `undefined_method` naming `Type`.
+#[cfg(test)]
+#[path = "ticket_3187_tests.rs"]
+mod ticket_3187_tests;
