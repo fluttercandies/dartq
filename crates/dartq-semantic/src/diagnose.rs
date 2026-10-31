@@ -5814,8 +5814,9 @@ mod ticket_3111_tests;
 #[cfg(test)]
 mod ticket_3112_tests;
 
-/// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
-/// type-check verdict under-emits on (function-type test spellings, type
-/// literals, typedef-folded checked types, dynamic operands).
+/// The #3118 pins: a generic local function declaration latches
+/// `pending_exec_name`, so its `<T extends num>` window pairs into
+/// `exec_bounds` like a top-level function's — bound-violating calls
+/// report the `'num'` clamp row the oracle emits.
 #[cfg(test)]
-mod ticket_3038_tests;
+mod ticket_3118_tests;

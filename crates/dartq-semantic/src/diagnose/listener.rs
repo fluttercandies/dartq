@@ -2969,6 +2969,20 @@ impl ParserListener for DiagnoseListener<'_> {
                     // matrix stays silent (the oracle's dynamic return type
                     // for a local function written without one).
                     engine.latch_return_type(ExecKind::Function, name, token.range);
+                    // #3118: the header's declaring name — its
+                    // type-variable window pairs at the window's close
+                    // exactly like a top-level function's (the
+                    // `exec_bounds` route, never `method_exec_bounds`: a
+                    // local function owns no member send, so the
+                    // member-inference guard the `method_` table exists
+                    // for has nothing to race). The nameless arm stays
+                    // unlatched — a synthetic `""` key would collide with
+                    // the generic function-literal send's
+                    // `bounds.pending_window` fallback
+                    // (`row.name == intern("")`), and the top-level
+                    // nameless arm keeps the same closed-window posture.
+                    engine.pending_exec_name = Some((name, token.range.offset));
+                    engine.pending_exec_is_method = false;
                     // The written return is the call's result face
                     // (`List<Und> ranges(f) => …; ranges(x).any((r) => …)`):
                     // it joins the enclosing frame's local-callee return
