@@ -1,6 +1,6 @@
 //! In-crate test suites: one file per parser area plus the golden smoke.
 
-mod collector;
+pub(crate) mod collector;
 
 mod declarations;
 mod directives;

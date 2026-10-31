@@ -108,6 +108,9 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod ticket_2978_tests;
+
 pub use cursor::TokenCursor;
 pub use features::ParserFeatures;
 pub use listener::{
