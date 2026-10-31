@@ -2837,7 +2837,9 @@ impl<'o> Interp<'o> {
     /// `flowEnd(thenExpression)`/`flowEnd(elseExpression)`,
     /// type_analyzer.dart:2588/2616): a Never-operand cast inside the arm
     /// parked its type head on the [`Frame::Cond`] — the cast type is the
-    /// first dead node, and the row runs to the arm's own end. An
+    /// first dead node, and the row runs to the arm's own end (`arm_start`
+    /// is the arm's begin token, the containment bound the interval is
+    /// retired against). An
     /// entry-dead arm reports its whole-range row instead
     /// ([`Self::dead_arm_row`]); a live arm without the Never cast parks
     /// nothing and this is a no-op. A mid-arm cast-tail death inside an
@@ -2845,7 +2847,7 @@ impl<'o> Interp<'o> {
     /// exactly like `dead_arm_row` — the face fires only outside every
     /// dead arm ([`Interp::arm_dead_depth`] == 0; an entry-dead arm never
     /// reaches this face — its own close took `dead_arm_row`).
-    pub(crate) fn cast_tail_row(&mut self, arm_end: u32) {
+    pub(crate) fn cast_tail_row(&mut self, arm_start: u32, arm_end: u32) {
         if self.arm_dead_depth >= 1 {
             return;
         }
@@ -2874,6 +2876,22 @@ impl<'o> Interp<'o> {
         let Some(head) = head.filter(|_| !self.reachable()) else {
             return;
         };
+        // The arm's own `flowEnd` closes the interval its cast-type poll
+        // opened, exactly as upstream resets `_firstDeadNode` after
+        // reporting (dead_code_verifier.dart:223-232's
+        // `_containsFirstDeadNode` gate runs the report AND the reset):
+        // keeping the interval open past the arm made every later poll in
+        // the block fold into a dead region that had already ended, and
+        // the enclosing conditional's `parent_live` read the stale window
+        // as a began-dead context (`c ? 1 : ((throw 0) as int)` swallowed
+        // the next conditional's own cast tail).
+        if self
+            .dead
+            .as_ref()
+            .is_some_and(|window| window.anchor.range.offset >= arm_start)
+        {
+            self.dead = None;
+        }
         if arm_end > head.range.offset {
             self.emit(FlowFact::DeadCode {
                 span: TokenSpan {

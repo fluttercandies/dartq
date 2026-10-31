@@ -2063,7 +2063,7 @@ impl Interp<'_> {
                     // head to the arm's own end (the initializer-context
                     // semantic face stages only the bare-initializer row;
                     // the arm close owns this one).
-                    self.cast_tail_row(*then_end);
+                    self.cast_tail_row(then_begin.range.offset, *then_end);
                 }
                 // The then arm ended: rejoin its open null-shorting before
                 // the state swap.
@@ -2119,7 +2119,7 @@ impl Interp<'_> {
                 } else {
                     // The else arm's mid-arm cast-tail death (the then arm's
                     // twin above).
-                    self.cast_tail_row(*arm_end);
+                    self.cast_tail_row(else_begin.range.offset, *arm_end);
                 }
                 // The else arm ended: rejoin its open null-shorting before
                 // the arm join.

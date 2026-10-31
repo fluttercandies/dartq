@@ -3168,6 +3168,11 @@ impl ParserListener for Flow<'_> {
         _equals: Token,
     ) {
         self.record(Ev::PatternAssign);
+        // The init/cond index boundary, exactly like the three sibling
+        // hooks above. It must trail this hook's own pattern event: the
+        // marker closes the initializer's region, and `PatternAssign`
+        // carries the pattern writes the initializer's effects fold in.
+        self.record(Ev::ForInit);
     }
 
     fn begin_conditional_expression(&mut self, _question: Token) {
