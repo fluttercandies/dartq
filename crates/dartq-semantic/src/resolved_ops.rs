@@ -2027,6 +2027,12 @@ pub struct ResolvedTypeOps<'a> {
     /// (`is_subtype`, `factor`, `try_promote_to`) carry no `names`
     /// slice, so this set is the only overload face they can read.
     overload_ids: RefCell<FxHashSet<u32>>,
+    /// Flow-layer name ids whose spelling resolves nowhere — the oracle's
+    /// undefined-name face (`type_test_with_undefined_name`), extended
+    /// beside the `name_ty` cache in `observe_names` where the lexeme is
+    /// already interned. `tested_head_undefined` consults this set
+    /// instead of re-interning each probe's spelling (#2487 F6).
+    undefined_ids: RefCell<FxHashSet<u32>>,
     /// `TypeDeclId` → memoized "sealed or enum" answer — the
     /// `is_always_exhaustive` per-decl verdict, stable across the
     /// corpus's switch-end probes.
@@ -2106,6 +2112,7 @@ impl<'a> ResolvedTypeOps<'a> {
             name_ty: RefCell::new(Vec::new()),
             local_fn_shapes: RefCell::new(FxHashMap::default()),
             overload_ids: RefCell::new(FxHashSet::default()),
+            undefined_ids: RefCell::new(FxHashSet::default()),
             closed: RefCell::new(FxHashMap::default()),
             opaque: RefCell::new(FxHashMap::default()),
             decl_names: RefCell::new(None),
@@ -2291,7 +2298,22 @@ impl<'a> ResolvedTypeOps<'a> {
                     .insert((start + offset) as u32);
             }
             let name = self.strings.intern(lexeme);
-            let pair = if let Some(param) = self.scoped_param(name) {
+            let scoped = self.scoped_param(name);
+            // The undefined-name face (`tested_head_undefined`'s verdict,
+            // #2450): not a kind spelling, not a scoped type parameter,
+            // not a resolved-but-unmodeled name, and absent from the
+            // registry. Cached id-keyed beside `overload_ids` so the
+            // is-check guards never re-intern (#2487 F6).
+            if scoped.is_none()
+                && !matches!(&**lexeme, "FutureOr" | "Null" | "Never")
+                && !self.snapshot.non_containers.contains(&name)
+                && !self.snapshot.registry.contains_key(&name)
+            {
+                self.undefined_ids
+                    .borrow_mut()
+                    .insert((start + offset) as u32);
+            }
+            let pair = if let Some(param) = scoped {
                 (
                     self.snapshot
                         .table
@@ -3922,13 +3944,16 @@ impl<'a> ResolvedTypeOps<'a> {
     }
 
     /// Whether the is-check's tested spelling heads with a name that
-    /// resolves nowhere — the oracle's undefined-name face. The same
-    /// resolution chain [`Self::map_name`] walks decides: a type
-    /// parameter, the `FutureOr` pseudo type, a registered container, the
-    /// `Null`/`Never` kind spellings, or a resolved-but-unmodeled
-    /// (`non_containers`) name all resolve; anything else is the
-    /// undefined head the official's `named_type_resolver.dart` reports
-    /// `type_test_with_undefined_name` on.
+    /// resolves nowhere — the oracle's undefined-name face, decided by
+    /// the id-keyed `undefined_ids` set `observe_names` extends beside
+    /// the `name_ty` cache (#2487 F6 — the probe never re-interns: the
+    /// same resolution chain [`Self::map_name`] walks already ran inside
+    /// the scan). A type parameter, the `FutureOr` pseudo type, a
+    /// registered container, the `Null`/`Never` kind spellings, or a
+    /// resolved-but-unmodeled (`non_containers`) name all resolve;
+    /// anything else is the undefined head the official's
+    /// `named_type_resolver.dart` reports `type_test_with_undefined_name`
+    /// on.
     ///
     /// #2450 counter-finding: an is-check whose tested type is that face
     /// never folds. The oracle's flow bails — no constant verdict, no
@@ -3941,17 +3966,13 @@ impl<'a> ResolvedTypeOps<'a> {
         let Base::Name(id) = ty.base else {
             return false;
         };
-        let Some(lexeme) = names.get(id as usize) else {
-            return false;
-        };
-        if matches!(&**lexeme, "FutureOr" | "Null" | "Never") {
-            return false;
-        }
-        let name = self.strings.intern(lexeme);
-        if self.scoped_param(name).is_some() || self.snapshot.non_containers.contains(&name) {
-            return false;
-        }
-        !self.snapshot.registry.contains_key(&name)
+        // The run-start `observe_names` already classified every lexeme
+        // interned before the replay; this top-up covers only the ids a
+        // mid-replay probe appended (a no-op bounds check in the common
+        // case), then the set answers by id — the same face
+        // `id_overloaded` reads for the overload guard.
+        self.observe_names(names);
+        self.undefined_ids.borrow().contains(&id)
     }
 }
 
