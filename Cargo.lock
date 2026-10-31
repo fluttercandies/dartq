@@ -299,6 +299,7 @@ dependencies = [
  "dartq-pub",
  "dartq-sdk",
  "dartq-session",
+ "dartq-snapshot",
  "dartq-source",
  "dartq-test",
  "filetime",

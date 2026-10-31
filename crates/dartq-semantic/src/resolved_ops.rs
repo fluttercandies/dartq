@@ -3187,10 +3187,46 @@ impl<'a> ResolvedTypeOps<'a> {
         Some(self.snapshot.table.substitute(on, &map))
     }
 
-    /// The structural answer over two instantiate-to-bounds projections —
-    /// step 5's pair test: `(sub <: sup, sup <: sub)` computed over the
-    /// two mapped projections in one pass. `None` where either side
-    /// carries no structural fact.
+    /// The structural answer over two `on` types — step 5's pair test
+    /// `(sub <: sup, sup <: sub)`, with the parameter-level order the
+    /// instantiate-to-bounds projection alone loses. `None` where either
+    /// side carries no structural fact.
+    ///
+    /// Two reads, the finer one first:
+    ///
+    /// * **Parameter-level order**: each side's own parameters
+    ///   instantiated to their declared bounds, compared against the
+    ///   TWIN's written `on` type (`_isMoreSpecific` steps 3-4 ask the
+    ///   receiver-instantiated forms, `extension_member_resolver.dart:
+    ///   484-497`; a declared bound is the widest instantiation of the
+    ///   face's own parameter, so the order holds for every receiver the
+    ///   face applies to). `on Bag<T>` with `T extends Fragment` reads
+    ///   `Bag<Fragment>`, which orders strictly below a twin's written
+    ///   `on Bag<Fragment>` — mutually aimed bound projections are the
+    ///   same type and would leave the pair unordered.
+    /// * **Bound projections**: step 5's `_instantiateToBounds` pair
+    ///   (`extension_member_resolver.dart:500-506`), the fallback where
+    ///   the parameter-level read is not strict.
+    ///
+    /// A face without type parameters has no parameter to instantiate:
+    /// its `on` type stands as written (which is exactly its bound
+    /// projection).
+    ///
+    /// Two limits are inherent to this function's inputs:
+    ///
+    /// * A receiver whose argument IS the declared bound exactly reads as
+    ///   strictly ordered here, where the oracle's receiver-instantiated
+    ///   comparison reads both faces equal (steps 3-4 mutually compatible)
+    ///   and step 5's projections equal — ambiguous. The receiver decides
+    ///   that pair, and it is not an input.
+    /// * The caller only reaches this comparison when the name-level
+    ///   steps 3-4 read the pair as mutually compatible, so a pair whose
+    ///   `on` arguments are a parameter against a concrete spelling
+    ///   (`on Bag<T>` vs `on Bag<Fragment>`) never arrives: the name level
+    ///   cannot order the parameter leaf, and the gate declines before the
+    ///   structural read runs. Ordering that pair is the receiver-side
+    ///   seam (the step-3-4 comparison needs the instantiated `on` types,
+    ///   which only the applicability walk holds).
     pub(crate) fn try_bounds_subtype(
         &self,
         sub_on_ty: Ty,
@@ -3199,8 +3235,25 @@ impl<'a> ResolvedTypeOps<'a> {
         sup_face_params: &[(TypeParamId, Option<TypeId>)],
         pool: &crate::model::ArgPool,
     ) -> Option<(bool, bool)> {
-        let sub = self.bounds_projection(sub_on_ty, sub_face_params, pool)?;
-        let sup = self.bounds_projection(sup_on_ty, sup_face_params, pool)?;
+        let sub_written = self.map_ty_strict(sub_on_ty, pool)?;
+        let sup_written = self.map_ty_strict(sup_on_ty, pool)?;
+        // `bounds_projection` answers `None` for a parameter-free face and
+        // for an unmapped `on` type — the mapping above already ruled the
+        // latter out, so the fallback is the written form, exact for the
+        // former.
+        let sub = self
+            .bounds_projection(sub_on_ty, sub_face_params, pool)
+            .unwrap_or(sub_written);
+        let sup = self
+            .bounds_projection(sup_on_ty, sup_face_params, pool)
+            .unwrap_or(sup_written);
+        let param_order = (
+            self.system.is_subtype(sub, sup_written),
+            self.system.is_subtype(sup, sub_written),
+        );
+        if param_order.0 != param_order.1 {
+            return Some(param_order);
+        }
         Some((
             self.system.is_subtype(sub, sup),
             self.system.is_subtype(sup, sub),

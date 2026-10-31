@@ -1189,6 +1189,20 @@ impl<'a> Engine<'a> {
                     {
                         continue;
                     }
+                    // #2499: an unnamed face's field defers to the face loop
+                    // below, like the method arm — the loop owns the whole
+                    // unnamed face's verdicts, and without the deferral the
+                    // field stages its row twice (here and in the loop).
+                    let unnamed_face_owns = self.index.get(self.file).is_some_and(|f| {
+                        f.extension_faces().iter().any(|face| {
+                            face.name.is_none()
+                                && self.is_nameless(container)
+                                && face.members.contains_key(&site.name)
+                        })
+                    });
+                    if unnamed_face_owns {
+                        continue;
+                    }
                     self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
                 }
                 DeclKind::Member {
@@ -1232,15 +1246,21 @@ impl<'a> Engine<'a> {
                     // the position in `extension_faces()` the resolve-side
                     // credit keyed. A member no face claims keeps the
                     // spelling arm.
-                    // An unnamed extension's members never reach this arm's
-                    // report path — the face loop below owns them (its
-                    // nameless faces carry no `containers` entry, so the
-                    // accessibility test's container-miss default spares
-                    // here; and the oracle agrees the whole face is
+                    // The oracle agrees an unnamed extension's whole face is
                     // private: `ExtensionElement.isPrivate` answers
                     // `name == null || name.isPrivateName`, element.dart:
                     // 3264-3267, upstream Dart SDK source, so its members
-                    // report exactly once, from the face loop).
+                    // report exactly once, from the face loop — and this arm
+                    // DEFERS to that loop (`unnamed_face_owns` below): an
+                    // unnamed extension's members DO carry declaration sites
+                    // (the container frame interns the empty spelling), so
+                    // without the deferral both this arm and the loop stage
+                    // the row (#2499's duplicate emission — instance and
+                    // static alike). The loop's verdict keys the same
+                    // `extension_member_used` credit pool on the member's
+                    // own face index; its static spelling arm reads the
+                    // `element_used`/`read_names` sets the unnamed face can
+                    // actually resolve through.
                     let extension_face = self.index.get(self.file).and_then(|f| {
                         f.extension_faces()
                             .iter()
@@ -1251,16 +1271,19 @@ impl<'a> Engine<'a> {
                                     |name| name == container,
                                 ) && face.members.contains_key(&site.name)
                             })
-                            .map(|(index, _)| index)
+                            .map(|(index, face)| (index, face.name.is_none()))
                     });
+                    let unnamed_face_owns = matches!(extension_face, Some((_, true)));
                     let member_used = match extension_face {
-                        Some(index) if !is_static => u32::try_from(index).is_ok_and(|index| {
-                            self.extension_member_used
-                                .contains(&(self.file, index, site.name))
-                                || self
-                                    .extension_member_used
-                                    .contains(&(self.file, index, bare))
-                        }),
+                        Some((index, false)) if !is_static => {
+                            u32::try_from(index).is_ok_and(|index| {
+                                self.extension_member_used
+                                    .contains(&(self.file, index, site.name))
+                                    || self
+                                        .extension_member_used
+                                        .contains(&(self.file, index, bare))
+                            })
+                        }
                         // `_isUsedMember`'s element-level `members` ∪
                         // `elements` join (unused_local_elements_verifier
                         // .dart:977-992): a resolved member access credits
@@ -1276,7 +1299,8 @@ impl<'a> Engine<'a> {
                             .contains(&(self.file, container, site.name))
                             || member_element_used.contains(&bare),
                     };
-                    let spared = site.annotated
+                    let spared = unnamed_face_owns
+                        || site.annotated
                         || (!self.is_nameless(site.name)
                             && self.is_publicly_accessible(site.name, site.kind, false))
                         || member_used
@@ -1480,14 +1504,16 @@ impl<'a> Engine<'a> {
         // rule). The candidates clone out first — the staging below
         // mutates the engine.
         //
-        // Membership split with `decl_sites`: an unnamed extension
-        // declares no sites at all, so its whole member set checks here; a
-        // named extension's members are declaration sites — its
-        // methods/getters/setters ride the `DeclKind::Member` arm above
-        // (the `extension_member_used` credit substituted for the
-        // spelling arm there), and its STATIC fields the `DeclKind::
-        // Member` field arm — leaving this face the named-private
-        // instance fields the site arms are ineligible for.
+        // Membership split with `decl_sites`: an unnamed extension's
+        // members carry declaration sites (the container frame interns the
+        // empty spelling), but the `DeclKind::Member` arm defers their
+        // verdicts to this loop (#2499) — so the whole unnamed set still
+        // checks here; a named extension's members are
+        // declaration sites — its methods/getters/setters ride the
+        // `DeclKind::Member` arm above (the `extension_member_used` credit
+        // substituted for the spelling arm there), and its STATIC fields
+        // the `DeclKind::Member` field arm — leaving this face the
+        // named-private instance fields the site arms are ineligible for.
         let mut extension_members: Vec<(u32, StringId, SourceRange, MemberKind, bool, bool)> =
             Vec::new();
         if let Some(elements) = self.index.get(self.file) {
@@ -4710,6 +4736,79 @@ mod pins {
                       }\n";
         let v = source.find("var v").unwrap() as u32 + 4;
         assert_eq!(unused_local_rows(source), vec![(v, 1)], "{source:?}");
+    }
+
+    /// A bare for-in loop target is a WRITE per iteration — the official
+    /// `ForEachPartsWithIdentifier` assignment (`_isReadIdentifier`'s
+    /// `inGetterContext` fails, unused_local_elements_verifier.dart
+    /// :429-453) — so the loop's mention never spares the declaration and
+    /// the write-only life reports.
+    #[test]
+    fn for_in_write_target_still_reports() {
+        let source = "void f(List<int> xs) {\n\
+                      \x20 int i;\n\
+                      \x20 for (i in xs) {}\n\
+                      }\n";
+        let i = source.find("int i").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(source), vec![(i, 1)], "{source:?}");
+    }
+
+    /// Control for [`Self::for_in_write_target_still_reports`]: a body
+    /// read survives the loop-target retraction — only the loop target's
+    /// own offset is a write position.
+    #[test]
+    fn for_in_body_read_spares_the_local() {
+        let source = "void sink(int x) {}\n\
+                      void f(List<int> xs) {\n\
+                      \x20 int i;\n\
+                      \x20 for (i in xs) {\n\
+                      \x20   sink(i);\n\
+                      \x20 }\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// A `when` guard's read resolves the guarded head's own binding, so
+    /// it never joins the shared-case spelling pair: a second, unguarded
+    /// `case int a:` stays a read-free life and reports (each case clause
+    /// visits its pattern variables individually,
+    /// unused_local_elements_verifier.dart:565-579; the guard credit is
+    /// the individual `BindPatternVariableElement`,
+    /// resolution_visitor.dart:926-929). dartq anchors the row on the
+    /// first binder — the flat frame credits the guard read on the newest
+    /// same-name entry, leaving the first entry's own `uses` at zero
+    /// while the join refuses to spare it; the oracle anchors the second
+    /// binder, so the (severity, code, file) triplet matches and only the
+    /// in-file anchor differs.
+    #[test]
+    fn guard_read_spares_only_its_own_arm() {
+        let source = "void f(Object? x) {\n\
+                      \x20 switch (x) {\n\
+                      \x20   case int a when a > 0:\n\
+                      \x20   case int a:\n\
+                      \x20     break;\n\
+                      \x20 }\n\
+                      }\n";
+        let a = source.find("case int a").unwrap() as u32 + 9;
+        assert_eq!(unused_local_rows(source), vec![(a, 1)], "{source:?}");
+    }
+
+    /// The logical-or chain IS one element upstream: both branches bind
+    /// the same variable and the guard's read joins them
+    /// (`UsedLocalElements.addElement` over the
+    /// `JoinPatternVariableElement`'s transitiveVariables,
+    /// unused_local_elements_verifier.dart:1237-1241), so the guard-only
+    /// read spares every same-name binder of the chain and nothing
+    /// reports.
+    #[test]
+    fn same_arm_or_chain_guard_read_spares_all() {
+        let source = "void f(Object? x) {\n\
+                      \x20 switch (x) {\n\
+                      \x20   case int a || int a when a > 0:\n\
+                      \x20     break;\n\
+                      \x20 }\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
     }
 
     /// #2189-c (archive bzip2_encoder/zlib rows): a trailing same-line

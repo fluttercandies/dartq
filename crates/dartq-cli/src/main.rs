@@ -1203,6 +1203,18 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
     // decides before any discovery probe — a `no-plugins` run is the exact
     // pre-plugin shape (no options read, no convention scan).
     let plugins_enabled = !args.no_plugins;
+    // The cross-process facts cache (#2630): the one-shot face opens the
+    // same XDG-rooted store the daemon flushes. An unreadable store warns
+    // once and leaves every engine cold — the accelerator posture, never a
+    // dependency.
+    let facts_store =
+        match dartq_snapshot::SnapshotStore::open(dartq_snapshot::SnapshotConfig::default()) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("warning: facts snapshot store unavailable: {error}");
+                None
+            }
+        };
     let mut engines = Vec::with_capacity(groups.len());
     let mut members: Vec<Vec<Target>> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -1239,13 +1251,25 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         } else {
             dartq_commands::plugins::PluginSet::default()
         };
-        let engine = match dartq_engine::Engine::new(config) {
+        let mut engine = match dartq_engine::Engine::new(config) {
             Ok(engine) => engine,
             Err(error) => {
                 eprintln!("error: engine context unusable: {error}");
                 return exit::USAGE;
             }
         };
+        // Warm start (#2630): the engine's own header pins the SDK identity,
+        // the package graph, and the context salt, so a stale or foreign
+        // generation is a whole-generation miss — never a poisoned load.
+        // Staged facts serve the first apply's content-hash lookups (SDK
+        // units included: the keys are path-free); a miss is the plain cold
+        // build.
+        if let Some(store) = &facts_store {
+            let header = engine.snapshot_header();
+            if let Some(snapshot) = store.load::<dartq_engine::PersistedFacts>(&header) {
+                engine.ingest_facts_snapshot(snapshot);
+            }
+        }
         if let Some(advisory) = stale_advisory {
             advisories.push(advisory);
         }
@@ -1343,6 +1367,21 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         assembly_ms,
         &merged.memory,
     );
+    // Release the runs' engine borrows before the flush below — `merged`
+    // holds each `AnalyzeRun`'s `&mut Engine` until dropped, and the save
+    // walks `&engines` immutably.
+    drop(merged);
+    // The flush (#2630): each engine's resident facts persist under its own
+    // generation header, so the next cold run on an equal context ingests
+    // them instead of re-deriving. A failed save is a future miss, never an
+    // error — warn and continue (the daemon's save_generation posture).
+    if let Some(store) = &facts_store {
+        for engine in &engines {
+            if let Err(error) = engine.save_facts_snapshot(store) {
+                eprintln!("warning: facts snapshot save skipped: {error}");
+            }
+        }
+    }
     // The graceful teardown: each live plugin handshake-completes before the
     // process exits (a bare drop is kill-only).
     for set in plugin_sets {

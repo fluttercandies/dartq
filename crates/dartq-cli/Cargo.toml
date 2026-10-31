@@ -32,6 +32,10 @@ dartq-pub = { workspace = true }
 # declared context's SDK snapshot at the shell edge (the CLI owns SDK
 # discovery; the daemon is shell only).
 dartq-sdk = { workspace = true }
+# The analyze cold path's cross-process facts cache (#2630): the same
+# XDG-rooted generation store the daemon flushes — a warm CLI run ingests
+# the persisted per-file facts instead of re-deriving them.
+dartq-snapshot = { workspace = true }
 # The fix apply face's span-capacity gate (#1543 bypass face) speaks the
 # source crate's capacity constant and error text directly.
 dartq-source = { workspace = true }
