@@ -468,6 +468,13 @@ pub enum SemanticCode {
     /// reports per statement entered — a documented per-statement
     /// divergence.
     DeadCode,
+    /// `This expression has a type of 'void' so its value can't be used.` —
+    /// a `void`-typed expression's value consumed by an enclosing construct
+    /// (the official `checkForUseOfVoidResult`,
+    /// error_detection_helpers.dart:245-258): the operand's `staticType` is
+    /// `VoidTypeImpl` and the position is value-expecting (binary/prefix/
+    /// postfix operand — a whole `ExpressionStatement` is exempt upstream).
+    UseOfVoidResult,
     // —— #476: the extension-application family (all `COMPILE_TIME_ERROR`) ——
     /// `A member named '{0}' is defined in '{1}' and '{2}', and neither is
     /// more specific.` — two applicable extensions both declare the member
@@ -2090,6 +2097,7 @@ impl SemanticCode {
                 "OVERRIDE_ON_NON_OVERRIDING_MEMBER",
             ),
             Self::DeadCode => ("dead_code", "DEAD_CODE"),
+            Self::UseOfVoidResult => ("use_of_void_result", "USE_OF_VOID_RESULT"),
             // One code name with two message texts (the `uniqueName` split,
             // `ambiguous_extension_member_access_two` / `_three_or_more`).
             Self::AmbiguousExtensionMemberTwo | Self::AmbiguousExtensionMemberThreeOrMore => (
@@ -3320,6 +3328,9 @@ impl SemanticCode {
             Self::ExpectedRepresentationType => registry_message("expected_representation_type"),
             // No-argument flow row (diagnostic.g.dart:3546).
             Self::DeadCode => "Dead code.".to_string(),
+            Self::UseOfVoidResult => {
+                "This expression has a type of 'void' so its value can't be used.".to_string()
+            }
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
@@ -4262,6 +4273,12 @@ impl SemanticCode {
                 "Try removing the code, or fixing the code before it so that it can be reached."
                     .to_string(),
             ),
+            // The void-result row's verbatim oracle correction
+            // (messages.yaml `useOfVoidResult`).
+            Self::UseOfVoidResult => Some(
+                "Try checking to see if you're using the correct API; there might be a function or call that returns void you didn't expect. Also check type parameters and variables which might also be void."
+                    .to_string(),
+            ),
             // The #504/#505 rows' verbatim oracle corrections
             // (diagnostic.g.dart, the usage and import/flow families).
             Self::UnusedLocalVariable => Some("Try removing the variable or using it.".to_string()),
@@ -5146,6 +5163,10 @@ mod tests {
         SemanticCode::InheritsAbstractMemberFivePlus,
         SemanticCode::InconsistentInheritance,
         SemanticCode::InconsistentInheritanceGetterAndMethod,
+        // The #3164 `use_of_void_result` emitter's row (compile-time-error
+        // tier by the `dtype()` default — same derivation arm as the
+        // batch's error rows).
+        SemanticCode::UseOfVoidResult,
     ];
 
     /// The severity derivation is the diagnostic layer's: every row's
@@ -5798,6 +5819,7 @@ mod tests {
             | SemanticCode::UnusedLocalVariable
             | SemanticCode::UnusedResult
             | SemanticCode::UnusedShownName
+            | SemanticCode::UseOfVoidResult
             | SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface
             | SemanticCode::WrongNumberOfParametersForOperator
             | SemanticCode::WrongNumberOfParametersForOperatorMinus

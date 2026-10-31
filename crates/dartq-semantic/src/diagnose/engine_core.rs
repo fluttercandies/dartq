@@ -607,6 +607,21 @@ impl<'a> Engine<'a> {
         ));
     }
 
+    /// `use_of_void_result` on one operand row (upstream
+    /// `checkForUseOfVoidResult`, error_detection_helpers.dart:245-258):
+    /// the operand's `staticType` is `VoidTypeImpl` and its value is
+    /// consumed by the enclosing construct — the official helper reports
+    /// `useOfVoidResult.at(methodName)` for a `MethodInvocation` and
+    /// `.at(expression)` for every other shape. The row's own `range`
+    /// answers both: an `Intent::Invoke` row spans the callee's name
+    /// token (the `.at(methodName)` anchor), every other operand row spans
+    /// its own expression. A non-`void` operand is a no-op.
+    fn emit_use_of_void_result(&mut self, ty: Ty, operand: &Row) {
+        if ty == Ty::Void {
+            self.emit(SemanticCode::UseOfVoidResult, operand.range, "", "");
+        }
+    }
+
     /// The correction-carrying emit: the correction renders from the table
     /// template with the row's name (the FAM13 context faces and the catch
     /// `on`-type face — `error_converter.dart`'s correction attachments).
@@ -6315,7 +6330,20 @@ impl<'a> Engine<'a> {
             }
             None => return,
         };
-        if ty == Ty::Null {
+        if ty == Ty::Void {
+            // The `!`-postfix operand's own face (upstream
+            // `visitPostfixExpression`'s `checkForUseOfVoidResult(node)` on
+            // the whole `x!`, error_verifier.dart:1692 →
+            // error_detection_helpers.dart:245-258): a `void`-typed
+            // operand's value is consumed by the assertion — the oracle
+            // reports `use_of_void_result` at the operand-plus-`!` span
+            // before the null-check faces ever ask their question.
+            let range = SourceRange {
+                offset: read_span.offset,
+                length: at.end() - read_span.offset,
+            };
+            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        } else if ty == Ty::Null {
             self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
         } else if self.strictly_non_nullable(ty) {
             self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
@@ -7147,6 +7175,19 @@ impl<'a> Engine<'a> {
         let right = self.rows[right_index].clone();
         let left_ty = self.equality_operand_ty(&left);
         let right_ty = self.equality_operand_ty(&right);
+        // The void-operand verdict runs first (upstream
+        // `visitBinaryExpression`, error_verifier.dart:467-482 →
+        // error_detection_helpers.dart:245-258): the LEFT operand is
+        // checked unconditionally; the RIGHT operand is checked only for
+        // `&&`/`||` (every other binary's right operand is the resolver's
+        // own assignability/operator question, never a void use). A `void`
+        // operand's value is consumed by the operator, so the row reports
+        // at the operand's own span — ahead of every member/argument face
+        // the binary's own resolution asks, and before `bound_face`.
+        self.emit_use_of_void_result(left_ty, &left);
+        if op == self.intern("&&") || op == self.intern("||") {
+            self.emit_use_of_void_result(right_ty, &right);
+        }
         // Both operands read through their BOUND when they are type
         // parameters (#2349): the oracle's ladder and the argument check
         // run on the parameter's interface (`T extends num` is `num`), and
@@ -7742,6 +7783,15 @@ impl<'a> Engine<'a> {
             None => (face.code(), "", None),
         };
         let ty = self.condition_operand_ty(row);
+        // The condition operand's void face precedes every bool verdict
+        // (upstream `bool_expression_verifier.dart:57`'s
+        // `_checkForUseOfVoidResult(expression)` early-return —
+        // `x ? a : b`, `if (x)`, `while (x)`, `assert(x)`, `x &&`/`x ||`
+        // consume a `void` operand's value, so the oracle reports
+        // `use_of_void_result` at the operand and `known_non_bool`'s
+        // `void` arm stays silent below, error_detection_helpers.dart:
+        // 245-258).
+        self.emit_use_of_void_result(ty, row);
         if self.nullable_bool_ty(ty) {
             self.stage_condition_offset(row.range.offset);
             self.staged_checks.push(StagedCheck {
@@ -7961,6 +8011,13 @@ impl<'a> Engine<'a> {
     /// the condition face does not (the negation face owns the report).
     pub(crate) fn classify_negation_operand(&mut self, row: &Row) {
         let ty = self.condition_operand_ty(row);
+        // The `!`-prefix operand's void face runs ahead of the bool
+        // verdict (upstream `visitPrefixExpression`'s
+        // `checkForUseOfVoidResult(operand)`, error_verifier.dart:1727 →
+        // error_detection_helpers.dart:245-258): a `void`-typed operand's
+        // value is consumed by the negation — `!x` on `void x` reports
+        // `use_of_void_result`, never `non_bool_*`.
+        self.emit_use_of_void_result(ty, row);
         if !self.condition_staged.contains(&row.range.offset) && self.nullable_bool_ty(ty) {
             self.stage_condition_offset(row.range.offset);
             self.staged_checks.push(StagedCheck {
@@ -9439,6 +9496,13 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 #[path = "ticket_2935_tests.rs"]
 mod ticket_2935_tests;
+
+/// The #3164 `use_of_void_result` pins (the operand-consumption faces the
+/// engine decides at its own operand-type seams — binary operands,
+/// `!`-postfix, `!`-prefix, and every condition operand).
+#[cfg(test)]
+#[path = "ticket_3164_tests.rs"]
+mod ticket_3164_tests;
 
 #[cfg(test)]
 mod tests {
