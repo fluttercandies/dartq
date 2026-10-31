@@ -2939,6 +2939,41 @@ impl Interp<'_> {
                         .map(|span| span.range.offset)
                         .unwrap_or(0);
                     self.null_short_begin(receiver, recv_offset);
+                    // The target's `ReadType` row re-spells the promoted
+                    // face: upstream `cascadeReceiver` reads the target's
+                    // promoted static type (`type_analyzer.dart`'s
+                    // `cascadeExpression` family), so every section's
+                    // receiver verdict re-derives through that row — a
+                    // `?..` head over a nullable local leaves `A`, never
+                    // `A?`, for the whole cascade extent. Only the flow-type
+                    // row moves: a `PromotedRead` here would misreport the
+                    // `?..` itself as unnecessary (the official's
+                    // `_checkForUnnecessaryNullAware` reads the target's
+                    // declared face, which stays `A?` outside the short).
+                    if let Some(head) = self.exprs.last()
+                        && let Some(var) = head.reference
+                        && let Some(span) = head.read_span
+                    {
+                        let model = self.current.model(var);
+                        let promoted = self.promoted_type_of(var, &model);
+                        let promoted_args = self.promoted_args_of(var, &model);
+                        if promoted != head.ty {
+                            self.facts.retain(|fact| {
+                                !matches!(
+                                    fact,
+                                    FlowFact::ReadType { span: s, .. }
+                                        | FlowFact::PromotedRead { span: s, .. }
+                                        | FlowFact::WhyNotPromoted { span: s, .. }
+                                        if *s == span
+                                )
+                            });
+                            self.emit(FlowFact::ReadType {
+                                span,
+                                ty: promoted,
+                                args: promoted_args,
+                            });
+                        }
+                    }
                 }
                 self.cascade_head_open = *null_aware || inherited_head;
                 let target = self
