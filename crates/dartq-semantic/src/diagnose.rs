@@ -5790,3 +5790,9 @@ mod ticket_2349_tests;
 /// both the site arm and the loop).
 #[cfg(test)]
 mod ticket_2499_tests;
+
+/// The #3109 pins: INVALID_OVERRIDE family — the named-mixin-application
+/// `with`-face chain on the override verdict face, and the
+/// `CovariantParametersVerifier` relatedness gate.
+#[cfg(test)]
+mod ticket_3109_tests;

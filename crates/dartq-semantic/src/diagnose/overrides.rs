@@ -921,12 +921,27 @@ impl<'a> Engine<'a> {
                     Instantiated::Undecidable => continue,
                 };
                 let declared_cmp = face_entry.as_ref().unwrap_or(entry);
-                if self.override_broken(
+                // The `CovariantParametersVerifier` gate (upstream
+                // `inheritance_override.dart:541-544`): the function-subtype
+                // check rewrites a covariant parameter to `Object?`, so an
+                // unrelated covariant parameter passes `override_broken`
+                // unflagged; the oracle's second verifier still reports
+                // `invalid_override` (never the setter code) when the
+                // parameter type relates to the super parameter in neither
+                // direction.
+                let covariant_unrelated = self.covariant_param_unrelated(
                     declared_cmp,
                     (self.file, container),
                     inherited_ref,
                     (hit.origin, hit.face_name),
-                ) {
+                );
+                let subtype_broken = self.override_broken(
+                    declared_cmp,
+                    (self.file, container),
+                    inherited_ref,
+                    (hit.origin, hit.face_name),
+                );
+                if subtype_broken || covariant_unrelated {
                     if let Some(ptr) = hit.identity() {
                         broken_seen.push((setter_face, ptr));
                     }
@@ -936,21 +951,43 @@ impl<'a> Engine<'a> {
                     let declared_text = self.override_signature_text(declared_cmp);
                     let face_text = self.strings.resolve(hit.face_name);
                     let inherited_text = self.override_signature_text(inherited_ref);
-                    let code = if setter_face {
-                        SemanticCode::InvalidOverrideSetter
-                    } else {
-                        SemanticCode::InvalidOverride
-                    };
-                    self.emit5_with_context(
-                        code,
-                        range,
-                        display,
-                        container_text,
-                        &declared_text,
-                        face_text,
-                        &inherited_text,
-                        overridden_member_context(inherited_ref, hit.origin, setter_face),
-                    );
+                    // The subtype verdict keeps the setter spelling's own
+                    // code; the covariant verifier always reports the plain
+                    // `invalid_override` (upstream `correct_override.dart`
+                    // `CovariantParametersVerifier.verify` — no setter arm).
+                    // Both gates firing on a non-setter face lands two
+                    // identical (code, span) rows — the oracle's diagnostic
+                    // dedup collapses them, so the second emit is setter-
+                    // face-only there.
+                    if subtype_broken {
+                        let code = if setter_face {
+                            SemanticCode::InvalidOverrideSetter
+                        } else {
+                            SemanticCode::InvalidOverride
+                        };
+                        self.emit5_with_context(
+                            code,
+                            range,
+                            display,
+                            container_text,
+                            &declared_text,
+                            face_text,
+                            &inherited_text,
+                            overridden_member_context(inherited_ref, hit.origin, setter_face),
+                        );
+                    }
+                    if covariant_unrelated && (!subtype_broken || setter_face) {
+                        self.emit5_with_context(
+                            SemanticCode::InvalidOverride,
+                            range,
+                            display,
+                            container_text,
+                            &declared_text,
+                            face_text,
+                            &inherited_text,
+                            overridden_member_context(inherited_ref, hit.origin, setter_face),
+                        );
+                    }
                 }
             }
         }
@@ -3221,6 +3258,17 @@ impl<'a> Engine<'a> {
                 if !seen.insert(*mixin) {
                     return None;
                 }
+                // A resolved mixin CLASS / named application carries its own
+                // `with` faces on the application interface (`with A<...>`
+                // where `mixin class A = Object with M<...>` exposes M's
+                // members exactly like a written `with M` — the same
+                // named-application rule the member walk and
+                // `override_face_member` apply; upstream Dart SDK source,
+                // `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart`).
+                // The applied faces contribute concretely; `on`/`implements`
+                // contribute as interfaces. A plain mixin's `with` is empty —
+                // this only fires for mixin classes and named applications.
+                let mut applied: VecDeque<(StringId, FileId, LibraryId, bool)> = VecDeque::new();
                 if let Some((mixin_container, mixin_owner)) = resolve_container(
                     self.graph,
                     self.namespaces,
@@ -3243,8 +3291,77 @@ impl<'a> Engine<'a> {
                             });
                         }
                     }
+                    let mixin_owner_lib = self
+                        .owner_library_of(mixin_owner, *mixin)
+                        .unwrap_or(owner_lib);
+                    for mixin_face in mixin_container.with_clause.iter() {
+                        applied.push_back((*mixin_face, mixin_owner, mixin_owner_lib, true));
+                    }
+                    for mixin_face in mixin_container
+                        .on_clause
+                        .iter()
+                        .chain(mixin_container.implements_clause.iter())
+                    {
+                        applied.push_back((*mixin_face, mixin_owner, mixin_owner_lib, false));
+                    }
                 } else {
                     self.frozen_list_face_hits(*mixin, found_owner, true, &mut hits);
+                }
+                while let Some((face, face_owner, face_lib, concrete)) = applied.pop_front()
+                {
+                    // A clause cycle in the applied faces poisons the whole
+                    // face walk — the same suppression the outer `with`
+                    // loop keeps.
+                    if !seen.insert(face) {
+                        return None;
+                    }
+                    let Some((face_container, face_owner)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        face_lib,
+                        face_owner,
+                        face,
+                    ) else {
+                        self.frozen_list_face_hits(face, face_owner, concrete, &mut hits);
+                        continue;
+                    };
+                    if face_container.members.is_empty() {
+                        self.frozen_list_face_hits(face, face_owner, concrete, &mut hits);
+                    }
+                    for (member, entry) in &face_container.members {
+                        if !entry.is_static {
+                            hits.push(FaceEntry {
+                                name: *member,
+                                entry: self.boundary.member(
+                                    face_owner,
+                                    face,
+                                    *member,
+                                    entry,
+                                ),
+                                owner_name: face,
+                                owner_file: face_owner,
+                                concrete_source: concrete,
+                            });
+                        }
+                    }
+                    // The applied chain keeps climbing the face's own
+                    // application faces transitively (`A = Object with B`,
+                    // `B = Object with M`): each hop's `with` faces join
+                    // concrete, its `on`/`implements` join the interface.
+                    let next_lib = self
+                        .owner_library_of(face_owner, face)
+                        .unwrap_or(face_lib);
+                    for next in face_container.with_clause.iter() {
+                        applied.push_back((*next, face_owner, next_lib, true));
+                    }
+                    for next in face_container
+                        .on_clause
+                        .iter()
+                        .chain(face_container.implements_clause.iter())
+                    {
+                        applied.push_back((*next, face_owner, next_lib, false));
+                    }
                 }
             }
             for interface in &found.implements_clause {
@@ -4489,6 +4606,31 @@ impl<'a> Engine<'a> {
                         collected.push(hit);
                         mixin_hit = true;
                         break;
+                    }
+                    // A mixin CLASS applied through `with` also contributes
+                    // its own `with` faces: a named application `mixin class
+                    // A<U, V> = Object with M<...>` denotes the application
+                    // type, so `class C ... with A<...>` puts M's members on
+                    // C's interface exactly like a directly-written `with M`
+                    // (upstream Dart SDK source,
+                    // `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart`
+                    // — the application interface keeps the applied faces'
+                    // members). The superclass stays out: an applied mixin's
+                    // superclass is always `Object`
+                    // (`MIXIN_CLASS_DECLARATION_EXTENDS_NOT_OBJECT`), whose
+                    // members the object-members gate owns. A plain mixin's
+                    // `with` clause is empty — this only fires for mixin
+                    // classes and named applications.
+                    let mixin_owner_lib = self
+                        .owner_library_of(mixin_owner, *mixin)
+                        .unwrap_or(owner_lib);
+                    for mixin_face in mixin_container
+                        .with_clause
+                        .iter()
+                        .chain(mixin_container.on_clause.iter())
+                        .chain(mixin_container.implements_clause.iter())
+                    {
+                        pending.push_back((*mixin_face, mixin_owner, mixin_owner_lib, *mixin));
                     }
                 }
             }
@@ -5931,78 +6073,18 @@ impl<'a> Engine<'a> {
         if declared.type_params != inherited.type_params {
             return true;
         }
-        let world = self.name_world();
         // The single type-decision point for every face below: the M1
         // assignability first, the name lattice on its `None`. No consumer
-        // of this verdict re-derives either half. Both operands read
-        // through their type aliases first: the oracle compares resolved
-        // function types, so a parameterless alias's nullability joins the
-        // comparison (`typedef WhenComplete = void Function(...)?` — the
-        // spelled `WhenComplete?` and `WhenComplete` are the same type;
-        // riverpod's `create` override). The fold is identity for every
-        // non-alias spelling, and an alias to an unmodelable RHS keeps the
-        // written head — the same under-fold posture `fold_alias_ty` keeps.
+        // of this verdict re-derives either half — [`Engine::override_decide`]
+        // encodes it once.
+        let world = self.name_world();
         let decide = |from: (Ty, (FileId, StringId), &MemberEntry),
                       to: (Ty, (FileId, StringId), &MemberEntry)| {
             let (from_ty, from_scope, from_entry) = from;
             let (to_ty, to_scope, to_entry) = to;
-            let from_ty = self.fold_alias_ty(from_ty);
-            let to_ty = self.fold_alias_ty(to_ty);
-            if let Ty::Named { name, .. } = from_ty
-                && self.named_head_is_invalid(name, from_scope, from_entry)
-            {
-                return Some(true);
-            }
-            if let Ty::Named { name, .. } = to_ty
-                && self.named_head_is_invalid(name, to_scope, to_entry)
-            {
-                return Some(true);
-            }
-            // The override faces read the SUBTYPE matrix, not the
-            // dynamic-dispatch assignment face (`subtype.dart`'s top rules):
-            // `dynamic` is a top type here, so `dynamic Function()` is no
-            // subtype of `int Function()` even though an expression of type
-            // `dynamic` assigns anywhere — the inferred/written `dynamic`
-            // override rows decide on this arm.
-            if matches!(from_ty, Ty::Dynamic) {
-                return Some(match to_ty {
-                    Ty::Dynamic => true,
-                    Ty::Named {
-                        name,
-                        nullable: true,
-                        ..
-                    } => name == self.intern("Object"),
-                    _ => false,
-                });
-            }
-            if matches!(to_ty, Ty::Dynamic) {
-                return Some(true);
-            }
-            self.assignable(from_ty, to_ty, false).or_else(|| {
-                let (
-                    Ty::Named {
-                        name: from_name,
-                        nullable: false,
-                        ..
-                    },
-                    Ty::Named {
-                        name: to_name,
-                        nullable: false,
-                        ..
-                    },
-                ) = (from_ty, to_ty)
-                else {
-                    return None;
-                };
-                if from_name == to_name {
-                    // Same-head pairs stay with the covariant-argument
-                    // rule; the lattice decides distinct heads only.
-                    return None;
-                }
-                world
-                    .decide_subtype(from_name, to_name)
-                    .or_else(|| self.dead_edge_subtype(from_name, from_scope, to_name))
-            })
+            self.override_decide(
+                from_ty, from_scope, from_entry, to_ty, to_scope, to_entry, &world,
+            )
         };
         let declared_at = |ty: Ty| (ty, declared_owner, declared);
         let inherited_at = |ty: Ty| (ty, inherited_owner, inherited);
@@ -6146,6 +6228,177 @@ impl<'a> Engine<'a> {
             ),
             Some(false)
         )
+    }
+
+    /// The single type-decision point behind every [`Engine::override_broken`]
+    /// face — the M1 assignability first, the name lattice on its `None`.
+    /// Both operands read through their type aliases first: the oracle
+    /// compares resolved function types, so a parameterless alias's
+    /// nullability joins the comparison (`typedef WhenComplete = void
+    /// Function(...)?` — the spelled `WhenComplete?` and `WhenComplete` are
+    /// the same type; riverpod's `create` override). The fold is identity
+    /// for every non-alias spelling, and an alias to an unmodelable RHS
+    /// keeps the written head — the same under-fold posture `fold_alias_ty`
+    /// keeps.
+    ///
+    /// The InvalidType arm (`subtype.dart:274-276` — `T0 is InvalidType ||
+    /// T1 is InvalidType` answers the subtype question `true`, so the
+    /// override is satisfied and stays silent): a `Ty::Named` whose head
+    /// resolves to no type in the *member's defining scope* is the oracle's
+    /// `InvalidType`. The leniency applies at the compared pair's own head:
+    /// an invalid head on either operand makes the pair compatible
+    /// outright, while an invalid *argument* inside an otherwise-resolved
+    /// pair still descends through `assignable`'s covariant-argument arm —
+    /// matching the oracle, where `List<InvalidType> <: Set<int>` still
+    /// fails on the head walk. `scope` is `(defining file, declaring
+    /// container name)` per side.
+    fn override_decide(
+        &self,
+        from_ty: Ty,
+        from_scope: (FileId, StringId),
+        from_entry: &MemberEntry,
+        to_ty: Ty,
+        to_scope: (FileId, StringId),
+        to_entry: &MemberEntry,
+        world: &NameWorld<'a>,
+    ) -> Option<bool> {
+        let from_ty = self.fold_alias_ty(from_ty);
+        let to_ty = self.fold_alias_ty(to_ty);
+        if let Ty::Named { name, .. } = from_ty
+            && self.named_head_is_invalid(name, from_scope, from_entry)
+        {
+            return Some(true);
+        }
+        if let Ty::Named { name, .. } = to_ty
+            && self.named_head_is_invalid(name, to_scope, to_entry)
+        {
+            return Some(true);
+        }
+        // The override faces read the SUBTYPE matrix, not the
+        // dynamic-dispatch assignment face (`subtype.dart`'s top rules):
+        // `dynamic` is a top type here, so `dynamic Function()` is no
+        // subtype of `int Function()` even though an expression of type
+        // `dynamic` assigns anywhere — the inferred/written `dynamic`
+        // override rows decide on this arm.
+        if matches!(from_ty, Ty::Dynamic) {
+            return Some(match to_ty {
+                Ty::Dynamic => true,
+                Ty::Named {
+                    name,
+                    nullable: true,
+                    ..
+                } => name == self.intern("Object"),
+                _ => false,
+            });
+        }
+        if matches!(to_ty, Ty::Dynamic) {
+            return Some(true);
+        }
+        self.assignable(from_ty, to_ty, false).or_else(|| {
+            let (
+                Ty::Named {
+                    name: from_name,
+                    nullable: false,
+                    ..
+                },
+                Ty::Named {
+                    name: to_name,
+                    nullable: false,
+                    ..
+                },
+            ) = (from_ty, to_ty)
+            else {
+                return None;
+            };
+            if from_name == to_name {
+                // Same-head pairs stay with the covariant-argument rule;
+                // the lattice decides distinct heads only.
+                return None;
+            }
+            world
+                .decide_subtype(from_name, to_name)
+                .or_else(|| self.dead_edge_subtype(from_name, from_scope, to_name))
+        })
+    }
+
+    /// The `CovariantParametersVerifier` gate (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/correct_override.dart:96-138` —
+    /// `verify`/`_superParameters`; wired from
+    /// `inheritance_override.dart:541-544` for the declared-member path
+    /// only, never the mixin-application face). A `covariant` declared
+    /// parameter is exempt from the function-subtype check (its type reads
+    /// as `Object?` there), but the oracle still requires the parameter's
+    /// declared type to be RELATED to every corresponding superinterface
+    /// parameter — `thisType <: superType || superType <: thisType` —
+    /// reporting `invalid_override` (never the setter code) when neither
+    /// direction holds (`void f(covariant String)` over `void f(int)`).
+    /// Correspondence is positional by index and named by name. An
+    /// undecidable pair (`None` — unresolvable head, type parameter) keeps
+    /// the under-report direction.
+    fn covariant_param_unrelated(
+        &self,
+        declared: &MemberEntry,
+        declared_owner: (FileId, StringId),
+        inherited: &MemberEntry,
+        inherited_owner: (FileId, StringId),
+    ) -> bool {
+        let (Some(a), Some(b)) = (declared.formals.as_deref(), inherited.formals.as_deref())
+        else {
+            return false;
+        };
+        // The gate fires only when a covariant parameter is present;
+        // building the lattice world lazily keeps the common
+        // non-covariant member free of its table work.
+        let mut world = None;
+        let mut unrelated = |d: &Formal, i: &Formal| {
+            let world = world.get_or_insert_with(|| self.name_world());
+            let forward = self.override_decide(
+                d.ty,
+                declared_owner,
+                declared,
+                i.ty,
+                inherited_owner,
+                inherited,
+                world,
+            );
+            let backward = self.override_decide(
+                i.ty,
+                inherited_owner,
+                inherited,
+                d.ty,
+                declared_owner,
+                declared,
+                world,
+            );
+            matches!(forward, Some(false)) && matches!(backward, Some(false))
+        };
+        for (index, d) in a.positional.iter().enumerate() {
+            let Some(i) = b.positional.get(index) else {
+                continue;
+            };
+            // The oracle's `parameter.isCovariant` covers the propagated
+            // covariance too (instance-member inference marks the
+            // overriding parameter covariant when any overridden parameter
+            // is), so either side's flag puts the pair on this gate.
+            if !d.covariant && !i.covariant {
+                continue;
+            }
+            if unrelated(d, i) {
+                return true;
+            }
+        }
+        for d in &a.named {
+            let Some(i) = b.named_formal(d.name) else {
+                continue;
+            };
+            if !d.covariant && !i.covariant {
+                continue;
+            }
+            if unrelated(d, i) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether a `Ty::Named` head is the oracle's `InvalidType` — a
