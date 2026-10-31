@@ -176,7 +176,20 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// top level).
     fn reserved_name_recovery_at(&self, context: crate::listener::IdentifierContext) -> bool {
         match context {
+            // `LibraryIdentifierContext.ensureIdentifier` recovery branch 2b
+            // (identifier_context_impl.dart:976-983) is shared by the
+            // library and `part of` name positions AND their `.`
+            // continuations (the upstream impl class backs all four
+            // `IdentifierContext` constants): a top-level-declaration head
+            // after `library`/`part of`/`lib.` splices a synthetic name and
+            // stays for the declaration loop — `part of lib. final a = 0;`
+            // reports `missing_identifier` at `final`, and `final a = 0;`
+            // reparses as a variable declaration. The keep-set is the same
+            // `.`/`;`/EOF for every flavor (:947-951).
             crate::listener::IdentifierContext::LibraryName
+            | crate::listener::IdentifierContext::LibraryNameContinuation
+            | crate::listener::IdentifierContext::PartName
+            | crate::listener::IdentifierContext::PartNameContinuation
             | crate::listener::IdentifierContext::TopLevelVariableDeclaration => {
                 self.looks_like_start_of_next_top_level_declaration_at(0)
                     && !self.name_continuation_follower(context)
@@ -195,6 +208,46 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             }
             crate::listener::IdentifierContext::LocalVariableDeclaration => {
                 self.looks_like_statement_start_at(0)
+            }
+            // `EnumValueDeclarationIdentifierContext.ensureIdentifier`
+            // (identifier_context_impl.dart:346-357): the value-name slot's
+            // first recovery arm inserts a synthetic name when the head is a
+            // top-level-declaration keyword — `void foo() {}` inside an
+            // enum body without a `;` reparses `void` as the member head,
+            // so the oracle reports `missing_identifier` at `void` (never
+            // `expectedIdentifierButGotKeyword`) and the `}`/`;` recovery
+            // lands on the same anchor.
+            crate::listener::IdentifierContext::EnumValueDeclaration => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+            }
+            // `ClassOrMixinOrExtensionIdentifierContext.ensureIdentifier`
+            // (identifier_context_impl.dart:80-86): a top-level-declaration
+            // keyword head in the class/mixin/extension name slot splices a
+            // synthetic name and stays for the declaration loop when the
+            // FOLLOWER does not continue the declaration header —
+            // `class enum E { v }` reports `missing_identifier` at `enum`
+            // (never `builtInIdentifierInDeclaration`), leaving `enum E { v }`
+            // to reparse as an enum declaration; `class enum { }` /
+            // `class enum <T> { }` keep the keyword as the name because `{`/`<`
+            // are in the `_isOneOfFollowingValues` keep-set (`<` `{`
+            // `extends` `with` `implements` `on` `=` `(` `.` EOF, :58-69).
+            crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+                    && !matches!(
+                        self.cursor.look_kind(1),
+                        TokenKind::Lt
+                            | TokenKind::OpenCurly
+                            | TokenKind::Keyword(
+                                Keyword::Extends
+                                    | Keyword::With
+                                    | Keyword::Implements
+                                    | Keyword::On
+                            )
+                            | TokenKind::Eq
+                            | TokenKind::OpenParen
+                            | TokenKind::Period
+                            | TokenKind::Eof
+                    )
             }
             crate::listener::IdentifierContext::MetadataReference
             | crate::listener::IdentifierContext::MetadataContinuation
@@ -217,15 +270,38 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                             )
                     )
             }
-            // `TypedefDeclarationIdentifierContext.ensureIdentifier` branch 2
-            // (identifier_context_impl.dart:1417-1424): a reserved word that
-            // heads a top-level declaration splices a synthetic name and stays
-            // for the declaration loop (oracle `typedef var a;`). The
-            // template's `_isOneOfFollowingValues(identifier)` disjunct tests
-            // the name token itself against `(` `<` `=` `;` EOF — unreachable
-            // for a reserved word (those heads never carry a keyword kind).
+            // `TypedefDeclarationIdentifierContext.ensureIdentifier`
+            // (identifier_context_impl.dart:1417-1449): a declaration-head
+            // keyword in the name slot splices a synthetic name and stays for
+            // the declaration loop, but a BUILT-IN head is kept as the name
+            // first — `isBuiltIn && _isOneOfFollowingValues(identifier.next)`
+            // (:1419-1424) consumes `mixin`/`get`/`set`/`export`/`import`/
+            // `library`/`part`/`typedef`/`extension` after the
+            // `builtInIdentifierInDeclaration` row when the follower is `(`
+            // `<` `=` `;` or EOF (oracle `typedef int get;` / `typedef int
+            // mixin;`: builtIn row only, no splice). RESERVED heads (`class`/
+            // `enum`/`void`/`var`/`const`/`final`) fail the `isBuiltIn` gate
+            // and always splice — oracle `typedef int enum;` splices even
+            // with the `;` follower. The splice arm itself is
+            // `looksLikeStartOfNextTopLevelDeclaration(identifier) ||
+            // _isOneOfFollowingValues(identifier)` (:1425-1426); the second
+            // disjunct is dead for keywords (a keyword is never `(`/`<`/`=`/
+            // `;`/EOF), and the `(`/`=` keeps that survive the built-in gate
+            // reach here via `ensureIdentifierPotentiallyRecovered` anyway.
             crate::listener::IdentifierContext::TypedefDeclaration => {
                 self.looks_like_start_of_next_top_level_declaration_at(0)
+                    && !(matches!(
+                        self.cursor.peek_kind(),
+                        TokenKind::Keyword(kw)
+                            if kw.style() == dartq_scanner::KeywordStyle::BuiltIn
+                    ) && matches!(
+                        self.cursor.look_kind(1),
+                        TokenKind::OpenParen
+                            | TokenKind::Lt
+                            | TokenKind::Eq
+                            | TokenKind::Semicolon
+                            | TokenKind::Eof
+                    ))
             }
             // `TypeVariableDeclarationIdentifierContext.ensureIdentifier`
             // (identifier_context_impl.dart:1589-1603): the keep-set joins
@@ -349,6 +425,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 dartq_scanner::KeywordStyle::Reserved => matches!(
                     context,
                     crate::listener::IdentifierContext::LibraryName
+                        | crate::listener::IdentifierContext::LibraryNameContinuation
+                        | crate::listener::IdentifierContext::PartName
+                        | crate::listener::IdentifierContext::PartNameContinuation
                         | crate::listener::IdentifierContext::TopLevelVariableDeclaration
                         | crate::listener::IdentifierContext::Combinator
                         | crate::listener::IdentifierContext::LocalVariableDeclaration
@@ -358,9 +437,34 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         | crate::listener::IdentifierContext::ImportPrefixDeclaration
                         | crate::listener::IdentifierContext::TypedefDeclaration
                         | crate::listener::IdentifierContext::TypeVariableDeclaration
+                        | crate::listener::IdentifierContext::EnumValueDeclaration
+                        | crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration
                 ),
                 dartq_scanner::KeywordStyle::BuiltIn => {
+                    // The `looksLikeStartOfNextTopLevelDeclaration` recovery
+                    // arm makes no reserved/built-in distinction upstream —
+                    // `enum`/`mixin`/`typedef`/`extension`/`get`/`set` are
+                    // built-in keywords yet still head a top-level
+                    // declaration, so a name slot whose recovery template
+                    // keep-tests that head set splices the synthetic name for
+                    // a built-in head exactly as for a reserved one (`library
+                    // mixin M {}` / `typedef T set a(b) {}` / `part of lib.
+                    // final a = 0;`: all `missing_identifier` at the head,
+                    // never `builtInIdentifierInDeclaration` /
+                    // `expectedIdentifierButGotKeyword`). The admit set is
+                    // therefore every context whose `reserved_name_recovery_at`
+                    // arm keep-tests the top-level-declaration head — NOT the
+                    // statement-start contexts (`LocalVariableDeclaration`,
+                    // `Metadata*`), where a built-in `set`/`get`/`mixin` is a
+                    // legal name.
                     context == crate::listener::IdentifierContext::ImportPrefixDeclaration
+                        || context == crate::listener::IdentifierContext::LibraryName
+                        || context == crate::listener::IdentifierContext::LibraryNameContinuation
+                        || context == crate::listener::IdentifierContext::PartName
+                        || context == crate::listener::IdentifierContext::PartNameContinuation
+                        || context == crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                        || context == crate::listener::IdentifierContext::Combinator
+                        || context == crate::listener::IdentifierContext::TypedefDeclaration
                         // `TypeVariableDeclarationIdentifierContext.ensureIdentifier`
                         // (identifier_context_impl.dart:1589-1603) tests the
                         // keep-set BEFORE the built-in face: a built-in that
@@ -379,6 +483,24 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         // the Complex recovery loop and the closer assert in
                         // the Simple1 arm is unreachable for them.
                         || context == crate::listener::IdentifierContext::TypeVariableDeclaration
+                        // `EnumValueDeclarationIdentifierContext.ensureIdentifier`
+                        // (:346-357): a built-in top-level-declaration head
+                        // (`typedef`/`extension`/`mixin`/`export`/`import`/
+                        // `library`/`part`/`get`/`set`) in the value-name slot
+                        // takes the same synthetic-insert arm as a reserved
+                        // head — `enum E { typedef }` reports
+                        // `missing_identifier` at `typedef`, never
+                        // `builtInIdentifierInDeclaration`.
+                        || context == crate::listener::IdentifierContext::EnumValueDeclaration
+                        // `ClassOrMixinOrExtensionIdentifierContext`
+                        // (:80-86): a built-in top-level-declaration head
+                        // (`enum`/`mixin`/`typedef`/`extension`/`import`/
+                        // `export`/`library`/`part`) in the declaration-name
+                        // slot takes the same synthetic-insert arm as a
+                        // reserved head — `class enum E { v }` reports
+                        // `missing_identifier` at `enum`, never
+                        // `builtInIdentifierInDeclaration`.
+                        || context == crate::listener::IdentifierContext::ClassOrMixinOrExtensionDeclaration
                 }
                 _ => false,
             },
@@ -993,7 +1115,10 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     fn name_continuation_follower(&self, context: crate::listener::IdentifierContext) -> bool {
         let follower = self.cursor.look_kind(1);
         match context {
-            crate::listener::IdentifierContext::LibraryName => {
+            crate::listener::IdentifierContext::LibraryName
+            | crate::listener::IdentifierContext::LibraryNameContinuation
+            | crate::listener::IdentifierContext::PartName
+            | crate::listener::IdentifierContext::PartNameContinuation => {
                 matches!(
                     follower,
                     TokenKind::Period | TokenKind::Semicolon | TokenKind::Eof
@@ -1828,9 +1953,17 @@ fn keyword_as_name_message(
         // `expectedIdentifierButGotKeyword` for every keyword name — built-in
         // and reserved alike; oracle keyword_named_typedefs.dart 1|14). The
         // second face at the same token (the typedef-name built-in text) is
-        // the caller's (`parse_typedef`).
+        // the caller's (`parse_typedef`). A built-in kept by the plain
+        // `_isOneOfFollowingValues` gate on `;`/`<`/EOF stays the name with
+        // only the caller's built-in row (`typedef int get;`), so the
+        // keyword-name face is gated to the `(`/`=` followers that mark the
+        // recovered shapes.
         dartq_scanner::KeywordStyle::BuiltIn
-            if context == crate::listener::IdentifierContext::TypedefDeclaration =>
+            if context == crate::listener::IdentifierContext::TypedefDeclaration
+                && matches!(
+                    cursor.look_kind(1),
+                    TokenKind::OpenParen | TokenKind::Eq
+                ) =>
         {
             Some(msg::expected_identifier_but_got_keyword(lexeme))
         }

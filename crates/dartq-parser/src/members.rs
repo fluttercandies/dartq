@@ -513,7 +513,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if is_external && self.peek_kind() != TokenKind::Semicolon {
             self.report(msg::external_method_with_body(), self.peek_span());
         }
-        let allow_abstract = is_external || self.features.augmentations_enabled;
+        // Upstream `parseTopLevelMethod` passes
+        // `isAugmentationsFeatureEnabled` into `allowAbstract`
+        // (parser_impl.dart:6255) so the `;` arm stays silent at parse
+        // time, then the analyzer reports `missingFunctionBody` on any
+        // declaration with no complete fragment — every top-level `;`
+        // body that is not itself `augment`/`external` (a top-level
+        // member can never be abstract). dartq has no post-parse
+        // fragment walk, so the parser emits the row: only a real
+        // `augment`/`external` declaration legally keeps a `;` body.
+        let allow_abstract = is_external || augment.is_some();
         let end = self.parse_function_body(false, allow_abstract);
         self.async_state = saved_async;
         let begin_token = self.span_at_mark(before_start);
@@ -1532,9 +1541,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::expected_body(), follower);
             follower
         } else {
+            // Upstream `parseClassOrMixinOrExtensionOrEnumMemberImpl`
+            // passes `isAugmentationsFeatureEnabled` into `allowAbstract`
+            // (parser_impl.dart:6077) so the `;` arm stays silent at
+            // parse time, then the analyzer reports `missingFunctionBody`
+            // on any member with no complete fragment — concretely every
+            // `static` member with a `;` body (a static member can never
+            // be abstract, and `augment`/`external` are their own body
+            // kinds). Non-static `;` members stay silent here: they are
+            // abstract-legal at this tier and any misuse surfaces as the
+            // verifier's `concrete_class_with_abstract_member`, not
+            // `missing_function_body`. dartq has no post-parse fragment
+            // walk, so the parser emits the row for the static arm.
             let allow_abstract = (static_kw.is_none()
                 || mods.external.is_some()
-                || self.features.augmentations_enabled)
+                || mods.augment.is_some())
                 && self.async_state == AsyncModifier::Sync;
             self.parse_function_body(false, allow_abstract)
         };
@@ -2821,6 +2842,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     fn parse_super_initializer_expression(&mut self) -> TokenSpan {
         let head = self.peek_span();
         let mut n = 1;
+        // Span of the name slot when a synthetic name was spliced at a
+        // keyword head (`super. var f;`): the official
+        // `insertParens(includeIdentifier: false)` anchors
+        // `expectedAfterButGot('(')` on the token FOLLOWING the name — the
+        // spliced identifier sits at the keyword's own offset, so its
+        // follower is `var`, not `f` (a real name like `super. foo f;`
+        // anchors the `(`-expect on the real follower `f`).
+        let mut spliced_name_span: Option<TokenSpan> = None;
         if self.cursor.look_kind(n) == TokenKind::Period {
             n += 1;
             let name = self.cursor.look_kind(n);
@@ -2829,6 +2858,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 let at = self.look_span_at(n);
                 self.report(msg::missing_identifier(), at);
                 self.synthetic(TokenKind::Identifier, at.range.offset);
+                spliced_name_span = Some(at);
             }
             n += 1;
         }
@@ -2916,7 +2946,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             } else if next != TokenKind::OpenParen {
                 // `expectedAfterButGot('(')` + `insertParens(includeIdentifier:
                 // false)` (:4948-4952): wrap the follower in empty parens.
-                let at = self.look_span_at(n);
+                // The report anchors on the token after the name: a real
+                // name leaves the follower current (`super. foo f;` → `f`),
+                // while a name spliced at a keyword head sits at the
+                // keyword's own offset so its follower is that keyword
+                // (`super. var f;` → `var`, never `f`).
+                let at = spliced_name_span.unwrap_or_else(|| self.look_span_at(n));
                 self.report(msg::expected_after_but_got("("), at);
                 let type_param = self.compute_type_param_or_arg_at(n, false);
                 if matches!(type_param, TypeParamOrArg::None) {
