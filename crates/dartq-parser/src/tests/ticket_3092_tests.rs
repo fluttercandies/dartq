@@ -90,13 +90,14 @@ fn initializer_this_target_stays_silent() {
 /// `C() : super = 0;` — the super-initializer dispatch keeps the selector
 /// row (the arm's real target) and the invalid-initializer face, but no
 /// illegal rider: the initializer lane has no statement (`issue_48411_prime_1`
-/// 12:9|5 + 12:9|9).
+/// 12:9|5 + 12:9|9). The invalid-initializer row anchors on the WHOLE entry
+/// `super = 0` (16..25) since #3193, not on the bare `super` head.
 #[test]
 fn initializer_super_target_has_no_rider() {
     let rows = sorted_rows("class A { A() : super = 0; }\n");
     assert_eq!(
         rows,
-        vec![code("invalid_initializer", 16, 21), mas(16, 21)],
+        vec![code("invalid_initializer", 16, 25), mas(16, 21)],
         "oracle: selector + invalid-initializer rows only, never the rider"
     );
 }

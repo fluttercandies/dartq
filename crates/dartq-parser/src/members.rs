@@ -2811,23 +2811,34 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Parses `this(...)`/`this.name(...)` as a redirecting initializer and
     /// checks the body that follows (:4860-4866).
     fn finish_redirecting_initializer(&mut self) -> TokenSpan {
+        let head = self.peek_span();
         // AstBuilder initializer recovery (`ast_builder.dart:803-815`):
         // `this(...)` followed by a selector (`this().foo`) reports
-        // `invalid_this_in_initializer` at `this`.
+        // `invalid_this_in_initializer` at `this`. A follower `=`/`!`/`(` is
+        // the `buildInitializer` null path instead (`this() = 0`, `this()!`,
+        // `this()()`: no representable initializer node, ast_builder.dart
+        // :2209-2234) — the report spans the WHOLE entry and is deferred
+        // until the re-read below fixes the entry end.
         let mut n = 1;
         if self.cursor.look_kind(n) == TokenKind::Period {
             n += 1;
         }
+        let mut reject = false;
         if self.cursor.look_kind(n) == TokenKind::OpenParen
             && let Some(close) = self.cursor.table_matching_end(self.look_span_at(n).id)
-            && matches!(
-                self.kind_at(self.offset_of(close) + 1),
-                TokenKind::Period | TokenKind::QuestionPeriod | TokenKind::OpenSquare
-            )
         {
-            self.report(msg::invalid_this_in_initializer(), self.peek_span());
+            match self.kind_at(self.offset_of(close) + 1) {
+                TokenKind::Period | TokenKind::QuestionPeriod | TokenKind::OpenSquare => {
+                    self.report(msg::invalid_this_in_initializer(), head);
+                }
+                TokenKind::Eq | TokenKind::Bang | TokenKind::OpenParen => reject = true,
+                _ => {}
+            }
         }
         let end = self.parse_initializer_expression_rest();
+        if reject {
+            self.report(msg::invalid_initializer(), initializer_entry_span(head, end));
+        }
         let after = self.peek_kind();
         if after == TokenKind::OpenCurly || after == TokenKind::Function {
             self.report(msg::redirecting_constructor_with_body(), self.peek_span());
@@ -2841,6 +2852,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// (:4934-4953) — then the expression re-read.
     fn parse_super_initializer_expression(&mut self) -> TokenSpan {
         let head = self.peek_span();
+        // Set by the dispatch arms whose parsed node `buildInitializer` cannot
+        // turn into an initializer (bare `super =`, `super()` + `=`/`!`/`(`):
+        // the `invalidInitializer` row spans the whole entry, so it is emitted
+        // after the expression re-read has fixed the entry end.
+        let mut reject = false;
         let mut n = 1;
         // Span of the name slot when a synthetic name was spliced at a
         // keyword head (`super. var f;`): the official
@@ -2943,8 +2959,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     // will report error on assignment to super") but the analyzer
                     // builder cannot build an initializer from a bare super
                     // assignment (`buildInitializer` `default: return null`) and
-                    // reports `invalidInitializer` at the initializer begin.
-                    self.report(msg::invalid_initializer(), head);
+                    // reports `invalidInitializer` over the WHOLE entry span
+                    // (ast_builder.dart:2209-2234, `beginToken..endToken`) —
+                    // deferred to the tail, where the re-read has fixed the end.
+                    reject = true;
                 } else {
                     // `super.name = ...` — parseExpression reports the
                     // assignment itself; this is the declaring-class rider.
@@ -3078,14 +3096,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     let end_span = self.span_of(end_id);
                     self.report(
                         msg::invalid_initializer(),
-                        TokenSpan::new(
-                            head.id,
-                            SourceRange {
-                                offset: head.range.offset,
-                                length: end_span.range.offset + end_span.range.length
-                                    - head.range.offset,
-                            },
-                        ),
+                        initializer_entry_span(head, end_span),
                     );
                     self.skip_to_token(end_id);
                     self.cursor.advance();
@@ -3103,11 +3114,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // initializer recovery reports `invalid_super_in_initializer` at
                 // `super` (ast_builder.dart:786-800).
                 self.report(msg::invalid_super_in_initializer(), head);
-            } else if after == TokenKind::Bang {
-                // `super()!`: the postfix `!` leaves no representable
-                // initializer node (`buildInitializer` final `return null`) —
-                // `invalidInitializer` at the initializer begin (issue_41597).
-                self.report(msg::invalid_initializer(), head);
+            } else if matches!(after, TokenKind::Eq | TokenKind::Bang | TokenKind::OpenParen) {
+                // `super()` followed by `=`/`!`/`(` (`super() = 0`, `super()!`,
+                // `super()()`): the parsed node leaves no representable
+                // initializer (`buildInitializer` `default: return null`,
+                // ast_builder.dart:2209-2234) — `invalidInitializer` over the
+                // WHOLE entry span, deferred to the tail where the re-read has
+                // fixed the entry end (issue_41597 for the `!` face).
+                reject = true;
             }
         }
         // A keyword/junk name head on a re-read arm (`super. var = ...`,
@@ -3120,7 +3134,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::missing_identifier(), at);
             self.synthetic(TokenKind::Identifier, at.range.offset);
         }
-        self.parse_initializer_expression_rest()
+        let end = self.parse_initializer_expression_rest();
+        if reject {
+            self.report(msg::invalid_initializer(), initializer_entry_span(head, end));
+        }
+        end
     }
 
     /// Official `parseInitializerExpressionRest` (:4957): the entry
@@ -3373,6 +3391,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
         }
     }
+}
+
+/// The `buildInitializer` rejection span: the whole initializer entry, from
+/// the head token through the entry expression's end token — upstream
+/// `endInitializers` anchors `invalidInitializer` on
+/// `initializerObject.beginToken..endToken` (ast_builder.dart:2209-2234).
+fn initializer_entry_span(head: TokenSpan, end: TokenSpan) -> TokenSpan {
+    TokenSpan::new(
+        head.id,
+        SourceRange {
+            offset: head.range.offset,
+            length: end.range.offset + end.range.length - head.range.offset,
+        },
+    )
 }
 
 /// `isUnaryMinus`: `unary` immediately followed by `-`.

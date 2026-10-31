@@ -48,14 +48,15 @@ fn illegal(start: u32, end: u32) -> (String, u32, u32) {
 }
 
 /// A constructor initializer's super-call target: the arm's selector row
-/// survives, the statement rider does not (`super()` = 16..23).
+/// survives, the statement rider does not (`super()` = 16..23). The separate
+/// `invalidInitializer` row over the whole entry (16..27) landed with #3193.
 #[test]
 fn ticket_3185_initializer_lane_drops_the_rider() {
     assert_eq!(
         sorted_rows("class A { A() : super() = 0; }\n"),
-        vec![mas(16, 23)],
+        vec![code("invalid_initializer", 16, 27), mas(16, 23)],
         "oracle: the ctor initializer is not a statement expression — \
-         MAS only (the separate invalidInitializer gap is tracked elsewhere)"
+         MAS + the whole-entry invalidInitializer, never the rider"
     );
 }
 
