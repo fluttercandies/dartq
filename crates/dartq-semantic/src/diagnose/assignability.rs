@@ -1613,6 +1613,25 @@ impl<'a> Engine<'a> {
                 }
             }
             return self.top_level_decl(row.name).map_or(Ty::UNKNOWN, |decl| {
+                // A container head invoked bare is a creation — `C()`,
+                // `C<int>()` — whose static type is the instantiated head
+                // (`visitInstanceCreationExpression`), never the
+                // declaration's absent `return_ty`. The written
+                // `<...>` group instantiates it when spelled; a generic
+                // head with no group stays the inferencing residual the
+                // send-close solver owns (`Unknown`).
+                if matches!(
+                    decl.kind,
+                    MicroKind::Class | MicroKind::Mixin | MicroKind::Enum
+                ) {
+                    return self
+                        .creation_row_ty(row.name, false, row.range.offset)
+                        .unwrap_or(if decl.type_params == 0 {
+                            Ty::named(row.name)
+                        } else {
+                            Ty::UNKNOWN
+                        });
+                }
                 self.instantiate_call_return(row, &Receiver::Unknown, decl.return_ty)
             });
         }
@@ -2507,7 +2526,7 @@ impl<'a> Engine<'a> {
     /// `??` joins `LUB(nonNull(left), last)`, `?:` joins `LUB(then, last)`.
     /// `None` for every other neighborhood (a single-operand tail, a
     /// nested composite whose operands the tail row does not pair with).
-    fn binary_join_operands<'r>(&self, last: &'r Row) -> Option<(&'r Row, bool)> {
+    fn binary_join_operands<'r>(&'r self, last: &'r Row) -> Option<(&'r Row, bool)> {
         let index = self.rows.iter().rposition(|row| std::ptr::eq(row, last))?;
         let left = self.rows[..index]
             .iter()
@@ -3215,22 +3234,113 @@ impl<'a> Engine<'a> {
         // method's declared return (`firstDepleted`'s `Future<InventoryEvent?>`
         // must not adjudicate `onTimeout: () => null`).
         let found = self.frames.iter().rev().find_map(|f| match &f.kind {
-            FrameKind::Executable { ret, is_async, .. } => Some(match ret {
-                Some(ret) => Ok((ret.ty, ret.host, ret.name, ret.display, ret.ctor, *is_async)),
-                None => Err(*is_async),
+            FrameKind::Executable {
+                ret,
+                is_async,
+                generator,
+                ..
+            } => Some(match ret {
+                Some(ret) => Ok((
+                    ret.ty,
+                    ret.host,
+                    ret.name,
+                    ret.display,
+                    ret.ctor,
+                    *is_async,
+                    *generator,
+                )),
+                None => Err((*is_async, *generator)),
             }),
             _ => None,
         });
         let Some(found) = found else {
             return;
         };
-        let (to, host, name, display, ctor, is_async) = match found {
+        let (to, host, name, display, ctor, is_async, generator) = match found {
             Ok(latched) => latched,
-            Err(is_async) => {
-                self.check_closure_return(from, range, from_literal, is_async);
+            Err((is_async, generator)) => {
+                self.check_closure_return(from, range, from_literal, is_async, generator);
                 return;
             }
         };
+        // A bare `return;` carries no expression — the listener feeds the
+        // `;` token's own span with a `void` source, so the byte at the
+        // range's head is `;` exactly when no expression stood (a `return
+        // void_fn();` spells the callee's identifier instead). The three
+        // upstream early-returns below all key on it
+        // (return_type_verifier.dart `verifyReturnStatement`:54-76).
+        let bare = from == Ty::Void
+            && self
+                .source
+                .as_bytes()
+                .get(self.byte_of(range.offset))
+                .is_some_and(|b| *b == b';');
+        // A generative constructor's `return e;` reports its own code and
+        // skips the assignability matrix entirely (:57-63 —
+        // `isGenerativeConstructor`; the factory-latched `ctor` flag marks
+        // the other face, a factory checks the pair like a function). The
+        // bare `return;` falls through silent.
+        if host == ExecKind::Constructor && !ctor {
+            if !bare {
+                self.emit_compile_time(
+                    "return_in_generative_constructor",
+                    "RETURN_IN_GENERATIVE_CONSTRUCTOR",
+                    self.staged_expression_span(range),
+                    "Constructors can't return values.",
+                    Some(
+                        "Try removing the return statement or using a factory constructor.",
+                    ),
+                );
+            }
+            return;
+        }
+        // A generator body's `return e;`/`=> e` is the parser's
+        // `generatorReturnsValue` row (`returnInGenerator`,
+        // parser_impl.dart:6628/:6855 — the `=>` body anchors at the arrow
+        // token, the statement at the `return` keyword); the verifier then
+        // early-returns (:66-68) so no assignability question is ever
+        // asked. The bare `return;` reports nothing.
+        if generator {
+            if !bare {
+                let anchor = self.generator_return_anchor(range);
+                self.emit_compile_time(
+                    "return_in_generator",
+                    "RETURN_IN_GENERATOR",
+                    anchor,
+                    "Can't return a value from a generator function that uses the 'async*' or 'sync*' modifier.",
+                    Some(
+                        "Try replacing 'return' with 'yield', using a block function body, or changing the method body modifier.",
+                    ),
+                );
+            }
+            return;
+        }
+        // The bare `return;` gate (:292-308 `_checkReturnWithoutValue`):
+        // the ok-set is `void`/`dynamic`/`Null`/`InvalidType` over `T`
+        // (`_isVoidDynamicOrNull`, :341-346) for a synchronous body, or over
+        // `futureValueType(T)` for `async` (:299-301). The anchor is the
+        // `return` keyword — the `;` the listener handed is the
+        // statement's end, not the keyword.
+        if bare {
+            let t_eff = if is_async {
+                future_value_ty(self.strings, &self.boundary.pool(), to)
+            } else {
+                to
+            };
+            let ok = matches!(t_eff, Ty::Void | Ty::Dynamic | Ty::Null | Ty::Unknown)
+                || matches!(t_eff, Ty::Named { name: head, .. } if !self.named_type_is_type(head));
+            if !ok {
+                let keyword = self.return_keyword_range(range);
+                self.emit_compile_time(
+                    "return_without_value",
+                    "RETURN_WITHOUT_VALUE",
+                    keyword,
+                    "The return value is missing after 'return'.",
+                    None,
+                );
+            }
+            return;
+        }
         // The `await e` operand's row anchors at `e`, but the oracle's
         // `.at(expression)` is the AwaitExpression — the `await` keyword
         // through the operand's own end (`reportTypeError`,
@@ -3356,10 +3466,57 @@ impl<'a> Engine<'a> {
         range: SourceRange,
         from_literal: bool,
         is_async: bool,
+        generator: bool,
     ) {
+        // The generator/bare early-returns mirror the declared path above
+        // (`verifyReturnStatement`:66-73 applies to every executable, the
+        // closure's `return e;` included — `() sync* { return 3; }` is the
+        // parser's `generatorReturnsValue` row, and a generator closure's
+        // bare `return;` reports nothing).
+        let bare = from == Ty::Void
+            && self
+                .source
+                .as_bytes()
+                .get(self.byte_of(range.offset))
+                .is_some_and(|b| *b == b';');
+        if generator {
+            if !bare {
+                let anchor = self.generator_return_anchor(range);
+                self.emit_compile_time(
+                    "return_in_generator",
+                    "RETURN_IN_GENERATOR",
+                    anchor,
+                    "Can't return a value from a generator function that uses the 'async*' or 'sync*' modifier.",
+                    Some(
+                        "Try replacing 'return' with 'yield', using a block function body, or changing the method body modifier.",
+                    ),
+                );
+            }
+            return;
+        }
         let Some(to) = self.closure_context_return() else {
             return;
         };
+        if bare {
+            let t_eff = if is_async {
+                future_value_ty(self.strings, &self.boundary.pool(), to)
+            } else {
+                to
+            };
+            let ok = matches!(t_eff, Ty::Void | Ty::Dynamic | Ty::Null | Ty::Unknown)
+                || matches!(t_eff, Ty::Named { name: head, .. } if !self.named_type_is_type(head));
+            if !ok {
+                let keyword = self.return_keyword_range(range);
+                self.emit_compile_time(
+                    "return_without_value",
+                    "RETURN_WITHOUT_VALUE",
+                    keyword,
+                    "The return value is missing after 'return'.",
+                    None,
+                );
+            }
+            return;
+        }
         // The declared path's untyped-literal arm (`_fromContextType`): a
         // collection literal body resolves against the context return
         // before the assignability ask, so `[3]` under `List<String>`
@@ -3393,6 +3550,364 @@ impl<'a> Engine<'a> {
                 to,
                 from_literal,
             );
+        }
+    }
+
+    /// The compile-time-error emit for the return family's own codes —
+    /// rows the [`SemanticCode`] table does not carry
+    /// (`return_without_value`, `return_in_generator`,
+    /// `return_in_generative_constructor` are compile-time-error rows of
+    /// the pinned registry, `analyzer-codes.tsv`), pushed with their
+    /// verbatim oracle message and correction, if any.
+    fn emit_compile_time(
+        &mut self,
+        name: &'static str,
+        machine: &'static str,
+        range: SourceRange,
+        message: &'static str,
+        correction: Option<&'static str>,
+    ) {
+        self.report.diagnostics.push(Diagnostic::new(
+            Severity::Error,
+            CodeInfo::new(name, machine, DiagnosticType::CompileTimeError, true),
+            message,
+            self.file,
+            range,
+            correction.map(str::to_string),
+        ));
+    }
+
+    /// The `return` keyword's own span behind a bare `return;` (the
+    /// `returnWithoutValue` anchor — `.at(statement.returnKeyword)`,
+    /// return_type_verifier.dart:305-307): the listener hands the `;`'s
+    /// span, so the keyword is the six `return` bytes ahead of it after
+    /// skipping whitespace. Anything unexpected keeps the handed span.
+    fn return_keyword_range(&self, range: SourceRange) -> SourceRange {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(range.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor >= 6 && &bytes[cursor - 6..cursor] == b"return" {
+            SourceRange {
+                offset: self.utf16_of(cursor - 6),
+                length: 6,
+            }
+        } else {
+            range
+        }
+    }
+
+    /// The generator value-return's anchor (the parser's
+    /// `handleInvalidStatement(begin, generatorReturnsValue)` —
+    /// parser_impl.dart:6628/:6855): `begin` is the `=>` FUNCTION token
+    /// for an arrow body, the `return` keyword for a statement — both sit
+    /// ahead of the expression's span after whitespace. Neither spelled
+    /// keeps the expression's own span.
+    fn generator_return_anchor(&self, range: SourceRange) -> SourceRange {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(range.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor >= 2 && &bytes[cursor - 2..cursor] == b"=>" {
+            return SourceRange {
+                offset: self.utf16_of(cursor - 2),
+                length: 2,
+            };
+        }
+        if cursor >= 6 && &bytes[cursor - 6..cursor] == b"return" {
+            return SourceRange {
+                offset: self.utf16_of(cursor - 6),
+                length: 6,
+            };
+        }
+        range
+    }
+
+    /// The downward tear-off instantiation behind a generic source
+    /// function type assigned to a non-generic target
+    /// (`_isFunctionSubtypeOf` never reaches the pair — its
+    /// `relateTypeParameters` count gate, type_system.dart:1585-1590):
+    /// solve the source's own type parameters from the target's
+    /// structurally-paired types, then run the subtype checks over the
+    /// substituted signature. `Some(bool)` decides; `None` leaves the
+    /// ordinary signature verdict in place (the under-report direction —
+    /// an unsolved nested shape the name-level model cannot bind is not a
+    /// definite rejection).
+    ///
+    /// The candidate parameter spellings are the signature leaves that
+    /// appear only on the source side — the stash's named entries when it
+    /// captured them, else the bare `Named` heads present in the source
+    /// signature but absent from every target type. A candidate appearing
+    /// at no pairable position proves nothing (`List<T>` under an
+    /// unrelated target head stays unbound) and keeps `None`.
+    fn instantiated_fn_sig_subtype(&self, from: &FnVarSig, to: &FnVarSig) -> Option<bool> {
+        // The arity shape the instantiation cannot change: subtype needs
+        // every target parameter covered — `from.positional.len() >=
+        // to.positional.len()`, `from.required_positional <=
+        // to.required_positional`, and every target named formal present
+        // on the source (subtype.dart:419-431 — an instantiation only
+        // rewrites the type variables).
+        if from.positional.len() < to.positional.len()
+            || from.required_positional > to.required_positional
+            || to
+                .named
+                .iter()
+                .any(|(name, _, _)| !from.named.iter().any(|(n, _, _)| n == name))
+        {
+            return Some(false);
+        }
+        // The candidate type-parameter spellings: the stash's named
+        // entries when they exist (the pooled `Ty::Function` shape keeps
+        // only a count, `StringId::NONE`), otherwise every bare `Named`
+        // head the source signature spells that no target type spells —
+        // a name on both sides is a shared declared type, never a
+        // parameter.
+        let mut candidates: Vec<StringId> = from
+            .params
+            .iter()
+            .filter_map(|(name, _)| (*name != StringId::NONE).then_some(*name))
+            .collect();
+        if candidates.is_empty() {
+            let mut to_heads: FxHashSet<StringId> = FxHashSet::default();
+            for ty in to
+                .positional
+                .iter()
+                .chain(to.named.iter().map(|(_, t, _)| t))
+                .chain(std::iter::once(&to.return_ty))
+            {
+                self.collect_named_heads(*ty, &mut to_heads);
+            }
+            let mut from_heads: FxHashSet<StringId> = FxHashSet::default();
+            for ty in from
+                .positional
+                .iter()
+                .chain(from.named.iter().map(|(_, t, _)| t))
+                .chain(std::iter::once(&from.return_ty))
+            {
+                self.collect_named_heads(*ty, &mut from_heads);
+            }
+            candidates = from_heads
+                .into_iter()
+                .filter(|head| !to_heads.contains(head))
+                // A name that resolves to a real type — a core primitive,
+                // a declared container, an in-scope type parameter — is
+                // never the signature's own type variable: it just happens
+                // to appear on the source side only, and binding it would
+                // accept instantiations the oracle's inference rejects.
+                .filter(|head| {
+                    !self.members.primitive_ids.contains(head)
+                        && !self.type_params.contains(head)
+                        && !self.pending_type_params.contains(head)
+                        && resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            *head,
+                        )
+                        .is_none()
+                })
+                .collect();
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let candidate_set: FxHashSet<StringId> = candidates.iter().copied().collect();
+        // Bind each candidate from its structurally-paired target type: a
+        // bare `Named` leaf binds the whole target type, a shared head
+        // recurses into its arguments (`List<T>` against `List<int>` binds
+        // `T := int`); anything else cannot bind through this model and
+        // leaves the candidate unbound. A conflicting re-bind fails the
+        // instantiation (`T Function<T>(T, T)` against `int
+        // Function(int, String)` wants `T` to be two types at once).
+        let mut bindings: FxHashMap<StringId, Ty> = FxHashMap::default();
+        let mut failed = false;
+        for (from_ty, to_ty) in from.positional.iter().zip(to.positional.iter()) {
+            self.bind_sig_leaves(*from_ty, *to_ty, &candidate_set, &mut bindings, &mut failed);
+        }
+        for (name, to_ty, _) in &to.named {
+            if let Some((_, from_ty, _)) = from.named.iter().find(|(n, _, _)| n == name) {
+                self.bind_sig_leaves(*from_ty, *to_ty, &candidate_set, &mut bindings, &mut failed);
+            }
+        }
+        self.bind_sig_leaves(
+            from.return_ty,
+            to.return_ty,
+            &candidate_set,
+            &mut bindings,
+            &mut failed,
+        );
+        if failed || bindings.is_empty() || candidates.iter().any(|c| !bindings.contains_key(c)) {
+            return None;
+        }
+        // The substituted signature re-runs the subtype checks: return
+        // covariance (a `void` target is Right Top — skipped like
+        // [`Engine::fn_sig_subtype`]'s own guard), the target's
+        // positional/named contravariance. One undecidable slot
+        // suppresses the whole (`None`).
+        if to.return_ty != Ty::Void {
+            match self.slot_subtype(self.subst_ty(from.return_ty, &bindings), to.return_ty) {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => return None,
+            }
+        }
+        for (index, to_ty) in to.positional.iter().enumerate() {
+            let from_ty = self.subst_ty(from.positional[index], &bindings);
+            match self.slot_subtype(*to_ty, from_ty) {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => return None,
+            }
+        }
+        for (name, to_ty, _) in &to.named {
+            let Some((_, from_ty, _)) = from.named.iter().find(|(n, _, _)| n == name) else {
+                return Some(false);
+            };
+            let from_ty = self.subst_ty(*from_ty, &bindings);
+            match self.slot_subtype(*to_ty, from_ty) {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => return None,
+            }
+        }
+        Some(true)
+    }
+
+    /// The bare `Named` heads inside a signature leaf — the candidates the
+    /// instantiation walk scans.
+    fn collect_named_heads(&self, ty: Ty, out: &mut FxHashSet<StringId>) {
+        match ty {
+            Ty::Named { name, args, .. } => {
+                out.insert(name);
+                let args = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                };
+                for arg in args {
+                    self.collect_named_heads(arg, out);
+                }
+            }
+            Ty::Record { shape, .. } => {
+                let shape = {
+                    let pool = self.boundary.pool();
+                    pool.record_shape(shape).clone()
+                };
+                for field in shape
+                    .positional
+                    .iter()
+                    .chain(shape.named.iter().map(|(_, t)| t))
+                {
+                    self.collect_named_heads(*field, out);
+                }
+            }
+            Ty::Function { shape, .. } => {
+                let (return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                self.collect_named_heads(return_ty, out);
+                for ty in positional.iter().chain(named.iter().map(|(_, t)| t)) {
+                    self.collect_named_heads(*ty, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The pairwise binding walk: `from_ty`'s bare candidate `Named` leaf
+    /// takes `to_ty` wholesale; a shared head recurses into its arguments
+    /// pairwise. A re-bind to a different type marks the instantiation
+    /// unsolvable.
+    fn bind_sig_leaves(
+        &self,
+        from_ty: Ty,
+        to_ty: Ty,
+        candidates: &FxHashSet<StringId>,
+        bindings: &mut FxHashMap<StringId, Ty>,
+        failed: &mut bool,
+    ) {
+        if *failed {
+            return;
+        }
+        match (from_ty, to_ty) {
+            (
+                Ty::Named {
+                    name,
+                    args: ArgListId::EMPTY,
+                    ..
+                },
+                _,
+            ) if candidates.contains(&name) => {
+                if let Some(bound) = bindings.get(&name) {
+                    if *bound != to_ty {
+                        *failed = true;
+                    }
+                } else {
+                    bindings.insert(name, to_ty);
+                }
+            }
+            (
+                Ty::Named {
+                    name: from_name,
+                    args: from_args,
+                    ..
+                },
+                Ty::Named {
+                    name: to_name,
+                    args: to_args,
+                    ..
+                },
+            ) if from_name == to_name => {
+                // The pairwise argument walk borrows the pool twice in a
+                // row — own the vectors before recursing so no `RefCell`
+                // guard crosses a nested `intern_list` borrow.
+                let (from_args, to_args) = {
+                    let pool = self.boundary.pool();
+                    (pool.get(from_args).to_vec(), pool.get(to_args).to_vec())
+                };
+                for (from_arg, to_arg) in from_args.iter().zip(to_args.iter()) {
+                    self.bind_sig_leaves(*from_arg, *to_arg, candidates, bindings, failed);
+                }
+            }
+            (
+                Ty::Record {
+                    shape: from_shape, ..
+                },
+                Ty::Record {
+                    shape: to_shape, ..
+                },
+            ) => {
+                let (from_shape, to_shape) = {
+                    let pool = self.boundary.pool();
+                    (
+                        pool.record_shape(from_shape).clone(),
+                        pool.record_shape(to_shape).clone(),
+                    )
+                };
+                for (from_field, to_field) in
+                    from_shape.positional.iter().zip(to_shape.positional.iter())
+                {
+                    self.bind_sig_leaves(*from_field, *to_field, candidates, bindings, failed);
+                }
+                for ((from_name, from_field), (to_name, to_field)) in
+                    from_shape.named.iter().zip(to_shape.named.iter())
+                {
+                    if from_name != to_name {
+                        return;
+                    }
+                    self.bind_sig_leaves(*from_field, *to_field, candidates, bindings, failed);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3773,7 +4288,7 @@ impl<'a> Engine<'a> {
             // stays silent), so the Created-name read below must not
             // resurrect the operand's type.
             Ty::Never
-        } else if let Some(result) = self.invoked_callee_result(row) {
+        } else if let Some(result) = self.invoked_callee_result(&row) {
             // The send's own static type — the `expression_row_ty` mirror
             // for the body/return window: an invocation row keeps the
             // callee's DECLARED type (or nothing), never the send's
@@ -3781,10 +4296,18 @@ impl<'a> Engine<'a> {
             // `int` exactly like the initializer position does
             // (send_result.rs's own contract).
             result
-        } else if row.intent == Intent::Invoke && row.ty == Ty::UNKNOWN {
-            self.callee_return_ty(row)
+        // A creation send (`C()`, `C<int>()`) keeps the receiver face: its
+        // static type is the instantiated head, which the shape match below
+        // resolves through `creation_row_ty`. The callee walk would answer
+        // the constructor declaration's absent `return_ty` (`Ty::UNKNOWN`)
+        // and silence every return check on a created value.
+        } else if row.intent == Intent::Invoke
+            && row.ty == Ty::UNKNOWN
+            && !matches!(row.shape, RowShape::Receiver(Receiver::Created { .. }))
+        {
+            self.callee_return_ty(&row)
         } else if row.ty == Ty::UNKNOWN
-            && let Some(sig) = self.tear_off_sig(row)
+            && let Some(sig) = self.tear_off_sig(&row)
         {
             // A bare function-name expression is the tear-off: the
             // return/arrow-body ask reads the declaration's own
@@ -3817,7 +4340,7 @@ impl<'a> Engine<'a> {
         // expression type is the `==`'s `bool`, never `bool?`.
         let ty = if self.null_aware_members.contains(&row.range.offset)
             && !matches!(row.intent, Intent::Operator(..))
-            && !self.bool_decided_covers(row)
+            && !self.bool_decided_covers(&row)
         {
             Self::nullable_form(ty)
         } else {
@@ -3825,7 +4348,7 @@ impl<'a> Engine<'a> {
         };
         Some((
             ty,
-            Self::primitive_literal(row, &self.members.primitive_ids),
+            Self::primitive_literal(&row, &self.members.primitive_ids),
             row.range,
         ))
     }
@@ -4223,6 +4746,37 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn declared_subtype_negative(&self, from: &Ty, to: &Ty) -> Option<bool> {
+        // The record source arm (`subtype.dart`'s record block): a record
+        // type's only interface supertypes are `Object` and `Record`
+        // itself — every other named target is a decidable negative
+        // (`(int, int) <: int`, `(int, int) <: num`, `(a: 1) <: String`).
+        // `FutureOr` is a union, not a head a record cannot meet
+        // (`(int, int) <: FutureOr<Object>` holds through the value leg),
+        // so it stays open; a target that resolves to no container and is
+        // no core primitive could still be an alias or an unseen edge —
+        // the under-report direction keeps it undecidable.
+        if let Ty::Record { nullable: false, .. } = from
+            && let Ty::Named {
+                name: to_name,
+                nullable: false,
+                ..
+            } = to
+            && *to_name != self.intern("Object")
+            && *to_name != self.intern("Record")
+            && *to_name != self.intern("FutureOr")
+            && (self.members.primitive_ids.contains(to_name)
+                || resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    *to_name,
+                )
+                .is_some())
+        {
+            return Some(false);
+        }
         let (
             Ty::Named {
                 name: from_name,
@@ -5171,6 +5725,30 @@ impl<'a> Engine<'a> {
         let from_fn = self.function_shape_sig(from);
         let to_fn = self.function_shape_sig(to);
         if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
+            // The generic-instantiation arm: a generic function-typed
+            // expression in a context position is not the un-instantiated
+            // signature — the resolver's downward tear-off inference
+            // instantiates it toward the context type before the
+            // assignability ask, so `return g;` with `g: T Function<T>(T)`
+            // inside an `int Function(int)` host reads `S = int
+            // Function(int)`, a clean pair (`return_type_verifier.dart`'s
+            // `expression.staticType` is the post-inference type).
+            // `_isFunctionSubtypeOf` itself refuses the pair — its
+            // `relateTypeParameters` count gate (subtype.dart:338-345,
+            // type_system.dart:1585-1590) never relates a generic source
+            // to a non-generic target — so this arm answers the
+            // instantiation question `fn_sig_subtype` cannot: bind each
+            // source-only signature leaf (the parameter spellings) from
+            // the target's structurally-matching type, then re-run the
+            // subtype checks over the substituted signature. An arity the
+            // instantiation can never bridge (`U Function<U>(U, int)`
+            // against `int Function(int)` — two required positionals where
+            // one is wanted) reports through the same shape rules.
+            if from_fn.params.len() > to_fn.params.len() && to_fn.params.is_empty() {
+                if let Some(verdict) = self.instantiated_fn_sig_subtype(from_fn, to_fn) {
+                    return Some(verdict);
+                }
+            }
             return self.fn_sig_subtype(from_fn, to_fn);
         }
         // The alias unfold: the element model never carries a type-alias
@@ -6905,15 +7483,16 @@ mod async_return_tests {
         assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
-    /// A bare `return;` in an async body reads `flatten_S = void` (branch
-    /// b): `Future<int>` demands a value (`T_v = int` fits no
-    /// void/dynamic host) and reports; the `Future<void>` host keeps it
-    /// silent (`T_v = void`, branch a's ok-set).
+    /// A bare `return;` in an async body reads `futureValueType(T)`
+    /// (return_type_verifier.dart `_checkReturnWithoutValue`:299-301):
+    /// `Future<int>` unwraps to `int`, a non-ok-set face, and reports
+    /// `return_without_value` at the keyword; the `Future<void>` host
+    /// keeps it silent (`T_v = void` joins the ok-set).
     #[test]
     fn async_bare_return_follows_the_flattened_hosts() {
         let demands_a_value =
             report("class Future<T> {}\nclass int {}\nFuture<int> f() async { return; }");
-        assert_eq!(code_names(&demands_a_value), ["return_of_invalid_type"]);
+        assert_eq!(code_names(&demands_a_value), ["return_without_value"]);
         let keeps_it_silent = report("class Future<T> {}\nFuture<void> f() async { return; }");
         assert!(
             code_names(&keeps_it_silent).is_empty(),
@@ -7304,3 +7883,13 @@ mod ticket_2967_tests;
 #[cfg(test)]
 #[path = "ticket_3145_tests.rs"]
 mod ticket_3145_tests;
+
+// The #3147 pins (the return family: bare `return;`'s
+// `return_without_value`, the generator's `return_in_generator`, the
+// generative constructor's `return_in_generative_constructor`, the
+// creation send's instantiated-head read, the record source's closed
+// supertype set, and the generic tear-off's context instantiation).
+// Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3147_tests.rs"]
+mod ticket_3147_tests;
