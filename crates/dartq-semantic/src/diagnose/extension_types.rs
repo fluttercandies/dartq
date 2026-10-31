@@ -94,10 +94,99 @@ impl Engine<'_> {
                 "",
             );
         }
+        // `_checkForRepresentationField`'s trailing-comma face
+        // (`error_verifier.dart:5009-5015`, anchored at
+        // `first.endToken.next`): the same pre-declaring-formal arm. From
+        // the primary-constructors feature on, the representation formal is
+        // a declaring formal and its list takes a trailing comma like any
+        // other (`class A(int x,)`); probe 3.13.7: silent at the current
+        // version, `REPRESENTATION_FIELD_TRAILING_COMMA` at `@dart=3.10`.
+        if !self.primary_constructors_enabled
+            && let Some(comma) = self.representation_trailing_comma(rep.name_range)
+        {
+            self.emit(
+                SemanticCode::RepresentationFieldTrailingComma,
+                comma,
+                "",
+                "",
+            );
+        }
         // `_verifyExtensionElementImplements`'s representation face
         // (`extension_type_implements_not_supertype`) decides at the
         // file-tail bounds pass ([`Self::finalize_ext_faces`]): the faces'
         // type arguments name declarations the parse has not reached yet.
+    }
+
+    /// The representation formal list's trailing comma, when it has one.
+    /// The formal runs from its name to the list's `)` — a default value
+    /// may sit between them, so the scan tracks bracket depth and steps
+    /// over string literals and comments. `None` for a list that closes
+    /// right after the formal.
+    fn representation_trailing_comma(&self, name: SourceRange) -> Option<SourceRange> {
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(name.end());
+        let mut depth = 0u32;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'/' => match bytes.get(at + 1) {
+                    Some(b'/') => {
+                        while at < bytes.len() && bytes[at] != b'\n' {
+                            at += 1;
+                        }
+                    }
+                    Some(b'*') => {
+                        at += 2 + self.source.get(at + 2..)?.find("*/")? + 2;
+                    }
+                    _ => at += 1,
+                },
+                quote @ (b'\'' | b'"') => at = self.string_end(at, quote)?,
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    at += 1;
+                }
+                b')' | b']' | b'}' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    at += 1;
+                }
+                b',' if depth == 0 => {
+                    return Some(SourceRange {
+                        offset: self.utf16_of(at),
+                        length: 1,
+                    });
+                }
+                _ => at += 1,
+            }
+        }
+        None
+    }
+
+    /// `at` (a quote byte) advanced past the string literal it opens —
+    /// backslash escapes and the triple-quoted forms included.
+    fn string_end(&self, at: usize, quote: u8) -> Option<usize> {
+        let bytes = self.source.as_bytes();
+        let triple = bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote);
+        let mut at = at + if triple { 3 } else { 1 };
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b if b == quote => {
+                    if triple {
+                        if bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote) {
+                            return Some(at + 3);
+                        }
+                        at += 1;
+                    } else {
+                        return Some(at + 1);
+                    }
+                }
+                b'\n' if !triple => return None,
+                _ => at += 1,
+            }
+        }
+        None
     }
 }
 

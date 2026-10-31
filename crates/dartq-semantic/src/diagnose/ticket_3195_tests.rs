@@ -78,3 +78,36 @@ fn typeless_representation_is_silent_at_the_current_version() {
         report.diagnostics
     );
 }
+
+/// The trailing-comma row (#3197): the representation formal list closes
+/// with a comma. Only the pre-declaring-formal versions reject it — the
+/// anchor is the comma itself (oracle 3.13.7:
+/// `REPRESENTATION_FIELD_TRAILING_COMMA` at `@dart=3.10`).
+#[test]
+fn representation_trailing_comma_reports_at_the_comma() {
+    let source = "// @dart=3.10\n\
+                  extension type E(int it,) {}\n";
+    let report = report_ops_bare(source);
+    assert_eq!(
+        offsets(&report, "representation_field_trailing_comma"),
+        vec![source.find(",)").expect("anchor") as u32],
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range.offset))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The same shape at the current version: the formal is a declaring formal
+/// and its list takes a trailing comma — silent (probe 3.13.7).
+#[test]
+fn representation_trailing_comma_is_silent_at_the_current_version() {
+    let report = report_ops("extension type E(int it,) {}\n");
+    assert!(
+        offsets(&report, "representation_field_trailing_comma").is_empty(),
+        "{:?}",
+        report.diagnostics
+    );
+}

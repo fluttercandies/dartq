@@ -84,6 +84,27 @@ pub(super) fn report_ops_wildcards(source: &str, wildcard_variables: bool) -> Fi
     )
 }
 
+/// The fixture's own language version: a leading `// @dart=X.Y` marker (the
+/// corpus convention) pins it, everything else analyzes at the latest. A
+/// prelude-carrying fixture never matches — its first line is the prelude,
+/// so `report_ops` fixtures keep the latest version and a version-gated pin
+/// uses [`report_ops_bare`].
+fn fixture_language_version(source: &str) -> LanguageVersion {
+    for line in source.lines().take(3) {
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with("//") {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("// @dart=")
+            && let Some((major, minor)) = rest.trim().split_once('.')
+            && let (Ok(major), Ok(minor)) = (major.parse(), minor.parse())
+        {
+            return LanguageVersion::new(major, minor);
+        }
+    }
+    LanguageVersion::new(3, 15)
+}
+
 fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::ScanResult {
     let scanned = dartq_scanner::scan(
         source,
@@ -109,7 +130,7 @@ pub(super) fn report_ops_with(
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
     let scanned = scan_fixture(source, file);
-    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let set = FeatureSet::for_language_version(fixture_language_version(source));
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(source, &scanned.tokens, features, &strings);
     let mut builder = LibraryGraphBuilder::new(&strings);
@@ -242,7 +263,7 @@ pub(super) fn report_ops_augment(main: &str, augment_source: &str) -> FileReport
     let scanned = scan_fixture(&source, file);
     let aug_file = files.intern(Path::new("aug.dart"));
     let aug_scanned = scan_fixture(augment_source, aug_file);
-    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let set = FeatureSet::for_language_version(fixture_language_version(&source));
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(&source, &scanned.tokens, features, &strings);
     let aug_elements = collect(augment_source, &aug_scanned.tokens, features, &strings);
