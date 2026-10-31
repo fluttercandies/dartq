@@ -47,15 +47,15 @@ fn check(c: &mut Check<'_>) {
     let op = c.lexeme(op_token);
     // Right literal first (:64-71); the length access must sit on the
     // other operand (`_isLengthAccess`).
-    let (value, constant_on_right, length_pieces, const_pieces) =
+    let (value, constant_on_right, length_pieces) =
         if let Some(value) = super::prefer_contains::int_value(c, &right, 0) {
-            (value, true, length_marker(c, &left).map(|_| &left), &left)
+            (value, true, length_marker(c, &left).map(|_| &left))
         } else if let Some(value) = super::prefer_contains::int_value(c, &left, 0) {
-            (value, false, length_marker(c, &right).map(|_| &right), &left)
+            (value, false, length_marker(c, &right).map(|_| &right))
         } else {
             return;
         };
-    let Some(length_pieces) = length_pieces else {
+    let Some(_length_pieces) = length_pieces else {
         return;
     };
     // The const-context bails (:93-108): a const constructor initializer
@@ -85,20 +85,16 @@ fn check(c: &mut Check<'_>) {
         }
     };
     // The official span is the binary expression itself
-    // (`reportAtNode(expression)`). The start anchors at the operand:
-    // a `length` access on the left operand hugs the dot (the
-    // receiver's span ends exactly before the member name token), a
-    // leading constant anchors at its own row. The end reads the right
-    // operand's tail — a trailing `DotAccess` bounds at its name token
-    // (its row seals past the follower `;`).
-    let marker = length_marker(c, length_pieces);
-    let start = if constant_on_right {
-        marker
-            .and_then(|tail| access_hug_start(c, length_pieces, tail))
-            .unwrap_or_else(|| c.utf16_span(length_pieces[0]).start)
-    } else {
-        c.utf16_span(const_pieces[0]).start
-    };
+    // (`reportAtNode(expression)`) — the whole comparison, operator and
+    // both operands. The container's own covered span anchors at its
+    // delta-tile operator, never the operand head, so the extent reads
+    // the run bounds: the left operand's token-adjacent tail's earliest
+    // head (a constructor-initializer's `x = ` target group tiles ahead
+    // of the operand — the contiguous tail drops it) through the right
+    // operand's last value row.
+    let start = slice::operand_utf16_start(c, &left, op_token)
+        .or_else(|| slice::run_utf16_start(c, &left))
+        .unwrap_or_else(|| c.utf16_span(node).start);
     let end = match right.last() {
         Some(&tail) if c.kind(tail) == NodeKind::DotAccess => {
             crate::rules::utf16_token_span(c, c.head_token(tail)).end
@@ -107,20 +103,6 @@ fn check(c: &mut Check<'_>) {
         None => c.utf16_span(node).end,
     };
     c.report_texts(start..end, problem, correction.unwrap_or_default(), &[]);
-}
-
-/// The operand-adjacent start of the `.length` access: the receiver
-/// hugs the dot — its span ends exactly before the member name token —
-/// so the owner-level leak rows (an initializer target, an
-/// expression-body signature) stay out of the report.
-fn access_hug_start(c: &Check<'_>, pieces: &[u32], tail: u32) -> Option<u32> {
-    let name = crate::rules::utf16_token_span(c, c.head_token(tail));
-    let dot = name.start.checked_sub(1)?;
-    pieces
-        .iter()
-        .copied()
-        .find(|&row| c.utf16_span(row).end == dot)
-        .map(|row| c.utf16_span(row).start)
 }
 
 /// The operand's `.length` access marker (`_isLengthAccess`,
@@ -135,6 +117,25 @@ fn length_marker(c: &Check<'_>, pieces: &[u32]) -> Option<u32> {
     let tail = pieces.iter().rev().copied().find(|&row| {
         c.kind(row) == NodeKind::DotAccess && c.lexeme(c.head_token(row)) == "length"
     })?;
+    // `_isLengthAccess` drills through parens/`as` to the access itself
+    // (:188-205 — `ignoreParens: true, ignoreAs: true`), so the trailing
+    // `as T`/`(…)` wrappers the production tiling keeps after the marker
+    // stay the access; only a live operand row (`+`/binary tail
+    // `[].length + 1`, a trailing expression piece) leaves `length`
+    // mid-run and is not the access.
+    let after = &pieces[pieces.iter().position(|&row| row == tail)? + 1..];
+    if after.iter().any(|&row| {
+        !slice::is_send_group_piece(c, row)
+            && !matches!(
+                c.kind(row),
+                NodeKind::AsExpression
+                    | NodeKind::ParenthesizedExpression
+                    | NodeKind::Type
+                    | NodeKind::TypeArguments
+            )
+    }) {
+        return None;
+    }
     let Some(name) = slice::access_name_index(c, pieces, tail) else {
         return None;
     };

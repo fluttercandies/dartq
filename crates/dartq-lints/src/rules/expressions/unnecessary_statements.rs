@@ -1,4 +1,4 @@
-use dartq_semantic::model::MemberKind;
+use dartq_semantic::model::{MemberKind, Ty};
 
 use super::{Check, NodeKind, PayloadField, RuleSpec, query_site, same_file};
 use crate::rules::{body_members, get_set_token, same_file_declaration, slice, type_face};
@@ -94,6 +94,8 @@ fn check(c: &mut Check<'_>) {
                     .collect();
                 if let (Some(&first), Some(&last)) = (content.first(), content.last()) {
                     let start = crate::rules::utf16_token_span(c, first).start;
+                    // The `[]`/`{}` tokens carry the pair as one token —
+                    // the token's own end is the literal close.
                     let end = crate::rules::utf16_token_span(c, last).end;
                     c.report(start..end, &[]);
                 }
@@ -276,22 +278,22 @@ fn statement_run(c: &Check<'_>, stmt: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The run's root row: the outermost row whose span contains every
-/// other row's span (sibling pieces never nest; wrapper rows may tie —
-/// the outermost completion is the last in run order), falling back to
-/// the last row (postfix completion order puts the root last).
+/// The run's root row: the outermost completion — the last row in run
+/// order (postfix completion seals the wrapper last) — but only when its
+/// span covers every other row. A sibling marker row can sit last with a
+/// wider span (an updater `[]`'s owner sibling tiles after the literal
+/// row it never covers), so containment without the last-row pin would
+/// hand the dispatch a `CascadeAccess`/`DotAccess` follower instead of
+/// the expression.
 fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
     let root = *run.last()?;
+    let span = c.byte_span(root);
     run.iter()
-        .copied()
-        .rfind(|&row| {
-            let span = c.byte_span(row);
-            run.iter().all(|&other| {
-                let other = c.byte_span(other);
-                other.start >= span.start && other.end <= span.end
-            })
+        .all(|&other| {
+            let other = c.byte_span(other);
+            other.start >= span.start && other.end <= span.end
         })
-        .or(Some(root))
+        .then_some(root)
 }
 
 /// Reports at the whole expression `root`: the run's earliest head
@@ -483,49 +485,77 @@ fn walk_access(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: 
     // through the callee head's same-file class first, then the
     // send-completion site's bridge member walk (a constructor
     // invocation's static type carries the instance members).
+    let interned = analysis.strings().intern(name);
     if run[..name_index]
         .iter()
         .any(|&row| c.kind(row) == NodeKind::Arguments)
-        && let Some(head) = run.iter().find(|&row| c.kind(*row) == NodeKind::Identifier)
     {
-        let class = c.lexeme(c.head_token(*head));
-        if let Some(class_row) = same_file_declaration(c, class) {
-            match class_member(c, class_row, name) {
-                Some(Member::Getter) | None => {}
-                Some(_) => report(c, root, run),
-            }
-            return;
-        }
-        if let Some(send) = run[..name_index]
+        // The receiver is the invocation head group — `List` of
+        // `List.empty()`, `C` of `C()`: the rows left of the selector's
+        // `Arguments` piece.
+        let arguments = run[..name_index]
             .iter()
-            .rev()
-            .find(|&row| c.kind(*row) == NodeKind::Send)
+            .position(|&row| c.kind(row) == NodeKind::Arguments)
+            .unwrap_or(0);
+        let head = run[..arguments]
+            .iter()
             .copied()
-            && let Some(member) = analysis
-                .member_of(query_site(c, send), analysis.strings().intern(name))
-            && matches!(member.entry.kind, MemberKind::Method | MemberKind::Field)
-        {
-            report(c, root, run);
+            .find(|&row| c.kind(row) == NodeKind::Identifier);
+        if let Some(head) = head {
+            let class = c.lexeme(c.head_token(head));
+            if let Some(class_row) = same_file_declaration(c, class) {
+                match class_member(c, class_row, name) {
+                    // An origin getter stays silent; a name absent from
+                    // the same-file class — inherited or imported —
+                    // joins the conservative silent face.
+                    Some(Member::Getter) | None => {}
+                    Some(_) => report(c, root, run),
+                }
+                return;
+            }
+            // The cross-file instance face: the head's container
+            // resolution (`member_of` walks the type-use row off the
+            // head span — `List` names `List` and the walk lands the
+            // instance member `where`).
+            match analysis.member_of(query_site(c, head), interned) {
+                Some(member) => {
+                    if member.entry.kind != MemberKind::Getter {
+                        report(c, root, run);
+                    }
+                }
+                // An unresolved member is not a getter — the upstream
+                // `visitNode` face reports (:113-116).
+                None => report(c, root, run),
+            }
         }
+        return;
+    }
+    // The type-reference receiver face: the receiver resolves to a
+    // class-like declaration (`DateTime.now`, `ArgumentError.new`) and
+    // the member is a constructor or a static — upstream's element is a
+    // `ConstructorElement`/`MethodElement`, never a `GetterElement`
+    // origin, so the `visitNode` face reports (:113-155).
+    if matches!(
+        analysis.binding_of(query_site(c, run[name_index - 1])),
+        Some(binding) if binding.kind == dartq_semantic::BindingKind::Decl
+    ) {
+        report(c, root, run);
         return;
     }
     let Some(receiver) = slice::bare_receiver(c, run, name_index) else {
         return;
     };
     let receiver_name = c.lexeme(c.head_token(receiver));
-    if let Some(member) =
-        analysis.member_of(query_site(c, receiver), analysis.strings().intern(name))
-    {
+    if let Some(member) = analysis.member_of(query_site(c, receiver), interned) {
         match member.entry.kind {
             // The origin-getter face (:129-138, :150-159).
             MemberKind::Getter => return,
-            // A field read or a method tear-off reports (:117-121,
-            // :139-147 — `test_instanceField`, `test_methodTearoff`).
-            MemberKind::Method | MemberKind::Field => {
+            // A field read, a setter reference, or a method tear-off
+            // reports (:117-155).
+            MemberKind::Method | MemberKind::Field | MemberKind::Setter => {
                 report(c, root, run);
                 return;
             }
-            MemberKind::Setter => {}
         }
     }
     let Some(class_name) = same_file::written_type(c, receiver, receiver_name) else {
@@ -680,13 +710,18 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     // The initialization run: the pieces before the first separator. The
     // content bound (not the row's own seal — a bare-send-tailed
     // initialization seals past the separator) keeps the row inside the
-    // initialization window.
+    // initialization window. A comma-separated expression list (the
+    // oracle's `ForPartsWithExpression` recovery: `a == s, c = 0`)
+    // walks each segment separately — the whole run carries no single
+    // covering root.
     let init: Vec<u32> = fragments
         .iter()
         .copied()
         .filter(|&row| c.byte_span(content_end_row(c, row, &[row])).end <= left_start)
         .collect();
-    walk(c, analysis, &init);
+    for run in comma_groups(c, &init) {
+        walk(c, analysis, &run);
+    }
     // Each comma-delimited updater walks separately (:212-215).
     let parts_end = c.byte_span(parts).end;
     let updater_rows: Vec<u32> = fragments
@@ -857,36 +892,36 @@ fn cascade_section_function_typed(
         };
         return member_function_typed(c, class_row, name);
     };
-    // The semantic member face: a resolved `Method` entry is a
-    // tear-off (cross-file classes included). A getter/field entry
-    // falls through — the model carries no function-type `Ty`, so the
-    // written-type face below answers what it can.
+    // The semantic member face: the section's resolved `staticType` is
+    // the member's declared type — a `Ty::Function` entry is a tear-off
+    // (a method's own signature type, or a function-typed getter/field).
+    // An unresolved member stays silent — the official `staticType is
+    // FunctionType` gate (:194) cannot be proven, so the section joins
+    // the conservative family rather than reporting every miss.
     if let Some(member) =
         analysis.member_of(query_site(c, receiver), analysis.strings().intern(name))
-        && member.entry.kind == MemberKind::Method
     {
-        return true;
+        let entry_ty = match member.entry.kind {
+            MemberKind::Method | MemberKind::Getter => member.entry.return_ty,
+            MemberKind::Field => member.entry.var_ty,
+            MemberKind::Setter => Ty::Unknown,
+        };
+        return matches!(entry_ty, Ty::Function { .. });
     }
     // The invocation target (`List.empty()..where`): the callee head's
-    // same-file class decides first, then the send-completion site's
-    // bridge member walk (a constructor invocation's static type
-    // carries the instance members).
+    // container decides — the same-file class first, then the head's
+    // cross-file container resolution (`member_of` walks the type-use
+    // row off the head span — `List` names `List` and the walk lands
+    // the instance member `where`; the `Send` row's own site carries
+    // no receiver binding).
     let receiver_name = c.lexeme(c.head_token(receiver));
     if target.iter().any(|&row| c.kind(row) == NodeKind::Arguments) {
         if let Some(class_row) = same_file_declaration(c, receiver_name) {
             return member_function_typed(c, class_row, name);
         }
-        if let Some(send) = target
-            .iter()
-            .rev()
-            .find(|&row| c.kind(*row) == NodeKind::Send)
-            .copied()
-        {
-            return analysis
-                .member_of(query_site(c, send), analysis.strings().intern(name))
-                .is_some_and(|member| member.entry.kind == MemberKind::Method);
-        }
-        return false;
+        return analysis
+            .member_of(query_site(c, receiver), analysis.strings().intern(name))
+            .is_some_and(|member| member.entry.kind == MemberKind::Method);
     }
     let Some(class_name) = same_file::written_type(c, receiver, receiver_name) else {
         return false;

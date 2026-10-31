@@ -325,17 +325,27 @@ pub(crate) fn receiver_family(
         return Some(decides);
     }
     let run = expand_wrappers(c, &pieces[..name]);
-    // A wrapper-revealed bare name reads its written type.
+    // A wrapper-revealed bare name reads its written type first; an
+    // inferred `var`/`final` binding carries no written face, so the
+    // bridge read row answers (a `var i = Iterable.empty()` receiver's
+    // inferred `Iterable` static type — the official `staticType`).
     if let [only] = run.as_slice()
         && c.kind(*only) == NodeKind::Identifier
     {
         let receiver_name = c.lexeme(c.head_token(*only));
-        let written = crate::rules::expressions::same_file::written_type(c, *only, receiver_name)?;
-        if crate::rules::expressions::same_file::declares_type(c, written) {
-            return Some(false);
+        let written =
+            crate::rules::expressions::same_file::written_type(c, *only, receiver_name);
+        if let Some(written) = written {
+            if crate::rules::expressions::same_file::declares_type(c, written) {
+                return Some(false);
+            }
+            let bits = core_family_bits(written);
+            return (bits != 0).then(|| bits & required != 0);
         }
-        let bits = core_family_bits(written);
-        return (bits != 0).then(|| bits & required != 0);
+        if let Some(ty) = analysis?.type_of(query_site(c, *only)) {
+            return ty_family(c, analysis?, ty, required);
+        }
+        return None;
     }
     member_receiver_family(c, analysis?, &run, required)
 }

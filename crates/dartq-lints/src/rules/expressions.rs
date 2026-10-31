@@ -162,6 +162,12 @@ pub(crate) mod noop_primitive_operations;
 pub(crate) mod null_check_on_nullable_type_parameter;
 pub(crate) mod null_closures;
 pub(crate) mod only_throw_errors;
+/// The lint pack-C wave's production-bridge pins: the verdict shapes the
+/// conformance sweep flagged red across the expression/check cluster
+/// (`no_dynamic_casts`, `void_checks`, `implicit_call_tearoffs`,
+/// `unrelated_type_equality_checks`).
+#[cfg(test)]
+mod packc_pins;
 pub(crate) mod prefer_adjacent_string_concatenation;
 pub(crate) mod prefer_conditional_assignment;
 pub(crate) mod prefer_const_constructors;

@@ -42,6 +42,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
     "void_checks",
     &[
         NodeKind::Assignment,
+        NodeKind::PatternAssignment,
         NodeKind::ReturnStatement,
         NodeKind::Send,
         NodeKind::NewExpression,
@@ -53,6 +54,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {
         NodeKind::Assignment => assignment_face(c),
+        NodeKind::PatternAssignment => pattern_assignment_face(c),
         NodeKind::ReturnStatement => return_face(c),
         NodeKind::Send | NodeKind::NewExpression | NodeKind::ImplicitCreation => argument_face(c),
         _ => {}
@@ -73,14 +75,43 @@ fn assignment_face(c: &mut Check<'_>) {
     let Some((left, right)) = slice::binary_operands(c) else {
         return;
     };
-    // The target: bare `<field>` or `this.<field>`.
-    let Some((name, this_prefixed)) = assigned_name(c, &left) else {
+    // The pattern-assignment face (`visitAssignedVariablePattern`,
+    // :68-74): a `[p] = …` / `(p,) = …` left side reports each
+    // void-typed bound variable at the variable itself, when the
+    // matched value is not void-acceptable. The pattern pieces tile
+    // flat inside the left run — the `AssignedVariablePattern` rows are
+    // siblings of the pattern root, not its children.
+    if left
+        .iter()
+        .any(|&row| matches!(c.kind(row), NodeKind::ListPattern | NodeKind::RecordPattern))
+    {
+        pattern_face(c, c.semantics(), &left, &right);
         return;
+    }
+    // The target: bare `<field>` or `this.<field>` or `<recv>.<field>`.
+    let run = slice::access_run(c, &left);
+    let (name, this_prefixed, receiver) = match run.as_slice() {
+        [single] if c.kind(*single) == NodeKind::Identifier => {
+            (c.lexeme(c.head_token(*single)), false, None)
+        }
+        [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
+            (c.lexeme(c.head_token(*name)), true, None)
+        }
+        // The member-write target `recv.<field>` (`a.x = 1`): the
+        // field's written type decides through the receiver's declared
+        // type (`visitAssignmentExpression`'s `writeType`).
+        [receiver, name] if c.kind(*receiver) == NodeKind::Identifier => {
+            (c.lexeme(c.head_token(*name)), false, Some(*receiver))
+        }
+        _ => return,
     };
     // Shadow-correct target type: a bare name goes through the
     // same-file binding walk (a local of the same name shadows the
-    // field); a `this.` target is the field itself.
-    let face = if this_prefixed {
+    // field); a `this.` target is the field itself; a member write
+    // reads the field off the receiver's declared type.
+    let face = if let Some(receiver) = receiver {
+        member_write_face(c, node, receiver, name)
+    } else if this_prefixed {
         type_face_of_field(c, name)
     } else {
         match same_file::binding(c, node, name) {
@@ -172,21 +203,47 @@ fn return_face(c: &mut Check<'_>) {
     let Some(face) = written_return_face(c, function) else {
         return;
     };
-    if !face.is_future_or_void {
+    if !face.is_future_or_void && !face.is_void {
         return;
     }
     let Some(analysis) = c.semantics() else {
         return;
     };
     // The value's static type; `return;` carries none and stays
-    // silent (`node.expression?.staticType` is null).
-    let rows = c.collect_direct(node);
+    // silent (`node.expression?.staticType` is null). The value rows
+    // can tile as the statement's siblings under the block (the
+    // send-group adoption), so the run reads the owner's window inside
+    // the statement's extent.
+    let extent = c.byte_span(node);
+    let mut rows = c.collect_direct(node);
+    if let Some(parent) = c.unit.ast.parent(node) {
+        for kid in c.collect_direct(parent) {
+            if kid == node || rows.contains(&kid) {
+                continue;
+            }
+            let span = c.byte_span(kid);
+            if span.start >= extent.start && span.end <= extent.end {
+                rows.push(kid);
+            }
+        }
+    }
+    rows.sort_by_key(|&row| c.byte_span(row).start);
     let Some(ty) =
         literal_ty(c, analysis, &rows).or_else(|| static_type_faces::expr_type(c, analysis, &rows))
     else {
         return;
     };
-    if acceptable_when_future_or_void_expected(analysis, ty) {
+    // The return-statement cut (`_check` :141-173): a `void` expectation
+    // reports only the `dynamic` value — the
+    // `expectedType is VoidType && type is! DynamicType && ReturnStatement`
+    // bail silents every decidable non-dynamic value upstream; a
+    // `FutureOr<void>` expectation runs the wider acceptability set.
+    let acceptable = if face.is_void {
+        ty != Ty::Dynamic
+    } else {
+        acceptable_when_future_or_void_expected(analysis, ty)
+    };
+    if acceptable {
         return;
     }
     c.report(c.utf16_span(node), &[]);
@@ -202,7 +259,7 @@ fn argument_face(c: &mut Check<'_>) {
         return;
     };
     let node = c.node();
-    let (formals, arguments) = match c.kind(node) {
+    let (formals, arguments, type_vars, subst) = match c.kind(node) {
         NodeKind::Send => {
             let Some((kids, pos)) = slice::owner_slice(c) else {
                 return;
@@ -213,9 +270,14 @@ fn argument_face(c: &mut Check<'_>) {
             // A constructor invocation tiles as a plain send (`K(1)`)
             // — when no function signature answers, the resolved
             // constructor's formals do (the official
-            // InstanceCreationExpression branch).
-            let formals = match analysis.function_signature_of(query_site(c, kids[head])) {
-                Some(sig) => sig.formals,
+            // InstanceCreationExpression branch). The container's type
+            // variables ride along so a bare `T` formal substitutes
+            // through the invocation's own `TypeArguments`
+            // (`A<void>.c(p)`).
+            let (formals, type_vars) = match analysis
+                .function_signature_of(query_site(c, kids[head]))
+            {
+                Some(sig) => (sig.formals, Vec::new()),
                 None => {
                     let Some(binding) =
                         analysis.resolve_constructor(query_site(c, kids[head]), None)
@@ -225,10 +287,12 @@ fn argument_face(c: &mut Check<'_>) {
                     let Some(formals) = binding.formals else {
                         return;
                     };
-                    formals
+                    let vars = class_type_vars(c, analysis, binding.container);
+                    (formals, vars)
                 }
             };
-            (formals, arguments)
+            let subst = invocation_type_args(c, &kids[..pos]);
+            (formals, arguments, type_vars, subst)
         }
         NodeKind::NewExpression | NodeKind::ImplicitCreation => {
             let kids = c.collect_direct(node);
@@ -258,7 +322,9 @@ fn argument_face(c: &mut Check<'_>) {
             let Some(formals) = binding.formals else {
                 return;
             };
-            (formals, kids[args_pos])
+            let type_vars = class_type_vars(c, analysis, binding.container);
+            let subst = invocation_type_args(c, &kids[..args_pos]);
+            (formals, kids[args_pos], type_vars, subst)
         }
         _ => return,
     };
@@ -287,7 +353,24 @@ fn argument_face(c: &mut Check<'_>) {
             positional += 1;
             (formal.ty, &pieces[range.start..range.end])
         };
-        if formal_ty != Ty::Void {
+        // A bare type-variable formal (`A<void>.c(p)` — `T value`)
+        // decides through the invocation's own type arguments: the
+        // class's parameter index names the substitution slot
+        // (:87-103 — `parameterElement.type` reads the instantiated
+        // signature).
+        let formal_is_void = formal_ty == Ty::Void
+            || match formal_ty {
+                Ty::Named { name, .. } => {
+                    let var = analysis.strings().resolve(name);
+                    type_vars
+                        .iter()
+                        .position(|v| v == var)
+                        .and_then(|index| subst.get(index))
+                        .is_some_and(|arg| arg == "void")
+                }
+                _ => false,
+            };
+        if !formal_is_void {
             continue;
         }
         // The value's static type; undecidable values stay silent
@@ -306,19 +389,278 @@ fn argument_face(c: &mut Check<'_>) {
     }
 }
 
-/// The assigned name off the left run: `(name, this-prefixed)`. The
-/// run reads through the access-run form (the access markers and the
-/// bare-name send group tile beside the chain rows).
-fn assigned_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<(&'a str, bool)> {
-    match slice::access_run(c, rows).as_slice() {
-        [single] if c.kind(*single) == NodeKind::Identifier => {
-            Some((c.lexeme(c.head_token(*single)), false))
+/// The `PatternAssignment` row face (`addAssignedVariablePattern` +
+/// `addAssignmentExpression`, :30-36): the childless row anchors over the
+/// `=` (`Equals` word); the pattern pieces tile as the parent's left
+/// siblings, the value pieces to its right — the same peel
+/// `parameter_assignments`'s pattern arm walks.
+fn pattern_assignment_face(c: &mut Check<'_>) {
+    let node = c.node();
+    let Some(equals) = c.field(node, PayloadField::Equals) else {
+        return;
+    };
+    let eq_start = c
+        .unit
+        .tokens
+        .get(equals as usize)
+        .map(|t| t.byte_offset as usize);
+    let Some(eq_start) = eq_start else {
+        return;
+    };
+    let eq_end = c
+        .unit
+        .tokens
+        .get(equals as usize)
+        .map(|t| t.byte_offset as usize + t.byte_len as usize);
+    let (Some(parent), Some(eq_end)) = (c.unit.ast.parent(node), eq_end) else {
+        return;
+    };
+    let siblings = c.collect_direct(parent);
+    let Some(pos) = siblings.iter().position(|&sibling| sibling == node) else {
+        return;
+    };
+    // The pattern and the value pieces tile together BEFORE the marker
+    // row under the statement — the left run ends at the `=`, the right
+    // run opens after it (the same byte peel as the `Operator` face).
+    let run = slice::statement_run(c, &siblings[..pos]);
+    let left: Vec<u32> = run
+        .iter()
+        .copied()
+        .filter(|&row| c.byte_span(row).end <= eq_start)
+        .collect();
+    let right: Vec<u32> = run
+        .iter()
+        .copied()
+        .filter(|&row| c.byte_span(row).start >= eq_end)
+        .collect();
+    pattern_face(c, c.semantics(), &left, &right);
+}
+
+/// The pattern-assignment face (`visitAssignedVariablePattern`, :75-81):
+/// each `AssignedVariablePattern` inside the left pattern whose bound
+/// variable is `void`- or `FutureOr<void>`-typed reports at the variable
+/// when the matched value type is not acceptable — the matched type reads
+/// the right literal's element face (a `<int>[…]`'s `int`, a `(7,)`'s
+/// first field). The bound variables tile as siblings of the pattern
+/// root (the `AssignedVariablePattern` row's head IS the variable name —
+/// the production tiling keeps it flat under the statement, not nested
+/// under the pattern row). Undecidable matched types stay silent.
+fn pattern_face(
+    c: &mut Check<'_>,
+    analysis: Option<&dartq_semantic::Analysis<'_>>,
+    left: &[u32],
+    right: &[u32],
+) {
+    let Some(analysis) = analysis else {
+        return;
+    };
+    let is_list = left
+        .iter()
+        .any(|&row| c.kind(row) == NodeKind::ListPattern);
+    // The matched value type: a list pattern reads the right literal's
+    // element type (`<int>[7]` → `int`); a record pattern the first
+    // positional field's literal type. Anything undecidable bails.
+    let matched = if is_list {
+        right_literal_element_ty(c, analysis, right)
+    } else {
+        right_record_field_ty(c, analysis, right)
+    };
+    let Some(matched) = matched else {
+        return;
+    };
+    for &name_row in left {
+        if c.kind(name_row) != NodeKind::AssignedVariablePattern {
+            continue;
         }
-        [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
-            Some((c.lexeme(c.head_token(*name)), true))
+        let name = c.lexeme(c.head_token(name_row));
+        let face = match same_file::binding(c, name_row, name) {
+            Some((_, Some(row))) => Some(type_face(c, row)),
+            _ => type_face_of_field(c, name),
+        };
+        let Some(face) = face else { continue };
+        if !face.is_void && !face.is_future_or_void {
+            continue;
         }
-        _ => None,
+        let acceptable = if face.is_void {
+            acceptable_when_void_expected(analysis, matched)
+        } else {
+            acceptable_when_future_or_void_expected(analysis, matched)
+        };
+        if !acceptable {
+            c.report(c.utf16_span(name_row), &[]);
+        }
     }
+}
+
+/// The right literal's element type for a `[p]` match (`<int>[7]` →
+/// `int`, `<int>{…}` likewise; an untyped literal stays undecidable).
+fn right_literal_element_ty(
+    c: &Check<'_>,
+    analysis: &dartq_semantic::Analysis<'_>,
+    right: &[u32],
+) -> Option<Ty> {
+    let lit = right.iter().copied().find(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
+        )
+    })?;
+    let args = c
+        .collect_direct(lit)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::TypeArguments)?;
+    let arg = c
+        .collect_direct(args)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+    let face = type_face(c, arg);
+    face.name.map(|name| Ty::Named {
+        name: analysis.strings().intern(name),
+        nullable: face.nullable,
+        args: ArgListId::EMPTY,
+    })
+}
+
+/// The first positional field's type of a `(7,)` record literal (the
+/// `(p,)` match reads the positional slot).
+fn right_record_field_ty(
+    c: &Check<'_>,
+    analysis: &dartq_semantic::Analysis<'_>,
+    right: &[u32],
+) -> Option<Ty> {
+    let lit = right
+        .iter()
+        .copied()
+        .find(|&row| c.kind(row) == NodeKind::RecordLiteral)?;
+    let kids = c.collect_direct(lit);
+    literal_ty(c, analysis, &kids)
+}
+
+/// The declared type-parameter names of the same-file class `container`
+/// (`class A<T>` → `["T"]`), in declaration order — the substitution
+/// slots a bare type-variable formal reads.
+fn class_type_vars(
+    c: &Check<'_>,
+    analysis: &dartq_semantic::Analysis<'_>,
+    container: dartq_source::StringId,
+) -> Vec<String> {
+    let name = analysis.strings().resolve(container);
+    let Some(class_row) = crate::rules::same_file_declaration(c, name) else {
+        return Vec::new();
+    };
+    let Some(vars) = c
+        .collect_direct(class_row)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+    else {
+        return Vec::new();
+    };
+    c.collect_direct(vars)
+        .into_iter()
+        .flat_map(|tv| c.collect_direct(tv))
+        .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+        .map(|kid| c.lexeme(c.head_token(kid)).to_owned())
+        .collect()
+}
+
+/// The invocation site's explicit type-argument names (`A<void>.c(p)` →
+/// `["void"]`), in order — the substitution values a generic
+/// container's bare `T` formal reads.
+fn invocation_type_args(c: &Check<'_>, pieces: &[u32]) -> Vec<String> {
+    let Some(ta) = pieces
+        .iter()
+        .copied()
+        .find(|&row| c.kind(row) == NodeKind::TypeArguments)
+    else {
+        return Vec::new();
+    };
+    c.collect_direct(ta)
+        .into_iter()
+        .filter(|&arg| c.kind(arg) == NodeKind::Type)
+        .map(|arg| c.lexeme(c.head_token(arg)).to_owned())
+        .collect()
+}
+
+/// The member-write target's written face (`a.x = v`): the receiver's
+/// same-file declared type names the class; the field's written type is
+/// the face. A generic setter's type-variable parameter substitutes
+/// through the receiver's written type arguments (`A<void> a; a.f = v`
+/// — `set f(T value)` decides through `void`).
+fn member_write_face<'a>(
+    c: &'a Check<'_>,
+    node: u32,
+    receiver: u32,
+    name: &str,
+) -> Option<TypeFace<'a>> {
+    let recv_name = c.lexeme(c.head_token(receiver));
+    let Some((_, Some(type_row))) = same_file::binding(c, node, recv_name) else {
+        return None;
+    };
+    let recv_face = type_face(c, type_row);
+    let class_name = recv_face.name?;
+    let class_row = crate::rules::same_file_declaration(c, class_name)?;
+    // A plain field's written face: the `Fields` member whose
+    // declaration names `name` — the type row precedes the variable row
+    // inside the `Fields` window.
+    let members = crate::rules::body_members(c, class_row);
+    let field_face = members.iter().copied().find_map(|member| {
+        if !matches!(
+            c.kind(member),
+            NodeKind::Fields | NodeKind::VariablesDeclaration | NodeKind::TopLevelFields
+        ) {
+            return None;
+        }
+        let name_row = c.collect_direct(member).into_iter().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name
+        })?;
+        crate::rules::type_before(c, member, name_row)
+            .map(|(t, _)| type_face(c, t))
+    });
+    if field_face.is_some() {
+        return field_face;
+    }
+    // The generic-setter face: `set f(T value)` — the parameter's bare
+    // type variable substitutes through the receiver's written type
+    // arguments at the class's parameter index.
+    let setter = members.iter().copied().find(|&member| {
+        c.kind(member) == NodeKind::Method
+            && crate::rules::get_set_token(c, member) == Some("set")
+            && c.collect_direct(member).into_iter().any(|kid| {
+                c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name
+            })
+    })?;
+    let params = c
+        .collect_direct(setter)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)?;
+    let param_type = c
+        .collect_direct(params)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+    let var_name = c.lexeme(c.head_token(param_type));
+    // The class's type-parameter list (`class A<T>`) — the index of the
+    // bare `T` names the substitution slot.
+    let type_params = c
+        .collect_direct(class_row)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)?;
+    let param_names: Vec<&str> = c
+        .collect_direct(type_params)
+        .into_iter()
+        .flat_map(|tv| c.collect_direct(tv))
+        .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+        .map(|kid| c.lexeme(c.head_token(kid)))
+        .collect();
+    let index = param_names.iter().position(|&p| p == var_name)?;
+    let &(subst_name, subst_nullable) = recv_face.type_arguments.get(index)?;
+    Some(TypeFace {
+        name: Some(subst_name),
+        nullable: subst_nullable,
+        is_void: subst_name == "void",
+        is_future_or_void: false,
+        is_function_type: false,
+        type_arguments: Vec::new(),
+    })
 }
 
 /// The written return type of a method-like row, as its full
@@ -348,10 +690,17 @@ pub(crate) fn written_return_face<'a>(c: &'a Check<'_>, function: u32) -> Option
         })?;
     let (type_row, kind) = crate::rules::type_before(c, function, name)?;
     // A function-typed return (`void Function() f()`) tiles as the
-    // `FunctionType` row — the caller's face gate decides whether it
-    // answers (the implicit_call_tearoffs return face does; the
-    // void_checks `FutureOr<void>` cut rejects it).
-    (matches!(kind, NodeKind::Type | NodeKind::FunctionType)).then(|| type_face(c, type_row))
+    // `FunctionType` row; a bare `void` return tiles as `VoidType` (the
+    // `void f(dynamic p)` return face reports a `dynamic` value —
+    // `type_face` on `VoidType` answers `is_void`). The caller's face
+    // gate decides whether the face answers (the implicit_call_tearoffs
+    // return face rejects non-function types; the void_checks cut reads
+    // `is_void`/`is_future_or_void`).
+    (matches!(
+        kind,
+        NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType
+    ))
+    .then(|| type_face(c, type_row))
 }
 
 /// The value type the literal faces answer: `null` and the scalar
@@ -384,10 +733,13 @@ fn literal_ty(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, rows: &[u3
 /// and reports; `Unknown` (inferred) values pass.
 fn acceptable_when_void_expected(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
     match ty {
-        Ty::Dynamic | Ty::Null | Ty::Void | Ty::Never | Ty::Unknown => true,
+        // `isTypeAcceptableWhenExpectingVoid` (:55-65) has no `Dynamic`
+        // arm — only the `FutureOr` variant passes `dynamic` (:45), so a
+        // `void` formal rejects a `dynamic` argument upstream.
+        Ty::Null | Ty::Void | Ty::Never | Ty::Unknown => true,
         Ty::Named { name, .. } => analysis.strings().resolve(name) == "Future",
         // A function-typed value is no `Future` head — it reports.
-        Ty::Record { .. } | Ty::Function { .. } => false,
+        Ty::Dynamic | Ty::Record { .. } | Ty::Function { .. } => false,
     }
 }
 

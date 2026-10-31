@@ -19,6 +19,7 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
     &[
         NodeKind::ConstExpression,
         NodeKind::ConstLiteral,
+        NodeKind::ConstDotShorthand,
         NodeKind::ListLiteral,
         NodeKind::SetOrMapLiteral,
         NodeKind::RecordLiteral,
@@ -28,16 +29,30 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
-    // `keyword == null || keyword.type != CONST` bails (:57-59).
-    let Some(keyword) = const_keyword(c, node) else {
-        return;
+    // The dot-shorthand const invocation (`const .new()`) opens its
+    // `ConstDotShorthand` row at the `const` keyword itself
+    // (`visitDotShorthandConstructorInvocation` reports at
+    // `node.constKeyword`), which the shared `const_keyword` table does
+    // not key — read the head token directly.
+    let keyword = if c.kind(node) == NodeKind::ConstDotShorthand {
+        let head = c.head_token(node);
+        if c.lexeme(head) != "const" {
+            return;
+        }
+        head
+    } else {
+        // `keyword == null || keyword.type != CONST` bails (:57-59).
+        let Some(keyword) = const_keyword(c, node) else {
+            return;
+        };
+        keyword
     };
     // `node.inConstantContext` (:60-62).
     if !in_const_context(c) {
         return;
     }
-    let Some(start) = c.utf16_of_token(keyword) else {
-        return;
-    };
-    c.report(start..start, &[]);
+    // `rule.reportAtToken(constKeyword)` reports the keyword's whole
+    // token (the official `unnecessaryConst` extent — `const`, 5 wide).
+    let span = crate::rules::utf16_token_span(c, keyword);
+    c.report(span.start..span.end, &[]);
 }

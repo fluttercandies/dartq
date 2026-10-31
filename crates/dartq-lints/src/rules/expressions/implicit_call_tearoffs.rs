@@ -45,6 +45,8 @@ pub(crate) static SPEC: RuleSpec = crate::spec!(
         NodeKind::ReturnStatement,
         NodeKind::ExpressionBody,
         NodeKind::Send,
+        NodeKind::ListLiteral,
+        NodeKind::SetOrMapLiteral,
     ],
     check,
 );
@@ -54,6 +56,7 @@ fn check(c: &mut Check<'_>) {
         NodeKind::Assignment | NodeKind::VariableInitializer => context_face(c),
         NodeKind::ReturnStatement | NodeKind::ExpressionBody => return_face(c),
         NodeKind::Send => argument_face(c),
+        NodeKind::ListLiteral | NodeKind::SetOrMapLiteral => collection_face(c),
         _ => {}
     }
 }
@@ -92,9 +95,13 @@ fn context_face(c: &mut Check<'_>) {
         return;
     }
     // The right side: a bare read, a `this.<field>`, or a creation —
-    // whose type names a class with an instance `call` method.
+    // whose type names a class with an instance `call` method. The
+    // initializer's operand pieces can tile as the initializer's siblings
+    // under the variable row (the send-group adoption), so the run reads
+    // the node's own children plus the parent's rows inside its extent —
+    // the same window [`value_rows`] assembles.
     let rows = if c.kind(node) == NodeKind::VariableInitializer {
-        c.collect_direct(node)
+        value_rows(c, node)
     } else {
         let Some((_, right)) = slice::binary_operands(c) else {
             return;
@@ -204,6 +211,43 @@ fn value_rows(c: &Check<'_>, node: u32) -> Vec<u32> {
     rows
 }
 
+/// The tear-off-instantiation verdict over a send group's operand rows:
+/// the last `TypeArguments` row whose tail carries no `Arguments` (an
+/// invocation's type arguments are followed by its argument list — a
+/// `c<T>` tear-off's are followed by `NoArguments`/nothing). The operand
+/// before it judges through the shared `call` verdict; the report spans
+/// `operand…<T>`.
+fn instantiation_face(c: &mut Check<'_>, node: u32, rows: &[u32]) -> bool {
+    let Some(ta_pos) = rows
+        .iter()
+        .rposition(|&row| c.kind(row) == NodeKind::TypeArguments)
+    else {
+        return false;
+    };
+    if rows[ta_pos + 1..]
+        .iter()
+        .any(|&row| c.kind(row) == NodeKind::Arguments)
+    {
+        return false;
+    }
+    // The operand is the send group ending before the type-argument
+    // list's `<` — the argument types' own `Type`/`Identifier` rows tile
+    // inside the `TypeArguments` span and stay out.
+    let ta_start = c.byte_span(rows[ta_pos]).start;
+    let operand: Vec<u32> = rows[..ta_pos]
+        .iter()
+        .copied()
+        .filter(|&row| c.byte_span(row).end <= ta_start)
+        .collect();
+    if operand.is_empty() || !operand_rows_have_call(c, node, &operand) {
+        return false;
+    }
+    let start = c.utf16_span(operand[0]).start;
+    let end = c.utf16_span(rows[ta_pos]).end;
+    c.report(start..end, &[]);
+    true
+}
+
 /// The argument face for a same-file top-level callee: the written
 /// formal table decides the function-typed slots (positional by
 /// required order, named by label; an optional-positional formal
@@ -216,7 +260,20 @@ fn argument_face(c: &mut Check<'_>) {
     let Some((kids, pos)) = slice::owner_slice(c) else {
         return;
     };
-    let Some((head, Some(arguments))) = slice::send_parts(c, &kids, pos) else {
+    let Some((head, arg_row)) = slice::send_parts(c, &kids, pos) else {
+        return;
+    };
+    // The tear-off-instantiation face (:34-39): `c<T>` / `C()<T>` — the
+    // operand tiles a `TypeArguments` row that no `Arguments` follows (a
+    // generic invocation `f<T>(…)` carries one; a type use `List<int>`
+    // owns no expression operand). The production tiling wraps the
+    // instantiation in a `TypeApplication` row whose `TypeArguments`
+    // piece seals after the operand's `Send` — the slice is the owner
+    // window minus the trailing statement/completion rows.
+    if instantiation_face(c, node, &kids) {
+        return;
+    }
+    let Some(arguments) = arg_row else {
         return;
     };
     if c.kind(kids[head]) != NodeKind::Identifier {
@@ -354,6 +411,154 @@ fn top_level_function_row(c: &Check<'_>, name: &str) -> Option<u32> {
     None
 }
 
+/// The collection-element face (:34-39 through the resolver's context
+/// walk): a literal whose element context is a function type reports
+/// each operand carrying an instance `call` — `<void Function()>[c]`
+/// reads the literal's own `TypeArguments`, `List<void Function()> f =
+/// [c]` / `return [c]` reads the enclosing declared type's element
+/// argument (a `List`/`Set` face; maps keep their value argument). An
+/// element-untyped literal stays silent.
+fn collection_face(c: &mut Check<'_>) {
+    let node = c.node();
+    let span = c.byte_span(node);
+    // The element pieces can tile as the literal's siblings under the
+    // enclosing statement — collect every row inside the literal's span.
+    let mut rows = c.collect_direct(node);
+    if let Some(parent) = c.unit.ast.parent(node) {
+        for kid in c.collect_direct(parent) {
+            if kid == node || rows.contains(&kid) {
+                continue;
+            }
+            let kid_span = c.byte_span(kid);
+            if kid_span.start >= span.start && kid_span.end <= span.end {
+                rows.push(kid);
+            }
+        }
+    }
+    rows.sort_by_key(|&row| c.byte_span(row).start);
+    // The literal's own type arguments (`<void Function()>[c]`): the
+    // first `Type` row under the literal's `TypeArguments` child decides
+    // the element context directly. The production tiling anchors the
+    // `<T>` prefix as a sibling sealing at the literal's `[` (the
+    // literal row covers `[…]` only), so the prefix row comes off the
+    // parent's child window too.
+    let ta = rows
+        .iter()
+        .copied()
+        .find(|&row| c.kind(row) == NodeKind::TypeArguments)
+        .or_else(|| {
+            c.unit.ast.parent(node).and_then(|parent| {
+                c.collect_direct(parent).into_iter().find(|&kid| {
+                    c.kind(kid) == NodeKind::TypeArguments
+                        && c.byte_span(kid).end == span.start
+                })
+            })
+        });
+    let element_is_function = if let Some(ta) = ta {
+        c.collect_direct(ta)
+            .into_iter()
+            .find(|&arg| matches!(c.kind(arg), NodeKind::Type | NodeKind::FunctionType))
+            .is_some_and(|arg| written_row_is_function(c, Some(arg)))
+    } else {
+        // The enclosing declared element type: `List<void Function()>` —
+        // the first `FunctionType` row inside the written type's
+        // `TypeArguments`. The declaration sibling scan covers a local
+        // (`var l = [c]` under a `List<…>` declared target is not this
+        // shape — the typed target is the return/assignment context),
+        // so the face reads the enclosing written type directly: the
+        // nearest enclosing declaration's written return type first.
+        enclosing_collection_element_is_function(c, node)
+    };
+    if !element_is_function {
+        return;
+    }
+    for segment in slice::comma_segments(c, node, &rows) {
+        if segment
+            .iter()
+            .any(|&row| matches!(c.kind(row), NodeKind::TypeArguments))
+        {
+            continue;
+        }
+        if segment.is_empty() || !operand_rows_have_call(c, node, &segment) {
+            continue;
+        }
+        let start = c.utf16_span(segment[0]).start;
+        let end = value_run_end(c, &segment, *segment.last().unwrap_or(&node));
+        c.report(start..end, &[]);
+    }
+}
+
+/// Whether the enclosing context's written collection type carries a
+/// function-typed element argument (`List<void Function()>`, a map's
+/// value argument). The face walks the enclosing written type rows —
+/// the return type of the enclosing function (`return [c]`), the
+/// declared type of the enclosing variable initializer.
+fn enclosing_collection_element_is_function(c: &Check<'_>, _node: u32) -> bool {
+    // The literal's enclosing declaration's written type row: the
+    // return type (`return [c]`) or the variable's declared type.
+    let function = c.path.iter().rev().copied().find(|&a| {
+        matches!(
+            c.kind(a),
+            NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration
+        )
+    });
+    let type_row = function.and_then(|f| {
+        let name = c
+            .collect_direct(f)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Identifier)?;
+        crate::rules::type_before(c, f, name).map(|(row, _)| row)
+    });
+    let Some(type_row) = type_row else {
+        return false;
+    };
+    // The `List<…>`/`Set<…>`/`Map<…, …>` type's `TypeArguments` subtree:
+    // the element context is the first `FunctionType` argument (the
+    // collection's element face; a map literal's value shares it). The
+    // `TypeArguments` row tiles as the `Type` row's sibling inside the
+    // type's byte span, so the walk scans every row the span covers.
+    let span = c.byte_span(type_row);
+    let Some(owner) = c.unit.ast.parent(type_row) else {
+        return false;
+    };
+    let mut pending: Vec<u32> = c
+        .collect_direct(owner)
+        .into_iter()
+        .filter(|&row| {
+            let s = c.byte_span(row);
+            s.start >= span.start && s.end <= span.end
+        })
+        .collect();
+    while let Some(row) = pending.pop() {
+        match c.kind(row) {
+            NodeKind::FunctionType => return true,
+            NodeKind::Type => {
+                if bare_function_spelling(c, c.lexeme(c.head_token(row))) {
+                    return true;
+                }
+                for kid in c.collect_direct(row) {
+                    match c.kind(kid) {
+                        NodeKind::FunctionType => return true,
+                        NodeKind::Type | NodeKind::TypeArguments => pending.push(kid),
+                        _ => {}
+                    }
+                }
+            }
+            NodeKind::TypeArguments => {
+                for kid in c.collect_direct(row) {
+                    match c.kind(kid) {
+                        NodeKind::FunctionType => return true,
+                        NodeKind::Type | NodeKind::TypeArguments => pending.push(kid),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The operand verdict over a value's rows — the argument/return
 /// faces' operand shapes: a bare read through
 /// [`operand_type_has_call`], a `this.`-field through the field face
@@ -363,6 +568,33 @@ fn top_level_function_row(c: &Check<'_>, name: &str) -> Option<u32> {
 /// raw rows' leading `Identifier` stands in when the access run
 /// empties.
 fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
+    // An explicit `.call` selector is the spelled tear-off, not an
+    // implicit one — the resolver builds no `ImplicitCallReference` for
+    // `Callable().call` (the official's visitor keys on the implicit node).
+    // The `DotAccess` marker's head token IS the member name, so the
+    // lexeme decides; the send group's trailing markers can also tile
+    // just past the operand slice, so the owner's rows one step past
+    // `rows` count too.
+    let call_marked = |rows: &[u32]| {
+        rows.iter().any(|&row| {
+            c.kind(row) == NodeKind::DotAccess && c.lexeme(c.head_token(row)) == "call"
+        })
+    };
+    if call_marked(rows) {
+        return false;
+    }
+    if let Some(&last) = rows.last()
+        && let Some(parent) = c.unit.ast.parent(last)
+    {
+        let owner = c.collect_direct(parent);
+        if let Some(pos) = owner.iter().position(|&kid| kid == last) {
+            for &kid in &owner[pos + 1..] {
+                if c.kind(kid) == NodeKind::DotAccess && c.lexeme(c.head_token(kid)) == "call" {
+                    return false;
+                }
+            }
+        }
+    }
     // A binary container riding the run (`return c1 ?? c2;`): the
     // operand pieces tile beside it — either side's verdict answers
     // (the official face reports the whole expression when the
@@ -405,15 +637,27 @@ fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
             .map(|type_name| same_file_class_has_call(c, type_name))
             .unwrap_or(false);
     }
+    // A bare read followed only by marker pieces (`c<int>` — the
+    // tear-off's `TypeArguments` tails the name inside the operand
+    // slice, before the `NoArguments` group marker) reads the name's
+    // type the same way the access-run arm does; a `C()` creation's
+    // `Arguments` piece is not a bare-read marker and falls through.
     if let Some(&first) = rows.first()
         && c.kind(first) == NodeKind::Identifier
-        && rows.len() > 1
-        && rows[1..]
-            .iter()
-            .all(|&row| slice::is_send_group_piece(c, row))
     {
-        let name = c.lexeme(c.head_token(first));
-        return operand_type_has_call(c, use_node, &[first], name);
+        let tail_is_markers = rows[1..].iter().all(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::NoTypeArguments
+                    | NodeKind::TypeArguments
+                    | NodeKind::NoArguments
+                    | NodeKind::Send
+            )
+        });
+        if tail_is_markers && !rows[1..].iter().any(|&row| c.kind(row) == NodeKind::Arguments) {
+            let name = c.lexeme(c.head_token(first));
+            return operand_type_has_call(c, use_node, &[first], name);
+        }
     }
     creation_has_call(c, rows)
 }

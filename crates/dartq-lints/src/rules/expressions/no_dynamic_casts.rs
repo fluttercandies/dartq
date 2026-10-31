@@ -107,11 +107,35 @@ fn source_is_dynamic(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run
 /// `Send` and its argument markers — finalize at the statement's `;`,
 /// which the container row swallows; the expression's own rows bound the
 /// span, exactly the upstream `reportAtNode(expression)` extent).
+/// Whether the row carries the expression's own tokens — the send group's
+/// completion wrappers (`Send`, the argument markers, the `.` access row)
+/// anchor at their delta-tile operator or swallow the statement's `;`,
+/// never at the operand head.
+fn is_completion_row(c: &Check<'_>, row: u32) -> bool {
+    matches!(
+        c.kind(row),
+        NodeKind::Send
+            | NodeKind::NoArguments
+            | NodeKind::NoTypeArguments
+            | NodeKind::TypeArguments
+            | NodeKind::DotAccess
+    )
+}
+
 fn report_run(c: &mut Check<'_>, run: &[u32]) {
-    let Some((&first, &last)) = run.first().zip(run.last()) else {
+    let Some(&last) = run.last() else {
         return;
     };
-    let start = c.utf16_span(first).start;
+    // The container's own covered span anchors at its delta-tile operator,
+    // never the operand head (the `a && b` right run's `Send` covers `&& b`)
+    // — the report opens at the first value row's head token, exactly the
+    // upstream `reportAtNode(expression)` extent.
+    let start = run
+        .iter()
+        .find(|&&row| !is_completion_row(c, row))
+        .map(|&row| c.utf16_span(row).start)
+        .or_else(|| slice::run_utf16_start(c, run))
+        .unwrap_or_else(|| c.utf16_span(run[0]).start);
     let end = value_run_end(c, run, last);
     c.report(start..end, &[]);
 }
@@ -296,8 +320,45 @@ fn body_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 /// if/while/do/switch statements and clauses; the run judges against
 /// `bool`.
 fn condition_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
-    let run = c.collect_direct(c.node());
+    let run = condition_run(c, c.node());
     check_bool_target(c, analysis, &run);
+}
+
+/// The condition segment's full piece run: `ParenthesizedCondition`
+/// adopts only the expression's completion row (`begin_adopting(…, 1)`),
+/// so the direct children are the lone `Send`/`BinaryExpression` wrapper
+/// while its send-group pieces (`Identifier`, `NoTypeArguments`,
+/// `NoArguments`) tile as the node's left siblings under the statement.
+/// The run is the contiguous tail of left-sibling send-group pieces plus
+/// the node's own children — the tail walk stops at the `(` boundary so
+/// an earlier statement's pieces stay out.
+fn condition_run(c: &Check<'_>, node: u32) -> Vec<u32> {
+    let mut run = c.collect_direct(node);
+    let Some(parent) = c.unit.ast.parent(node) else {
+        return run;
+    };
+    let kids = c.collect_direct(parent);
+    let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+        return run;
+    };
+    // The send-group pieces tile immediately before the node inside the
+    // condition's `(...)` — walk left while each sibling's covered range
+    // sits past the `(` (the node's own covered span opens at `(`),
+    // keeping the operand `Identifier` and the send-group markers.
+    let open = c.byte_span(node).start;
+    let mut prefix: Vec<u32> = kids[..pos]
+        .iter()
+        .rev()
+        .copied()
+        .take_while(|&kid| {
+            c.byte_span(kid).start >= open
+                && (slice::is_send_group_piece(c, kid)
+                    || c.kind(kid) == NodeKind::Identifier)
+        })
+        .collect();
+    prefix.reverse();
+    prefix.extend(run.drain(..));
+    prefix
 }
 
 /// The for-statement condition face (:104-109): the condition segment
@@ -312,12 +373,53 @@ fn for_parts_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     };
     let left_end = byte_span_of_token(c, left).end;
     let right_start = byte_span_of_token(c, right).start;
-    let run: Vec<u32> = c
-        .collect_direct(node)
-        .into_iter()
-        .filter(|&kid| c.byte_span(kid).start >= left_end && c.byte_span(kid).end <= right_start)
-        .collect();
+    let run = window_pieces(c, node, left_end, right_start);
     check_bool_target(c, analysis, &run);
+}
+
+/// The expression pieces tiling inside `[lo, hi)`: the send-group pieces
+/// of a `for`-parts condition (`for (; a;)`) or a for-in iterable can tile
+/// as the container's siblings under the enclosing statement while only the
+/// completion wrapper is the direct child (the same adoption tiling
+/// [`condition_run`] reads), and the condition's statement-level wrapper
+/// (`ExpressionStatement` in `for (; a;)`) owns the send group instead of
+/// the condition row itself. The run is every direct row of the node plus
+/// the parent's rows whose covered range sits inside the window, sorted by
+/// byte offset — a statement wrapper inside the window unwraps to its own
+/// children (the wrapper itself drops out, it is the header's statement
+/// marker not a value row).
+fn window_pieces(c: &Check<'_>, node: u32, lo: usize, hi: usize) -> Vec<u32> {
+    let inside = |row: u32| {
+        let span = c.byte_span(row);
+        span.start >= lo && span.end <= hi
+    };
+    let mut candidates: Vec<u32> = c.collect_direct(node).into_iter().collect();
+    if let Some(parent) = c.unit.ast.parent(node) {
+        for kid in c.collect_direct(parent) {
+            if kid != node && !candidates.contains(&kid) {
+                candidates.push(kid);
+            }
+        }
+    }
+    // A statement-level wrapper in the candidates (`for (; a;)`'s
+    // `ExpressionStatement`) is the header's marker — its children are
+    // the real expression pieces inside the window; the wrapper itself
+    // drops out. Pieces still outside the window (a marker's own send
+    // group that straddles the `;`) stay out.
+    let mut run: Vec<u32> = Vec::new();
+    for row in candidates {
+        if c.kind(row) == NodeKind::ExpressionStatement {
+            for kid in c.collect_direct(row) {
+                if inside(kid) && !run.contains(&kid) {
+                    run.push(kid);
+                }
+            }
+        } else if inside(row) && !run.contains(&row) {
+            run.push(row);
+        }
+    }
+    run.sort_by_key(|&row| c.byte_span(row).start);
+    run
 }
 
 /// The if-element condition face (:110-113): the condition rows sit
@@ -349,27 +451,36 @@ fn if_element_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some(group_end) = group_end else {
         return;
     };
-    let run: Vec<u32> = c
-        .collect_direct(node)
-        .into_iter()
-        .filter(|&kid| c.byte_span(kid).end <= group_end)
-        .collect();
+    let run = window_pieces(c, node, c.byte_span(node).start, group_end);
+    // The production tiling keeps a `ParenthesizedCondition` row for the
+    // element's `(...)` group — its own dispatch (`condition_face`)
+    // reports the same condition once; this face only fills the shape
+    // where the group carries no dedicated row.
+    if run
+        .iter()
+        .any(|&row| c.kind(row) == NodeKind::ParenthesizedCondition)
+    {
+        return;
+    }
     check_bool_target(c, analysis, &run);
 }
 
 /// The conditional-expression condition face (:115-117): the rows before
-/// the conditional's `?` operator judge against `bool`.
+/// the conditional's `?` operator judge against `bool`. The container's
+/// own covered span anchors at the `?` (the delta-tile operator), so the
+/// condition pieces tile as the node's left siblings under the parent —
+/// the window is the token-adjacent tail ending at the operator.
 fn conditional_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let node = c.node();
     let Some(op) = c.field(node, PayloadField::Question) else {
         return;
     };
     let op_start = byte_span_of_token(c, op).start;
-    let run: Vec<u32> = c
-        .collect_direct(node)
-        .into_iter()
-        .filter(|&kid| c.byte_span(kid).end <= op_start)
-        .collect();
+    let run = window_pieces(c, node, 0, op_start);
+    // The window opens at the source start, so a preceding statement's
+    // rows could join — bound at the token-adjacent tail (the operand's
+    // pieces chain back to the `?`; an earlier statement's do not).
+    let run = slice::contiguous_tail(c, &run, op).to_vec();
     check_bool_target(c, analysis, &run);
 }
 
@@ -416,9 +527,20 @@ fn check_bool_target(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>,
 /// `typeArguments` read). `(name, nullable)` per argument, owned so the
 /// faces read them across the `&mut` report boundary.
 fn literal_type_arguments(c: &Check<'_>, literal: u32) -> Vec<(String, bool)> {
+    // The `<T>` prefix anchors as a sibling sealing at the literal's `[`
+    // (the literal row covers `[…]` only), so the row comes off the
+    // parent's child window when it is not a direct child.
+    let span = c.byte_span(literal);
     c.collect_direct(literal)
         .into_iter()
         .find(|&kid| c.kind(kid) == NodeKind::TypeArguments)
+        .or_else(|| {
+            c.unit.ast.parent(literal).and_then(|parent| {
+                c.collect_direct(parent).into_iter().find(|&kid| {
+                    c.kind(kid) == NodeKind::TypeArguments && c.byte_span(kid).end == span.start
+                })
+            })
+        })
         .map(|args| {
             c.collect_direct(args)
                 .into_iter()
@@ -444,13 +566,19 @@ fn collection_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         .ast
         .token_range(node)
         .any(|token| c.lexeme(token) == ":");
-    let raw = c.collect_direct(node);
+    // The element pieces can tile as the literal's siblings under the
+    // enclosing statement (the same send-group adoption `condition_run`
+    // reads) — collect every row inside the literal's span.
+    let span = c.byte_span(node);
+    let raw = window_pieces(c, node, span.start, span.end);
     let segments = slice::comma_segments(c, node, &raw);
     if is_map && args.len() >= 2 {
         let (key, value) = (args[0].clone(), args[1].clone());
         for segment in &segments {
             // A spread judges against the whole map face; an entry
-            // splits at its `:`.
+            // splits at its `:` — the `MapEntry` marker trails the
+            // segment and carries the colon token (`PayloadField::Colon`,
+            // the same boundary `declarations::entry_sides` reads).
             if segment
                 .first()
                 .is_some_and(|&row| c.kind(row) == NodeKind::Spread)
@@ -458,13 +586,27 @@ fn collection_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
                 spread_face(c, analysis, segment, &key);
                 continue;
             }
-            let Some(colon) = segment.iter().position(|&row| {
-                c.unit.ast.token_range(row).len() == 1 && c.lexeme(c.head_token(row)) == ":"
-            }) else {
+            let Some(marker) = segment
+                .iter()
+                .copied()
+                .find(|&row| c.kind(row) == NodeKind::MapEntry)
+            else {
                 continue;
             };
-            check_typed_target(c, analysis, &segment[..colon], &key);
-            check_typed_target(c, analysis, &segment[colon + 1..], &value);
+            let Some(colon) = c.field(marker, PayloadField::Colon) else {
+                continue;
+            };
+            let sides: Vec<u32> = segment
+                .iter()
+                .copied()
+                .filter(|&row| row != marker)
+                .collect();
+            let split = sides
+                .iter()
+                .position(|&row| c.unit.ast.token_range(row).end > colon + 1)
+                .unwrap_or(sides.len());
+            check_typed_target(c, analysis, &sides[..split], &key);
+            check_typed_target(c, analysis, &sides[split..], &value);
         }
     } else if !is_map && !args.is_empty() {
         let element = args[0].clone();
@@ -529,7 +671,11 @@ fn for_each_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         return;
     };
     let in_span = byte_span_of_token(c, in_token);
-    let kids = c.collect_direct(node);
+    let node_span = c.byte_span(node);
+    // The loop-variable and iterable pieces can tile as the `ForIn`
+    // container's siblings under the enclosing statement (the send-group
+    // adoption [`window_pieces`] reads).
+    let kids = window_pieces(c, node, node_span.start, node_span.end);
     let loop_var_rows: Vec<u32> = kids
         .iter()
         .copied()
