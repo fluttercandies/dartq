@@ -20,12 +20,14 @@
 //!   writes a `Reference?` local, and each switch arm's `reference = …`
 //!   re-decision promotes it by the written `Reference` face — the local
 //!   needs the `Reference?` the `Map`-`[]` result stages (upstream Dart
-//!   SDK source, pkg/analyzer/lib/src/summary2/reference.dart:712);
+//!   SDK source, pkg/analyzer/lib/src/summary2/reference.dart:680, arm
+//!   writes at :684-707);
 //! - `evaluation.dart`'s `_checkParameters` loop binds
 //!   `var argumentValue = _argumentValueMap[baseParameter]` — a
 //!   `DartObjectImpl?` face the `argumentValue == null` guard then
 //!   promotes away, the oracle's own null-check arm (upstream Dart SDK
-//!   source, pkg/analyzer/lib/src/dart/constant/evaluation.dart:3344);
+//!   source, pkg/analyzer/lib/src/dart/constant/evaluation.dart:3335,
+//!   guard at :3341);
 //! - `replacement_visitor.dart`'s formal-parameter walk binds
 //!   `var parameter = node.formalParameters[i]` and
 //!   `var type = parameter.type` — the `List<E>` element face carries
@@ -129,65 +131,16 @@ mod tests {
     //! var-index chains, each carrying the upstream citation of the
     //! `.dart` line the face lights up.
 
-    use crate::collector::collect;
-    use crate::diagnose::{FileReport, StrictModes, diagnose_with};
-    use crate::library::ElementIndex;
-    use crate::model::MicroKind;
-    use dartq_language::{FeatureSet, LanguageVersion};
-    use dartq_parser::ParserFeatures;
-    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
-    use dartq_scanner::ScanConfig;
-    use dartq_source::{FileTable, StringTable};
-    use std::path::Path;
+    use crate::diagnose::FileReport;
 
-    /// The one-library rig: `source` is the sole analyzed file of
-    /// `package:t`, no imports (ticket_2521_tests carries the same
-    /// shape).
+    /// The canonical single-file rig (`super::test_rig`): the fixture rides
+    /// the shared `dart:core` stub and the resolved-type snapshot, so the
+    /// core heads (`int`, `List`, `Map`, `String`) resolve exactly like the
+    /// product path. The private copy this module used to carry built its
+    /// own graph against the no-ops `diagnose_with` entry and lost every
+    /// core head (`undefined_class 'int'` on each pin).
     fn unit_report(source: &str) -> FileReport {
-        let strings = StringTable::new();
-        let mut files = FileTable::new();
-        let file = files.intern(Path::new("main.dart"));
-        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
-        let features = ParserFeatures::from_feature_set(set);
-        let scanned = dartq_scanner::scan(
-            source,
-            ScanConfig {
-                enable_triple_shift: true,
-                enable_augmentations: true,
-            },
-            file,
-        );
-        assert!(
-            scanned.diagnostics.is_empty(),
-            "scanner diagnostics: {source:?}"
-        );
-        let elements = collect(source, &scanned.tokens, features, &strings);
-        let mut builder = LibraryGraphBuilder::new(&strings);
-        let lib = builder.intern("package:t/main.dart");
-        for (name, decl) in elements.declarations() {
-            if decl.kind == MicroKind::TypeParam {
-                continue;
-            }
-            builder.declare(lib, name, file);
-        }
-        let graph = builder.finish();
-        let namespaces = Namespaces::build(&graph);
-        let mut index = ElementIndex::default();
-        index.insert(file, elements);
-        diagnose_with(
-            source,
-            &scanned.tokens,
-            features,
-            &strings,
-            file,
-            lib,
-            &graph,
-            &namespaces,
-            &index,
-            StrictModes::default(),
-            &LibraryClassModifiers::default(),
-            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
-        )
+        super::test_rig::report_ops(source)
     }
 
     fn codes(report: &FileReport) -> Vec<&str> {
@@ -198,36 +151,36 @@ mod tests {
             .collect::<Vec<_>>()
     }
 
-    /// reference.dart:712's switch-arm write-promotion face: `var
+    /// reference.dart's switch-arm write-promotion face: `var
     /// reference = _referenceByIndex[index]` binds the map's `V?`
     /// face (`Reference?`), and each switch arm's `reference = …`
     /// write promotes it by the written `Reference` — the switch
     /// body's member reads stay silent exactly like the oracle's
     /// promoted local (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/summary2/reference.dart:712).
+    /// pkg/analyzer/lib/src/summary2/reference.dart:680 — the read —
+    /// with the arm writes at :684-707).
     ///
-    /// `#[ignore]`d: the `Map` `V?` bind needs the var-window's
-    /// nullable-result gate flipped in `listener.rs`
-    /// (`end_variable_initializer`'s `!is_nullable_ty` arm) — outside
-    /// this lane's file scope. The `List` `E` faces below run live:
-    /// a non-nullable element face binds through the window today.
+    /// The bind rides the #3085 gate flip in `listener.rs`
+    /// (`end_variable_initializer`'s index-result arm now admits the
+    /// nullable `V?` static type); the fixture is `final`/non-`const`
+    /// so the only row under test is the inference face (oracle 3.13.1:
+    /// zero rows for this source).
     #[test]
-    #[ignore = "Map V? bind needs the listener window gate flip (out of lane scope)"]
     fn map_index_binds_nullable_then_switch_arm_promotes() {
         let source = r#"
 class Reference {
   int get id => 0;
 }
 
-const Map<int, Reference> _referenceByIndex = {0: Reference()};
+final Map<int, Reference> _referenceByIndex = {0: Reference()};
 
 int f(int index, int tag) {
   var reference = _referenceByIndex[index];
   switch (tag) {
     case 1:
-      reference = const Reference();
+      reference = Reference();
     default:
-      reference = const Reference();
+      reference = Reference();
   }
   return reference.id;
 }
@@ -245,23 +198,25 @@ int f(int index, int tag) {
         );
     }
 
-    /// evaluation.dart:3344's optional-parameter guard face: `var
+    /// evaluation.dart's optional-parameter guard face: `var
     /// argumentValue = _argumentValueMap[baseParameter]` binds
     /// `DartObjectImpl?`, and the `argumentValue == null` guard's
     /// else arm promotes it — the member read below the guard
     /// carries the non-null face, so no unchecked-use verdict fires
     /// where the oracle stays silent (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart:3344).
-    /// `#[ignore]`d on the same listener-gate flip.
+    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart:3335 — the
+    /// read — with the `:3341` null guard).
+    ///
+    /// Lifted by the same #3085 listener gate flip; oracle 3.13.1:
+    /// zero rows for this source.
     #[test]
-    #[ignore = "Map V? bind needs the listener window gate flip (out of lane scope)"]
     fn map_index_binds_nullable_then_guard_promotes() {
         let source = r#"
 class DartObjectImpl {
   int get value => 0;
 }
 
-const Map<String, DartObjectImpl> _argumentValueMap = {
+final Map<String, DartObjectImpl> _argumentValueMap = {
   'x': DartObjectImpl(),
 };
 

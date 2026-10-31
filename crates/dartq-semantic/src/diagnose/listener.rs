@@ -2176,19 +2176,28 @@ impl ParserListener for DiagnoseListener<'_> {
                             // the result's value row (#2521): the initializer's
                             // expression row is the value row — one past the
                             // operator — so `var symbols = map[key]!` infers the
-                            // index result's type exactly like a plain read. Only
-                            // the assertion-decided NON-NULL face binds: a nullable
-                            // index result (`var h = headers[k]`, `var r =
-                            // byIndex[i]`) owes the null-check promotion and the
-                            // reassignment writes the staged faces re-decide
-                            // downstream, and binding it here fires the return/
-                            // unchecked/undefined verdicts before those re-decides
-                            // run (the analyzer corpus's map-inferred locals) —
-                            // the under-report stands until the write-side staging
-                            // carries them. The `!`-asserted face is the one shape
-                            // with no such question standing: the assertion itself
-                            // decided nullness, the type is the index result's own,
-                            // and no promotion re-decide can change it.
+                            // index result's type exactly like a plain read. The
+                            // bind carries that row's static type at WHATEVER
+                            // nullability it holds (#3085): a `Map<K, V>` read is
+                            // `V?`, and the oracle's inferred local takes that face
+                            // — the SDK's own `var reference =
+                            // _referenceByIndex[index]` (reference.dart:680, the
+                            // switch's arm writes promoting it back to `Reference`)
+                            // and `var argumentValue =
+                            // _argumentValueMap[baseParameter]` (evaluation.dart
+                            // :3335, the `:3341` null guard promoting it) are both
+                            // written on it. Binding the nullable face is what makes
+                            // those promotions decidable: the bind's staged declared
+                            // type (keyed on the declarator's name token, below)
+                            // reaches the flow layer, so `!= null` / `case null` and
+                            // every arm write re-decide on the real face instead of
+                            // the `Unknown` slot — and where no promotion stands, the
+                            // unchecked/undefined verdicts fire on the `V?` receiver
+                            // exactly like the oracle's. The one shape still held
+                            // back is the type-tested receiver
+                            // ([`Engine::index_receiver_latched`]): its pass-1 index
+                            // result reads the unpromoted container, so the
+                            // write-side staging — not this bind — owns it.
                             count
                                 if count == mark + 2
                                     && matches!(
@@ -2197,11 +2206,11 @@ impl ParserListener for DiagnoseListener<'_> {
                                     )
                                     && matches!(engine.rows[mark + 1].shape, RowShape::Value)
                                     && engine.rows[mark + 1].ty != Ty::UNKNOWN
-                                    && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
                                     && (engine.byte_at(engine.rows[mark + 1].range.end())
                                         == Some(b'!')
-                                        || (engine
-                                            .strictly_non_nullable(engine.rows[mark + 1].ty)
+                                        || ((Engine::is_nullable_ty(engine.rows[mark + 1].ty)
+                                            || engine
+                                                .strictly_non_nullable(engine.rows[mark + 1].ty))
                                             && !engine
                                                 .index_receiver_latched(&engine.rows[mark]))) =>
                             {
@@ -12048,3 +12057,11 @@ mod ticket_2933_tests;
 #[cfg(test)]
 #[path = "ticket_3089_tests.rs"]
 mod ticket_3089_tests;
+
+/// The #3085 pins (the var-window's index-result arm binds the read's own
+/// static type at any nullability — a `Map<K, V>` read binds `V?` and the
+/// downstream write/guard promotions decide on the real face,
+/// reference.dart:680 / evaluation.dart:3335).
+#[cfg(test)]
+#[path = "ticket_3085_tests.rs"]
+mod ticket_3085_tests;
