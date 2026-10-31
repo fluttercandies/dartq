@@ -241,15 +241,43 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     }
 
     /// The frame-lean form of [`Parser::is_bare_super_expression`] for deep
-    /// recursion: the caller records "the sub-expression's first token is
-    /// `super`" (a `bool`) before the recursive descent and pairs it with
-    /// this end check afterwards. Equivalent — no parsed expression ends on
-    /// the `super` keyword unless it is the bare `super` itself (`super`
-    /// admits no trailing continuation), and a trailing `super` swallowed by
-    /// token-level recovery implies a non-`super` begin, so both forms stay
-    /// silent together.
+    /// recursion: written-out operator chains recurse once per operator
+    /// through this file, and at `-O0` every local is stack frame, so the
+    /// begin span is never held across the descent. Instead the caller
+    /// pairs the end check with the token immediately before the descent —
+    /// the operator/bracket/keyword span the arm already holds. Real token
+    /// ids are dense scan indexes (inserted tokens number from
+    /// `table.len()`), so "the end token directly follows `prev`" restores
+    /// the exact `begin == end` identity; a synthetic end can never be a
+    /// `super` token, and no parsed expression ends on the `super` keyword
+    /// unless it is the bare `super` itself (`super` admits no trailing
+    /// continuation — a trailing `super` swallowed by token-level recovery
+    /// implies a non-`super` begin, which the identity check rejects).
+    pub(crate) fn ends_bare_super_after(&self, prev: TokenSpan, end: TokenSpan) -> bool {
+        end.id == prev.id + 1 && self.span_kind(end.id) == TokenKind::Keyword(Keyword::Super)
+    }
+
+    /// The kind-only half of [`Parser::ends_bare_super_after`] for sites
+    /// whose predecessor token can be a spliced synthetic (the conditional
+    /// colon): an inserted id sits off the real sequence, so the identity
+    /// check alone would drop the face — there the kind check carries it.
     pub(crate) fn ends_bare_super(&self, end: TokenSpan) -> bool {
         self.span_kind(end.id) == TokenKind::Keyword(Keyword::Super)
+    }
+
+    /// `missingAssignableSelector` over the whole LHS run
+    /// (`handleRecoverableError(…, lhs.beginToken, lhs.endToken)`,
+    /// ast_builder.dart:3831-3836) plus the statement-level
+    /// `illegalAssignmentToNonAssignable` rider anchored on the same run
+    /// (:4429-4432; `const [r] = g()` anchors both on the `const` head).
+    /// Split out so the run's end spans never occupy the recursion frame of
+    /// [`Parser::parse_precedence_inner`] (written-out operator chains
+    /// recurse once per operator through it).
+    fn report_non_assignable_target(&mut self, lhs_begin: TokenSpan) {
+        let lhs_end = self.last_consumed_span();
+        let lhs_span = self.span_through(lhs_begin, lhs_end);
+        self.report(msg::missing_assignable_selector(), lhs_span);
+        self.report(msg::illegal_assignment_to_non_assignable(), lhs_span);
     }
 
     /// The kind of a token id, reading inserted ids through the cursor (the
@@ -494,13 +522,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // (synthetic) token is read by id — its offset points at the
                 // real token it stands in for, never at itself.
                 let lhs_last = self.cursor.last_consumed_id().map(|id| self.span_kind(id));
-                // `handleRecoverableError(missingAssignableSelector,
-                // lhs.beginToken, lhs.endToken)` (ast_builder.dart:3831-3836):
-                // the row spans the whole LHS run (`super + 1 = 3` anchors on
-                // `super` with the extent through the `1`, `new C() = 1` on
-                // the creation, `const [] = g()` on the list literal).
-                let lhs_end = self.last_consumed_span();
-                let lhs_span = self.span_through(lhs_begin, lhs_end);
                 match lhs_last {
                     // Official `_isAssignable` (ast_builder.dart:6607) tests
                     // the parsed EXPRESSION shape — a bare name qualifies,
@@ -527,16 +548,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     Some(TokenKind::Keyword(Keyword::Super)) => {
                         self.report(msg::missing_assignable_selector(), left);
                     }
-                    // `missingAssignableSelector` at `lhs.beginToken`
-                    // (ast_builder.dart:3831-3836) and the statement-level
-                    // `illegalAssignmentToNonAssignable` rider at the
-                    // invalid target's begin (:4429-4432) — both anchor on
-                    // the LHS's first token (`const [r] = g()` reports at
-                    // the `const` head, never at the literal closer).
-                    _ => {
-                        self.report(msg::missing_assignable_selector(), lhs_span);
-                        self.report(msg::illegal_assignment_to_non_assignable(), lhs_span);
-                    }
+                    // Both rows span the whole LHS run, anchored on its first
+                    // token — [`Parser::report_non_assignable_target`].
+                    _ => self.report_non_assignable_target(lhs_begin),
                 }
                 // Right associative: recurse at the same level (:6671-6691).
                 // The `>>=`-without-triple-shift recovery is dead at the pin
@@ -545,8 +559,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let operator = self.peek_span();
                 let is_if_null = self.peek_kind() == TokenKind::QuestionQuestionEq;
                 self.cursor.advance();
-                let rhs_starts_super =
-                    self.peek_kind() == TokenKind::Keyword(Keyword::Super);
                 // The `??=` RHS split's begin face (official
                 // `ifNullExpression_rightBegin`): the RHS runs on the null
                 // path alone, so the flow snapshots the live skip path
@@ -562,7 +574,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // `reportErrorIfSuper(rhs)` (ast_builder.dart:3653): a bare
                 // `super` as the assigned value carries the selector-missing
                 // row (`x = super;`).
-                if rhs_starts_super && self.ends_bare_super(end) {
+                if self.ends_bare_super_after(operator, end) {
                     self.report(msg::missing_assignable_selector(), end);
                 }
                 self.listener.handle_assignment_expression(operator, end);
@@ -764,14 +776,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let operator = self.peek_span();
                 self.listener.begin_binary_expression(operator);
                 self.cursor.advance();
-                let right_starts_super =
-                    self.peek_kind() == TokenKind::Keyword(Keyword::Super);
                 let right = self.parse_precedence(level + 1, allow_cascades);
                 // `reportErrorIfSuper(right)` (ast_builder.dart:1079): a bare
                 // `super` as the binary's right operand carries the
                 // selector-missing row (`a + super`); the left operand is
                 // never checked.
-                if right_starts_super && self.ends_bare_super(right) {
+                if self.ends_bare_super_after(operator, right) {
                     self.report(msg::missing_assignable_selector(), right);
                 }
                 let rhs_last = self.last_consumed_span();
@@ -947,6 +957,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let end = type_arg.parse_arguments(self);
         if self.peek_kind() != TokenKind::OpenParen {
             // `e<a, b>;` — an applied, non-invoked group (:6569-6577).
+            // `reportErrorIfSuper(receiver)` (handleTypeArgumentApplication,
+            // ast_builder.dart:5608): a bare `super` receiver of a
+            // standalone type-argument group (`super<int>;`,
+            // `super<int>.x`) carries the selector-missing row; the invoked
+            // flavor (`super<int>(3)`) checks the arguments instead and
+            // stays silent. `current` rides the receiver's end token — it
+            // is the `super` keyword only for the bare receiver.
+            if self.ends_bare_super(current) {
+                self.report(msg::missing_assignable_selector(), current);
+            }
             self.listener.handle_type_argument_application(lt);
             return (end, TypeParamOrArg::None);
         }
@@ -1144,12 +1164,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let await_kw = self.peek_span();
         self.cursor.advance();
         self.listener.begin_await_expression(await_kw);
-        let operand_starts_super =
-            self.peek_kind() == TokenKind::Keyword(Keyword::Super);
         let end = self.parse_precedence(POSTFIX_PRECEDENCE, allow_cascades);
         // `reportErrorIfSuper` (ast_builder.dart:1061): a bare `super`
         // operand carries the selector-missing row (`await super`).
-        if operand_starts_super && self.ends_bare_super(end) {
+        if self.ends_bare_super_after(await_kw, end) {
             self.report(msg::missing_assignable_selector(), end);
         }
         if self.async_state == AsyncModifier::Sync {
@@ -1253,15 +1271,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 } else {
                     let saved = self.may_parse_function_expressions;
                     self.may_parse_function_expressions = true;
-                    let index_starts_super =
-                        self.peek_kind() == TokenKind::Keyword(Keyword::Super);
                     let index_end = self.parse_expression();
                     self.may_parse_function_expressions = saved;
                     // `reportErrorIfSuper(index)` (ast_builder.dart:4504):
                     // the bracket CONTENT carries the selector-missing row
                     // when it is the bare `super` expression (`g[super]`);
                     // `super[0]` checks the content `0`, never the target.
-                    if index_starts_super && self.ends_bare_super(index_end) {
+                    if self.ends_bare_super_after(open, index_end) {
                         self.report(msg::missing_assignable_selector(), index_end);
                     }
                 }
@@ -1360,11 +1376,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener
             .end_conditional_expression_then_arm(question, then_begin, colon, then_end);
         self.listener.handle_conditional_expression_colon();
-        let else_starts_super =
-            self.peek_kind() == TokenKind::Keyword(Keyword::Super);
         let end = self.parse_expression_without_cascade();
-        // `reportErrorIfSuper(elseExpression)` (ast_builder.dart:1300).
-        if else_starts_super && self.ends_bare_super(end) {
+        // `reportErrorIfSuper(elseExpression)` (ast_builder.dart:1300). A
+        // spliced (synthetic) colon numbers off the real sequence, so the
+        // identity check alone would drop the face — there the kind check
+        // alone carries it ([`Parser::ends_bare_super`]).
+        if self.ends_bare_super(end)
+            && (end.id == colon.id + 1 || (colon.id as usize) >= self.table.len())
+        {
             self.report(msg::missing_assignable_selector(), end);
         }
         // The else arm's own last token: the `end` above tiles a bare-send

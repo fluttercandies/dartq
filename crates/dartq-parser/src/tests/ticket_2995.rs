@@ -43,9 +43,10 @@ fn code(c: &str, start: u32, end: u32) -> (String, u32, u32) {
 
 /// Selector faces on the assignment arm: the row spans the whole LHS run
 /// (`super + 1 = 3` reports (11,20), never the bare `super` (11,16)), a
-/// single-token LHS keeps its own extent, and the bare `super` target
-/// carries the selector row (`this` stays silent pending the initializer
-/// lane's context flag).
+/// single-token LHS keeps its own extent, and the bare-keyword statement
+/// targets carry their full oracle row sets (#3091 closed the statement
+/// faces: the `this` selector row and the illegal rider live on
+/// `handleExpressionStatement`, ast_builder.dart:4209-4221).
 #[test]
 fn assignment_lhs_selector_rows_span_the_lhs() {
     assert_eq!(
@@ -66,16 +67,22 @@ fn assignment_lhs_selector_rows_span_the_lhs() {
     );
     assert_eq!(
         sorted_rows("void f() { this = 3; }\n"),
-        Vec::<(String, u32, u32)>::new(),
-        "oracle MAS at `this` (12,4) is real, but the INITIALIZER lane routes its \
-         `this = …` recovery through the same arm with its own silent face (oracle \
-         `C() : this = 0;` — expected_token + missing_assignment_in_initializer); \
-         distinguishing them needs the initializer lane's context flag (#2995 residual)"
+        vec![
+            code("illegal_assignment_to_non_assignable", 11, 15),
+            code("missing_assignable_selector", 11, 15),
+        ],
+        "oracle: both rows on the `this` target; the statement context is \
+         what separates them from the redirecting-initializer lane \
+         (`C() : this = 0;` keeps its silent face)"
     );
     assert_eq!(
         sorted_rows("void f() { super = 0; }\n"),
-        vec![code("missing_assignable_selector", 11, 16)],
-        "oracle MAS at `super` (12,5); the illegal rider is the statement-level face"
+        vec![
+            code("illegal_assignment_to_non_assignable", 11, 16),
+            code("missing_assignable_selector", 11, 16),
+        ],
+        "oracle MAS at `super` (12,5) from the assignment arm; the illegal \
+         rider is the statement-level face"
     );
 }
 

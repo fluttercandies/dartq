@@ -352,7 +352,35 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         | Keyword::Await
                 )
             );
+        // Statement-level assignment faces (ast_builder.dart:4209-4221):
+        // a statement whose whole expression is an assignment to a bare
+        // keyword target. The selector row for `this` and the
+        // `illegalAssignmentToNonAssignable` rider are pinned here — the
+        // shared assignment arm stays silent in the redirecting-initializer
+        // lane (`C() : this = 0;` carries neither), and this is the only
+        // context that distinguishes them. `super`'s selector row rides the
+        // assignment arm; the faces key on the statement head followed by
+        // an assignment operator (any compound form,
+        // `super += 3;`/`super ??= 3;` included).
+        let head_assigns =
+            matches!(head, TokenKind::Keyword(Keyword::Super | Keyword::This))
+                && self.precedence_of(self.cursor.look_kind(1))
+                    == Some(crate::expressions::ASSIGNMENT_PRECEDENCE);
         let _ = self.parse_expression();
+        // `reportErrorIfSuper(expression)` (ast_builder.dart:4202): the
+        // bare-`super` statement (`super;`) carries the selector-missing
+        // row; wrappers widen the statement expression and stay silent
+        // (`super == 3;`, `super + 1;` — the binary face checks the right
+        // operand only).
+        if self.is_bare_super_expression(begin, self.last_consumed_span()) {
+            self.report(msg::missing_assignable_selector(), begin);
+        }
+        if head_assigns {
+            if head == TokenKind::Keyword(Keyword::This) {
+                self.report(msg::missing_assignable_selector(), begin);
+            }
+            self.report(msg::illegal_assignment_to_non_assignable(), begin);
+        }
         let single_recovered_name =
             head_is_recoverable_name && self.cursor.real_pos() - before == 1;
         let end = self.ensure_semicolon();
@@ -806,6 +834,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         self.cursor.advance();
         self.listener.begin_variable_initializer(assignment);
         let _ = self.parse_expression();
+        // `reportErrorIfSuper(initializer)` (endVariableInitializer,
+        // ast_builder.dart:3459): a bare `super` initializer value carries
+        // the selector-missing row (`var x = super;`, and the field flavor
+        // through the shared member call).
+        if self.ends_bare_super_after(assignment, self.last_consumed_span()) {
+            self.report(
+                msg::missing_assignable_selector(),
+                self.span_of(assignment.id + 1),
+            );
+        }
         self.listener.end_variable_initializer(assignment);
     }
 
@@ -947,6 +985,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
             self.synthetic(TokenKind::CloseParen, offset);
             let _ = self.parse_expression();
+            // The recovery flavor of the condition face
+            // (ast_builder.dart:5229): the spliced group leaves the
+            // condition token as `open` itself (`if super) {}` reports the
+            // selector row on it), so the identity check is direct.
+            if self.is_bare_super_expression(open, self.last_consumed_span()) {
+                self.report(msg::missing_assignable_selector(), open);
+            }
             self.cursor.advance(); // the synthetic `)` — the clean close
             self.listener
                 .handle_parenthesized_condition(open, None, None);
@@ -954,6 +999,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         self.cursor.advance(); // `(`
         let _ = self.parse_expression();
+        // `reportErrorIfSuper(condition)` (endParenthesizedCondition,
+        // ast_builder.dart:5229): the shared if/while/do/switch-statement
+        // and switch-expression condition face (`if (super) {}`). The
+        // synthetic-group recovery branch below reports its own — its `open`
+        // is the condition token itself.
+        if self.ends_bare_super_after(open, self.last_consumed_span()) {
+            self.report(msg::missing_assignable_selector(), self.span_of(open.id + 1));
+        }
         if allow_case && self.peek_kind() == TokenKind::Keyword(Keyword::Case) {
             let case_kw = self.peek_span();
             self.cursor.advance();
@@ -1347,6 +1400,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let expr_begin = self.peek_span();
         self.listener.begin_for_in_expression(expr_begin);
         let _ = self.parse_expression();
+        // `reportErrorIfSuper(iterable)` (endForIn,
+        // ast_builder.dart:4282): a bare `super` iterable carries the
+        // selector-missing row (`for (var x in super)`).
+        if self.ends_bare_super_after(in_kw, self.last_consumed_span()) {
+            self.report(
+                msg::missing_assignable_selector(),
+                self.span_of(in_kw.id + 1),
+            );
+        }
         let end = self.ensure_close_paren(left_paren);
         self.listener.end_for_in_expression(end);
         self.listener.handle_for_in_loop_parts(
@@ -2083,6 +2145,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         of_function_expression: bool,
     ) -> TokenSpan {
         let _ = self.parse_expression();
+        // `reportErrorIfSuper(expression)` (handleExpressionFunctionBody,
+        // ast_builder.dart:4179): a bare `super` arrow body carries the
+        // selector-missing row (`() => super`, `void g() => super;`).
+        if self.ends_bare_super_after(arrow, self.last_consumed_span()) {
+            self.report(msg::missing_assignable_selector(), self.span_of(arrow.id + 1));
+        }
         // The member flavor requires `;`; the function-expression flavor
         // leaves the end token `None` (official parseExpressionFunctionBody
         // :6117).
