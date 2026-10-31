@@ -259,3 +259,205 @@ fn remove_deprecations_is_structurally_silent() {
     assert_eq!(SPEC.group, Group::Standalone);
     assert!(SPEC.kinds.is_empty(), "{:?}", SPEC.kinds);
 }
+
+
+// —— deprecated_member_use_from_same_package: emission faces ————————————
+//
+// The corpus shapes the first wave left as residuals
+// (`ConformanceTest` next to each face). Every expectation is the live
+// oracle row transcribed in the corpus (`conformance/expected.tsv`):
+// span length and message, in the fixture's own coordinates.
+
+/// `test_deprecatedUnnamedConstructor`: the unnamed constructor written as
+/// the class name (`C();`) keys on the type name — the own name is the
+/// selector only when it differs from the type (`C.named`).
+#[test]
+fn dmfs_unnamed_constructor_named_as_the_class() {
+    let f = Fixture::parse("class C {\n  @deprecated\n  C();\n}\nvar x = C();\n");
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'C' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "C", 2));
+    assert_eq!(lints[0].range, start..start + 1);
+}
+
+/// `test_deprecatedNamedConstructor`: the named constructor's use is the
+/// whole `C.named` selector and displays `C.named`.
+#[test]
+fn dmfs_named_constructor_displays_the_selector() {
+    let f = Fixture::parse("class C {\n  @deprecated\n  C.named();\n}\nvar x = C.named();\n");
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "'C.named' is deprecated and shouldn't be used."
+    );
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "C", 2));
+    assert_eq!(lints[0].range, start..start + 7);
+}
+
+/// `test_deprecatedExtensionType_usedInRepresentation`: an extension type's
+/// name is its `Name` payload word (no identifier row) — the deprecated
+/// extension type reports at a representation use.
+#[test]
+fn dmfs_extension_type_name_is_a_payload_word() {
+    let f = Fixture::parse("@deprecated\nextension type E(int i) { }\nextension type F(E c) { }\n");
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'E' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "E", 1));
+    assert_eq!(lints[0].range, start..start + 1);
+}
+
+/// `test_deprecatedExtension_usedInExtensionOverride_methodInvocation`: a
+/// named extension's deprecated name reports at the override's receiver.
+#[test]
+fn dmfs_extension_override_reports_at_the_receiver() {
+    let f = Fixture::parse(
+        "@deprecated\nextension E on int {\n  int get foo => 1;\n}\nvar x = E(0).foo;\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'E' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "E", 1));
+    assert_eq!(lints[0].range, start..start + 1);
+}
+
+/// `test_deprecatedEnumValue`: an enum constant names through its `Name`
+/// payload word; `E.two` reports at `two`.
+#[test]
+fn dmfs_enum_constant_reports_at_the_selector() {
+    let f = Fixture::parse(
+        "enum E {\n  one, @deprecated two;\n}\nlate E e = E.two;\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'two' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "two", 1));
+    assert_eq!(lints[0].range, start..start + 3);
+}
+
+/// `test_deprecatedNamedParameterOfFunction`: a named argument reads the
+/// parameter; the label is the report span.
+#[test]
+fn dmfs_named_argument_reports_at_the_label() {
+    let f = Fixture::parse(
+        "void f({@deprecated int? p}) {}\nvoid g() => f(p: 1);\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'p' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "p", 1));
+    assert_eq!(lints[0].range, start..start + 1);
+}
+
+/// `test_deprecatedPositionalParameterOfFunction`: a positional argument
+/// reads the parameter at its index; the argument is the report span.
+#[test]
+fn dmfs_positional_argument_reports_at_the_argument() {
+    let f = Fixture::parse(
+        "void f([@deprecated int? p]) {}\nvoid g() => f(1);\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'p' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "1", 0));
+    assert_eq!(lints[0].range, start..start + 1);
+}
+
+/// `test_deprecatedNamedParameterOfFunction_usedInDeclaringFunction`: the
+/// parameter's own body use is the upstream `_isLocalParameter` exemption —
+/// a parameter only reports at a call-site argument.
+#[test]
+fn dmfs_parameter_self_use_stays_silent() {
+    let f = Fixture::parse("int? f({@deprecated int? p}) => p;\n");
+    assert!(
+        f.run(&one_rule("deprecated_member_use_from_same_package"))
+            .is_empty()
+    );
+}
+
+/// `test_deprecatedGetter_usedInAssignment`: a plain assignment reads the
+/// setter — the deprecated getter alone never reports there.
+#[test]
+fn dmfs_plain_assignment_reads_the_setter() {
+    let f = Fixture::parse(
+        "@deprecated\nint get x => 1;\nset x(int value) {}\nvoid f() {\n  x = 1;\n}\n",
+    );
+    assert!(
+        f.run(&one_rule("deprecated_member_use_from_same_package"))
+            .is_empty()
+    );
+}
+
+/// `test_deprecatedGetter_usedInCompoundAssignment`: a compound assignment
+/// checks both the read and the write element (`x += 1` reports the
+/// deprecated getter at `x`).
+#[test]
+fn dmfs_compound_assignment_reports_the_getter() {
+    let f = Fixture::parse(
+        "@deprecated\nint get x => 1;\nset x(int value) {}\nvoid f() {\n  x += 1;\n}\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'x' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "x", 2));
+    assert_eq!(lints[0].range, start..start + 1);
+}
+
+/// `test_deprecatedOperator`: a binary expression reads its operator method
+/// and reports at the whole expression with the operator as the name.
+#[test]
+fn dmfs_operator_reports_at_the_expression() {
+    let f = Fixture::parse(
+        "class C {\n  @deprecated\n  C operator+(int other) => C();\n}\nvoid f(C c) {\n  c + 1;\n}\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'+' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "c", 1));
+    assert_eq!(lints[0].range, start..start + 5);
+}
+
+/// `test_deprecatedIndexOperator`: an index expression reads `[]` and
+/// reports the whole `c[1]`.
+#[test]
+fn dmfs_index_operator_reports_at_the_expression() {
+    let f = Fixture::parse(
+        "class C {\n  @deprecated\n  int operator[](int p) => 1;\n}\nvoid f(C c) {\n  c[1];\n}\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'[]' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "c", 1));
+    assert_eq!(lints[0].range, start..start + 4);
+}
+
+/// `test_deprecatedField_inObjectPattern_explicitName`: an object-pattern
+/// field label reads the field and reports at the label.
+#[test]
+fn dmfs_pattern_field_label_reports_at_the_label() {
+    let f = Fixture::parse(
+        "class A {\n  @Deprecated('')\n  final int foo = 0;\n}\nint f(Object x) =>\n  switch (x) {\n    A(foo: var bar) => bar,\n    _ => 0,\n  };\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'foo' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "foo", 1));
+    assert_eq!(lints[0].range, start..start + 3);
+}
+
+/// `test_deprecatedField_usedInPostfix`: the increment face reports the
+/// whole operand `a.f`, not the bare selector.
+#[test]
+fn dmfs_postfix_reports_the_operand() {
+    let f = Fixture::parse(
+        "class A {\n  @deprecated\n  int f = 0;\n}\nvoid f(A a) {\n  a.f++;\n}\n",
+    );
+    let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(lints[0].message, "'f' is deprecated and shouldn't be used.");
+    let start = utf16_at(&f, tok(&f.source, &f.tokens, "a", 1));
+    assert_eq!(lints[0].range, start..start + 3);
+}
+
