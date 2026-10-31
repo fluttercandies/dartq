@@ -9356,6 +9356,13 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         }
         engine.open_member_static = static_kw.is_some();
+        // A static or `late` group's initializers sit OUTSIDE the primary
+        // constructor's `ConstructorInitializerScope`
+        // (pkg/analyzer/lib/src/dart/resolver/scope_context.dart:432-461):
+        // the formal names stay out of scope for the whole group, and the
+        // close below restores them (the constructor body follows the
+        // class's field groups).
+        engine.primary_formals_muted = static_kw.is_some() || late_kw.is_some();
     }
 
     fn end_fields(
@@ -9375,6 +9382,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.field_group_open = false;
         engine.group_augment = false;
+        engine.primary_formals_muted = false;
         engine.disarm_const_group();
         // The field group closed: an unclaimed signature stash dies here.
         engine.fn_stash_drop();
@@ -9407,12 +9415,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_field_initializer(&mut self, _token: Token) {
         self.engine.open_const_initializer();
-        self.engine.field_initializer_open = true;
     }
 
     fn end_field_initializer(&mut self, _assignment: Token, _end: Token) {
         self.engine.close_const_field_initializer();
-        self.engine.field_initializer_open = false;
     }
 
     fn begin_const_literal(&mut self, _token: Token) {

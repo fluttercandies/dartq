@@ -133,18 +133,45 @@ impl<'a> Engine<'a> {
     /// `resolveObjectPatternPropertyGet` (type_analyzer.dart:1669-1715):
     /// each object-pattern field reads a getter on the head type; a clean
     /// miss reports `undefined_getter` at the field's name token (the
-    /// written name, or the shorthand's variable). Found members of any
-    /// kind (a method field reads its tear-off), `Object` members, and an
-    /// applicable extension face resolve; a broken chain, an unresolvable
-    /// or core head, and mixin/extension/extension-type heads (their
-    /// `on`/representation faces are invisible here) stay silent.
+    /// written name, or the shorthand's variable). The verdict runs on the
+    /// head's resolved static type: a written alias folds to its right-hand
+    /// side first while the row keeps the ALIAS spelling the oracle
+    /// displays, and every interface-bearing kind answers — a mixin's `on`
+    /// chain and an extension type's own members/representation both read
+    /// like a class (`case M(:var q)` over a bare mixin reports "for the
+    /// type 'M'", probe 3.13.7). A function right-hand side has no field
+    /// column at all, so every name misses (`typedef Fn = void Function()`
+    /// reports the alias spelling). Found members of any kind (a method
+    /// field reads its tear-off), `Object` members, enum synthesis, and an
+    /// applicable extension face resolve; `dynamic` and record heads answer
+    /// their own shapes (under-report), and an unresolvable head stays
+    /// silent.
     pub(crate) fn finalize_pattern_getters(&mut self) {
         for (head, getter, at) in std::mem::take(&mut self.pending_pattern_getters) {
-            let kind = match self.container_kind_of(head) {
-                Some(kind @ (ContainerKind::Class | ContainerKind::Enum)) => kind,
+            // The head's static type (`ObjectPattern.type` → `NamedType` →
+            // the aliased element's type): a written alias stands for its
+            // right-hand side's member columns, one fold hop chain deep.
+            let (container, kind) = match self.fold_alias_ty(Ty::named(head)) {
+                Ty::Named { name, .. } => {
+                    let Some(kind) = self.container_kind_of(name) else {
+                        continue;
+                    };
+                    (name, kind)
+                }
+                // A function type declares the `Object` members alone; a
+                // field name beyond them misses at the written head.
+                Ty::Function { .. } => {
+                    let name_text = self.strings.resolve(getter).to_string();
+                    let type_text = self.strings.resolve(head).to_string();
+                    self.stage_typed(SemanticCode::UndefinedGetter, at, &name_text, &type_text);
+                    continue;
+                }
+                // `dynamic` matches every shape; a record's columns are its
+                // own shape (no member table at name level). Both keep the
+                // established silence.
                 _ => continue,
             };
-            let resolved = !matches!(self.walk_members(head, getter), Walk::Missing)
+            let resolved = !matches!(self.walk_members(container, getter), Walk::Missing)
                 || getter == self.intern("==")
                 || self.members.object_members.contains(&getter)
                 || (kind == ContainerKind::Enum
@@ -160,12 +187,12 @@ impl<'a> Engine<'a> {
                 // is used AND read. Credit both faces at name level here;
                 // the element-level `member_read_owners` gets its handle
                 // from the head container (the same owner `member_found`
-                // resolved).
+                // resolved) — the FOLDED container, where the member lives.
                 self.read_names.insert(getter);
                 self.member_read_owners
                     .entry(getter)
                     .or_default()
-                    .insert((self.file, head));
+                    .insert((self.file, container));
                 continue;
             }
             let name_text = self.strings.resolve(getter).to_string();

@@ -4586,6 +4586,13 @@ mod ticket_2471_tests;
 #[cfg(test)]
 mod ticket_1598_tests;
 
+/// The #2506 pins: the `.nonNulls` getter on an `Iterable<T?>` chain
+/// (`.expand`/`.map` over a cross-file nullable getter) resolves — the
+/// oracle's `NullableIterableExtensions` face — while a genuinely absent
+/// member still reports.
+#[cfg(test)]
+mod ticket_2506_tests;
+
 /// The #2159 pins: the `unused_field` read-attribution faces of the
 /// census's reads-side family — the `?.` chain's nested private-field
 /// read, the private-field read inside a getter body, the const-list

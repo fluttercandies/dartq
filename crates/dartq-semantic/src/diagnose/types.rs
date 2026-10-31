@@ -3255,12 +3255,12 @@ pub(crate) struct Engine<'a> {
     /// them), so the set marks the names that must not answer there; it is
     /// cleared with the container frame.
     pub(crate) primary_formals: FxHashSet<StringId>,
-    /// A field-group initializer is open (`begin_field_initializer` ..
-    /// `end_field_initializer`) — with a non-static, non-`late` group it is
-    /// the one member plane the primary constructor's formals are visible
-    /// from. A closure inside the initializer stays on the plane (the
-    /// upstream scope covers the whole expression).
-    pub(crate) field_initializer_open: bool,
+    /// A field group whose initializers cannot see the enclosing primary
+    /// constructor's formals is open: a `static` or `late` group
+    /// (`begin_fields` .. `end_fields`). With a non-static, non-`late`
+    /// group the formals ARE in scope ([`Self::primary_formals`]) — that
+    /// plane is the upstream `ConstructorInitializerScope`.
+    pub(crate) primary_formals_muted: bool,
     /// The parameters of the executable declaration in flight attach to
     /// this declaration site (set at the site-creating begin events,
     /// read by the formal-parameter identifiers).

@@ -1026,9 +1026,7 @@ impl<'a> Engine<'a> {
     /// and reads `undefined_identifier` (oracle 3.13.7:
     /// `class A(int foo) { static var s = foo; }`).
     pub(crate) fn primary_formal_hidden(&self, name: StringId) -> bool {
-        self.field_initializer_open
-            && (self.open_member_static || self.group_late)
-            && self.primary_formals.contains(&name)
+        self.primary_formals_muted && self.primary_formals.contains(&name)
     }
 
     /// The local declaration `name` resolves to, innermost frame first

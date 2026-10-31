@@ -1785,23 +1785,30 @@ impl<'a> Engine<'a> {
     /// member face (own-file container chain), the extension pool, enum
     /// synthesized members, then the scoped library lookup.
     pub(crate) fn resolve_bare(&self, name: StringId) -> (BareInfo, RefTarget) {
-        // Innermost frame first: a pattern binder's var_types slot and a
-        // tracked local resolve per-frame, so a binder shadowing an
-        // outer SAME-NAMED local (`if (x case var x?)` rebinds `x` to the
-        // non-null matched type) wins over the outer's declared type —
-        // a graph-wide locals-first scan would read the outer's nullable
-        // face and lose the binder's promotion.
-        for frame in self.frames.iter().rev() {
-            if let Some(ty) = frame.var_types.get(&name) {
-                return (BareInfo::Plain { ty: *ty }, RefTarget::Local);
-            }
-            if frame.locals.contains(&name) {
-                return (
-                    BareInfo::Plain {
-                        ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
-                    },
-                    RefTarget::Local,
-                );
+        // A primary constructor's formal is in scope from the constructor's
+        // own planes alone ([`Self::primary_formal_hidden`]): a static or
+        // `late` field initializer is outside both, and the read falls
+        // through to the member/library faces exactly as an undeclared name
+        // does (`undefined_identifier`).
+        if !self.primary_formal_hidden(name) {
+            // Innermost frame first: a pattern binder's var_types slot and a
+            // tracked local resolve per-frame, so a binder shadowing an
+            // outer SAME-NAMED local (`if (x case var x?)` rebinds `x` to the
+            // non-null matched type) wins over the outer's declared type —
+            // a graph-wide locals-first scan would read the outer's nullable
+            // face and lose the binder's promotion.
+            for frame in self.frames.iter().rev() {
+                if let Some(ty) = frame.var_types.get(&name) {
+                    return (BareInfo::Plain { ty: *ty }, RefTarget::Local);
+                }
+                if frame.locals.contains(&name) {
+                    return (
+                        BareInfo::Plain {
+                            ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
+                        },
+                        RefTarget::Local,
+                    );
+                }
             }
         }
         // The frameless initializer world: a pattern variable of a switch /
