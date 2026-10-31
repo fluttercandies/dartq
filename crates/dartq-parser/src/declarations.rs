@@ -2354,8 +2354,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 TokenKind::Keyword(Keyword::Extends | Keyword::Implements | Keyword::With)
             ) {
                 // Official expectedInstead: anchored on the offending
-                // clause keyword itself (parser_impl.dart:3713-3719).
+                // clause keyword itself (parser_impl.dart:3713-3719), then
+                // `token` advances to it so `computeType` reads the type
+                // AFTER the clause keyword — `extends C` resolves `C` as a
+                // type (the `undefined_class` row), not `extends` itself.
                 self.report(msg::expected_instead("on"), at);
+                self.cursor.advance();
             } else {
                 // Official expectedAfterButGot: anchored on `token` — the
                 // last consumed header token (the name/type-argument end),
