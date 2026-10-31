@@ -1171,6 +1171,7 @@ pub static SEMANTIC_RULES: &[&str] = &[
     "unnecessary_to_list_in_spreads",
     "unnecessary_unawaited",
     "unrelated_type_equality_checks",
+    "unreachable_from_main",
     "use_build_context_synchronously",
     "use_colored_box",
     "use_decorated_box",

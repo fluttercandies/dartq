@@ -36,16 +36,20 @@ use dartq_ast::{NodeKind, mod_flags};
 /// official gatherer adds an enum body's `members`, never its
 /// constants).
 ///
-/// Shell-side suppression faces (same-file approximations of the
-/// official's element queries): a member whose name resolves against a
-/// same-file ancestor's member table never gathers (the `isOverride`
-/// arm — `getOverridden` across the interface; extensions and extension
-/// types pass `containerElement: null` upstream (:135-149) so their
-/// members never take the override skip), a non-static method named
-/// `toJson` never gathers (the `dart:convert` dynamic-invocation
-/// auto-reach arm :293-303), and a declaration whose doc-comment
-/// `[Name]` references match its own name reads as referenced (the
-/// comment-reference edge the engine face does not carry).
+/// Shell-side suppression faces (approximations of the official's
+/// element queries): a member whose name resolves against an ancestor's
+/// instance-member table never gathers (the `isOverride` arm —
+/// `getOverridden` across the interface, instance members only; the
+/// same-file ancestors answer name-level, the cross-file remainder
+/// anchors the semantic bridge's inheritance walk
+/// ([`super::bridge_inherited_member`], the `prefer_final_fields`
+/// override read's twin); extensions and extension types pass
+/// `containerElement: null` upstream (:135-149) so their members never
+/// take the override skip), a non-static method named `toJson` never
+/// gathers (the `dart:convert` dynamic-invocation auto-reach arm
+/// :293-303), and a declaration whose doc-comment `[Name]` references
+/// match its own name reads as referenced (the comment-reference edge
+/// the engine face does not carry).
 ///
 /// The local per-library face: the official walk is per-library
 /// (`context.allUnits`, `entryPoints.isEmpty` bail) while the engine
@@ -71,10 +75,11 @@ use dartq_ast::{NodeKind, mod_flags};
 /// directive makes the same-file index incomplete, so a part-carrying
 /// library keeps the engine flag with the counted-use rescue.
 ///
-/// Approximations (documented): the override read is same-file only —
-/// an override relation through an imported or SDK interface stays
-/// invisible, matching the face family's documented cross-file
-/// under-reach. The reference graph is name-level — an operator use on
+/// Approximations (documented): the bridge-backed override read
+/// degrades to the same-file arm alone when the semantic analysis is
+/// unmounted (the fixture harness) or the supertype chain leaves the
+/// analyzed set — the face family's documented under-reach posture.
+/// The reference graph is name-level — an operator use on
 /// an unrelated type marks the same-file operator spelling (the
 /// official resolves the element), the external-variable
 /// `NamedType` exception is not carried (no corpus pin), and entries
@@ -350,13 +355,15 @@ fn judge_container(
                         };
                         // The `isOverride` arm (:101-116): a field
                         // whose getter resolves against an ancestor
-                        // member never gathers. The getter/setter face
-                        // reads the field's own name — upstream keys on
-                        // `element.getter`, the accessor the variable
-                        // carries.
-                        if is_override_member(
+                        // instance member never gathers. The
+                        // getter/setter face reads the field's own
+                        // name — upstream keys on `element.getter`,
+                        // the accessor the variable carries.
+                        if member_is_override(
                             c,
+                            row,
                             &ancestor_members,
+                            joins_implements,
                             c.lexeme(name),
                             MemberQuery::Getter,
                         ) {
@@ -420,7 +427,14 @@ fn judge_container(
                     Some(_) => MemberQuery::Setter,
                     None => MemberQuery::Method,
                 };
-                if is_override_member(c, &ancestor_members, lexeme, override_query) {
+                if member_is_override(
+                    c,
+                    row,
+                    &ancestor_members,
+                    joins_implements,
+                    lexeme,
+                    override_query,
+                ) {
                     continue;
                 }
                 judge(
@@ -444,16 +458,47 @@ fn judge_container(
     }
 }
 
-/// Whether `name` resolves against any ancestor member row — the
-/// `isOverride` approximation (`getOverridden` across the same-file
-/// interface chain). `concrete=false` joins `implements` links, the
-/// official `InterfaceElement.getOverridden` semantics. `members` is
-/// the flattened member-row table of the ancestor chain (a class row
-/// itself answers no `member_matches` kind).
-fn is_override_member(c: &Check<'_>, members: &[u32], name: &str, query: MemberQuery) -> bool {
-    members
-        .iter()
-        .any(|&member| !member_matches(c, member, query, name).is_empty())
+/// The `isOverride` arm (:101-116, `getOverridden`): whether `name` in
+/// the accessor shape of `query` resolves against an ancestor's
+/// INSTANCE member table — upstream's interface map carries no static
+/// members, so a static ancestor declaration never suppresses. The
+/// same-file ancestors answer name-level; the cross-file remainder
+/// anchors the semantic bridge's inheritance walk (every written
+/// supertype clause, abstract members included — the concrete cut is
+/// off), gated on the InterfaceElement containers only (extensions and
+/// extension types pass `containerElement: null` upstream). An
+/// unmounted bridge or an unresolved chain answers through the
+/// same-file arm alone (the documented under-reach posture).
+fn member_is_override(
+    c: &Check<'_>,
+    container_row: u32,
+    same_file: &[u32],
+    bridge_mounted_container: bool,
+    name: &str,
+    query: MemberQuery,
+) -> bool {
+    if same_file.iter().any(|&member| {
+        dartq_ast::mod_flags(c.unit.ast, member) & STATIC_BIT == 0
+            && !member_matches(c, member, query, name).is_empty()
+    }) {
+        return true;
+    }
+    bridge_mounted_container
+        && bridge_is_override(c, container_row, name, query)
+}
+
+/// The cross-file half of the override read: the semantic bridge's
+/// inheritance walk on the accessor-spelled name (`name=` keys a
+/// setter in the model; getters, methods, and field getters keep the
+/// bare spelling — upstream `Name.forElement`/`Name.forLibrary`). A
+/// static hit is no hit (the instance-only interface map).
+fn bridge_is_override(c: &Check<'_>, container_row: u32, name: &str, query: MemberQuery) -> bool {
+    let spelled = match query {
+        MemberQuery::Setter => format!("{name}="),
+        _ => name.to_owned(),
+    };
+    super::bridge_inherited_member(c, container_row, false, &spelled)
+        .is_some_and(|(_, entry)| !entry.is_static)
 }
 
 /// Judges one constructor: the display name is `Type.written`, the
@@ -1528,6 +1573,30 @@ impl ReferenceGraph {
                         keys.push(lexeme.to_owned());
                     } else {
                         continue;
+                    }
+                }
+                NodeKind::ObjectPattern => {
+                    // The pattern's type name rides the row's name
+                    // fields (the head identifier tiles no Identifier
+                    // row of its own): `SecondName` when a prefix dot
+                    // is present (`p.C(...)` names the type at `C`),
+                    // else `FirstName`. `visitNamedType`'s exception
+                    // list counts it only when the type is alias-like
+                    // — a typedef or an extension type (structural
+                    // matching instantiates the representation); a
+                    // plain class in a pattern never counts (the
+                    // official NamedType filter).
+                    let named = |field| {
+                        c.field(row, field)
+                            .filter(|&token| token != dartq_ast::TOKEN_NONE)
+                    };
+                    let type_token = named(PayloadField::SecondName)
+                        .or_else(|| named(PayloadField::FirstName));
+                    if let Some(token) = type_token {
+                        let lexeme = c.lexeme(token);
+                        if alias_like.contains(lexeme) {
+                            keys.push(lexeme.to_owned());
+                        }
                     }
                 }
                 NodeKind::BinaryExpression => {

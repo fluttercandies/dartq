@@ -31,6 +31,18 @@ use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_f
 ///   count either — the official registers no pattern-assignment
 ///   visitor (:41-48), so a field mutated only there reports, exactly
 ///   as upstream.
+/// - Candidates: every private non-`final` field declaration of any
+///   class-like owner (`visitFieldDeclaration`, :107-123). Enum fields
+///   are excluded whole (:109); an extension-type instance field is the
+///   front-end's error and never candidates (`isInvalidExtensionTypeField`,
+///   :108), while a static one passes — the constructor-set faces
+///   (:69-88) run only when the owner `is ClassDeclaration`, so mixin,
+///   extension and extension-type fields answer by the initializer
+///   alone. The primary-constructor declaring formals
+///   (`visitPrimaryConstructorDeclaration`, :140-159) are in: a plain
+///   private non-`final` formal of a class or mixin owner declares a
+///   field and reports at the formal itself; the enum and extension-type
+///   owners are skipped (:142-145).
 /// - Private-ness is the leading underscore. The setter-override
 ///   exemption (`_overridesField`, :147-158) reads the written
 ///   extends/with/implements chain — the same-file ancestor walk, then
@@ -40,20 +52,29 @@ use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_f
 ///   non-final field beside a same-name setter is the front-end's
 ///   setter-conflicts-with-declaration error, so no valid shape needs
 ///   it.
-/// - The cross-unit half of the official library scan
-///   (`_fieldsFromParameters` — primary-constructor declaring formals,
-///   :114-131) is out of the substrate and under-reports.
+/// - The cross-unit half of the official library scan is out of the
+///   substrate: the mutated set folds one unit's writes, so a write in
+///   a sibling part unit is invisible to the declaring unit's walk (and
+///   vice versa). Closing it needs the driver-mounted library-wide face
+///   precedent (`library_type_uses`), not a rule-side change.
 pub(crate) static SPEC: RuleSpec =
     crate::spec!("prefer_final_fields", &[NodeKind::CompilationUnit], check,);
 
-/// One candidate: the declaration node, its name, whether the
-/// declaration carries an initializer, and the enclosing class row (the
-/// constructor set faces scan its completion window).
+/// One candidate: the reported row (the field's name-through-initializer
+/// identifier, or a primary-constructor declaring formal), its name,
+/// whether the declaration is its own setting, the enclosing class-like
+/// row (the setter-override walk anchors on it), and whether the
+/// constructor-set faces apply.
 struct Candidate<'a> {
     declaration: u32,
     name: &'a str,
     has_initializer: bool,
     class_row: u32,
+    /// The constructor-set faces (:69-88) run only when the official's
+    /// `classDeclaration is ClassDeclaration` holds — a class owner. A
+    /// declaring formal carries `has_initializer` instead: it IS the
+    /// setting (:94-98), reported unconditionally when unmutated.
+    constructor_faces: bool,
 }
 
 fn check(c: &mut Check<'_>) {
@@ -78,59 +99,90 @@ fn check(c: &mut Check<'_>) {
         if overrides_setter(c, candidate.class_row, candidate.name) {
             continue;
         }
-        // The constructors of the field's own class (:62-71). The class
-        // subtree occupies the contiguous row range ending at the class
-        // row, so the constructor set reads from that range under every
-        // tiling layout. Factories are `ConstructorDeclaration`s in the
-        // official and count for the "set in every constructor"
-        // question; they never set.
-        let members = c.children(candidate.class_row);
-        let constructors: Vec<u32> = (members.start..=candidate.class_row)
-            .filter(|&id| matches!(c.kind(id), NodeKind::Constructor | NodeKind::Factory))
-            .collect();
-        let set = |ctor: u32| sets_field(c, ctor, candidate.name);
-        let set_any = constructors.iter().copied().any(set);
-        let set_all = constructors.iter().copied().all(set);
-        if !(candidate.has_initializer || set_any && set_all) {
+        if candidate.constructor_faces {
+            // The constructors of the field's own class (:62-71). The
+            // class subtree occupies the contiguous row range ending at
+            // the class row, so the constructor set reads from that
+            // range under every tiling layout. Factories are
+            // `ConstructorDeclaration`s in the official and count for
+            // the "set in every constructor" question; they never set.
+            let members = c.children(candidate.class_row);
+            let constructors: Vec<u32> = (members.start..=candidate.class_row)
+                .filter(|&id| matches!(c.kind(id), NodeKind::Constructor | NodeKind::Factory))
+                .collect();
+            let set = |ctor: u32| sets_field(c, ctor, candidate.name);
+            let set_any = constructors.iter().copied().any(set);
+            let set_all = constructors.iter().copied().all(set);
+            if !(candidate.has_initializer || set_any && set_all) {
+                continue;
+            }
+        } else if !candidate.has_initializer {
+            // A non-class owner (mixin, extension, extension type) or a
+            // declaring formal: no constructor set — the initializer (or
+            // the formal itself) is the only setting face (:89-91,
+            // :94-98).
             continue;
         }
+        // The report extent is the official VariableDeclaration — the
+        // name through the initializer's end. The declaration row's
+        // registered tail can regress behind the initializer's last row
+        // (a trailing bracketed literal completes rows whose tail
+        // adoption stops short: `var _x = []` registers `_x = `), so the
+        // extent also reads the completion window's last row end — the
+        // subtree the initializer actually built.
         let range = c.utf16_span(candidate.declaration);
-        c.report(range, &[candidate.name]);
+        let end = c
+            .children(candidate.declaration)
+            .fold(range.end, |end, row| end.max(c.utf16_span(row).end));
+        c.report(range.start..end, &[candidate.name]);
     }
 }
 
 /// The one-pass unit walk: candidates from `Fields` declarations and
-/// mutations from bare-name writes. `path` carries the enclosing nodes
-/// of the visited row (the shadow gate reads it). Enum and
-/// extension-type bodies are skipped whole (the official excludes
-/// their fields, :98/:118-121); top-level declarations are not fields
-/// and never match.
+/// primary-constructor declaring formals, and mutations from bare-name
+/// writes. `owner` carries the enclosing class-like row and its kind
+/// (the extension-type static gate and the constructor-faces gate read
+/// the kind). `path` carries the enclosing nodes of the visited row (the
+/// shadow gate reads it). Enum bodies are skipped whole (the official
+/// excludes every enum field, :109); top-level declarations are not
+/// fields and never match.
 fn scan<'a>(
     c: &Check<'a>,
     node: u32,
-    class_row: Option<u32>,
+    owner: Option<(u32, NodeKind)>,
     candidates: &mut Vec<Candidate<'a>>,
     mutated: &mut Vec<&'a str>,
     path: &mut Vec<u32>,
 ) {
     match c.kind(node) {
-        NodeKind::EnumDeclaration | NodeKind::ExtensionTypeDeclaration => return,
-        NodeKind::ClassDeclaration => {
-            // Member discovery anchors on the class row: its completion
+        NodeKind::EnumDeclaration => return,
+        NodeKind::ClassDeclaration
+        | NodeKind::MixinDeclaration
+        | NodeKind::ExtensionDeclaration
+        | NodeKind::ExtensionTypeDeclaration => {
+            // Member discovery anchors on the owner row: its completion
             // window opens at the head keyword and covers every member
             // row, while the body container's window can open later and
             // the derived parent pointer can link a field row to either
-            // neighbor. Walking the class row's window is correct under
+            // neighbor. Walking the owner row's window is correct under
             // both layouts.
+            let kind = c.kind(node);
             for kid in c.collect_direct(node) {
                 path.push(kid);
-                scan(c, kid, Some(node), candidates, mutated, path);
+                scan(c, kid, Some((node, kind)), candidates, mutated, path);
                 path.pop();
+            }
+            // `visitPrimaryConstructorDeclaration` (:140-159): the
+            // declaring formals of the owner's primary constructor —
+            // the enum and extension-type owners are excluded
+            // (:142-145).
+            if matches!(kind, NodeKind::ClassDeclaration | NodeKind::MixinDeclaration) {
+                declaring_formals(c, node, candidates);
             }
             return;
         }
         NodeKind::DeclarationBody => {
-            // A body container between the class row and its members
+            // A body container between the owner row and its members
             // owns rows in either its completion window or its
             // derived-child set depending on layout; both faces are
             // cheap and the candidate set dedupes by declaration.
@@ -138,48 +190,62 @@ fn scan<'a>(
             kids.extend(crate::rules::rows_with_parent(c, node));
             for kid in kids {
                 path.push(kid);
-                scan(c, kid, class_row, candidates, mutated, path);
+                scan(c, kid, owner, candidates, mutated, path);
                 path.pop();
             }
             return;
         }
         NodeKind::Fields => {
-            for declaration in c.collect_direct(node) {
-                if c.kind(declaration) != NodeKind::VariablesDeclaration {
-                    continue;
-                }
-                if let Some(kw) = crate::rules::variables_declaration_keyword(c, declaration)
-                    && matches!(c.lexeme(kw), "final" | "const")
-                {
-                    continue;
-                }
-                let Some(class_row) = class_row else { continue };
-                for var in c.collect_direct(declaration) {
-                    if c.kind(var) != NodeKind::InitializedIdentifier {
+            // An extension-type instance field is the front-end's error
+            // (`isInvalidExtensionTypeField`, :108) and never
+            // candidates; the valid static face passes. The static
+            // modifier rides the `Fields` member row. The walk below
+            // still descends — an initializer's own writes count (the
+            // official visits assignments wherever they sit).
+            if let Some((class_row, owner_kind)) = owner
+                && (owner_kind != NodeKind::ExtensionTypeDeclaration
+                    || dartq_ast::mod_flags(c.unit.ast, node) & same_file::STATIC_BIT != 0)
+            {
+                for declaration in c.collect_direct(node) {
+                    if c.kind(declaration) != NodeKind::VariablesDeclaration {
                         continue;
                     }
-                    // The production row is width-0 at the name, so the
-                    // name is the span head; hand-built tables keep the
-                    // same head (see
-                    // [`crate::rules::initialized_identifier_name`]).
-                    let Some(name_token) = crate::rules::initialized_identifier_name(c, var) else {
-                        continue;
-                    };
-                    let name = c.lexeme(name_token);
-                    if !name.starts_with('_') {
+                    if let Some(kw) = crate::rules::variables_declaration_keyword(c, declaration)
+                        && matches!(c.lexeme(kw), "final" | "const")
+                    {
                         continue;
                     }
-                    // The row ends past its head exactly when an
-                    // initializer followed (`end_last` adopts the
-                    // initializer's value end; a bare name ends at the
-                    // name itself).
-                    let has_initializer = c.head_token(var) != crate::rules::tail_token(c, var);
-                    candidates.push(Candidate {
-                        declaration: var,
-                        name,
-                        has_initializer,
-                        class_row,
-                    });
+                    for var in c.collect_direct(declaration) {
+                        if c.kind(var) != NodeKind::InitializedIdentifier {
+                            continue;
+                        }
+                        // The production row is width-0 at the name, so the
+                        // name is the span head; hand-built tables keep the
+                        // same head (see
+                        // [`crate::rules::initialized_identifier_name`]).
+                        let Some(name_token) =
+                            crate::rules::initialized_identifier_name(c, var)
+                        else {
+                            continue;
+                        };
+                        let name = c.lexeme(name_token);
+                        if !name.starts_with('_') {
+                            continue;
+                        }
+                        // The row ends past its head exactly when an
+                        // initializer followed (`end_last` adopts the
+                        // initializer's value end; a bare name ends at the
+                        // name itself).
+                        let has_initializer =
+                            c.head_token(var) != crate::rules::tail_token(c, var);
+                        candidates.push(Candidate {
+                            declaration: var,
+                            name,
+                            has_initializer,
+                            class_row,
+                            constructor_faces: owner_kind == NodeKind::ClassDeclaration,
+                        });
+                    }
                 }
             }
         }
@@ -289,9 +355,64 @@ fn scan<'a>(
     }
     for kid in c.collect_direct(node) {
         path.push(kid);
-        scan(c, kid, class_row, candidates, mutated, path);
+        scan(c, kid, owner, candidates, mutated, path);
         path.pop();
     }
+}
+
+/// The primary-constructor declaring formals of `class_row`
+/// (`visitPrimaryConstructorDeclaration`, :140-159): a plain formal
+/// declares a field (`isDeclaring`) — a `this.`/`super.` receiver
+/// formal binds an explicit field the `Fields` face already carries —
+/// and a private non-`final` one candidates with the formal itself as
+/// the reported node (`[!var int _x!]`, the whole formal span). No
+/// constructor faces: the formal IS the setting (:94-98).
+fn declaring_formals<'a>(c: &Check<'a>, class_row: u32, candidates: &mut Vec<Candidate<'a>>) {
+    for primary in c
+        .collect_direct(class_row)
+        .into_iter()
+        .filter(|&kid| c.kind(kid) == NodeKind::PrimaryConstructor)
+    {
+        let Some(params) = c
+            .collect_direct(primary)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            continue;
+        };
+        for param in c.collect_direct(params) {
+            if c.kind(param) != NodeKind::FormalParameter {
+                continue;
+            }
+            if c.field(param, PayloadField::Receiver).unwrap_or(NONE_TOKEN) != NONE_TOKEN {
+                continue;
+            }
+            let Some(name_token) = c
+                .field(param, PayloadField::Name)
+                .filter(|&token| token != NONE_TOKEN)
+            else {
+                continue;
+            };
+            let name = c.lexeme(name_token);
+            if !name.starts_with('_') || formal_is_final(c, param, name_token) {
+                continue;
+            }
+            candidates.push(Candidate {
+                declaration: param,
+                name,
+                has_initializer: true,
+                class_row,
+                constructor_faces: false,
+            });
+        }
+    }
+}
+
+/// Whether a formal carries `final` (`!field.isFinal`, :154): the
+/// keyword sits between the formal's span head (a modifier starts the
+/// span) and its name token.
+fn formal_is_final(c: &Check<'_>, param: u32, name_token: u32) -> bool {
+    (c.head_token(param)..name_token).any(|token| c.lexeme(token) == "final")
 }
 
 /// Whether the DFS path crosses a constructor initializer list: a write
@@ -580,4 +701,250 @@ fn initializer_set_name<'a>(c: &'a Check<'a>, init: u32) -> Option<&'a str> {
     };
     let token = c.unit.tokens.get(name_token as usize)?;
     (token.kind == dartq_scanner::TokenKind::Identifier).then(|| c.lexeme(name_token))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// The whole upstream oracle corpus — `PreferFinalFieldsTest` (30
+    /// cases, `pkg/linter/test/rules/prefer_final_fields_test.dart`) plus
+    /// the `PreferFinalFieldsExtensionTypesTest` trio and the eight
+    /// `messages.yaml` doc cases: 41 total, `conformance/status.tsv`
+    /// `lint prefer_final_fields 41 28 13`. Each entry is the exact
+    /// materialized case source (the test-file cases carry a leading
+    /// blank line, the doc files do not) and the oracle's
+    /// `(line, column, length)` for every `prefer_final_fields` row
+    /// (`expected.tsv`). Only the rule's own rows are pinned — the
+    /// co-reported `unused_field`/ERROR rows are other faces.
+    ///
+    /// The two cross-unit cases (`test_assignedInPart`,
+    /// `test_declaredInPart`) are not representable in a single-source
+    /// fixture: the oracle answers `-` because the field's write (or
+    /// declaration) lives in the sibling part unit, which this per-unit
+    /// walk cannot see (the documented cross-unit residual — the fix is
+    /// the driver-mounted library-wide mutation face, not a rule-side
+    /// change).
+    ///
+    /// Every mismatch is collected before the single panic so one run
+    /// shows the whole deviation set.
+    #[test]
+    fn prefer_final_fields_oracle_corpus_pins() {
+        // (case, source, oracle rows as (line, column, length)).
+        let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+            (
+                "assignedInConstructorInitializer",
+                "\nclass C {\n  int _x;\n  C() : _x = 7;\n}\n",
+                &[(3, 7, 2)],
+            ),
+            (
+                "assignedInConstructorInitializer_butNotAll",
+                "\nclass C {\n  var _x;\n  C(this._x);\n  C.named();\n}\n",
+                &[],
+            ),
+            (
+                "assignedInTopLevelFunction",
+                "\nclass C {\n  int _x = 0;\n}\n\nvoid f() {\n  var c = C();\n  c._x = 42;\n}\n",
+                &[],
+            ),
+            (
+                "assignment_plusEquals",
+                "\nclass C {\n  var _x = 1;\n  void f() {\n    _x += 2;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "enum",
+                "\nenum A {\n  a,b,c;\n  int _x = 0;\n  int get x => _x;\n}\n",
+                &[],
+            ),
+            ("final_multiple", "\nclass C {\n  final _x = 1, _y = 2;\n}\n", &[]),
+            (
+                "final_public_multiple",
+                "\nclass C {\n  final x = 1, y = 2;\n}\n",
+                &[],
+            ),
+            (
+                "indexAssignment",
+                "\nclass C {\n  var _x = [];\n\n  void f() {\n    _x[0] = 3;\n  }\n}\n",
+                &[(3, 7, 7)],
+            ),
+            (
+                "overrideField_extends",
+                "\nclass A {\n  bool _a = false;\n  void m() {\n    _a = true;\n    print(_a);\n  }\n}\n\nclass B extends A {\n  @override\n  bool _a = false;\n\n  @override\n  void m() {\n    print(_a);\n  }\n}\n",
+                &[],
+            ),
+            (
+                "overrideField_implements",
+                "\nclass A {\n  bool _a = false;\n  void m() {\n    _a = true;\n    print(_a);\n  }\n}\n\nclass B implements A {\n  @override\n  bool _a = false;\n\n  @override\n  void m() {\n    print(_a);\n  }\n}\n",
+                &[],
+            ),
+            (
+                "overrideSetter_extends",
+                "\nclass A {\n  set _a(bool a) {}\n  void m() {\n    _a = true;\n  }\n}\n\nclass B extends A {\n  @override\n  bool _a = false;\n\n  @override\n  void m() {\n    print(_a);\n  }\n}\n",
+                &[],
+            ),
+            (
+                "overrideSetter_implements",
+                "\nclass A {\n  set _a(bool a) {}\n  void m() {\n    _a = true;\n  }\n}\n\nclass B implements A {\n  @override\n  bool _a = false;\n\n  @override\n  void m() {\n    print(_a);\n  }\n}\n",
+                &[],
+            ),
+            (
+                "postfixExpression_decrement",
+                "\nclass C {\n  int _x = 1;\n  void f() {\n    _x--;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "postfixExpression_increment",
+                "\nclass C {\n  int _x = 1;\n  void f() {\n    _x++;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "prefixExpression_decrement",
+                "\nclass C {\n  int _x = 1;\n  void f() {\n    --_x;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "prefixExpression_increment",
+                "\nclass C {\n  int _x = 1;\n  void f() {\n    ++_x;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "prefixExpression_not",
+                "\nclass C {\n  bool _x = false;\n  void f() {\n    !_x;\n  }\n}\n",
+                &[(3, 8, 10)],
+            ),
+            (
+                "prefixExpression_tilde",
+                "\nclass C {\n  int _x = 0xffff;\n  void f() {\n    ~_x;\n  }\n}\n",
+                &[(3, 7, 11)],
+            ),
+            (
+                "propertyAccess",
+                "\nclass C {\n  int _x = 1;\n  void f() {\n    _x.isEven;\n  }\n}\n",
+                &[(3, 7, 6)],
+            ),
+            (
+                "readInInstanceMethod",
+                "\nclass C {\n  int _x = 0;\n\n  void f() {\n    var a = _x;\n  }\n}\n",
+                &[(3, 7, 6)],
+            ),
+            (
+                "reassigned",
+                "\nclass C {\n  var _x = 1;\n  void f() {\n    _x = 2;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "referencedInFieldFormalParameters",
+                "\nclass C {\n  int _x;\n  C(this._x);\n  C.named(this._x);\n}\n",
+                &[(3, 7, 2)],
+            ),
+            (
+                "subclassOnGenericClass",
+                "\nabstract class C<T> {\n  int _x = 0;\n}\n\nclass D extends C<int> {\n  void f() {\n    _x = 1;\n  }\n}\n",
+                &[],
+            ),
+            ("unused", "\nclass C {\n  var _x = 1;\n}\n", &[(3, 7, 6)]),
+            (
+                "unused_fromDeclaringParameter",
+                "\nclass C(var int _x) {\n  void m() {\n    print(_x);\n  }\n}\n",
+                &[(2, 9, 10)],
+            ),
+            (
+                "unused_multiple",
+                "\nclass C {\n  var _x = 1, _y = 2;\n  void f() {\n    _x = 2;\n  }\n}\n",
+                &[(3, 15, 6)],
+            ),
+            ("unused_public", "\nclass C {\n  var x = 1;\n}\n", &[]),
+            (
+                "unused_uninitialized",
+                "\nclass C {\n  int? _x;\n}\n",
+                &[],
+            ),
+            (
+                "ext_field_instance",
+                "\nextension type E(Object o) {\n  int _i = 0;\n}\n",
+                &[],
+            ),
+            (
+                "ext_field_static",
+                "\nextension type E(Object o) {\n  static int _i = 0;\n}\n",
+                &[(3, 14, 6)],
+            ),
+            (
+                "ext_field_static_writtenInConstructor",
+                "\nextension type E(Object o) {\n  static Object _o = 0;\n  E.e(this.o) {\n    _o = o;\n  }\n}\n",
+                &[],
+            ),
+            (
+                "doc_bad_0",
+                "class C {\n  int _f = 1;\n\n  int get f => _f;\n}\n",
+                &[(2, 7, 6)],
+            ),
+            (
+                "doc_bad_1",
+                "class BadImmutable {\n  var _label = 'hola mundo! BadImmutable'; // LINT\n  var label = 'hola mundo! BadImmutable'; // OK\n}\n",
+                &[(2, 7, 35)],
+            ),
+            (
+                "doc_bad_2",
+                "class MultipleMutable {\n  var _label = 'hola mundo! GoodMutable', _offender = 'mumble mumble!'; // LINT\n  var _someOther; // LINT\n\n  MultipleMutable() : _someOther = 5;\n\n  MultipleMutable(this._someOther);\n\n  void changeLabel() {\n    _label= 'hello world! GoodMutable';\n  }\n}\n",
+                &[(2, 43, 28), (3, 7, 10)],
+            ),
+            (
+                "doc_bad_3",
+                "class AssignedInAllConstructors {\n  var _label; // LINT\n  AssignedInAllConstructors(this._label);\n  AssignedInAllConstructors.withDefault() : _label = 'Hello';\n}\n",
+                &[(2, 7, 6)],
+            ),
+            (
+                "doc_good_0",
+                "class C {\n  final int _f = 1;\n\n  int get f => _f;\n}\n",
+                &[],
+            ),
+            (
+                "doc_good_1",
+                "class GoodImmutable {\n  final label = 'hola mundo! BadImmutable', bla = 5; // OK\n  final _label = 'hola mundo! BadImmutable', _bla = 5; // OK\n}\n",
+                &[],
+            ),
+            (
+                "doc_good_2",
+                "class GoodMutable {\n  var _label = 'hola mundo! GoodMutable';\n\n  void changeLabel() {\n    _label = 'hello world! GoodMutable';\n  }\n}\n",
+                &[],
+            ),
+            (
+                "doc_good_3",
+                "class NotAssignedInAllConstructors {\n  var _label; // OK\n  NotAssignedInAllConstructors();\n  NotAssignedInAllConstructors.withDefault() : _label = 'Hello';\n}\n",
+                &[],
+            ),
+        ];
+        // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+        fn offset(source: &str, line: u32, column: u32) -> u32 {
+            let line_start: usize = source
+                .split_inclusive('\n')
+                .take(line as usize - 1)
+                .map(str::len)
+                .sum();
+            (line_start + column as usize - 1) as u32
+        }
+        let mut mismatches = Vec::new();
+        for (case, source, oracle) in cases {
+            let f = Fixture::parse(source);
+            let mut lints = f.run(&one_rule("prefer_final_fields"));
+            lints.sort_by_key(|lint| lint.range.start);
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            let want: Vec<(u32, u32)> = oracle
+                .iter()
+                .map(|&(line, column, length)| {
+                    let start = offset(source, line, column);
+                    (start, start + length)
+                })
+                .collect();
+            if got != want {
+                mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
 }

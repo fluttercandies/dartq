@@ -473,6 +473,25 @@ use dartq_source::{FileTable, StringTable};
 /// face. The context tables leak (`'static`); the tests are one-shot
 /// processes.
 fn run_semantic(source: &str, rule: &str, dependency: Option<&str>) -> Vec<crate::engine::Lint> {
+    run_semantic_face(source, rule, dependency, false, &[])
+}
+
+/// [`run_semantic`] with the reachability face mounted — the
+/// dead-code face reads both the semantic bridge and the engine's
+/// reachability flags.
+fn run_semantic_face(
+    source: &str,
+    rule: &str,
+    dependency: Option<&str>,
+    has_entry: bool,
+    flags: &[(u32, bool)],
+) -> Vec<crate::engine::Lint> {
+    let mut flags: Vec<(u32, bool)> = flags.to_vec();
+    flags.sort_unstable_by_key(|&(offset, _)| offset);
+    let face = ReachabilityFace {
+        has_entry,
+        flags: &flags,
+    };
     let mut fixture = Fixture::parse(source);
     // The unit path is a package lib file — the path-gated rules
     // (`avoid_renaming_method_parameters`' `isInLibDir`) register.
@@ -550,7 +569,7 @@ fn run_semantic(source: &str, rule: &str, dependency: Option<&str>) -> Vec<crate
         features: fixture.features,
         version: fixture.version,
         workspace: None,
-        reachability: None,
+        reachability: Some(face),
         async_context_uses: None,
         library_type_uses: None,
     };
@@ -1798,4 +1817,62 @@ fn widget_preview_alias_and_custom_preview_class() {
         "Unreachable member 'f6' in an executable library."
     );
     assert_eq!(lints[1].range.start, flag(&f, "f6", 0, false).0);
+}
+
+/// `test_typedef_reachable_referencedInObjectPattern`: an object
+/// pattern's type name counts when it is alias-like — the typedef
+/// reference (upstream `visitNamedType`'s `type.alias` arm). The head
+/// identifier tiles no Identifier row of its own, so the row pass
+/// reads the ObjectPattern row's name fields. A plain class in the
+/// same position stays uncounted (`test_class_referencedInObjectPattern`
+/// — structural matching against an unknown layout is no use).
+#[test]
+fn object_pattern_type_counts_alias_like_types_only() {
+    let f = Fixture::parse(
+        "typedef T = int;\n\nvoid main() {\n  f();\n}\n\nvoid f([Object? c]) {\n  if (c case T()) {}\n}\n",
+    );
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let f = Fixture::parse(
+        "class C {}\n\nvoid main() {\n  f();\n}\n\nvoid f([Object? c]) {\n  if (c case C()) {}\n}\n",
+    );
+    let lints = run(&f, true, &[]);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'C' in an executable library."
+    );
+}
+
+/// `test_class_instanceMethod_reachable_overrides_imported`: the
+/// override read crosses files — the semantic bridge's inheritance walk
+/// anchored at the written extends head (upstream `getOverridden`
+/// answers through the imported interface), so `B.foo` never gathers.
+/// With the imported base declaring no `foo`, the bridge answers no and
+/// the unreferenced member reports.
+#[test]
+fn imported_override_suppresses_the_override() {
+    let dependency = "class A {\n  void foo() {}\n}\n";
+    let source = concat!(
+        "import 'kit.dart';\n",
+        "\n",
+        "void main() {\n",
+        "  B();\n",
+        "}\n",
+        "\n",
+        "class B extends A {\n",
+        "  void foo() {}\n",
+        "}\n",
+    );
+    let lints = run_semantic_face(source, "unreachable_from_main", Some(dependency), true, &[]);
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let dependency = "class A {}\n";
+    let lints = run_semantic_face(source, "unreachable_from_main", Some(dependency), true, &[]);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'foo' in an executable library."
+    );
 }

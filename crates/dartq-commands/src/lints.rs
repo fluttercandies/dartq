@@ -1260,12 +1260,13 @@ fn neutralize_ignore_keywords(text: &str, comments: &Comments) -> String {
 /// library. An unresolvable target still registers the prefix with an
 /// empty table, so `p.x` answers "prefix" and a miss reports. Without the
 /// edges `[p.X]` doc references never see `p` and all report.
-fn seed_prefixed_imports(
+fn seed_imports(
     engine: &Engine,
     builder: &mut LibraryGraphBuilder<'_>,
     lib: dartq_resolution::LibraryId,
     members: &[FileId],
     core_file: FileId,
+    index: &mut ElementIndex,
 ) {
     let strings = engine.strings();
     for &member in members {
@@ -1273,12 +1274,20 @@ fn seed_prefixed_imports(
             continue;
         };
         for directive in &facts.directives {
-            if directive.kind != dartq_engine::DirectiveKind::Import || directive.prefix.is_none() {
+            if directive.kind != dartq_engine::DirectiveKind::Import {
                 continue;
             }
             let target = match (&directive.target, directive.uri.as_deref()) {
                 (dartq_resolution::ResolvedTarget::Resolved(file), _) => {
                     engine.file_facts(*file).map(|target_facts| {
+                        // The import target's element model joins the
+                        // index: the bridge's container lookups read
+                        // member tables from the index by owner file
+                        // (`resolve_container`), so an uninserted
+                        // target resolves to a name with no members —
+                        // every cross-file inheritance face dead-ends
+                        // there.
+                        index.insert(*file, Arc::clone(&target_facts.elements));
                         let node = builder.intern(&format!("lint_import:{}", file.index()));
                         for (name, declaration) in target_facts.elements.declarations() {
                             if declaration.kind != MicroKind::TypeParam {
@@ -1395,15 +1404,15 @@ fn build_library_semantics(engine: &Engine, file: FileId, members: &[FileId]) ->
         .find(|(uri, _)| *uri == "core")
         .expect("generated SDK table carries dart:core");
     builder.seed_implicit_core(lib, core_file, core_face);
-    seed_prefixed_imports(engine, &mut builder, lib, members, core_file);
-    let graph = builder.finish();
-    let namespaces = Namespaces::build(&graph);
     let mut index = ElementIndex::default();
     for &member in members {
         if let Some(facts) = engine.file_facts(member) {
             index.insert(member, Arc::clone(&facts.elements));
         }
     }
+    seed_imports(engine, &mut builder, lib, members, core_file, &mut index);
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
     LibrarySemantics {
         lib,
         graph: Arc::new(graph),
@@ -3620,6 +3629,72 @@ void stray() {}
             main.scanned.tokens.len(),
             part.scanned.tokens.len(),
             "each member scans its own bytes"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The import seeding end to end: an UNPREFIXED import's target
+    /// carries its member table through to the lint tier — the override
+    /// face (`unreachable_from_main`'s `isOverride` arm through the
+    /// semantic bridge) answers across the file boundary, so the
+    /// overriding member stays silent against a base that declares it
+    /// and reports against a base that does not.
+    #[test]
+    fn imported_override_resolves_through_the_shared_substrate() {
+        let files: &[(&str, &str)] = &[
+            (
+                "analysis_options.yaml",
+                "linter:\n  rules:\n    - unreachable_from_main\n",
+            ),
+            (
+                "lib/main.dart",
+                "import 'kit.dart';\n\nvoid main() {\n  B();\n}\n\nclass B extends A {\n  void foo() {}\n}\n",
+            ),
+            ("lib/kit.dart", "class A {\n  void foo() {}\n}\n"),
+        ];
+        let root = crate::workspace::test_fixture::workspace("lints_imported_override", files);
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<&str> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unreachable_from_main")
+            .map(|d| d.message.as_ref())
+            .collect();
+        assert!(rows.is_empty(), "the override stays silent: {rows:?}");
+
+        let files: &[(&str, &str)] = &[
+            (
+                "analysis_options.yaml",
+                "linter:\n  rules:\n    - unreachable_from_main\n",
+            ),
+            (
+                "lib/main.dart",
+                "import 'kit.dart';\n\nvoid main() {\n  B();\n}\n\nclass B extends A {\n  void foo() {}\n}\n",
+            ),
+            ("lib/kit.dart", "class A {}\n"),
+        ];
+        let root = crate::workspace::test_fixture::workspace("lints_imported_override_base", files);
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<&str> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unreachable_from_main")
+            .map(|d| d.message.as_ref())
+            .collect();
+        assert_eq!(rows.len(), 1, "no base member, no override: {rows:?}");
+        assert!(
+            rows[0].contains("'foo'"),
+            "the overriding member reports: {rows:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
