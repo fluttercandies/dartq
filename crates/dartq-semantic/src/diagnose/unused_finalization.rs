@@ -558,23 +558,39 @@ impl<'a> Engine<'a> {
         ) else {
             return;
         };
-        if container.constructors.contains(&selector) {
-            self.used_names.insert(selector);
-            // The element-level edge (#2618's `member_refs` face): a
-            // resolved `C.sel` creation credits the exact constructor
-            // element — `D.sel` never shares the credit. The
-            // `member_used_elements` set in `finalize_usage` reads it.
-            self.report.member_refs.push(MemberRef {
-                range: SourceRange {
-                    offset: 0,
-                    length: 0,
-                },
-                kind: MemberRefKind::Invoked,
-                target_file: owner,
-                target_name: selector,
-                target_container: head,
-            });
+        // The `new` selector spells the unnamed face
+        // (`ctor_face_exists`'s same fold): `C.new` resolves the unnamed
+        // constructor's element upstream, so the credit joins under the
+        // container spelling the declaration site and the
+        // `member_used_elements` tuple already key on. A genuinely named
+        // `sel` keeps its own spelling.
+        let named = container.constructors.contains(&selector);
+        let unnamed = selector == self.intern("new") && container.has_unnamed_constructor;
+        if !(named || unnamed) {
+            return;
         }
+        let target = if named { selector } else { head };
+        self.used_names.insert(target);
+        // The element-level edge (#2618's `member_refs` face): a
+        // resolved `C.sel` creation credits the exact constructor
+        // element — `D.sel` never shares the credit. The
+        // `member_used_elements` set in `finalize_usage` reads it.
+        // `report_optional_parameters`'s non-call arm does NOT read this
+        // edge: `end_constructor_reference` fires for `new C.sel(` /
+        // `const C.sel(` call sites too, where only the supplied
+        // arguments credit — the zero-length range cannot distinguish
+        // call from tear-off, so the token-walked `noncall_reads` set
+        // (tear-offs + `this.sel` redirects) owns that arm instead.
+        self.report.member_refs.push(MemberRef {
+            range: SourceRange {
+                offset: 0,
+                length: 0,
+            },
+            kind: MemberRefKind::Invoked,
+            target_file: owner,
+            target_name: target,
+            target_container: head,
+        });
     }
 
     /// The constructor half of a resolved `C.sel` access (`_E._`,
@@ -1051,6 +1067,14 @@ impl<'a> Engine<'a> {
         // given sets the parameter face reads, and the resolved-target map
         // feeds the constructor corresponding-parameter face.
         let super_ctor_targets = self.walk_super_invocation_givens();
+        // The non-call read set the parameter face's all-formals arm
+        // reads: `this.sel(...)` redirecting-initializer targets joined
+        // with the bare `C.sel` / `C.new` / `C<T>.sel` / `@C.sel` tear-off
+        // reads (both resolved `(container, selector)` pairs — upstream's
+        // `visitSimpleIdentifier` non-call arm credits the whole formal
+        // list either way).
+        let mut noncall_reads = self.walk_this_redirect_targets();
+        noncall_reads.extend(self.walk_ctor_tearoffs());
         // The element-attributed use pool: `used_names` minus the member
         // spellings that only an unresolved access contributed (the
         // `Receiver::Unknown`/`Prefix` rows — an `InvalidType` or `dynamic`
@@ -1635,7 +1659,12 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            self.report_optional_parameters(site_index, &site, &super_ctor_targets);
+            self.report_optional_parameters(
+                site_index,
+                &site,
+                &super_ctor_targets,
+                &noncall_reads,
+            );
         }
         // The recursive-constant-constructor face: a const constructor
         // whose own formal default values const-instantiate the SAME
@@ -2710,6 +2739,312 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The constructor tear-off pass (`visitSimpleIdentifier`'s non-call
+    /// arm, upstream Dart SDK source,
+    /// unused_local_elements_verifier.dart:311-327): a `C.sel` / `C.new`
+    /// / `C<T>.sel` reference that is NOT followed by an invocation group
+    /// resolves the constructor element in a non-call position — a
+    /// tear-off value, a redirecting target, or a metadata selector — and
+    /// the arm marks every formal of that constructor used (the
+    /// `functionReferenceIsCall` gate only excuses the
+    /// `ConstructorName`-under-`InstanceCreationExpression` shape; every
+    /// other read credits the whole list). A `@C.sel` metadata reference
+    /// is always non-call (its `ConstructorName` sits under `Annotation`,
+    /// never `InstanceCreationExpression`), arguments or not.
+    ///
+    /// Returns the resolved `(container, selector)` set — `sel` keeps its
+    /// written spelling (`new` stays `new`; the reader folds it against
+    /// the unnamed face's container key). A redirecting FACTORY's
+    /// `= C.sel` target is the one non-call shape that does NOT credit
+    /// the whole list upstream (`_matchParameters` pairs the factory's
+    /// own formals against the target's — the `redirect_formals_into`
+    /// lane already models that pairing), so the walk excludes it by
+    /// the `factory` keyword behind the `=`.
+    fn walk_ctor_tearoffs(&mut self) -> FxHashSet<(StringId, StringId)> {
+        let mut targets: FxHashSet<(StringId, StringId)> = FxHashSet::default();
+        let tokens = self.tokens.as_slice();
+        let new = self.intern("new");
+        for i in 0..tokens.len() {
+            if tokens[i].kind != dartq_scanner::TokenKind::Period {
+                continue;
+            }
+            // The selector token: `new` scans as the keyword (a `C.new`
+            // reference); every other selector is a plain identifier.
+            let sel_token = tokens.get(i + 1);
+            let selector = match sel_token.map(|t| &t.kind) {
+                Some(dartq_scanner::TokenKind::Identifier) => {
+                    Some(self.intern(self.token_text(&tokens[i + 1])))
+                }
+                Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::New)) => Some(new),
+                _ => None,
+            };
+            let Some(selector) = selector else {
+                continue;
+            };
+            // The class head behind the `.`: a bare identifier, or the
+            // identifier in front of a balanced `<…>` group
+            // (`C<int>.sel`). The walk answers an index — the token kind
+            // gates the arm, so a non-identifier head resolves `None`.
+            let mut head_index = i;
+            let head_token = loop {
+                let Some(index) = head_index.checked_sub(1) else {
+                    break None;
+                };
+                head_index = index;
+                match tokens[head_index].kind {
+                    dartq_scanner::TokenKind::Identifier => {
+                        break Some(tokens[head_index])
+                    }
+                    dartq_scanner::TokenKind::Gt => {
+                        // Backward `<…>` skip: a shallow depth walk — the
+                        // group's own nested `<`/`>` pairs balance, and a
+                        // `>` with no matching `<` ends the head search
+                        // (a comparison, never a type-argument group).
+                        let mut angle = 1usize;
+                        let mut lt = None;
+                        while let Some(k) = head_index.checked_sub(1) {
+                            match tokens[k].kind {
+                                dartq_scanner::TokenKind::Gt => angle += 1,
+                                dartq_scanner::TokenKind::Lt => {
+                                    angle -= 1;
+                                    if angle == 0 {
+                                        lt = Some(k);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            head_index = k;
+                        }
+                        let Some(lt) = lt else {
+                            break None;
+                        };
+                        head_index = lt;
+                    }
+                    _ => break None,
+                }
+            };
+            let Some(head_token) = head_token else {
+                continue;
+            };
+            let metadata = head_index > 0
+                && matches!(
+                    tokens[head_index - 1].kind,
+                    dartq_scanner::TokenKind::At
+                );
+            // The call gate: `(` immediately after the selector is an
+            // invocation (`C.sel(...)`, `new C.sel(...)`, `const C.sel(...)`)
+            // — `_addParametersForArguments` owns its per-argument credit
+            // through the givens sets. A `<` group first can still close
+            // into `(` (`C.sel<int>(...)`) — resolve its follower too.
+            // Metadata (`@C.sel(...)`) is exempt: the `Annotation` parent
+            // keeps the selector read non-call upstream, arguments or not.
+            if !metadata {
+                let mut next = i + 2;
+                let mut called = matches!(
+                    tokens.get(next).map(|t| &t.kind),
+                    Some(dartq_scanner::TokenKind::OpenParen)
+                );
+                if !called
+                    && matches!(
+                        tokens.get(next).map(|t| &t.kind),
+                        Some(dartq_scanner::TokenKind::Lt)
+                    )
+                    && let Some(gt) = self.tokens.matching_end(next)
+                    && matches!(
+                        tokens.get(gt + 1).map(|t| &t.kind),
+                        Some(dartq_scanner::TokenKind::OpenParen)
+                    )
+                {
+                    called = true;
+                }
+                if called {
+                    continue;
+                }
+            }
+            // The redirecting-factory target (`factory X(...) = C.sel`): the
+            // `=` right before the head with `factory` inside the same
+            // member header — its `_matchParameters` pairing lives in the
+            // `redirect_formals_into` lane, not here. A `var x = C.sel`
+            // tear-off keeps its `=` but finds no `factory` behind it. The
+            // backward depth scan reads closers as openers.
+            let mut factory_target = false;
+            if head_index > 0
+                && matches!(
+                    tokens[head_index - 1].kind,
+                    dartq_scanner::TokenKind::Eq
+                )
+            {
+                let mut depth = 0usize;
+                let mut k = head_index;
+                while let Some(prev) = k.checked_sub(1) {
+                    if head_index - prev > SUPER_WALK_BACKWARD_CAP {
+                        break;
+                    }
+                    match tokens[prev].kind {
+                        dartq_scanner::TokenKind::CloseCurly
+                        | dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare => depth += 1,
+                        dartq_scanner::TokenKind::OpenCurly
+                        | dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare => {
+                            depth = depth.saturating_sub(1)
+                        }
+                        dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Colon
+                            if depth == 0 =>
+                        {
+                            break;
+                        }
+                        dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Factory)
+                            if depth == 0 =>
+                        {
+                            factory_target = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    k = prev;
+                }
+            }
+            if factory_target {
+                continue;
+            }
+            let head = self.intern(self.token_text(&head_token));
+            // The constructor face must actually exist upstream's way: a
+            // named selector joins through the container's `constructors`
+            // set, `new` through the unnamed face. A prefix segment, a
+            // variable head, or a method selector resolves nothing — the
+            // under-report posture every unmodelable corner keeps.
+            let Some((decl, _)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                head,
+            ) else {
+                continue;
+            };
+            let named = decl.constructors.contains(&selector);
+            let unnamed = selector == new && decl.has_unnamed_constructor;
+            if !(named || unnamed) {
+                continue;
+            }
+            // The element-use credit: a tear-off reads the constructor
+            // element (`usedElements.elements` — `C.sel` spares `sel`, the
+            // `new` face spares the container-spelled element).
+            self.used_names.insert(if named { selector } else { head });
+            targets.insert((head, selector));
+        }
+        targets
+    }
+
+    /// The `this.sel(...)` redirecting-initializer pass
+    /// (`visitSimpleIdentifier`'s tear-off arm, upstream Dart SDK source,
+    /// unused_local_elements_verifier.dart:311-327): a redirecting
+    /// `this.sel(...)` initializer resolves `sel` to the target constructor
+    /// element, and the read is NOT call-shaped (its parent is a
+    /// `ConstructorName` under a `RedirectingConstructorInvocation`, never
+    /// an `InstanceCreationExpression`), so the tear-off arm marks every
+    /// formal of the target used — regardless of what the argument list
+    /// actually supplies. A bare `this(...)` initializer carries no
+    /// selector identifier, so the unnamed target receives no credit there
+    /// (probed 3.13.1: `_A([int? p]); _A.sel() : this();` reports `p`,
+    /// `_B._t([int? p]); _B.sel() : this._t();` spares `p`).
+    ///
+    /// Containment mirrors [`Self::walk_super_invocation_givens`]: the
+    /// innermost `{` still holding the `this` token opens a class body
+    /// exactly when the occurrence sits in an initializer list — a method
+    /// body's `this.m(...)` send opens closer and fails the class-header
+    /// parse, so member sends never credit here. Returns the resolved
+    /// `(container, selector)` set the parameter face's non-call arm
+    /// reads; `sel` keeps its written spelling (a `this.new(...)` head
+    /// names the `new` selector, which the `ctor_formals` lookup spells
+    /// as the container — the reader folds it).
+    fn walk_this_redirect_targets(&mut self) -> FxHashSet<(StringId, StringId)> {
+        let mut targets: FxHashSet<(StringId, StringId)> = FxHashSet::default();
+        let tokens = self.tokens.as_slice();
+        // The interpolation-closer table mirrors the super walk's: a
+        // `${…}` group's `}` closes a `StringInterpolationExpression` begin
+        // and carries no matching `{`, so it must not move the brace
+        // balance below.
+        let mut interp_closers: FxHashSet<usize> = FxHashSet::default();
+        if tokens
+            .iter()
+            .any(|t| t.kind == dartq_scanner::TokenKind::StringInterpolationExpression)
+        {
+            for (index, t) in tokens.iter().enumerate() {
+                if t.kind == dartq_scanner::TokenKind::StringInterpolationExpression
+                    && let Some(end) = self.tokens.matching_end(index)
+                {
+                    interp_closers.insert(end);
+                }
+            }
+        }
+        for i in 0..tokens.len() {
+            if tokens[i].kind != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::This) {
+                continue;
+            }
+            // The selector shape `this . sel (` — a bare `this(` carries no
+            // selector identifier and credits nothing (the oracle's
+            // `this()` arm never reaches a formal element).
+            if !matches!(
+                tokens.get(i + 1).map(|t| &t.kind),
+                Some(dartq_scanner::TokenKind::Period)
+            ) {
+                continue;
+            }
+            let Some(sel) = tokens
+                .get(i + 2)
+                .filter(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+            else {
+                continue;
+            };
+            if !matches!(
+                tokens.get(i + 3).map(|t| &t.kind),
+                Some(dartq_scanner::TokenKind::OpenParen)
+            ) {
+                continue;
+            }
+            // The innermost containing `{` decides the initializer
+            // context — the same balanced-backward walk the super pass
+            // runs (a member body's `{` opens closer and its header walk
+            // hits the enclosing `{`/`;` before any `class` keyword).
+            let Some(opener) = (|interp: &FxHashSet<usize>| {
+                let mut depth = 0usize;
+                for j in (0..i).rev() {
+                    if i - j > SUPER_WALK_BACKWARD_CAP {
+                        return None;
+                    }
+                    match tokens[j].kind {
+                        dartq_scanner::TokenKind::CloseCurly if !interp.contains(&j) => depth += 1,
+                        dartq_scanner::TokenKind::OpenCurly => {
+                            if depth == 0 {
+                                return Some(j);
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            })(&interp_closers) else {
+                continue;
+            };
+            let Some(container) = self.class_header_name(tokens, opener) else {
+                continue;
+            };
+            let selector = self.intern(self.token_text(sel));
+            // The selector's element credit (`usedElements.elements` — the
+            // same join the super-initializer arm makes): `this.sel(...)`
+            // reads the target constructor element, so a private-selector
+            // target never reports `unused_element`.
+            self.used_names.insert(selector);
+            targets.insert((container, selector));
+        }
+        targets
+    }
+
     /// The container name a class-family header writes before its body
     /// opener — the identifier directly behind a `class` keyword, scanned
     /// backward across the extends/with/implements clauses and the primary
@@ -3087,6 +3422,7 @@ impl<'a> Engine<'a> {
         site_index: usize,
         site: &DeclSite,
         super_ctor_targets: &FxHashMap<(StringId, StringId), Option<StringId>>,
+        noncall_reads: &FxHashSet<(StringId, StringId)>,
     ) {
         let (member_kind, container) = match &site.kind {
             DeclKind::Member {
@@ -3356,24 +3692,56 @@ impl<'a> Engine<'a> {
                 r.kind == MemberRefKind::Invoked
                     && r.target_file == self.file
                     && r.target_container == container
+                    // The zero-span `credit_constructor_selector` edge
+                    // credits a CONSTRUCTOR element — never this member —
+                    // and its synthetic (0,0) range would read non-call.
+                    && r.range.length > 0
                     && r.target_name == site.name
                     && !invocation_after(self, r.range)
             }),
             DeclKind::Constructor { container } => {
-                // `credit_constructor_selector`'s zero-span edge (the
-                // `super.x()`/`this.x()`/metadata/selector-reference faces —
-                // every non-`InstanceCreationExpression` read) credits all
-                // formals; the `super_ctor_targets` map joins the
-                // initializer invocations whose selector names this
-                // constructor directly.
+                // The non-call arm's three read faces, all crediting every
+                // formal upstream (unused_local_elements_verifier.dart
+                // `visitSimpleIdentifier`:311-327 — every
+                // non-`InstanceCreationExpression` executable read):
+                //   * `member_refs` real-range edges — a resolved `C.sel`
+                //     /`C.new` access the collector recorded. The
+                //     zero-length `credit_constructor_selector` edge is
+                //     excluded: it fires on `end_constructor_reference`,
+                //     which the listener also emits for `new C.sel(` /
+                //     `const C.sel(` call sites — a call-shape read that
+                //     must credit only the supplied arguments, not the
+                //     whole list, so its always-`token[0]` range cannot
+                //     gate `invocation_after`.
+                //   * `noncall_reads` — the token-walked union of the
+                //     `this.sel(...)` redirect targets and the bare
+                //     `C.sel` / `C.new` / `C<T>.sel` / `@C.sel` tear-off
+                //     reads (`walk_ctor_tearoffs`), each resolved against
+                //     the container's real constructor set.
+                //   * `super_ctor_targets` — the `super.sel(...)`
+                //     initializer invocations whose selector names this
+                //     constructor.
                 let noncall_ref = self.report.member_refs.iter().any(|r| {
                     r.kind == MemberRefKind::Invoked
                         && r.target_file == self.file
                         && r.target_container == container
+                        && r.range.length > 0
                         && (r.target_name == site.name || r.target_name == ctor_spelling)
                         && !invocation_after(self, r.range)
                 });
+                let new_sel = self.intern("new");
+                let noncall_targeted = noncall_reads.iter().any(|(c, sel)| {
+                    *c == container
+                        && (*sel == ctor_spelling
+                            || *sel == site.name
+                            // `this.new(...)` / `C.new` name the unnamed
+                            // face — `sel` keeps the written spelling while
+                            // the site's `ctor_spelling` answers the
+                            // container.
+                            || (*sel == new_sel && ctor_spelling == container))
+                });
                 noncall_ref
+                    || noncall_targeted
                     || super_ctor_targets.iter().any(|((sub, _sub_key), sel)| {
                         sel.is_some_and(|sel| {
                             sel == ctor_spelling
@@ -6895,3 +7263,11 @@ mod ticket_3159_tests;
 #[cfg(test)]
 #[path = "ticket_2482_tests.rs"]
 mod ticket_2482_tests;
+
+/// The #3044 `unused_element_parameter` constructor-formals pins — the
+/// positional / named / field-formal (`this.x`) / super-param (`super.x`)
+/// matrix against used-via-call, used-in-body, and unused shapes — kept as
+/// a standalone module so the shared `pins` rig stays untouched.
+#[cfg(test)]
+#[path = "ticket_3044_tests.rs"]
+mod ticket_3044_tests;
