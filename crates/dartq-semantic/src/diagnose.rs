@@ -6554,3 +6554,11 @@ mod ticket_f2_tests;
 /// into ONE span. Exact oracle `(offset, length)` triples.
 #[cfg(test)]
 mod ticket_3213_tests;
+
+/// The #3211 `integer_literal_imprecise_as_double` corpus-shape pins: the
+/// `double_literal_coercion_error` multitest's optional-positional
+/// argument face (`notDouble([double value = 0.0])`) locked end-to-end
+/// through the diagnostic surface — the exact variant bytes, the
+/// boundary/hex/negated/overflow sections, and the `int`-typed silence.
+#[cfg(test)]
+mod ticket_3211_tests;
