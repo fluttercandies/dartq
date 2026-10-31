@@ -6645,6 +6645,285 @@ fn prefer_const_declarations_record_faces() {
     assert!(f.run(&one_rule("prefer_const_declarations")).is_empty());
 }
 
+/// The whole upstream corpus (`PreferConstDeclarationsTest`, 48 cases,
+/// plus the six `messages.yaml` doc examples) pinned against the oracle
+/// rows of `conformance/expected.tsv`: each entry is the exact case
+/// source (the materialized file carries a leading blank line, so the
+/// upstream `3:3` rows land as written) and the oracle's
+/// `(line, column, length)` for every `prefer_const_declarations` row.
+/// Every mismatch is collected before the single panic so one run shows
+/// the whole deviation set.
+#[test]
+fn prefer_const_declarations_upstream_corpus_pins() {
+    // (case, source, oracle rows as (line, column, length)).
+    let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+        (
+            "constructorTearoff_inference",
+            "\nvoid f() {\n  final C<int> Function() c = C.new;\n}\nclass C<T> {}\n",
+            &[(3, 3, 33)],
+        ),
+        (
+            "constructorTearoff_instantiatedWithType",
+            "\nvoid f() {\n  final c = C<int>.new;\n}\nclass C<T> {}\n",
+            &[(3, 3, 20)],
+        ),
+        // The oracle reports here (upstream marks the test @FailingTest —
+        // the analyzer's constant evaluator accepts the tear-off).
+        (
+            "constructorTearoff_instantiatedWithTypeVariable",
+            "\nvoid f<T>() {\n  final c = C<T>.new;\n}\nclass C<T> {}\n",
+            &[(3, 3, 18)],
+        ),
+        (
+            "constructorTearoff_uninstantiated",
+            "\nvoid f() {\n  final x = C.new;\n}\nclass C<T> {}\n",
+            &[(3, 3, 15)],
+        ),
+        (
+            "instanceField_final_listLiteral_const",
+            "\nclass C {\n  final x = const [];\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_const_listLiteral_const",
+            "\nvoid f() {\n  const x = const [];\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_final_constructorInvocation_const",
+            "\nvoid f() {\n  final x = const C();\n}\nclass C {\n  const C();\n}\n",
+            &[(3, 3, 19)],
+        ),
+        (
+            "localVariable_final_constructorInvocation_new",
+            "\nvoid f() {\n  final x = C();\n}\nclass C {\n  const C();\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_final_doubleLiteral",
+            "\nvoid f() {\n  final x = 1.3;\n}\n",
+            &[(3, 3, 13)],
+        ),
+        (
+            "localVariable_final_intLiteral",
+            "\nvoid f() {\n  final x = 1;\n}\n",
+            &[(3, 3, 11)],
+        ),
+        (
+            "localVariable_final_intLiteral_multiple",
+            "\nvoid f() {\n  final x, y = 1;\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_final_listLiteral",
+            "\nvoid f() {\n  final x = [];\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_final_listLiteral_const",
+            "\nvoid f() {\n  final x = const [];\n}\n",
+            &[(3, 3, 18)],
+        ),
+        (
+            "localVariable_final_mapOrSetLiteral_const",
+            "\nvoid f() {\n  final x = const {};\n}\n",
+            &[(3, 3, 18)],
+        ),
+        (
+            "localVariable_final_methodInvocation",
+            "\nvoid f() {\n  final x = 7.toString();\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_final_nullLiteral",
+            "\nvoid f() {\n  final x = null;\n}\n",
+            &[(3, 3, 14)],
+        ),
+        (
+            "localVariable_final_prefixedIdentifier",
+            "\nvoid f() {\n  final x = 7.hashCode;\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_final_staticProperty_const",
+            "\nvoid f() {\n  final x = C.p;\n}\nclass C {\n  const C();\n  static const p = const [];\n}\n",
+            &[(3, 3, 13)],
+        ),
+        (
+            "localVariable_final_stringLiteral",
+            "\nvoid f() {\n  final x = '';\n}\n",
+            &[(3, 3, 12)],
+        ),
+        (
+            "localVariable_listLiteral_final_typed",
+            "\nvoid f() {\n  final List<int> x = [];\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_listLiteral_final_typed_typeArg",
+            "\nvoid f() {\n  final List<int> x = <int>[];\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_listLiteral_final_untyped_typeArg",
+            "\nvoid f() {\n  final x = <int>[];\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_mapLiteral_final_typed",
+            "\nvoid f() {\n  final Map<int,int> x = {};\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_mapLiteral_final_typed_typeArgs",
+            "\nvoid f() {\n  final Map<int,int> x = <int,int>{};\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_mapLiteral_final_untyped_typeArgs",
+            "\nvoid f() {\n  final x = <int,int>{};\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_mapOrSetLiteral_final_untyped",
+            "\nvoid f() {\n  final x = {};\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_setLiteral_final_typed",
+            "\nvoid f() {\n  final Set<int> x = {};\n}\n",
+            &[],
+        ),
+        (
+            "localVariable_setLiteral_final_typed_typeArg",
+            "\nvoid f() {\n  final Set<int> ids2 = <int>{};\n}\n",
+            &[],
+        ),
+        (
+            "recordLiteral",
+            "\nfinal tuple = const (\"first\", 2, true);\n",
+            &[(2, 1, 38)],
+        ),
+        (
+            "staticField_const_listLiteral_const",
+            "\nclass C {\n  static const x = const [];\n}\n",
+            &[],
+        ),
+        (
+            "staticField_final_listLiteral",
+            "\nclass C {\n  static final x = const [];\n}\n",
+            &[(3, 10, 18)],
+        ),
+        (
+            "staticField_final_nullLiteral",
+            "\nclass C {\n  static final x = null;\n}\n",
+            &[(3, 10, 14)],
+        ),
+        (
+            "staticFunctionTearoff_inference",
+            "\nvoid f() {\n  final C<int> Function() c = C.m;\n}\nclass C<T> {\n  static C<X> m<X>() => C<X>();\n}\n",
+            &[(3, 3, 31)],
+        ),
+        (
+            "staticFunctionTearoff_instantiatedWithType",
+            "\nvoid f() {\n  final c = C.m<int>;\n}\nclass C<T> {\n  static C<X> m<X>() => C<X>();\n}\n",
+            &[(3, 3, 18)],
+        ),
+        (
+            "staticFunctionTearoff_instantiatedWithTypeVariable",
+            "\nvoid f<T>() {\n  final c = C.m<T>;\n}\nclass C<T> {\n  static C<X> m<X>() => C<X>();\n}\n",
+            &[],
+        ),
+        (
+            "staticFunctionTearoff_uninstantiated",
+            "\nvoid f() {\n  final x = C.m;\n}\nclass C<T> {\n  static C<X> m<X>() => C<X>();\n}\n",
+            &[(3, 3, 13)],
+        ),
+        (
+            "test_recordLiteral_nonConst",
+            "\nfinal tuple = (1, () {});\n",
+            &[],
+        ),
+        (
+            "test_recordLiteral_ok",
+            "\nconst record = (number: 123, name: \"Main\", type: \"Street\");\n",
+            &[],
+        ),
+        ("topLevelVariable_final_doubleLiteral", "\nfinal x = 1.3;\n", &[(2, 1, 13)]),
+        ("topLevelVariable_final_listLiteral", "\nfinal x = [];\n", &[]),
+        (
+            "topLevelVariable_final_listLiteral_const",
+            "\nfinal x = const [];\n",
+            &[(2, 1, 18)],
+        ),
+        ("topLevelVariable_final_mapOrSetLiteral", "\nfinal o9 = {};\n", &[]),
+        (
+            "topLevelVariable_final_mapOrSetLiteral_const",
+            "\nfinal x = const {};\n",
+            &[(2, 1, 18)],
+        ),
+        ("topLevelVariable_final_nullLiteral", "\nfinal a = null;\n", &[(2, 1, 14)]),
+        (
+            "topLevelVariable_final_topLevelVariable_const",
+            "\nconst x = const [];\nfinal y = x;\n",
+            &[(3, 1, 11)],
+        ),
+        ("topLevelVariable_listLiteral_const", "\nconst x = const [];\n", &[]),
+        ("doc_bad_0", "final v = const <int>[];\n", &[(1, 1, 23)]),
+        (
+            "doc_bad_1",
+            "class C {\n  static final f = const <int>[];\n}\n",
+            &[(2, 10, 23)],
+        ),
+        (
+            "doc_bad_2",
+            "void f() {\n  final v = const <int>[];\n  print(v);\n}\n",
+            &[(2, 3, 23)],
+        ),
+        (
+            "doc_bad_3",
+            "final o = const <int>[];\n\nclass A {\n  static final o = const <int>[];\n}\n",
+            &[(1, 1, 23), (4, 10, 23)],
+        ),
+        ("doc_good_0", "class C {\n  static const f = <int>[];\n}\n", &[]),
+        (
+            "doc_good_1",
+            "const o = <int>[];\n\nclass A {\n  static const o = <int>[];\n}\n",
+            &[],
+        ),
+    ];
+    // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+    fn offset(source: &str, line: u32, column: u32) -> u32 {
+        let line_start: usize = source
+            .split_inclusive('\n')
+            .take(line as usize - 1)
+            .map(str::len)
+            .sum();
+        (line_start + column as usize - 1) as u32
+    }
+    let mut mismatches = Vec::new();
+    for (case, source, oracle) in cases {
+        let f = Fixture::parse(source);
+        let mut lints = f.run(&one_rule("prefer_const_declarations"));
+        lints.sort_by_key(|lint| lint.range.start);
+        let got: Vec<(u32, u32)> = lints
+            .iter()
+            .map(|lint| (lint.range.start, lint.range.end))
+            .collect();
+        let want: Vec<(u32, u32)> = oracle
+            .iter()
+            .map(|&(line, column, length)| {
+                let start = offset(source, line, column);
+                (start, start + length)
+            })
+            .collect();
+        if got != want {
+            mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 // —— prefer_mixin ———————————————————————————————————————————————————————
 
 /// `PreferMixinTestLanguage219.test_mixedInClass` — a plain class in a

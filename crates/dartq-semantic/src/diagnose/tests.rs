@@ -17668,3 +17668,16 @@ mod ticket_3231_tests;
 #[cfg(test)]
 #[path = "ticket_3267_tests.rs"]
 mod ticket_3267_tests;
+
+// The #3238 pins (the catch-clause verifier on RESOLVED on-types:
+// `catch_on_ty` carries the written type-argument list so same-head pairs
+// decide covariantly through `resolved_subtype`; the catch-all trigger is
+// `exceptionType == null || isDartCoreObject` with element identity only —
+// `on Object?` is catch-all — while a record/paren `on` head still resolves
+// and takes the subtype arm, and an unparsable head is the `InvalidType`
+// face). Registered here because `diagnose.rs` is a live-lane file out of
+// this ticket's write scope; `#[path]` keeps the module inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3238_tests.rs"]
+mod ticket_3238_tests;

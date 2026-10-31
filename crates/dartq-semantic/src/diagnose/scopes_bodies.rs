@@ -1,5 +1,7 @@
 use super::*;
 
+use dartq_scanner::{Keyword, TokenKind};
+
 /// The arm-scope sentinel range inside [`LocalDecl::group`]: a case-header
 /// pattern variable (`case A(:var e)`, a switch-expression arm) encodes its
 /// declaring switch-stack depth as `BASE - depth`, so [`Engine::resolve_local`]
@@ -495,27 +497,41 @@ impl<'a> Engine<'a> {
     }
 
     /// `end_try_statement`: the official `_CatchClausesVerifier` — a
-    /// catch-all clause (no `on` type, or `on Object`) followed by more
-    /// clauses makes the tail dead; and an on-clause whose type is a
-    /// subtype of an earlier on-clause type in the same try is dead too
-    /// (`dead_code_verifier.dart`, `nextCatchClause`; the subtype arm,
-    /// :589-604). Either way the span covers the first dead clause through
-    /// the last one, and one dead-catch row per try at most (`_done`).
+    /// catch-all clause (no `on` type, or an `on` type resolving to dart:core
+    /// `Object`) followed by more clauses makes the tail dead; and an
+    /// on-clause whose type is a subtype of an earlier on-clause type in the
+    /// same try is dead too (`dead_code_verifier.dart`, `nextCatchClause`;
+    /// the subtype arm, :589-604). Either way the span covers the first dead
+    /// clause through the last one, and one dead-catch row per try at most
+    /// (`_done`, dead_code_verifier.dart:414).
     ///
-    /// Two faces the upstream text pins exactly:
+    /// Faces the upstream text pins exactly:
     ///
     /// - The catch-all test reads the RESOLVED type:
     ///   `exceptionType?.type == null || ....isDartCoreObject`, and
-    ///   `isDartCoreObject` is `Object` with the none nullability suffix. So
-    ///   `on Object?` is NOT catch-all — it takes the subtype arm and every
-    ///   later `on T` reports `dead_code_on_catch_subtype` (`T <: Object?`
-    ///   is the right-top rule, subtype.dart:52-56), never a
-    ///   `catch_following_catch` row anchored at the next clause.
-    /// - The subtype arm asks the written types. An unresolved `on` head is
-    ///   the official `InvalidType`, which answers `true` from either side
-    ///   of `isSubtypeOf` (subtype.dart:274-276, the 0c rule), so the
-    ///   oracle's `'InvalidType' is a subtype of 'T'` rows stand; the name
-    ///   lattice keeps that face (`Ty::Unknown` maps to the nullable top).
+    ///   `isDartCoreObject` is element identity — core `Object`, ANY
+    ///   written nullability (`type.dart:767-769` checks only
+    ///   `element.name`/`element.library`). So `on Object?` IS catch-all,
+    ///   exactly like `on Object`.
+    /// - An `on` head that starts with `(` still resolves: `computeType`
+    ///   accepts the record type annotation (parser_impl.dart:10723 — the
+    ///   records-feature ambiguity resolution), so `exceptionType.type` is
+    ///   a `RecordType` — never null, never `isDartCoreObject`. The clause
+    ///   takes the subtype arm, where a record shape proves nothing against
+    ///   a named head and vice versa — silent (corpus `on_clauses_A01_*` /
+    ///   `A03_*`, all `-`). An `on` head NO type parse accepts
+    ///   (`on<T>(…)`) resolves to the `InvalidType`: the 0c rule answers
+    ///   `true` from either side of `isSubtypeOf`, so the corpus's
+    ///   `'InvalidType' is a subtype of 'String'` row (`on_clauses_A02_t05`)
+    ///   fires through [`Self::resolved_subtype`].
+    /// - The subtype arm asks `TypeSystem.isSubtypeOf(current, earlier)` —
+    ///   the resolved types WITH their type-argument lists (covariance:
+    ///   `on num {} on int {}` fires, `on int {} on num {}` is silent,
+    ///   `dead_code_on_catch_subtype/doc_0`). [`Self::resolved_subtype`] is
+    ///   that walk over the written shapes; an unresolved head answers
+    ///   `true` from either side (0c) and keeps the oracle's
+    ///   `'InvalidType'` argument spelling ([`Ty::Unknown`] renders
+    ///   `InvalidType`).
     pub(crate) fn finish_try_statement(&mut self) {
         let Some(clauses) = self.try_clauses.pop() else {
             return;
@@ -523,9 +539,13 @@ impl<'a> Engine<'a> {
         let object = self.intern("Object");
         let mut visited: Vec<Ty> = Vec::new();
         for (index, clause) in clauses.iter().enumerate() {
+            // A bare `catch` carries no `exceptionType` (null — catch-all);
+            // an `on` clause always resolves to a type (named, record, or
+            // `InvalidType`) and reaches the subtype arm, with core
+            // `Object` in any nullability the one catch-all exception.
             let catches_all = match clause.on_type {
-                None => true,
-                Some(name) => name == object && !clause.on_nullable,
+                None => !self.catch_head_is_on(clause),
+                Some(name) => name == object,
             };
             if catches_all {
                 if index + 1 < clauses.len() {
@@ -543,17 +563,22 @@ impl<'a> Engine<'a> {
                 break;
             }
             // The subtype arm: `isSubtypeOf(current, earlier)` over the
-            // written on-types (`on int?` is not below `on int`).
+            // resolved on-types (`on int?` is not below `on int`; the
+            // argument lists decide same-head pairs covariantly).
             let current = self.catch_on_ty(clause);
             if let Some(earlier) = visited
                 .iter()
-                .find(|earlier| self.name_subtype(current, **earlier))
+                .find(|earlier| self.resolved_subtype(current, **earlier))
                 .copied()
             {
                 let start = clause.start.offset;
                 let end = clauses[clauses.len() - 1].end.end();
-                let a0 = self.ty_display(current);
-                let a1 = self.ty_display(earlier);
+                // The message names the RESOLVED faces: an invalid head
+                // spells `InvalidType` (the oracle's `DartType
+                // .getDisplayString` on the substituted `InvalidType`), a
+                // written argument list renders its arguments.
+                let a0 = self.catch_ty_display(current);
+                let a1 = self.catch_ty_display(earlier);
                 self.stage_typed(
                     SemanticCode::DeadCodeOnCatchSubtype,
                     SourceRange {
@@ -569,12 +594,41 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the clause's head token is the `on` keyword — the split the
+    /// `on_type == None` fold at [`Self::finish_catch_clause`] hides:
+    /// `None` is either a bare `catch` (no exception type — catch-all) or a
+    /// record/paren head (`on (...)`, which still resolves upstream — never
+    /// catch-all).
+    fn catch_head_is_on(&self, clause: &CatchClauseFact) -> bool {
+        self.tokens
+            .as_slice()
+            .get(self.token_at_offset(clause.start.offset))
+            .is_some_and(|t| t.kind == TokenKind::Keyword(Keyword::On))
+    }
+
+    /// The diagnostic-message face of a verdict type: an invalid head (the
+    /// unresolved/paren-junk face) spells `InvalidType`, everything else
+    /// renders through [`Self::ty_display`].
+    fn catch_ty_display(&self, ty: Ty) -> String {
+        if self.is_invalid_ty(ty) {
+            return self.render_ty(Ty::Unknown);
+        }
+        self.ty_display(ty)
+    }
+
+    /// The token index at/after a UTF-16 offset (the table is
+    /// offset-ordered; EOF closes every walk).
+    fn token_at_offset(&self, offset: u32) -> usize {
+        self.tokens.as_slice().partition_point(|t| t.utf16_offset < offset)
+    }
+
     /// The written on-clause type as a [`Ty`] (`dynamic`/`Null` keep their
-    /// dedicated shapes; everything else is the written name with its
-    /// trailing-`?` face).
+    /// dedicated shapes; a named head carries its written type-argument
+    /// list — upstream compares the RESOLVED types, so `on List<String>`
+    /// and `on List<dynamic>` must not collide).
     pub(crate) fn catch_on_ty(&self, clause: &CatchClauseFact) -> Ty {
         let Some(name) = clause.on_type else {
-            return Ty::UNKNOWN;
+            return self.catch_record_face(clause);
         };
         match self.strings.resolve(name) {
             "dynamic" => Ty::Dynamic,
@@ -582,9 +636,193 @@ impl<'a> Engine<'a> {
             _ => Ty::Named {
                 name,
                 nullable: clause.on_nullable,
-                args: ArgListId::EMPTY,
+                args: self.catch_head_args(clause),
             },
         }
+    }
+
+    /// The record/paren head's lattice face (the folded
+    /// `on_type == None` clause whose head token IS the `on` keyword):
+    /// a `(`-led head resolves to a `RecordType` — it proves nothing
+    /// against a named head and no named head proves against it — while a
+    /// head no type parse accepts (`on<T>(…)`, a junk token after `on`)
+    /// resolves to `InvalidType` (the 0c rule: subtypes everything, and
+    /// everything subtypes it — corpus `on_clauses_A02_t05`).
+    fn catch_record_face(&self, clause: &CatchClauseFact) -> Ty {
+        let toks = self.tokens.as_slice();
+        let head = self.token_at_offset(clause.start.offset);
+        if !toks
+            .get(head)
+            .is_some_and(|t| t.kind == TokenKind::Keyword(Keyword::On))
+        {
+            // A bare `catch` fact never reaches this arm (it answers the
+            // catch-all test first); an unexpected face keeps the old
+            // whole-fact invalid answer.
+            return Ty::UNKNOWN;
+        }
+        match toks.get(head + 1).map(|t| t.kind) {
+            Some(TokenKind::OpenParen) => {
+                // The record shape rides the clause's own arity: the
+                // depth-0 commas inside the paren group + 1 fields, the
+                // recovered holes `Unknown` (the analyzer's InvalidType
+                // splice keeps the record's arity honest — `(int, ,)`
+                // binds `(int, InvalidType)`). Identity decides the rare
+                // record-vs-record pair; named heads prove nothing.
+                let Some(close) = self.tokens.matching_end(head + 1) else {
+                    return Ty::UNKNOWN;
+                };
+                let mut commas = 0usize;
+                let mut depth = 0usize;
+                for t in toks.iter().take(close).skip(head + 2) {
+                    match t.kind {
+                        TokenKind::OpenParen
+                        | TokenKind::OpenSquare
+                        | TokenKind::OpenCurly
+                        | TokenKind::Lt => depth += 1,
+                        TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly
+                        | TokenKind::Gt => depth = depth.saturating_sub(1),
+                        TokenKind::Comma if depth == 0 => commas += 1,
+                        _ => {}
+                    }
+                }
+                let arity = if close == head + 2 { 0 } else { commas + 1 };
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&vec![Ty::Unknown; arity], &[], false)
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// The written type-argument group of the clause's on-head (the `<…>`
+    /// between the head name and the body block) — [`ArgListId::EMPTY`]
+    /// when the head is raw or any argument spelling walks past the
+    /// simple-shape grammar (an exotic argument keeps the whole list raw:
+    /// the pre-fix face, never a fabricated one).
+    fn catch_head_args(&self, clause: &CatchClauseFact) -> ArgListId {
+        let toks = self.tokens.as_slice();
+        let mut cursor = self.token_at_offset(clause.start.offset);
+        let mut group = None;
+        while let Some(t) = toks.get(cursor) {
+            match t.kind {
+                // The body block (or a body-less `on X;`) closes the head.
+                TokenKind::OpenCurly | TokenKind::Semicolon | TokenKind::Eof => break,
+                TokenKind::Lt => {
+                    group = Some(cursor);
+                    break;
+                }
+                _ => cursor += 1,
+            }
+        }
+        let Some(open) = group else {
+            return ArgListId::EMPTY;
+        };
+        let Some(close) = self.tokens.matching_end(open) else {
+            return ArgListId::EMPTY;
+        };
+        let mut args = Vec::new();
+        let mut cursor = open + 1;
+        while cursor < close {
+            if toks[cursor].kind == TokenKind::Comma {
+                // An empty argument slot (`A<, B>`) — recovery shape.
+                return ArgListId::EMPTY;
+            }
+            let Some((ty, next)) = self.catch_arg_ty(toks, cursor, close) else {
+                return ArgListId::EMPTY;
+            };
+            args.push(ty);
+            cursor = match toks.get(next) {
+                Some(t) if t.kind == TokenKind::Comma => next + 1,
+                Some(_) => next,
+                None => return ArgListId::EMPTY,
+            };
+            if cursor == next && cursor <= close {
+                // `next` landed on the closer: the list ended.
+                break;
+            }
+        }
+        if args.is_empty() || cursor != close {
+            return ArgListId::EMPTY;
+        }
+        self.boundary.intern_list(&args)
+    }
+
+    /// One written type argument in `[start, end)`: an identifier head
+    /// (`dynamic`/`Null` keep their dedicated shapes) with an optional
+    /// nested argument group and trailing `?`. Returns the type and the
+    /// index just past it, or `None` on any other spelling (prefixed
+    /// heads, function types, junk).
+    fn catch_arg_ty(
+        &self,
+        toks: &[dartq_scanner::Token],
+        start: usize,
+        end: usize,
+    ) -> Option<(Ty, usize)> {
+        let head = toks.get(start)?;
+        if head.kind != TokenKind::Identifier {
+            return None;
+        }
+        let name = &self.source[head.byte_range()];
+        let (mut ty, mut next) = match name {
+            "dynamic" => (Ty::Dynamic, start + 1),
+            "Null" => (Ty::Null, start + 1),
+            _ => (
+                Ty::Named {
+                    name: self.intern(name),
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                },
+                start + 1,
+            ),
+        };
+        if toks.get(next)?.kind == TokenKind::Lt {
+            let close = self.tokens.matching_end(next)?;
+            if close >= end {
+                return None;
+            }
+            let Ty::Named {
+                name: inner_name,
+                nullable: false,
+                ..
+            } = ty
+            else {
+                return None;
+            };
+            let mut inner = Vec::new();
+            let mut cursor = next + 1;
+            while cursor < close {
+                if toks[cursor].kind == TokenKind::Comma {
+                    return None;
+                }
+                let (arg, after) = self.catch_arg_ty(toks, cursor, close)?;
+                inner.push(arg);
+                cursor = match toks.get(after) {
+                    Some(t) if t.kind == TokenKind::Comma => after + 1,
+                    Some(_) => after,
+                    None => return None,
+                };
+            }
+            if inner.is_empty() || cursor != close {
+                return None;
+            }
+            ty = Ty::Named {
+                name: inner_name,
+                nullable: false,
+                args: self.boundary.intern_list(&inner),
+            };
+            next = close + 1;
+        }
+        if toks.get(next)?.kind == TokenKind::Question {
+            let Ty::Named { nullable, .. } = &mut ty else {
+                return None;
+            };
+            *nullable = true;
+            next += 1;
+        }
+        Some((ty, next))
     }
 
     /// `handle_label` (the colon fired): the pending label opens its own
