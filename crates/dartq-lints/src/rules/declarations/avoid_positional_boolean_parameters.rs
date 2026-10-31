@@ -11,19 +11,24 @@ use dartq_ast::mod_flags;
 
 /// Official:
 /// `pkg/linter/lib/src/rules/avoid_positional_boolean_parameters.dart`
-/// — the second positional parameter whose type is `bool` reports at
-/// the parameter (:98-109, `reportAtNode(second)`). Public
-/// declarations only (:51/:62/:82/:93); getters, setters, and
-/// operators skip (:76-78); a fixed signature (an augmentation or an
-/// override, :79 + the extensions :129-151) skips, and a generic
-/// function type inside a fixed signature skips (:116-126).
-/// Message: `diagnostic.g.dart` `avoidPositionalBooleanParameters`.
+/// — the FIRST positional parameter whose type is `bool` reports at the
+/// parameter (:50-54, `firstWhereOrNull(_isBoolean)` +
+/// `reportAtNode(parameterToLint)`). Public declarations only
+/// (:51/:62/:82/:93); getters, setters, and operators skip (:76-78); a
+/// fixed signature (an augmentation or an override, :79 + the
+/// extensions :129-151) skips, and a generic function type inside a
+/// fixed signature skips (:116-126). The augmentation skip keeps the
+/// ORIGINAL declaration of an augmented member lintable — an augmenting
+/// part's `augment A(bool b)` stays silent while the plain `A(bool b)`
+/// it augments reports. Message: `diagnostic.g.dart`
+/// `avoidPositionalBooleanParameters`.
 ///
 /// Approximations: the resolved parameter type folds to the written
 /// type spelling — exactly `bool` (an import-prefixed or aliased
 /// spelling under-reports); a `this.f` field formal reads the
 /// same-class field's written type. The override face folds to the
-/// same-file concrete ancestor scan (cross-file overrides
+/// same-file any-member ancestor scan — `implements` interfaces join the
+/// chain, the `getInheritedMember` cut (cross-file overrides
 /// under-report); augmentations read the member `ModSet` augment bit.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "avoid_positional_boolean_parameters",
@@ -67,12 +72,20 @@ fn check(c: &mut Check<'_>) {
                 if get_set_token(c, node).is_some() {
                     return; // getters/setters (:76-77)
                 }
-                // Operators skip (:78) — the name row answers.
-                if c.collect_direct(node)
-                    .iter()
-                    .any(|&kid| c.kind(kid) == NodeKind::OperatorName)
-                {
-                    return;
+                // Operators skip (:78) — the `OperatorName` tiles as the
+                // method row's LEFT SIBLING (bridge `handleOperatorName`
+                // precedes `beginMethod`), never as a child.
+                if let Some(parent) = c.unit.ast.parent(node) {
+                    let siblings = c.collect_direct(parent);
+                    if let Some(pos) = siblings.iter().position(|&kid| kid == node) {
+                        if siblings[..pos]
+                            .iter()
+                            .rev()
+                            .any(|&kid| c.kind(kid) == NodeKind::OperatorName)
+                        {
+                            return;
+                        }
+                    }
                 }
                 if fixed_signature(c, node) {
                     return; // (:79)
@@ -87,19 +100,31 @@ fn check(c: &mut Check<'_>) {
     }
 }
 
-/// `_checkParams` (:98-109): the second positional `bool` parameter
-/// reports; fewer candidates never do.
+/// `checkParams` (:50-54): the FIRST positional `bool` parameter reports
+/// — `firstWhereOrNull`, one report per declaration.
 fn check_params(c: &mut Check<'_>, owner: u32, class_row: Option<u32>) {
-    let mut count = 0;
     for param in formal_parameter_rows(c, owner) {
-        if !positional(c, param) || !bool_typed(c, param, class_row) {
-            continue;
-        }
-        count += 1;
-        if count == 2 {
-            c.report(c.utf16_span(param), &[]);
+        if positional(c, param) && bool_typed(c, param, class_row) {
+            c.report(param_span(c, param), &[]);
             return;
         }
+    }
+}
+
+/// The parameter's extent as the official node spans it: through the
+/// default value's last token. The row seals `end_incl` on
+/// `InitializerEnd`, which the parser sets to the peek AFTER the default
+/// expression (exclusive bound), so a defaulted parameter over-covers by
+/// the trailing `,`/`]`/`)` token — trim back to `InitializerEnd - 1`.
+fn param_span(c: &Check<'_>, param: u32) -> core::ops::Range<u32> {
+    let full = c.utf16_span(param);
+    match c
+        .field(param, PayloadField::InitializerEnd)
+        .filter(|&end| end != NONE_TOKEN)
+        .and_then(|end| c.utf16_end_of_token(end - 1))
+    {
+        Some(end) if end > full.start => full.start..end,
+        _ => full,
     }
 }
 
@@ -169,8 +194,10 @@ fn primary_is_private(c: &Check<'_>, primary: u32) -> bool {
 }
 
 /// `hasFixedSignature` (:129-138): an augmentation, or a method a
-/// same-file concrete ancestor declares (the inherited-member face;
-/// cross-file supertypes under-report).
+/// same-file supertype declares under the ANY-member cut
+/// (`getInheritedMember` — `implements` interfaces join the extends/with
+/// chain, `extensions.dart` :574-597; cross-file supertypes
+/// under-report).
 fn fixed_signature(c: &Check<'_>, method: u32) -> bool {
     if mod_flags(c.unit.ast, method) & AUGMENT_MEMBER_BIT != 0 {
         return true;
@@ -182,7 +209,7 @@ fn fixed_signature(c: &Check<'_>, method: u32) -> bool {
     let Some(class_row) = class_like_row(c) else {
         return false;
     };
-    same_file_ancestors(c, class_row, true)
+    same_file_ancestors(c, class_row, false)
         .iter()
         .any(|&ancestor| {
             body_members(c, ancestor)

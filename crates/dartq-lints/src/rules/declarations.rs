@@ -324,6 +324,35 @@ fn written_import_prefix(c: &Check<'_>, name: &str) -> bool {
     })
 }
 
+/// The unit's unprefixed import URIs (cooked string values) — the
+/// directive rows wherever the bridge tiles them: bare unit children or
+/// inside the directive's `TopLevelDeclaration` wrapper (a unit child
+/// runs `[MetadataStar, TopLevelDeclaration]`, the `Import` row under
+/// the wrapper). A prefixed import never binds the bare spelling, so
+/// its URI stays out.
+pub(crate) fn unprefixed_import_uris(c: &Check<'_>) -> Vec<String> {
+    let Some(root) = c.unit.ast.root() else {
+        return Vec::new();
+    };
+    let mut uris = Vec::new();
+    for top in c.collect_direct(root) {
+        for row in std::iter::once(top).chain(c.collect_direct(top)) {
+            if c.kind(row) != NodeKind::Import
+                || c.field(row, PayloadField::AsKeyword).unwrap_or(NONE_TOKEN) != NONE_TOKEN
+            {
+                continue;
+            }
+            uris.extend(
+                c.collect_direct(row)
+                    .into_iter()
+                    .filter(|&kid| c.kind(kid) == NodeKind::StringLiteral)
+                    .map(|kid| c.lexeme(c.head_token(kid)).trim_matches(['\'', '"']).to_owned()),
+            );
+        }
+    }
+    uris
+}
+
 /// Whether `node` is one of the scope binders that capture `name` for its
 /// whole span (the shadow walk's binder family: block locals, catch
 /// parameters, nested functions, loop variables, case pattern variables,
@@ -768,7 +797,7 @@ pub(crate) use crate::rules::get_set_token;
 // `isFeatureEnabled` posture in `registerNodeProcessors`.
 
 /// The `external` (member family) `ModSet` bit, bridge `mod_bits`.
-const EXTERNAL_MEMBER_BIT: u16 = 1 << 2;
+pub(crate) const EXTERNAL_MEMBER_BIT: u16 = 1 << 2;
 /// The `var`/`final`/`const` (member family) `ModSet` bit, bridge `mod_bits`.
 const VAR_FINAL_OR_CONST_MEMBER_BIT: u16 = 1 << 6;
 
@@ -807,10 +836,74 @@ fn modifier_keyword(c: &Check<'_>, ctor: u32, needle: &str) -> Option<u32> {
     None
 }
 
+/// The official `VariableDeclarationList` span in UTF-16: the declaration
+/// keyword head through the last variable's last token — the trailing `;`
+/// belongs to the statement/field wrapper, not the list node
+/// (`reportAtNode(list)` faces: prefer_const_declarations :62,
+/// specify_nonobvious_property_types :122/:127). The row's own token range
+/// carries the `;` (both seal paths pass it in), so the last non-`;` token
+/// of the range answers the official end even when the initializer's
+/// trailing groups (`const []`, `C.m<int>`) tile as flat siblings that the
+/// per-variable row spans miss. The local statement's row anchors at the
+/// NAME (the keyword and a written type sit before it in the statement
+/// wrapper), so the left edge reads the keyword/type face: the recovered
+/// keyword (the backward walk of `variables_declaration_keyword`) when
+/// one exists, `late` prefixes included (`late final int x` — the
+/// official's list node owns them; `late` is reserved, never a
+/// preceding identifier).
+pub(crate) fn variables_list_range(c: &Check<'_>, row: u32) -> Option<core::ops::Range<u32>> {
+    let mut first = crate::rules::variables_declaration_keyword(c, row)
+        .unwrap_or_else(|| c.head_token(row));
+    while let Some(prev) = first.checked_sub(1) {
+        if c.lexeme(prev) == "late" {
+            first = prev;
+        } else {
+            break;
+        }
+    }
+    let start = c.utf16_of_token(first)?;
+    let tokens = c.unit.ast.token_range(row);
+    let mut last = tokens.end;
+    while last > tokens.start {
+        last -= 1;
+        if c.lexeme(last) != ";" {
+            break;
+        }
+    }
+    if last == tokens.start && tokens.start == tokens.end {
+        return Some(start..start);
+    }
+    let end = c.utf16_end_of_token(last).unwrap_or(start);
+    Some(start..end)
+}
+
 /// The name identifier row of a class-like declaration: the production
 /// wrapper keeps it as the row's left sibling, hand-built trees nest it
 /// (`class_declaration_name` returning the node instead of the lexeme).
-fn container_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
+/// The constructor member's first token after comment and metadata (the
+/// `firstTokenAfterCommentAndMetadata` report anchor): the row anchors at
+/// the declared name — or the parameter group of the new-syntax unnamed
+/// form — so the head modifiers (`augment`/`external`/`const`/`factory`,
+/// and the new-syntax `new` keyword) sit in the bounded window before it.
+pub(crate) fn constructor_first_token(c: &Check<'_>, ctor: u32) -> u32 {
+    let mut token = c.head_token(ctor);
+    for _ in 0..5 {
+        let Some(prev) = token.checked_sub(1) else {
+            break;
+        };
+        if matches!(
+            c.lexeme(prev),
+            "augment" | "external" | "const" | "factory" | "new"
+        ) {
+            token = prev;
+        } else {
+            break;
+        }
+    }
+    token
+}
+
+pub(crate) fn container_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
     let is_name = |kid: u32| {
         c.kind(kid) == NodeKind::Identifier
             && matches!(
@@ -989,7 +1082,7 @@ fn within_try_block(c: &Check<'_>, node: u32) -> bool {
 // —— shared faces of the annotation / member-scan / trivial-body rules ——
 
 /// Whether a token is a plain identifier.
-fn is_identifier_token(c: &Check<'_>, token: u32) -> bool {
+pub(crate) fn is_identifier_token(c: &Check<'_>, token: u32) -> bool {
     c.unit
         .tokens
         .get(token as usize)

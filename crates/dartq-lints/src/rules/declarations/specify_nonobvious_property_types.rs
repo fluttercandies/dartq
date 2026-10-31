@@ -1,6 +1,6 @@
 use super::{Check, NodeKind, PayloadField, RuleSpec, fields_written_type, obvious_spelling};
 use crate::rules::{
-    MemberQuery, last_child, member_matches, same_file_ancestors, same_file_declaration, supertypes,
+    MemberQuery, member_matches, same_file_ancestors, same_file_declaration, supertypes,
 };
 
 /// Official: `pkg/linter/lib/src/rules/specify_nonobvious_property_types.dart:47-120`
@@ -78,9 +78,18 @@ fn check(c: &mut Check<'_>) {
             .collect_direct(var)
             .into_iter()
             .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer);
-        let obvious = initializer
-            .and_then(|init| last_child(c, init))
-            .is_some_and(|value| initializer_obvious(c, value));
+        // `A()..x..x..x` — the cascade row may tile after its target;
+        // the upstream face reads the cascade's own target
+        // (`obvious_types.dart:215-217`), not the trailing section rows.
+        let obvious = initializer.is_some_and(|init| {
+            let kids = c.collect_direct(init);
+            let value = kids
+                .iter()
+                .copied()
+                .find(|&kid| c.kind(kid) == NodeKind::Cascade)
+                .or(kids.last().copied());
+            value.is_some_and(|value| initializer_obvious(c, value))
+        });
         if !obvious {
             needs.push(var);
         }
@@ -89,7 +98,12 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     if declarators == 1 {
-        c.report(c.utf16_span(node), &[]);
+        // `reportAtNode(node)` (:122) — the list node: the keyword head
+        // through the last initializer token, the trailing `;` owned by
+        // the field/declaration wrapper excluded.
+        if let Some(range) = super::variables_list_range(c, node) {
+            c.report(range, &[]);
+        }
     } else {
         for var in needs {
             c.report(c.utf16_span(var), &[]);

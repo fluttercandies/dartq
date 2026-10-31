@@ -19,16 +19,16 @@ fn run(f: &Fixture, has_entry: bool, entries: &[(u32, bool)]) -> Vec<Lint> {
 }
 
 /// `test_topLevelFunction_unreachable` under an entry-less library —
-/// `if (entryPoints.isEmpty) return`: nothing reports at all.
+/// `if (entryPoints.isEmpty) return`: nothing reports at all. The entry
+/// read is LOCAL (the official walk is per-library): no `main`, no
+/// exempting annotation — the face's `has_entry` cannot revive it.
 #[test]
 fn library_without_entry_point_reports_nothing() {
-    let f = Fixture::parse("void main() {}\nvoid stray() {}\n");
-    let lints = run(
-        &f,
-        false,
-        &[flag(&f, "main", 0, false), flag(&f, "stray", 0, false)],
-    );
-    assert!(lints.is_empty(), "{lints:?}");
+    let f = Fixture::parse("void stray() {}\n");
+    assert!(run(&f, false, &[flag(&f, "stray", 0, false)]).is_empty());
+    // The imported-file shape: the workspace graph marked the row
+    // reachable (`has_entry` true), but this library declares no entry.
+    assert!(run(&f, true, &[flag(&f, "stray", 0, true)]).is_empty());
 }
 
 /// `test_topLevelFunction_unreachable` — an unreferenced top-level
@@ -53,18 +53,43 @@ fn unreachable_top_level_function_reports() {
     assert_eq!(lints[0].range.start, flag(&f, "stray", 0, false).0);
 }
 
-/// `test_topLevelFunction_reachable` / `..._Variable_reachable` —
-/// reachable flags stay silent, and a flag row absent from the face is
-/// the conservative no-report.
+/// `test_topLevelFunction_reachable`: a locally referenced declaration
+/// stays silent however the face flags it, and a flag row absent from
+/// the face is the conservative no-report. A `Some(true)` face row with
+/// no local reference reports — the engine graph is workspace-global
+/// (a type annotation, another library's edge); the closure is
+/// authoritative for a single-file library. Oracle-verified
+/// (`dart analyze`): the closure answers both directions — `used`
+/// reachable from `main` while `k` reports, then `used` reporting too
+/// once `main` drops the call.
 #[test]
 fn reachable_and_unrowed_declarations_stay_silent() {
+    let f = Fixture::parse("void main() {\n  used();\n}\nvoid used() {}\nint k = 0;\n");
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "used", 0, false)],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'k' in an executable library."
+    );
     let f = Fixture::parse("void main() {}\nvoid used() {}\nint k = 0;\n");
     let lints = run(
         &f,
         true,
         &[flag(&f, "main", 0, true), flag(&f, "used", 0, true)],
     );
-    assert!(lints.is_empty(), "{lints:?}");
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'used' in an executable library."
+    );
+    assert_eq!(
+        lints[1].message,
+        "Unreachable member 'k' in an executable library."
+    );
 }
 
 /// `test_topLevelFunction_reachable_private` — private declarations
@@ -109,13 +134,13 @@ fn visible_for_testing_annotation_exempts() {
 /// declaration splits per variable, each judged at its own name.
 #[test]
 fn top_level_variables_split_per_variable() {
-    let f = Fixture::parse("void main() {}\nint used = 0, dead = 0;\n");
+    let f = Fixture::parse("void main() {\n  print(used);\n}\nint used = 0, dead = 0;\n");
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "used", 0, true),
+            flag(&f, "used", 0, false),
             flag(&f, "dead", 0, false),
         ],
     );
@@ -132,14 +157,14 @@ fn top_level_variables_split_per_variable() {
 #[test]
 fn dead_member_of_reachable_class_reports_dead_class_wins() {
     let f = Fixture::parse(
-        "void main() {}\n\nclass C {\n  static void stray() {}\n}\n\nclass D {\n  static void dead() {}\n}\n",
+        "void main() {\n  C();\n}\n\nclass C {\n  static void stray() {}\n}\n\nclass D {\n  static void dead() {}\n}\n",
     );
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "C", 0, true),
+            flag(&f, "C", 1, true),
             flag(&f, "stray", 0, false),
             flag(&f, "D", 0, false),
             flag(&f, "dead", 0, false),
@@ -158,19 +183,19 @@ fn dead_member_of_reachable_class_reports_dead_class_wins() {
 
 /// `test_constructor_named_new` / unreachable named constructor — a
 /// named constructor displays `Type.name`; the unnamed face displays
-/// `Type.new`, anchored at its own class-name echo (`C();` — the third
-/// `C` lexeme, after the declaration and the `C.named` echo).
+/// `Type.new`, anchored at its own class-name echo. `main`'s `C.x`
+/// keeps the class reachable without counting either constructor.
 #[test]
 fn constructors_display_qualified_names() {
-    let f = Fixture::parse("void main() {}\n\nclass C {\n  C.named();\n  C();\n}\n");
+    let f = Fixture::parse("void main() {\n  C.x;\n}\n\nclass C {\n  C.named();\n  C();\n}\n");
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "C", 0, true),
+            flag(&f, "C", 1, true),
             flag(&f, "named", 0, false),
-            flag(&f, "C", 2, false),
+            flag(&f, "C", 3, false),
         ],
     );
     assert_eq!(lints.len(), 2, "{lints:?}");
@@ -190,14 +215,14 @@ fn constructors_display_qualified_names() {
 #[test]
 fn enum_constructors_and_constants_never_gather() {
     let f = Fixture::parse(
-        "void main() {}\n\nenum E {\n  a, b;\n\n  const E._();\n\n  static void stray() {}\n}\n",
+        "void main() {\n  E.a;\n}\n\nenum E {\n  a, b;\n\n  const E._();\n\n  static void stray() {}\n}\n",
     );
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "E", 0, true),
+            flag(&f, "E", 1, true),
             flag(&f, "stray", 0, false),
         ],
     );
@@ -212,13 +237,13 @@ fn enum_constructors_and_constants_never_gather() {
 #[test]
 fn test_harness_method_names_never_report() {
     let f = Fixture::parse(
-        "void main() {}\n\nclass T {\n  void test_one() {}\n  void solo_test_two() {}\n  void setUp() {}\n  void tearDown() {}\n  void setUpClass() {}\n  void tearDownClass() {}\n}\n",
+        "void main() {\n  T();\n}\n\nclass T {\n  void test_one() {}\n  void solo_test_two() {}\n  void setUp() {}\n  void tearDown() {}\n  void setUpClass() {}\n  void tearDownClass() {}\n}\n",
     );
     // `main` is the entry and `T` is reachable; the six unreachable
     // test-harness methods never gather, so nothing reports.
     let entries = [
         flag(&f, "main", 0, true),
-        flag(&f, "T", 0, true),
+        flag(&f, "T", 1, true),
         flag(&f, "test_one", 0, false),
         flag(&f, "solo_test_two", 0, false),
         flag(&f, "setUp", 0, false),
@@ -230,19 +255,38 @@ fn test_harness_method_names_never_report() {
     assert!(lints.is_empty(), "{lints:?}");
 }
 
-/// The widget-preview suppression: a public static `@Preview` member
-/// never reports; an ordinary dead static member next to it does.
+/// The widget-preview suppression resolves the annotation INTO the
+/// flutter widget-previews library (upstream `hasWidgetPreview`): a
+/// bare `@Preview` spelling with no flutter import does not suppress
+/// (the unit declares no resolvable `Preview`), the
+/// `package:flutter/widget_previews.dart` import surface does.
 #[test]
-fn static_preview_member_suppressed() {
-    let f = Fixture::parse(
-        "void main() {}\n\nclass C {\n  @Preview\n  static void previewed() {}\n\n  static void stray() {}\n}\n",
-    );
+fn preview_suppression_needs_the_flutter_import_surface() {
+    let bare = "void main() {\n  C.x;\n}\n\nclass C {\n  @Preview\n  static void previewed() {}\n\n  static void stray() {}\n}\n";
+    let f = Fixture::parse(bare);
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "C", 0, true),
+            flag(&f, "C", 1, true),
+            flag(&f, "previewed", 0, false),
+            flag(&f, "stray", 0, false),
+        ],
+    );
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'previewed' in an executable library."
+    );
+    let imported = "import 'package:flutter/widget_previews.dart';\n\nvoid main() {\n  C.x;\n}\n\nclass C {\n  @Preview\n  static void previewed() {}\n\n  static void stray() {}\n}\n";
+    let f = Fixture::parse(imported);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "C", 1, true),
             flag(&f, "previewed", 0, false),
             flag(&f, "stray", 0, false),
         ],
@@ -258,14 +302,15 @@ fn static_preview_member_suppressed() {
 /// their own names under the field row's metadata face.
 #[test]
 fn field_variables_report_at_their_names() {
-    let f = Fixture::parse("void main() {}\n\nclass C {\n  int live = 0, gone = 0;\n}\n");
+    let f =
+        Fixture::parse("void main() {\n  C.live;\n}\n\nclass C {\n  int live = 0, gone = 0;\n}\n");
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "C", 0, true),
-            flag(&f, "live", 0, true),
+            flag(&f, "C", 1, true),
+            flag(&f, "live", 1, false),
             flag(&f, "gone", 0, false),
         ],
     );
@@ -301,6 +346,88 @@ fn typedef_and_extension_display_their_names() {
     assert_eq!(
         lints[1].message,
         "Unreachable member 'Ext' in an executable library."
+    );
+}
+
+/// `test_class_reachable_referencedInTypeAnnotation_external*` /
+/// `…_referencedDeepInTypeAnnotation_externalMethodDeclaration`: the
+/// written type of an external variable and the return type of an
+/// external function mark their class reachable (the external
+/// implementation can instantiate it); a PARAMETER type does not
+/// (`test_class_unreachable_referencedInParameter_…`).
+#[test]
+fn external_variable_and_return_types_mark_reachable() {
+    for source in [
+        "void main() {\n  D().f;\n}\n\nclass C {}\n\nclass D {\n  external C f();\n}\n",
+        "void main() {\n  D().c;\n}\n\nclass C {}\n\nclass D {\n  external C? c;\n}\n",
+        "void main() {\n  D().f;\n}\n\nclass C {}\n\nclass D {\n  external C Function() f();\n}\n",
+    ] {
+        let f = Fixture::parse(source);
+        let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+        assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+    }
+
+    let f = Fixture::parse(
+        "void main() {\n  D().f;\n}\n\nclass C {}\n\nclass D {\n  external f(C c);\n}\n",
+    );
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'C' in an executable library."
+    );
+}
+
+/// `test_typedef_reachable_referencedIn*`: a `typedef A = B;` alias's
+/// invocation (`T()`, `T.named()`) resolves through to B's constructor
+/// element — B rides the alias's reachability. A type-parameter BOUND
+/// (`<T extends C>`) never counts (`visitNamedType`'s parent is a
+/// TypeParameter, not a TypeArgumentList).
+#[test]
+fn typedef_alias_invocation_reaches_target_but_bounds_do_not() {
+    let f = Fixture::parse("void main() {\n  T();\n}\n\nclass C {}\n\ntypedef T = C;\n");
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let f = Fixture::parse(
+        "void main() {\n  T.named();\n}\n\nclass C {\n  C.named();\n}\n\ntypedef T = C;\n",
+    );
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let f = Fixture::parse(
+        "void main() {\n  f();\n}\n\nclass C {}\n\nvoid f<T extends C>() {}\n",
+    );
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'C' in an executable library."
+    );
+}
+
+/// `test_typedef_reachable_referencedInTypeAnnotation_topLevelVariable`:
+/// a used variable's written type (`Cb? c;` with `c` assigned in
+/// `main`) rides the variable's dependency set — the typedef stays
+/// reachable. A reference inside a `ConstantPattern`
+/// (`test_constructor_unnamed_referencedInConstantPattern`) never
+/// counts (`_patternLevel`).
+#[test]
+fn variable_type_rides_reachability_and_const_patterns_do_not() {
+    let f = Fixture::parse(
+        "void main() {\n  c = () {};\n}\n\nCb? c;\n\ntypedef Cb = void Function();\n",
+    );
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let f = Fixture::parse(
+        "class C {\n  const C();\n}\n\nvoid main() {\n  f();\n}\n\nvoid f([C? c]) {\n  if (c case const C()) {}\n}\n",
+    );
+    let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'C' in an executable library."
     );
 }
 
@@ -1336,38 +1463,39 @@ fn doc_comment_reference_counts_as_use() {
 }
 
 /// The anti-reach arm: an expression-position identifier use counts
-/// (the official `visitSimpleIdentifier` — the face's under-reach over
-/// a local call site reads reachable). A plain type annotation does
-/// not — `TypeReference` rows never enter the counting set.
+/// (the official `visitSimpleIdentifier`) — the closure propagates
+/// through the call chain. A plain type annotation does not count —
+/// `TypeReference` rows never enter the reference set, and a
+/// `Some(true)` face row riding only one reports (the official's
+/// NamedType filter over the workspace-global engine graph).
 #[test]
 fn expression_use_counts_type_annotation_does_not() {
-    // The counted arm: `dead()` at the call site is an Expression
-    // context — the face flags it unreachable, the use suppresses.
-    let source = "void main() {}\nvoid dead() {}\nvoid live() { dead(); }\n";
+    // The counted arm: `dead()` inside `live()` — `live` is called
+    // from `main`, so the closure reaches `dead` through it.
+    let source = "void main() {\n  live();\n}\nvoid live() { dead(); }\nvoid dead() {}\n";
     let f = Fixture::parse(source);
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "live", 0, true),
+            flag(&f, "live", 0, false),
             flag(&f, "dead", 0, false),
         ],
     );
     assert!(lints.is_empty(), "{lints:?}");
 
-    // The type-reference counterface: `Dead` appearing only in
-    // annotations keeps its report (the official's NamedType filter —
-    // a plain type reference never marks the declaration reachable).
-    let source = "void main() {}\nclass Dead {}\nvoid f(Dead d) {}\n";
+    // The type-reference counterface: `Dead` appearing only in a type
+    // annotation keeps its report even under a `Some(true)` face row.
+    let source = "void main() {\n  f(0);\n}\nvoid f(Object o) {}\nclass Dead {}\n";
     let f = Fixture::parse(source);
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "Dead", 0, false),
-            flag(&f, "f", 0, true),
+            flag(&f, "f", 0, false),
+            flag(&f, "Dead", 0, true),
         ],
     );
     assert_eq!(lints.len(), 1, "{lints:?}");
@@ -1375,4 +1503,299 @@ fn expression_use_counts_type_annotation_does_not() {
         lints[0].message,
         "Unreachable member 'Dead' in an executable library."
     );
+}
+
+// —— the per-library closure's shape pins ————————————————————————
+
+/// `test_topLevelGetter_unreachable` — `INFO|…|4:9|1|'g'`: a top-level
+/// getter reports at its name (the declaration-name read is
+/// context-filtered — a return-type identifier never answers for the
+/// name).
+#[test]
+fn top_level_getter_reports() {
+    let f = Fixture::parse("void main() {}\nint get g => 7;\n");
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "g", 0, false)],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'g' in an executable library."
+    );
+    assert_eq!(lints[0].range.start, flag(&f, "g", 0, false).0);
+}
+
+/// The operator visits (`visitBinaryExpression`,
+/// `visitPrefixExpression`, `visitPostfixExpression`,
+/// `visitIndexExpression`): every operator spelling the body uses
+/// stays reachable — `[]`, `[]=` (the assignment target), `<`, `+`
+/// (from `++`), unary `-`, `~`.
+#[test]
+fn operator_uses_keep_operators_reachable() {
+    let source = concat!(
+        "void main() {\n",
+        "  final v = V();\n",
+        "  v[0];\n",
+        "  v[0] = 1;\n",
+        "  v < 1;\n",
+        "  v++;\n",
+        "  -v;\n",
+        "  ~v;\n",
+        "}\n",
+        "\n",
+        "class V {\n",
+        "  int operator [](int i) => 0;\n",
+        "  void operator []=(int i, int x) {}\n",
+        "  bool operator <(Object o) => true;\n",
+        "  V operator +(int o) => this;\n",
+        "  V operator -() => this;\n",
+        "  V operator ~() => this;\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let entries = [
+        flag(&f, "main", 0, true),
+        flag(&f, "V", 1, true),
+        flag(&f, "[]", 0, false),
+        flag(&f, "[]=", 0, false),
+        flag(&f, "<", 1, false),
+        flag(&f, "+", 0, false),
+        flag(&f, "-", 1, false),
+        flag(&f, "~", 1, false),
+    ];
+    let lints = run(&f, true, &entries);
+    assert!(lints.is_empty(), "{lints:?}");
+}
+
+/// `test_constructor_named_reachableViaRedirection` — the redirecting
+/// `this.named()` initializer marks the target constructor and the
+/// class (`visitRedirectingConstructorInvocation`): both constructors
+/// and the class stay reachable.
+#[test]
+fn redirect_marks_the_target_constructor() {
+    let source = concat!(
+        "void main() {\n",
+        "  C.two();\n",
+        "}\n",
+        "\n",
+        "class C {\n",
+        "  C.named();\n",
+        "  C.two() : this.named();\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let entries = [
+        flag(&f, "main", 0, true),
+        flag(&f, "C", 1, true),
+        flag(&f, "named", 1, false),
+        flag(&f, "C", 3, false),
+    ];
+    let lints = run(&f, true, &entries);
+    assert!(lints.is_empty(), "{lints:?}");
+}
+
+/// `test_constructor_named_new` — `INFO|…|7:7|5|'C.named'`: a
+/// `new`-prefixed declaration displays `Type.written`, anchored at the
+/// written name (`new named();`).
+#[test]
+fn new_named_constructor_displays_the_written_name() {
+    let source = concat!(
+        "void main() {\n",
+        "  C;\n",
+        "}\n",
+        "\n",
+        "class C {\n",
+        "  new named();\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "C", 1, true),
+            flag(&f, "named", 0, false),
+        ],
+    );
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'C.named' in an executable library."
+    );
+    assert_eq!(lints[0].range.start, flag(&f, "named", 0, false).0);
+}
+
+/// `test_extensionType_member_redeclare_unreachable` —
+/// `INFO|…|13:8|1|'m'`: an extension type's members never take the
+/// override skip (`containerElement: null`), and the closure's
+/// receiver-resolved key (`c.m()` with `var c = C()` marks `C.m`, not
+/// every `m`) leaves the redeclared `E.m` unreachable — even where the
+/// face flags it reachable.
+#[test]
+fn extension_type_redeclared_member_reports() {
+    let source = concat!(
+        "void main() {\n",
+        "  var c = C();\n",
+        "  c.m();\n",
+        "  E(c);\n",
+        "}\n",
+        "\n",
+        "class C {\n",
+        "  void m() {}\n",
+        "}\n",
+        "\n",
+        "extension type E(C c) implements C {\n",
+        "  void m() {}\n",
+        "}\n",
+    );
+    let f = Fixture::parse(source);
+    let entries = [
+        flag(&f, "main", 0, true),
+        flag(&f, "C", 1, true),
+        flag(&f, "m", 1, true),
+        flag(&f, "E", 1, true),
+        flag(&f, "m", 2, true),
+    ];
+    let lints = run(&f, true, &entries);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'm' in an executable library."
+    );
+    assert_eq!(lints[0].range.start, flag(&f, "m", 2, false).0);
+}
+
+/// `visitNamedType`'s exception list still counts: a type-argument
+/// position (`List<C>`) and a typedef-alias reference keep their
+/// declarations reachable through the closure.
+#[test]
+fn type_arguments_and_aliases_still_count() {
+    let source = concat!(
+        "void main() {\n",
+        "  f<List<C>>();\n",
+        "}\n",
+        "\n",
+        "void f(List<C> x) {}\n",
+        "\n",
+        "class C {}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "f", 0, false),
+            flag(&f, "C", 1, false),
+        ],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let alias = concat!(
+        "typedef T = int;\n",
+        "\n",
+        "void main() {\n",
+        "  T x = 1;\n",
+        "}\n",
+    );
+    let f = Fixture::parse(alias);
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "T", 0, false)],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+}
+
+/// `test_topLevelFunction_vmEntryPoint_const` — the const alias
+/// `const entryPoint = pragma('vm:entry-point')` seeds an entry
+/// through `@entryPoint` (`computeConstantValue`'s alias following):
+/// `f6` never reports, and the alias const itself stays reachable
+/// through the annotation's reference.
+#[test]
+fn vm_entry_point_const_alias_seeds_an_entry() {
+    let source = concat!(
+        "const entryPoint = pragma('vm:entry-point');\n",
+        "\n",
+        "@entryPoint\n",
+        "void f6() {}\n",
+        "\n",
+        "void main() {}\n",
+    );
+    let f = Fixture::parse(source);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "entryPoint", 0, false),
+            flag(&f, "f6", 0, false),
+        ],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+}
+
+/// `test_widgetPreview_topLevelFunction_const` (the alias suppresses
+/// through the flutter import surface) and
+/// `test_widgetPreview_topLevelFunction_customPreviewClass` (a
+/// unit-declared `Preview` class shadows the annotation — `f6` AND the
+/// unreferenced `Preview` class report; the const constructor stays
+/// suppressed behind its dead container).
+#[test]
+fn widget_preview_alias_and_custom_preview_class() {
+    let imported = concat!(
+        "import 'package:flutter/widget_previews.dart';\n",
+        "\n",
+        "const preview = Preview();\n",
+        "\n",
+        "@preview\n",
+        "void f6() {}\n",
+        "\n",
+        "void main() {}\n",
+    );
+    let f = Fixture::parse(imported);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "preview", 0, false),
+            flag(&f, "f6", 0, false),
+        ],
+    );
+    assert!(lints.is_empty(), "{lints:?}");
+
+    let custom = concat!(
+        "class Preview {\n",
+        "  const Preview();\n",
+        "}\n",
+        "\n",
+        "@Preview()\n",
+        "void f6() {}\n",
+        "\n",
+        "void main() {}\n",
+    );
+    let f = Fixture::parse(custom);
+    let lints = run(
+        &f,
+        true,
+        &[
+            flag(&f, "main", 0, true),
+            flag(&f, "Preview", 0, false),
+            flag(&f, "f6", 0, false),
+        ],
+    );
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'Preview' in an executable library."
+    );
+    assert_eq!(
+        lints[1].message,
+        "Unreachable member 'f6' in an executable library."
+    );
+    assert_eq!(lints[1].range.start, flag(&f, "f6", 0, false).0);
 }

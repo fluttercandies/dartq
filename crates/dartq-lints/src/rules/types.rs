@@ -214,38 +214,143 @@ fn raw_generic_face(c: &Check<'_>, row: u32) -> Option<(Vec<String>, bool)> {
         // The `TypeVariables` row tiles under the declaration's
         // `TopLevelDeclaration` wrapper (a sibling of the class-like row),
         // not inside the class-like itself.
-        let type_variables = c
-            .unit
-            .ast
-            .parent(decl)
-            .map(|wrapper| {
-                c.collect_direct(wrapper)
-                    .into_iter()
-                    .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
-            })
-            .flatten()
-            .or_else(|| {
-                c.collect_direct(decl)
-                    .into_iter()
-                    .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
-            })?;
+        let type_variables = declaration_type_variables(c, decl)?;
         let optional = optional_type_args_annotation(c, decl);
-        let fills = c
-            .collect_direct(type_variables)
-            .into_iter()
-            .filter(|&tv| c.kind(tv) == NodeKind::TypeVariable)
-            .map(|tv| match first_type_child(c, tv) {
-                Some(bound) => written_display(c, bound),
-                None => "dynamic".to_owned(),
-            })
-            .collect();
-        return Some((fills, optional));
+        return Some((type_variable_fills(c, type_variables), optional));
     }
+    match same_file_alt_fills(c, name) {
+        // `Some(None)`: the name resolves same-file to a declaration
+        // without type variables — the resolution is exclusive, the
+        // core table never answers behind it.
+        Some(Resolved::NotGeneric) => None,
+        Some(Resolved::Generic(fills, optional)) => Some((fills, optional)),
+        None => core_generic_fills(name).map(|fills| (fills, false)),
+    }
+}
+
+enum Resolved {
+    Generic(Vec<String>, bool),
+    NotGeneric,
+}
+
+/// The same-file non-class-like generic spellings — extension types and
+/// typedefs. `None` = the name does not resolve same-file;
+/// [`Resolved::NotGeneric`] = it resolves without type variables.
+fn same_file_alt_fills(c: &Check<'_>, name: &str) -> Option<Resolved> {
+    // Extension types: the name is the `Name` payload token; the type
+    // variables tile under the same `TopLevelDeclaration` wrapper as the
+    // class-like layout.
+    let Some(root) = c.unit.ast.root() else {
+        return None;
+    };
+    for top in c.collect_direct(root) {
+        if c.kind(top) != NodeKind::TopLevelDeclaration {
+            continue;
+        }
+        for kid in c.collect_direct(top) {
+            match c.kind(kid) {
+                NodeKind::ExtensionTypeDeclaration => {
+                    if c.field_token(kid, PayloadField::Name)
+                        .is_some_and(|token| c.lexeme(token) == name)
+                    {
+                        let optional = optional_type_args_annotation(c, kid);
+                        return Some(match type_variables_row_of(c, top) {
+                            Some(tv) => Resolved::Generic(type_variable_fills(c, tv), optional),
+                            None => Resolved::NotGeneric,
+                        });
+                    }
+                }
+                NodeKind::Typedef => {
+                    let ctx = dartq_parser::IdentifierContext::TypedefDeclaration as u32;
+                    let named = c.collect_direct(kid).into_iter().any(|row| {
+                        c.kind(row) == NodeKind::Identifier
+                            && c.field(row, PayloadField::Context) == Some(ctx)
+                            && c.lexeme(c.head_token(row)) == name
+                    });
+                    if named {
+                        // The typedef's type variables tile inside the
+                        // `Typedef` row (emitted after `begin_typedef`).
+                        let optional = optional_type_args_annotation(c, kid);
+                        return Some(match type_variables_row_of(c, kid) {
+                            Some(tv) => Resolved::Generic(type_variable_fills(c, tv), optional),
+                            None => Resolved::NotGeneric,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn type_variables_row_of(c: &Check<'_>, owner: u32) -> Option<u32> {
+    c.collect_direct(owner)
+        .into_iter()
+        .find(|&row| c.kind(row) == NodeKind::TypeVariables)
+}
+
+/// Whether `name` spells a generic type on the pure-syntax face — the
+/// same resolution order as [`raw_generic_face`] (the same-file
+/// class-like table first, then the extension-type/typedef spellings,
+/// then the core generics; the `element.typeParameters.isNotEmpty`
+/// stand-in for the invocation-callee arm). The returned flag is the
+/// `@optionalTypeArgs` word — an exempt invocation callee.
+fn raw_generic_name(c: &Check<'_>, name: &str) -> Option<bool> {
+    if let Some(decl) = crate::rules::same_file_declaration(c, name) {
+        // The class-like `TypeVariables` walk of [`raw_generic_face`]:
+        // the wrapper's row first, the declaration's own second — a
+        // same-file class-like without type variables answers `None`
+        // (the exclusive resolution, the core table never answers
+        // behind it).
+        return declaration_type_variables(c, decl)
+            .map(|_| optional_type_args_annotation(c, decl));
+    }
+    match same_file_alt_fills(c, name) {
+        Some(Resolved::Generic(_, optional)) => Some(optional),
+        Some(Resolved::NotGeneric) => None,
+        None => core_generic_fills(name).map(|_| false),
+    }
+}
+
+/// The `TypeVariables` row of a same-file class-like declaration — the
+/// wrapper's row (the class-like layout) or the declaration's own.
+fn declaration_type_variables(c: &Check<'_>, decl: u32) -> Option<u32> {
+    c.unit
+        .ast
+        .parent(decl)
+        .map(|wrapper| {
+            c.collect_direct(wrapper)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+        })
+        .flatten()
+        .or_else(|| {
+            c.collect_direct(decl)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+        })
+}
+
+fn core_generic_fills(name: &str) -> Option<Vec<String>> {
     let arity = CORE_GENERICS
         .iter()
         .find(|(core, _)| *core == name)
         .map(|&(_, arity)| arity)?;
-    Some((vec!["dynamic".to_owned(); arity], false))
+    Some(vec!["dynamic".to_owned(); arity])
+}
+
+/// Each type variable's fill (the `instantiateToBounds` face): a bounded
+/// variable fills with its bound, an unbounded one with `dynamic`.
+fn type_variable_fills(c: &Check<'_>, type_variables: u32) -> Vec<String> {
+    c.collect_direct(type_variables)
+        .into_iter()
+        .filter(|&tv| c.kind(tv) == NodeKind::TypeVariable)
+        .map(|tv| match first_type_child(c, tv) {
+            Some(bound) => written_display(c, bound),
+            None => "dynamic".to_owned(),
+        })
+        .collect()
 }
 
 /// Whether the class-like declaration carries an `@optionalTypeArgs`
@@ -4464,7 +4569,7 @@ pub(crate) mod always_specify_types {
         Check, NodeKind, PayloadField, RuleSpec, TYPE_FAMILY, first_type_child, raw_generic_face,
         type_arguments_row,
     };
-    use crate::rules::{is_just_underscores, variables_declaration_keyword};
+    use crate::rules::{is_just_underscores, slice, variables_declaration_keyword};
 
     const PROBLEM: &str = "Missing type annotation.";
     const ADD_TYPE: &str = "Try adding a type annotation.";
@@ -4504,6 +4609,11 @@ pub(crate) mod always_specify_types {
             NodeKind::VariablesDeclaration,
             NodeKind::FormalParameter,
             NodeKind::DeclaredVariablePattern,
+            NodeKind::ListLiteral,
+            NodeKind::SetOrMapLiteral,
+            NodeKind::ImplicitCreation,
+            NodeKind::NewExpression,
+            NodeKind::Send,
         ],
         check,
     );
@@ -4514,8 +4624,179 @@ pub(crate) mod always_specify_types {
             NodeKind::VariablesDeclaration => variable_list(c),
             NodeKind::FormalParameter => formal(c),
             NodeKind::DeclaredVariablePattern => pattern(c),
+            NodeKind::ListLiteral | NodeKind::SetOrMapLiteral => literal(c),
+            NodeKind::ImplicitCreation | NodeKind::NewExpression => creation(c),
+            NodeKind::Send => send_creation(c),
             _ => {}
         }
+    }
+
+    /// The bare-invocation creation face on the send tiling (`C()`,
+    /// `C.named()`, `C.new()` — the analyzer's implicit-new
+    /// `InstanceCreationExpression`, whose `ConstructorName.type`
+    /// `NamedType` the official visit covers): the invocation's type
+    /// identifier — the bare form's send head, the named form's access-run
+    /// receiver — of a raw-generic spelling reports add-type at that
+    /// identifier. Written callee type arguments (`C<int>()`) exempt; a
+    /// `NoArguments` send is a tear-off, not a creation.
+    fn send_creation(c: &mut Check<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, args)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        let Some(args) = args else {
+            return;
+        };
+        if c.kind(kids[head]) != NodeKind::Identifier {
+            return;
+        }
+        // The named forms (`C.named()`, `C.new()`): the access run's
+        // leading identifier is the creation type; the bare form's head
+        // already is. The run filters the access/send markers, leaving
+        // the semantic pieces — its first row is the receiver-most.
+        let callee = if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
+            slice::access_run(c, &kids[..head + 1])
+                .into_iter()
+                .next()
+        } else {
+            Some(kids[head])
+        };
+        let Some(callee) = callee else {
+            return;
+        };
+        if c.kind(callee) != NodeKind::Identifier {
+            return;
+        }
+        // Written callee type arguments exempt (the pieces between the
+        // type and the argument list).
+        let args_pos = kids.iter().position(|&kid| kid == args);
+        if args_pos.is_some_and(|end| {
+            kids[..end]
+                .iter()
+                .any(|&kid| c.kind(kid) == NodeKind::TypeArguments)
+        }) {
+            return;
+        }
+        let name = c.lexeme(c.head_token(callee));
+        // `!element.metadata.hasOptionalTypeArgs` (:127-131) — the
+        // exempt callee face rides the same resolution; only a generic
+        // NON-exempt callee reports.
+        if super::raw_generic_name(c, name) != Some(false) {
+            return;
+        }
+        let token = c.head_token(callee);
+        let Some(start) = c.utf16_of_token(token) else {
+            return;
+        };
+        let end = c.utf16_end_of_token(token).unwrap_or(start);
+        c.report(start..end, &[]);
+    }
+
+    /// `checkLiteral` (:60-66/:186-189): a list/set/map literal without
+    /// written type arguments reports add-type at `literal.beginToken`
+    /// (the `const` keyword when written, else the bracket). The typed
+    /// literal's `TypeArguments` row tiles as the immediate preceding
+    /// sibling — either beside the literal itself or, when the
+    /// expression wraps in a send group (which filters the marker rows
+    /// out of its own kids), beside that wrapper.
+    fn literal(c: &mut Check<'_>) {
+        let row = c.node();
+        if typed_literal(c, row) {
+            return;
+        }
+        let head = crate::rules::const_keyword(c, row).unwrap_or_else(|| c.head_token(row));
+        let Some(start) = c.utf16_of_token(head) else {
+            return;
+        };
+        let end = match c.utf16_end_of_token(head) {
+            Some(end) if end > start => end,
+            // The empty `[]`/`{}` scans as one composite token; the
+            // parser splices zero-width bracket synthetics for the
+            // literal's anchors — `beginToken` is still the one-char
+            // bracket.
+            _ => start + 1,
+        };
+        c.report(start..end, &[]);
+    }
+
+    /// Whether the literal carries written type arguments: the
+    /// `TypeArguments` row ends on the literal's head token (token-index
+    /// adjacency — `<int>` closes directly before the `[`). The literal
+    /// row seals AFTER its elements (the pieces tile before it in
+    /// creation order), so the immediate-sibling read misses; adjacency
+    /// is exact: a sibling literal's type arguments end on ITS bracket,
+    /// never this one's. One wrapper level up covers the send-grouped
+    /// tiling.
+    fn typed_literal(c: &Check<'_>, row: u32) -> bool {
+        let mut current = row;
+        for _ in 0..2 {
+            let Some(parent) = c.unit.ast.parent(current) else {
+                return false;
+            };
+            let head = c.head_token(current);
+            if c.collect_direct(parent).into_iter().any(|kid| {
+                c.kind(kid) == NodeKind::TypeArguments
+                    && c.unit.ast.token_range(kid).end == head
+            }) {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    /// The `visitNamedType` face on a bare invocation callee (:117-132):
+    /// `C()`, `new C()` of a generic type with no written type arguments
+    /// — the analyzer's `ConstructorName.type` NamedType — reports
+    /// add-type at the callee's identifier. The callee identifier row
+    /// tiles before the `Arguments` row inside the creation.
+    fn creation(c: &mut Check<'_>) {
+        let row = c.node();
+        let kids = c.collect_direct(row);
+        let Some(args_at) = kids.iter().position(|&kid| c.kind(kid) == NodeKind::Arguments)
+        else {
+            return;
+        };
+        let Some(&name_row) = kids[..args_at].iter().find(|&kid| {
+            matches!(
+                c.kind(*kid),
+                NodeKind::Identifier | NodeKind::ConstructorReference
+            )
+        }) else {
+            return;
+        };
+        // The callee's own type arguments (`C<int>()`) tile inside the
+        // creation before the arguments.
+        if kids[..args_at]
+            .iter()
+            .any(|&kid| c.kind(kid) == NodeKind::TypeArguments)
+        {
+            return;
+        }
+        let name = if c.kind(name_row) == NodeKind::Identifier {
+            Some(c.lexeme(c.head_token(name_row)))
+        } else {
+            c.collect_direct(name_row)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                .map(|kid| c.lexeme(c.head_token(kid)))
+        };
+        let Some(name) = name else {
+            return;
+        };
+        // `!element.metadata.hasOptionalTypeArgs` (:127-131) — only a
+        // generic non-exempt callee reports.
+        if super::raw_generic_name(c, name) != Some(false) {
+            return;
+        }
+        let token = c.head_token(name_row);
+        let Some(start) = c.utf16_of_token(token) else {
+            return;
+        };
+        let end = c.utf16_end_of_token(token).unwrap_or(start);
+        c.report(start..end, &[]);
     }
 
     /// `visitNamedType` (:117-132): a raw generic type reports add-type at
@@ -4639,6 +4920,13 @@ pub(crate) mod always_specify_types {
     /// the add-type code (the unwritten formal's static type is dynamic).
     fn formal(c: &mut Check<'_>) {
         let row = c.node();
+        // Catch-clause parameters are not `RegularFormalParameter`s in the
+        // analyzer AST (`CatchClause.exceptionParameter` is a bare
+        // parameter of the clause), so the registered visitor never sees
+        // them — `catch (e)` stays silent.
+        if c.path.iter().any(|&anc| c.kind(anc) == NodeKind::CatchClause) {
+            return;
+        }
         // Receiver formals are the Field/Super formal visitors upstream and
         // never enter (:135 registration).
         if c.field(row, PayloadField::Receiver)
@@ -6586,6 +6874,56 @@ mod wave1_types_tests {
         assert_eq!(f.run(&one_rule("always_specify_types")).len(), 1);
     }
 
+    /// `test_extensionType_optionalTypeArgs`/`test_interfaceType_…`/
+    /// `test_typedefType_…` and `doc_good_4`/`doc_good_6`:
+    /// `!element.metadata.hasOptionalTypeArgs` (:127-131) — a bare
+    /// reference to an `@optionalTypeArgs` generic stays silent in the
+    /// annotation AND the invocation-callee faces, across class,
+    /// extension-type and typedef spellings.
+    #[test]
+    fn specify_optional_type_args_passes() {
+        for source in [
+            "import 'package:meta/meta.dart';\n\n@optionalTypeArgs\nextension type E<T>(int i) { }\n\nvoid f() {\n  E e = E(1);\n}\n",
+            "import 'package:meta/meta.dart';\n\n@optionalTypeArgs\nclass C<T> {}\n\nC c = C();\n",
+            "import 'package:meta/meta.dart';\n\nclass C<T> { }\n\n@optionalTypeArgs\ntypedef F<T> = C<T>;\n\nvoid f() {\n  F f = F();\n}\n",
+            "import 'package:meta/meta.dart';\n\n@optionalTypeArgs\nclass Key<T> {}\n\nvoid main() {\n  Key s = Key();\n}\n",
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("always_specify_types"));
+            assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+        }
+    }
+
+    /// `test_listLiteral_ok`/`test_setLiteral_ok`/`test_mapLiteral_ok`
+    /// and `doc_good_2`: a typed literal (`<int>[1]`, `<int>{1}`,
+    /// `<int, String>{1: ''}`) has written type arguments —
+    /// `checkLiteral` (:60-66) stays silent. A typed destructuring
+    /// pattern (`test_listPattern_destructured_ok`) stays silent too.
+    #[test]
+    fn specify_typed_literals_stay_silent() {
+        for source in [
+            "f() {\n  return <int>[1];\n}\n",
+            "f() {\n  return <int>{1};\n}\n",
+            "f() {\n  return <int, String>{1: ''};\n}\n",
+            "Set<int> items = <int>{1, 2};\n",
+            "f() {\n  var [int a] = <int>[1];\n  print(a);\n}\n",
+            "f() {\n  var {'a': int a} = <String, int>{'a': 1};\n  print(a);\n}\n",
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("always_specify_types"));
+            assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+        }
+    }
+
+    /// `test_listLiteral_inferredTypeArgument`: the untyped literal
+    /// reports at `literal.beginToken` — the bracket, a one-char span.
+    #[test]
+    fn specify_untyped_literal_span() {
+        let f = Fixture::parse("List<String> x = [];\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let open = f.source.find("[").unwrap() as u32;
+        assert_eq!(lints[0].range, open..open + 1, "{lints:?}");
+    }
+
     /// The for-in declared identifier: an untyped loop variable reports at
     /// its keyword, a typed one stays silent.
     #[test]
@@ -6630,14 +6968,13 @@ mod wave1_types_tests {
         assert!(f.run(&one_rule("always_specify_types")).is_empty());
     }
 
-    /// `test_catchVariable_omitted` — an untyped catch variable reports.
+    /// `test_catchVariable_omitted` — an untyped catch variable stays
+    /// silent (`assertNoDiagnostics`): a catch-clause parameter is not a
+    /// `RegularFormalParameter`, so the registered visitor never sees it.
     #[test]
-    fn specify_catch_variable_reports() {
-        let f = Fixture::parse("void f() {\n  try {} catch (e) {}\n}\n");
-        let lints = f.run(&one_rule("always_specify_types"));
-        assert_eq!(lints.len(), 1, "{lints:?}");
-        let e = tok(&f.source, &f.tokens, "e", 0);
-        assert_eq!(lints[0].range.start, utf16_at(&f, e));
+    fn specify_catch_variable_stays_silent() {
+        let f = Fixture::parse("void f() {\n  try {} catch (e) {\n    print(e);\n  }\n}\n");
+        assert!(f.run(&one_rule("always_specify_types")).is_empty());
     }
 
     // —— avoid_futureor_void ——————————————————————————————————————————————

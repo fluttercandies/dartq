@@ -599,10 +599,11 @@ fn constructor_name_reports_new() {
     let lints = f.run(&one_rule("unnecessary_constructor_name"));
     assert_eq!(lints.len(), 1);
     assert_eq!(lints[0].message, "Unnecessary '.new' constructor name.");
-    assert_eq!(
-        lints[0].range.start,
-        utf16_at(&f, tok(&f.source, &f.tokens, "new", 0))
-    );
+    let new_kw = tok(&f.source, &f.tokens, "new", 0);
+    let start = utf16_at(&f, new_kw);
+    assert_eq!(lints[0].range.start, start);
+    // The whole `new` token — `reportAtToken(node.name)`, not a point.
+    assert_eq!(lints[0].range.end, start + 3);
 }
 
 /// An unnamed constructor has no name token to check; a differently
@@ -644,10 +645,10 @@ fn creation_face_reports_dot_new() {
     let f = Fixture::parse("void f() { Foo.new(1); }\n");
     let lints = f.run(&one_rule("unnecessary_constructor_name"));
     assert_eq!(lints.len(), 1);
-    assert_eq!(
-        lints[0].range.start,
-        utf16_at(&f, tok(&f.source, &f.tokens, "new", 0))
-    );
+    let new_kw = tok(&f.source, &f.tokens, "new", 0);
+    let start = utf16_at(&f, new_kw);
+    assert_eq!(lints[0].range.start, start);
+    assert_eq!(lints[0].range.end, start + 3);
 }
 
 /// A constructor tear-off (`Foo.new` without the invocation) is not an
@@ -5001,7 +5002,8 @@ fn test_types_in_equals_negative_faces() {
 
 // —— avoid_positional_boolean_parameters ———————————————————————————————
 
-/// A second positional `bool` parameter reports at the parameter.
+/// The FIRST positional `bool` parameter reports at the parameter
+/// (`firstWhereOrNull`, :50-54).
 #[test]
 fn avoid_positional_bool_reports_a_function() {
     let f = Fixture::parse("void f(bool p1, bool p2) {}\n");
@@ -5011,30 +5013,30 @@ fn avoid_positional_bool_reports_a_function() {
         lints[0].message,
         "'bool' parameters should be named parameters."
     );
-    let param = tok(&f.source, &f.tokens, "bool", 1);
+    let param = tok(&f.source, &f.tokens, "bool", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, param));
 }
 
-/// A lone positional `bool`, named booleans, and a third bool never
-/// report twice (`reportAtNode(second)`).
+/// A lone positional `bool` reports once; named booleans pass; three
+/// bools report once (the first — `firstWhereOrNull`).
 #[test]
 fn avoid_positional_bool_counts_pass() {
     let f = Fixture::parse("void f(bool b) {}\n");
-    assert!(
-        f.run(&one_rule("avoid_positional_boolean_parameters"))
-            .is_empty()
-    );
+    let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let param = tok(&f.source, &f.tokens, "bool", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, param));
+
     let f = Fixture::parse("void f({bool p1, bool p2}) {}\n");
     assert!(
         f.run(&one_rule("avoid_positional_boolean_parameters"))
             .is_empty()
     );
     let f = Fixture::parse("void f(bool p1, bool p2, bool p3) {}\n");
-    assert_eq!(
-        f.run(&one_rule("avoid_positional_boolean_parameters"))
-            .len(),
-        1
-    );
+    let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let param = tok(&f.source, &f.tokens, "bool", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, param));
 }
 
 /// Private declarations skip (:51/:62/:93) — the function name and
@@ -5054,7 +5056,8 @@ fn avoid_positional_bool_private_passes() {
 }
 
 /// The fixed-signature face: a same-file override skips (:79 + the
-/// extensions) while the superclass declaration reports.
+/// extensions) while the superclass declaration reports at its first
+/// positional bool.
 #[test]
 fn avoid_positional_bool_override_passes() {
     let f = Fixture::parse(
@@ -5062,31 +5065,46 @@ fn avoid_positional_bool_override_passes() {
     );
     let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
-    let first = tok(&f.source, &f.tokens, "bool", 1);
+    let first = tok(&f.source, &f.tokens, "bool", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, first));
 }
 
-/// The primary-constructor face (:88-96): the second positional bool
+/// The `implements` join of the inherited-member face
+/// (`test_instanceMethod_overrideImplements_positionalOptional`): the
+/// interface-conforming method skips under the any-member cut, the
+/// defining declaration reports.
+#[test]
+fn avoid_positional_bool_override_implements_passes() {
+    let f = Fixture::parse(
+        "class C {\n  void m(bool p = false) {}\n}\nabstract class D implements C {\n  @override\n  void m(bool p = false) {}\n}\n",
+    );
+    let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let first = tok(&f.source, &f.tokens, "bool", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, first));
+}
+
+/// The primary-constructor face (:88-96): the first positional bool
 /// reports (the storage keyword does not matter).
 #[test]
 fn avoid_positional_bool_primary_constructor_reports() {
     let f = Fixture::parse("class C(bool p1, final bool p2) {}\n");
     let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
-    let param = tok(&f.source, &f.tokens, "final", 0);
+    let param = tok(&f.source, &f.tokens, "bool", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, param));
 }
 
 /// The generic-function-type face (:68-72): a `void Function(...)`
-/// parameter's second positional bool reports; the closure parameter
+/// parameter's first positional bool reports; the closure parameter
 /// lists never reach the rule (`test_anonymousFunction`).
 #[test]
 fn avoid_positional_bool_generic_function_type_faces() {
     let f = Fixture::parse("class C {\n  void m(void Function(bool p1, bool p2) callback) {}\n}\n");
     let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
-    let p2 = tok(&f.source, &f.tokens, "bool", 1);
-    assert_eq!(lints[0].range.start, utf16_at(&f, p2));
+    let p1 = tok(&f.source, &f.tokens, "bool", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, p1));
     let f = Fixture::parse("void f(List<bool> list) {\n  list.where((bool e) => e);\n}\n");
     assert!(
         f.run(&one_rule("avoid_positional_boolean_parameters"))
@@ -5095,14 +5113,46 @@ fn avoid_positional_bool_generic_function_type_faces() {
 }
 
 /// `test_constructor_fieldFormalParameter_positional`: a field formal
-/// reads the same-class field's written `bool`.
+/// reads the same-class field's written `bool` (`C.named([!this.p!])`).
 #[test]
 fn avoid_positional_bool_field_formal_reports() {
-    let f = Fixture::parse("class C {\n  bool p2;\n  C.named(bool p1, this.p2);\n}\n");
+    let f = Fixture::parse("class C {\n  bool p2;\n  C.named(this.p2);\n}\n");
     let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let param = tok(&f.source, &f.tokens, "this", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, param));
+}
+
+/// `test_operator_plus`/`minus`/`indexAssignment`: operators skip
+/// (:78) — the `OperatorName` tiles as the method row's LEFT SIBLING,
+/// never as a child row.
+#[test]
+fn avoid_positional_bool_operator_passes() {
+    let f = Fixture::parse(
+        "class C {\n  void operator +(bool value) {}\n  void operator [](bool value) {}\n  void operator []=(bool value, int i) {}\n}\n",
+    );
+    assert!(
+        f.run(&one_rule("avoid_positional_boolean_parameters"))
+            .is_empty()
+    );
+}
+
+/// `test_extensionMethod`/`test_instanceMethod_positionalOptional`: a
+/// defaulted optional positional bool reports at the parameter extent
+/// THROUGH the default's last token — the row seals `end_incl` on the
+/// exclusive `InitializerEnd` peek, so the span trims the trailing `]`.
+#[test]
+fn avoid_positional_bool_defaulted_optional_span() {
+    let f = Fixture::parse("extension on int {\n  void f([bool p = false]) {}\n}\n");
+    let lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let start = tok(&f.source, &f.tokens, "bool", 0);
+    let end = tok(&f.source, &f.tokens, "false", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, start));
+    assert_eq!(
+        lints[0].range.end,
+        utf16_at(&f, end) + "false".encode_utf16().count() as u32
+    );
 }
 
 // —— avoid_field_initializers_in_const_classes —————————————————————————
@@ -5905,10 +5955,14 @@ fn omit_obvious_property_types_gate() {
 
 /// A non-const empty-bodied constructor on an `@immutable` class
 /// reports at the name; a `const` constructor and a non-immutable
-/// class pass.
+/// class pass. The `package:meta` import surface gates the annotation
+/// (`_isImmutable` resolves the element — an unresolvable spelling
+/// carries no element).
 #[test]
 fn prefer_const_constructors_in_immutables_gate() {
-    let f = Fixture::parse("@immutable\nclass A {\n  A();\n}\n");
+    let f = Fixture::parse(
+        "import 'package:meta/meta.dart';\n\n@immutable\nclass A {\n  A();\n}\n",
+    );
     let lints = f.run(&one_rule("prefer_const_constructors_in_immutables"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
@@ -5918,11 +5972,134 @@ fn prefer_const_constructors_in_immutables_gate() {
     let name = tok(&f.source, &f.tokens, "A", 1);
     assert_eq!(lints[0].range.start, utf16_at(&f, name));
 
-    let f = Fixture::parse("@immutable\nclass A {\n  const A();\n}\nclass B {\n  B();\n}\n");
+    let f = Fixture::parse(
+        "import 'package:meta/meta.dart';\n\n@immutable\nclass A {\n  const A();\n}\n\nclass B {\n  B();\n}\n",
+    );
     assert!(
         f.run(&one_rule("prefer_const_constructors_in_immutables"))
             .is_empty()
     );
+
+    // `test_immutableInstantiation_nonConstConstructor`: the
+    // `@Immutable('')` class spelling resolves to the same element
+    // (`metadata.hasImmutable` — meta ships both `immutable` the const
+    // and `Immutable` the class).
+    let f = Fixture::parse(
+        "import 'package:meta/meta.dart';\n\n@Immutable('')\nclass A {\n  A();\n}\n",
+    );
+    let lints = f.run(&one_rule("prefer_const_constructors_in_immutables"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let name = tok(&f.source, &f.tokens, "A", 1);
+    assert_eq!(lints[0].range.start, utf16_at(&f, name));
+}
+
+/// `test_extensionType_constConstructor_named`/`_primary`,
+/// `test_immutable_constConstructor_primary`, and
+/// `test_immutable_constructorHasBody_primary`: a header-`const`
+/// declaration never reports — neither its primary constructor nor a
+/// `const` named member; a primary body with a block is a non-empty
+/// body (:74-76) and stays silent.
+#[test]
+fn immutables_header_const_and_bodied_primary_stay_silent() {
+    for source in [
+        "import 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) {\n  const E.e(this.i);\n}\n",
+        "import 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) { }\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass const C(final int i);\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass C(final int i) {\n  this {\n    print(1);\n  }\n}\n",
+    ] {
+        let lints =
+            Fixture::parse(source).run(&one_rule("prefer_const_constructors_in_immutables"));
+        assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+    }
+
+    // `test_extensionType_nonConstConstructor_named`: the non-const
+    // named constructor of a header-const extension type reports at the
+    // constructor's first token (:125-127).
+    let f = Fixture::parse(
+        "import 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) {\n  E.e(this.i);\n}\n",
+    );
+    let lints = f.run(&one_rule("prefer_const_constructors_in_immutables"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let ctor = tok(&f.source, &f.tokens, "E", 1);
+    assert_eq!(lints[0].range.start, utf16_at(&f, ctor));
+}
+
+/// `test_immutable_constSuperCall_primary` /
+/// `test_immutable_nonConstSuperCall_primary`: a primary constructor's
+/// `this : super(…)` initializer list lives in its body MEMBER row —
+/// the explicit super invocation resolves the target constructor's
+/// `const` face (:103-133), overriding the implicit-default read.
+#[test]
+fn immutables_primary_constructor_super_call_faces() {
+    for (source, reports) in [
+        (
+            "import 'package:meta/meta.dart';\nclass C {\n  const C();\n}\n@immutable\nclass D(final int i) extends C {\n  this : super();\n}\n",
+            true,
+        ),
+        (
+            "import 'package:meta/meta.dart';\nclass C {}\n@immutable\nclass D(final int i) extends C {\n  this : super();\n}\n",
+            false,
+        ),
+        // The named target decides, not the unnamed default.
+        (
+            "import 'package:meta/meta.dart';\nclass C {\n  C();\n  const C.k();\n}\n@immutable\nclass D(final int i) extends C {\n  this : super.k();\n}\n",
+            true,
+        ),
+        (
+            "import 'package:meta/meta.dart';\nclass C {\n  const C();\n  C.k();\n}\n@immutable\nclass D(final int i) extends C {\n  this : super.k();\n}\n",
+            false,
+        ),
+    ] {
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("prefer_const_constructors_in_immutables"));
+        if reports {
+            assert_eq!(lints.len(), 1, "{source:?} -> {lints:?}");
+            let name = tok(&f.source, &f.tokens, "D", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, name), "{source:?}");
+        } else {
+            assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+        }
+    }
+}
+
+/// The `canBeConst` initializer-entry faces
+/// (`test_assertInitializer_cannotBeConst`,
+/// `test_immutable_nonConstInInitializerList`/`6`): a method invocation
+/// (`a.toString()`) or a reference to a non-const variable (`notConst`)
+/// in an assert or field initializer is not potentially constant, so the
+/// constructor cannot be made const and the rule stays silent. The
+/// potentially-const shapes
+/// (`test_assertInitializer_canBeConst`/`_enumComparison`,
+/// `test_immutable_enumComparisonInInitializerList`,
+/// `test_immutable_nonConstInInitializerList2`-`5`) keep reporting.
+#[test]
+fn immutables_initializer_entries_potentially_const_faces() {
+    for source in [
+        // Not potentially constant — silent.
+        "import 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  C.named(a) : assert(a.toString() == 'string');\n}\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass C {\n  final String _a;\n  C(int a) : _a = a.toString();\n}\n",
+        "import 'package:meta/meta.dart';\nint notConst = 0;\n@immutable\nclass C {\n  final int f;\n  C(Object f) : f = notConst;\n}\n",
+    ] {
+        let lints =
+            Fixture::parse(source).run(&one_rule("prefer_const_constructors_in_immutables"));
+        assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+    }
+    for source in [
+        // Potentially constant (parameters bound) — reports.
+        "import 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  C.named(a) : assert(a != null);\n}\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass C {\n  final int _a;\n  C(int a) : _a = a;\n}\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass C {\n  final bool _a;\n  C(bool a) : _a = a && a;\n}\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass C {\n  final String _a;\n  C(bool a) : _a = '${a ? a : ''}';\n}\n",
+        "import 'package:meta/meta.dart';\n@immutable\nclass C {\n  final bool f;\n  C(bool? f) : f = f ?? f == null;\n}\n",
+        "import 'package:meta/meta.dart';\nenum E { a, b }\n@immutable\nclass C {\n  final bool isA;\n  C(E e) : isA = e == E.a;\n}\n",
+        "import 'package:meta/meta.dart';\nenum E { a, b }\n@immutable\nclass C {\n  final E e;\n  C(this.e) : assert(e == E.a);\n}\n",
+    ] {
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("prefer_const_constructors_in_immutables"));
+        assert_eq!(lints.len(), 1, "{source:?} -> {lints:?}");
+        let name = tok(&f.source, &f.tokens, "C", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, name), "{source:?}");
+    }
 }
 
 /// A never-reassigned for-each loop variable reports at the name; an

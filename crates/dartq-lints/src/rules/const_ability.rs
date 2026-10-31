@@ -79,7 +79,57 @@ const MODIFIER_LEXEMES: [&str; 8] = [
 #[must_use]
 pub(crate) fn is_const_able(unit: &Unit<'_>, expr: u32) -> bool {
     let index = ConstIndex::build(unit);
-    able(unit, &index, expr)
+    able(unit, &index, Scope::Constant, expr)
+}
+
+/// The potentially-constant face: `is_const_able` with the constructor's
+/// formal parameter names bound as const-able leaves (upstream
+/// `ConstructorDeclaration.canBeConst` runs the resolved constant
+/// verifier over the pretend-`const` constructor, which binds the
+/// parameters as potentially-const variables — `upstream Dart SDK
+/// source, pkg/linter/lib/src/extensions.dart`). The const-family
+/// consumer is `prefer_const_constructors_in_immutables`, whose
+/// initializer entries (`assert` conditions and messages, field
+/// initializer values) must be potentially constant for the
+/// constructor to be convertible. Beyond the parameter leaves the mode
+/// widens exactly two faces: `??` joins the legal operators, and a
+/// string interpolation is judged by its embedded rows instead of
+/// bailing on the marker.
+pub(crate) fn is_potentially_const(unit: &Unit<'_>, expr: u32, params: &[&str]) -> bool {
+    let index = ConstIndex::build(unit);
+    able(unit, &index, Scope::Potentially(params), expr)
+}
+
+/// The bare-name leaf of the potentially-const face: a bound parameter
+/// or a same-file top-level constant — for initializer values that tile
+/// as a single `Identifier` row (transparent inside an extent walk, so
+/// they never carry the verdict there).
+pub(crate) fn potentially_const_name(unit: &Unit<'_>, params: &[&str], name: &str) -> bool {
+    let index = ConstIndex::build(unit);
+    params.contains(&name) || index.consts.contains_key(name)
+}
+
+/// The leaf scope of a const-ability walk. `Constant` is the plain
+/// const-expression face; `Potentially` binds the listed parameter
+/// names as const-able leaves and widens the two operator/interpolation
+/// faces documented on [`is_potentially_const`].
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    Constant,
+    Potentially(&'a [&'a str]),
+}
+
+impl Scope<'_> {
+    fn binds(&self, name: &str) -> bool {
+        match self {
+            Scope::Constant => false,
+            Scope::Potentially(params) => params.contains(&name),
+        }
+    }
+
+    fn potentially(&self) -> bool {
+        matches!(self, Scope::Potentially(_))
+    }
 }
 
 /// The named-constant alias of the const-written creation `creation`: the
@@ -346,7 +396,7 @@ impl<'a> ConstIndex<'a> {
     clippy::match_same_arms,
     reason = "each arm mirrors one class of the official rule's const               taxonomy; merging the two true-verdict groups would erase the               documented structure"
 )]
-fn able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
+fn able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u32) -> bool {
     match unit.ast.kind(row) {
         // Const by written shape: the token leaves, the symbol face, and
         // the written `const` wrappers.
@@ -358,7 +408,7 @@ fn able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
         | NodeKind::ConstExpression
         | NodeKind::ConstLiteral
         | NodeKind::ConstDotShorthand => true,
-        NodeKind::StringLiteral => string_able(unit, row),
+        NodeKind::StringLiteral => string_face(unit, index, scope, row),
         // Collections and records (parenthesized contents land as the
         // `ParenthesizedExpression` seal of the canonical
         // `RecordLiteral` open): every entry row inside the extent is
@@ -372,14 +422,14 @@ fn able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
         | NodeKind::ParenthesizedExpression
         | NodeKind::IfControlFlow
         | NodeKind::Conditional
-        | NodeKind::AsExpression => extent_able(unit, index, row),
-        NodeKind::NewExpression | NodeKind::ImplicitCreation => creation_able(unit, index, row),
-        NodeKind::Send => send_able(unit, index, row),
+        | NodeKind::AsExpression => extent_able(unit, index, scope, row),
+        NodeKind::NewExpression | NodeKind::ImplicitCreation => creation_able(unit, index, scope, row),
+        NodeKind::Send => send_able(unit, index, scope, row),
         // Operator faces: the const-legal operator set, then the operands
         // through the extent (they tile inside the operator row's own
         // window).
-        NodeKind::BinaryExpression => binary_able(unit, index, row),
-        NodeKind::UnaryPrefix => unary_able(unit, index, row),
+        NodeKind::BinaryExpression => binary_able(unit, index, scope, row),
+        NodeKind::UnaryPrefix => unary_able(unit, index, scope, row),
         // Transparent rows: containers and wrappers whose contents are
         // separate extent rows (judged there), and the identifier rows a
         // send group or creation face already owns. A plain identifier is
@@ -430,10 +480,10 @@ fn able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
 /// completion window plus the surrounding sibling run, span-filtered) is
 /// const-able. The sibling scan covers the production tiling's leaked
 /// entries (the `literal_faces` posture in `slice.rs`).
-fn extent_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
+fn extent_able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u32) -> bool {
     rows_within(unit, row)
         .into_iter()
-        .all(|inner| able(unit, index, inner))
+        .all(|inner| able(unit, index, scope, inner))
 }
 
 /// The rows nesting inside `row`'s token extent: the row's and its
@@ -475,6 +525,32 @@ fn nested(unit: &Unit<'_>, candidate: u32, span: core::ops::Range<u32>) -> bool 
 /// scan stops at the head's own token count plus any continuation segments
 /// the interpolation opened. The escaped `\$` spelling bails too — the
 /// under-report.
+fn string_face(
+    unit: &Unit<'_>,
+    index: &ConstIndex<'_>,
+    scope: Scope<'_>,
+    row: u32,
+) -> bool {
+    if string_able(unit, row) {
+        return true;
+    }
+    // The plain-string face accepted; an interpolated literal is judged
+    // by its embedded rows only in the potentially-const scope (the
+    // plain const family keeps the documented interpolation bail).
+    if !scope.potentially() {
+        return false;
+    }
+    child_rows(unit, row).into_iter().all(|kid| match unit.ast.kind(kid) {
+        // `$id` shorthand: the identifier is a leaf, not a group piece —
+        // a bound parameter or a same-file const variable only.
+        NodeKind::Identifier => {
+            let name = lexeme(unit, head_token(unit, kid));
+            scope.binds(name) || index.consts.contains_key(name)
+        }
+        _ => able(unit, index, scope, kid),
+    })
+}
+
 fn string_able(unit: &Unit<'_>, row: u32) -> bool {
     use dartq_scanner::TokenKind;
     let range = unit.ast.token_range(row);
@@ -552,9 +628,13 @@ fn string_closes(lexeme: &str) -> bool {
 /// expressions (`??` is not), a `+` over a written string operand is not
 /// (the one typed non-const the shape proves), and the operands are
 /// judged through the extent.
-fn binary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
+fn binary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u32) -> bool {
     let op = unit.ast.field(row, PayloadField::Operator);
-    let legal = op.is_some_and(|token| const_operator(lexeme(unit, token)));
+    let legal = op.is_some_and(|token| {
+        let operator = lexeme(unit, token);
+        const_operator(operator)
+            || (scope.potentially() && matches!(operator, "??" | "!="))
+    });
     if !legal {
         return false;
     }
@@ -562,7 +642,7 @@ fn binary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
         && rows_within(unit, row)
             .into_iter()
             .any(|inner| unit.ast.kind(inner) == NodeKind::StringLiteral);
-    !strings && extent_able(unit, index, row)
+    !strings && extent_able(unit, index, scope, row)
 }
 
 /// Whether the binary operator spells a constant-legal operation.
@@ -593,15 +673,16 @@ fn const_operator(op: &str) -> bool {
 /// The prefix-operator face: `-`, `!` and `~` are the const-legal set
 /// (`++`/`--` spell as `UnaryPrefix` too and bail here); the operand is
 /// judged through the extent.
-fn unary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
-    matches!(lexeme(unit, head_token(unit, row)), "-" | "!" | "~") && extent_able(unit, index, row)
+fn unary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u32) -> bool {
+    matches!(lexeme(unit, head_token(unit, row)), "-" | "!" | "~")
+        && extent_able(unit, index, scope, row)
 }
 
 /// The structured creation face (`new C(...)`, the generic implicit
 /// creation): the callee resolves to a same-file const constructor and
 /// every argument is const-able through the argument list's extent. A
 /// prefixed callee (`new p.C()`) under-reports.
-fn creation_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
+fn creation_able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u32) -> bool {
     let Some((type_name, ctor_name, args)) = creation_parts(unit, row) else {
         return false;
     };
@@ -612,7 +693,7 @@ fn creation_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
         return false;
     }
     if let Some(args) = args
-        && !extent_able(unit, index, args)
+        && !extent_able(unit, index, scope, args)
     {
         return false;
     }
@@ -851,6 +932,91 @@ fn ctor_ref_name<'s>(unit: &Unit<'s>, row: u32) -> Option<&'s str> {
         .map(|id| lexeme(unit, head_token(unit, id)))
 }
 
+/// An operand-position send: the tiling of a binary's left operand and
+/// its operator (`a !=` of `a != null`, `f ??` of `f ?? …`) — a
+/// childless `Send` leaf at the head of the binary's extent with no
+/// argument list anywhere behind it, so [`parse_callee`] cannot chain
+/// it. Only the potentially-const scope answers (the bound-parameter
+/// face — upstream binds the constructor's formal parameters as
+/// potentially-const variables when proving `canBeConst`, upstream
+/// Dart SDK source, pkg/linter/lib/src/extensions.dart); the constant
+/// scope keeps its under-report, exactly as the `None` callee parse
+/// always answered.
+fn operand_send_binds(unit: &Unit<'_>, scope: Scope<'_>, send: u32) -> bool {
+    if !scope.potentially() {
+        return false;
+    }
+    let range = unit.ast.token_range(send);
+    if range.end != range.start + 2 {
+        return false;
+    }
+    let Some(binary) = unit.ast.parent(send) else {
+        return false;
+    };
+    if unit.ast.kind(binary) != NodeKind::BinaryExpression {
+        return false;
+    }
+    let operator = unit.ast.field(binary, PayloadField::Operator);
+    if operator != Some(range.end - 1) {
+        return false;
+    }
+    scope.binds(lexeme(unit, head_token(unit, send)))
+}
+
+/// The member-chain segment face for the potentially-const scope. Inside
+/// a binary extent the production tiling spaces a member chain across
+/// sibling rows (`E.a` of `e == E.a`: the receiver segment tiles as a
+/// [`Send`] of `E` `.`, the selector as the next-sibling `Identifier`),
+/// and the span-contiguity chain of [`parse_callee`] stitches the
+/// operand sends and the trailing re-tile into it — over-counting the
+/// segments, so the callee parse fails. Two narrow faces answer what the
+/// parse lost: the receiver segment answers the member face
+/// (`member_const_face(head, next-sibling selector)`), and the trailing
+/// re-tile segment (`identifier` + terminator, e.g. `a` `)` of the
+/// assert close) whose token range twins a sibling `DotAccess` marker
+/// carries that marker's verdict. The constant scope keeps its
+/// under-report — both answer false there, exactly as the failed callee
+/// parse always did.
+fn chain_segment_face(
+    unit: &Unit<'_>,
+    index: &ConstIndex<'_>,
+    scope: Scope<'_>,
+    send: u32,
+) -> bool {
+    if !scope.potentially() {
+        return false;
+    }
+    let Some((kids, pos)) = owner_run(unit, send) else {
+        return false;
+    };
+    let range = unit.ast.token_range(send);
+    if range.end != range.start + 2 {
+        return false;
+    }
+    match kids.get(pos + 1) {
+        // The receiver segment: the selector is the next sibling row.
+        Some(&next) if unit.ast.kind(next) == NodeKind::Identifier => {
+            lexeme(unit, range.start + 1) == "."
+                && member_const_face(
+                    unit,
+                    index,
+                    lexeme(unit, head_token(unit, send)),
+                    lexeme(unit, head_token(unit, next)),
+                )
+        }
+        // The trailing re-tile segment: its twin `DotAccess` marker row
+        // is transparent in the extent walk and already carries the
+        // verdict.
+        _ => {
+            matches!(lexeme(unit, range.end - 1), ";" | ")" | "," | "]" | "}")
+                && kids.iter().any(|&kid| {
+                    unit.ast.kind(kid) == NodeKind::DotAccess
+                        && unit.ast.token_range(kid) == range
+                })
+        }
+    }
+}
+
 /// The send face: bare names, invocations and member chains over the
 /// owner run (production tiling — a send chain tiles as one childless
 /// `Send` leaf per selector segment: `C(1)` is one leaf; `E.a` is the
@@ -862,9 +1028,10 @@ fn ctor_ref_name<'s>(unit: &Unit<'s>, row: u32) -> Option<&'s str> {
 /// a named const constructor; a member read is an enum value or a
 /// `static const` field. Every segment of a chain answers the whole
 /// chain's verdict — the extent walk judges them all.
-fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, send: u32) -> bool {
+fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, send: u32) -> bool {
     let Some(callee) = parse_callee(unit, send) else {
-        return false;
+        return operand_send_binds(unit, scope, send)
+            || chain_segment_face(unit, index, scope, send);
     };
     // The written-type-argument face (`C<U>()`): the whole creation's
     // extent runs from the chain head through the arguments.
@@ -882,15 +1049,16 @@ fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, send: u32) -> bool {
             .get(callee.name)
             .copied()
             .is_some_and(|class_row| const_ctor_face(unit, class_row, selector))
-            && extent_able(unit, index, args)
+            && extent_able(unit, index, scope, args)
     };
     match (callee.args, callee.selector) {
         // Bare creation `C(...)`: a same-file const constructor.
         (Some(args), None) => creation_face(callee.name, args) && !type_var_bail(args),
         // Member invocation `C.named(...)`: a named const constructor.
         (Some(args), Some(selector)) => creation_face(selector, args) && !type_var_bail(args),
-        // Bare name: a top-level `const` variable.
-        (None, None) => index.consts.contains_key(callee.name),
+        // Bare name: a top-level `const` variable, or — in the
+        // potentially-const scope — one of the bound parameter names.
+        (None, None) => index.consts.contains_key(callee.name) || scope.binds(callee.name),
         // Member read `Color.red` / `K.z`: an enum value or a `static
         // const` field.
         // A tear-off instantiated with an in-scope type variable
@@ -1145,7 +1313,7 @@ pub(crate) fn send_shorthand_able(
         .get(type_name)
         .copied()
         .is_some_and(|class_row| const_ctor_face(unit, class_row, selector))
-        && extent_able(unit, &index, args)
+        && extent_able(unit, &index, Scope::Constant, args)
 }
 
 /// The member-const face: `type.selector` is an enum value or a `static
@@ -1640,6 +1808,7 @@ mod w3_const_pins {
             assert!(is_const_able(&unit, row), "C<int>.new(1) not const-able");
         }
     }
+
 
     /// The reject face: non-const constructors, runtime calls, non-const
     /// identifiers, interpolation, spreads and loop elements, `??`/`is`/

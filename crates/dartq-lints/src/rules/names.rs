@@ -41,18 +41,25 @@ fn check_lower_camel(c: &mut Check<'_>, token: u32, lexeme: &str) {
 }
 
 pub(crate) mod camel_case_types {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_types.dart:33-88` —
     /// every type-introducing declaration's name must be `UpperCamelCase`
-    /// (`isCamelCase`, `pkg/linter/lib/src/utils.dart:22`). Message:
+    /// (`isCamelCase`, `pkg/linter/lib/src/utils.dart:22`), reported at the
+    /// full name token (`reportAtToken(name)`, :52). Message:
     /// `diagnostic.g.dart` `camelCaseTypes`.
     ///
-    /// Names of top-level declarations live in the enclosing
-    /// [`NodeKind::TopLevelDeclaration`] wrapper (`TopLevelDeclarationEnd`
-    /// layout, the name-Identifier container). The official
-    /// augmentation skips are wave-1 inert: `augment` is gated off at the
-    /// scanner, so no augmentation declaration reaches the AST.
+    /// Augmentation declarations of the four class-like kinds skip
+    /// (:55/:63/:71/:77 — the original declaration reports, the
+    /// `augment`-prefixed one does not); typedefs and class type aliases
+    /// carry no augmentation face upstream and always check.
+    ///
+    /// Names of class-like top-level declarations live in the enclosing
+    /// [`NodeKind::TopLevelDeclaration`] wrapper; a typedef's name row is
+    /// emitted inside the open `Typedef` row (the parser emits the
+    /// identifier after `begin_typedef`), and an extension type carries
+    /// its name as the `Name` payload token
+    /// (`begin_extension_type_declaration` passes the name through).
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "camel_case_types",
         &[
@@ -66,23 +73,24 @@ pub(crate) mod camel_case_types {
         check,
     );
 
+    /// The `augment` ModSet bit (bridge `mod_bits`).
+    const AUGMENT_BIT: u16 = 1 << 1;
+
     fn check(c: &mut Check<'_>) {
-        let Some(parent) = c.ancestor(1) else {
-            return;
-        };
-        if c.kind(parent) != NodeKind::TopLevelDeclaration {
+        let node = c.node();
+        if matches!(
+            c.kind(node),
+            NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::EnumDeclaration
+                | NodeKind::ExtensionTypeDeclaration
+        ) && dartq_ast::mod_flags(c.unit.ast, node) & AUGMENT_BIT != 0
+        {
             return;
         }
-        // The wrapper's first child is the name Identifier.
-        let name = c
-            .direct_children(parent)
-            .iter()
-            .copied()
-            .find(|&ch| c.kind(ch) == NodeKind::Identifier);
-        let Some(name) = name else {
+        let Some(token) = name_token(c, node) else {
             return;
         };
-        let token = c.head_token(name);
         let lexeme = c.lexeme(token);
         if super::is_upper_camel_case(lexeme) {
             return;
@@ -90,7 +98,38 @@ pub(crate) mod camel_case_types {
         let Some(start) = super::utf16_start_of(c, token) else {
             return;
         };
-        c.report(start..start, &[lexeme]);
+        let end = c.utf16_end_of_token(token).unwrap_or(start);
+        c.report(start..end, &[lexeme]);
+    }
+
+    /// The declaration's name token: the extension type's `Name` payload
+    /// word, the typedef's own `TypedefDeclaration`-context identifier
+    /// row, or the enclosing `TopLevelDeclaration` wrapper's first
+    /// identifier (the class-like layout).
+    fn name_token(c: &Check<'_>, node: u32) -> Option<u32> {
+        match c.kind(node) {
+            NodeKind::ExtensionTypeDeclaration => c.field_token(node, PayloadField::Name),
+            NodeKind::Typedef => {
+                let ctx = dartq_parser::IdentifierContext::TypedefDeclaration as u32;
+                c.collect_direct(node)
+                    .into_iter()
+                    .find(|&kid| {
+                        c.kind(kid) == NodeKind::Identifier
+                            && c.field(kid, PayloadField::Context) == Some(ctx)
+                    })
+                    .map(|kid| c.head_token(kid))
+            }
+            _ => {
+                let parent = c.ancestor(1)?;
+                if c.kind(parent) != NodeKind::TopLevelDeclaration {
+                    return None;
+                }
+                c.collect_direct(parent)
+                    .into_iter()
+                    .find(|&ch| c.kind(ch) == NodeKind::Identifier)
+                    .map(|name| c.head_token(name))
+            }
+        }
     }
 }
 
@@ -3739,18 +3778,22 @@ pub(crate) mod sort_unnamed_constructors_first {
 }
 
 pub(crate) mod sort_constructors_first {
-    use super::{Check, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, PayloadField, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/sort_constructors_first.dart`
     /// — a constructor that follows a non-constructor member in a class,
     /// enum, or extension-type body reports (`_Visitor.check`: the first
     /// non-constructor member arms the flag; every constructor past it
     /// reports). Factories are constructor declarations in the official
-    /// member list and join the family. The official's
-    /// `PrimaryConstructorBody` arm (`reportAtToken(member.thisKeyword)`)
-    /// is inert here: a primary body is part of the declaration header, not
-    /// a body member, so it never appears in the member walk. Message:
-    /// `diagnostic.g.dart` `sortConstructorsFirst`.
+    /// member list and join the family. A `PrimaryConstructorBody` member
+    /// (`this;` / `this : …` inside the body) reports at its `this`
+    /// keyword when it follows a non-constructor member and never arms
+    /// the flag (:43-48). Constructors report at `member.errorRange`
+    /// (`ConstructorDeclarationImpl.errorRange`,
+    /// pkg/analyzer/lib/src/dart/ast/ast.dart:7066-7070 — the type-name
+    /// token, or the `new`/`factory` keyword head, through the
+    /// constructor name's end). Message: `diagnostic.g.dart`
+    /// `sortConstructorsFirst`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "sort_constructors_first",
         &[
@@ -3764,20 +3807,94 @@ pub(crate) mod sort_constructors_first {
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         let mut other = false;
-        let mut hits: Vec<u32> = Vec::new();
+        let mut hits: Vec<(u32, bool)> = Vec::new();
         for member in super::class_like_members(c, node) {
-            if matches!(c.kind(member), NodeKind::Constructor | NodeKind::Factory) {
-                if other {
-                    hits.push(member);
+            match c.kind(member) {
+                NodeKind::Constructor | NodeKind::Factory => {
+                    if other {
+                        hits.push((member, false));
+                    }
                 }
-            } else {
-                other = true;
+                NodeKind::PrimaryConstructorBody => {
+                    if other {
+                        hits.push((member, true));
+                    }
+                }
+                _ => other = true,
             }
         }
-        for member in hits {
-            let range = c.utf16_span(member);
+        for (member, primary_body) in hits {
+            let range = if primary_body {
+                primary_body_span(c, member)
+            } else {
+                constructor_error_range(c, member)
+            };
             c.report(range, &[]);
         }
+    }
+
+    /// A `PrimaryConstructorBody` reports at its `this` keyword
+    /// (`errorRange`, :43-48). The parser advances past `this` before
+    /// `beginPrimaryConstructorBody` (members.rs
+    /// `parse_primary_constructor_body` peeks AFTER the advance), so the
+    /// row and its `ThisKeyword` word anchor on the token FOLLOWING
+    /// `this` — the real keyword is one token back.
+    fn primary_body_span(c: &Check<'_>, member: u32) -> core::ops::Range<u32> {
+        let stored = c
+            .field(member, PayloadField::ThisKeyword)
+            .filter(|&token| token != crate::rules::NONE_TOKEN)
+            .unwrap_or_else(|| c.unit.ast.token_range(member).start);
+        let this = if stored > 0 && c.lexeme(stored - 1) == "this" {
+            stored - 1
+        } else {
+            stored
+        };
+        super::utf16_token_span(c, this)
+    }
+
+    /// `ConstructorDeclaration.errorRange`
+    /// (pkg/analyzer/lib/src/dart/ast/ast.dart:7066-7070): the type name
+    /// token — or the `new`-form `new` keyword when no type name is
+    /// written — through the constructor name's end (the type name's own
+    /// end for the unnamed form). The modifier run (`augment`, `external`,
+    /// `const`, `factory`) sits before the anchor and drops out.
+    fn constructor_error_range(c: &Check<'_>, ctor: u32) -> core::ops::Range<u32> {
+        let tokens = c.unit.ast.token_range(ctor);
+        // The new-form `new` keyword tiles BEFORE the row's token range
+        // (`begin_constructor` anchors at the name — the parser never
+        // passes the constructor head); `errorRange` starts there.
+        let new_kw = c
+            .field(ctor, PayloadField::NewKeyword)
+            .filter(|&token| token != crate::rules::NONE_TOKEN);
+        let mut cursor = tokens.start;
+        while cursor < tokens.end
+            && matches!(
+                c.lexeme(cursor),
+                "augment" | "external" | "const" | "factory"
+            )
+        {
+            cursor += 1;
+        }
+        let head = cursor.min(tokens.end.saturating_sub(1));
+        let start_entity = new_kw.unwrap_or(head);
+        let start = c
+            .utf16_of_token(start_entity)
+            .unwrap_or_default();
+        // `name ?? startEntity`: the `.named` part when written (the
+        // type-name echo `A.named` shape); the new-form name when the
+        // head is an identifier (`new named`); the start entity's own
+        // end otherwise (`A()` / `new()`).
+        let end_token = if head + 2 < tokens.end && c.lexeme(head + 1) == "." {
+            head + 2
+        } else if crate::rules::declarations::is_identifier_token(c, head) {
+            head
+        } else {
+            start_entity
+        };
+        let end = c
+            .utf16_end_of_token(end_token)
+            .unwrap_or_else(|| start);
+        start..end
     }
 
     #[cfg(test)]
@@ -3828,6 +3945,38 @@ pub(crate) mod sort_constructors_first {
         fn enum_constants_do_not_arm_the_flag() {
             let f = Fixture::parse("enum E {\n  a;\n  const E();\n}");
             assert!(f.run(&one_rule("sort_constructors_first")).is_empty());
+        }
+
+        /// `test_fieldBeforeConstructor_newHead_named`/`_unnamed`: the
+        /// new-form head reports at `errorRange` — the `new` keyword
+        /// through the written name (`new named`, or `new` alone when
+        /// unnamed).
+        #[test]
+        fn new_form_heads_span_from_the_new_keyword() {
+            let f = Fixture::parse("abstract class A {\n  int a = 0;\n  new named();\n}\n");
+            let lints = f.run(&one_rule("sort_constructors_first"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("new").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 9);
+
+            let f = Fixture::parse("abstract class A {\n  int a = 0;\n  new();\n}\n");
+            let lints = f.run(&one_rule("sort_constructors_first"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("new").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 3);
+        }
+
+        /// `test_primaryConstructorBody_afterMethod` (and the enum /
+        /// extension-type variants): a `this;` body reports at its `this`
+        /// keyword — the row anchors one token late (the parser advances
+        /// past `this` before beginning the row), so the span steps back.
+        #[test]
+        fn primary_constructor_body_spans_the_this_keyword() {
+            let f = Fixture::parse("class C() {\n  void f() {}\n  this;\n}\n");
+            let lints = f.run(&one_rule("sort_constructors_first"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.rfind("this").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 4);
         }
     }
 }

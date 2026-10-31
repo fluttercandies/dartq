@@ -1,12 +1,13 @@
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{Check, PayloadField, RuleSpec, container_name_token};
+use super::{Check, EXTERNAL_MEMBER_BIT, PayloadField, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
 use crate::rules::{
     MemberQuery, SupertypeClause, get_set_token, initialized_identifier_name, member_matches,
     member_name, rows_with_parent, same_file_ancestors, supertypes, utf16_token_span,
+    variables_declaration_keyword,
 };
-use dartq_ast::NodeKind;
+use dartq_ast::{NodeKind, mod_flags};
 
 /// Official: upstream Dart SDK source,
 /// `pkg/linter/lib/src/rules/unreachable_from_main.dart` — in an
@@ -38,28 +39,51 @@ use dartq_ast::NodeKind;
 /// Shell-side suppression faces (same-file approximations of the
 /// official's element queries): a member whose name resolves against a
 /// same-file ancestor's member table never gathers (the `isOverride`
-/// arm — `getOverridden` across the interface), a non-static method
-/// named `toJson` never gathers (the `dart:convert` dynamic-invocation
+/// arm — `getOverridden` across the interface; extensions and extension
+/// types pass `containerElement: null` upstream (:135-149) so their
+/// members never take the override skip), a non-static method named
+/// `toJson` never gathers (the `dart:convert` dynamic-invocation
 /// auto-reach arm :293-303), and a declaration whose doc-comment
 /// `[Name]` references match its own name reads as referenced (the
 /// comment-reference edge the engine face does not carry).
 ///
+/// The local per-library face: the official walk is per-library
+/// (`context.allUnits`, `entryPoints.isEmpty` bail) while the engine
+/// graph is workspace-global, so for a single-file library the shell
+/// re-derives the official algorithm name-level — the
+/// [`ReferenceGraph`] carries the entry seeds (`main`, the
+/// `vm:entry-point` pragma through const aliases — `computeConstantValue`
+/// — and widget-preview functions) and the entry-reach closure over the
+/// same reference keys the official visitor counts (`visitSimpleIdentifier`
+/// expression reads; `visitNamedType`'s exception list — typedef aliases,
+/// extension types, type arguments; `visitClassDeclaration`'s
+/// unconditional clause names; annotations; operators through
+/// `visitBinaryExpression`/`visitPrefixExpression`/`visitPostfixExpression`/
+/// `visitIndexExpression`; redirects through
+/// `visitRedirectingConstructorInvocation`). The closure is
+/// AUTHORITATIVE for single-file libraries in both directions — the
+/// engine flag's under-reach (a missed edge) and over-reach (a type
+/// annotation, a constant pattern, another library's reference, a
+/// reference inside an unreachable declaration's body) both fold to
+/// the closure's answer — and it answers whether THIS library declares
+/// an entry at all (an imported file without one is silent even when
+/// the workspace graph marks its rows reachable). A part or part-of
+/// directive makes the same-file index incomplete, so a part-carrying
+/// library keeps the engine flag with the counted-use rescue.
+///
 /// Approximations (documented): the override read is same-file only —
 /// an override relation through an imported or SDK interface stays
 /// invisible, matching the face family's documented cross-file
-/// under-reach. Three substrate deltas lean the same under-report
-/// direction and stay engine-owned (the shell never compensates): the
-/// propagation graph is workspace-global where the official walk is
-/// per-library, the entry seeds admit every declaration kind where the
-/// official seeds only functions, and type-annotation references carry
-/// no `NamedType` filter (a type used only in an ordinary annotation
-/// over-reachable — the oracle's `visitNamedType` counts aliases,
-/// extension types, type literals, type arguments, and external
-/// declaration types only). Annotation reads (`@visibleForTesting`,
-/// `@Preview`) are by spelling — a same-file annotation class of either
-/// name over-suppresses (the flutter-family approximation register). An
-/// unnamed extension has no name token to key a face flag with: it
-/// never reports, and its members judge on their own flags.
+/// under-reach. The reference graph is name-level — an operator use on
+/// an unrelated type marks the same-file operator spelling (the
+/// official resolves the element), the external-variable
+/// `NamedType` exception is not carried (no corpus pin), and entries
+/// read annotations by spelling with a flutter `widget_previews.dart`
+/// import-surface gate (a unit-declared `Preview` class shadows, the
+/// `customPreviewClass` posture). Annotation reads (`@visibleForTesting`)
+/// are by spelling. An unnamed extension has no name token to key a
+/// face flag with: it never reports, and its members judge on their own
+/// flags.
 ///
 /// Constructor verdicts: the face universe is the capture's declaration
 /// rows and constructors are not declaration rows (`dartq-index`
@@ -98,25 +122,30 @@ fn check(c: &mut Check<'_>) {
     let Some(face) = c.unit.reachability else {
         return;
     };
-    // `if (entryPoints.isEmpty) return` — a library without an entry
-    // point reports nothing at all.
-    if !face.has_entry {
-        return;
-    }
     // The constructor marking arms (the subclass walk the constructor
     // verdict fallback consults) — built once per unit.
     let arms = ctor_arms(c);
-    // The lexical-use supplement: the name → counting-position index
-    // the doc-reference and anti-reach arms consult. Built once per
-    // unit — `Identifier` rows in a reference context (expression,
-    // expression-continuation, or constructor-reference position) count
-    // the candidate's written name; declaration-context names and
-    // `TypeReference`/`PrefixedTypeReference` rows do not (the
-    // official's `SimpleIdentifier`-vs-`NamedType` split :349-386,
-    // :307-346 — a plain type annotation never counts). Doc-comment
-    // `[Name]` references count through the same index (the official
-    // resolves comment references against the element model).
-    let uses = counting_uses(c);
+    // The name-level reference graph: the flat counting index, the
+    // per-declaration dependency edges, the entry seeds, and the
+    // entry-reach closure (the official per-library walk, name-level).
+    let graph = ReferenceGraph::build(c);
+    // `if (entryPoints.isEmpty) return` — a library without an entry
+    // point reports nothing at all. The entry read is local first (the
+    // engine's `has_entry` is workspace-global — a same-workspace
+    // reference can mark this library's rows reachable without any
+    // local entry); a part or part-of directive widens the entry read
+    // back to the engine flag (the entry may live in a sibling file of
+    // the same library, and the local index does not cross files).
+    let multi_file = directive_rows(c, c.node())
+        .into_iter()
+        .any(|row| matches!(c.kind(row), NodeKind::Part | NodeKind::PartOf));
+    if graph.used.is_empty() && !(multi_file && face.has_entry) {
+        return;
+    }
+    // The anti-over-reach override (a `Some(true)` flag the local
+    // closure contradicts) applies only where the local index is
+    // complete — a single-file library.
+    let single_file = !multi_file;
     // The name offsets of the unreachable public containers: a member's
     // enclosing declaration in that set suppresses the member (the
     // outermost-container-wins gate).
@@ -134,8 +163,9 @@ fn check(c: &mut Check<'_>) {
                     judge(
                         c,
                         &face,
-                        &uses,
+                        &graph,
                         &arms,
+                        single_file,
                         top,
                         row,
                         Shape::TopLevelFunction,
@@ -161,8 +191,9 @@ fn check(c: &mut Check<'_>) {
                             judge(
                                 c,
                                 &face,
-                                &uses,
+                                &graph,
                                 &arms,
+                                single_file,
                                 top,
                                 row,
                                 Shape::Other,
@@ -180,7 +211,7 @@ fn check(c: &mut Check<'_>) {
                 | NodeKind::ExtensionDeclaration
                 | NodeKind::ExtensionTypeDeclaration
                 | NodeKind::EnumDeclaration => {
-                    judge_container(c, &face, &uses, &arms, top, row, &mut dead);
+                    judge_container(c, &face, &graph, &arms, single_file, top, row, &mut dead);
                 }
                 NodeKind::Typedef => {
                     let Some(name) = name_token_of(c, top, row) else {
@@ -189,8 +220,9 @@ fn check(c: &mut Check<'_>) {
                     judge(
                         c,
                         &face,
-                        &uses,
+                        &graph,
                         &arms,
+                        single_file,
                         top,
                         row,
                         Shape::Other,
@@ -212,8 +244,9 @@ fn check(c: &mut Check<'_>) {
 fn judge_container(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
-    uses: &rustc_hash::FxHashMap<String, u32>,
+    graph: &ReferenceGraph,
     arms: &CtorArms,
+    single_file: bool,
     wrapper: u32,
     row: u32,
     dead: &mut FxHashSet<u32>,
@@ -224,7 +257,17 @@ fn judge_container(
     // `unusedDeclarations` is the pre-gate set): an unreachable public
     // container suppresses its members even when the container itself
     // is `@visibleForTesting`.
-    let is_dead = name_offset.is_some_and(|offset| face.is_reachable(offset) == Some(false));
+    let is_dead = name.is_some_and(|token| {
+        effective_verdict(
+            c,
+            face,
+            graph,
+            single_file,
+            row,
+            token,
+            utf16_token_span(c, token).start,
+        ) == Some(false)
+    });
     if let (Some(offset), true) = (name_offset, is_dead) {
         let public = name.is_some_and(|token| !c.lexeme(token).starts_with('_'));
         if public {
@@ -234,9 +277,10 @@ fn judge_container(
     if let Some(name) = name {
         judge(
             c,
-            face,
-            uses,
+            &face,
+            graph,
             arms,
+            single_file,
             wrapper,
             row,
             Shape::Other,
@@ -247,19 +291,36 @@ fn judge_container(
             c.lexeme(name),
         );
     }
-    // Members gather only under a public container, and a dead one
-    // suppresses them all (the gate above).
-    let public = name.is_some_and(|token| !c.lexeme(token).starts_with('_'));
-    if !public || is_dead {
+    // Members gather only under a public container. A dead one
+    // suppresses its executables — methods and constructors report at
+    // the container alone (upstream :568-577: the member's enclosing
+    // `Declaration` is the dead class-like) — but FIELDS still face
+    // their own verdict: the gathered field node is the
+    // `VariableDeclaration`, whose enclosing `Declaration` is the
+    // `FieldDeclaration` itself (never a gathered declaration, so never
+    // in `unusedDeclarations` — the suppression cannot fire upstream).
+    // An unnamed extension has no name to judge — its members judge on
+    // their own flags.
+    let Some(name) = name else {
+        return;
+    };
+    if c.lexeme(name).starts_with('_') {
         return;
     }
-    let container = c.lexeme(name.expect("public implies a name")).to_owned();
+    let container = c.lexeme(name).to_owned();
     let is_enum = c.kind(row) == NodeKind::EnumDeclaration;
     // The ancestor chain resolves once per container, flattened to its
     // member rows — every member's `isOverride` read consults the same
     // table (the official gathers `members` per container element; the
-    // same-file approximation).
-    let ancestor_members: Vec<u32> = same_file_ancestors(c, row, false)
+    // same-file approximation). Extensions and extension types pass
+    // `containerElement: null` upstream (:135-149) — `getOverridden`
+    // never answers for their members, so the chain read joins
+    // `implements` links only for the class-like containers.
+    let joins_implements = !matches!(
+        c.kind(row),
+        NodeKind::ExtensionDeclaration | NodeKind::ExtensionTypeDeclaration
+    );
+    let ancestor_members: Vec<u32> = same_file_ancestors(c, row, !joins_implements)
         .iter()
         .flat_map(|&ancestor| member_rows(c, ancestor))
         .collect();
@@ -267,11 +328,13 @@ fn judge_container(
         match c.kind(member) {
             NodeKind::Constructor | NodeKind::Factory => {
                 // An enum's constructors never gather (upstream
-                // `member.parent?.parent is! EnumDeclaration`).
-                if is_enum {
+                // `member.parent?.parent is! EnumDeclaration`), and a
+                // dead container's executables suppress into its own
+                // report (the enclosing-Declaration gate above).
+                if is_enum || is_dead {
                     continue;
                 }
-                judge_constructor(c, face, uses, arms, member, &container);
+                judge_constructor(c, face, graph, arms, single_file, member, &container);
             }
             NodeKind::Fields => {
                 for variable in c.collect_direct(member) {
@@ -302,8 +365,9 @@ fn judge_container(
                         judge(
                             c,
                             face,
-                            uses,
+                            graph,
                             arms,
+                            single_file,
                             member,
                             member,
                             Shape::Other,
@@ -317,6 +381,11 @@ fn judge_container(
                 }
             }
             NodeKind::Method => {
+                // A dead container's executables suppress into its own
+                // report (the enclosing-Declaration gate above).
+                if is_dead {
+                    continue;
+                }
                 let Some(name) = member_name(c, member) else {
                     continue;
                 };
@@ -357,8 +426,9 @@ fn judge_container(
                 judge(
                     c,
                     face,
-                    uses,
+                    graph,
                     arms,
+                    single_file,
                     member,
                     member,
                     Shape::Method(is_static),
@@ -388,12 +458,15 @@ fn is_override_member(c: &Check<'_>, members: &[u32], name: &str, query: MemberQ
 
 /// Judges one constructor: the display name is `Type.written`, the
 /// unnamed face `Type.new` (upstream `nameForError`'s
-/// `self.name?.lexeme ?? 'new'`), anchored at the name token.
+/// `self.name?.lexeme ?? 'new'`), anchored at the name token. A
+/// `new`-prefixed declaration (`new named();`) carries no
+/// method-continuation name — its row head IS the written name.
 fn judge_constructor(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
-    uses: &rustc_hash::FxHashMap<String, u32>,
+    graph: &ReferenceGraph,
     arms: &CtorArms,
+    single_file: bool,
     row: u32,
     container: &str,
 ) {
@@ -404,19 +477,26 @@ fn judge_constructor(
             if lexeme == container {
                 // The unnamed face: the row anchors at the class-name
                 // echo.
-                (c.head_token(row), "new")
+                (c.head_token(node), "new")
             } else {
                 (c.head_token(node), lexeme)
             }
         }
-        None => (c.head_token(row), "new"),
+        None => {
+            let head = c.head_token(row);
+            let lexeme = c.lexeme(head);
+            // The row head is the class-name echo for the unnamed face
+            // and the written name for a `new`-prefixed declaration.
+            (head, if lexeme == container { "new" } else { lexeme })
+        }
     };
     let display = format!("{container}.{member}");
     judge(
         c,
         face,
-        uses,
+        graph,
         arms,
+        single_file,
         row,
         row,
         Shape::Constructor,
@@ -441,8 +521,9 @@ fn judge_constructor(
 fn judge(
     c: &mut Check<'_>,
     face: &ReachabilityFace<'_>,
-    uses: &rustc_hash::FxHashMap<String, u32>,
+    graph: &ReferenceGraph,
     arms: &CtorArms,
+    single_file: bool,
     wrapper: u32,
     annotation_row: u32,
     shape: Shape,
@@ -452,8 +533,18 @@ fn judge(
     counted: &str,
     display: &str,
 ) {
+    // 0. Entry point (`_isEntryPoint`: a function declaration named
+    // `main` or carrying the pragma / widget-preview annotation) — an
+    // entry is reachable by construction, never a candidate.
+    if graph.entries.contains(public) || graph.entries.contains(counted) {
+        return;
+    }
     // 1. Unreachable (the face's flag; `None` — outside the face's
-    // universe — never reports).
+    // universe — never reports). The local override: a `Some(true)`
+    // flag a single-file library's entry-reach closure contradicts
+    // reads unreachable (the engine graph is workspace-global and
+    // counts every type reference; the official walk is per-library
+    // with the `visitNamedType` filter).
     let offset = utf16_token_span(c, name_token).start;
     // 1.5. Counted use (the anti-reach arm): a candidate the face's
     // under-reach flagged unreachable but whose name has a same-file
@@ -461,19 +552,26 @@ fn judge(
     // a pattern name never counts (upstream's visitor split), an
     // expression or constructor use does. Constructors count under the
     // qualified `C.name` key AND the bare member (a `: this.one()`
-    // redirect writes `one`, never `C.one`).
-    let counted_count = uses.get(counted).copied().unwrap_or(0)
+    // redirect writes `one`, never `C.one`). Single-file libraries
+    // never take this arm — the local closure (the effective verdict)
+    // already answers, and a reference inside an unreachable
+    // declaration's body must NOT rescue (the official walk propagates
+    // only from reachable declarations).
+    let counted_count = graph.uses.get(counted).copied().unwrap_or(0)
         + if counted == public {
             0
         } else {
-            uses.get(public).copied().unwrap_or(0)
+            graph.uses.get(public).copied().unwrap_or(0)
         };
-    match face.is_reachable(offset) {
-        Some(false) => {
+    let verdict =
+        effective_verdict(c, face, graph, single_file, annotation_row, name_token, offset);
+    match verdict {
+        Some(false) if !single_file => {
             if counted_count > 0 {
                 return;
             }
         }
+        Some(false) => {}
         // The face's universe is the capture's declaration rows, and
         // constructors are not declaration rows (`dartq-index` capture,
         // the constructor exclusion): a real-pipeline constructor rides
@@ -487,7 +585,7 @@ fn judge(
         // silent; otherwise it reports.
         _ => {
             if shape != Shape::Constructor
-                || ctor_self_reachable(c, face, uses, arms, container, public)
+                || ctor_self_reachable(c, face, &graph.uses, arms, container, public)
             {
                 return;
             }
@@ -499,24 +597,109 @@ fn judge(
     if public.starts_with('_') {
         return;
     }
-    // 5. Outermost container wins — a member of a dead container never
-    // reaches this far: the member loop is skipped entirely for a dead
-    // container (the caller's gate).
+    // 5. Outermost container wins — a dead container's executables never
+    // reach this far (the caller's member-loop gates); its fields do
+    // (upstream's enclosing-Declaration read never suppresses a field).
     // 3. Not `@visibleForTesting` (`element.hasVisibleForTesting`).
     if carries_annotation(c, wrapper, annotation_row, "visibleForTesting") {
         return;
     }
     // 4. Not a public widget-preview member (`hasWidgetPreview`:
-    // constructors, top-level functions, and static executables).
+    // constructors, top-level functions, and static executables — the
+    // annotation must RESOLVE into the flutter widget-previews
+    // library; a unit-declared `Preview` class or a bare spelling with
+    // no flutter import does not suppress).
     let previewable = match shape {
         Shape::TopLevelFunction | Shape::Constructor => true,
         Shape::Method(is_static) => is_static,
         Shape::Other => false,
     };
-    if previewable && carries_annotation(c, wrapper, annotation_row, "Preview") {
+    if previewable
+        && (carries_annotation(c, wrapper, annotation_row, "Preview") && graph.preview_resolves
+            || graph
+                .preview_aliases
+                .iter()
+                .any(|alias| carries_annotation(c, wrapper, annotation_row, alias)))
+    {
         return;
     }
     c.report(utf16_token_span(c, name_token), &[display]);
+}
+
+/// The reach verdict over one name offset: a single-file library
+/// answers through the local entry-reach closure alone — the official
+/// walk IS per-library, so the closure is authoritative in both
+/// directions (the engine flag's under-reach, a missed edge, and its
+/// over-reach — a type annotation, a constant pattern, another
+/// library's reference — both fold to the closure's answer). A
+/// part-carrying library (the same-file index incomplete) keeps the
+/// face flag with the counted-use rescue. `declaration_row` locates
+/// the enclosing declaration for the closure's member keys — the
+/// container whose members ride the class flag, the member whose own
+/// flag the face answers directly.
+fn effective_verdict(
+    c: &Check<'_>,
+    face: &ReachabilityFace<'_>,
+    graph: &ReferenceGraph,
+    single_file: bool,
+    declaration_row: u32,
+    name_token: u32,
+    offset: u32,
+) -> Option<bool> {
+    if single_file {
+        return Some(locally_used(c, graph, declaration_row, name_token));
+    }
+    face.is_reachable(offset)
+}
+
+/// Whether the entry-reach closure marks the candidate named at
+/// `name_token` (in `declaration_row`) used — the candidate's own keys
+/// (its name, or a member's bare and container-qualified keys) plus
+/// nothing else: a member kept alive only through its container's own
+/// reference still reports (the official marks the container, not the
+/// member).
+fn locally_used(
+    c: &Check<'_>,
+    graph: &ReferenceGraph,
+    declaration_row: u32,
+    name_token: u32,
+) -> bool {
+    let name = c.lexeme(name_token);
+    if graph.used.contains(name) {
+        return true;
+    }
+    // A member or constructor: the container-qualified key too — a
+    // receiver-resolved continuation (`c.m()` with `var c = C()`)
+    // marks `C.m`, a redirect or tear-off `C.new`.
+    if matches!(
+        c.kind(declaration_row),
+        NodeKind::Constructor | NodeKind::Factory | NodeKind::Method | NodeKind::Fields
+    ) && let Some(container) = enclosing_container_name(c, declaration_row)
+    {
+        let member = if name == container.as_str() { "new" } else { name };
+        return graph.used.contains(member)
+            || graph.used.contains(format!("{container}.{member}").as_str());
+    }
+    false
+}
+
+/// The name of the class-like container enclosing `row`, when one does.
+fn enclosing_container_name(c: &Check<'_>, row: u32) -> Option<String> {
+    let mut current = row;
+    while let Some(parent) = c.unit.ast.parent(current) {
+        if matches!(
+            c.kind(parent),
+            NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::ExtensionDeclaration
+                | NodeKind::ExtensionTypeDeclaration
+                | NodeKind::EnumDeclaration
+        ) {
+            return container_name_token(c, parent).map(|token| c.lexeme(token).to_owned());
+        }
+        current = parent;
+    }
+    None
 }
 
 /// The same-file class table the constructor marking arms walk. The
@@ -768,6 +951,33 @@ fn declaration_rows(c: &Check<'_>, wrapper: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The directive rows of the unit — every `Import`/`Export`/`Part`/
+/// `PartOf` row, wherever the bridge tiles it: directives sit behind a
+/// `TopLevelDeclaration` wrapper beside their `MetadataStar` sibling
+/// (`behind_prelude`'s descent), so both the bare and the wrapped face
+/// are admitted.
+fn directive_rows(c: &Check<'_>, unit: u32) -> Vec<u32> {
+    fn is_directive(kind: NodeKind) -> bool {
+        matches!(
+            kind,
+            NodeKind::Import | NodeKind::Export | NodeKind::Part | NodeKind::PartOf
+        )
+    }
+    let mut rows = Vec::new();
+    for kid in c.collect_direct(unit) {
+        if is_directive(c.kind(kid)) {
+            rows.push(kid);
+        } else if c.kind(kid) == NodeKind::TopLevelDeclaration {
+            rows.extend(
+                c.collect_direct(kid)
+                    .into_iter()
+                    .filter(|&row| is_directive(c.kind(row))),
+            );
+        }
+    }
+    rows
+}
+
 /// The member rows of a container (its `DeclarationBody`/`EnumBody`
 /// children).
 fn member_rows(c: &Check<'_>, container: u32) -> Vec<u32> {
@@ -783,15 +993,30 @@ fn member_rows(c: &Check<'_>, container: u32) -> Vec<u32> {
 
 /// The name TOKEN of a declaration: a name-bearing direct child
 /// (methods, operators, typedefs — an `OperatorName` names through its
-/// payload token, the head would hit the `operator` keyword), else the
-/// production wrapper's name row (the class-like left-sibling
-/// placement), else [`container_name_token`].
+/// payload token, the head would hit the `operator` keyword; the
+/// identifier read is context-filtered, so a return-type identifier —
+/// `int get g` — never answers for the name), else the production
+/// wrapper's name row (the class-like left-sibling placement), else
+/// [`container_name_token`].
 fn name_token_of(c: &Check<'_>, wrapper: u32, row: u32) -> Option<u32> {
-    if let Some(name) = c
-        .collect_direct(row)
-        .into_iter()
-        .find(|&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::OperatorName))
-    {
+    use dartq_parser::IdentifierContext as Ctx;
+    const NAME_CONTEXTS: &[u32] = &[
+        Ctx::MethodDeclaration as u32,
+        Ctx::TopLevelFunctionDeclaration as u32,
+        Ctx::TypedefDeclaration as u32,
+        // Hand-built test tables stamp every identifier with the
+        // generic `Expression` word (the `member_name` posture).
+        Ctx::Expression as u32,
+    ];
+    if let Some(name) = c.collect_direct(row).into_iter().find(|&kid| {
+        match c.kind(kid) {
+            NodeKind::OperatorName => true,
+            NodeKind::Identifier => c
+                .field(kid, PayloadField::Context)
+                .is_some_and(|ctx| NAME_CONTEXTS.contains(&ctx)),
+            _ => false,
+        }
+    }) {
         return Some(if c.kind(name) == NodeKind::OperatorName {
             c.field(name, PayloadField::Name)
                 .unwrap_or_else(|| c.head_token(name))
@@ -813,13 +1038,28 @@ fn name_token_of(c: &Check<'_>, wrapper: u32, row: u32) -> Option<u32> {
 
 /// The written constructor name: the identifier in the
 /// method-continuation context (`unnecessary_constructor_name`'s
-/// reading — an unnamed constructor's class-name echo carries the same
-/// context, the caller compares against the container name).
+/// reading), else the plain method-declaration identifier — a
+/// `new`-prefixed declaration (`new named();`) names through its
+/// identifier. An unnamed constructor's class-name echo carries the
+/// same contexts; the caller compares against the container name.
 fn constructor_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
-    let ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
+    let cont = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
+    let decl = dartq_parser::IdentifierContext::MethodDeclaration as u32;
+    let mut fallback = None;
     c.collect_direct(row).into_iter().find(|&kid| {
-        c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
+        if c.kind(kid) != NodeKind::Identifier {
+            return false;
+        }
+        match c.field(kid, PayloadField::Context) {
+            Some(ctx) if ctx == cont => true,
+            Some(ctx) if ctx == decl && fallback.is_none() => {
+                fallback = Some(kid);
+                false
+            }
+            _ => false,
+        }
     })
+    .or(fallback)
 }
 
 /// The test-harness method names (`isTestMethod`).
@@ -869,158 +1109,981 @@ fn carries_annotation(c: &Check<'_>, wrapper: u32, row: u32, name: &str) -> bool
 /// The `static` `ModSet` bit (bridge `mod_bits`, member family).
 const STATIC_BIT: u16 = 1 << 3;
 
-/// The name → counting-position index of the unit: every `Identifier`
-/// row whose [`dartq_parser::IdentifierContext`] marks a reference
-/// position (`Expression`, `ExpressionContinuation`,
-/// `ConstructorReference`, `ConstructorReferenceContinuation`,
-/// `ConstructorReferenceContinuationAfterTypeArguments`, or
-/// `PatternFieldName`) contributes its lexeme, plus every doc-comment
-/// `[Name]` reference (the official resolves comment references
-/// against the element model — a `/// See [C]` read marks `C` used).
-/// Declaration contexts, directive names, label positions, and plain
-/// `TypeReference`/`PrefixedTypeReference` rows do not count — the
-/// official's `SimpleIdentifier`-vs-`NamedType` split
-/// (`unreachable_from_main.dart` `visitNamedType` :307-346 keeps a
-/// plain type annotation out of the use set; `visitSimpleIdentifier`
-/// :386-394 keeps every expression reference in it).
-fn counting_uses(c: &Check<'_>) -> rustc_hash::FxHashMap<String, u32> {
-    use dartq_parser::IdentifierContext as Ctx;
-    const EXPRESSION: u32 = Ctx::Expression as u32;
-    const EXPRESSION_CONT: u32 = Ctx::ExpressionContinuation as u32;
-    const CTOR: u32 = Ctx::ConstructorReference as u32;
-    const PATTERN_FIELD: u32 = Ctx::PatternFieldName as u32;
-    let mut uses: rustc_hash::FxHashMap<String, u32> = rustc_hash::FxHashMap::default();
-    let count = |uses: &mut rustc_hash::FxHashMap<String, u32>, key: String| {
-        *uses.entry(key).or_default() += 1;
-    };
-    let Some(root) = c.unit.ast.root() else {
-        return uses;
-    };
-    for row in c.children(root) {
-        if c.kind(row) != NodeKind::Identifier {
-            continue;
-        }
-        let Some(ctx) = c.field(row, PayloadField::Context) else {
-            continue;
+/// The name-level reference graph of one unit — the official
+/// per-library walk re-derived shell-side (upstream Dart SDK source,
+/// `pkg/linter/lib/src/rules/unreachable_from_main.dart`):
+///
+/// * `uses` — the flat name → counting-position index: every reference
+///   key the official visitor counts (the `visitSimpleIdentifier`
+///   expression reads, `visitNamedType`'s exception list — typedef
+///   aliases, extension types, type arguments — `visitClassDeclaration`'s
+///   unconditional clause names, `visitAnnotation`, the operator visits,
+///   `visitRedirectingConstructorInvocation`, and the doc-comment
+///   `[Name]` face). The anti-reach arm (gate 1.5) reads it.
+/// * `entries` — the entry seeds (`_isEntryPoint`: functions named
+///   `main`, or carrying `@pragma('vm:entry-point')` — const aliases
+///   followed through `computeConstantValue` — or a widget-preview
+///   annotation that resolves into the flutter library).
+/// * `used` — the entry-reach closure over the per-declaration
+///   dependency edges (a reference credits its enclosing member and the
+///   enclosing container — upstream walks each declaration's subtree, so
+///   a class's dep set covers its member bodies — `_addDeclaration`'s
+///   enclosing-top-level double marking; the worklist walk folds them
+///   into `used` at build time).
+struct ReferenceGraph {
+    uses: FxHashMap<String, u32>,
+    entries: FxHashSet<String>,
+    used: FxHashSet<String>,
+    /// Whether a `Preview` annotation can resolve into the flutter
+    /// widget-previews library here (the `widget_previews.dart` import
+    /// surface, unshadowed by a unit-declared `Preview` class).
+    preview_resolves: bool,
+    /// The const aliases of the resolved flutter `Preview`
+    /// (`const preview = Preview();` — `@preview` follows the alias).
+    preview_aliases: Vec<String>,
+}
+
+impl ReferenceGraph {
+    fn build(c: &Check<'_>) -> ReferenceGraph {
+        use dartq_parser::IdentifierContext as Ctx;
+        const EXPRESSION: u32 = Ctx::Expression as u32;
+        const EXPRESSION_CONT: u32 = Ctx::ExpressionContinuation as u32;
+        const CTOR: u32 = Ctx::ConstructorReference as u32;
+        const CTOR_CONT: u32 = Ctx::ConstructorReferenceContinuation as u32;
+        const CTOR_CONT_ARGS: u32 =
+            Ctx::ConstructorReferenceContinuationAfterTypeArguments as u32;
+        const PATTERN_FIELD: u32 = Ctx::PatternFieldName as u32;
+        const TYPE_REF: u32 = Ctx::TypeReference as u32;
+        const META_REF: u32 = Ctx::MetadataReference as u32;
+        const META_CONT: u32 = Ctx::MetadataContinuation as u32;
+        let last = c.unit.tokens.len().saturating_sub(1) as u32;
+
+        // The declaration pre-scan: containers, the alias-like type
+        // names (`visitNamedType` counts every reference to a typedef
+        // or an extension type), the member-name → container table
+        // (`_addDeclaration`'s enclosing-top-level arm), the flutter
+        // import surface, and the const annotation aliases.
+        let mut alias_like: FxHashSet<&str> = FxHashSet::default();
+        let mut alias_rhs: FxHashMap<String, String> = FxHashMap::default();
+        let mut containers: FxHashSet<&str> = FxHashSet::default();
+        let mut member_containers: FxHashMap<String, String> = FxHashMap::default();
+        let mut import_uris: Vec<&str> = Vec::new();
+        let mut declares_preview = false;
+        let mut pragma_aliases: Vec<String> = Vec::new();
+        let mut preview_aliases: Vec<String> = Vec::new();
+        let mut entries: FxHashSet<String> = FxHashSet::default();
+        let mut uses: FxHashMap<String, u32> = FxHashMap::default();
+        let mut deps: FxHashMap<String, Vec<String>> = FxHashMap::default();
+        let Some(root) = c.unit.ast.root() else {
+            return ReferenceGraph {
+                uses,
+                entries,
+                used: FxHashSet::default(),
+                preview_resolves: false,
+                preview_aliases,
+            };
         };
-        // Upstream's `_patternLevel` (:170, :237-243): a reference
-        // inside a `ConstantPattern` subtree never counts — a constant
-        // pattern's `C()` or `name` is matched against, never invoked.
-        // The pattern-field name is exempt (visitPatternField carries
-        // no level gate).
-        if ctx != PATTERN_FIELD && inside_constant_pattern(c, row) {
-            continue;
-        }
-        if ctx == EXPRESSION || ctx == EXPRESSION_CONT || ctx == PATTERN_FIELD {
-            let lexeme = c.lexeme(c.head_token(row)).to_owned();
-            count(&mut uses, lexeme.clone());
-            // An invocation head (`C()`) resolves to the constructor it
-            // invokes upstream (`visitMethodInvocation`'s element
-            // read): an immediate `(` counts the unnamed constructor,
-            // a `.` the written member — the same keys the
-            // constructor-reference head counts. No angle scan (a
-            // comparison's `<` would run it; `C<T>()` keeps the
-            // bare-name count only).
-            if ctx == EXPRESSION {
-                let next = c.unit.ast.token_range(row).end;
-                if next + 1 < c.unit.tokens.len() as u32 {
-                    match c.lexeme(next) {
-                        "(" => count(&mut uses, format!("{lexeme}.new")),
-                        "." => count(&mut uses, format!("{lexeme}.{}", c.lexeme(next + 1))),
-                        _ => {}
+        let wrappers: Vec<u32> = c
+            .children(root)
+            .into_iter()
+            .filter(|&row| c.kind(row) == NodeKind::TopLevelDeclaration)
+            .collect();
+        for wrapper in &wrappers {
+            for row in declaration_rows(c, *wrapper) {
+                match c.kind(row) {
+                    NodeKind::Typedef => {
+                        if let Some(name) = name_token_of(c, *wrapper, row) {
+                            alias_like.insert(c.lexeme(name));
+                            // `typedef A = B;` — an alias invocation
+                            // (`A()`, `A.named()`) resolves through to B's
+                            // constructor element; the row pass expands the
+                            // credited keys through this edge.
+                            if let Some(head) = typedef_rhs_class(c, row) {
+                                alias_rhs.insert(c.lexeme(name).to_owned(), head.to_owned());
+                            }
+                        }
                     }
-                }
-            }
-            continue;
-        }
-        // A `ConstructorReferenceContinuation` counts its written
-        // member name (the `: this.one()` redirect names `one` — the
-        // qualified `C.one` key is the head arm's job; the bare lexeme
-        // covers the redirect and the `super.name()` faces the head
-        // arm cannot key).
-        if ctx == Ctx::ConstructorReferenceContinuation as u32
-            || ctx == Ctx::ConstructorReferenceContinuationAfterTypeArguments as u32
-        {
-            count(&mut uses, c.lexeme(c.head_token(row)).to_owned());
-            continue;
-        }
-        if ctx != CTOR {
-            continue;
-        }
-        // A constructor head counts the class and its member: `C()`
-        // marks `C` and `C.new`, `C.two()` marks `C` and `C.two`. The
-        // tokens after the head's span decide the arm — `.name` reads
-        // the written continuation, `(`/`else` reads the unnamed form
-        // (upstream's `ConstructorName` element split: the
-        // constructor the invocation resolves is the use).
-        let lexeme = c.lexeme(c.head_token(row));
-        count(&mut uses, lexeme.to_owned());
-        // The member token sits after the head's own type arguments:
-        // `C<T>.named` reads the `.named`, `C()` and `C<T>()` read
-        // `new`. The scan walks the balanced `<…>` run off the token
-        // stream (the row's span ends at `C`; a `>` deeper than it
-        // opened closes the args).
-        let mut dot = c.unit.ast.token_range(row).end;
-        if c.lexeme(dot) == "<" {
-            let last = c.unit.tokens.len().saturating_sub(1) as u32;
-            let mut depth = 1i32;
-            while depth > 0 && dot < last {
-                dot += 1;
-                match c.lexeme(dot) {
-                    "<" | "<<" | "<<<" => depth += 1,
-                    ">" => depth -= 1,
-                    ">>" => depth -= 2,
-                    ">>>" => depth -= 3,
+                    NodeKind::ExtensionTypeDeclaration => {
+                        if let Some(name) = container_name_token(c, row) {
+                            alias_like.insert(c.lexeme(name));
+                            containers.insert(c.lexeme(name));
+                            let container = c.lexeme(name).to_owned();
+                            credit_member_names(c, row, &container, &mut member_containers);
+                        }
+                    }
+                    NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::EnumDeclaration => {
+                        if let Some(name) = container_name_token(c, row) {
+                            if c.lexeme(name) == "Preview" {
+                                declares_preview = true;
+                            }
+                            let container = c.lexeme(name).to_owned();
+                            containers.insert(c.lexeme(name));
+                            credit_member_names(c, row, &container, &mut member_containers);
+                        }
+                    }
+                    NodeKind::TopLevelMethod => {
+                        // `_isEntryPoint`: a function (or accessor) named
+                        // `main`, or one carrying an entry annotation —
+                        // read after the alias scan below completes.
+                        if let Some(name) = member_name(c, row) {
+                            if c.lexeme(c.head_token(name)) == "main" {
+                                entries.insert("main".to_owned());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
-            dot = (dot + 1).min(last);
         }
-        let member = if dot + 1 < c.unit.tokens.len() as u32 && c.lexeme(dot) == "." {
-            c.lexeme(dot + 1).to_owned()
-        } else {
-            "new".to_owned()
-        };
-        count(&mut uses, format!("{lexeme}.{member}"));
-    }
-    // The doc-comment `[Name]` face: a bracketed name in any comment
-    // reads as a reference. `Comment.range` is byte offsets into the
-    // source — the scan walks the comment text once per unit.
-    for comment in c.comments.all() {
-        let text = &c.unit.source[comment.range.start as usize..comment.range.end as usize];
-        let bytes = text.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == b'[' {
-                let start = i + 1;
-                let mut end = start;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-                {
-                    end += 1;
-                }
-                if end > start && bytes.get(end) == Some(&b']') {
-                    *uses.entry(text[start..end].to_owned()).or_default() += 1;
-                    i = end;
-                    continue;
+        for row in directive_rows(c, root) {
+            if c.kind(row) != NodeKind::Import {
+                continue;
+            }
+            for kid in c.collect_direct(row) {
+                if c.kind(kid) == NodeKind::StringLiteral {
+                    import_uris.push(unquote(c.lexeme(c.head_token(kid))));
                 }
             }
-            i += 1;
+        }
+        let preview_resolves =
+            import_uris.iter().any(|uri| uri.contains("widget_previews")) && !declares_preview;
+        // The const aliases (`const entryPoint = pragma('vm:entry-point')`,
+        // `const preview = Preview()`): `_isExemptingAnnotation` follows
+        // them through `computeConstantValue`, so `@entryPoint` reads
+        // as the pragma and `@preview` as the widget preview.
+        for wrapper in &wrappers {
+            for row in declaration_rows(c, *wrapper) {
+                if c.kind(row) != NodeKind::TopLevelFields {
+                    continue;
+                }
+                for variable in c.collect_direct(row) {
+                    if c.kind(variable) != NodeKind::VariablesDeclaration
+                        || variables_declaration_keyword(c, variable)
+                            .is_none_or(|kw| c.lexeme(kw) != "const")
+                    {
+                        continue;
+                    }
+                    for var in c.collect_direct(variable) {
+                        let Some(name) = (c.kind(var) == NodeKind::InitializedIdentifier)
+                            .then(|| initialized_identifier_name(c, var))
+                            .flatten()
+                        else {
+                            continue;
+                        };
+                        let Some(init) = c.collect_direct(var).into_iter().find(|&kid| {
+                            c.kind(kid) == NodeKind::VariableInitializer
+                        }) else {
+                            continue;
+                        };
+                        let kids = c.collect_direct(init);
+                        let Some(head) = kids
+                            .iter()
+                            .find(|&&kid| c.kind(kid) == NodeKind::Identifier)
+                            .map(|&kid| c.head_token(kid))
+                        else {
+                            continue;
+                        };
+                        match c.lexeme(head) {
+                            "pragma"
+                                if first_string_argument(c, &kids) == Some("vm:entry-point") =>
+                            {
+                                pragma_aliases.push(c.lexeme(name).to_owned());
+                            }
+                            "Preview" if preview_resolves && has_arguments(c, &kids) => {
+                                preview_aliases.push(c.lexeme(name).to_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        // The entry annotations on functions: the direct pragma, the
+        // aliases, and the resolved widget preview.
+        for wrapper in &wrappers {
+            for row in declaration_rows(c, *wrapper) {
+                if c.kind(row) != NodeKind::TopLevelMethod {
+                    continue;
+                }
+                let Some(name) = member_name(c, row) else {
+                    continue;
+                };
+                let name = c.lexeme(c.head_token(name));
+                if carries_pragma_entry(c, *wrapper, row)
+                    || (carries_annotation(c, *wrapper, row, "Preview") && preview_resolves)
+                    || pragma_aliases
+                        .iter()
+                        .chain(preview_aliases.iter())
+                        .any(|alias| carries_annotation(c, *wrapper, row, alias))
+                {
+                    entries.insert(name.to_owned());
+                }
+            }
+        }
+        // The local receiver types: a variable initialized from a
+        // same-file creation (`var c = C();`) or annotated with a
+        // same-file container type names its container — a member
+        // continuation on that receiver (`c.m()`) keys the QUALIFIED
+        // member (`C.m`), the official's element resolution; an
+        // unknown receiver keeps the bare member key (the conservative
+        // name-level fallback).
+        let mut receiver_types: FxHashMap<&str, &str> = FxHashMap::default();
+        for row in c.children(root) {
+            if c.kind(row) != NodeKind::InitializedIdentifier {
+                continue;
+            }
+            let Some(name) = initialized_identifier_name(c, row) else {
+                continue;
+            };
+            let kids = c.collect_direct(row);
+            if let Some(&init) = kids
+                .iter()
+                .find(|&&kid| c.kind(kid) == NodeKind::VariableInitializer)
+            {
+                // The initializer's head identifier (a token read — the
+                // creation's tiling never matters); `C(`, `C.named`,
+                // `C<…>` head a same-file container's instance.
+                for token in c.unit.ast.token_range(init) {
+                    let lexeme = c.lexeme(token);
+                    if lexeme == "=" || lexeme == "new" || lexeme == "const" {
+                        continue;
+                    }
+                    if lexeme.chars().next().is_none_or(|ch| !(ch.is_alphabetic() || ch == '_')) {
+                        break;
+                    }
+                    let next = (token + 1).min(last);
+                    if containers.contains(lexeme)
+                        && next <= last
+                        && matches!(c.lexeme(next), "(" | "." | "<")
+                    {
+                        receiver_types.insert(c.lexeme(name), lexeme);
+                    }
+                    break;
+                }
+            } else if let Some(&ty) = kids.iter().find(|&&kid| c.kind(kid) == NodeKind::Type) {
+                let head = c.lexeme(c.head_token(ty));
+                if containers.contains(head) {
+                    receiver_types.insert(c.lexeme(name), head);
+                }
+            }
+        }
+        // The row pass: every reference key counts into `uses` and
+        // credits the enclosing declarations' dependency edges.
+        // `credit` folds one reference row: the closure keys into the
+        // flat use index and the per-declaration dependency edges (the
+        // attribution), `uses_extra` the flat-index-only keys a
+        // receiver-resolved continuation carries beside its qualified
+        // closure key.
+        let mut credit = |keys: &[String], uses_extra: &[String], row: u32| {
+            count_keys(&mut uses, keys);
+            count_keys(&mut uses, uses_extra);
+            let mut attribution = attribution_keys(c, row);
+            // `_addDeclaration`'s enclosing-top-level arm: a plain-name
+            // reference to a member also marks the member's container.
+            for key in keys {
+                if !key.contains('.') {
+                    if let Some(container) = member_containers.get(key) {
+                        attribution.push(container.clone());
+                    }
+                }
+            }
+            for source in &attribution {
+                deps.entry(source.clone()).or_default().extend_from_slice(keys);
+            }
+        };
+        let constant_patterns: Vec<core::ops::Range<u32>> = c
+            .children(root)
+            .into_iter()
+            .filter(|&row| c.kind(row) == NodeKind::ConstantPattern)
+            .map(|row| c.unit.ast.token_range(row))
+            .collect();
+        for row in c.children(root) {
+            let mut keys: Vec<String> = Vec::new();
+            let mut uses_extra: Vec<String> = Vec::new();
+            match c.kind(row) {
+                NodeKind::Identifier => {
+                    let Some(ctx) = c.field(row, PayloadField::Context) else {
+                        continue;
+                    };
+                    // Upstream's `_patternLevel` (:170, :237-243): a
+                    // reference inside a `ConstantPattern` subtree
+                    // never counts — the pattern-field name is exempt.
+                    if ctx != PATTERN_FIELD
+                        && inside_constant_pattern(&constant_patterns, c.head_token(row))
+                    {
+                        continue;
+                    }
+                    let lexeme = c.lexeme(c.head_token(row));
+                    if ctx == EXPRESSION || ctx == EXPRESSION_CONT || ctx == PATTERN_FIELD {
+                        // A member continuation on a locally typed
+                        // receiver keys the qualified member for the
+                        // closure (`c.m()` with `var c = C()` marks
+                        // `C.m` — the official resolves the element; a
+                        // bare key would mark every same-named member);
+                        // the flat use index keeps the bare key too
+                        // (`uses_extra` — the multi-file counted rescue
+                        // reads it).
+                        if ctx == EXPRESSION_CONT {
+                            let start = c.unit.ast.token_range(row).start;
+                            let resolved = (start >= 2 && c.lexeme(start - 1) == ".")
+                                .then(|| receiver_types.get(c.lexeme(start - 2)))
+                                .flatten();
+                            if let Some(container) = resolved {
+                                // The class key too — `_addDeclaration`
+                                // marks the member's enclosing top-level.
+                                keys.push(container.to_string());
+                                keys.push(format!("{container}.{lexeme}"));
+                                uses_extra.push(lexeme.to_owned());
+                            } else {
+                                keys.push(lexeme.to_owned());
+                            }
+                        } else {
+                            keys.push(lexeme.to_owned());
+                        }
+                        // An invocation head resolves to the constructor
+                        // it invokes: `(` counts the unnamed constructor,
+                        // `.` the written member (`C()`, `C.named()`).
+                        // No angle scan (a comparison's `<` would run it).
+                        if ctx == EXPRESSION {
+                            let next = c.unit.ast.token_range(row).end.min(last);
+                            if next + 1 < c.unit.tokens.len() as u32 {
+                                match c.lexeme(next) {
+                                    "(" => {
+                                        credit_ctor(&mut keys, &alias_rhs, lexeme, "new");
+                                    }
+                                    "." => credit_ctor(
+                                        &mut keys,
+                                        &alias_rhs,
+                                        lexeme,
+                                        c.lexeme(next + 1),
+                                    ),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    } else if ctx == CTOR_CONT || ctx == CTOR_CONT_ARGS {
+                        // A constructor-reference continuation counts
+                        // its written member (`: this.one()` names `one`;
+                        // the qualified key is the head arm's job).
+                        keys.push(lexeme.to_owned());
+                    } else if ctx == CTOR {
+                        // A constructor head counts the class and its
+                        // member (`C()` → `C`, `C.new`; `C<T>.two()` →
+                        // `C`, `C.two`) — the balanced `<…>` scan walks
+                        // the head's own type arguments.
+                        keys.push(lexeme.to_owned());
+                        let mut dot = c.unit.ast.token_range(row).end;
+                        if dot <= last && c.lexeme(dot) == "<" {
+                            let mut depth = 1i32;
+                            while depth > 0 && dot < last {
+                                dot += 1;
+                                match c.lexeme(dot) {
+                                    "<" | "<<" | "<<<" => depth += 1,
+                                    ">" => depth -= 1,
+                                    ">>" => depth -= 2,
+                                    ">>>" => depth -= 3,
+                                    _ => {}
+                                }
+                            }
+                            // Past the closing bracket: the member
+                            // continuation (`.two`) follows it.
+                            dot = (dot + 1).min(last);
+                        }
+                        let member = if dot + 1 < c.unit.tokens.len() as u32 && c.lexeme(dot) == "."
+                        {
+                            c.lexeme(dot + 1).to_owned()
+                        } else {
+                            "new".to_owned()
+                        };
+                        credit_ctor(&mut keys, &alias_rhs, lexeme, &member);
+                    } else if ctx == META_REF {
+                        // `visitAnnotation`: the annotation's element —
+                        // the class (`@C`), its constructor (`@C()`,
+                        // `@C.named()`), or the const the alias names.
+                        keys.push(lexeme.to_owned());
+                        let next = c.unit.ast.token_range(row).end.min(last);
+                        if next + 1 < c.unit.tokens.len() as u32 {
+                            match c.lexeme(next) {
+                                "(" => keys.push(format!("{lexeme}.new")),
+                                "." => keys.push(format!("{lexeme}.{}", c.lexeme(next + 1))),
+                                _ => {}
+                            }
+                        }
+                    } else if ctx == META_CONT {
+                        // The named-annotation member (`@C.named`).
+                        keys.push(lexeme.to_owned());
+                    } else if ctx == TYPE_REF
+                        && (alias_like.contains(lexeme)
+                            || in_type_argument(c, row)
+                            || external_type_position(c, row))
+                    {
+                        // `visitNamedType`'s exception list: a typedef
+                        // alias, an extension type, a type-argument
+                        // position, or an external variable type /
+                        // external function return type counts; an
+                        // ordinary type annotation never does.
+                        keys.push(lexeme.to_owned());
+                    } else {
+                        continue;
+                    }
+                }
+                NodeKind::BinaryExpression => {
+                    // `visitBinaryExpression`: the operator element.
+                    if let Some(operator) = c.field(row, PayloadField::Operator) {
+                        keys.push(c.lexeme(operator).to_owned());
+                    }
+                }
+                NodeKind::UnaryPrefix => {
+                    // `visitPrefixExpression`: `~`/unary `-`/`++`/`--`.
+                    match c.lexeme(c.head_token(row)) {
+                        "~" | "-" => keys.push(c.lexeme(c.head_token(row)).to_owned()),
+                        "++" => keys.push("+".to_owned()),
+                        "--" => keys.push("-".to_owned()),
+                        _ => {}
+                    }
+                }
+                NodeKind::UnaryPostfix => {
+                    // `visitPostfixExpression`: `++`/`--` name `+`/`-`.
+                    let range = c.unit.ast.token_range(row);
+                    if range.end > 0 {
+                        match c.lexeme(range.end - 1) {
+                            "++" => keys.push("+".to_owned()),
+                            "--" => keys.push("-".to_owned()),
+                            _ => {}
+                        }
+                    }
+                }
+                NodeKind::Indexed => {
+                    // `visitIndexExpression`: `a[i]` reads `[]`; an
+                    // assignment target (`a[i] = v`, `a[i] += v`) is
+                    // the write element `[]=`.
+                    keys.push("[]".to_owned());
+                    let next = c.unit.ast.token_range(row).end.min(last);
+                    if next <= last {
+                        match c.lexeme(next) {
+                            "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | ">>>="
+                            | "&=" | "|=" | "^=" => keys.push("[]=".to_owned()),
+                            _ => {}
+                        }
+                    }
+                }
+                NodeKind::ThisExpression => {
+                    // `visitRedirectingConstructorInvocation`: a
+                    // redirect's `: this()` marks the target constructor
+                    // and its class; `: this.name()` the named target.
+                    let next = c.unit.ast.token_range(row).end.min(last);
+                    if next <= last {
+                        if let Some(container) = enclosing_container_name(c, row) {
+                            match c.lexeme(next) {
+                                "(" => {
+                                    keys.push(container.clone());
+                                    keys.push(format!("{container}.new"));
+                                }
+                                "." if next + 1 < c.unit.tokens.len() as u32 => {
+                                    let member = c.lexeme(next + 1);
+                                    keys.push(container.clone());
+                                    keys.push(format!("{container}.{member}"));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+            if !keys.is_empty() {
+                credit(&keys, &uses_extra, row);
+            }
+        }
+        // The class clauses (`visitClassDeclaration` /
+        // `visitExtensionTypeDeclaration`): an `extends`/`with`/
+        // `implements`/`on` name counts unconditionally — the
+        // reference visitor's `_addNamedType` bypasses the NamedType
+        // filter — credited to the container's declaration.
+        for wrapper in &wrappers {
+            for row in declaration_rows(c, *wrapper) {
+                if !matches!(
+                    c.kind(row),
+                    NodeKind::ClassDeclaration
+                        | NodeKind::MixinDeclaration
+                        | NodeKind::ExtensionDeclaration
+                        | NodeKind::ExtensionTypeDeclaration
+                        | NodeKind::EnumDeclaration
+                ) {
+                    continue;
+                }
+                let Some(name) = container_name_token(c, row) else {
+                    continue;
+                };
+                let container = c.lexeme(name).to_owned();
+                for (super_name, _) in supertypes(c, row) {
+                    count_keys(&mut uses, &[super_name.to_owned()]);
+                    deps.entry(container.clone()).or_default().push(super_name.to_owned());
+                }
+            }
+        }
+        // The doc-comment `[Name]` face: a bracketed name in any
+        // comment reads as a reference — into the flat use index, and
+        // as a dependency edge of the declaration the comment attaches
+        // to (the official reads doc-comment references against the
+        // element model; the deepest covering row is the doc'd
+        // declaration).
+        for comment in c.comments.all() {
+            let text = &c.unit.source[comment.range.start as usize..comment.range.end as usize];
+            let bytes = text.as_bytes();
+            let mut names: Vec<String> = Vec::new();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'[' {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    if end > start && bytes.get(end) == Some(&b']') {
+                        names.push(text[start..end].to_owned());
+                        i = end;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            if names.is_empty() {
+                continue;
+            }
+            count_keys(&mut uses, &names);
+            let candidates: Vec<u32> = wrappers
+                .iter()
+                .flat_map(|wrapper| declaration_rows(c, *wrapper))
+                .collect();
+            if let Some(owner) = doc_owner(c, &candidates, comment.token) {
+                for source in attribution_keys(c, owner) {
+                    deps.entry(source).or_default().extend_from_slice(&names);
+                }
+            }
+        }
+        // The entry-reach closure: the worklist walk over the
+        // dependency edges (mark-before-push, one enqueue per key).
+        let mut used = entries.clone();
+        let mut queue: Vec<String> = entries.iter().cloned().collect();
+        while let Some(source) = queue.pop() {
+            let Some(targets) = deps.get(&source) else {
+                continue;
+            };
+            for target in targets.clone() {
+                if used.insert(target.clone()) {
+                    queue.push(target);
+                }
+            }
+        }
+        ReferenceGraph {
+            uses,
+            entries,
+            used,
+            preview_resolves,
+            preview_aliases,
         }
     }
-    uses
+}
+
+/// Counts every reference key into the flat use index.
+fn count_keys(uses: &mut FxHashMap<String, u32>, keys: &[String]) {
+    for key in keys {
+        *uses.entry(key.clone()).or_default() += 1;
+    }
+}
+
+/// Credits every member name of `container` in the member-name →
+/// container table (`_addDeclaration`'s enclosing-top-level arm).
+fn credit_member_names(
+    c: &Check<'_>,
+    container_row: u32,
+    container: &str,
+    member_containers: &mut FxHashMap<String, String>,
+) {
+    for member in member_rows(c, container_row) {
+        match c.kind(member) {
+            NodeKind::Method => {
+                if let Some(name) = member_name(c, member) {
+                    let token = if c.kind(name) == NodeKind::OperatorName {
+                        c.field(name, PayloadField::Name).unwrap_or_else(|| c.head_token(name))
+                    } else {
+                        c.head_token(name)
+                    };
+                    member_containers.insert(c.lexeme(token).to_owned(), container.to_owned());
+                }
+            }
+            NodeKind::Fields => {
+                for variable in c.collect_direct(member) {
+                    if c.kind(variable) != NodeKind::VariablesDeclaration {
+                        continue;
+                    }
+                    for var in c.collect_direct(variable) {
+                        if c.kind(var) == NodeKind::InitializedIdentifier
+                            && let Some(name) = initialized_identifier_name(c, var)
+                        {
+                            member_containers
+                                .insert(c.lexeme(name).to_owned(), container.to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The declaration keys a row sits in: its nearest member (or
+/// top-level function / variable / constructor) key and the enclosing
+/// container's key — the official dependency walk's attribution.
+/// `MetadataStar` rows sit LEFT of the declaration they annotate
+/// (flat-tailed siblings, never ancestors): the walk jumps to the
+/// star's right sibling — the annotated declaration.
+fn attribution_keys(c: &Check<'_>, row: u32) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut node = row;
+    loop {
+        // `MetadataStar` rows sit LEFT of the declaration they annotate
+        // (flat-tailed siblings, never ancestors): when the walk is
+        // about to climb into one, jump to the annotated declaration
+        // instead. A top-level star's right sibling is the production
+        // wrapper — descend to its declaration row.
+        if c.unit
+            .ast
+            .parent(node)
+            .is_some_and(|parent| c.kind(parent) == NodeKind::MetadataStar)
+        {
+            let Some(star) = c.unit.ast.parent(node) else {
+                break;
+            };
+            let Some(star_parent) = c.unit.ast.parent(star) else {
+                break;
+            };
+            let siblings = c.collect_direct(star_parent);
+            let Some(pos) = siblings.iter().position(|&kid| kid == star) else {
+                break;
+            };
+            let Some(&next) = siblings.get(pos + 1) else {
+                break;
+            };
+            node = if c.kind(next) == NodeKind::TopLevelDeclaration {
+                match declaration_rows(c, next).first() {
+                    Some(&decl) => decl,
+                    None => break,
+                }
+            } else {
+                next
+            };
+        }
+        match c.kind(node) {
+            NodeKind::Constructor | NodeKind::Factory => {
+                if let Some(container) = enclosing_container_name(c, node) {
+                    let written = constructor_name_node(c, node);
+                    let head = written.map_or_else(
+                        || c.head_token(node),
+                        |name| c.head_token(name),
+                    );
+                    let head_lexeme = c.lexeme(head);
+                    let member = if head_lexeme == container { "new" } else { head_lexeme };
+                    keys.push(format!("{container}.{member}"));
+                    if member != "new" {
+                        keys.push(member.to_owned());
+                    }
+                }
+            }
+            NodeKind::Method | NodeKind::TopLevelMethod => {
+                if let Some(name) = member_name(c, node) {
+                    let token = if c.kind(name) == NodeKind::OperatorName {
+                        c.field(name, PayloadField::Name).unwrap_or_else(|| c.head_token(name))
+                    } else {
+                        c.head_token(name)
+                    };
+                    keys.push(c.lexeme(token).to_owned());
+                }
+            }
+            NodeKind::InitializedIdentifier => {
+                if let Some(name) = initialized_identifier_name(c, node) {
+                    keys.push(c.lexeme(name).to_owned());
+                }
+            }
+            // A fields row attributes its WRITTEN TYPE to every variable
+            // it declares (`declarations.addAll(variables.variables)` +
+            // the `visitVariableDeclaration` type re-accept — a reference
+            // in the type rides each variable's dependency set). The
+            // type's rows tile as the fields row's direct children (the
+            // `VariablesDeclaration` seals after the names as a sibling),
+            // so the walk reaches this arm with NO keys yet; a walk that
+            // climbed out of an initializer already carries that one
+            // variable's key (the `InitializedIdentifier` arm) and must
+            // not widen to its siblings.
+            NodeKind::Fields | NodeKind::TopLevelFields if keys.is_empty() => {
+                for list in c.collect_direct(node) {
+                    if c.kind(list) != NodeKind::VariablesDeclaration {
+                        continue;
+                    }
+                    for var in c.collect_direct(list) {
+                        if c.kind(var) == NodeKind::InitializedIdentifier
+                            && let Some(name) = initialized_identifier_name(c, var)
+                        {
+                            keys.push(c.lexeme(name).to_owned());
+                        }
+                    }
+                }
+            }
+            NodeKind::ClassDeclaration
+            | NodeKind::MixinDeclaration
+            | NodeKind::ExtensionDeclaration
+            | NodeKind::ExtensionTypeDeclaration
+            | NodeKind::EnumDeclaration => {
+                if let Some(name) = container_name_token(c, node) {
+                    keys.push(c.lexeme(name).to_owned());
+                }
+                break;
+            }
+            NodeKind::Typedef => {
+                if let Some(name) = name_token_of_typedef(c, node) {
+                    keys.push(c.lexeme(name).to_owned());
+                }
+                break;
+            }
+            _ => {}
+        }
+        let Some(parent) = c.unit.ast.parent(node) else {
+            break;
+        };
+        node = parent;
+    }
+    keys
+}
+
+/// The deepest declaration row whose token window covers `token` —
+/// the declaration a comment attaches to (a member's doc comment
+/// credits the member, not its container).
+fn doc_owner(c: &Check<'_>, candidates: &[u32], token: u32) -> Option<u32> {
+    candidates.iter().copied().find_map(|row| {
+        c.unit.ast.token_range(row).contains(&token).then(|| {
+            doc_owner(c, &member_rows(c, row), token).unwrap_or(row)
+        })
+    })
+}
+
+/// The name token of a typedef row (its direct identifier child).
+fn name_token_of_typedef(c: &Check<'_>, row: u32) -> Option<u32> {
+    c.collect_direct(row)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+        .map(|kid| c.head_token(kid))
+        .or_else(|| container_name_token(c, row))
+}
+
+/// Whether the identifier row sits inside a type-argument list — the
+/// token walkback reaches the opening `<` before any non-argument
+/// punctuation (a record type's `(C, D)` stops at `(`).
+/// Credit an invocation head's constructor key (`C`/`C.new`, `C.named`)
+/// — a typedef alias head (`typedef A = B; A()`) resolves through to the
+/// target class's element, so the target keys ride along.
+fn credit_ctor(
+    keys: &mut Vec<String>,
+    alias_rhs: &FxHashMap<String, String>,
+    lexeme: &str,
+    member: &str,
+) {
+    keys.push(format!("{lexeme}.{member}"));
+    if let Some(target) = alias_rhs.get(lexeme) {
+        keys.push(target.clone());
+        keys.push(format!("{target}.{member}"));
+    }
+}
+
+/// The `typedef A = B;` RHS head class name — the alias's resolution
+/// target (`A()` invokes B's constructor). Only a plain-identifier head
+/// names a class (`void Function()` / record RHSes target no class).
+fn typedef_rhs_class<'a>(c: &'a Check<'_>, row: u32) -> Option<&'a str> {
+    let rhs = c.collect_direct(row).into_iter().find(|&kid| {
+        matches!(
+            c.kind(kid),
+            NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
+        )
+    })?;
+    let head = c.head_token(rhs);
+    super::is_identifier_token(c, head).then(|| c.lexeme(head))
+}
+
+/// `isInExternalVariableTypeOrFunctionReturnType`
+/// (unreachable_from_main.dart:740-753): the topmost type annotation's
+/// declaration — an external function's RETURN type, or the written
+/// type of an external field / top-level variable. `external C? c;`
+/// types the variable from outside — the external implementation can
+/// instantiate it — so the type counts as reachable.
+fn external_type_position(c: &Check<'_>, row: u32) -> bool {
+    // Climb to the topmost type-annotation row (the `topmostTypeAnnotation`
+    // walk — Type/FunctionType/RecordType/TypeArguments shells).
+    let mut top = row;
+    while let Some(parent) = c.unit.ast.parent(top) {
+        if matches!(
+            c.kind(parent),
+            NodeKind::Type
+                | NodeKind::FunctionType
+                | NodeKind::RecordType
+                | NodeKind::TypeArguments
+        ) {
+            top = parent;
+        } else {
+            break;
+        }
+    }
+    let Some(owner) = c.unit.ast.parent(top) else {
+        return false;
+    };
+    match c.kind(owner) {
+        // `external C f();` — a MEMBER method's return type (:744-745
+        // matches `MethodDeclaration` only: a top-level or local
+        // function's return type never counts). The return type is the
+        // child before the parameter group; parameter types sit inside it.
+        NodeKind::Method => {
+            mod_flags(c.unit.ast, owner) & EXTERNAL_MEMBER_BIT != 0
+                && c
+                    .collect_direct(owner)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                    .is_some_and(|params| {
+                        c.unit.ast.token_range(top).start
+                            < c.unit.ast.token_range(params).start
+                    })
+        }
+        // `external C? c;` — the written type of an external field /
+        // top-level variable: the type's name and `Type` rows tile as
+        // direct children of the `Fields`/`TopLevelFields` row, and that
+        // row carries the `external` modifier bit (the
+        // `VariablesDeclaration` seals after the names as a sibling and
+        // never owns the type).
+        NodeKind::Fields | NodeKind::TopLevelFields => {
+            mod_flags(c.unit.ast, owner) & EXTERNAL_MEMBER_BIT != 0
+        }
+        _ => false,
+    }
+}
+
+fn in_type_argument(c: &Check<'_>, row: u32) -> bool {
+    let mut token = c.unit.ast.token_range(row).start;
+    for _ in 0..16 {
+        if token == 0 {
+            return false;
+        }
+        token -= 1;
+        match c.lexeme(token) {
+            "<" => return true,
+            // A type-parameter BOUND (`<T extends C>` / `on` constraints)
+            // is a declaration position, never a type argument — `extends`
+            // cannot occur inside a true argument list, so it settles the
+            // walk as "not an argument" (upstream: the parent is a
+            // TypeParameter, not a TypeArgumentList).
+            "extends" | "on" => return false,
+            "," | "." | ">" => continue,
+            lexeme => {
+                let first = lexeme.chars().next();
+                if first.is_some_and(char::is_alphabetic) || lexeme.starts_with('_') {
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the row carries a `@pragma('vm:entry-point')` annotation
+/// (any string spelling — `_isValidVmEntryPoint`'s const value).
+fn carries_pragma_entry(c: &Check<'_>, wrapper: u32, row: u32) -> bool {
+    for meta in metadata_of(c, wrapper, row) {
+        let kids = c.collect_direct(meta);
+        let Some(head) = kids
+            .iter()
+            .find(|&&kid| c.kind(kid) == NodeKind::Identifier)
+            .map(|&kid| c.head_token(kid))
+        else {
+            continue;
+        };
+        if c.lexeme(head) == "pragma"
+            && first_string_argument(c, &kids) == Some("vm:entry-point")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The metadata rows annotating `row` (the `MetadataStar` left of the
+/// row under its parent, or of the wrapper).
+fn metadata_of(c: &Check<'_>, wrapper: u32, row: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut holders = [Some(row), None];
+    if c.kind(wrapper) == NodeKind::TopLevelDeclaration {
+        holders[1] = Some(wrapper);
+    }
+    for holder in holders.into_iter().flatten() {
+        let Some(parent) = c.unit.ast.parent(holder) else {
+            continue;
+        };
+        let siblings = c.collect_direct(parent);
+        let Some(pos) = siblings.iter().position(|&kid| kid == holder) else {
+            continue;
+        };
+        if let Some(&star) = siblings[..pos]
+            .iter()
+            .rev()
+            .find(|&&kid| c.kind(kid) == NodeKind::MetadataStar)
+        {
+            out.extend(
+                c.collect_direct(star)
+                    .into_iter()
+                    .filter(|&meta| c.kind(meta) == NodeKind::Metadata),
+            );
+        }
+    }
+    out
+}
+
+/// The first string-literal argument of the first `Arguments` row among
+/// `kids`, unquoted.
+fn first_string_argument<'a>(c: &'a Check<'_>, kids: &[u32]) -> Option<&'a str> {
+    let arguments = kids
+        .iter()
+        .find(|&&kid| c.kind(kid) == NodeKind::Arguments)
+        .copied()?;
+    let literal = c
+        .collect_direct(arguments)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::StringLiteral)?;
+    Some(unquote(c.lexeme(c.head_token(literal))))
+}
+
+/// Whether `kids` carry an `Arguments` row (a creation, not a bare
+/// identifier).
+fn has_arguments(c: &Check<'_>, kids: &[u32]) -> bool {
+    kids.iter().any(|&kid| c.kind(kid) == NodeKind::Arguments)
+}
+
+/// A string literal's lexeme unquoted (any quote style, `r` prefix).
+fn unquote(lexeme: &str) -> &str {
+    let trimmed = lexeme.trim_start_matches('r');
+    trimmed.trim_matches(|ch| ch == '\'' || ch == '"')
 }
 
 /// Whether `row` sits inside a `ConstantPattern` subtree — the
 /// `_patternLevel` arm the use index consults (parent walk; the
 /// subtree boundary is the pattern row's own completion window).
-fn inside_constant_pattern(c: &Check<'_>, row: u32) -> bool {
-    let mut current = row;
-    while let Some(parent) = c.unit.ast.parent(current) {
-        if c.kind(parent) == NodeKind::ConstantPattern {
-            return true;
-        }
-        current = parent;
-    }
-    false
+/// Whether `row` sits inside a `ConstantPattern` subtree — the
+/// `_patternLevel` arm the use index consults. The pattern row BEGINS
+/// after its operand pieces (the seal-order tiling — `const C()`'s
+/// identifier and arguments are created before the pattern row opens),
+/// so the parent walk never sees it; the pattern's TOKEN window is the
+/// reliable cover.
+fn inside_constant_pattern(ranges: &[core::ops::Range<u32>], token: u32) -> bool {
+    ranges.iter().any(|range| range.contains(&token))
 }

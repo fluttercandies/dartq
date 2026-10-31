@@ -3,6 +3,7 @@ use super::{
     container_members, ctor_header_has_const, is_identifier_token, range_has_const,
     top_level_annotations,
 };
+use crate::rules::const_ability::{is_potentially_const, potentially_const_name};
 use crate::rules::{
     NONE_TOKEN, SupertypeClause, last_child, same_file_ancestors, same_file_declaration,
     supertypes, utf16_token_span, variables_declaration_keyword,
@@ -21,8 +22,10 @@ use crate::rules::{
 /// invocation resolves its target constructor's `const` keyword over
 /// the same-file substrate, a missing initializer list takes the
 /// implicit-super face (no `extends` means `Object`, whose unnamed
-/// constructor is const), an `assert` or a field initializer bails,
-/// and `canBeConst` folds to every instance field of the class and its
+/// constructor is const), and every `assert`/field-initializer entry
+/// must be potentially constant with the constructor's parameters bound
+/// (`initializer_entries_able`); `canBeConst` also folds to every
+/// instance field of the class and its
 /// same-file extends chain being spelled `final`/`const` (a field
 /// initializer must be an obviously const literal; `late` bails). A
 /// cross-file supertype under-reports. Extension types answer the
@@ -85,11 +88,10 @@ fn face_constructor(c: &mut Check<'_>, container: u32, node: u32) {
     if !const_able_class(c, container, node) {
         return;
     }
-    // `node.firstTokenAfterCommentAndMetadata` (:58/:65) — the row
-    // head (metadata rides the left sibling; an extension-type
-    // constructor's head is the type-name echo, the `errorRange`
-    // face).
-    c.report(utf16_token_span(c, c.head_token(node)), &[]);
+    // `node.firstTokenAfterCommentAndMetadata` (:58/:65) — the member's
+    // first token: the modifiers (`const`, `factory`, the new-syntax
+    // `new`) sit in the window before the row's name anchor.
+    c.report(utf16_token_span(c, super::constructor_first_token(c, node)), &[]);
 }
 
 /// The redirecting-factory face (:53-58): a non-const factory whose
@@ -119,9 +121,15 @@ fn face_factory(c: &mut Check<'_>, container: u32, node: u32) {
         cursor += 1;
     }
     let container_name = c
-        .collect_direct(container)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+        .unit
+        .ast
+        .parent(container)
+        .map(|wrapper| {
+            c.collect_direct(wrapper)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+        })
+        .flatten()
         .map(|row| c.lexeme(c.head_token(row)));
     // `C` / `C.named` / `prefix.C` — the prefixed and cross-file
     // shapes under-report.
@@ -140,7 +148,7 @@ fn face_factory(c: &mut Check<'_>, container: u32, node: u32) {
         _ => return,
     };
     if const_ctor_named(c, target.0, target.1) {
-        c.report(utf16_token_span(c, c.head_token(node)), &[]);
+        c.report(utf16_token_span(c, super::constructor_first_token(c, node)), &[]);
     }
 }
 
@@ -152,22 +160,17 @@ fn face_primary(c: &mut Check<'_>, container: u32, node: u32) {
     }
     // `node.body?.body is! EmptyFunctionBody` (:74-76) — a body with a
     // block skips.
-    if last_child(c, node).is_some_and(|body| {
-        c.kind(body) == NodeKind::PrimaryConstructorBody
-            && c.collect_direct(body)
-                .into_iter()
-                .any(|kid| matches!(c.kind(kid), NodeKind::Block | NodeKind::BlockBody))
+    if primary_body_row(c, container).is_some_and(|body| {
+        c.collect_direct(body)
+            .into_iter()
+            .any(|kid| matches!(c.kind(kid), NodeKind::Block | NodeKind::BlockBody))
     }) {
         return;
     }
     if !has_immutable(c, container) {
         return;
     }
-    let name = c
-        .collect_direct(container)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier)
-        .map(|row| c.head_token(row));
+    let name = container_name_token(c, container);
     if c.kind(container) == NodeKind::ExtensionTypeDeclaration {
         // (:82-85) — the representation face has no super constructor.
         if let Some(name) = name {
@@ -184,16 +187,95 @@ fn face_primary(c: &mut Check<'_>, container: u32, node: u32) {
     }
 }
 
+/// The primary constructor's `this …` body: a MEMBER row of the
+/// container's declaration body (the header `C(...)` row seals at its
+/// `)`; the body is written among the members and tiles there), holding
+/// `[Initializers, EmptyBody]` for `this : …;` or a `BlockBody` for
+/// `this { … }`.
+fn primary_body_row(c: &Check<'_>, container: u32) -> Option<u32> {
+    container_members(c, container)
+        .1
+        .into_iter()
+        .find(|&member| c.kind(member) == NodeKind::PrimaryConstructorBody)
+}
+
+/// The container's name token — an extension type stores the `Name`
+/// payload word (no identifier row tiles), a class-like keeps its name
+/// row (with the `TopLevelDeclaration` wrapper's identifier as the
+/// fallback tiling).
+fn container_name_token(c: &Check<'_>, container: u32) -> Option<u32> {
+    if c.kind(container) == NodeKind::ExtensionTypeDeclaration {
+        return c.field_token(container, PayloadField::Name);
+    }
+    super::container_name_node(c, container)
+        .map(|row| c.head_token(row))
+        .or_else(|| {
+            c.unit.ast.parent(container).and_then(|wrapper| {
+                c.collect_direct(wrapper)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                    .map(|row| c.head_token(row))
+            })
+        })
+}
+
+/// Whether the container's header or the primary constructor itself
+/// writes `const` before the name (`class const C(...)`,
+/// `extension type const E(...)`).
+fn primary_header_const(c: &Check<'_>, container: u32, primary: u32) -> bool {
+    if c.kind(primary) == NodeKind::PrimaryConstructor && ctor_header_has_const(c, primary) {
+        return true;
+    }
+    container_name_token(c, container).is_some_and(|name_head| {
+        range_has_const(c, c.head_token(container)..name_head)
+    })
+}
+
 /// `hasImmutableAnnotation` (:136-147): the container's own
-/// annotations plus the same-file chain walk.
+/// annotations plus the same-file chain walk. The spelling only counts
+/// behind a `package:meta/meta.dart` import of the unit — an unresolved
+/// `@immutable` (a unit that never imports meta) does not resolve to the
+/// element and stays silent upstream.
 fn has_immutable(c: &Check<'_>, container: u32) -> bool {
+    if !imports_meta(c) {
+        return false;
+    }
     std::iter::once(container)
         .chain(same_file_ancestors(c, container, true))
         .any(|row| {
             top_level_annotations(c, row)
                 .iter()
-                .any(|&meta| annotation_names(c, meta, "immutable"))
+                .any(|&meta| {
+                    // `metadata.hasImmutable` resolves the element —
+                    // meta ships both spellings (`immutable` the const,
+                    // `Immutable` the class).
+                    annotation_names(c, meta, "immutable")
+                        || annotation_names(c, meta, "Immutable")
+                })
         })
+}
+
+/// Whether the unit imports `package:meta/meta.dart` (any prefix — the
+/// prefixed-annotation face under-reports: the corpus annotation is bare).
+/// The directive rows sit inside their `TopLevelDeclaration` wrapper
+/// under the unit root (the shared [`unprefixed_import_uris`] walk minus
+/// the prefix cut).
+fn imports_meta(c: &Check<'_>) -> bool {
+    let Some(root) = c.unit.ast.root() else {
+        return false;
+    };
+    c.collect_direct(root).into_iter().any(|top| {
+        std::iter::once(top)
+            .chain(c.collect_direct(top))
+            .any(|row| {
+                c.kind(row) == NodeKind::Import
+                    && c.collect_direct(row).into_iter().any(|piece| {
+                        c.kind(piece) == NodeKind::StringLiteral
+                            && c.lexeme(c.head_token(piece)).trim_matches(['\'', '"'])
+                                == "package:meta/meta.dart"
+                    })
+            })
+    })
 }
 
 /// The const-ability shape (:103-133 folded to the token faces): no
@@ -212,11 +294,127 @@ fn const_able_class(c: &Check<'_>, container: u32, node: u32) -> bool {
     if !rows.iter().all(|&row| fields_all_final(c, row)) {
         return false;
     }
-    let Some(region) = initializer_region(c, node) else {
+    let Some(region) = initializer_region(c, container, node) else {
         return false;
     };
-    const_invocation_face(c, container, region)
+    let invocation = const_invocation_face(c, container, region);
+    let entries = initializer_entries_able(c, container, node);
+    invocation && entries
 }
+
+/// The `canBeConst` initializer-entry face: every `assert` condition and
+/// message and every field-initializer value must be potentially
+/// constant with the constructor's parameters bound (upstream runs the
+/// resolved constant verifier over the pretend-`const` constructor —
+/// `upstream Dart SDK source, pkg/linter/lib/src/extensions.dart`,
+/// `ConstructorDeclaration.canBeConst`). A method invocation
+/// (`a.toString()`) or a reference to a non-const variable (`f = notConst`)
+/// is not potentially constant, so the constructor cannot be made const
+/// and the rule stays silent. The `super`/`this` invocation entries are
+/// the invocation face's decision (`const_invocation_face`) and are
+/// skipped here.
+fn initializer_entries_able(c: &Check<'_>, container: u32, node: u32) -> bool {
+    let Some(parameters) = c
+        .collect_direct(node)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+    else {
+        return false;
+    };
+    let params: Vec<&str> = crate::rules::types::leak_formal_rows(c, parameters)
+        .into_iter()
+        .filter_map(|formal| {
+            c.field(formal, PayloadField::Name)
+                .filter(|&token| token != NONE_TOKEN)
+                .map(|token| c.lexeme(token))
+        })
+        .collect();
+    let initializers = if c.kind(node) == NodeKind::PrimaryConstructor {
+        primary_body_row(c, container)
+            .and_then(|body| {
+                c.collect_direct(body)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Initializers)
+            })
+    } else {
+        c.collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Initializers)
+    };
+    let Some(list) = initializers else {
+        // No initializer list: nothing but the invocation face to judge.
+        return true;
+    };
+    for entry in c.collect_direct(list) {
+        if c.kind(entry) != NodeKind::Initializer {
+            continue;
+        }
+        let kids = c.collect_direct(entry);
+        // The invocation entries belong to `const_invocation_face`.
+        if kids.iter().any(|&kid| c.kind(kid) == NodeKind::SuperExpression) {
+            continue;
+        }
+        let Some(name_send) = kids
+            .iter()
+            .position(|&kid| c.kind(kid) == NodeKind::Send && is_field_name_send(c, kid))
+        else {
+            // No field target: a `this(...)` invocation (the invocation
+            // face owns it) or an `assert` entry (its condition and
+            // message rows are the potentially-const face).
+            for kid in kids {
+                if c.kind(kid) == NodeKind::Assert
+                    && !c
+                        .collect_direct(kid)
+                        .into_iter()
+                        .all(|part| is_potentially_const(c.unit, part, &params))
+                {
+                    return false;
+                }
+            }
+            continue;
+        };
+        // The value rows: everything past the `name =` send, minus the
+        // trailing `Assignment` row — the production tiling re-covers
+        // the value's tail segment with its terminator, it is not a
+        // genuine assignment expression.
+        let mut value = &kids[name_send + 1..];
+        if let Some((last, rest)) = value.split_last() {
+            if c.kind(*last) == NodeKind::Assignment {
+                value = rest;
+            }
+        }
+        for kid in value {
+            match c.kind(*kid) {
+                // A bare-name value (`_a = a`, `f = notConst`): a bound
+                // parameter or a same-file constant only.
+                NodeKind::Identifier => {
+                    let name = c.lexeme(c.head_token(*kid));
+                    if !potentially_const_name(c.unit, &params, name) {
+                        return false;
+                    }
+                }
+                // The chain and sentinel pieces of a compound value —
+                // the owning expression rows carry the verdict.
+                NodeKind::NoTypeArguments | NodeKind::NoArguments | NodeKind::Arguments => {}
+                _ => {
+                    if !is_potentially_const(c.unit, *kid, &params) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Whether the send row is a field-initializer name piece — its tokens
+/// are `name =` (the value tiles as a sibling row).
+fn is_field_name_send(c: &Check<'_>, send: u32) -> bool {
+    let tokens = c.unit.ast.token_range(send);
+    tokens.start + 1 < tokens.end && c.lexeme(tokens.start + 1) == "="
+}
+
+
 
 /// Whether every instance field of the row is spelled
 /// `final`/`const` without `late`, with an initializer that is an
@@ -290,21 +488,30 @@ fn const_literal(c: &Check<'_>, value: u32) -> bool {
 
 /// The token region between the parameter group's `)` and the body —
 /// the initializer list. A primary constructor scans its `this`-body
-/// (the face reads after the leading `this`); no body at all is the
-/// empty region.
-fn initializer_region(c: &Check<'_>, node: u32) -> Option<core::ops::Range<u32>> {
+/// member row (which starts at the token after the leading `this`: the
+/// `:` of its initializers or its `{`); no body at all is the empty
+/// region.
+fn initializer_region(
+    c: &Check<'_>,
+    container: u32,
+    node: u32,
+) -> Option<core::ops::Range<u32>> {
     let params_end = c
         .collect_direct(node)
         .into_iter()
         .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
         .map(|row| c.unit.ast.token_range(row).end)?;
     if c.kind(node) == NodeKind::PrimaryConstructor {
-        let body = last_child(c, node)?;
-        if c.kind(body) != NodeKind::PrimaryConstructorBody {
+        let Some(body) = primary_body_row(c, container) else {
             return Some(params_end..params_end);
-        }
+        };
         let tokens = c.unit.ast.token_range(body);
-        Some(tokens.start + 1..tokens.end)
+        let start = if c.lexeme(tokens.start) == "this" {
+            tokens.start + 1
+        } else {
+            tokens.start
+        };
+        Some(start..tokens.end)
     } else {
         let end = last_child(c, node).map_or(params_end, |body| c.head_token(body));
         Some(params_end..end.max(params_end))
@@ -312,9 +519,9 @@ fn initializer_region(c: &Check<'_>, node: u32) -> Option<core::ops::Range<u32>>
 }
 
 /// The invocation face (:103-133): a `super`/`this` invocation
-/// resolves its target constructor's `const` keyword; an `assert` or
-/// a field-initializer-only list bails (the const-evaluation faces);
-/// no initializer list takes the implicit-super face (:129-132).
+/// resolves its target constructor's `const` keyword; every other entry
+/// — `assert`, field initializers — leaves the decision to the
+/// implicit-super face (:129-132) and `canBeConst`.
 fn const_invocation_face(c: &Check<'_>, container: u32, region: core::ops::Range<u32>) -> bool {
     let mut cursor = region.start;
     while cursor < region.end && c.lexeme(cursor) != ":" {
@@ -328,12 +535,16 @@ fn const_invocation_face(c: &Check<'_>, container: u32, region: core::ops::Range
         match c.lexeme(cursor) {
             "super" => return explicit_super_const(c, container, cursor),
             "this" => return const_ctor_named(c, container, named_after(c, cursor).as_deref()),
-            "assert" => return false,
             _ => {}
         }
         cursor += 1;
     }
-    false
+    // Field initializers and `assert` entries never decide the invocation
+    // face (:103-133 keys only on the super/this invocations) — the
+    // implicit-super face answers and `canBeConst` carries their
+    // const-ness (a parameter reference is the canonical const-constructor
+    // field initializer).
+    implicit_super_const(c, container)
 }
 
 /// The constructor name written after `super`/`this`, when any
@@ -381,19 +592,4 @@ fn const_ctor_named(c: &Check<'_>, class_row: u32, name: Option<&str>) -> bool {
             && constructor_name_part(c, member).map(|part| c.lexeme(c.head_token(part))) == name
             && ctor_header_has_const(c, member)
     })
-}
-
-/// Whether the container's header or the primary constructor itself
-/// writes `const` before the name (`class const C(...)`,
-/// `extension type const E(...)`).
-fn primary_header_const(c: &Check<'_>, container: u32, primary: u32) -> bool {
-    if c.kind(primary) == NodeKind::PrimaryConstructor && ctor_header_has_const(c, primary) {
-        return true;
-    }
-    let name_head = c
-        .collect_direct(container)
-        .into_iter()
-        .find(|&kid| c.kind(kid) == NodeKind::Identifier)
-        .map(|row| c.head_token(row));
-    name_head.is_some_and(|name_head| range_has_const(c, c.head_token(container)..name_head))
 }

@@ -427,8 +427,9 @@ pub(crate) mod prefer_spread_collections {
 }
 
 pub(crate) mod prefer_collection_literals {
-    use super::{Check, NodeKind, RuleSpec, slice};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
     use crate::rules::expressions::same_file;
+    use crate::rules::NONE_TOKEN;
 
     const PROBLEM: &str = "Unnecessary constructor invocation.";
     const CORRECTION: &str = "Try using a collection literal.";
@@ -446,15 +447,21 @@ pub(crate) mod prefer_collection_literals {
     ///
     /// Element approximation: a unit-local declaration of the name (a
     /// typedef, a user class — the `TypeAliasElement` exemption :44-46 and
-    /// user shadows) bails through the same-file index, and a `Map`/`Set`
-    /// spelling resolving to another library's unit-declared container
-    /// bails through the semantic-lane probe (a core spelling resolves to
-    /// no unit). The `Linked*`
-    /// context exemption reads the declared type around the creation
-    /// (declaration type-before, method return type); an assignment or
-    /// argument position bails — the context type is not derivable there
-    /// (the conservative family). Prefixed callees (`core.Map()`) never
-    /// match. Message: `diagnostic.g.dart` `preferCollectionLiterals`.
+    /// user shadows) bails through the same-file index, and the `Linked*`
+    /// spellings resolve only through an unprefixed `dart:collection`
+    /// import — an import-less unit leaves the head unresolved, and the
+    /// official's instance-creation arm never arms on an unresolved head
+    /// (no static type; the MethodInvocation arm answers `toSet` only).
+    /// Every `Linked*` creation consults
+    /// [`context_reports`] first — the written context face of the
+    /// official's `approximateContextType` (declaration type-before,
+    /// assignment target, argument formal, closure return, field
+    /// initializer, method return with the async/generator unwrap on
+    /// return/yield). Prefixed callees (`core.Map()`) never match.
+    /// Residual (documented): a cross-file unit-declared `Map`/`Set`
+    /// shadowing the core spelling stays outside a same-file scan — the
+    /// official's static type silences it, this face does not see it.
+    /// Message: `diagnostic.g.dart` `preferCollectionLiterals`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "prefer_collection_literals",
         &[
@@ -476,7 +483,7 @@ pub(crate) mod prefer_collection_literals {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let report = match c.kind(node) {
+        let report: Option<core::ops::Range<u32>> = match c.kind(node) {
             // The explicit-new shape owns its callee and argument list.
             NodeKind::NewExpression | NodeKind::ImplicitCreation => {
                 let kids = c.collect_direct(node);
@@ -487,54 +494,68 @@ pub(crate) mod prefer_collection_literals {
                 else {
                     return;
                 };
-                owned_creation(c, &kids, args)
+                owned_creation(c, node, &kids, args)
             }
             // A plain send owns nothing — rebuild from the owner slice.
             NodeKind::Send => match slice::owner_slice(c) {
-                Some((kids, pos)) => send_face(c, &kids, pos),
-                None => false,
+                Some((kids, pos)) => send_face(c, node, &kids, pos),
+                None => None,
             },
-            _ => false,
+            _ => None,
         };
-        if !report {
+        let Some(range) = report else {
             return;
-        }
-        let range = c.utf16_span(node);
+        };
         c.report_texts(range, PROBLEM, CORRECTION, &[]);
     }
 
-    /// The unnamed-creation face over an owned child list (`new Map()`):
-    /// the callee is the identifier before the argument list — the
-    /// explicit-new shape carries a `ConstructorReference` marker owning
-    /// the name.
-    fn owned_creation(c: &Check<'_>, kids: &[u32], args: u32) -> bool {
-        let Some(args_pos) = kids.iter().position(|&kid| kid == args) else {
-            return false;
-        };
-        let Some((callee, name)) =
-            kids[..args_pos]
-                .iter()
-                .rev()
-                .find_map(|&kid| match c.kind(kid) {
-                    NodeKind::Identifier => Some((kid, c.lexeme(c.head_token(kid)))),
-                    NodeKind::ConstructorReference => c
-                        .collect_direct(kid)
-                        .into_iter()
-                        .find(|&k| c.kind(k) == NodeKind::Identifier)
-                        .map(|k| (k, c.lexeme(c.head_token(k)))),
-                    _ => None,
-                })
-        else {
-            return false;
-        };
-        unnamed_face(c, callee, name, args)
+    /// The explicit-new / implicit-creation face (`new Map()`,
+    /// `Set<int>.from(…)`): the `ConstructorReference` marker owns the
+    /// callee — its first identifier is the type name and, behind a
+    /// `PeriodBeforeName` payload, its last is the named constructor
+    /// (`C<int>.from`). The unnamed face keeps the creation row's own span
+    /// (`new` included — the official's `InstanceCreationExpression`); the
+    /// named face spans the type name through the argument list's close.
+    fn owned_creation(
+        c: &Check<'_>,
+        node: u32,
+        kids: &[u32],
+        args: u32,
+    ) -> Option<core::ops::Range<u32>> {
+        let args_pos = kids.iter().position(|&kid| kid == args)?;
+        let cref = kids[..args_pos]
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::ConstructorReference)?;
+        let mut identifiers = c
+            .collect_direct(cref)
+            .into_iter()
+            .filter(|&piece| c.kind(piece) == NodeKind::Identifier);
+        let ty = identifiers.next()?;
+        let written = c.lexeme(c.head_token(ty));
+        let ctor = identifiers.next();
+        if c.field(cref, PayloadField::PeriodBeforeName).is_some() {
+            // `C.from`/`C.of` ride the named faces; any other named
+            // constructor (`C.new`, `C.identity`) is outside both faces.
+            let ctor = ctor?;
+            let selector = c.lexeme(c.head_token(ctor));
+            if (selector != "from" && selector != "of")
+                || !named_verdict(c, written)
+                || !single_list_literal(c, args)
+            {
+                return None;
+            }
+            let start = c.utf16_of_token(c.head_token(ty))?;
+            return Some(start..c.utf16_span(args).end);
+        }
+        unnamed_face(c, written, args).then(|| c.utf16_span(node))
     }
 
     /// The unnamed faces (`constructorName == null && arguments.isEmpty`,
     /// :57-59/:68-71): written empty parentheses only — a `NoArguments`
     /// send is a tear-off, no creation. The `Linked*` faces add the
-    /// context-type exemption (:85-88/:101-104).
-    fn unnamed_face(c: &Check<'_>, callee: u32, name: &str, args: u32) -> bool {
+    /// context-type exemption (:54-56/:67-70).
+    fn unnamed_face(c: &Check<'_>, name: &str, args: u32) -> bool {
         if !UNNAMED.contains(&name) || c.kind(args) != NodeKind::Arguments {
             return false;
         }
@@ -547,11 +568,11 @@ pub(crate) mod prefer_collection_literals {
         }) {
             return false;
         }
-        if same_file::declares_name(c, name) || cross_file_collection_head(c, callee) {
+        if same_file::declares_name(c, name) {
             return false;
         }
         if name == "LinkedHashMap" || name == "LinkedHashSet" {
-            return context_reports(c, name);
+            return imports_dart_collection(c) && context_reports(c, name);
         }
         true
     }
@@ -561,75 +582,96 @@ pub(crate) mod prefer_collection_literals {
     /// head before that (skipping the type-argument wrapper). A trailing
     /// same-span `DotAccess` marker switches to the member faces. A
     /// `NoArguments` send is a tear-off — no invocation, no face.
-    fn send_face(c: &Check<'_>, kids: &[u32], pos: usize) -> bool {
+    fn send_face(
+        c: &Check<'_>,
+        node: u32,
+        kids: &[u32],
+        pos: usize,
+    ) -> Option<core::ops::Range<u32>> {
         let Some((head, args)) = slice::send_parts(c, kids, pos) else {
-            return false;
+            return None;
         };
         if c.kind(kids[head]) != NodeKind::Identifier {
-            return false;
+            return None;
         }
         let selector = c.lexeme(c.head_token(kids[head]));
         let access = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
         match (access, args) {
-            (None, Some(args)) => unnamed_face(c, kids[head], selector, args),
+            (None, Some(args)) => {
+                unnamed_face(c, selector, args).then(|| c.utf16_span(node))
+            }
             (Some(_), Some(args)) if selector == "from" || selector == "of" => {
                 named_face(c, kids, head, args)
             }
-            (Some(access), Some(_)) if selector == "toSet" => to_set_face(c, kids, head, access),
-            _ => false,
+            (Some(_), Some(args)) if selector == "toSet" => to_set_face(c, kids, head, args),
+            _ => None,
         }
     }
 
     /// The `Set.from([…])`/`Set.of([…])` faces (:75-81): the receiver is
     /// the bare-identifier tear-off group ending at the selector, and the
-    /// single argument is a list literal.
-    fn named_face(c: &Check<'_>, kids: &[u32], sel: usize, args: u32) -> bool {
-        let Some(group_start) = sel.checked_sub(4) else {
-            return false;
-        };
+    /// single argument is a list literal. `LinkedHashSet.from` rides the
+    /// `isHashSet` context exemption (:67-70); the report spans the type
+    /// name through the argument list's close (the official's
+    /// `InstanceCreationExpression` — `Set.from(…)` whole).
+    fn named_face(
+        c: &Check<'_>,
+        kids: &[u32],
+        sel: usize,
+        args: u32,
+    ) -> Option<core::ops::Range<u32>> {
+        let group_start = sel.checked_sub(4)?;
         if !slice::is_tear_off_group(c, kids, group_start) {
-            return false;
+            return None;
         }
-        let written = c.lexeme(c.head_token(kids[group_start]));
-        if !NAMED_SET.contains(&written)
-            || same_file::declares_name(c, written)
-            || cross_file_collection_head(c, kids[group_start])
-        {
-            return false;
+        let receiver = kids[group_start];
+        let written = c.lexeme(c.head_token(receiver));
+        if !named_verdict(c, written) || !single_list_literal(c, args) {
+            return None;
         }
-        single_list_literal(c, args)
+        let start = c.utf16_of_token(c.head_token(receiver))?;
+        Some(start..c.utf16_span(args).end)
     }
 
-    /// Whether the creation head's spelling resolves to a unit-declared
-    /// container — another library's `class Map`/`class Set` is never the
-    /// pinned core type (`staticType.isDartCoreMap`/`.isDartCoreSet`),
-    /// so the official stays silent on its creations. The probe is the
-    /// semantic lane's own resolution faces on the callee row's span: the
-    /// creation-type use (`resolve_constructor`, any constructor) or the
-    /// bare reference's binding (`BindingKind::Decl`) — a workspace
-    /// declaration only, the synthetic SDK face (`is_sdk_binding`) being
-    /// the core symbol itself and never a bail. Without the semantic run
-    /// the plain-run posture holds — no bail.
-    fn cross_file_collection_head(c: &Check<'_>, callee: u32) -> bool {
-        let Some(analysis) = c.semantics() else {
-            return false;
-        };
-        let site = crate::rules::expressions::query_site(c, callee);
-        analysis.resolve_constructor(site, None).is_some()
-            || analysis.binding_of(site).is_some_and(|binding| {
-                !analysis.is_sdk_binding(&binding)
-                    && binding.kind == dartq_semantic::BindingKind::Decl
-            })
+    /// The named faces' head gates: the written spelling rides the exact
+    /// core set type (`NAMED_SET` — a same-file declaration shadows it),
+    /// and the `LinkedHashSet` spelling resolves only through the unit's
+    /// `dart:collection` import and consults the context exemption first
+    /// (:67-70 — every `isHashSet` creation reads the context before the
+    /// constructor faces).
+    fn named_verdict(c: &Check<'_>, written: &str) -> bool {
+        NAMED_SET.contains(&written)
+            && !same_file::declares_name(c, written)
+            && (written == "Set" || (imports_dart_collection(c) && context_reports(c, written)))
+    }
+
+    /// Whether the unit imports `dart:collection` unprefixed — the bare
+    /// `Linked*` spellings resolve only through that surface (a prefixed
+    /// import never binds the bare name). An import-less unit leaves the
+    /// head unresolved: no static type, and the official's
+    /// instance-creation arm never arms.
+    fn imports_dart_collection(c: &Check<'_>) -> bool {
+        crate::rules::declarations::unprefixed_import_uris(c)
+            .iter()
+            .any(|uri| uri == "dart:collection")
     }
 
     /// `['a'].toSet()` (:87-95): a list literal ends right before the dot —
     /// the literal's span ends one code unit before the selector (the dot
-    /// between), so the pieces of a foreign expression never bind.
-    fn to_set_face(c: &Check<'_>, kids: &[u32], sel: usize, _access: u32) -> bool {
+    /// between), so the pieces of a foreign expression never bind. The
+    /// report covers the official's `MethodInvocation`: the literal's head
+    /// through the invocation's close.
+    fn to_set_face(
+        c: &Check<'_>,
+        kids: &[u32],
+        sel: usize,
+        args: u32,
+    ) -> Option<core::ops::Range<u32>> {
         let selector_start = c.utf16_span(kids[sel]).start;
-        kids.iter().any(|&piece| {
+        let literal = kids.iter().copied().find(|&piece| {
             c.kind(piece) == NodeKind::ListLiteral && c.utf16_span(piece).end + 1 == selector_start
-        })
+        })?;
+        Some(c.utf16_span(literal).start..c.utf16_span(args).end)
     }
 
     /// The single-list-literal test over the flattened argument pieces: a
@@ -663,21 +705,48 @@ pub(crate) mod prefer_collection_literals {
         count == 1
     }
 
-    /// The `Linked*` context exemption (:85-88/:101-104): the context type
-    /// decides — a declaration whose written type matches the creation is
-    /// exempt, an untyped (`var`/`final`) declaration is the official's
-    /// invalid context, any other declared type reports; an assignment or
-    /// argument position bails (the context type is not derivable — the
-    /// conservative family).
+    /// The `Linked*` context exemption (:54-56/:67-70 through
+    /// `approximateContextType`, extensions.dart:437-496): a matching
+    /// written context exempts, the invalid face (an argument without a
+    /// corresponding parameter, an unresolvable assignment target) exempts,
+    /// and every other face — a null context included — reports.
     fn context_reports(c: &Check<'_>, name: &str) -> bool {
+        match context_head(c) {
+            Context::Invalid => false,
+            Context::Head(head) => head != name,
+            Context::None => true,
+        }
+    }
+
+    /// The derived context faces of the official's
+    /// `approximateContextType` (extensions.dart:437-496) — the first
+    /// ancestor row that owns a context, walking upward from the creation.
+    enum Context<'a> {
+        /// A written context head (reports unless it spells the creation).
+        Head(&'a str),
+        /// The official's `InvalidType` face (exempts).
+        Invalid,
+        /// No derivable context — the official's null (reports).
+        None,
+    }
+
+    fn context_head<'a>(c: &'a Check<'_>) -> Context<'a> {
         let len = c.path.len();
+        // A closure body crossed below an argument position reads the
+        // function-typed formal's return type (:477-481); a block body
+        // crossed disarms the function-declaration backstop below (a
+        // statement-position creation carries the official's null
+        // context, never the enclosing return type).
+        let mut closure = false;
+        let mut block_body = false;
         for i in (0..len.saturating_sub(1)).rev() {
             match c.kind(c.path[i]) {
                 NodeKind::VariablesDeclaration => {
-                    // The declared type tiles in the owner slices above the
-                    // declaration (block / fields): the binding type is the
-                    // last one ending within the declaration — a later
-                    // declaration's type ends past it.
+                    // `VariableDeclarationList.type` (:487-490): the binding
+                    // type is the last Type row ending within the
+                    // declaration — a later declaration's type ends past
+                    // it. An untyped (`var`) declaration is the official's
+                    // null context (reports).
                     let decl = c.path[i];
                     let decl_end = c.byte_span(decl).end;
                     let written = c.path[..=i]
@@ -690,26 +759,414 @@ pub(crate) mod prefer_collection_literals {
                         .max_by_key(|&kid| c.byte_span(kid).start)
                         .map(|t| c.lexeme(c.head_token(t)));
                     return match written {
-                        // Matching or invalid (`var`) context: exempt.
-                        None => false,
-                        Some(t) => t != name,
+                        Some(t) => Context::Head(t),
+                        None => Context::None,
                     };
                 }
-                NodeKind::Assignment | NodeKind::Arguments => return false,
-                NodeKind::Method | NodeKind::TopLevelMethod => {
-                    let written = c
-                        .collect_direct(c.path[i])
-                        .into_iter()
-                        .find(|&kid| c.kind(kid) == NodeKind::Type);
-                    return match written.map(|t| c.lexeme(c.head_token(t))) {
-                        None => true,
-                        Some(t) => t != name,
+                NodeKind::Assignment => {
+                    // `AssignmentExpression.staticType` (:463-464) — the
+                    // written type of the left operand; unresolvable
+                    // approximates invalid (the official reads the
+                    // variable's own type, never null here).
+                    return match assignment_lhs_written(c, c.path[i]) {
+                        Some(t) => Context::Head(t),
+                        None => Context::Invalid,
+                    };
+                }
+                NodeKind::FieldInitializer => {
+                    // `ConstructorFieldInitializer` (:466-468) — the
+                    // initialized field's written type.
+                    return match field_written(c, c.path[i]) {
+                        Some(t) => Context::Head(t),
+                        None => Context::None,
+                    };
+                }
+                NodeKind::Arguments => {
+                    // `ArgumentList`/`NamedArgument` (:458-465, :486-489) —
+                    // the corresponding parameter's written type, or the
+                    // function-typed formal's return type under a closure
+                    // body; a miss is the invalid face.
+                    return match argument_formal_head(c, c.path[i], c.node(), closure) {
+                        Some(t) => Context::Head(t),
+                        None => Context::Invalid,
+                    };
+                }
+                NodeKind::ExpressionBody => {
+                    // An arrow body under a declared function reads the
+                    // declared return type (:483-485); under a closure it
+                    // keeps walking — the argument formal's function type
+                    // owns the context (:477-481).
+                    let owner = c.path[i - 1];
+                    if matches!(
+                        c.kind(owner),
+                        NodeKind::Method
+                            | NodeKind::TopLevelMethod
+                            | NodeKind::LocalFunctionDeclaration
+                    ) {
+                        return match return_type_head(c, owner) {
+                            Some(t) => Context::Head(t),
+                            None => Context::None,
+                        };
+                    }
+                    closure = true;
+                }
+                NodeKind::BlockBody => {
+                    block_body = true;
+                }
+                NodeKind::FunctionExpression => {
+                    // An anonymous-function boundary crossed below an
+                    // argument position — the corresponding formal's
+                    // function type owns the context (:477-481; the body
+                    // row tiles as a sibling, so this ancestor arm is the
+                    // production face of the `ExpressionBody` closure
+                    // flag above).
+                    closure = true;
+                }
+                NodeKind::ReturnStatement | NodeKind::YieldStatement => {
+                    // `expectedReturnType` (:496-553): the enclosing
+                    // function's written return type, Future/Stream/
+                    // Iterable unwrapped per the body's async/generator
+                    // modifier (a `Future<LinkedHashSet<int>>` async body
+                    // yields `LinkedHashSet`). The NEAREST function
+                    // boundary answers — a closure carries no written
+                    // return type and the context keeps walking outward
+                    // (the argument formal's function type owns it,
+                    // :477-481).
+                    let boundary = c.path[..i].iter().rposition(|&row| {
+                        matches!(
+                            c.kind(row),
+                            NodeKind::Method
+                                | NodeKind::TopLevelMethod
+                                | NodeKind::LocalFunctionDeclaration
+                                | NodeKind::FunctionExpression
+                        )
+                    });
+                    let closure_return = boundary
+                        .is_some_and(|j| c.kind(c.path[j]) == NodeKind::FunctionExpression);
+                    if !closure_return {
+                        return match expected_return_head(c, &c.path[..i]) {
+                            Some(t) => Context::Head(t),
+                            None => Context::None,
+                        };
+                    }
+                }
+                NodeKind::Method | NodeKind::TopLevelMethod if !block_body => {
+                    // The arrow-body backstop (an `ExpressionBody` row the
+                    // tiling does not materialize); a block body crossed
+                    // keeps the official's null context for statements.
+                    let func = c.path[i];
+                    return match return_type_head(c, func) {
+                        Some(t) => Context::Head(t),
+                        None => Context::None,
                     };
                 }
                 _ => {}
             }
+            // The flat-tiling faces: the assignment row seals after its
+            // operands (a cascade RHS widens the window — `s =
+            // LinkedHashSet()..addAll([1])` leaves the creation its
+            // SIBLING, never its child) and a `return`/`yield` statement
+            // row likewise follows its expression (`Future<LinkedHashSet>
+            // f() async { return LinkedHashSet(); }`). Both sort after the
+            // creation's pieces among the owner's kids (seal order), so at
+            // the nearest ancestor holding the creation as a direct child,
+            // the first such sibling to its right carries the context the
+            // ancestor climb cannot see.
+            let kids = c.collect_direct(c.path[i]);
+            if let Some(pos) = kids.iter().position(|&kid| kid == c.node()) {
+                let tail = &kids[pos..];
+                if let Some(&assignment) = tail
+                    .iter()
+                    .find(|&&row| c.kind(row) == NodeKind::Assignment)
+                {
+                    return match assignment_lhs_written(c, assignment) {
+                        Some(t) => Context::Head(t),
+                        None => Context::Invalid,
+                    };
+                }
+                if let Some(&stmt) = tail
+                    .iter()
+                    .find(|&&row| crate::rules::is_statement_row(c, row))
+                    && matches!(
+                        c.kind(stmt),
+                        NodeKind::ReturnStatement | NodeKind::YieldStatement
+                    )
+                {
+                    // The inclusive slice: the owner at `i` IS the body row
+                    // carrying the async/generator modifier the unwrap
+                    // below reads (the exclusive slice at the ancestor arm
+                    // above still holds it between the function and the
+                    // statement).
+                    return match expected_return_head(c, &c.path[..=i]) {
+                        Some(t) => Context::Head(t),
+                        None => Context::None,
+                    };
+                }
+            }
         }
-        true
+        Context::None
+    }
+
+    /// The written type head of the assignment at `node` — the left
+    /// operand's bare identifier resolved through the same-file binding
+    /// (locals shadow fields, fields shadow nothing else). Member targets
+    /// (`a.b = …`) carry no verdict.
+    fn assignment_lhs_written<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
+        let (left, _) = slice::binary_operands_at(c, node)?;
+        match slice::access_run(c, &left).as_slice() {
+            [lhs] if c.kind(*lhs) == NodeKind::Identifier => {
+                let name = c.lexeme(c.head_token(*lhs));
+                same_file::written_type(c, *lhs, name)
+            }
+            _ => None,
+        }
+    }
+
+    /// The written type head of the field a constructor initializer
+    /// writes — the name is the identifier at the initializer's head.
+    fn field_written<'a>(c: &'a Check<'_>, init: u32) -> Option<&'a str> {
+        let field = c
+            .collect_direct(init)
+            .into_iter()
+            .find(|&piece| c.kind(piece) == NodeKind::Identifier)?;
+        let name = c.lexeme(c.head_token(field));
+        same_file::written_type(c, field, name)
+    }
+
+    /// The written return-type head of a function-like declaration (the
+    /// first `Type` child; `void` included, an omitted return type is
+    /// `None`).
+    fn return_type_head<'a>(c: &'a Check<'_>, func: u32) -> Option<&'a str> {
+        let ty = c
+            .collect_direct(func)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+        Some(c.lexeme(c.head_token(ty)))
+    }
+
+    /// The expected return/yield type head of the nearest enclosing
+    /// function (`_expectedReturnableOrYieldableType`, :537-554): the
+    /// written return type, its Future/Stream/Iterable wrapper dropped
+    /// when the body's modifier demands it (async non-generator unwraps
+    /// `Future`, async* `Stream`, sync* `Iterable`). The modifier words
+    /// patch onto the body row, between the function and the return.
+    fn expected_return_head<'a>(c: &'a Check<'_>, path: &[u32]) -> Option<&'a str> {
+        // The NEAREST function boundary owns the return type — a
+        // closure boundary ends the walk (no written return type ever).
+        let func_idx = path.iter().rposition(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::Method
+                    | NodeKind::TopLevelMethod
+                    | NodeKind::LocalFunctionDeclaration
+                    | NodeKind::FunctionExpression
+            )
+        })?;
+        if c.kind(path[func_idx]) == NodeKind::FunctionExpression {
+            return None;
+        }
+        let ty = c
+            .collect_direct(path[func_idx])
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+        let head = c.lexeme(c.head_token(ty));
+        let body = path[func_idx + 1..]
+            .iter()
+            .copied()
+            .find(|&row| {
+                matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody)
+            })?;
+        let is_async = c
+            .field(body, PayloadField::AsyncKeyword)
+            .is_some_and(|kw| kw != NONE_TOKEN && c.lexeme(kw) == "async");
+        let is_generator = c
+            .field(body, PayloadField::Star)
+            .is_some_and(|star| star != NONE_TOKEN);
+        let wrapper = if is_async && !is_generator {
+            "Future"
+        } else if is_async && is_generator {
+            "Stream"
+        } else if is_generator {
+            "Iterable"
+        } else {
+            return Some(head);
+        };
+        if head != wrapper {
+            return Some(head);
+        }
+        // The wrapper's first type argument (`Future<X>` → `X`): the
+        // declared-type tiling puts the `TypeArguments` wrapper beside the
+        // type row (the sibling right before it among the function's
+        // kids), its `Type` children the arguments in order.
+        let kids = c.collect_direct(path[func_idx]);
+        if let Some(pos) = kids.iter().position(|&kid| kid == ty)
+            && let Some(&prev) = pos
+                .checked_sub(1)
+                .and_then(|prev| kids.get(prev))
+            && c.kind(prev) == NodeKind::TypeArguments
+            && let Some(arg) = c
+                .collect_direct(prev)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Type)
+        {
+            return Some(c.lexeme(c.head_token(arg)));
+        }
+        Some(head)
+    }
+
+    /// The written type head of the formal receiving the `creation` — the
+    /// official's `correspondingParameter?.type`, resolved same-file: the
+    /// enclosing invocation's callee name, the unit's function-like
+    /// declarations of that name, and the argument's own group (a
+    /// positional index, or the `name:` of a named group). A closure body
+    /// (`closure`) reads the function-typed formal's return type instead
+    /// (:477-481).
+    fn argument_formal_head<'a>(
+        c: &'a Check<'_>,
+        args: u32,
+        creation: u32,
+        closure: bool,
+    ) -> Option<&'a str> {
+        let parent = c.unit.ast.parent(args)?;
+        let kids = c.collect_direct(parent);
+        let pos = kids.iter().position(|&kid| kid == args)?;
+        // The callee: the nearest identifier BEFORE the argument list that
+        // also STARTS before it — the flat tiling interleaves the
+        // arguments' interior rows (a closure's parameter list, its
+        // creation head) between the callee and the `(`, and an interior
+        // piece never starts left of the paren it lives in.
+        let args_start = c.byte_span(args).start;
+        let callee = kids[..pos]
+            .iter()
+            .rev()
+            .find(|&&kid| {
+                c.kind(kid) == NodeKind::Identifier && c.byte_span(kid).start < args_start
+            })
+            .copied()?;
+        let callee_name = c.lexeme(c.head_token(callee));
+        // The argument group holding the creation, and its key — the name
+        // of a named group or the positional index.
+        let pieces = c.collect_direct(args);
+        let groups = slice::arguments(c, &pieces);
+        let group = groups
+            .iter()
+            .find(|g| pieces[g.start..g.end].contains(&creation))
+            .or_else(|| groups.last())
+            .cloned()?;
+        let named = pieces[group.start..group.end]
+            .iter()
+            .any(|&piece| c.kind(piece) == NodeKind::NamedArgument);
+        let positional = groups
+            .iter()
+            .take_while(|g| g.start < group.start)
+            .filter(|g| {
+                !pieces[g.start..g.end]
+                    .iter()
+                    .any(|&piece| c.kind(piece) == NodeKind::NamedArgument)
+            })
+            .count();
+        // The unit's function-like declarations of the callee name —
+        // the declaration rows sit inside their `TopLevelDeclaration`
+        // wrapper under the unit root (the same wrapper walk as
+        // [`unprefixed_import_uris`]).
+        let unit = c
+            .path
+            .iter()
+            .find(|&&row| c.kind(row) == NodeKind::CompilationUnit)?;
+        for owner in c.collect_direct(*unit) {
+            for row in std::iter::once(owner).chain(c.collect_direct(owner)) {
+                if !matches!(
+                    c.kind(row),
+                    NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration
+                ) || !crate::rules::declarations::member_declaration_name(c, row)
+                    .is_some_and(|name_row| c.lexeme(c.head_token(name_row)) == callee_name)
+                {
+                    continue;
+                }
+                let formals = slice::parameter_assignments::parameter_rows(c, row);
+                let formal = if named {
+                    pieces[group.start..group.end]
+                        .iter()
+                        .find(|&&piece| c.kind(piece) == NodeKind::Identifier)
+                        .and_then(|piece| {
+                            let name = c.lexeme(c.head_token(*piece));
+                            formals
+                                .iter()
+                                .find(|(p, _)| slice::parameter_assignments::parameter_name(c, *p) == Some(name))
+                                .map(|&(p, _)| p)
+                        })
+                } else {
+                    formals.get(positional).map(|&(p, _)| p)
+                };
+                let Some(formal) = formal else { continue };
+                if closure || c.kind(formal) == NodeKind::FunctionTypedFormalParameter {
+                    // The function-typed formal's return type
+                    // (`functionType.returnType`): a `TypeReference`
+                    // identifier child when it tiles directly, else the
+                    // head of the written return-`Type` row — beside the
+                    // formal (`Set<int> f()`) or under the formal's
+                    // `FunctionType` row (`Set<int> Function() f`). The
+                    // production `FunctionTypedFormalParameter` row can
+                    // also seal CHILDLESS (`begin_function_typed_formal_
+                    // parameter(before)` with the interior rows tiling as
+                    // siblings): the row's own token range begins at the
+                    // written return type's head (`before` = the inline
+                    // function type's start), so its first token answers.
+                    // An omitted return type (`Function() p` — dynamic)
+                    // never spells a creation and keeps the report
+                    // posture (the official's dynamic return context).
+                    let kids = c.collect_direct(formal);
+                    let return_type = kids
+                        .iter()
+                        .copied()
+                        .find(|&piece| {
+                            c.kind(piece) == NodeKind::Identifier
+                                && c.field(piece, PayloadField::Context)
+                                    == Some(dartq_parser::IdentifierContext::TypeReference as u32)
+                        })
+                        .or_else(|| {
+                            kids.iter()
+                                .copied()
+                                .find(|&piece| c.kind(piece) == NodeKind::Type)
+                        })
+                        .or_else(|| {
+                            kids.iter()
+                                .copied()
+                                .find(|&piece| c.kind(piece) == NodeKind::FunctionType)
+                                .and_then(|ft| {
+                                    c.collect_direct(ft)
+                                        .into_iter()
+                                        .find(|&piece| c.kind(piece) == NodeKind::Type)
+                                })
+                        });
+                    return return_type
+                        .map(|piece| c.lexeme(c.head_token(piece)))
+                        .or_else(|| {
+                            let head = c.lexeme(c.head_token(formal));
+                            (head != "Function").then_some(head)
+                        });
+                }
+                // A function-typed parameter written with the
+                // generalized type (`Set<int> Function() p`) tiles as a
+                // plain formal whose `FunctionType` child owns the
+                // return type — the row's own head token (`Set<int>
+                // Function()` begins at the return type). Every other
+                // plain formal reads its written `Type` row's head.
+                let kids = c.collect_direct(formal);
+                return kids
+                    .iter()
+                    .copied()
+                    .find(|&piece| c.kind(piece) == NodeKind::FunctionType)
+                    .map(|ft| c.lexeme(c.head_token(ft)))
+                    .or_else(|| {
+                        kids.iter()
+                            .copied()
+                            .find(|&piece| c.kind(piece) == NodeKind::Type)
+                            .map(|ty| c.lexeme(c.head_token(ty)))
+                    });
+            }
+        }
+        None
     }
 }
 
@@ -2449,7 +2906,10 @@ mod tests {
     /// `test/rules/prefer_collection_literals_test.dart` `test_map` — the
     /// no-arg `Map()`/`Set()` invocations report; `HashMap()`/`HashSet()`
     /// never report (their static type is the unrelated dart:collection
-    /// class — :28-32/:99-105 pin `Map`/`Set`/`Linked*` only).
+    /// class — :28-32/:99-105 pin `Map`/`Set`/`Linked*` only). The
+    /// `Linked*` spellings resolve only through a `dart:collection`
+    /// import — an import-less unit leaves the head unresolved and the
+    /// official's creation arm never arms.
     #[test]
     fn collection_literals_reports_map_and_set() {
         let f = Fixture::parse("void f() { Map(); }");
@@ -2464,8 +2924,15 @@ mod tests {
         let f = Fixture::parse("void f() { Set(); }");
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
 
-        let f = Fixture::parse("void f() { LinkedHashMap(); LinkedHashSet(); }");
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid f() { LinkedHashMap(); LinkedHashSet(); }",
+        );
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 2);
+
+        // No dart:collection import: the heads are unresolved, no face
+        // arms (the `doc_good_2` posture).
+        let f = Fixture::parse("void f() { LinkedHashMap(); LinkedHashSet.from([1]); }");
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
 
         let f = Fixture::parse("void f() { HashMap(); HashSet(); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
@@ -2480,16 +2947,50 @@ mod tests {
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
     }
 
-    /// `Set.from([1])` reports; `LinkedHashSet.from` rides the `isHashSet`
-    /// face; a named constructor on the map family, a non-list argument,
-    /// and two arguments pass.
+    /// `test_returnStatement_functionExpression`: a return inside a
+    /// closure argument reads the corresponding formal's function-type
+    /// return head — the matching `LinkedHashSet` context stays silent
+    /// (the nearest function boundary is the closure, so the context
+    /// keeps walking outward to the argument position).
+    #[test]
+    fn collection_literals_closure_return_context() {
+        let f = Fixture::parse(
+            "import 'dart:collection';\n\nvoid f() {\n  g(() {\n    return LinkedHashSet();\n  });\n}\n\nvoid g(LinkedHashSet<int> Function()) {}\n",
+        );
+        assert!(
+            f.run(&one_rule("prefer_collection_literals"))
+                .is_empty()
+        );
+    }
+
+    /// `Set.from([1])` reports at the whole invocation (`Set` through the
+    /// closing paren — the official's `InstanceCreationExpression`); the
+    /// type-argumented `Set<int>.from([])` rides the implicit-creation
+    /// face (`C<int>.name(…)` parses as a constructor reference);
+    /// `LinkedHashSet.from` rides the `isHashSet` face; a named
+    /// constructor on the map family, a non-list argument, and two
+    /// arguments pass.
     #[test]
     fn collection_literals_from_of_and_negatives() {
         let f = Fixture::parse("void f() { Set.from([1]); }");
-        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+        let lints = f.run(&one_rule("prefer_collection_literals"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let set = f.source.find("Set.from").unwrap() as u32;
+        assert_eq!(lints[0].range, set..set + 13, "{lints:?}");
 
         let f = Fixture::parse("void f() { Set.of([1]); LinkedHashSet.from([1]); }");
-        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 2);
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid f() { LinkedHashSet.from([1]); }",
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        let f = Fixture::parse("void f() { Set<int>.from([]); }");
+        let lints = f.run(&one_rule("prefer_collection_literals"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let set = f.source.find("Set<int>").unwrap() as u32;
+        assert_eq!(lints[0].range, set..set + 17, "{lints:?}");
 
         let f = Fixture::parse("void f() { HashMap.identity(); Map.from([1]); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
@@ -2497,6 +2998,7 @@ mod tests {
         let f = Fixture::parse("void f() { Set.from(1); Set.of([1], 2); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
     }
+
 
     /// The same-file element gate (:44-46): a unit-local declaration of
     /// the name — a user class or a typedef — shadows the core type and
@@ -2516,32 +3018,103 @@ mod tests {
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
     }
 
-    /// The `Linked*` context exemption (:85-88/:101-104): a declaration
-    /// typed with the same creation is exempt, an untyped (`var`)
-    /// declaration is the official's invalid context, and any other
-    /// declared type reports.
+    /// The `Linked*` context exemption (:54-56/:67-70 through
+    /// `approximateContextType`): a declaration typed with the same
+    /// creation is exempt, an untyped (`var`/`final`) declaration is the
+    /// official's null context (reports — `VariableDeclarationList.type`
+    /// is null, not invalid), and any other declared type reports.
     #[test]
     fn collection_literals_context_types() {
         let f = Fixture::parse(
-            "void f() { LinkedHashMap<int, int> m = LinkedHashMap(); Set<int> s = LinkedHashSet(); }",
+            "import 'dart:collection';\nvoid f() { LinkedHashMap<int, int> m = LinkedHashMap(); Set<int> s = LinkedHashSet(); }",
         );
         // The matching-type creation is exempt; `LinkedHashSet()` in a
         // `Set<int>` context is a non-exempt context and reports.
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
 
-        let f = Fixture::parse("void f() { var m = LinkedHashMap(); final s = LinkedHashSet(); }");
-        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid f() { var m = LinkedHashMap(); final s = LinkedHashSet(); }",
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 2);
 
-        let f = Fixture::parse("void f() { Map<int, int> m = LinkedHashMap(); }");
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid f() { Map<int, int> m = LinkedHashMap(); }",
+        );
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
     }
 
-    /// `['a'].toSet()` reports; `x.toSet()` on a non-literal target and an
-    /// index target pass (:87-95).
+    /// The context faces beyond the declaration (extensions.dart
+    /// :458-496): the assignment target's written type exempts
+    /// (`s = LinkedHashSet()`, `:463-464`), the argument formal decides
+    /// (`:458-465` — a `Map` formal reports a `LinkedHashMap` creation, a
+    /// matching `LinkedHashSet` formal exempts), the closure body reads
+    /// the function-typed formal's return type (`:477-481`), and
+    /// return/yield unwrap the async wrapper (`:496-554` —
+    /// `Future<LinkedHashSet<int>>` yields `LinkedHashSet`).
+    #[test]
+    fn collection_literals_context_faces() {
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid f(LinkedHashSet<int> s) { s = LinkedHashSet(); }",
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid f(LinkedHashSet<int> s) { s = LinkedHashSet()..addAll([1]); }",
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid c() { g(LinkedHashMap<int, int>()); }\nvoid g(Map<int, int> p) {}",
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid c() { g(LinkedHashSet<Foo>()); }\nvoid g(LinkedHashSet<Foo> p) {}\nclass Foo {}",
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid c() { a(some: LinkedHashSet<Foo>()); }\nvoid a({required Set<Foo> some}) {}\nclass Foo {}",
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nvoid c() { a(() => LinkedHashSet<int>()); }\nvoid a(Set<int> Function() f) {}",
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        let f = Fixture::parse(
+            "import 'dart:collection';\nFuture<LinkedHashSet<int>> f() async { return LinkedHashSet(); }\nStream<LinkedHashSet<int>> g() async* { yield LinkedHashSet(); }\nIterable<LinkedHashSet<int>> h() sync* { yield LinkedHashSet(); }",
+        );
+        let async_lints = f.run(&one_rule("prefer_collection_literals"));
+        assert!(async_lints.is_empty(), "{async_lints:?}");
+
+        // A sync body keeps the wrapper head (`Future<…>` un-unwrapped
+        // reports) and a mismatched wrapper reports.
+        let f = Fixture::parse(
+            "import 'dart:collection';\nFuture<Set<int>> f() { return LinkedHashSet(); }",
+        );
+        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+
+        // The constructor field initializer face (:466-468) — the field's
+        // written type decides.
+        let f = Fixture::parse(
+            "import 'dart:collection';\nclass A {\n  LinkedHashMap<int, int> m = LinkedHashMap();\n}",
+        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+    }
+
+    /// `['a'].toSet()` reports at the whole invocation — the literal's
+    /// head through the close (:87-95, the official's
+    /// `MethodInvocation` span); `x.toSet()` on a non-literal target and
+    /// an index target pass.
     #[test]
     fn collection_literals_to_set_on_list_literal() {
         let f = Fixture::parse("void f() { ['a'].toSet(); }");
-        assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
+        let lints = f.run(&one_rule("prefer_collection_literals"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let list = f.source.find("['a']").unwrap() as u32;
+        assert_eq!(lints[0].range, list..list + 13, "{lints:?}");
 
         let f = Fixture::parse("void f(List<int> x) { x.toSet(); x[0].toSet(); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());

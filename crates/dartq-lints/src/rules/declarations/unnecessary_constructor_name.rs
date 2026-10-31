@@ -133,10 +133,7 @@ fn check_declaration(c: &mut Check<'_>, node: u32) {
     if duplicate_new(c, body, owner_primary(c)) {
         return;
     }
-    let Some(start) = c.utf16_of_token(c.head_token(name)) else {
-        return;
-    };
-    c.report(start..start, &[]);
+    c.report(crate::rules::utf16_token_span(c, c.head_token(name)), &[]);
 }
 
 /// `visitPrimaryConstructorDeclaration` (:70-80): a written `.new`
@@ -153,10 +150,7 @@ fn check_primary(c: &mut Check<'_>, node: u32) {
     if duplicate_new(c, owner, Some(node)) {
         return;
     }
-    let Some(start) = c.utf16_of_token(c.head_token(name)) else {
-        return;
-    };
-    c.report(start..start, &[]);
+    c.report(crate::rules::utf16_token_span(c, c.head_token(name)), &[]);
 }
 
 fn check_creation(c: &mut Check<'_>) {
@@ -181,10 +175,10 @@ fn check_creation(c: &mut Check<'_>) {
     if let Some(group_start) = head.checked_sub(4)
         && slice::is_tear_off_group(c, &kids, group_start)
     {
-        let Some(start) = c.utf16_of_token(c.head_token(kids[head])) else {
-            return;
-        };
-        c.report(start..start, &[]);
+        c.report(
+            crate::rules::utf16_token_span(c, c.head_token(kids[head])),
+            &[],
+        );
         return;
     }
     // The prefixed face: `p.Foo.new(…)` — the head segment is an import
@@ -207,8 +201,5 @@ fn check_creation(c: &mut Check<'_>) {
     {
         return;
     }
-    let Some(start) = c.utf16_of_token(new_token) else {
-        return;
-    };
-    c.report(start..start, &[]);
+    c.report(crate::rules::utf16_token_span(c, new_token), &[]);
 }

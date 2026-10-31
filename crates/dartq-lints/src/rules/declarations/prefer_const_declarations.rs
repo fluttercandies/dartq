@@ -1,5 +1,5 @@
 use super::{Check, NodeKind, PayloadField, RuleSpec};
-use crate::rules::{const_ability, utf16_token_span, variables_declaration_keyword};
+use crate::rules::{const_ability, variables_declaration_keyword};
 use dartq_parser::MemberKind;
 
 /// Official: `pkg/linter/lib/src/rules/prefer_const_declarations.dart:52-64`
@@ -32,11 +32,9 @@ fn check(c: &mut Check<'_>) {
     let node = c.node();
     // `node.isConst`/`!node.isFinal` (:53-54) — the keyword must spell
     // exactly `final` (`const` and `var` never qualify).
-    let Some(keyword) =
-        variables_declaration_keyword(c, node).filter(|&kw| c.lexeme(kw) == "final")
-    else {
+    if variables_declaration_keyword(c, node).is_none_or(|kw| c.lexeme(kw) != "final") {
         return;
-    };
+    }
     // The visited faces (:31-34). Instance fields stay silent (the
     // official registers only the static `FieldDeclaration`), and the
     // for-loop faces are no `VariableDeclarationStatement`s.
@@ -62,7 +60,7 @@ fn check(c: &mut Check<'_>) {
     // qualifies outright (:58-59 — the keyword arm); its content may
     // tile beside the wrapper row, so the initializer kids are read
     // wrapper-first.
-    let mut last_var = None;
+    let mut any_variable = false;
     for var in c.collect_direct(node) {
         if c.kind(var) != NodeKind::InitializedIdentifier {
             continue;
@@ -98,17 +96,18 @@ fn check(c: &mut Check<'_>) {
         if !verdict.unwrap_or(false) {
             return;
         }
-        last_var = Some(var);
+        any_variable = true;
     }
-    let Some(last_var) = last_var else {
+    if !any_variable {
         return;
-    };
-    // `rule.reportAtNode(node)` (:62) — the list: the keyword head
-    // through the last variable (the row's trailing `;` belongs to the
-    // statement, not the official list node).
-    let start = utf16_token_span(c, keyword).start;
-    let end = c.utf16_span(last_var).end;
-    c.report(start..end, &[]);
+    }
+    // `rule.reportAtNode(node)` (:62) — the list node: the keyword head
+    // through the last variable's last token, the trailing `;` excluded
+    // (the statement/field wrapper owns it; flat-tailed initializer
+    // groups ride the row's own token range).
+    if let Some(range) = super::variables_list_range(c, node) {
+        c.report(range, &[]);
+    }
 }
 
 /// Whether the initializer is a constant as written — the official

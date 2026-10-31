@@ -31,26 +31,38 @@ fn run(f: &Fixture, has_entry: bool, entries: &[(u32, bool)]) -> Vec<Lint> {
 /// The constructor verdict fallback: the face universe carries no
 /// constructor rows (the `dartq-index` capture exclusion), so an
 /// unreferenced constructor answers no verdict and its own reference
-/// face decides — an unreferenced named and unnamed constructor report
-/// (`C.named` / `C.new`).
+/// face decides. Oracle-verified (`dart analyze`, mirroring upstream
+/// `test_constructor_named_unreachable`): a live class through the
+/// bare expression use `C;` leaves an unreferenced constructor
+/// reporting (`C.named` / `C.new`) — under a DEAD class the container
+/// wins and the constructor never reports.
 #[test]
 fn ufm_ctor_verdict_fallback_reports() {
-    let f = Fixture::parse("void main() {}\n\nclass C {\n  C();\n}\n");
+    let f = Fixture::parse("void main() {\n  C;\n}\n\nclass C {\n  C();\n}\n");
     let lints = run(&f, true, &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)]);
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
         "Unreachable member 'C.new' in an executable library."
     );
-    assert_eq!(lints[0].range.start, flag(&f, "C", 1, false).0);
+    assert_eq!(lints[0].range.start, flag(&f, "C", 2, false).0);
 
-    let f = Fixture::parse("void main() {}\n\nclass C {\n  C.named();\n}\n");
+    let f = Fixture::parse("void main() {\n  C;\n}\n\nclass C {\n  C.named();\n}\n");
     let lints = run(&f, true, &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)]);
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
         "Unreachable member 'C.named' in an executable library."
     );
+
+    let f = Fixture::parse("void main() {}\n\nclass C {\n  C();\n}\n");
+    let lints = run(&f, true, &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)]);
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    assert_eq!(
+        lints[0].message,
+        "Unreachable member 'C' in an executable library."
+    );
+    assert_eq!(lints[0].range.start, flag(&f, "C", 0, false).0);
 }
 
 /// A counting position keeps the constructor silent even under a
@@ -111,26 +123,27 @@ fn ufm_named_super_initializer_leaves_super_unnamed_dead() {
 }
 
 /// The `@reflectiveTest` arm (:220-231): the mirrors instantiation
-/// marks the unnamed constructor — the probe method beside it reports.
+/// marks the unnamed constructor — the upstream
+/// `test_constructor_reachableViaTestReflectiveLoader` fixture
+/// (`assertNoDiagnostics`) with the bare expression use `A;` keeping
+/// the class alive. Oracle note: the arm keys the annotation spelling
+/// (the element face resolves `package:test_reflective_loader` — a
+/// corpus library carries the import).
 #[test]
 fn ufm_reflective_test_marks_unnamed_ctor() {
     let f = Fixture::parse(
-        "void main() {}\n\n@reflectiveTest\nclass T {\n  T();\n  void probe() {}\n}\n",
+        "import 'package:test_reflective_loader/test_reflective_loader.dart';\n\nvoid main() {\n  A;\n}\n\n@reflectiveTest\nclass A {\n  A();\n}\n",
     );
     let lints = run(
         &f,
         true,
         &[
             flag(&f, "main", 0, true),
-            flag(&f, "T", 0, true),
-            flag(&f, "probe", 0, false),
+            flag(&f, "A", 0, true),
+            flag(&f, "A", 1, false),
         ],
     );
-    assert_eq!(lints.len(), 1, "{lints:?}");
-    assert_eq!(
-        lints[0].message,
-        "Unreachable member 'probe' in an executable library."
-    );
+    assert!(lints.is_empty(), "{lints:?}");
 }
 
 // —— prefer_initializing_formals —————————————————————————————————————
