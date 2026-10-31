@@ -6765,26 +6765,27 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|&(name, bound)| (name, bound.map(|b| self.subst_ty(b, map))))
                     .collect();
-                let mut args = self.boundary.args.borrow_mut();
-                let ty = if names.is_empty() && type_params > 0 {
-                    args.function(
-                        type_params,
-                        self.subst_ty(return_ty, map),
-                        &positional,
-                        &named,
-                        nullable,
-                    )
+                // Own the return face before the re-intern guard:
+                // `subst_ty` re-enters the pool in every compound arm
+                // (`pool()`'s borrow), which a live `RefMut` here panics
+                // against (#3202's frame pair — the same discipline as
+                // `canonical_dotted_ty`'s function leg and #2992's
+                // alias-fold rebuild).
+                let return_ty = self.subst_ty(return_ty, map);
+                if names.is_empty() && type_params > 0 {
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .function(type_params, return_ty, &positional, &named, nullable)
                 } else {
-                    args.function_generic(
+                    self.boundary.args.borrow_mut().function_generic(
                         &names,
-                        self.subst_ty(return_ty, map),
+                        return_ty,
                         &positional,
                         &named,
                         nullable,
                     )
-                };
-                drop(args);
-                ty
+                }
             }
             Ty::Record { shape, nullable } => {
                 let (positional, named) = {
@@ -8011,3 +8012,12 @@ mod ticket_3173_tests;
 #[cfg(test)]
 #[path = "ticket_2487_tests.rs"]
 mod ticket_2487_tests;
+
+// The #3202 pins: the args RefCell re-entrancy panic in `subst_ty`'s
+// function leg — the guard held across the recursive return-face
+// substitution (the release-binary crash of the extension-type
+// primary-constructor sweep) — plus its verdict integrity on the
+// hoisted discipline.
+#[cfg(test)]
+#[path = "ticket_3202_tests.rs"]
+mod ticket_3202_tests;

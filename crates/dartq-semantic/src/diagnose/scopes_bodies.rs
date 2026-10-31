@@ -3932,19 +3932,22 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|&(n, bound)| (n, bound.map(|b| self.closure_subst_param_ty(b, map))))
                     .collect();
-                let mut args = self.boundary.args.borrow_mut();
+                // Own the return face before the re-intern guard:
+                // `closure_subst_param_ty` re-enters the pool in every
+                // compound arm (`pool()`'s borrow), which a live `RefMut`
+                // here panics against (#3202's frame pair — the same
+                // discipline as `subst_ty`'s function leg and #2992's
+                // alias-fold rebuild).
+                let return_ty = self.closure_subst_param_ty(return_ty, map);
                 if names.is_empty() && type_params > 0 {
-                    args.function(
-                        type_params,
-                        self.closure_subst_param_ty(return_ty, map),
-                        &positional,
-                        &named,
-                        nullable,
-                    )
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .function(type_params, return_ty, &positional, &named, nullable)
                 } else {
-                    args.function_generic(
+                    self.boundary.args.borrow_mut().function_generic(
                         &names,
-                        self.closure_subst_param_ty(return_ty, map),
+                        return_ty,
                         &positional,
                         &named,
                         nullable,
