@@ -8884,8 +8884,11 @@ fn trim_value_ws(bytes: &[u8], start: usize, end: usize) -> usize {
 /// every name lives only in its `dart:core`/`dart:async`/`dart:typed_data`
 /// library, so an entry the analysis set resolves to its own declaration is
 /// a user element and never restricted — the spelling is the SDK face
-/// exactly when nothing indexed claims it. #2972.
-const NON_SUBTYPABLE_SDK_NAMES: &[&str] = &[
+/// exactly when nothing indexed claims it. #2972. The modifier-use gate
+/// (`overrides.rs`'s `non_subtypable_clause_head`) reads the same table —
+/// one spelling list serves both the disallowed-subtype rows and the
+/// clause-error drive gate.
+pub(crate) const NON_SUBTYPABLE_SDK_NAMES: &[&str] = &[
     // dart:core (type_provider.dart:27-36).
     "bool",
     "double",

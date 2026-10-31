@@ -17515,3 +17515,24 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
 #[cfg(test)]
 #[path = "ticket_3215_tests.rs"]
 mod ticket_3215_tests;
+
+// The #3218 pins (F9-A clause-error drive gate — the outside-library
+// passes 1-4 stand down when a clause-error probe already fired, modeled
+// on `non_subtypable_clause_head` in `overrides.rs`). Registered here
+// because the brief's named hosts (`diagnose.rs`/`engine_core.rs`) are
+// live-lane files out of this ticket's write scope; `#[path]` keeps the
+// module inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3218_tests.rs"]
+mod ticket_3218_tests;
+
+// The #3219 pins (F9-B pre-feature modifier mask — a declaration in a
+// library predating `class-modifiers` carries no modifier facts, masked in
+// `types.rs`'s `FoldHierarchy::declared`). Registered here because the
+// brief's named host (`diagnose.rs`) is a live-lane file out of this
+// ticket's write scope; `#[path]` keeps the module inside the `diagnose`
+// subtree so `crate::diagnose::*` resolves.
+#[cfg(test)]
+#[path = "ticket_3219_tests.rs"]
+mod ticket_3219_tests;

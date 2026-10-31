@@ -3078,6 +3078,7 @@ impl<'a> Engine<'a> {
             index,
             file: self.file,
             lib: self.lib,
+            class_modifiers: self.class_modifiers,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
             alias_head: Some(&alias_hop),
@@ -3215,6 +3216,7 @@ impl<'a> Engine<'a> {
             index: self.index,
             file: self.file,
             lib: self.lib,
+            class_modifiers: self.class_modifiers,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
             alias_head: Some(&alias_hop),
@@ -3310,6 +3312,46 @@ impl<'a> Engine<'a> {
         // superclass (`visitEnumDeclaration` → `_checkClassInheritance`,
         // :823-863), so it carries the `with` face and never the `on` one.
         let class_drive = matches!(decl.kind, ContainerKind::Class | ContainerKind::Enum);
+        // The clause-error drive gate (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/generated/error_verifier.dart`): the
+        // outside-library block (passes 1–4) stands down when a clause-error
+        // probe already fired — the class drive's four probes
+        // (`_checkForExtendsDisallowedClass`,
+        // `_checkForImplementsClauseErrorCodes`,
+        // `_checkForAllMixinErrorCodes`,
+        // `_checkForNoGenerativeConstructorsInSuperclass`, :2746-2753) and
+        // the mixin drive's two (`_checkForOnClauseErrorCodes`,
+        // `_checkForImplementsClauseErrorCodes`, :8168-8169). Modeled here:
+        // the disallowed-subtype arm (`isNonSubtypableClass`/`isDartCoreEnum`
+        // — the rows dartq emits as `subtype_of_disallowed_type` plus the
+        // core-`Enum` `with` arm, the probes the conformance extras proved).
+        // Pass 5 (the resolver-driven `BaseOrFinalTypeVerifier`) is NOT
+        // gated. Deliberately under-gated for iteration 1:
+        // `class_used_as_mixin` reports WITHOUT setting `problemReported`
+        // upstream (error_verifier.dart:2917-2926 — a sealed class reached
+        // through `with` still reports beside it,
+        // `test_mixinOutside_rawClass`), so a plain class in `with` never
+        // gates; `mixin_inherits_not_from_object`/`mixin_instantiate`
+        // (non-Object or extension-type with-faces) and
+        // `no_generative_constructors_in_superclass` stay unmodeled — a
+        // deferred clause's `*_deferred_class` rows live in probe arms
+        // dartq does not emit either — so a clause error they alone fire
+        // still emits the outside-library rows beside it.
+        let clause_error = if class_drive {
+            decl.superclass
+                .is_some_and(|name| self.non_subtypable_clause_head(name))
+                || decl
+                    .implements_clause
+                    .iter()
+                    .chain(decl.with_clause.iter())
+                    .any(|&name| self.non_subtypable_clause_head(name))
+        } else {
+            decl.on_clause
+                .iter()
+                .chain(decl.implements_clause.iter())
+                .any(|&name| self.non_subtypable_clause_head(name))
+        };
+        if !clause_error {
         // Pass 1 — the base-implemented walks (`implements` entries, the
         // named type plus its transitive supertypes, first report per
         // entry; :3712-3752).
@@ -3438,6 +3480,7 @@ impl<'a> Engine<'a> {
                 });
             }
         }
+        }
         // Pass 5 — the base-or-final subtype requirement, official face
         // order superclass → implements → with → `on` (classes) /
         // implements → `on` (mixins), one error per element
@@ -3508,6 +3551,85 @@ impl<'a> Engine<'a> {
             }
         }
         findings
+    }
+
+    /// Whether the clause entry `entry` spells a non-subtypable face the
+    /// gate's disallowed arm covers (`_checkForExtendsOrImplementsDisallowed
+    /// Class`, error_verifier.dart:5171-5187 — `type is InterfaceType &&
+    /// _typeProvider.isNonSubtypableClass(...)`, plus the
+    /// `_checkDirectSuperType` `isDartCoreEnum` arm the same clause-error
+    /// rows fire through, inheritance_override.dart:610-620). The probe
+    /// mirrors [`Self::disallowed_subtype_head`] — the shared alias-chase
+    /// and the user-shadow exemption (`isNonSubtypableClass` keys on the
+    /// RESOLVED element's `dart:*` library, so a user declaration named
+    /// `int` is never restricted) — with the core `Enum` carve-out flipped:
+    /// `with Enum` *is* a clause error upstream (its `concrete_class_has_
+    /// enum_superinterface` report carries `problemReported = true`), so
+    /// the gate counts it where `finalize_disallowed_subtypes`'s report arm
+    /// does not.
+    fn non_subtypable_clause_head(&self, entry: StringId) -> bool {
+        let mut head = entry;
+        // The same resolution decision [`Self::disallowed_subtype_head`]
+        // makes: `resolve_container` first (a user typedef named `int`
+        // shadows the SDK face before its `var_ty` is read); an unresolved
+        // entry chases one level through a non-generic bare alias.
+        match resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            entry,
+        ) {
+            Some((_, owner_file)) => {
+                let is_sdk = self
+                    .graph
+                    .library_of_file(owner_file)
+                    .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
+                if !is_sdk {
+                    return false;
+                }
+            }
+            None => {
+                // No indexed container under the spelling: the bare
+                // non-generic alias chase is the only face the model
+                // keeps; an absent decl is the closed-spelling face (the
+                // names-only `dart:*` stub resolves it as a type without
+                // an index entry — `disallowed_subtype_head`'s fallthrough
+                // contract).
+                if let Some(decl) = self.index.get(self.file).and_then(|f| f.decl(entry)) {
+                    if decl.kind != MicroKind::TypeAlias || decl.type_params != 0 {
+                        return false;
+                    }
+                    match decl.var_ty {
+                        Ty::Named { name, .. } => head = name,
+                        Ty::Null => head = self.intern("Null"),
+                        _ => return false,
+                    }
+                    // The chased head rides the same decision: a user
+                    // element under that name is never restricted.
+                    if let Some((_, owner_file)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        head,
+                    ) {
+                        let is_sdk = self
+                            .graph
+                            .library_of_file(owner_file)
+                            .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
+                        if !is_sdk {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        let spelling = self.strings.resolve(head);
+        spelling == "Enum"
+            || super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&spelling)
     }
 
     /// The written `with` entries' spans of `container`, read from the clause
