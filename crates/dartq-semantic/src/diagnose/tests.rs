@@ -17546,3 +17546,13 @@ mod ticket_3219_tests;
 #[cfg(test)]
 #[path = "ticket_3224_tests.rs"]
 mod ticket_3224_tests;
+
+// The #3229 pins (Cluster A of the undefined_* family — a wildcard `_`
+// local-scope declaration binds nothing under `wildcard-variables`, gated
+// across every frame-scope population surface in `scopes_bodies.rs`, with
+// the context-schema ordinal counting tracked parameter rows so a wildcard
+// formal keeps its positional slot). Registered here because `diagnose.rs`
+// is a live-lane file out of this ticket's write scope; `#[path]` keeps the
+// module inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]

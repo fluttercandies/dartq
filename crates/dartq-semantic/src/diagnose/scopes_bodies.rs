@@ -223,13 +223,20 @@ impl<'a> Engine<'a> {
     /// (the official `_enclosingExec` keeps only in-body self-references
     /// from counting: the entry is absent from the tracked stack while
     /// the body parses, so a self-reference finds no declaration).
+    ///
+    /// An `_`-named local function binds nothing at all
+    /// ([`Self::declares_nothing`]): the official `LocalScope.add` skips
+    /// the element like every other wildcard, so neither a sibling nor an
+    /// in-body `_()` resolves — both report `undefined_function`, while
+    /// the tracked row still carries the `dead_code` face.
     pub(crate) fn note_local_function(&mut self, name: StringId, range: SourceRange) {
         // The name joins the enclosing statement list's duplicate scope
         // (`checkStatements`' `FunctionDeclarationStatement` arm): the name
         // event fires before the body block opens the function's own scope,
         // so the innermost scope is the enclosing list's.
         self.dup_scope_add(name, range);
-        if self.frames.len() >= 2
+        if !self.declares_nothing(name)
+            && self.frames.len() >= 2
             && let Some(enclosing) = self.frames.len().checked_sub(2)
             && let Some(frame) = self.frames.get_mut(enclosing)
         {
@@ -1180,7 +1187,9 @@ impl<'a> Engine<'a> {
         let ty = self.instantiated_head_ty(ty);
         match slot {
             VarInferSlot::Local => {
-                if let Some(frame) = self.frames.last_mut() {
+                if !self.declares_nothing(name)
+                    && let Some(frame) = self.frames.last_mut()
+                {
                     frame.var_types.insert(name, ty);
                 }
             }
@@ -1354,6 +1363,28 @@ impl<'a> Engine<'a> {
         (ty != Ty::UNKNOWN).then_some(ty)
     }
 
+    /// Whether a local-scope declaration of `name` binds nothing: under the
+    /// wildcard-variables feature a lone `_` declares no name in any frame
+    /// scope, so neither the frame's resolution set ([`Self::add_local`],
+    /// [`Self::note_local_function`]) nor its declared-type map
+    /// ([`Self::bind_declared_type`], [`Self::bind_parameter_type`],
+    /// [`Self::bind_inferred_ty`]) receives it — the official skips the
+    /// element at every local-scope population site (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/element/scope.dart:537-557
+    /// `LocalScope.add`, :106-124 `FormalParameterScope`, :15-35
+    /// `ConstructorInitializerScope`), so a read falls through the lexical
+    /// chain and reports undefined-name. The formal keeps its positional
+    /// slot in the context schema ([`Self::formal_ordinal`]) and the
+    /// tracked `locals` row stays for unused-warning bookkeeping; only the
+    /// binding is skipped.
+    ///
+    /// Top-level declarations are outside every frame scope and never
+    /// consults this gate — a top-level `_` is an ordinary library-scope
+    /// name and keeps resolving.
+    fn declares_nothing(&self, name: StringId) -> bool {
+        self.is_wildcard(name)
+    }
+
     /// A pattern variable declared outside every frame (the top-level
     /// variable-initializer world) still binds for the enclosing clause's
     /// reads: the guard and case body of a switch/if-case expression in
@@ -1366,18 +1397,18 @@ impl<'a> Engine<'a> {
         // A frame-local `_` declares nothing when wildcard-variables is on:
         // the official scopes skip the name at every frame level —
         // LocalScope.add (upstream Dart SDK source,
-        // pkg/analyzer/lib/src/dart/element/scope.dart:550-554), and the
-        // formal scopes on the same feature gate (scope.dart:22,
-        // ConstructorInitializerScope; scope.dart:117-118,
-        // FormalParameterScope) — so a later read falls through the lexical
-        // chain to undefined-name. The tracked row is deliberately kept:
+        // pkg/analyzer/lib/src/dart/element/scope.dart:537-557), and the
+        // formal scopes on the same feature gate (scope.dart:106-124
+        // FormalParameterScope; scope.dart:15-35 ConstructorInitializerScope)
+        // — so a later read falls through the lexical chain to
+        // undefined-name. The tracked row is deliberately kept:
         // [`Self::add_tracked_local`] still pushes the usage entry (the
         // unused-local wildcard exemption walks the tracked vec, not this
         // resolution set), only the binding is skipped. The no-frame
         // branch (the top-level initializer world) stays ordinary — a
         // top-level `_` is a library-scope name, not a LocalScope row, and
         // keeps resolving.
-        if self.is_wildcard(name) && self.frames.last().is_some() {
+        if self.declares_nothing(name) && self.frames.last().is_some() {
             return;
         }
         if let Some(frame) = self.frames.last_mut() {
@@ -1604,6 +1635,9 @@ impl<'a> Engine<'a> {
         let ty = self.pending_decl_ty.unwrap_or(Ty::UNKNOWN);
         let ty = self.fold_alias_ty(ty);
         let ty = self.instantiated_head_ty(ty);
+        if self.declares_nothing(name) {
+            return;
+        }
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
         }
@@ -1625,6 +1659,12 @@ impl<'a> Engine<'a> {
     /// source)` — the co19 `Instantiate-to-bound` typedef family's spelled
     /// annotation) binds its instantiate-to-bounds face, the same resolved
     /// `staticType` the declared-type arm above binds.
+    ///
+    /// A wildcard `_` formal binds no slot at all
+    /// ([`Self::declares_nothing`]); the written or inferred type is still
+    /// consumed (`armed_ty` never leaks into the next parameter) and the
+    /// formal's positional slot in the context schema keeps counting
+    /// ([`Self::formal_ordinal`]).
     pub(crate) fn bind_parameter_type(&mut self, name: StringId) {
         let ty = self
             .armed_ty
@@ -1633,9 +1673,36 @@ impl<'a> Engine<'a> {
             .unwrap_or(Ty::UNKNOWN);
         let ty = self.fold_alias_ty(ty);
         let ty = self.instantiated_head_ty(ty);
+        if self.declares_nothing(name) {
+            return;
+        }
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
         }
+    }
+
+    /// The open formal's positional ordinal inside the innermost frame's
+    /// formal list: the parameter rows the frame already carries, less the
+    /// formal being bound (its own row precedes the type bind — every call
+    /// site runs `note_parameter`/`note_catch_parameter` first).
+    ///
+    /// The tracked rows decide the ordinal, never `var_types.len()`: a
+    /// wildcard `_` formal binds no declared-type slot
+    /// ([`Self::declares_nothing`]) yet keeps its positional place in the
+    /// context schema — the official element list keeps the formal and
+    /// drops only its name, so `void Function(int, String)` pairs `(_, s)`'s
+    /// `s` with `String` (`_` claims `int`). Dropping the slot from the
+    /// count would shift every following formal by one.
+    fn formal_ordinal(&self) -> Option<usize> {
+        let lo = *self.frame_local_marks.last()?;
+        Some(
+            self.locals
+                .get(lo..)?
+                .iter()
+                .filter(|decl| matches!(decl.kind, LocalKind::Parameter { .. }))
+                .count()
+                .saturating_sub(1),
+        )
     }
 
     /// The downward-inferred type of an implicitly typed formal inside an
@@ -1679,7 +1746,7 @@ impl<'a> Engine<'a> {
         let formal = if self.fn_formal_named_section {
             SchemaSlot::Named(name)
         } else {
-            SchemaSlot::Positional(self.frames.last()?.var_types.len())
+            SchemaSlot::Positional(self.formal_ordinal()?)
         };
         // The captured context answers first when it latched through a
         // non-argument channel — the declaration initializer, the
