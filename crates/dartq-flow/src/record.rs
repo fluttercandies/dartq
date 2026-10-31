@@ -2861,16 +2861,24 @@ impl ParserListener for Flow<'_> {
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
-        // The end token is the updater expression's end — the anchor the
-        // dead-updater row needs (header parts carry no statement wrapper,
-        // dead_code_verifier.dart:361-375's `updaters.endToken`).
+        // The end token is the assignment expression's own end — the anchor
+        // the dead-updater row needs (header parts carry no statement
+        // wrapper, dead_code_verifier.dart:361-375's `updaters.endToken`)
+        // and the bound of a dead null-shorted write target's row
+        // (`n?.p = i` ends after `i`). The parser's `end` span tiles a
+        // bare-leaf operand through its follower, so the run after the
+        // operator is scanned for its own last token (the else-arm trim's
+        // rule, [`Flow::else_arm_end`]).
+        let end = self
+            .scan_expression_end(operator.id + 1, Some(end.id))
+            .unwrap_or_else(|| end.range.end());
         self.record(Ev::Assign {
             plain: self.is_plain_assign(operator),
             if_null: matches!(
                 self.kind(operator),
                 Some(dartq_scanner::TokenKind::QuestionQuestionEq)
             ),
-            end: end.range.end(),
+            end,
             field_init: false,
         });
     }
@@ -3118,8 +3126,10 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::CascadeEnd);
     }
 
-    fn handle_spread_expression(&mut self, _operator: Token) {
-        self.record(Ev::Spread);
+    fn handle_spread_expression(&mut self, operator: Token) {
+        // The `...`/`...?` operator: the element's own first token, and the
+        // dead-element row's anchor.
+        self.record(Ev::Spread { token: operator });
     }
 
     fn handle_null_aware_element(&mut self, _token: Token) {

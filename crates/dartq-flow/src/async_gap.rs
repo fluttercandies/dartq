@@ -1909,7 +1909,7 @@ impl GapPass {
                 }
                 self.markers.push(Mk::OTHER);
             }
-            Ev::Spread | Ev::NullAwareElement | Ev::CascadeAccess { .. } => {
+            Ev::Spread { .. } | Ev::NullAwareElement | Ev::CascadeAccess { .. } => {
                 self.pop_val();
                 self.markers.push(Mk::OTHER);
             }

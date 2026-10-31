@@ -2199,6 +2199,49 @@ impl<'o> Interp<'o> {
         self.null_short_begin(receiver, recv_offset);
     }
 
+    /// Closes a dead null-shorted WRITE target's interval at the
+    /// assignment's own end.
+    ///
+    /// A `?.`/`?[` write target that ran dead from its open anchors the
+    /// interval at its member/operand poll, and the official's covering
+    /// node for such a chain is the ASSIGNMENT expression: `flowEnd` runs
+    /// over it at the null-short finish (`handleNullShortingFinished`,
+    /// resolver.dart:1195-1200; type_analyzer.dart:2616), so the row ends
+    /// at the right-hand side's end and never at the statement's `;` —
+    /// `n?.p = i` reports `p = i`. Only a window anchored strictly inside
+    /// the null-shorted chain is this write's (the containment rule of
+    /// [`Interp::null_short_end`]); a live access path or an enclosing
+    /// statement's anchor keeps the interval.
+    pub(crate) fn close_dead_null_write(&mut self, end: u32) {
+        let Some(short) = self.null_shorts.last() else {
+            return;
+        };
+        if !short.dead_at_open {
+            return;
+        }
+        let recv = short.recv_offset;
+        let Some(window) = self.dead else {
+            return;
+        };
+        if window.suppressed || window.anchor.range.offset <= recv {
+            return;
+        }
+        self.dead = None;
+        let offset = window.anchor.range.offset;
+        let end = window.end.max(end).max(offset);
+        if end > offset {
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: window.anchor.id,
+                    range: SourceRange {
+                        offset,
+                        length: end - offset,
+                    },
+                },
+            });
+        }
+    }
+
     /// Closes one open null-shorting context (official
     /// `nullAwareAccess_end`, flow_analysis.dart:7400-7404): joins the
     /// access path into the skip path and drops the checkpoint.

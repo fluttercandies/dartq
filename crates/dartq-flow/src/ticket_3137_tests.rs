@@ -286,3 +286,71 @@ fn live_null_aware_index_stays_silent() {
     let src = "void f(int? n, int i) {\n  n?[i];\n}";
     assert_eq!(dead_of(src), Vec::<String>::new());
 }
+
+// —— spread-element anchor ————————————————————————————————————————————————
+//
+// The spread element's own first token is the `...`/`...?` operator
+// (`Spread.token`), and it is the official's first dead node when the
+// element is reached dead (dead_code_verifier.dart:183-205) — one token
+// before the element's inner expression.
+
+#[test]
+fn dead_spread_element_anchors_at_the_operator() {
+    let src = "f(dyn) => {for (; false;) ...dyn};";
+    assert_eq!(dead_of(src), vec!["...dyn};".to_string()]);
+}
+
+#[test]
+fn live_spread_element_stays_silent() {
+    let src = "f(dyn) => [...dyn];";
+    assert_eq!(dead_of(src), Vec::<String>::new());
+}
+
+#[test]
+fn dead_statement_spread_keeps_the_statement_extent() {
+    // A statement that began dead owns the interval: the wrapper re-anchors
+    // the operator's poll to the statement's first token.
+    let src = "void f(dyn) {\n  return;\n  [...dyn];\n}";
+    assert_eq!(dead_of(src), vec!["[...dyn];".to_string()]);
+}
+
+// —— dead null-shorted write targets ————————————————————————————————————
+//
+// The covering node of a `?.`/`?[` write target's interval is the ASSIGNMENT
+// expression (`flowEnd` at the null-short finish, resolver.dart:1195-1200;
+// type_analyzer.dart:2616): the row ends at the right-hand side's end, never
+// at the statement's `;`.
+
+#[test]
+fn dead_null_write_row_ends_at_the_assignment() {
+    let src = "void f(Null n, int i) {\n  n?.p = i;\n}";
+    assert_eq!(dead_of(src), vec!["p = i".to_string()]);
+}
+
+#[test]
+fn dead_null_write_literal_rhs_row_ends_at_the_operand() {
+    let src = "void f(Null n) {\n  n?.p = 1;\n}";
+    assert_eq!(dead_of(src), vec!["p = 1".to_string()]);
+}
+
+#[test]
+fn dead_null_compound_write_row_ends_at_the_assignment() {
+    let src = "void f(Null n) {\n  n?.p += 1;\n}";
+    assert_eq!(dead_of(src), vec!["p += 1".to_string()]);
+}
+
+#[test]
+fn dead_null_index_write_row_spans_operand_to_rhs() {
+    let src = "void f(Null n, int i, int j) {\n  n?[i] = j;\n}";
+    assert_eq!(dead_of(src), vec!["i] = j".to_string()]);
+}
+
+// —— a began-dead statement owns its member poll ————————————————————————
+
+#[test]
+fn dead_statement_assignment_does_not_duplicate_the_member() {
+    // The member poll would open an interval at `b` inside a statement the
+    // top-down official walk already latched: one row, the statement's own.
+    let src = "void f(a) {\n  return;\n  x = a?.b;\n}";
+    assert_eq!(dead_of(src), vec!["x = a?.b;".to_string()]);
+}

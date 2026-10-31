@@ -636,7 +636,14 @@ pub enum Ev {
     EndLiteralString {
         interpolation_count: usize,
     },
-    Spread,
+    /// A spread element's `...`/`...?` operator token
+    /// (`handleSpreadExpression`): the element's own first token — the
+    /// dead-element row anchors there (`{for (; false;) ...dyn}` reports
+    /// `...dyn};`, dead_code_verifier `_visitNode` :183-205), one token
+    /// before the element's inner expression.
+    Spread {
+        token: TokenSpan,
+    },
     NullAwareElement,
     /// `if_kw`: the element's `if` keyword — the official's `IfElement`
     /// first token and the dead-row anchor when the element itself is the

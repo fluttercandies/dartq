@@ -1599,6 +1599,12 @@ impl Interp<'_> {
                 if *plain {
                     self.rejoin_value_split(&rhs);
                 }
+                // A dead null-shorted WRITE target's interval ends at the
+                // assignment's own end (`flowEnd` over the assignment node,
+                // type_analyzer.dart:2616 via `handleNullShortingFinished`,
+                // resolver.dart:1195-1200): `n?.p = i` reports `p = i`,
+                // never `p = i;` and never the bare member.
+                self.close_dead_null_write(*end);
                 // A constructor field initializer's write targets `this.f`
                 // (upstream `ConstructorFieldInitializer`): the LHS name is
                 // a field name, so a like-named local must take no write —
@@ -2241,7 +2247,9 @@ impl Interp<'_> {
                     // `a.m(1, 2)` on a `Never a` reports its first dead
                     // node at the argument list — `Ev::ArgumentsBegin`
                     // anchors at `(` below.
-                } else if !self.exit_at.is_some_and(|at| at >= member.range.offset) {
+                } else if !self.stmt_began_dead
+                    && !self.exit_at.is_some_and(|at| at >= member.range.offset)
+                {
                     // A `?.` whose access path was dead at open (a
                     // null-or-equivalent receiver) anchors at the member
                     // name — the official polls the property/method name
@@ -3132,10 +3140,30 @@ impl Interp<'_> {
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
-            Ev::Spread | Ev::NullAwareElement => {
+            Ev::Spread { token } => {
+                // The spread element's own first token (`...`/`...?`): an
+                // element reached dead (a dead collection-`for` body, a dead
+                // statement) makes the spread element the official's first
+                // dead node, so the row anchors at the operator —
+                // `{for (; false;) ...dyn}` reports `...dyn};`
+                // (dead_code_verifier.dart:183-205). The event is POST-order
+                // (the parser fires it after the operand), so the poll is
+                // gated on a context that BEGAN dead: an operand that kills
+                // the flow itself (`for (;; 1, 2) ...[throw '']`) leaves the
+                // deadness to the header's own row (official visit order
+                // reaches the updaters before the body), and a live element
+                // makes the poll a no-op.
+                if self.stmt_began_dead {
+                    self.dead_code(*token);
+                }
                 // The operand's value is consumed; the element leaves its
                 // own (trivial) value — every literal element nets exactly
                 // one.
+                self.flush_null_shorts_above(self.consumer_base(1));
+                self.exprs.pop();
+                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+            }
+            Ev::NullAwareElement => {
                 self.flush_null_shorts_above(self.consumer_base(1));
                 self.exprs.pop();
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
