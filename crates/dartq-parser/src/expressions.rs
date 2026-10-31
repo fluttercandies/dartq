@@ -473,17 +473,28 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // recovery attempt (:6644-6659). An accepted written-out operator
         // re-binds `left` and re-resolves the follower's level in this
         // frame — the official walk continues its own loop (:6901-6920).
-        // A re-entry here would deepen the native stack once per link of
-        // an unbounded `a xor 1 xor 1 ...` chain, invisible to the depth
-        // guard (the entry runs outside `enter_depth`).
+        // The attempt is gated at this frame's floor: a candidate below it
+        // can never be consumed by a loop running at `precedence` (the
+        // official spec reparse runs at that floor and makes no progress —
+        // `token == afterExpression` rejects), so this frame returns and
+        // the chain stays with the frame whose floor admits it. A flat
+        // `a xor 1 xor 1 ...` chain therefore folds link by link in ONE
+        // frame's loop; without the gate each nested right-operand frame
+        // absorbed the next link and the chain deepened the native stack
+        // once per link, overflowing 8MB before the depth fuse (500) could
+        // trip.
         let mut level = loop {
             if let Some(l) = self.precedence_of(self.peek_kind())
                 && l >= precedence
             {
                 break l;
             }
-            // Entry-floor recovery attempt (currentLevel = -1).
-            if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
+            // Entry-floor recovery attempt (official `currentLevel = -1`:
+            // no candidate-level ceiling; the floor gate reproduces the
+            // spec reparse's no-progress rejection).
+            if let Some((new_left, _)) =
+                self.attempt_written_out_operator(precedence, None, allow_cascades)
+            {
                 left = new_left;
                 lhs_ends_index = false;
                 is_dot_shorthand = false;
@@ -826,12 +837,19 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             }
             // Loop bookkeeping (:6874-6920). A `None` precedence is an
             // identifier position — exactly where the official recovery
-            // flag fires — so the written-out attempt runs there.
+            // flag fires — so the written-out attempt runs there, gated at
+            // the frame floor and the walk's current level (official
+            // `newLevel > currentLevel → continue`): a link this level
+            // cannot accept stays for a frame that can, and every accepted
+            // link folds right here, one loop iteration each — the right
+            // operand's frame sheds any following link back to this loop
+            // instead of absorbing it, so the native stack stays flat
+            // across unbounded chains.
             let next_level: u8 = match self.precedence_of(self.peek_kind()) {
                 Some(l) => l,
                 None => {
-                    if let Some((new_left, _replacement_level)) =
-                        self.attempt_written_out_operator(-1, allow_cascades)
+                    if let Some((new_left, _replacement_level)) = self
+                        .attempt_written_out_operator(precedence, Some(level), allow_cascades)
                     {
                         left = new_left;
                         lhs_ends_index = false;
@@ -860,15 +878,23 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// `_attemptPrecedenceLevelRecovery` (:6901) reduced to its pinned-live
     /// form: an identifier named `xor`/`and`/`or`/`shl`/`shr` at a binary
-    /// position. Candidates are tried in official order (a candidate above
-    /// the current level is unreachable and skipped); the first that
-    /// speculatively parses cleanly to a good follower is reported
+    /// position. Candidates are tried in official order, gated by the two
+    /// levels the official applies through its candidate filter and its
+    /// spec reparse: a candidate below `floor` (the frame's precedence)
+    /// can never be consumed by the loop at that floor — the official spec
+    /// reparse starts at `precedence` and stops before the rewritten
+    /// operator, so `token == afterExpression` rejects the candidate — and
+    /// a candidate above `ceiling` (the walk's current level, `Some` only
+    /// mid-walk) is skipped exactly like the official
+    /// `newLevel > currentLevel → continue`. The first surviving candidate
+    /// that speculatively parses cleanly to a good follower is reported
     /// (`binary_operator_written_out`) and consumed as the operator.
     /// Returns `(right operand, replacement precedence)` for the caller's
     /// `left`/`level` when a candidate was accepted.
     fn attempt_written_out_operator(
         &mut self,
-        current_level: i16,
+        floor: u8,
+        ceiling: Option<u8>,
         allow_cascades: bool,
     ) -> Option<(TokenSpan, u8)> {
         // Official `_currentlyRecovering` gate: no nested attempts while one
@@ -884,7 +910,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let operator_lexeme = self.cursor.lexeme(operator_span.id);
         for &replacement in candidates {
             let replacement_level = kind_precedence(replacement).expect("candidate operator");
-            if current_level >= 0 && i16::from(replacement_level) > current_level {
+            if replacement_level < floor || ceiling.is_some_and(|c| replacement_level > c) {
                 continue;
             }
             // Speculative: identifier consumed as the operator, right operand
