@@ -5964,3 +5964,47 @@ mod ticket_3129_tests;
 /// `FutureOr<Object?>` reach the NULLABLE twin).
 #[cfg(test)]
 mod ticket_3132_tests;
+
+/// The #3139 pins — `unnecessary_final`'s field/super-formal gate over
+/// the parser's full `fieldFormalParameter` shape: the optional type
+/// annotation between the keyword and the receiver (`final int this.x`,
+/// `final Map<String, int> this.m`, `final (int, String) this.r`) reports
+/// at the `final` keyword, while a call inside a statement region
+/// (`void f() { C(final this.x); }`) declares no formal at all.
+#[cfg(test)]
+mod ticket_3139_tests;
+
+/// The #3140 pins: `invalid_override`'s covariance faces (the propagated
+/// `covariant` mark, the `Object?` subtype rewrite, and the
+/// `CovariantParametersVerifier`'s transitive-interface relatedness) plus the
+/// subtype matrix's top-type arms (`void`/`dynamic`).
+#[cfg(test)]
+mod ticket_3140_tests;
+
+/// The #3143 pins — `undefined_method`'s display and receiver-class faces:
+/// the invocation face names the receiver's bare element display (never
+/// the written type arguments or nullability — `C<String>` renders `C`,
+/// `B?` renders `B`) while the getter/setter faces keep the full
+/// `getDisplayString` render, the shape receivers name `Function` /
+/// `<unknown>`, and the `new` selector splits by intent (`<unknown>` for
+/// the invocation, `InvalidType` for the read) — the oracle's
+/// `receiverClassName` asymmetry (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/resolver/method_invocation_resolver.dart).
+#[cfg(test)]
+mod ticket_3143_tests;
+
+/// The #3142 pins — `unnecessary_type_check`'s residual faces after
+/// #3129: the `core.`/`p.` head canonicalization, the generic
+/// member-tear-off operand, the raw generic alias's bounds fold, and the
+/// required-vs-optional positional arity gate the canonical `FnShapeId`
+/// merges away.
+#[cfg(test)]
+mod ticket_3142_tests;
+
+/// The #3144 pins: the `scopes_bodies.rs` staging faces —
+/// `duplicate_definition`'s statement-list/for-head scope walk,
+/// `unused_local_variable`'s tracked-local verdict (pattern groups,
+/// wildcard exemption, discarded reads), and `return_of_invalid_type`'s
+/// staged return verdict across the sync/async/arrow-body shapes.
+#[cfg(test)]
+mod ticket_3144_tests;
