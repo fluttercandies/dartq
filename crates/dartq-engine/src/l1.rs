@@ -1698,7 +1698,7 @@ fn directive_doc_imports(
 /// name form, the first URI-form `part of`'s; doc comments on every other
 /// declaration are never validated (analyzer corpus: ~24 such
 /// occurrences, all correctly silent).
-fn extract_directives(
+pub(crate) fn extract_directives(
     text: &str,
     tokens: &TokenTable,
     strings: &StringTable,
@@ -2036,20 +2036,47 @@ fn skip_annotation(tokens: &TokenTable, mut i: usize) -> usize {
 
 /// A dotted name (`a.b.c`) of identifier-ish tokens, consumed to the `;`.
 /// Returns the joined spelling and the index just past the `;`.
+///
+/// The grammar is `qualified: identifier qualifiedRest*` with
+/// `qualifiedRest: '.' identifier` (parser_impl.dart `parseQualified`
+/// :2525-2535 / `parseQualifiedRest` :2558-2566), so a segment continues
+/// the name only across a `.`. Both callers — `parseLibraryName`
+/// (:907-925) and `parsePartOf` (:1315-1334) — then end on
+/// `ensureSemicolon` (:5048-5063): the qualified name stops at the first
+/// token that cannot continue it, the synthetic `;` is spliced in front of
+/// the follower, and the top-level loop re-enters on it. A name token in the
+/// post-name position is therefore never part of this name —
+/// `library lib1 library lib2` is two `library` directives, and the second
+/// head must be handed back untouched so the caller's dispatch walks it
+/// instead of the first name swallowing it. A directive head in name
+/// position (the head, or right after a `.`) is still a legal name:
+/// `library` is a built-in identifier, so `library library;` names the
+/// library `library` (`parseQualified`'s `ensureIdentifier` takes built-in
+/// identifiers silently — token.dart:794 `isIdentifier`).
 fn walk_dotted_name(text: &str, tokens: &TokenTable, mut i: usize) -> (Option<Box<str>>, usize) {
     let mut name = String::new();
+    let mut in_name_position = true;
     loop {
         match kind_at(tokens, i) {
             Some(TokenKind::Semicolon) | None => return (Some(name.into_boxed_str()), i + 1),
-            Some(kind) if is_name_token(kind) => {
+            Some(kind) if in_name_position && is_name_token(kind) => {
                 if !name.is_empty() {
                     name.push('.');
                 }
                 name.push_str(tokens.lexeme(text, i));
+                in_name_position = false;
                 i += 1;
             }
-            Some(TokenKind::Period) => i += 1,
-            _ => return (Some(name.into_boxed_str()), i + 1),
+            Some(TokenKind::Period) => {
+                in_name_position = true;
+                i += 1;
+            }
+            // The qualified name ends here: hand the index back untouched so
+            // the caller's dispatch re-enters on the follower (the
+            // `ensureSemicolon` boundary above). Consuming it would drop a
+            // following `library`/`part`/`import`/`export` head and every
+            // fact behind that head.
+            _ => return (Some(name.into_boxed_str()), i),
         }
     }
 }
