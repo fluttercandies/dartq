@@ -2775,3 +2775,202 @@ fn anonymous_function_call_multiline_own_args_reports() {
         utf16_at(&f, tok(&f.source, &f.tokens, ")", 3))
     );
 }
+
+
+/// The whole upstream corpus (`SortConstructorsFirstTest`, 18 cases, plus
+/// the four `messages.yaml` doc examples) pinned against the oracle rows
+/// of `conformance/expected.tsv`: each entry is the case source verbatim
+/// (the materialized file carries a leading blank line, so the upstream
+/// `5:3` rows land as written) and the oracle's `(line, column, length)`
+/// for every `sort_constructors_first` row. Every mismatch is collected
+/// before the single panic so one run shows the whole deviation set.
+#[test]
+fn sort_constructors_first_oracle_corpus_pins() {
+    let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+        (
+            "test_constructorBeforeMethod",
+            "\nabstract class A {\n  const A();\n  void f();\n}\n",
+            &[],
+        ),
+        // A `PrimaryConstructorBody` neither arms the flag nor reports
+        // before one (`this;` is not a `ConstructorDeclaration`).
+        (
+            "test_constructor_afterPrimaryConstructorBody",
+            "\nclass C() {\n  this;\n  C.named() : this();\n}\n",
+            &[],
+        ),
+        (
+            "test_enum_afterPrimaryConstructorBody",
+            "\nenum E(int x) {\n  v(1);\n  this;\n  const E.named() : this(2);\n}\n",
+            &[],
+        ),
+        (
+            "test_enum_primaryConstructorBody_afterMethod",
+            "\nenum E(int x) {\n  v(1);\n  void f() {}\n  this;\n}\n",
+            &[(5, 3, 4)],
+        ),
+        (
+            "test_extensionType_primaryConstructorBody_afterMethod",
+            "\nextension type E(int x) {\n  void f() {}\n  this;\n}\n",
+            &[(4, 3, 4)],
+        ),
+        (
+            "test_fieldBeforeConstructor",
+            "\nabstract class A {\n  final a = 0;\n  A();\n}\n",
+            &[(4, 3, 1)],
+        ),
+        (
+            "test_fieldBeforeConstructor_newHead_named",
+            "\nabstract class A {\n  final a = 0;\n  new named();\n}\n",
+            &[(4, 3, 9)],
+        ),
+        (
+            "test_fieldBeforeConstructor_newHead_unnamed",
+            "\nabstract class A {\n  final a = 0;\n  new();\n}\n",
+            &[(4, 3, 3)],
+        ),
+        (
+            "test_methodBeforeConstructor",
+            "\nabstract class A {\n  void f();\n  const A();\n}\n",
+            &[(4, 9, 1)],
+        ),
+        (
+            "test_methodBeforeConstructor_extensionType",
+            "\nextension type E(Object o) {\n  void f() {}\n  E.e(this.o);\n}\n",
+            &[(4, 3, 3)],
+        ),
+        (
+            "test_methodBeforeConstructors",
+            "\nabstract class A {\n  void f();\n  A();\n  A.named();\n}\n",
+            &[(4, 3, 1), (5, 3, 7)],
+        ),
+        (
+            "test_method_betweenConstructors_withPrimaryConstructorBody",
+            "\nclass C() {\n  this;\n  void f() {}\n  C.named() : this();\n}\n",
+            &[(5, 3, 7)],
+        ),
+        (
+            "test_ok",
+            "\nenum A {\n  a,b,c;\n  const A();\n  int f() => 0;\n}\n",
+            &[],
+        ),
+        (
+            "test_primaryConstructorBody_afterMethod",
+            "\nclass C() {\n  void f() {}\n  this;\n}\n",
+            &[(4, 3, 4)],
+        ),
+        (
+            "test_primaryConstructorBody_amongConstructors",
+            "\nclass C() {\n  C.named() : this();\n  this;\n}\n",
+            &[],
+        ),
+        (
+            "test_primaryConstructorBody_beforeMethod",
+            "\nclass C() {\n  this;\n  void f() {}\n}\n",
+            &[],
+        ),
+        (
+            "test_staticFieldBeforeConstructor",
+            "\nabstract class A {\n  static final a = 0;\n  A();\n}\n",
+            &[(4, 3, 1)],
+        ),
+        (
+            "test_unsorted",
+            "\nenum A {\n  a,b,c;\n  int f() => 0;\n  const A();\n}\n",
+            &[(5, 9, 1)],
+        ),
+    ];
+    // The `messages.yaml` doc examples (the class-body snippets; the
+    // doc_bad_1/doc_good_1 oracle faces carry additional non-lint rows the
+    // pin does not cover).
+    let doc_cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+        ("doc_bad_0", "class C {\n  void m() {}\n\n  C();\n}\n", &[(4, 3, 1)]),
+        (
+            "doc_bad_1",
+            "abstract class Visitor {\n  double value;\n  visitSomething(Something s);\n  Visitor();\n}\n",
+            &[(4, 3, 7)],
+        ),
+        ("doc_good_0", "class C {\n  C();\n\n  void m() {}\n}\n", &[]),
+        (
+            "doc_good_1",
+            "abstract class Animation<T> {\n  const Animation(this.value);\n  double value;\n  void addListener(VoidCallback listener);\n}\n",
+            &[],
+        ),
+    ];
+
+    /// The UTF-16 offset of an oracle `(line, column)` pair (the corpus
+    /// sources are ASCII, so a byte walk matches).
+    fn offset(source: &str, line: u32, column: u32) -> u32 {
+        let line_start: usize = source
+            .split_inclusive('\n')
+            .take(line as usize - 1)
+            .map(str::len)
+            .sum();
+        (line_start + column as usize - 1) as u32
+    }
+    /// The `(line, column)` pair of a UTF-16 offset — the oracle's own
+    /// spelling, so a mismatch reads without arithmetic.
+    fn position(source: &str, offset: u32) -> (u32, u32) {
+        let offset = offset as usize;
+        let mut line = 1;
+        let mut line_start = 0;
+        for (index, ch) in source.char_indices() {
+            if index >= offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                line_start = index + 1;
+            }
+        }
+        (line, (offset - line_start) as u32 + 1)
+    }
+
+    let mut mismatches = Vec::new();
+    let expected_of = |oracle: &[(u32, u32, u32)], source: &str| -> Vec<(u32, u32)> {
+        oracle
+            .iter()
+            .map(|&(line, column, length)| {
+                let start = offset(source, line, column);
+                (start, start + length)
+            })
+            .collect()
+    };
+    let record = |mismatches: &mut Vec<String>, case: &str, source: &str, got: &[(u32, u32)]| {
+        let want = |ranges: &[(u32, u32)]| -> Vec<(u32, u32, u32)> {
+            ranges
+                .iter()
+                .map(|&(start, end)| {
+                    let (line, column) = position(source, start);
+                    (line, column, end - start)
+                })
+                .collect()
+        };
+        mismatches.push(format!(
+            "{case}: got {:?} {:?}",
+            want(got),
+            got.iter()
+                .map(|&(start, end)| &source[start as usize..end as usize])
+                .collect::<Vec<_>>()
+        ));
+    };
+    for (case, source, oracle) in cases.iter().chain(doc_cases.iter()) {
+        let f = Fixture::parse(source);
+        let mut lints = f.run(&one_rule("sort_constructors_first"));
+        lints.sort_by_key(|lint| lint.range.start);
+        let got: Vec<(u32, u32)> = lints
+            .iter()
+            .map(|lint| (lint.range.start, lint.range.end))
+            .collect();
+        if got != expected_of(oracle, source) {
+            record(&mut mismatches, case, source, &got);
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} cases deviate:\n{}",
+        mismatches.len(),
+        cases.len() + doc_cases.len(),
+        mismatches.join("\n")
+    );
+}
