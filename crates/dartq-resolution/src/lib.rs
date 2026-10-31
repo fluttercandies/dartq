@@ -29,7 +29,8 @@
 //!   the frozen graph: `ambiguous_export`'s cross-directive seen-map,
 //!   `duplicate_export`'s sorted adjacent-pair walk, the
 //!   `export_internal_library` and `invalid_export_of_internal_element`
-//!   gates, and the `deferred_import_of_extension` namespace probe.
+//!   gates, the `deferred_import_of_extension` namespace probe, and the
+//!   `shared_deferred_prefix` per-prefix import grouping.
 //! - [`cycles`] — the visited-set-bounded graph walks behind the element
 //!   recursion codes: self-reachability (`recursive_constructor_redirect`),
 //!   the on-stack dependency slice (`top_level_cycle`,

@@ -2,7 +2,7 @@
 //! pure decisions over the frozen [`LibraryGraph`] for the export-family
 //! red codes, pinned to the analyzer oracle (dart 3.13.7).
 //!
-//! Four faces live here as inherent [`LibraryGraph`] methods (the crate
+//! Six faces live here as inherent [`LibraryGraph`] methods (the crate
 //! owns the type; the module split keeps `library_graph.rs` at its graph
 //! core), each mirroring one upstream verifier walk:
 //!
@@ -46,6 +46,14 @@
 //!   (deferred flag **and** a prefix — the oracle probes
 //!   `prefix?.isDeferred`) whose combinator-filtered namespace contains
 //!   any extension element.
+//! - [`LibraryGraph::shared_deferred_prefix_imports`] —
+//!   `shared_deferred_prefix` (`error_verifier.dart:2371-2394`
+//!   `_checkDeferredPrefixCollision`, reached from `:4411-4436`
+//!   `_checkForDeferredPrefixCollisions`): imports grouped by their `as`
+//!   prefix; a group of more than one import reports each deferred member
+//!   at its `deferred` keyword. Part files carry no `import` directives,
+//!   so a library's imports are exactly one compilation unit's — the
+//!   per-library grouping here equals the oracle's per-unit grouping.
 //!
 //! The element-graph cycle codes (`recursive_interface_inheritance`,
 //! `top_level_cycle`, `recursive_compile_time_constant`,
@@ -166,6 +174,62 @@ impl LibraryGraph {
                     Entry::Vacant(slot) => {
                         slot.insert(file);
                     }
+                }
+            }
+        }
+        findings
+    }
+
+    /// The `shared_deferred_prefix` import-directive indices for `lib` — the
+    /// indices (into [`Self::import_edges`]) of every deferred import that
+    /// shares its `as` prefix with at least one other import of the same
+    /// library.
+    ///
+    /// Mirrors `error_verifier.dart:2371-2394` `_checkDeferredPrefixCollision`
+    /// (reached from `:4411-4436` `_checkForDeferredPrefixCollisions`) per
+    /// compilation unit: imports are grouped by their resolved prefix
+    /// element — a library-scoped identity, so the interned `prefix` name is
+    /// the group key — and a group of more than one import reports
+    /// `shared_deferred_prefix` at the `deferred` keyword of **each**
+    /// deferred member, in group-first-occurrence then directive order. An
+    /// import without a prefix joins no group (the oracle's
+    /// `directive.prefix != null` gate); a lone import under its prefix is
+    /// silent (`count > 1` gate). A library's `import` directives can only
+    /// live in its defining unit — part files carry just `part of` — so the
+    /// per-library grouping here equals the oracle's per-unit grouping.
+    ///
+    /// The graph edge records deferredness as a flag but not the keyword's
+    /// span; the caller anchors each finding at the directive's `deferred`
+    /// keyword token (`diag.sharedDeferredPrefix.at(deferredToken)`),
+    /// mapping the returned edge index back to its flattened import
+    /// directive exactly as the export faces map their ordinals.
+    #[must_use]
+    pub fn shared_deferred_prefix_imports(&self, lib: LibraryId) -> Vec<usize> {
+        // Group import indices by prefix, preserving first-occurrence group
+        // order (`prefixToDirectivesMap` is an insertion-ordered map).
+        let edges = self.import_edges(lib);
+        let mut group_of: FxHashMap<StringId, usize> = FxHashMap::default();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (index, edge) in edges.iter().enumerate() {
+            let Some(prefix) = edge.prefix else {
+                continue;
+            };
+            match group_of.entry(prefix) {
+                Entry::Occupied(occupied) => groups[*occupied.get()].push(index),
+                Entry::Vacant(slot) => {
+                    slot.insert(groups.len());
+                    groups.push(vec![index]);
+                }
+            }
+        }
+        let mut findings = Vec::new();
+        for members in groups {
+            if members.len() <= 1 {
+                continue;
+            }
+            for index in members {
+                if edges[index].deferred {
+                    findings.push(index);
                 }
             }
         }
@@ -419,6 +483,27 @@ mod tests {
                     target,
                     prefix: Some(prefix),
                     deferred: true,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+
+        /// One import edge with an explicit prefix spelling and deferred flag
+        /// (`None` prefix = a bare import).
+        fn import(
+            &mut self,
+            lib: LibraryId,
+            target: Option<LibraryId>,
+            prefix: Option<&str>,
+            deferred: bool,
+        ) {
+            let prefix = prefix.map(|p| self.name(p));
+            self.builder.import(
+                lib,
+                ImportEdge {
+                    target,
+                    prefix,
+                    deferred,
                     combinators: Combinators::unfiltered(),
                 },
             );
@@ -873,5 +958,96 @@ mod tests {
             combinators: Combinators::unfiltered(),
         };
         assert!(!graph.deferred_import_exports_extension(&edge));
+    }
+
+    // ---- shared_deferred_prefix (ticket #2389 double-zero pins) ----
+
+    /// An eager and a deferred import sharing one prefix report the deferred
+    /// one at its index — the `_checkForDeferredPrefixCollisions` gate.
+    #[test]
+    fn ticket_2389_shared_deferred_prefix_reports_the_deferred_member() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:x/a.dart");
+        let b = rig.builder.intern("package:x/b.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        rig.import(app, Some(a), Some("p"), false);
+        rig.import(app, Some(b), Some("p"), true);
+        let graph = rig.builder.finish();
+
+        assert_eq!(graph.shared_deferred_prefix_imports(app), vec![1]);
+    }
+
+    /// A lone import under its prefix is silent (`count > 1` gate), deferred
+    /// or not.
+    #[test]
+    fn ticket_2389_shared_deferred_prefix_single_import_is_silent() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:x/a.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        rig.import(app, Some(a), Some("p"), true);
+        let graph = rig.builder.finish();
+
+        assert!(graph.shared_deferred_prefix_imports(app).is_empty());
+    }
+
+    /// Two eager imports under one prefix are silent — the collision is about
+    /// a *deferred* import sharing its prefix, not a plain duplicate.
+    #[test]
+    fn ticket_2389_shared_deferred_prefix_two_eager_imports_are_silent() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:x/a.dart");
+        let b = rig.builder.intern("package:x/b.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        rig.import(app, Some(a), Some("p"), false);
+        rig.import(app, Some(b), Some("p"), false);
+        let graph = rig.builder.finish();
+
+        assert!(graph.shared_deferred_prefix_imports(app).is_empty());
+    }
+
+    /// Deferred imports under distinct prefixes never collide.
+    #[test]
+    fn ticket_2389_shared_deferred_prefix_distinct_prefixes_are_silent() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:x/a.dart");
+        let b = rig.builder.intern("package:x/b.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        rig.import(app, Some(a), Some("p"), true);
+        rig.import(app, Some(b), Some("q"), true);
+        let graph = rig.builder.finish();
+
+        assert!(graph.shared_deferred_prefix_imports(app).is_empty());
+    }
+
+    /// Every deferred member of a colliding group reports, in source order.
+    #[test]
+    fn ticket_2389_shared_deferred_prefix_multiple_deferred_in_group_all_report() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:x/a.dart");
+        let b = rig.builder.intern("package:x/b.dart");
+        let c = rig.builder.intern("package:x/c.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        rig.import(app, Some(a), Some("p"), true);
+        rig.import(app, Some(b), Some("p"), false);
+        rig.import(app, Some(c), Some("p"), true);
+        let graph = rig.builder.finish();
+
+        assert_eq!(graph.shared_deferred_prefix_imports(app), vec![0, 2]);
+    }
+
+    /// A prefixless deferred import joins no group (the oracle gates on
+    /// `directive.prefix != null`), so a sibling `as p` import stays a lone
+    /// member and is silent.
+    #[test]
+    fn ticket_2389_shared_deferred_prefix_unprefixed_import_joins_no_group() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:x/a.dart");
+        let b = rig.builder.intern("package:x/b.dart");
+        let app = rig.builder.intern("package:x/app.dart");
+        rig.import(app, Some(a), None, true);
+        rig.import(app, Some(b), Some("p"), false);
+        let graph = rig.builder.finish();
+
+        assert!(graph.shared_deferred_prefix_imports(app).is_empty());
     }
 }
