@@ -3321,12 +3321,25 @@ impl<'a> Engine<'a> {
     /// target, never a foreign callee's solved formal or a typedef's
     /// bound slot.
     fn return_target_is_type_param(&self, to_name: StringId) -> bool {
-        self.type_params.contains(&to_name)
-            || self.pending_type_params.contains(&to_name)
+        self.declared_head_is_type_param(to_name)
+    }
+
+    /// The declared-head param-ness predicate shared by the declared-return
+    /// and write-target faces: the live sets at pass 1, the file's decl
+    /// table once the frames are popped (the teardown re-decision). The
+    /// decl-table leg is safe on both faces that consult it — a declared
+    /// return's `to` is provably the executable's own return type, and an
+    /// assignment's `to` is the slot's own `writeType` — so a
+    /// `MicroKind::TypeParam` hit is a real parameter of the enclosing
+    /// declaration, never a foreign callee's solved formal or a typedef's
+    /// bound slot.
+    fn declared_head_is_type_param(&self, name: StringId) -> bool {
+        self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
             || self
                 .index
                 .get(self.file)
-                .and_then(|f| f.decl(to_name))
+                .and_then(|f| f.decl(name))
                 .is_some_and(|decl| decl.kind == MicroKind::TypeParam)
     }
 
@@ -3780,6 +3793,39 @@ impl<'a> Engine<'a> {
     /// decided by the matrix's later literal-refinement arms, which a
     /// negative evaluated before them would preempt.
     pub(crate) fn assignment_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        // A type-parameter write target (the slot's `writeType` is `T`/`T?`
+        // itself — upstream decides against that parameter type,
+        // assignment_expression_resolver.dart `_checkForInvalidAssignment`):
+        // subtype.dart's Left Variable arm refuses every interface, record,
+        // or function source (`static5_test_06`'s `final U x = const A()`,
+        // `test_typeParameter`'s write over `T?`) — no interface subtypes a
+        // parameter, whatever its bound (probed 3.13.1: `T extends num` takes
+        // `t = 3`, `T extends A` takes `t = a` and even the bound's own
+        // subtype `t = b` — the bound rescues nothing). A `Null` source meets
+        // only the nullable conjunct (`Null <: T?` holds, `Null <: T` is the
+        // report). A parameter SOURCE re-enters [`Self::assignable`], whose
+        // same-head matrix decides the reflexive and nullable spellings
+        // (`t = t` silent, `T?` into `T` reporting); a bound-chained
+        // parameter source (`S extends T`, probed silent) is not separable
+        // here — the face's frames are popped and the bound is not
+        // name-addressable — so it rides the rejection with the interface
+        // sources (the over-report residual). Everything else (`dynamic`,
+        // `Never`, `Unknown`, `void`) keeps the generic matrix. The
+        // decl-table predicate decides param-ness in BOTH passes — the
+        // staged row and the teardown re-decision agree, which the live
+        // frame sets alone cannot (empty once the frames pop).
+        if let Ty::Named { name: to_name, nullable: to_nullable, .. } = to
+            && self.declared_head_is_type_param(to_name)
+        {
+            return match from {
+                Ty::Null => Some(to_nullable),
+                Ty::Named { name: from_name, .. } if from_name == to_name => {
+                    self.assignable(from, to, false)
+                }
+                Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
+                _ => self.assignable(from, to, false),
+            };
+        }
         let verdict = self.assignable(from, to, from_literal);
         if verdict == Some(false) || from_literal {
             return verdict;

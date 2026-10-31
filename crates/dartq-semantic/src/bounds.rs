@@ -3063,7 +3063,14 @@ impl<'a> Snapshot<'a> {
     }
 
     fn system(&self) -> TypeSystem<'_> {
-        TypeSystem::new(&self.table, &self.hierarchy)
+        // The declared bounds arm the subtype walks: the left-type-variable
+        // rule (`X0 <: T1` via `bound(X0) <: T1`, subtype.dart:490-500)
+        // decides every bounded-parameter question the verifier poses — a
+        // self-referential bound's own site (`class A<X extends A<A<X>>>`
+        // annotation `A<A<X>>`) asks `A<X> <: A<A<A<X>>>`, which holds
+        // through `bound(X) <: A<A<X>>` by reflexivity, and a bound-blind
+        // system answers it `false` (the oracle's silent row reported).
+        TypeSystem::new(&self.table, &self.hierarchy).with_param_facts(&self.facts)
     }
 
     fn ctx(&self) -> MapCtx<'_, '_> {

@@ -5713,6 +5713,12 @@ mod ticket_3040_tests;
 #[cfg(test)]
 mod ticket_3056_tests;
 
+/// The #3060 pins — the instantiate-to-bound verdict face over
+/// self-referential bounds (the fact-armed verifier subtype walks) and the
+/// type-parameter write target (`writeType`'s own `T`/`T?` decides).
+#[cfg(test)]
+mod ticket_3060_tests;
+
 /// The #3061 pins — the argument-type over-emission family: the await
 /// flatten on argument rows (`analyzeAwaitExpression`'s `flatten(e)`
 /// static type), the closure literal's downward return inference
