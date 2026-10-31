@@ -1749,6 +1749,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         };
         self.may_parse_function_expressions = saved;
         if kind == AssertKind::Statement {
+            // The statement `;` anchors on the assert's own last real token
+            // — the condition/message expression end (`x` in `assert(x }`) —
+            // via `ensureSemicolon`'s `findPreviousNonZeroLengthToken`
+            // walk-back (util.dart:39). A `)`-relocation's spill mark must
+            // not forward that anchor onto the follower: `x` is the
+            // construct's genuine tail, not spill junk, so the mark's
+            // "consumed nothing real" precondition does not hold here. Clear
+            // it for the statement `;`; the enclosing `in_spill_region` check
+            // re-derives the mark lazily when it still needs one.
+            self.spill_after = None;
             self.ensure_semicolon();
         }
         self.listener.end_assert(assert_kw, kind, open, comma, end);

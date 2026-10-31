@@ -2855,10 +2855,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             let name = self.cursor.look_kind(n);
             if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
                 // Official `expressionContinuation.ensureIdentifier`.
-                let at = self.look_span_at(n);
-                self.report(msg::missing_identifier(), at);
-                self.synthetic(TokenKind::Identifier, at.range.offset);
-                spliced_name_span = Some(at);
+                spliced_name_span = Some(self.look_span_at(n));
             }
             n += 1;
         }
@@ -2951,12 +2948,81 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // while a name spliced at a keyword head sits at the
                 // keyword's own offset so its follower is that keyword
                 // (`super. var f;` → `var`, never `f`).
-                let at = spliced_name_span.unwrap_or_else(|| self.look_span_at(n));
-                self.report(msg::expected_after_but_got("("), at);
+                //
+                // The cursor splices synthetics at the cursor only (never
+                // mid-stream), so a `()` queued here would surface BEFORE
+                // `super` and derail the expression re-read — both the
+                // real-name (`super. foo f;`) and the spliced-name
+                // (`super. var f;`) faces. Drive the `super.<name>()`
+                // initializer through the send machinery instead, like the
+                // `super?.` arm: `handleSuperExpression`, the `.`, the name
+                // (spliced for a keyword head, `missing_identifier` there),
+                // the `(`-expect + empty `()` at the name slot's follower,
+                // `parseSendFromIdentifier` for the argument send, then
+                // `handleDotAccess` + `endInitializer` — leaving `var f;` /
+                // `f;` real for the member loop's field reparse.
                 let type_param = self.compute_type_param_or_arg_at(n, false);
                 if matches!(type_param, TypeParamOrArg::None) {
+                    self.cursor.advance(); // `super`
+                    self.listener
+                        .handle_super_expression(head, IdentifierContext::Expression);
+                    let dot = self.peek_span();
+                    self.cursor.advance(); // `.`
+                    // The member-name head (`parseSendContinuation`): `new`
+                    // reads as the name; a real identifier through
+                    // `ensureIdentifier`; a declaration-keyword head (`var`)
+                    // splices a name at its own offset and stays for the
+                    // member reparse; a literal/bracket operand (`super. 3`)
+                    // is a `.`-name the official `doDotExpression` consumes
+                    // and replaces with a synthetic name — `parse_primary`
+                    // reads the operand, the `missing_identifier` row fires on
+                    // it (the selector-arm law, ast_builder.dart:918).
+                    let operand_kind = self.peek_kind();
+                    let operand = self.parse_primary(
+                        IdentifierContext::ExpressionContinuation,
+                    );
+                    if matches!(
+                        operand_kind,
+                        TokenKind::Int
+                            | TokenKind::Hexadecimal
+                            | TokenKind::Double
+                            | TokenKind::String
+                            | TokenKind::Hash
+                            | TokenKind::OpenParen
+                            | TokenKind::OpenSquare
+                            | TokenKind::Index
+                            | TokenKind::OpenCurly
+                            | TokenKind::Lt
+                    ) || matches!(
+                        operand_kind,
+                        TokenKind::Keyword(
+                            Keyword::True
+                                | Keyword::False
+                                | Keyword::Null
+                                | Keyword::This
+                                | Keyword::Super
+                                | Keyword::Const
+                                | Keyword::Void
+                                | Keyword::Assert
+                        )
+                    ) {
+                        self.report(msg::missing_identifier(), operand);
+                    }
+                    // `(`-expect on the name slot's follower — `peek` is the
+                    // keyword (`super. var f;` → `var`) for a spliced name, the
+                    // real follower (`super. foo f;` → `f`) for a real one, or
+                    // the construct delimiter (`super. 3;`/`super.;` → `;`)
+                    // after a consumed junk operand; all are the
+                    // `insertParens` anchor.
+                    let at = self.peek_span();
+                    self.report(msg::expected_after_but_got("("), at);
                     self.synthetic(TokenKind::OpenParen, at.range.offset);
                     self.synthetic(TokenKind::CloseParen, at.range.offset);
+                    self.listener.handle_dot_access(dot, operand, false);
+                    let end = self.parse_arguments_rest();
+                    self.listener.handle_send(operand, end);
+                    self.listener.end_initializer(end);
+                    return end;
                 } else {
                     // `super<...>` (e.g. `: super<int>();`): the official
                     // re-read parses the initializer as a plain expression —
@@ -3016,6 +3082,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // `invalidInitializer` at the initializer begin (issue_41597).
                 self.report(msg::invalid_initializer(), head);
             }
+        }
+        // A keyword/junk name head on a re-read arm (`super. var = ...`,
+        // `super. var ( ...)` — every arm except the `(`-expect drive above)
+        // still takes the official `expressionContinuation.ensureIdentifier`
+        // shape: `missing_identifier` plus a spliced name at the keyword's
+        // offset. The `(`-expect arm drives the name itself (it returns
+        // before reaching this tail).
+        if let Some(at) = spliced_name_span {
+            self.report(msg::missing_identifier(), at);
+            self.synthetic(TokenKind::Identifier, at.range.offset);
         }
         self.parse_initializer_expression_rest()
     }

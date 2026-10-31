@@ -1175,7 +1175,18 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 .handle_identifier(span, crate::listener::IdentifierContext::CatchParameter);
             return span;
         }
-        self.report(msg::catch_syntax(), peek.span);
+        // Anchor on the real follower when the head is a scanner-parked
+        // synthetic closer — the `(`-group's `endGroup` `)` sits inline at the
+        // follower's offset with zero width, while upstream reads the name
+        // slot as the real next token (`catch ( }`: `openParens.next` is `}`
+        // upstream, not the parked `)`; the `catchSyntax` row is the
+        // follower's full span, never the synthetic's zero-width one).
+        let report_at = if peek.is_synthetic && peek.span.range.length == 0 {
+            self.look_span_at(1)
+        } else {
+            peek.span
+        };
+        self.report(msg::catch_syntax(), report_at);
         if !self.looks_like_statement_start_at(0)
             && !matches!(
                 peek.kind,

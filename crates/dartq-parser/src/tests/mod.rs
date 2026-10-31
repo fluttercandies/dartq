@@ -78,5 +78,6 @@ mod ticket_3100;
 mod ticket_3134_lane_b;
 mod ticket_3156_tests;
 mod ticket_3166_tests;
+mod ticket_3169_tests;
 mod type_compute;
 mod types;
