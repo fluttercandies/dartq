@@ -244,6 +244,8 @@ impl<'a> Engine<'a> {
             fn_type_capture: Vec::new(),
             fn_nested_unclaimed: false,
             fn_type_stash: None,
+            fn_shape_required: FxHashMap::default(),
+            last_fn_seal: None,
             call_type_args: Vec::new(),
             call_args_capture: None,
             pending_send_ty: None,
@@ -2770,7 +2772,21 @@ impl<'a> Engine<'a> {
                 // every undecidable generic face keep the slot walk.
                 Ty::Function { .. } => match self.generic_signature_subtype(sub, sup) {
                     Some(answer) => answer,
-                    None => self.slot_subtype(sub, sup) == Some(true),
+                    // The required-positional map decides the arity gate the
+                    // pooled rebuild fabricates (`required = positional.len`):
+                    // rebuild both signatures with the written counts and run
+                    // `fn_sig_subtype`'s honest legs before the slot walk —
+                    // `x is List<int> Function([int])` over a
+                    // `List<int> Function(int)` operand answers `false`
+                    // (the source's required 1 exceeds the target's 0), not
+                    // the canonical-shape reflexivity the interned ids give.
+                    None => match (self.fn_face_sig(sub, None), self.fn_face_sig(sup, None)) {
+                        (Some(from), Some(to)) => match self.fn_sig_subtype(&from, &to) {
+                            Some(answer) => answer,
+                            None => self.slot_subtype(sub, sup) == Some(true),
+                        },
+                        _ => self.slot_subtype(sub, sup) == Some(true),
+                    },
                 },
                 _ => false,
             },
@@ -3633,7 +3649,7 @@ impl<'a> Engine<'a> {
         // out (the documented under-report posture).
         let (container, _) = self.container_context()?;
         match self.walk_members(container, operand.name) {
-            Walk::Found(entry) if entry.type_params == 0 => self.member_entry_tear_off_ty(&entry),
+            Walk::Found(entry) => self.member_entry_tear_off_ty(&entry),
             _ => None,
         }
     }
@@ -3643,10 +3659,16 @@ impl<'a> Engine<'a> {
     /// declared leaves, the container's own parameters included — the raw
     /// face a `this` read carries), a getter its return type, a field its
     /// declared type. Each piece folds through a type alias first (the
-    /// resolved-face convention [`Self::tear_off_fn_ty`] documents). The
-    /// shared conversion of the bare ([`Self::operand_tear_off_ty`]) and
-    /// qualified ([`Self::member_tear_off_ty`]) faces; `None` for every
-    /// other kind and for an untyped accessor.
+    /// resolved-face convention [`Self::tear_off_fn_ty`] documents). A
+    /// generic method carries its own `<T extends B>` group as the
+    /// signature's `type_params_named` — upstream's tear-off `staticType`
+    /// is the generic `FunctionType` (the `is` verdict's
+    /// `relateTypeParameters` then unifies it against a generic alias or
+    /// written signature by position); the unbounded face spells
+    /// [`Ty::Dynamic`]. The shared conversion of the bare
+    /// ([`Self::operand_tear_off_ty`]) and qualified
+    /// ([`Self::member_tear_off_ty`]) faces; `None` for every other kind
+    /// and for an untyped accessor.
     fn member_entry_tear_off_ty(&self, entry: &MemberEntry) -> Option<Ty> {
         match entry.kind {
             MemberKind::Method => {
@@ -3661,13 +3683,44 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|formal| self.fold_alias_ty(formal.ty))
                     .collect();
-                Some(self.boundary.intern_function_ty(
-                    0,
-                    self.fold_alias_ty(entry.return_ty),
-                    &positional,
-                    &named,
-                    false,
-                ))
+                let return_ty = self.fold_alias_ty(entry.return_ty);
+                if entry.type_params == 0 {
+                    return Some(self.boundary.intern_function_ty(
+                        0,
+                        return_ty,
+                        &positional,
+                        &named,
+                        false,
+                    ));
+                }
+                // The generic face: names and declared bounds ride the
+                // signature so `generic_signature_subtype` can unify the
+                // pair by position (`m5<B extends core.int>` against
+                // `F5<int>`'s `B extends core.int`). A nameless or
+                // boundless slot keeps the unbounded face.
+                let type_params: Vec<(StringId, Option<Ty>)> = entry
+                    .type_param_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let bound = entry
+                            .type_param_bounds
+                            .get(i)
+                            .copied()
+                            .filter(|b| *b != Ty::Dynamic && *b != Ty::UNKNOWN)
+                            .map(|b| self.fold_alias_ty(b));
+                        (*name, bound)
+                    })
+                    .collect();
+                if type_params.iter().any(|(name, _)| *name == StringId::NONE) {
+                    return None;
+                }
+                Some(
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .function_generic(&type_params, return_ty, &positional, &named, false),
+                )
             }
             MemberKind::Getter if entry.return_ty != Ty::Unknown => {
                 Some(self.fold_alias_ty(entry.return_ty))
@@ -3716,10 +3769,19 @@ impl<'a> Engine<'a> {
         let Walk::Found(entry) = found else {
             return None;
         };
-        if entry.type_params != 0 {
-            return None;
-        }
+        // A generic member keeps its own `<T>` group on the signature face
+        // (`member_entry_tear_off_ty` carries it as `type_params_named`);
+        // the receiver instantiation's `subst_params` re-interns a
+        // function face through the count-only `intern_function_ty`, which
+        // would strip those very names the generic-signature unification
+        // reads. A generic member therefore keeps its raw face — a formal
+        // leaf spelling the member's own `<A>` is a signature variable,
+        // never the receiver's `T`, so skipping the container substitution
+        // loses only the rare member that mentions both.
         let raw = self.member_entry_tear_off_ty(&entry)?;
+        if entry.type_params != 0 {
+            return Some(raw);
+        }
         match recv {
             Receiver::Typed { .. } => {
                 let out = self.instantiate_accessor_static(container, recv, raw);
@@ -4090,7 +4152,7 @@ impl<'a> Engine<'a> {
     /// `var_ty` keeps the pooled shape where the alias row dropped out.
     /// Only a function-RHS alias answers — a `Named`/`Record` RHS stays
     /// unfolded, the under-report direction.
-    fn alias_function_ty(&self, ty: Ty) -> Option<Ty> {
+    fn alias_function_ty(&mut self, ty: Ty) -> Option<Ty> {
         let Ty::Named {
             name,
             nullable,
@@ -4104,9 +4166,10 @@ impl<'a> Engine<'a> {
         // real pipeline it answers the bounded-typedef pair (`xn is Xn`).
         // A rig-side alias whose capture dropped (the nested
         // function-RHS's stray-root arm) falls to `var_ty` below.
-        if let Some((_, type_params, ret, positional, named, _)) =
+        if let Some((_, type_params, ret, positional, named, required_positional)) =
             self.bounds.alias_fn_shape(name)
         {
+            let required = required_positional;
             let ret = ret.map_or(Ty::Dynamic, |tree| self.tree_ty(tree));
             let positional: Vec<Ty> =
                 positional.iter().map(|tree| self.tree_ty(tree)).collect();
@@ -4120,13 +4183,27 @@ impl<'a> Engine<'a> {
                     (*name, bound.as_ref().map(|b| self.tree_ty(b)))
                 })
                 .collect();
-            return Some(self.boundary.args.borrow_mut().function_generic(
+            let ty = self.boundary.args.borrow_mut().function_generic(
                 &type_params,
                 ret,
                 &positional,
                 &named,
                 nullable,
-            ));
+            );
+            // The capture's honest required-positional count rides the
+            // shape: `typedef int f<T>([int? a])` spells all-optional
+            // formals, which the pooled `Function(...)` id merges with the
+            // all-required `Function(int?, ...)`. Without this record the
+            // arity gate reads `required = positional.len` and answers the
+            // wrong side of `_isFunctionSubtypeOf`'s rule.
+            if let (Some(required), Ty::Function { shape, .. }) = (required, ty)
+                && shape != crate::model::FnShapeId::EMPTY
+            {
+                self.fn_shape_required
+                    .entry(shape)
+                    .or_insert(u16::try_from(required).unwrap_or(u16::MAX));
+            }
+            return Some(ty);
         }
         // The armed-annotation face: `var_ty` already interned the resolved
         // `Ty::Function` at capture (a nested function-RHS typedef drops
@@ -4169,6 +4246,120 @@ impl<'a> Engine<'a> {
             return Some(answer);
         }
         self.slot_subtype(from, to)
+    }
+
+    /// Rebuilds a non-generic `Ty::Function`'s [`FnVarSig`] with the honest
+    /// required-positional count the written signature carried — the
+    /// `fn_shape_required` side table the listener seals at each
+    /// `end_function_type`. The canonical `FnShapeId` merges required and
+    /// optional positionals (`Function(int)` and `Function([int])` are one
+    /// id), so the arity gate [`Self::fn_sig_subtype`] runs upstream
+    /// (`_isFunctionSubtypeOf`'s `required` rule, subtype.dart:107-113)
+    /// cannot read the split off the pool. A shape with no recorded
+    /// spelling — a declaration signature or an alias RHS folded through
+    /// the pool — keeps the all-required face the count-only rebuild
+    /// [`crate::diagnose::types`] `canonical_dotted_ty` plus the
+    /// required-count propagation the re-intern loses: the rewrite builds
+    /// a new `FnShapeId` when a `core.`/`p.` leaf changed, and that id
+    /// answers `positional.len()` (the all-required face) in
+    /// [`Self::fn_face_sig`] — a `core.List<int> Function(int, [int])`
+    /// face would read required 2 where the written signature said 1. The
+    /// written count is a positional-LAYOUT fact the leaf rewrite
+    /// preserves, so it copies across onto the new shape — the
+    /// `last_fn_seal` pair first (the written site's own answer), then the
+    /// map's record for the old id.
+    fn canonical_function_ty(&mut self, ty: Ty) -> Ty {
+        let before = match ty {
+            Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => {
+                Some(shape)
+            }
+            _ => None,
+        };
+        let rewritten = self.boundary.canonical_dotted_ty(ty);
+        let (
+            Some(before),
+            Ty::Function {
+                shape: after, ..
+            },
+        ) = (before, rewritten)
+        else {
+            return rewritten;
+        };
+        if after != before
+            && let Some(required) = self
+                .last_fn_seal
+                .and_then(|(sealed, count)| (sealed == before).then_some(count))
+                .or_else(|| self.fn_shape_required.get(&before).copied())
+        {
+            self.fn_shape_required.entry(after).or_insert(required);
+        }
+        rewritten
+    }
+
+    /// already produced. `None` for a non-function or nullable face.
+    /// `required` overrides the map answer for a caller that knows the
+    /// face's own written site (`check_type_check`'s `last_fn_seal` match)
+    /// — the per-site count the shared `FnShapeId` cannot carry.
+    fn fn_face_sig(&self, ty: Ty, required: Option<u16>) -> Option<Box<FnVarSig>> {
+        let Ty::Function {
+            shape,
+            nullable: false,
+        } = ty
+        else {
+            return None;
+        };
+        let (type_params, type_params_named, return_ty, positional, named) = {
+            let pool = self.boundary.pool();
+            let shape = pool.function_shape(shape);
+            (
+                shape.type_params,
+                shape.type_params_named.to_vec(),
+                shape.return_ty,
+                shape.positional.to_vec(),
+                shape.named.to_vec(),
+            )
+        };
+        let required_positional = required
+            .or_else(|| self.fn_shape_required.get(&shape).copied())
+            .unwrap_or_else(|| u16::try_from(positional.len()).unwrap_or(u16::MAX));
+        // A named shape carries its parameter spellings (and bounds)
+        // through `type_params_named`; a count-only face keeps the
+        // anonymous entries `function_shape_sig` produces.
+        let params: Box<[(StringId, Option<Ty>)]> = if type_params_named.is_empty() {
+            (0..usize::from(type_params))
+                .map(|_| (StringId::NONE, None))
+                .collect()
+        } else {
+            type_params_named.into_boxed_slice()
+        };
+        Some(Box::new(FnVarSig {
+            params,
+            required_positional,
+            positional: positional.into(),
+            named: named.iter().map(|(name, ty)| (*name, *ty, false)).collect(),
+            return_ty,
+        }))
+    }
+
+    /// The `is` operand's honest signature at a `Ty::Function` verdict
+    /// pair: the row's own declaration answers the required-positional
+    /// count the pooled shape cannot (the canonical `FnShapeId` merges the
+    /// split — `x is List<int> Function([int])` over a `Function(int)`
+    /// operand is one id, and the map records only the last-spelled count).
+    /// A function-typed local reads `fn_var_sigs`, a local function its
+    /// frame capture, a callable tear-off its declared formals; anything
+    /// else rebuilds the shape with the recorded count.
+    fn operand_fn_sig(&self, operand: &Row, operand_ty: Ty) -> Option<Box<FnVarSig>> {
+        if let Some(sig) = self.fn_var_sigs.get(&operand.name) {
+            return Some(Box::new(sig.as_ref().clone()));
+        }
+        if let Some(sig) = self.local_fn_sig(operand.name) {
+            return Some(Box::new(sig.clone()));
+        }
+        if let Some(sig) = self.tear_off_sig(operand) {
+            return Some(sig);
+        }
+        self.fn_face_sig(operand_ty, None)
     }
 
     /// The generic-signature unification at the type-check verdict
@@ -4310,6 +4501,27 @@ impl<'a> Engine<'a> {
             None => return None,
         }
         if from_pos.len() < to_pos.len() {
+            return Some(false);
+        }
+        // The required-positional half of `_isFunctionSubtypeOf`'s arity
+        // gate (subtype.dart:107-113): the source must accept AT LEAST the
+        // target's required count (`from.required <= to.required`). The
+        // interned shape carries no required column — `Function(int)` and
+        // `Function([int])` are one `FnShapeId` — so the written count
+        // rides `fn_shape_required`, keyed at each signature's own close;
+        // a shape with no recorded spelling reads its full length (the
+        // all-required face).
+        let from_required = self
+            .fn_shape_required
+            .get(&from_shape)
+            .map(|&r| r as usize)
+            .unwrap_or(from_pos.len());
+        let to_required = self
+            .fn_shape_required
+            .get(&to_shape)
+            .map(|&r| r as usize)
+            .unwrap_or(to_pos.len());
+        if from_required > to_required {
             return Some(false);
         }
         for (index, to_formal) in to_pos.iter().enumerate() {
@@ -4678,6 +4890,16 @@ impl<'a> Engine<'a> {
         negated: bool,
     ) {
         let Some(checked) = self.armed_ty else { return };
+        // The written target's own shape before the alias/canonical
+        // folds: `last_fn_seal` matches it to recover the written
+        // signature's required count — the per-site answer the shared
+        // `FnShapeId` map cannot give (`fn_face_sig` at the verdict).
+        let checked_shape0 = match checked {
+            Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => {
+                Some(shape)
+            }
+            _ => None,
+        };
         // The `this`/`super` keyword operand (`this is C` in `C`), resolved
         // by the listener at the operator's own left — the keyword pushes
         // no row, so the nearest row below belongs to an older expression
@@ -4707,6 +4929,25 @@ impl<'a> Engine<'a> {
         if let Some(folded) = self.alias_function_ty(checked) {
             checked = self.normalized_never(self.official_fn_face(folded));
         }
+        // A qualified spelling (`core.List`, `p.T`) rides the captured RHS
+        // and the written target as the dot-joined head; the resolved
+        // element the operand's declared face carries spells the same
+        // declaration bare. The same-element rewrite `boundary.ty` runs on
+        // the foreign projection is needed here too — without it a
+        // `core.`-spelled alias RHS (`typedef F2<T> = core.List<core.int>
+        // Function(int, [List<T> x])`) reads a different head from the
+        // operand's `List` declaration face and the always-true verdict
+        // stays silent (the `f2 is F2<int>` family).
+        checked = self.canonical_function_ty(checked);
+        // A bare generic alias (`x is F0` over `typedef F0<T> = int
+        // Function(int, [Function x])`) survives the first fold as the
+        // instantiate-to-bounds head `F0<dynamic>` — the bare loop's
+        // `type_params == 0` gate refuses a parameterized RHS. A second
+        // pass reads that arg-carrying head through
+        // `fold_parameterized_alias`, substituting the bounds into the
+        // captured signature the verdict's function rule answers (the
+        // oracle's `instantiateTypeFormalsToBounds` face).
+        checked = self.normalized_never(self.official_fn_face(self.fold_alias_ty(checked)));
         // A prefixed `is p.T` arms the prefix token's name (the parser's
         // `handle_type` anchors the qualified head at `p`, never `T`):
         // `Named{p}` resolves to the import prefix, not a type. The real
@@ -4762,6 +5003,14 @@ impl<'a> Engine<'a> {
             .alias_function_ty(operand_ty)
             .map(|ty| self.normalized_never(self.official_fn_face(ty)))
             .unwrap_or(operand_ty);
+        // The operand's `p.T`/`core.` leaves canonicalize the same way —
+        // the declared face spells `core.List` where the checked side's
+        // written or folded head reads `List`. The same raw-generic-alias
+        // second fold then reads an `x: F0` declared face's bounds into the
+        // signature.
+        let operand_ty = self.canonical_function_ty(operand_ty);
+        let operand_ty =
+            self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
         if operand_ty == Ty::Unknown
             || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)
@@ -4974,6 +5223,50 @@ impl<'a> Engine<'a> {
                     // cannot spell the formal correspondence); a decided
                     // miss is informative exactly like the ask below.
                     if !unified {
+                        return;
+                    }
+                    Some(true)
+                } else if let (Ty::Function { .. }, Ty::Function { .. }) = (operand_ty, checked)
+                    && let Some(sig_verdict) = {
+                        // The non-generic (or unification-undecidable)
+                        // signature pair answers through the honest
+                        // required-positional counts: the operand's own
+                        // declaration sig where the row resolves one, the
+                        // checked side's recorded written count. The pooled
+                        // `sub == sup` reflexivity reads `Function(int)` and
+                        // `Function([int])` as one shape and would report
+                        // true here; `fn_sig_subtype`'s arity gate
+                        // (`_isFunctionSubtypeOf`, subtype.dart:107-113)
+                        // answers `false` on the real split.
+                        let operand_sig = match keyword_operand {
+                            Some(_) => self.fn_face_sig(operand_ty, None),
+                            None => self
+                                .operand_row()
+                                .and_then(|row| self.operand_fn_sig(row, operand_ty))
+                                .or_else(|| self.fn_face_sig(operand_ty, None)),
+                        };
+                        // The written target is the signature the walk
+                        // sealed last — its own required count rides
+                        // `last_fn_seal` while the shared `FnShapeId` map
+                        // may answer a same-shape spelling's (the operand
+                        // declaration's `Function(int)` and the target's
+                        // `Function([int])` are one id). The pre-fold
+                        // `checked_shape0` match keeps the read on the
+                        // literal target alone: a folded alias's shape is
+                        // not the seal's.
+                        let checked_required = checked_shape0
+                            .and_then(|shape0| {
+                                self.last_fn_seal.and_then(|(sealed, count)| {
+                                    (sealed == shape0).then_some(count)
+                                })
+                            });
+                        let checked_sig = self.fn_face_sig(checked, checked_required);
+                        operand_sig
+                            .zip(checked_sig)
+                            .and_then(|(from, to)| self.fn_sig_subtype(&from, &to))
+                    }
+                {
+                    if !sig_verdict {
                         return;
                     }
                     Some(true)

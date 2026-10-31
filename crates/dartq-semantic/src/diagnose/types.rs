@@ -2536,6 +2536,27 @@ pub(crate) struct Engine<'a> {
     /// The last completed written signature, claimed by the next variable
     /// group's names and dropped at every declaration boundary in between.
     pub(crate) fn_type_stash: Option<Box<FnVarSig>>,
+    /// The written required-positional count of each interned function
+    /// shape the walk sealed (`end_function_type`). [`crate::model::FnShape`]
+    /// merges required and optional positionals into one column — the
+    /// canonical interning makes `Function(int)` and `Function([int])` the
+    /// same `FnShapeId`, so the required-vs-optional split the subtype
+    /// function rule (`_isFunctionSubtypeOf`, subtype.dart:86-171) gates on
+    /// cannot ride the shape. This side table records the count the
+    /// written capture carried at the shape's own close; a shape produced
+    /// by a path that never spelled it (a declaration signature, an alias
+    /// RHS folded through the pool) reads `positional.len()` — the
+    /// all-required face, the under-report posture.
+    pub(crate) fn_shape_required: FxHashMap<crate::model::FnShapeId, u16>,
+    /// The most recently sealed written function signature's own
+    /// `(FnShapeId, required)` pair — the per-site answer
+    /// `fn_shape_required` cannot give when two spellings share one
+    /// interned id (`g: int Function(int)` and `is int Function([int])`
+    /// are the same `FnShapeId`, and the map answers one count for every
+    /// face reading it). The `is` verdict's written target is the last
+    /// signature the walk sealed, so a shape match here recovers ITS
+    /// count even when the map already answered a different spelling's.
+    pub(crate) last_fn_seal: Option<(crate::model::FnShapeId, u16)>,
     /// Explicit type arguments of pending calls, keyed by the callee's row
     /// index (pushed at the group's close, consumed by the argument check
     /// or the tear-off/implicit-creation faces).

@@ -10052,7 +10052,33 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.bounds.end_function(question.is_some(), range);
         self.flow().end_function_type(function, question);
         self.engine.var_end_function_type(question.is_some());
+        // The written signature's required-positional count: the capture
+        // the close pops still carries it here, and the interned shape
+        // `fn_capture_end` arms merges required and optional positionals
+        // into one column. Record the split into `fn_shape_required` keyed
+        // by the resulting `FnShapeId` — the subtype function rule's
+        // `required` gate (`_isFunctionSubtypeOf`) cannot read it off the
+        // canonical shape (where `Function(int)` and `Function([int])`
+        // collapse to one id). The FIRST spelling's count wins the map
+        // slot: declarations seal before the `is` targets that reuse the
+        // shape, so the shared id keeps the declared face's count while
+        // `last_fn_seal` answers each written site's own.
+        let required = self
+            .engine
+            .fn_type_capture
+            .last()
+            .map(|capture| capture.required_positional.min(u16::MAX as usize) as u16);
         self.engine.fn_capture_end(question.is_some());
+        if let (Some(required), Some(Ty::Function { shape, .. })) =
+            (required, self.engine.armed_ty)
+            && shape != crate::model::FnShapeId::EMPTY
+        {
+            self.engine
+                .fn_shape_required
+                .entry(shape)
+                .or_insert(required);
+            self.engine.last_fn_seal = Some((shape, required));
+        }
         // The #1351 capture: a typedef RHS function type's own close
         // latches its nullability suffix (`typedef W = void Function()?;`
         // expands nullable); a nested function-typed formal's close is
