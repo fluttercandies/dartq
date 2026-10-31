@@ -257,6 +257,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                             | Keyword::Static
                             | Keyword::Covariant
                             | Keyword::Abstract
+                            | Keyword::Required
                     )
                 ) || self.looks_like_start_of_next_top_level_declaration_at(0)
                     || self.looks_like_statement_start_at(0)
@@ -360,6 +361,28 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 ),
                 dartq_scanner::KeywordStyle::BuiltIn => {
                     context == crate::listener::IdentifierContext::ImportPrefixDeclaration
+                        // `TypeVariableDeclarationIdentifierContext.ensureIdentifier`
+                        // (identifier_context_impl.dart:1589-1603) tests the
+                        // keep-set BEFORE the built-in face: a built-in that
+                        // heads a top-level declaration, class member, or
+                        // statement (`typedef`/`get`/`set`/`required`/...)
+                        // splices the synthetic name instead of being eaten
+                        // (oracle `void b< typedef int>();`:
+                        // `missing_identifier` at the `typedef`, never the
+                        // `builtInIdentifierInDeclaration` consume). The
+                        // single-token `< set >` group shape stays on the
+                        // consume face: upstream classifies it Complex
+                        // (`_computeTypeParamOrArgImpl`, type_info.dart:445
+                        // admits only IDENTIFIER/pseudo names) whose recovery
+                        // loop absorbs the kept keyword, while dartq's
+                        // Simple1 fast path asserts a closer directly after
+                        // the name — a kept keyword would break that
+                        // invariant (the gate lives in type_args.rs).
+                        || (context == crate::listener::IdentifierContext::TypeVariableDeclaration
+                            && !matches!(
+                                self.cursor.look_kind(1),
+                                TokenKind::Gt | TokenKind::GtGt | TokenKind::GtEq
+                            ))
                 }
                 _ => false,
             },
@@ -388,6 +411,29 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             )
         {
             self.report(message, peek.span);
+            // The verifier adds its own compile-time name face on every
+            // surviving type-parameter keyword name (`visitTypeParameter` →
+            // `_checkForBuiltInIdentifierAsName`, error_verifier.dart:
+            // 3365-3377: any keyword token whose style is not pseudo). The
+            // built-in branch above already carries that face; the
+            // reserved-word branch carries only the tolerant-consume row, so
+            // the built-in face rides the same token here (oracle `void b<
+            // is int>();`: expectedIdentifierButGotKeyword +
+            // builtInIdentifierInDeclaration, both on the `is`).
+            if context == crate::listener::IdentifierContext::TypeVariableDeclaration
+                && matches!(
+                    peek.kind,
+                    TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
+                )
+            {
+                self.report(
+                    msg::built_in_identifier_as_name(
+                        crate::message::msg::BuiltInNameKind::TypeParameter,
+                        self.cursor.lexeme(peek.span.id),
+                    ),
+                    peek.span,
+                );
+            }
             let id = self.cursor.advance();
             let span = self.span_of(id);
             self.listener.handle_identifier(span, context);

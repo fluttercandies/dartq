@@ -1051,14 +1051,17 @@ fn const_list_literal_lhs_reports_both_codes_at_const_head() {
     // missing_assignable_selector at 3:3). The pre-#2157 admission read any
     // `]`-ending LHS as an index target and stayed silent here.
     let c = parse("int g() => 0;\nvoid f() {\n  const [r] = g();\n}\n");
-    // `const` at line 3 col 3 = byte offset 27, length 5.
+    // `const` at line 3 col 3 = byte offset 27; the rows span the whole
+    // non-assignable LHS run — `handleRecoverableError(…, lhs.beginToken,
+    // lhs.endToken)` (ast_builder.dart:3645-3652), oracle 3.13: both rows
+    // at 3:3 length 9 (`const [r]`).
     assert_eq!(
         c.error_rows(),
         [
-            ("missing_assignable_selector", 27, 5),
-            ("illegal_assignment_to_non_assignable", 27, 5),
+            ("missing_assignable_selector", 27, 9),
+            ("illegal_assignment_to_non_assignable", 27, 9),
         ],
-        "const list literal LHS reports both codes at the const head"
+        "const list literal LHS reports both codes over the whole LHS run"
     );
 }
 
@@ -1068,13 +1071,15 @@ fn const_record_lhs_codes_anchor_at_const_head() {
     // official rows anchor on the `const` head (oracle 3:3), never on the
     // literal's closer (the pre-#2157 anchor).
     let c = parse("int g() => 0;\nvoid f() {\n  const (q,) = g();\n}\n");
+    // The record twin: both rows span `const (q,)` (oracle 3.13: 3:3
+    // length 10) — the whole non-assignable LHS run.
     assert_eq!(
         c.error_rows(),
         [
-            ("missing_assignable_selector", 27, 5),
-            ("illegal_assignment_to_non_assignable", 27, 5),
+            ("missing_assignable_selector", 27, 10),
+            ("illegal_assignment_to_non_assignable", 27, 10),
         ],
-        "const record literal LHS anchors at the const head"
+        "const record literal LHS anchors over the whole LHS run"
     );
 }
 
@@ -1093,14 +1098,17 @@ fn index_target_shapes_stay_assignable() {
     );
     assert!(c.errors.is_empty(), "{:?}", c.error_rows());
     let c = parse("void f(List<int> b, int i) {\n  b[0] + b[i] = 3;\n}\n");
-    // `b` at line 2 col 3 = byte offset 31, length 1.
+    // `b` at line 2 col 3 = byte offset 31; the rows span the whole
+    // non-assignable LHS run (`handleRecoverableError(…, lhs.beginToken,
+    // lhs.endToken)`, ast_builder.dart:3645-3652) — oracle 3.13: 2:3
+    // length 11 (`b[0] + b[i]`).
     assert_eq!(
         c.error_rows(),
         [
-            ("missing_assignable_selector", 31, 1),
-            ("illegal_assignment_to_non_assignable", 31, 1),
+            ("missing_assignable_selector", 31, 11),
+            ("illegal_assignment_to_non_assignable", 31, 11),
         ],
-        "binary LHS ending in an index reports at the operand head"
+        "binary LHS ending in an index reports over the whole LHS run"
     );
 }
 
