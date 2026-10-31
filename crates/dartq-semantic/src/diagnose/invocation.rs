@@ -505,6 +505,46 @@ impl<'a> Engine<'a> {
                 self.stage_receiver_of_type_never(popped.range, receiver_ty);
                 recv_span = popped.range;
                 was_local = self.local_hits.contains_key(&recv_span.offset);
+                // The parenthesized receiver (`_verifyUnassignedSimpleIdentifier`'s
+                // `target.unParenthesized`, dead_code_verifier.dart:486-490):
+                // `(i)?.x` folds `i` into a group row — the `local_hits` entry
+                // stays at `i`'s own offset inside the group's span, so the
+                // bare-receiver lookup misses. Unwrap the group the same way
+                // the official helper does: the chain roots on the inner local
+                // read, and the join's `unassigned`/`promotions` facts key on
+                // that inner span, never the parens.
+                if !was_local
+                    && !popped.qualified
+                    && matches!(popped.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                    && self.strings.resolve(popped.name).is_empty()
+                {
+                    if let Some((&inner_offset, _)) = self
+                        .local_hits
+                        .iter()
+                        .find(|(&off, _)| recv_span.offset < off && off < recv_span.end())
+                    {
+                        // The inner read's own span: the identifier token at
+                        // the hit offset (`local_hits` keys the read's
+                        // offset), spelled in UTF-16 like every row range.
+                        if let Some(token) = self
+                            .tokens
+                            .as_slice()
+                            .get(self.tokens.as_slice().partition_point(|t| {
+                                t.utf16_offset < inner_offset
+                            }))
+                            .filter(|t| t.utf16_offset == inner_offset)
+                        {
+                            let raw = &self.source[token.byte_range()];
+                            let length =
+                                raw.chars().map(char::len_utf16).sum::<usize>() as u32;
+                            recv_span = SourceRange {
+                                offset: inner_offset,
+                                length,
+                            };
+                            was_local = true;
+                        }
+                    }
+                }
                 // The dead-chain candidate: a null-aware operator over a
                 // local's nullable read (`c1?.g()`, `c1?..g()`). A merge
                 // INSIDE a latched chain's extent (`c1?.a.b`'s `.b`) is the
@@ -555,8 +595,22 @@ impl<'a> Engine<'a> {
                             match kind {
                                 crate::diagnose::types::DeadChainKind::Member
                                 | crate::diagnose::types::DeadChainKind::Index => {
-                                    self.dead_null_chains[index].1 =
-                                        self.dead_null_chains[index].1.max(chain_end);
+                                    // A cascade section (`..x`/`?..x`) after
+                                    // a `?.`/`?[` chain is a NEW
+                                    // CascadeExpression, not an access parent
+                                    // — the climb's
+                                    // `parent is MethodInvocation |
+                                    // PropertyAccess | IndexExpression` walk
+                                    // stops there, so `x?.y..z` reports `?.y`
+                                    // only (the cascade's own `?..` arm
+                                    // checks the cascade TARGET, which is the
+                                    // `x?.y` access — never a
+                                    // SimpleIdentifier). Only plain `.`/`?.`
+                                    // continuations grow the climb faces.
+                                    if !is_section {
+                                        self.dead_null_chains[index].1 =
+                                            self.dead_null_chains[index].1.max(chain_end);
+                                    }
                                 }
                                 crate::diagnose::types::DeadChainKind::CascadeMember
                                 | crate::diagnose::types::DeadChainKind::CascadeIndex => {

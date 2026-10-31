@@ -6434,6 +6434,29 @@ impl ParserListener for DiagnoseListener<'_> {
             Some(q) => Some(q.range),
             None => engine.cascade_null_aware_op.take(),
         };
+        // The index-continuation climb
+        // (`_verifyUnassignedSimpleIdentifier`'s
+        // `while (parent is IndexExpression)`, dead_code_verifier.dart
+        // :492-497): an index access whose operator sits inside-or-at a
+        // latched chain's end is the outer access the dead span climbs to
+        // — `l?[0][0]` reports `?.[0][0]` whole, `l?[0]?[1]` keeps one row
+        // at the inner `?[` (the second `?` lands exactly at the inner
+        // extent's end). The climb is kind-agnostic for the plain faces (a
+        // `?.`/`?[` root's climb covers every access parent); a cascade
+        // root grows too — `a?..[0][1]` keeps `first` an IndexExpression
+        // whose `period` is the `?..`, so the bare-body gate holds
+        // (`verifyCascadeExpression`'s index arm). The bracket's own close
+        // is the grown end; the operator offset is the containment key
+        // (`?` if present, `[` otherwise).
+        let index_op_offset = question_range.map_or(open.range.offset, |q| q.offset);
+        if let Some(index) = engine
+            .dead_null_chains
+            .iter()
+            .position(|(op, end, ..)| *op <= index_op_offset && index_op_offset <= *end)
+        {
+            engine.dead_null_chains[index].1 =
+                engine.dead_null_chains[index].1.max(close.range.end());
+        }
         if let Some(question_range) = question_range {
             // The same receiver typing `merge_member` runs (`f()?[i]`'s
             // receiver is the `f()` send, its result carried by
@@ -6460,6 +6483,47 @@ impl ParserListener for DiagnoseListener<'_> {
                 question_range
             };
             let recv = engine.rows[pos].range;
+            // The parenthesized receiver
+            // (`_verifyUnassignedSimpleIdentifier`'s
+            // `target.unParenthesized`, dead_code_verifier.dart:486-490):
+            // `(l)?[0]` folds `l` into a group row — the `local_hits` entry
+            // stays at `l`'s own offset inside the group's span, so the
+            // bare-receiver lookup misses. Re-spell the receiver onto the
+            // inner local read: the staged null-aware face and the dead
+            // chain both key on the inner span, never the parens.
+            let recv = if !engine.local_hits.contains_key(&recv.offset)
+                && !engine.rows[pos].qualified
+                && matches!(engine.rows[pos].shape, RowShape::Bare(BareInfo::Plain { .. }))
+                && engine.strings.resolve(engine.rows[pos].name).is_empty()
+            {
+                engine
+                    .local_hits
+                    .iter()
+                    .find(|&(off, _)| recv.offset < *off && *off < recv.end())
+                    .and_then(|(&inner_offset, _)| {
+                        engine
+                            .tokens
+                            .as_slice()
+                            .get(engine.tokens.as_slice().partition_point(|t| {
+                                t.utf16_offset < inner_offset
+                            }))
+                            .filter(|t| t.utf16_offset == inner_offset)
+                            .map(|token| {
+                                let raw = &engine.source[token.byte_range()];
+                                SourceRange {
+                                    offset: inner_offset,
+                                    length: raw
+                                        .chars()
+                                        .map(char::len_utf16)
+                                        .sum::<usize>()
+                                        as u32,
+                                }
+                            })
+                    })
+                    .unwrap_or(recv)
+            } else {
+                recv
+            };
             let kind = if question.is_some() {
                 NullAwareKind::Index
             } else {
@@ -12376,3 +12440,19 @@ mod ticket_3085_tests;
 #[cfg(test)]
 #[path = "ticket_3087_tests.rs"]
 mod ticket_3087_tests;
+
+/// The #3172 Lane D pins (the null-aware dead chain over a definitely
+/// unassigned local — `_verifyUnassignedSimpleIdentifier`,
+/// dead_code_verifier.dart:467-505: the `?.`/`?[`/`?..` operator anchors,
+/// the parent climb's outer-access end, and the `unParenthesized`
+/// receiver's inner-local gate).
+#[cfg(test)]
+#[path = "ticket_3172_tests.rs"]
+mod ticket_3172_tests;
+
+/// The #3165 pins (the rest-element relational sub-pattern's `List<E>`
+/// matched type, the `>>>`/`>>>=` re-glue under `no-triple-shift`, and the
+/// object-pattern shorthand binder's receiver-instantiated getter return).
+#[cfg(test)]
+#[path = "ticket_3165_tests.rs"]
+mod ticket_3165_tests;
