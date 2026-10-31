@@ -5429,6 +5429,339 @@ impl<'a> Engine<'a> {
             other => other,
         }
     }
+
+    /// The `unnecessary_type_check` deferred re-decision (#3005): the
+    /// pass-1 `check_type_check` runs before the flow replay materializes
+    /// `PromotedRead`/`ReadType`, so an `is`/`is!` whose operand read
+    /// stands promoted is decided on the declared face — the under-report
+    /// the two #3002 pins close (`int? q = 0; q is int`, `o is String`
+    /// inside `if (o is String)`). Upstream's verdict reads the operand's
+    /// flow-aware static type (`leftNode.typeOrThrow`,
+    /// best_practices_verifier.dart:1011), so once the read rows exist the
+    /// verdict re-runs here against the resolved flow type.
+    ///
+    /// The replay reuses `check_type_check` itself: the `keyword_operand`
+    /// slot carries the flow-typed operand (the same channel the
+    /// `this`/`super` face uses — the operand's flow type supplied
+    /// externally), and `armed_ty` carries the checked type reconstructed
+    /// from the token table (resolved type heads push no rows, so the
+    /// spelling is re-derived — bare/prefixed/generic/nullable heads only;
+    /// `Function()` and record spellings bail, the under-report direction
+    /// which is still better than the parse-time silence they replace).
+    /// Emissions ride `stage_usage` into `report.usage`, merged with the
+    /// rest of the verifier tail in source order. A site already holding
+    /// one of this walk's rows (`unnecessary_type_check`,
+    /// `type_check_with_null`, `type_check_with_not_null` — the three codes
+    /// `check_type_check`/`stage_type_check_null` emit) at the same span
+    /// dedupes: the oracle emits at most one row per `is` expression and a
+    /// promotion can only flip the verdict, never stack a second row.
+    pub(crate) fn deferred_type_checks(&mut self, promotions: &PromotionStaging) {
+        use dartq_scanner::{Keyword, TokenKind};
+        const GLUE: [TokenKind; 7] = [
+            TokenKind::Period,
+            TokenKind::QuestionPeriod,
+            TokenKind::PeriodPeriod,
+            TokenKind::QuestionPeriodPeriod,
+            TokenKind::Minus,
+            TokenKind::Bang,
+            TokenKind::Tilde,
+        ];
+        let tokens = self.tokens.as_slice();
+        for i in 0..tokens.len() {
+            if tokens[i].kind != TokenKind::Keyword(Keyword::Is) {
+                continue;
+            }
+            // `is!` carries a separate `!` token; the type head follows it.
+            let negated = tokens.get(i + 1).is_some_and(|t| t.kind == TokenKind::Bang);
+            let type_idx = i + 1 + usize::from(negated);
+            // The operand must be a bare identifier read: the token left of
+            // `is` is the read's identifier, and no member/prefix-operator
+            // token glues it into a wider operand (`x.f is T`, `-x is T`,
+            // `x as T is S` — the `as`/`is` target tokens left of the read
+            // carry no read row and drop out at the join anyway).
+            let Some(operand) = i
+                .checked_sub(1)
+                .and_then(|j| tokens.get(j))
+                .filter(|t| t.kind == TokenKind::Identifier)
+            else {
+                continue;
+            };
+            if i >= 2 && GLUE.contains(&tokens[i - 2].kind) {
+                continue;
+            }
+            // The read's span in UTF-16 (the join keys' convention) —
+            // byte_len coincides on ASCII identifiers; a wide-char
+            // identifier's utf16 length differs, so walk the lexeme.
+            let span = {
+                let text = &self.source[operand.byte_range()];
+                SourceRange {
+                    offset: operand.utf16_offset,
+                    length: text.chars().map(char::len_utf16).sum::<usize>() as u32,
+                }
+            };
+            // The operand's flow-aware static type: a `PromotedRead` fact
+            // at the read's own span substitutes outright (an opaque
+            // `Unknown` marker is the nullability-only face — defer to
+            // the read-type row, which spells the type); otherwise the
+            // `ReadType` row answers (the promoted or declared flow type —
+            // covering write promotions `x ??= SubImpl` that stage no
+            // `PromotedRead` fact). No row → not a promotable read →
+            // nothing changed since the parse-time verdict.
+            let operand_ty = match promotions.promoted(span) {
+                Some(ty) if ty != Ty::Unknown => ty,
+                _ => match self
+                    .read_types
+                    .binary_search_by(|(r, _)| r.offset.cmp(&span.offset))
+                {
+                    Ok(join) if self.read_types[join].0 == span => self.read_types[join].1,
+                    _ => continue,
+                },
+            };
+            if operand_ty == Ty::Unknown || self.is_invalid_ty(operand_ty) {
+                continue;
+            }
+            let Some((checked, type_end)) = self.reconstruct_is_ty(type_idx) else {
+                continue;
+            };
+            // A type-parameter spelling (`b is Box<String>` over
+            // `b: Box<T>`) cannot re-decide post-walk: `type_params`/
+            // `pending_type_params` are torn down, so the bound arm of
+            // `check_type_check`'s verdict reads an empty scope — a param
+            // head lands as an unresolved name and the vacuous-subtype arm
+            // answers true where the parse-time verdict (and the oracle)
+            // stayed silent (#2462's conservative pin). The gate covers
+            // the operand's whole spelling and the checked side's
+            // ARGUMENTS (the checked head is already the resolved
+            // written name — a prefixed `p.C` leaf needs no unqualified
+            // scope): any named head failing `resolve_bare`'s
+            // declaration face — a scope param, a local read, a prefix,
+            // `this`, a miss — keeps the site's parse-time verdict.
+            if self.ty_has_scope_head(operand_ty)
+                || self.ty_args_have_scope_head(checked)
+            {
+                continue;
+            }
+            // The verdict anchors at the whole `is` expression — operand
+            // start through the reconstructed type end, the same extent
+            // `verdict_at` takes in the listener.
+            let at = SourceRange {
+                offset: span.offset,
+                length: type_end.saturating_sub(span.offset),
+            };
+            // One row per `is` expression: pass-1's emissions at this span
+            // (either polarity of `unnecessary_type_check`, or the
+            // `is Null` family's rows) stand — a promotion only re-decides
+            // silence.
+            if self.report.usage.iter().any(|d| {
+                d.range == at
+                    && matches!(
+                        d.code.name,
+                        "unnecessary_type_check"
+                            | "type_check_with_null"
+                            | "type_check_with_not_null"
+                    )
+            }) {
+                continue;
+            }
+            let saved = self.armed_ty.replace(checked);
+            self.check_type_check(at, Some((operand_ty, span)), negated);
+            self.armed_ty = saved;
+        }
+    }
+
+    /// Re-derives the `is`/`is!` target's written `Ty` from the token
+    /// table for [`Self::deferred_type_checks`] — the pass-1 `armed_ty` is
+    /// consumed by the verdict and resolved heads push no rows, so the
+    /// checked spelling must be rebuilt (the ticket's "type_uses keeps
+    /// (range, head_name) not resolved Ty" gap). Covers the bare
+    /// (`int`/`Null`/`dynamic`), prefixed (`p.T` → the resolved leaf, the
+    /// substitution `check_type_check` itself makes), generic (`T<args>`,
+    /// nested; `>>`/`>>=` multi-closers counted by `carry`), and `?`
+    /// (adjacent only — `x is int ? a : b` keeps the conditional out).
+    /// Function-type (`int Function(...)`) and record (`(a, b)`) spellings
+    /// return `None` — the verdict would misread a truncated head; the
+    /// site keeps its parse-time silence instead. Returns the type and the
+    /// written extent's utf16 end (the verdict span's right edge).
+    fn reconstruct_is_ty(&self, start: usize) -> Option<(Ty, u32)> {
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let mut carry = 0u32; // half-consumed `>>`/`>>>` closers
+        let (ty, next) = self.reconstruct_ty_at(start, &mut carry)?;
+        if carry != 0 {
+            return None;
+        }
+        let last = tokens.get(next.wrapping_sub(1))?;
+        let end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
+        // A token that could continue the type (`Function` for a
+        // function-type tail, `(`/`[` for a record or indexed spelling)
+        // means the reconstruction is truncated — bail rather than judge
+        // the wrong head. Everything else (statement separators,
+        // operators, `{`/`)`/`]`/`>`) is a legal end.
+        if tokens.get(next).is_some_and(|t| {
+            matches!(t.kind, TokenKind::OpenParen | TokenKind::OpenSquare)
+                || matches!(t.kind, TokenKind::Identifier | TokenKind::Keyword(_))
+                    && &self.source[t.byte_range()] == "Function"
+        }) {
+            return None;
+        }
+        Some((ty, end))
+    }
+
+    /// Whether `ty` names a head the post-walk verdict cannot scope —
+    /// a type parameter, a local read, an import prefix, `this`, or an
+    /// unresolved name — the spellings [`Self::deferred_type_checks`]
+    /// refuses to replay (the parse-time scope the param/bound verdict
+    /// arms need is gone; a vacuous re-decision would over-report where
+    /// the oracle stays silent). Declaration-resolving heads (`Decl`,
+    /// `Opaque`) pass; argument trees walk recursively.
+    fn ty_has_scope_head(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Named { name, .. } => {
+                if matches!(
+                    self.resolve_bare(name).1,
+                    RefTarget::Local
+                        | RefTarget::TypeParam
+                        | RefTarget::Prefix
+                        | RefTarget::This
+                        | RefTarget::Missing
+                ) {
+                    return true;
+                }
+                // A `Decl` answer needs the same kind probe the
+                // member-face walk uses (`member_free_params`,
+                // resolution.rs:1640-1645): a type parameter is an
+                // element-model declaration, so `resolve_bare` can land
+                // `Decl` on a scope spelling — the bound arm still
+                // cannot read it post-walk.
+                if self
+                    .index
+                    .get(self.file)
+                    .and_then(|f| f.decl(name))
+                    .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam)
+                {
+                    return true;
+                }
+                self.ty_args_have_scope_head(ty)
+            }
+            _ => false,
+        }
+    }
+
+    /// The argument-tree half of [`Self::ty_has_scope_head`]: each arg
+    /// gets the full head check (a `T` argument is a scope spelling; the
+    /// checked head itself is exempt — see the call site).
+    fn ty_args_have_scope_head(&self, ty: Ty) -> bool {
+        let Ty::Named { args, .. } = ty else {
+            return false;
+        };
+        if args == ArgListId::EMPTY {
+            return false;
+        }
+        let args = self.boundary.args.borrow().get(args).to_vec();
+        args.iter().any(|&arg| self.ty_has_scope_head(arg))
+    }
+
+    /// One type spelling inside [`Self::reconstruct_is_ty`]'s token window
+    /// (recursive for `<` arguments). Returns `(ty, next_index)` — the
+    /// index of the first token the type does not own. `carry` is the
+    /// shared half-consumed-`>` count: a nested list whose closer lexed
+    /// multi-wide (`>>`) leaves a pending `>` for the enclosing list.
+    fn reconstruct_ty_at(&self, start: usize, carry: &mut u32) -> Option<(Ty, usize)> {
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let head = *tokens.get(start)?;
+        let text = &self.source[head.byte_range()];
+        let mut idx = start + 1;
+        // `dynamic`/`Null` keep their dedicated `Ty` faces (the
+        // `handle_type` table, listener.rs:3655-3663).
+        let mut name = match text {
+            "dynamic" => return Some((Ty::Dynamic, idx)),
+            "Null" => return Some((Ty::Null, idx)),
+            _ => self.strings.intern(text),
+        };
+        if !matches!(head.kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
+            return None;
+        }
+        // `p.T`: the prefixed head resolves to its leaf segment — the
+        // same substitution `check_type_check` makes against the last
+        // TypeUse row at parse time.
+        if tokens.get(idx).is_some_and(|t| t.kind == TokenKind::Period) {
+            let leaf = tokens.get(idx + 1)?;
+            if !matches!(leaf.kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
+                return None;
+            }
+            name = self.strings.intern(&self.source[leaf.byte_range()]);
+            idx += 2;
+        }
+        // The type-arguments group: `T<a, b<c>, ...>` — each argument
+        // recurses; a closer lexed multi-wide (`>>`, `>>>`, `>>=`, `>=`)
+        // repays through `carry` so the outer list sees its own `>`.
+        let mut args: Vec<Ty> = Vec::new();
+        if tokens.get(idx).is_some_and(|t| t.kind == TokenKind::Lt) {
+            idx += 1;
+            loop {
+                if *carry > 0 {
+                    *carry -= 1;
+                    break;
+                }
+                match tokens.get(idx).map(|t| t.kind) {
+                    Some(TokenKind::Gt) => {
+                        idx += 1;
+                        break;
+                    }
+                    Some(TokenKind::GtGt) => {
+                        *carry += 1;
+                        idx += 1;
+                        break;
+                    }
+                    Some(TokenKind::GtGtGt) => {
+                        *carry += 2;
+                        idx += 1;
+                        break;
+                    }
+                    // `>=`/`>>=` close the group and leave a `=`/`>` the
+                    // type never owns — same legal end as `>`.
+                    Some(TokenKind::GtEq | TokenKind::GtGtEq | TokenKind::GtGtGtEq) => {
+                        idx += 1;
+                        break;
+                    }
+                    Some(TokenKind::Comma) => {
+                        idx += 1;
+                    }
+                    _ => {
+                        let (arg, next) = self.reconstruct_ty_at(idx, carry)?;
+                        args.push(arg);
+                        idx = next;
+                    }
+                }
+            }
+        }
+        // `T?`: the suffix attaches only adjacent — `x is int ? a : b`
+        // keeps the conditional's `?` out (a whitespace gap separates
+        // them; the parser's own ambiguity rule reads the same way).
+        let mut nullable = false;
+        let last = tokens.get(idx - 1)?;
+        let end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
+        if tokens.get(idx).is_some_and(|t| {
+            t.kind == TokenKind::Question && t.utf16_offset == end
+        }) {
+            nullable = true;
+            idx += 1;
+        }
+        let args = if args.is_empty() {
+            ArgListId::EMPTY
+        } else {
+            self.boundary.intern_list(&args)
+        };
+        Some((
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            },
+            idx,
+        ))
+    }
 }
 
 // The #2815 pins (the B2 unchecked-nullable family). Registered here,

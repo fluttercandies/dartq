@@ -225,3 +225,167 @@ class C<T extends AstNodeTag> {
             .collect::<Vec<_>>()
     );
 }
+
+// —— the #2456 exhaustiveness face over the same unsolved scrutinee ———————
+
+/// The unsolved `T extends Enum` scrutinee the case set witnesses: every
+/// case root names one enum's constants, so the enum is the family the
+/// oracle's solved call reaches and the covering verdict is judged over it.
+/// The missing constant reports `non_exhaustive_switch_statement` (the
+/// oracle row the name level missed while the scrutinee still spelled `T`).
+#[test]
+fn unsolved_enum_bound_covering_verdict_reads_the_case_family() {
+    let source = "\
+class List<E> {
+  E get first => throw 0;
+}
+enum AstNodeTag { a, b, c }
+class R {
+  T readEnum<T extends Enum>(List<T> values) => values.first;
+}
+Object? f(R reader) {
+  var tag = reader.readEnum(AstNodeTag.values);
+  switch (tag) {
+    case AstNodeTag.a:
+      return 1;
+    case AstNodeTag.b:
+      return 2;
+  }
+}
+";
+    let report = unit_report(source);
+    assert_eq!(
+        count_code(&report, "non_exhaustive_switch_statement"),
+        1,
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    );
+    let row = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "non_exhaustive_switch_statement")
+        .expect("the covering row");
+    assert!(
+        row.message.to_string().contains("AstNodeTag.c"),
+        "witness names the missing constant: {}",
+        row.message
+    );
+}
+
+/// The full-coverage twin: the case set covers the witnessed family, so the
+/// solved switch is exhaustive and no covering row reports (the oracle stays
+/// silent on this shape).
+#[test]
+fn unsolved_enum_bound_full_coverage_is_not_non_exhaustive() {
+    let source = "\
+class List<E> {
+  E get first => throw 0;
+}
+enum AstNodeTag { a, b, c }
+class R {
+  T readEnum<T extends Enum>(List<T> values) => values.first;
+}
+Object? f(R reader) {
+  var tag = reader.readEnum(AstNodeTag.values);
+  switch (tag) {
+    case AstNodeTag.a:
+      return 1;
+    case AstNodeTag.b:
+      return 2;
+    case AstNodeTag.c:
+      return 3;
+  }
+}
+";
+    let report = unit_report(source);
+    assert_eq!(
+        count_code(&report, "non_exhaustive_switch_statement"),
+        0,
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The completion twin of the full-coverage face: an exhaustive switch whose
+/// cases all return leaves the body unable to complete, so no
+/// `body_might_complete_normally_nullable` reports (the oracle is silent; the
+/// flow layer's always-exhaustive verdict decides it — this pin holds the
+/// whole chain, staged call result through local read to the switch frame).
+#[test]
+fn unsolved_enum_bound_full_coverage_body_stays_closed() {
+    let source = "\
+class List<E> {
+  E get first => throw 0;
+}
+enum AstNodeTag { a, b, c }
+class R {
+  T readEnum<T extends Enum>(List<T> values) => values.first;
+}
+Object? f(R reader) {
+  var tag = reader.readEnum(AstNodeTag.values);
+  switch (tag) {
+    case AstNodeTag.a:
+      return 1;
+    case AstNodeTag.b:
+      return 2;
+    case AstNodeTag.c:
+      return 3;
+  }
+}
+";
+    let report = unit_report(source);
+    assert_eq!(
+        count_code(&report, "body_might_complete_normally_nullable"),
+        0,
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The over-emission guard: the same unsolved scrutinee shape under a bound
+/// that is no always-exhaustive family never takes the refinement — the
+/// oracle's solved type could be any `Box`, so a covering row would be a
+/// false positive and stays suppressed.
+#[test]
+fn class_bound_scrutinee_never_borrows_a_case_family() {
+    let source = "\
+class List<E> {
+  E get first => throw 0;
+}
+class Box {}
+enum AstNodeTag { a, b }
+class R {
+  T readOne<T extends Box>(List<T> values) => values.first;
+}
+Object? f(R reader) {
+  var boxed = reader.readOne(<Box>[Box()]);
+  switch (boxed) {
+    case AstNodeTag.a:
+      return 1;
+  }
+}
+";
+    let report = unit_report(source);
+    assert_eq!(
+        count_code(&report, "non_exhaustive_switch_statement"),
+        0,
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    );
+}

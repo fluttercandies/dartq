@@ -471,6 +471,96 @@ fn always_exhaustive_param(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> boo
     always_exhaustive_within(world, NameTy::from_semantic(bound), budget - 1)
 }
 
+/// The solved scrutinee of an unsolved `T extends Enum` switch (#2456): the
+/// verdict the oracle reaches because its call-site inference solved the
+/// generic callee (`T readEnum<T extends Enum>(…)` called with one enum's
+/// `values`), while this name level still reads the declared return's bare
+/// parameter spelling — a head the world cannot place, so neither the space
+/// model nor the always-exhaustive gate can decide it.
+///
+/// Such a scrutinee is *recoverable* from the case set: the bound is the
+/// `Enum` root, so the oracle's solved type is some enum — always-exhaustive
+/// at the statement face (type_system.dart:846-888's enum arm) — and every
+/// constant case can only name constants of that enum. When every case root
+/// is a constant of ONE enum `E`, `E` is the only family the cases witness,
+/// and the verdict over `E` is the solved verdict:
+///
+/// - the cases cover `E`'s constants ⇔ the solved switch is exhaustive
+///   (they are the same set), so a full set stays silent;
+/// - a missing constant is a missing constant of the solved type, so the
+///   witness and the correction text the row renders are the oracle's own.
+///
+/// Declines (the pre-#2456 silence) whenever a fact the equivalence needs is
+/// missing: a resolvable head, a parameter still in scope (the ordinary
+/// bound arm owns it — [`always_exhaustive_param`]), a bound that is not the
+/// `Enum` root — an unbounded `T` or one over a concrete class has no
+/// always-exhaustive solved face, so guessing a family could emit a row the
+/// oracle never writes — a case root that is no enum constant (a `null`, a
+/// type test, an unrepresentable constant), or case constants from two
+/// different enums. The bound lookup is spelling-keyed
+/// ([`Engine::param_bound_of`]): among several captured windows declaring the
+/// same one-letter parameter the first match stands, which can only narrow
+/// this face to a *weaker* bound (`Enum` mis-seen for a concrete bound is the
+/// one unsound direction) — the gate therefore also requires that every case
+/// root is an enum constant, the shape only an enum-bounded scrutinee can
+/// inhabit.
+pub(crate) fn enum_bound_scrutinee(world: &NameWorld<'_>, ctx: &SwitchCtx) -> Option<Ty> {
+    let NameTy::Named(name, false) = NameTy::from_semantic(ctx.scrutinee) else {
+        return None;
+    };
+    if world.is_known_head(name) {
+        return None;
+    }
+    let engine = fold_engine()?;
+    if engine.is_scope_param(name) {
+        return None;
+    }
+    // The parameter's declared bound, read through the captured declaration
+    // windows rather than the live scope (the declaring executable is
+    // another one — the official arm reads the *element*, type_system.dart
+    // :873-879, so a use site outside the declaring scope still decides).
+    let (NameTy::Named(bound_head, false) | NameTy::NamedArgs(bound_head, false, _)) =
+        NameTy::from_semantic(engine.param_bound_of(name)?)
+    else {
+        return None;
+    };
+    if bound_head != world.enum_id {
+        return None;
+    }
+    let mut family: Option<StringId> = None;
+    for case in &ctx.cases {
+        let mut leaves = Vec::new();
+        enum_constant_leaves(&case.space, &mut leaves)?;
+        for enum_name in leaves {
+            match family {
+                Some(found) if found != enum_name => return None,
+                Some(_) => {}
+                None => family = Some(enum_name),
+            }
+        }
+    }
+    family.map(Ty::named)
+}
+
+/// Collects the enum-constant leaves of one case root; `None` when any leaf
+/// is not an enum constant (the family is then not witnessed by the cases
+/// alone — the caller declines).
+fn enum_constant_leaves(root: &Restriction, out: &mut Vec<StringId>) -> Option<()> {
+    match root {
+        Restriction::EnumValue(enum_name, _) => {
+            out.push(*enum_name);
+            Some(())
+        }
+        Restriction::Union(parts) => {
+            for part in parts {
+                enum_constant_leaves(part, out)?;
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 // —— records/patterns/exhaustiveness (M2 face) ————————————————————————————
 
 /// The static type the semantic-level exhaustiveness walk uses: the M1

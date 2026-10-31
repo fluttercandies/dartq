@@ -457,6 +457,13 @@ mod ticket_2879_tests;
 #[cfg(test)]
 mod ticket_2216_tests;
 
+/// The #3057 `unused_local_variable` write-vs-read gate pins: the bare
+/// for-in loop-target write retraction and the shared-case-scope
+/// guard-vs-body join split. Kept as a standalone module so the shared
+/// `tests` rig stays untouched while its lane is in flight.
+#[cfg(test)]
+mod ticket_3057_tests;
+
 /// The #1351 faces pinned end-to-end: the function-type-alias boundedness
 /// gate, the const-eval deferred-creation walk, the formals' reach into
 /// the argument check, and the flow-fact joins (the nullable-condition
@@ -1587,6 +1594,14 @@ pub fn fold_unit_with_ops<'t>(
     };
     engine.invalid_type_names = invalid_names.clone();
     engine.resolve_rows(&promotions);
+    // The #3005 deferred `is`/`is!` verdicts re-decide now that the flow
+    // rows stand: pass-1's `check_type_check` ran before the
+    // `PromotedRead`/`ReadType` facts existed, so a promoted operand read
+    // replays the verdict against its flow-aware static type (the
+    // upstream `leftNode.typeOrThrow` face). Emissions stage into
+    // `report.usage` — the tail is taken and source-ordered below, so the
+    // rows merge with the verifier-family diagnostics.
+    engine.deferred_type_checks(&promotions);
     // The discarded-value folds (`checkConstructorInvocation`) and the
     // `unless` parameter co-row (`_findUndefinedUseResultParameter`) run
     // after the resolve arms: the folds read the final used set, the co-row
@@ -5752,3 +5767,10 @@ mod ticket_3064_tests;
 /// no formal-inference source).
 #[cfg(test)]
 mod ticket_3067_tests;
+
+/// The #2499 pins: the unnamed extension face's members report exactly
+/// once — the `DeclKind::Member` arm defers every unnamed-face verdict to
+/// the extension face loop (the duplicate emission staged the row from
+/// both the site arm and the loop).
+#[cfg(test)]
+mod ticket_2499_tests;

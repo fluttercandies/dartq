@@ -1764,6 +1764,33 @@ impl<'a> Engine<'a> {
             // extension-application probe, the scope-parameter bound, and
             // the `==` Object exclusion ride it.
             Receiver::Typed { ty, .. } => self.check_operator_expr(ty, row),
+            // The composite receiver row (`(c ? a : b) + 1`, `(l ?? r) +
+            // 1`, `a[i] + 1`, `x.f() + 1`): the re-derived static face
+            // answers the operator's definedness exactly like the typed
+            // arm — `recv_expression_ty` re-enters the read-fact /
+            // index-result / compound chain on the row's own span. The
+            // dynamic/unknown faces stay silent inside the shared check;
+            // a potentially-nullable face takes the `isNullable` tail's
+            // unchecked row instead (the bare operand's own gate).
+            Receiver::Unknown => {
+                if let Some(ty) = self.recv_expression_ty(row.range) {
+                    if self.potentially_nullable(ty)
+                        && !self.null_aware_members.contains(&row.range.offset)
+                    {
+                        let Intent::Operator(op, _) = row.intent else {
+                            return;
+                        };
+                        let op_text = self.strings.resolve(op).to_string();
+                        self.emit_unchecked_nullable(
+                            op_range,
+                            &op_text,
+                            UncheckedNullableKind::Operator,
+                        );
+                    } else {
+                        self.check_operator_expr(ty, row);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2164,6 +2191,24 @@ impl<'a> Engine<'a> {
                     // the face the same way the chained receiver walk's own
                     // `!` probe does (`null_asserted_after`).
                     let ty = self.null_asserted_after(row.range, ty);
+                    // A resolved function-DECLARATION identifier carries
+                    // its signature face (`f + 1` over `int f(int)` reads
+                    // the tear-off `int Function(int)` —
+                    // binary_expression_resolver.dart:425-478's operand
+                    // static type; `f += 1` the compound twin). The
+                    // `BareInfo` payload staged no face for the
+                    // declaration (a bare function name is a tear-off,
+                    // not a call), so the declaration-shape leg that
+                    // answers the chained-receiver family answers this
+                    // one too. The bare INVOCATION's callee keeps its own
+                    // gate (`f()` resolves through the send path).
+                    let ty = if ty == Ty::UNKNOWN
+                        && (matches!(row.intent, Intent::Operator(..)) || adjacent.is_some())
+                    {
+                        self.receiver_decl_shape(row.range).unwrap_or(ty)
+                    } else {
+                        ty
+                    };
                     if let Intent::Operator(_, op_range) = row.intent {
                         // The nullable-dereference face on the operator's own
                         // receiver (#2815 R2 — binary_expression_resolver's
@@ -2332,9 +2377,7 @@ impl<'a> Engine<'a> {
                                         face @ (Ty::Record { .. } | Ty::Function { .. }) => Some(
                                             face.render(&self.strings, &self.boundary.pool()),
                                         ),
-                                        Ty::Named { name, .. } => {
-                                            Some(self.strings.resolve(name).to_owned())
-                                        }
+                                        face @ Ty::Named { .. } => Some(self.ty_display(face)),
                                         _ => None,
                                     };
                                     if let Some(type_text) = type_text {
@@ -3357,8 +3400,304 @@ impl<'a> Engine<'a> {
                 ty => Some(ty),
             };
         }
+        // The compound receiver face (`(c ? a : b).m`, `(a ?? b).m` — the
+        // resolver's `static_type` join, resolver.dart:2426 →
+        // static_type_analyzer.dart:74-92): no staged fact covers the
+        // composite span, so the token-level `??`/`?:` split re-derives
+        // each arm's face through this same chain and joins them
+        // name-level. The walk keys strictly on spans ENDING inside the
+        // receiver (the member token's own end marks the chain's node);
+        // a nested composite re-enters through the recursion under the
+        // same depth cap the chain walk observes.
+        if self.recv_walk_depth.get() < RECV_WALK_DEPTH_CAP {
+            self.recv_walk_depth.set(self.recv_walk_depth.get() + 1);
+            let compound = self.compound_expression_face(read_span);
+            self.recv_walk_depth.set(self.recv_walk_depth.get() - 1);
+            if compound.is_some() {
+                return compound;
+            }
+        }
         let prev = self.chain_node_read(read_span, false)?;
         self.chained_read_static_ty(prev)
+    }
+
+    /// The name-level join of a `??`/`?:` receiver's arm faces — the
+    /// upstream `least_upper_bound` the resolver stamps on the composite's
+    /// `staticType` (binary_expression_resolver.dart:69-109 for `??`,
+    /// conditional_expression_resolver for `?:`). Arms re-derive through
+    /// [`Self::recv_expression_ty`] so promoted reads and chained sends
+    /// type the same way the walk above types them. `None` when the span
+    /// holds no top-level `??`/`?:` (the caller falls to the chain walk)
+    /// or no arm types (the member verdict keeps the under-report).
+    fn compound_expression_face(&self, read_span: SourceRange) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let mut first = tokens.partition_point(|t| t.utf16_offset < read_span.offset);
+        let mut last = tokens.partition_point(|t| t.utf16_offset < read_span.end());
+        // Strip enclosing parens: `(e)` ends at the `)` — the group is the
+        // expression.
+        while last > first + 1
+            && tokens[first].kind == dartq_scanner::TokenKind::OpenParen
+            && self.tokens.matching_end(first) == Some(last - 1)
+        {
+            first += 1;
+            last -= 1;
+        }
+        if last <= first + 1 {
+            return None;
+        }
+        // Depth-0 separator scan: bracket groups jump their matching close
+        // (`matching_end` also covers a `<` the table paired). `?:` is the
+        // LOWEST-precedence operator — when a top-level `?` pairs a `:` it
+        // owns the split (`a ?? b ? c : d` = `(a ?? b) ? c : d`, never
+        // `a ?? (b ? c : d)`), so the conditional outranks the leftmost
+        // `??`. A `?` that never pairs (`T?`'s type suffix, `?[`'s index
+        // probe) falls back to the NEXT `:` regardless: the split
+        // mis-reads the condition side, but the two value arms still
+        // come out intact (`x is int? ? a : b` joins `a`/`b` — the
+        // upstream join's operands).
+        let mut question = None;
+        let mut if_null = None;
+        let mut at = first;
+        while at < last && (question.is_none() || if_null.is_none()) {
+            match tokens[at].kind {
+                dartq_scanner::TokenKind::OpenCurly
+                | dartq_scanner::TokenKind::StringInterpolationExpression
+                | dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::Lt => {
+                    if let Some(close) = self.tokens.matching_end(at) {
+                        if close < last {
+                            at = close + 1;
+                            continue;
+                        }
+                    }
+                    at += 1;
+                }
+                dartq_scanner::TokenKind::QuestionQuestion => {
+                    if_null.get_or_insert(at);
+                    at += 1;
+                }
+                dartq_scanner::TokenKind::Question => {
+                    question.get_or_insert(at);
+                    at += 1;
+                }
+                _ => at += 1,
+            }
+        }
+        if let Some(at) = question {
+            // The matching `:` is the one returning conditional depth to
+            // zero — a nested `a ? b ? x : y : c` keeps the inner arm
+            // whole for the recursion.
+            let mut colon = None;
+            let mut depth = 1u32;
+            let mut first_colon = None;
+            let mut scan = at + 1;
+            while scan < last {
+                match tokens[scan].kind {
+                    dartq_scanner::TokenKind::OpenCurly
+                    | dartq_scanner::TokenKind::StringInterpolationExpression
+                    | dartq_scanner::TokenKind::OpenParen
+                    | dartq_scanner::TokenKind::OpenSquare
+                    | dartq_scanner::TokenKind::Lt => {
+                        if let Some(close) = self.tokens.matching_end(scan) {
+                            if close < last {
+                                scan = close + 1;
+                                continue;
+                            }
+                        }
+                        scan += 1;
+                    }
+                    dartq_scanner::TokenKind::Question => {
+                        depth += 1;
+                        scan += 1;
+                    }
+                    dartq_scanner::TokenKind::Colon => {
+                        if first_colon.is_none() {
+                            first_colon = Some(scan);
+                        }
+                        depth -= 1;
+                        if depth == 0 {
+                            colon = Some(scan);
+                            break;
+                        }
+                        scan += 1;
+                    }
+                    _ => scan += 1,
+                }
+            }
+            if let Some(colon) = colon.or(first_colon) {
+                let then = self.arm_span(&tokens[at + 1..colon], at + 1);
+                let other = self.arm_span(&tokens[colon + 1..last], colon + 1);
+                return self.join_branch_ty(
+                    then.and_then(|span| self.recv_expression_ty(span)),
+                    other.and_then(|span| self.recv_expression_ty(span)),
+                );
+            }
+        }
+        if let Some(at) = if_null {
+            let left = self.arm_span(&tokens[first..at], first);
+            let right = self.arm_span(&tokens[at + 1..last], at + 1);
+            // `LUB(NonNull(lhs), rhs)` — the official `??` result types
+            // the left operand's non-null form (`resolveIfNull`,
+            // binary_expression_resolver.dart:69-109): the expression is
+            // non-null exactly when both the unwrapped left and the
+            // right are.
+            return self.join_branch_ty(
+                left.and_then(|span| self.recv_expression_ty(span))
+                    .map(Self::non_null_form),
+                right.and_then(|span| self.recv_expression_ty(span)),
+            );
+        }
+        None
+    }
+
+    /// One arm's expression span for the [`Self::recv_expression_ty`]
+    /// re-derivation (`lo..hi` are the tokens' table indices). A single
+    /// token IS the read row — its own range is the staged facts' key. A
+    /// composite arm anchors at the LAST token: the chain walk keys
+    /// `member_read_ends` by the member token's end (and
+    /// `index_result_recvs` by the `]`), so the tail token's range
+    /// re-enters that chain without the FIRST token's read facts
+    /// (`local_decl_at_read`, `rebound_read_face`) answering for the whole
+    /// expression. A fully parenthesized arm — the nested `(...)`
+    /// composite — keeps the whole extent so the separator scan
+    /// re-enters. Leading/trailing `?`/`:` tokens a mis-paired
+    /// conditional split leaves behind (`x is int? ? a : b`'s type
+    /// suffix) trim first.
+    fn arm_span(
+        &self,
+        tokens: &[dartq_scanner::Token],
+        lo: usize,
+    ) -> Option<SourceRange> {
+        let mut front = 0usize;
+        let mut len = tokens.len();
+        while len > front
+            && matches!(
+                tokens[front].kind,
+                dartq_scanner::TokenKind::Question | dartq_scanner::TokenKind::Colon
+            )
+        {
+            front += 1;
+        }
+        while len > front
+            && matches!(
+                tokens[len - 1].kind,
+                dartq_scanner::TokenKind::Question | dartq_scanner::TokenKind::Colon
+            )
+        {
+            len -= 1;
+        }
+        if len <= front {
+            return None;
+        }
+        let (first, last) = (&tokens[front], &tokens[len - 1]);
+        let token_end = |token: &dartq_scanner::Token| {
+            dartq_source::byte_offset_to_utf16(
+                self.source,
+                (token.byte_offset + token.byte_len) as usize,
+            )
+        };
+        let offset = if len - front > 1 {
+            // A pure `(...)` arm keeps the group's extent (the nested
+            // composite re-enters the separator scan); every other
+            // composite anchors at the tail token — the chain walk's
+            // `member_read_ends`/`index_result_recvs` keys and the read
+            // facts' span keys all hang there, never at the head token.
+            let pure_group = first.kind == dartq_scanner::TokenKind::OpenParen
+                && self.tokens.matching_end(lo + front) == Some(lo + len - 1);
+            if pure_group {
+                first.utf16_offset
+            } else {
+                last.utf16_offset
+            }
+        } else {
+            first.utf16_offset
+        };
+        let end = token_end(last);
+        Some(SourceRange {
+            offset,
+            length: end.saturating_sub(offset),
+        })
+    }
+
+    /// The name-level `LUB(a, b)` a compound receiver's member verdict
+    /// reads: subtype-related arms collapse to the wider side
+    /// (`LUB(int, num) = num`), `Null` joins to the nullable partner
+    /// (`LUB(Null, T) = T?`), `dynamic`/`void`/`Unknown` absorb the join,
+    /// and an unordered pair keeps the LEFT arm — the under-report
+    /// direction the member face prefers over a wrongly-named container
+    /// (the real hierarchy's `LUB(int, double) = num` climb is a resolved
+    /// back-end question the name level does not answer).
+    fn join_branch_ty(&self, a: Option<Ty>, b: Option<Ty>) -> Option<Ty> {
+        // An arm that types nothing is the oracle's InvalidType operand —
+        // `LUB(InvalidType, X) = X` (least_upper_bound.dart:55): the join
+        // lands on the spelled side, never sinks both.
+        let (a, b) = match (a, b) {
+            (None, other) | (other, None) => return other,
+            (Some(a), Some(b)) => (a, b),
+        };
+        match (a, b) {
+            (Ty::Unknown, _) => Some(b),
+            (_, Ty::Unknown) => Some(a),
+            (Ty::Never, _) => Some(b),
+            (_, Ty::Never) => Some(a),
+            (Ty::Dynamic, _) | (Ty::Void, _) => Some(a),
+            (_, Ty::Dynamic) | (_, Ty::Void) => Some(b),
+            (Ty::Null, other) | (other, Ty::Null) => Some(match other {
+                Ty::Named {
+                    name, args, ..
+                } => Ty::Named {
+                    name,
+                    nullable: true,
+                    args,
+                },
+                Ty::Record { shape, .. } => Ty::Record {
+                    shape,
+                    nullable: true,
+                },
+                Ty::Function { shape, .. } => Ty::Function {
+                    shape,
+                    nullable: true,
+                },
+                other => other,
+            }),
+            _ if a == b => Some(a),
+            _ => {
+                if self.assignable(a, b, false) == Some(true) {
+                    Some(b)
+                } else if self.assignable(b, a, false) == Some(true) {
+                    Some(a)
+                } else {
+                    // The unordered pair joins at the root (`LUB(C1<int>,
+                    // C1<String>) = Object` — the upstream interface-LUB's
+                    // terminal climb, least_upper_bound.dart's common-
+                    // supertypes walk): two unrelated class heads share
+                    // `Object`, and a nullable arm joins to `Object?`. A
+                    // shape/record/function arm has no shared head the
+                    // name level can spell — the left arm stands (the
+                    // under-report direction).
+                    match (a, b) {
+                        (
+                            Ty::Named {
+                                nullable: a_nullable,
+                                ..
+                            },
+                            Ty::Named {
+                                nullable: b_nullable,
+                                ..
+                            },
+                        ) => {
+                            let mut ty = Ty::named(self.intern("Object"));
+                            if a_nullable || b_nullable {
+                                ty = Self::nullable_form(ty);
+                            }
+                            Some(ty)
+                        }
+                        _ => Some(a),
+                    }
+                }
+            }
+        }
     }
 
     /// The staged member-read record whose member token ENDS the span — the
@@ -3395,7 +3734,7 @@ impl<'a> Engine<'a> {
     /// push-time `closure_init_ty` re-derivation) or stays unsolvable here
     /// (the flow layer's declared slot staged `Unknown` and nothing else
     /// recorded the literal's type).
-    fn receiver_decl_shape(&self, read_span: SourceRange, member_offset: u32) -> Option<Ty> {
+    fn receiver_decl_shape(&self, read_span: SourceRange) -> Option<Ty> {
         let reference = self
             .refs
             .iter()
@@ -3436,16 +3775,18 @@ impl<'a> Engine<'a> {
                 Some(self.fn_sig_ty(&sig))
             }
             RefTarget::Local => {
-                // The declaring local's entry keys `local_hits` at the
-                // member row's offset (the merge moved the read's own
-                // hit there); its kind and name-token range drive the
-                // same source walk `initializer_literal_ty` runs at push
-                // time — a `var`-inferred declarator's initializer face,
-                // or a local function's written signature.
-                let hit = *self.local_hits.get(&member_offset)? as usize;
-                let local = self.locals.get(hit)?;
+                // The declaring local's name-token range keys
+                // `local_decl_at_read` — the non-moving twin (`local_hits`
+                // stack indices go stale with `close_frame_locals`'
+                // truncate; the roster itself is gone by pass 2). The
+                // name's own utf16 width lands the walk past the
+                // declarator: a local function's `(` (its written
+                // signature) or a `var`-inferred declarator's `=` (the
+                // initializer face `closure_init_ty` reads).
+                let decl_offset = *self.local_decl_at_read.get(&read_span.offset)?;
+                let name_len = self.strings.resolve(reference.name).len() as u32;
                 let bytes = self.source.as_bytes();
-                let mut at = self.byte_of(local.range.end());
+                let mut at = self.byte_of(decl_offset + name_len);
                 while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
                     at += 1;
                 }
@@ -3453,8 +3794,11 @@ impl<'a> Engine<'a> {
                     // A local function: `ret name(` — the group's written
                     // formals ride `closure_init_ty`'s positional walk; the
                     // return column is the annotation ending at the name
-                    // (absent → `dynamic`, the oracle's inferred face).
-                    Some(b'(') if matches!(local.kind, LocalKind::LocalFunction) => {
+                    // (absent → `dynamic`, the oracle's inferred face). A
+                    // `(` immediately after the name token IS the
+                    // function-declaration shape — a plain variable's
+                    // declarator continues with `=`/`,`/`;`, never `(`.
+                    Some(b'(') => {
                         let sig_ty = self.closure_init_ty(bytes, at);
                         let Ty::Function { shape, .. } = sig_ty else {
                             return None;
@@ -3468,16 +3812,26 @@ impl<'a> Engine<'a> {
                                 shape.named.to_vec(),
                             )
                         };
-                        // The written return annotation ends at the name's
-                        // own offset — the type-use row the group spelled.
-                        // Its absence keeps the face `closure_init_ty`
-                        // derived (the arrow body's own expression type,
-                        // `dynamic` for a block — the oracle's
-                        // uninferred-return posture).
+                        // The written return annotation is the last
+                        // type-use ending before the name — only
+                        // whitespace separates it from the declarator
+                        // (`int f(`: `int`'s row ends a space ahead of
+                        // `f`). Its absence keeps the face
+                        // `closure_init_ty` derived (the arrow body's own
+                        // expression type, `dynamic` for a block — the
+                        // oracle's uninferred-return posture).
+                        let decl_byte = self.byte_of(decl_offset);
                         let Some(ret) = self
                             .type_uses
                             .iter()
-                            .find(|(range, _)| range.end() == local.range.offset)
+                            .filter(|(range, _)| range.end() <= decl_offset)
+                            .filter(|(range, _)| {
+                                self.source.as_bytes()
+                                    [self.byte_of(range.end())..decl_byte]
+                                    .iter()
+                                    .all(u8::is_ascii_whitespace)
+                            })
+                            .last()
                             .map(|(_, name)| Ty::named(*name))
                         else {
                             return Some(sig_ty);
@@ -3926,7 +4280,7 @@ impl<'a> Engine<'a> {
                     match self
                         .rebound_local_receiver(row.range.offset, &recv)
                         .or_else(|| self.recv_expression_ty(read_span))
-                        .or_else(|| self.receiver_decl_shape(read_span, row.range.offset))
+                        .or_else(|| self.receiver_decl_shape(read_span))
                     {
                         Some(
                             face @ Ty::Named {
@@ -4926,7 +5280,20 @@ impl<'a> Engine<'a> {
                 // under an absent `m=` reports the setter write.
                 if row.intent == Intent::ReadWrite {
                     let name_text = self.strings.resolve(row.name);
-                    let type_text = self.strings.resolve(container).to_string();
+                    // A typed receiver's miss names its static type under
+                    // the oracle's `getDisplayString` render — the
+                    // instantiate-to-bounds fill (`Map` → `Map<dynamic,
+                    // dynamic>`) or the written arguments as spelled. A
+                    // `this`-family receiver's instance face is the bare
+                    // head the model honestly carries (`C`, whose `C<T>`
+                    // display is the type-parameter list no face spells).
+                    let type_text = match recv {
+                        Receiver::Typed {
+                            ty: ty @ Ty::Named { .. },
+                            ..
+                        } => self.ty_display(ty),
+                        _ => self.strings.resolve(container).to_string(),
+                    };
                     if getter_absent {
                         self.emit(
                             SemanticCode::UndefinedGetter,
@@ -4981,7 +5348,13 @@ impl<'a> Engine<'a> {
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
-            let type_text = self.strings.resolve(container).to_string();
+            let type_text = match recv {
+                Receiver::Typed {
+                    ty: ty @ Ty::Named { .. },
+                    ..
+                } => self.ty_display(ty),
+                _ => self.strings.resolve(container).to_string(),
+            };
             match row.intent {
                 Intent::Invoke => {
                     self.emit(
@@ -5165,7 +5538,18 @@ impl<'a> Engine<'a> {
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
-        let type_text = self.strings.resolve(report_on).to_string();
+        // The typed receiver's miss names its static type under the
+        // oracle's `getDisplayString` render — the promoted head fills its
+        // instantiate-to-bounds arguments (`Map` → `Map<dynamic,
+        // dynamic>`), a written-argument face keeps them (`G<int>`). Every
+        // `this` stays the bare head — the extension `on` type's arguments
+        // are the extension's own type parameters, never a face the user
+        // spelled (`this.nope()` inside `extension Tap<T> on Stream<T>`
+        // names `Stream`).
+        let type_text = match (recv, receiver_ty) {
+            (Receiver::Typed { .. }, ty @ Ty::Named { .. }) => self.ty_display(ty),
+            _ => self.strings.resolve(report_on).to_string(),
+        };
         match row.intent {
             Intent::Invoke => self.emit(
                 SemanticCode::UndefinedMethod,
@@ -5968,6 +6352,30 @@ impl<'a> Engine<'a> {
         receiver_nullable: bool,
     ) {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        // A record field resolves the READ face only — records are
+        // immutable upstream (`property_element_resolver`'s record arm
+        // consults the field getters; no setter element exists), so a
+        // write to an existing field reports `undefined_setter` on the
+        // record (`r.bar = v`), and a compound read-write the same
+        // (`r.bar += 1` — the getter resolved, the setter's face alone
+        // reports). `receiver_nullable` stays ahead: the `isNullable`
+        // tail's unchecked row precedes the `undefined_*` family.
+        if write
+            && !receiver_nullable
+            && matches!(shape_ty, Ty::Record { .. })
+            && self
+                .record_field_ty(
+                    shape_ty,
+                    row.name,
+                    self.null_aware_members.contains(&row.range.offset),
+                )
+                .is_some()
+        {
+            let name_text = self.strings.resolve(row.name);
+            self.emit(SemanticCode::UndefinedSetter, row.range, name_text, display);
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            return;
+        }
         // `call` resolves a non-nullable function receiver's own signature
         // (`callFunctionType`, type_property_resolver.dart:202-209) — a
         // nullable receiver reaches it only through the extension/`Object`
@@ -5979,7 +6387,13 @@ impl<'a> Engine<'a> {
         let resolved_spelling = if (!receiver_nullable
             && matches!(shape_ty, Ty::Function { .. })
             && row.name == self.intern("call"))
-            || matches!(shape_ty, Ty::Record { .. })
+            // A record field resolves the READ face only — records are
+            // immutable upstream (`property_element_resolver`'s record arm
+            // consults the field getters; no setter element exists), so
+            // `r.bar = v` reports `undefined_setter` on the record even
+            // though `bar` is a declared field.
+            || !write
+                && matches!(shape_ty, Ty::Record { .. })
                 && self
                     .record_field_ty(
                         shape_ty,
@@ -7108,7 +7522,12 @@ impl<'a> Engine<'a> {
         if missing.is_empty() {
             return;
         }
-        let type_text = self.strings.resolve(name).to_string();
+        // The receiver's display is the oracle's `getDisplayString` face —
+        // instantiate-to-bounds fills a raw head's arguments
+        // (`Map` → `Map<dynamic, dynamic>`), the written ones render as
+        // spelled (`is G<int>` → `G<int>`). `ty_display` is the shared
+        // render.
+        let type_text = self.ty_display(ty);
         for text in missing {
             self.emit(SemanticCode::UndefinedOperator, op_range, &text, &type_text);
         }
@@ -9102,6 +9521,7 @@ impl<'a> Engine<'a> {
 mod tests {
     use super::*;
     use crate::collector::collect;
+    use crate::diagnose::test_rig::report_ops;
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_resolution::{CombinatorClause, Combinators, LibraryGraphBuilder};
     use dartq_scanner::ScanConfig;
@@ -10456,5 +10876,398 @@ mod tests {
             "{:?}",
             report.diagnostics[0].message
         );
+    }
+
+    // —— the #3058 is-narrow receiver-typing pins —————————————————————
+    //
+    // An `is` test on a `dynamic`/untyped receiver re-types the narrowed
+    // reads so the `[]`/`[]=` operator faces consult the promoted
+    // interface, never an unnamed carrier. The historical board
+    // shared-root (~2895 co19 aux rows): `expected[key]` under
+    // `expected is Map` in co19's `expect_common.dart` typed the `[]`
+    // receiver as the empty-named face and cascaded `undefined_operator`
+    // across nearly every co19 case. The substrate resolves the promoted
+    // face (the flow's typed promotion spells the tested interface —
+    // upstream `isExpression_end`'s promotion split through
+    // `tryPromoteForTypeCheck` into `FlowModel.write`'s
+    // `promoteToTypeOfInterest` → `_tryPromoteToTypeOfInterest`, official
+    // Dart SDK source,
+    // pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart
+    // :2026, :5955, :3863-3866, :3982) and
+    // [`Self::check_operator_expr_in`]'s `Ty::Named` arm
+    // walks it; the dynamic face itself stays silent
+    // (type_system.dart:899's `isDynamicBounded`
+    // short-circuit). Every pin was A/B'd against the oracle
+    // (`dart analyze`: the shapes silent or reporting identically); these
+    // tests lock that 1:1.
+
+    /// The `undefined_operator` messages, one per reported row (the
+    /// reported receiver type rides inside the quotes).
+    fn undefined_operator_messages(report: &FileReport) -> Vec<String> {
+        report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_operator")
+            .map(|d| d.message.to_string())
+            .collect()
+    }
+
+    /// `d is Map` narrows a `dynamic` receiver to the `Map` interface: the
+    /// index read resolves on it, no `undefined_operator`.
+    #[test]
+    fn is_map_narrowed_dynamic_index_silent() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is Map) {\n\
+             \x20   d[0];\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// `d is List` — the same face on the list twin.
+    #[test]
+    fn is_list_narrowed_dynamic_index_silent() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is List) {\n\
+             \x20   d[0];\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// Scalar narrows ride the same substrate: `d is int` re-types the
+    /// read so `+` resolves on `int` (oracle-silent).
+    #[test]
+    fn is_int_narrowed_dynamic_plus_silent() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is int) {\n\
+             \x20   d + 1;\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// `d is String` — the scalar twin through `String`'s own `+`.
+    #[test]
+    fn is_string_narrowed_dynamic_concat_silent() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is String) {\n\
+             \x20   d + 'a';\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// The written-argument narrow (`is Map<String, int>`) types the index
+    /// read against the instantiated interface.
+    #[test]
+    fn is_generic_map_narrowed_index_silent() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is Map<String, int>) {\n\
+             \x20   d['k'];\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// The `[]=` write face on a narrowed `dynamic` receiver: the promoted
+    /// interface's write spelling resolves.
+    #[test]
+    fn is_narrowed_dynamic_index_write_silent() {
+        let report = report_ops("class Box {\n\
+             \x20 operator []=(int i, int v) {}\n\
+             }\n\
+             void f(dynamic d) {\n\
+             \x20 if (d is Box) {\n\
+             \x20   d[0] = 1;\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// The `&&`-joined narrow promotes both conjuncts into the
+    /// then-branch — the co19 `_deepEquals` shape (`expected is Map &&
+    /// actual is Map`).
+    #[test]
+    fn and_joined_is_narrow_both_index_silent() {
+        let report = report_ops("void f(dynamic expected, dynamic actual) {\n\
+             \x20 if (expected is Map && actual is Map) {\n\
+             \x20   expected['a'];\n\
+             \x20   actual['b'];\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// The negative narrow feeds the guard's tail: `is!` + return promotes
+    /// the remainder, the index read resolves (co19 `checkFailures` shape).
+    #[test]
+    fn is_not_guard_tail_index_silent() {
+        let report = report_ops("void f(dynamic failures) {\n\
+             \x20 if (failures is! List) return;\n\
+             \x20 failures[0];\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// The co19 `expect_common.dart` `deepEquals` shape itself: untyped
+    /// parameters narrowed through an if/else-if chain, index reads on
+    /// both branches feeding a call. The exact face that cascaded the
+    /// ~2895 aux rows — silent on both engines.
+    #[test]
+    fn deep_equals_shape_index_silent() {
+        let report = report_ops("void plan2check(a, b) {}\n\
+             void deepEquals(expected, actual) {\n\
+             \x20 if (expected is Map) {\n\
+             \x20   plan2check(expected['k'], actual['k']);\n\
+             \x20 } else if (expected is List) {\n\
+             \x20   plan2check(expected[0], actual[0]);\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// Negative (oracle-matching): a narrow to a type that genuinely lacks
+    /// the spelling still reports — `d is int` then `d[0]` names `int`,
+    /// not `''` and not `dynamic`.
+    #[test]
+    fn is_int_narrowed_index_still_reports_named_type() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is int) {\n\
+             \x20   d[0];\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec!["The operator '[]' isn't defined for the type 'int'.".to_string()]
+        );
+    }
+
+    /// Negative (oracle-matching): the write twin — `d is int` then
+    /// `d[0] = 1` reports `[]=` on `int`.
+    #[test]
+    fn is_int_narrowed_index_write_still_reports_named_type() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is int) {\n\
+             \x20   d[0] = 1;\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec!["The operator '[]=' isn't defined for the type 'int'.".to_string()]
+        );
+    }
+
+    // —— the #3058 display face ————————————————————————————————————————
+    //
+    // A narrowed head renders the oracle's `getDisplayString` face: a
+    // raw `Map` fills instantiate-to-bounds (`Map<dynamic, dynamic>`),
+    // a written-argument test keeps its spelling (`G<int>`).
+
+    /// `d is Map` + `d + 1` — the miss names `Map<dynamic, dynamic>`,
+    /// not the bare head.
+    #[test]
+    fn is_map_narrowed_operator_miss_renders_instantiated() {
+        let report = report_ops("void f(dynamic d) {\n\
+             \x20 if (d is Map) {\n\
+             \x20   d + 1;\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec![
+                "The operator '+' isn't defined for the type 'Map<dynamic, dynamic>'."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `d is G<int>` — the written argument rides the promoted face.
+    #[test]
+    fn is_generic_narrowed_operator_miss_renders_written_args() {
+        let report = report_ops("class G<T> {}\n\
+             void f(dynamic d) {\n\
+             \x20 if (d is G<int>) {\n\
+             \x20   d + 1;\n\
+             \x20 }\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec!["The operator '+' isn't defined for the type 'G<int>'.".to_string()]
+        );
+    }
+
+    // —— the #3081 function-identifier receiver ————————————————————————
+    //
+    // A bare function identifier evaluates to the tear-off — its static
+    // type is the signature face (`binary_expression_resolver.dart`:
+    // 425-478). `f + 1` reports the operator miss on `int Function(int)`.
+
+    /// Top-level function identifier as an operator operand.
+    #[test]
+    fn fn_identifier_binary_reports_function_type() {
+        let report = report_ops("int f(int x) => x;\n\
+             void g() {\n\
+             \x20 f + 1;\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec![
+                "The operator '+' isn't defined for the type 'int Function(int)'."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The same face on a local function declaration.
+    #[test]
+    fn local_fn_identifier_binary_reports_function_type() {
+        let report = report_ops("void g() {\n\
+             \x20 int f(int x) => x;\n\
+             \x20 f + 1;\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec![
+                "The operator '+' isn't defined for the type 'int Function(int)'."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The index spelling on the same tear-off (`f[0]` over `int f(int)`
+    /// — the `[]` the co19 cascades apply).
+    #[test]
+    fn fn_identifier_index_reports_function_type() {
+        let report = report_ops("int f(int x) => x;\n\
+             void g() {\n\
+             \x20 f[0];\n\
+             }\n");
+        assert_eq!(
+            undefined_operator_messages(&report),
+            vec![
+                "The operator '[]' isn't defined for the type 'int Function(int)'."
+                    .to_string()
+            ]
+        );
+    }
+
+    // —— the #3082 compound receiver ————————————————————————————————————
+    //
+    // The `?:`/`??` receiver's `static_type` is the arm join (resolver
+    // :2426 → static_type_analyzer.dart:74-92). A member defined on the
+    // joined face resolves; a miss names the join.
+
+    /// `(c ? l1 : l2)[0]` — both arms `List`-faced: the index resolves.
+    #[test]
+    fn conditional_receiver_same_head_index_silent() {
+        let report = report_ops("void f(bool c, List<int> l1, List<int> l2) {\n\
+             \x20 (c ? l1 : l2)[0];\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// `(l1 ?? l2)[0]` — the if-null twin.
+    #[test]
+    fn if_null_receiver_index_silent() {
+        let report = report_ops("void f(List<int>? l1, List<int> l2) {\n\
+             \x20 (l1 ?? l2)[0];\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// The joined face's member check: `LUB(A, B)` on sibling classes
+    /// without a common user base joins left; the `[]` miss names the
+    /// arm type the oracle's LUB produced.
+    #[test]
+    fn conditional_receiver_member_on_joined_face() {
+        let report = report_ops("class A { int get v => 0; }\n\
+             class B extends A {}\n\
+             void f(bool c, A a, B b) {\n\
+             \x20 (c ? a : b).v;\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
+    }
+
+    /// A `??` receiver whose member miss reports the joined face's
+    /// display (the under-report direction stays silent for unordered
+    /// arms; subtype-ordered arms name the wider side).
+    #[test]
+    fn if_null_receiver_member_miss_names_join() {
+        let report = report_ops("class A {}\n\
+             class B extends A {}\n\
+             void f(B? l, B r) {\n\
+             \x20 (l ?? r).nope;\n\
+             }\n");
+        // `LUB(B?, B) = B`; the `nope` miss names `B`.
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.name == "undefined_getter")
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>(),
+            vec!["The getter 'nope' isn't defined for the type 'B'.".to_string()]
+        );
+    }
+
+    // —— cluster H: the record field's write face ————————————————————————
+    //
+    // Records are immutable upstream (`property_element_resolver`'s record
+    // arm consults the field getters; no setter element exists): a write to
+    // an existing field reports `undefined_setter` on the record display.
+
+    /// `r.bar = 3` over `var r = (bar: 1)`: the field resolves the read
+    /// face only, so the write reports `undefined_setter 'bar'` on
+    /// `({int bar})` — the oracle's own row, not silence.
+    #[test]
+    fn record_named_field_write_reports_undefined_setter() {
+        let report = report_ops("void f() {\n\
+             \x20 var r = (bar: 1);\n\
+             \x20 r.bar = 3;\n\
+             }\n");
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.name == "undefined_setter")
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "The setter 'bar' isn't defined for the type '({int bar})'.".to_string()
+            ]
+        );
+    }
+
+    /// The compound `+=` reads the field fine and reports the setter face
+    /// alone (`r.bar += 1` — the read resolved, the write's face misses).
+    #[test]
+    fn record_named_field_compound_write_reports_undefined_setter() {
+        let report = report_ops("void f() {\n\
+             \x20 var r = (bar: 1);\n\
+             \x20 r.bar += 1;\n\
+             }\n");
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.name == "undefined_setter")
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "The setter 'bar' isn't defined for the type '({int bar})'.".to_string()
+            ]
+        );
+    }
+
+    /// A READ of the same field stays silent (the pin's other half: the
+    /// write face alone reports).
+    #[test]
+    fn record_named_field_read_stays_silent() {
+        let report = report_ops("int f() {\n\
+             \x20 var r = (bar: 1);\n\
+             \x20 return r.bar;\n\
+             }\n");
+        assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 }

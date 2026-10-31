@@ -4105,7 +4105,15 @@ impl<'a> Engine<'a> {
             return;
         }
         let world = self.name_world();
-        let value = NameTy::from_semantic(ctx.scrutinee);
+        // An unsolved `T extends Enum` scrutinee (#2456): the oracle solved
+        // the generic call that produced it, so its switch is judged over a
+        // real enum. The case set witnesses that enum
+        // ([`crate::switch_tracker::enum_bound_scrutinee`]); judging the
+        // verdict, the row text, and the deferred re-decision over it is the
+        // solved face. Any other scrutinee keeps its own type.
+        let scrutinee = crate::switch_tracker::enum_bound_scrutinee(&world, &ctx)
+            .unwrap_or(ctx.scrutinee);
+        let value = NameTy::from_semantic(scrutinee);
         for (i, c) in ctx.cases.iter().enumerate() {}
         let cases: Vec<Case<NameTy>> = ctx
             .cases
@@ -4125,7 +4133,7 @@ impl<'a> Engine<'a> {
             Exhaustiveness::NonExhaustive(witnesses) => {
                 let first = witnesses.first();
                 (
-                    self.ty_display(ctx.scrutinee),
+                    self.ty_display(scrutinee),
                     first.map_or(String::new(), |w: &EngineWitness<NameTy>| {
                         w.as_witness(&world)
                     }),
@@ -4292,15 +4300,15 @@ impl<'a> Engine<'a> {
                 // teardown keeps the unrefined verdict verbatim when no
                 // refinement stands. Anything else (a clause-less switch,
                 // an unnameable scrutinee) keeps today's immediate face.
-                if (Self::is_nullable_ty(ctx.scrutinee)
-                    || matches!(ctx.scrutinee, Ty::Named { .. }))
+                if (Self::is_nullable_ty(scrutinee)
+                    || matches!(scrutinee, Ty::Named { .. }))
                     && let Some(first) = ctx.cases.first()
                 {
                     self.pending_switch_coverings.push(PendingSwitchCovering {
                         code,
                         kw: ctx.switch_kw,
                         first_anchor: first.flow_anchor,
-                        scrutinee: ctx.scrutinee,
+                        scrutinee,
                         ty_text,
                         unmatched,
                         suggested,
@@ -4332,9 +4340,26 @@ impl<'a> Engine<'a> {
         pending: &PendingSwitchCovering,
         matched: Option<Ty>,
     ) -> Option<Diagnostic> {
-        let refined = match matched {
-            Some(ty) if ty != pending.scrutinee => NameTy::from_semantic(ty),
-            _ => {
+        let world = self.name_world();
+        // The flow's matched type refines the verdict only when it is a face
+        // the world can decide: a promoted read reaches a declared type, so a
+        // matched spelling no declaration backs (#2456's unsolved parameter,
+        // re-read by the flow from the same unresolved row) refines nothing —
+        // the parse-time verdict stands, rendered against the type it was
+        // decided over.
+        let matched_decides = matched.is_some_and(|ty| {
+            ty != pending.scrutinee
+                && match NameTy::from_semantic(ty) {
+                    NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
+                        world.is_known_head(name)
+                    }
+                    NameTy::Unknown(_) => false,
+                    _ => true,
+                }
+        });
+        let refined = match matched.filter(|_| matched_decides) {
+            Some(ty) => NameTy::from_semantic(ty),
+            None => {
                 return Some(Diagnostic::new(
                     pending.code.severity(),
                     pending.code.code_info(),
@@ -4347,7 +4372,6 @@ impl<'a> Engine<'a> {
                 ));
             }
         };
-        let world = self.name_world();
         let cases: Vec<Case<NameTy>> = pending
             .spaces
             .iter()
@@ -4361,7 +4385,8 @@ impl<'a> Engine<'a> {
             Exhaustiveness::Exhaustive => None,
             Exhaustiveness::NonExhaustive(witnesses) => {
                 let first = witnesses.first();
-                let ty_text = self.ty_display(matched.unwrap_or(pending.scrutinee));
+                let ty_text = self
+                    .ty_display(matched.filter(|_| matched_decides).unwrap_or(pending.scrutinee));
                 let unmatched = first.map_or(String::new(), |w: &EngineWitness<NameTy>| {
                     w.as_witness(&world)
                 });

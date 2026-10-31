@@ -24,6 +24,7 @@
 
 use super::test_rig::{
     RigImport, assert_silent, code_names, report_ops, report_ops_imports,
+    report_ops_wildcards,
 };
 
 /// A bare name declared nowhere reports `undefined_identifier`.
@@ -177,5 +178,98 @@ fn cross_library_public_member_resolves() {
             source: "class A { int get foo => 0; }\n",
         }],
     );
+    assert_silent(&report);
+}
+
+// --- Wildcard `_` declares nothing (wildcard-variables on) ---
+
+// A `_` parameter binds nothing: a read reports `undefined_identifier`
+// (FormalParameterScope skips the name — upstream Dart SDK source,
+// pkg/analyzer/lib/src/dart/element/scope.dart:117-118; LocalScope's
+// formal arm scope.dart:550-554).
+#[test]
+fn wildcard_parameter_read_reports() {
+    let report = report_ops("void f(int _) { _; }\n");
+    assert!(
+        code_names(&report).contains(&"undefined_identifier"),
+        "{report:?}"
+    );
+}
+
+// A `_` local binds nothing: the read reports (`LocalScope.add`'s skip,
+// scope.dart:550-554).
+#[test]
+fn wildcard_local_read_reports() {
+    let report = report_ops("void f() { var _ = 1; _; }\n");
+    assert!(
+        code_names(&report).contains(&"undefined_identifier"),
+        "{report:?}"
+    );
+}
+
+// A `_` pattern binder binds nothing: after a record-pattern declaration
+// the named element resolves and the `_` read reports (a declared `_`
+// pattern variable is skipped — scope.dart:550-554).
+#[test]
+fn wildcard_pattern_binder_read_reports() {
+    let report = report_ops("void f() { var (_, y) = (1, 2); y; _; }\n");
+    let codes = code_names(&report);
+    assert!(
+        codes.contains(&"undefined_identifier"),
+        "{codes:?} {report:?}"
+    );
+}
+
+// A name merely starting with `_` is ordinary: `_x` binds and the read is
+// silent (the rule is the exact spelling `_`, extensions.dart:81).
+#[test]
+fn underscore_prefixed_name_still_resolves() {
+    let report = report_ops("void f() { var _x = 1; _x; }\n");
+    assert_silent(&report);
+}
+
+// A TOP-LEVEL `_` keeps binding — the skip is a frame-scope rule
+// (LocalScope/formal scopes); library-scope names are untouched
+// (scope.dart:537-557 covers locals only).
+#[test]
+fn top_level_wildcard_still_resolves() {
+    let report = report_ops("int _ = 0;\nvoid g() { _; }\n");
+    assert_silent(&report);
+}
+
+// A `_` catch clause parameter binds nothing and stays exempt from
+// unused-catch reporting (the tracked row remains; only the binding is
+// skipped).
+#[test]
+fn wildcard_catch_parameter_is_silent() {
+    let report = report_ops("void f() { try {} catch (_) {} }\n");
+    assert_silent(&report);
+}
+
+// The tracked-row split: an unused `_` local stays exempt from
+// `unused_local_variable` (the wildcard exemption walks the tracked vec,
+// not the resolution set), while an unused ordinary name still reports —
+// the vec kept working.
+#[test]
+fn unused_wildcard_local_stays_exempt() {
+    let report = report_ops("void f() { var _ = 1; var q = 2; }\n");
+    let codes = code_names(&report);
+    assert!(codes.contains(&"unused_local_variable"), "{codes:?}");
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| **code == "unused_local_variable")
+            .count(),
+        1,
+        "the `_` row must stay exempt: {codes:?}"
+    );
+}
+
+// Pre-feature posture (a pre-3.7 library): `_` is an ordinary name — the
+// local binds and the read is silent (extensions.dart:81's feature gate;
+// scope.dart:550-554's skip is feature-conditioned for locals).
+#[test]
+fn pre_feature_underscore_local_binds() {
+    let report = report_ops_wildcards("void f() { var _ = 1; _; }\n", false);
     assert_silent(&report);
 }

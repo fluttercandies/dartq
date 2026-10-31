@@ -1105,6 +1105,23 @@ impl<'a> Engine<'a> {
     /// official clause scope only under-reports undefined-name, the flat
     /// frame's documented direction.
     pub(crate) fn add_local(&mut self, name: StringId) {
+        // A frame-local `_` declares nothing when wildcard-variables is on:
+        // the official scopes skip the name at every frame level —
+        // LocalScope.add (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/element/scope.dart:550-554), and the
+        // formal scopes on the same feature gate (scope.dart:22,
+        // ConstructorInitializerScope; scope.dart:117-118,
+        // FormalParameterScope) — so a later read falls through the lexical
+        // chain to undefined-name. The tracked row is deliberately kept:
+        // [`Self::add_tracked_local`] still pushes the usage entry (the
+        // unused-local wildcard exemption walks the tracked vec, not this
+        // resolution set), only the binding is skipped. The no-frame
+        // branch (the top-level initializer world) stays ordinary — a
+        // top-level `_` is a library-scope name, not a LocalScope row, and
+        // keeps resolving.
+        if self.is_wildcard(name) && self.frames.last().is_some() {
+            return;
+        }
         if let Some(frame) = self.frames.last_mut() {
             frame.locals.insert(name);
         } else {

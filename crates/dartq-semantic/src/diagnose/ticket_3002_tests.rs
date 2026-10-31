@@ -102,11 +102,10 @@ fn undecidable_pairs_stay_silent() {
 /// The initializer's non-null promotion (`int? q = 0`) is the flow's
 /// `PromotedRead` face: `q`'s read inside `q is int` carries the promoted
 /// `int` — a `isSubtypeOf(int, int)` constant-true upstream. The pass-1
-/// verdict runs before the flow replay, so the row under-reports here;
-/// the pinned expectation is the oracle's answer (the promoted-operand
-/// re-decision the #3002 residual documents).
+/// verdict runs before the flow replay; #3005's deferred-verdict pass
+/// (`Engine::deferred_type_checks`) re-decides the site against the
+/// materialized read rows and emits the oracle's row.
 #[test]
-#[ignore = "promoted-operand re-decision needs an Engine staging channel (types.rs) — #3002 residual"]
 fn initializer_promoted_operand_reports_true() {
     let fixture = concat!(
         "void t() {\n",
@@ -149,14 +148,14 @@ fn dynamic_operand_stays_silent() {
 /// head is constant-true, a `is!` of it constant-false, and an
 /// unrelated target stays a runtime question.
 ///
-/// Residual (#3002): `check_type_check` runs in pass 1, before the flow
-/// replay stages the `PromotedRead`/`ReadType` facts, so the operand's
-/// promoted face is not yet answerable — the oracle's rows under-report.
-/// The fix needs a deferred verdict channel (`Engine` staging in
-/// types.rs + a teardown re-decision beside `filter_staged`) that this
-/// ticket's scope forbids; the assertions pin the oracle's truth.
+/// Residual (#3002 → #3005): `check_type_check` runs in pass 1, before
+/// the flow replay stages the `PromotedRead`/`ReadType` facts, so the
+/// operand's promoted face was not yet answerable. #3005's deferred
+/// re-decision (`Engine::deferred_type_checks`, run after
+/// `resolve_rows` beside the `filter_staged` teardown) replays the
+/// verdict against the materialized read rows; the assertions pin the
+/// oracle's truth.
 #[test]
-#[ignore = "promoted-operand re-decision needs an Engine staging channel (types.rs) — #3002 residual"]
 fn promoted_operand_reads_promoted_ty() {
     let fixture = concat!(
         "void t() {\n",

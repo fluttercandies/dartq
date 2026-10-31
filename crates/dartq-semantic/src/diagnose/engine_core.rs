@@ -1532,6 +1532,152 @@ impl<'a> Engine<'a> {
         ))
     }
 
+    /// The utf16 offsets of bare for-in loop targets: `for (i in …)`'s `i`,
+    /// where the head carries no `var`/`final`/`const`/`late` declaration
+    /// keyword. Upstream the loop variable is the `ForEachPartsWithIdentifier`'s
+    /// assignment target — a WRITE per iteration, never a read — so the
+    /// official verifier's `_isReadIdentifier` (`inGetterContext` fails)
+    /// refuses the used-element credit
+    /// (unused_local_elements_verifier.dart:429-453): `int i; for (i in xs)`
+    /// still reports `unused_local_variable` on `i`. The row path credits a
+    /// bare `i` `resolve_local` use it never converts (no `=`/compound arm
+    /// reaches it), so the close retracts the write-position hits here.
+    ///
+    /// Returns the identifier token's own utf16 offset per bare-target head —
+    /// the `local_hits` key the row's read credit parked at. A `var`/typed/
+    /// pattern head declares its own loop variable (its `LocalVariableDeclaration`
+    /// tracking reports separately) and yields no write offset; a head whose
+    /// `(`..`in` window carries anything but a single identifier (a pattern
+    /// destructure, a metadata annotation, recovery debris) is left alone —
+    /// under-reporting the write rather than mis-crediting a read.
+    fn for_in_write_offsets(&self) -> FxHashSet<u32> {
+        let mut writes = FxHashSet::default();
+        let tokens = self.tokens.as_slice();
+        for i in 0..tokens.len() {
+            if tokens[i].kind
+                != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::For)
+            {
+                continue;
+            }
+            // The `(` opens immediately after `for` (`await for` parks the
+            // `await` before the `for`, not between `for` and `(`). A
+            // non-paren token here is a `for`-element keyword or recovery —
+            // never a loop-variable head.
+            let open_idx = i + 1;
+            if tokens.get(open_idx).is_none_or(|t| {
+                t.is_synthetic() || t.kind != dartq_scanner::TokenKind::OpenParen
+            }) {
+                continue;
+            }
+            // The head's `in` keyword before the paren's close — the loop
+            // variable region is `( .. in`. `await` before `(` is fine.
+            let Some(close_idx) = self.tokens.matching_end(open_idx) else {
+                continue;
+            };
+            let Some(in_rel) = tokens[open_idx + 1..close_idx]
+                .iter()
+                .position(|t| {
+                    t.kind
+                        == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
+                })
+            else {
+                continue;
+            };
+            let in_idx = open_idx + 1 + in_rel;
+            let head = &tokens[open_idx + 1..in_idx];
+            // A bare existing-variable target: exactly one identifier token,
+            // no declaration keyword (`var`/`final`/`const`/`late`), no
+            // pattern or type structure. Any other shape declares or
+            // destructures and reports through its own tracking.
+            let mut target: Option<u32> = None;
+            let mut bare = true;
+            for tok in head {
+                match tok.kind {
+                    dartq_scanner::TokenKind::Identifier => {
+                        if target.is_some() {
+                            // A second identifier (a written type name
+                            // before the variable, or a pattern head) — not
+                            // the bare-target shape.
+                            bare = false;
+                            break;
+                        }
+                        target = Some(tok.utf16_offset);
+                    }
+                    dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Var)
+                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final)
+                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Const)
+                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Late) => {
+                        bare = false;
+                        break;
+                    }
+                    _ => {
+                        bare = false;
+                        break;
+                    }
+                }
+            }
+            if bare && let Some(offset) = target {
+                writes.insert(offset);
+            }
+        }
+        writes
+    }
+
+    /// The `(start, end)` utf16 windows of `when` guard clauses: a read whose
+    /// offset lands inside one resolved the case head's OWN pattern variable
+    /// (the official `_resolveGuardedPattern` resolves the guarded pattern's
+    /// individual `BindPatternVariableElement`, never the shared-case-scope
+    /// joined element — resolution_visitor.dart:926-929). The window ends at
+    /// the head's `:`/`=>` terminator (or the `;`/`{`/`}`/`case`/`default` a
+    /// recovered head runs into): nested parens/brackets/braces jump whole so
+    /// an argument list or collection literal inside the guard can't forge
+    /// the boundary.
+    ///
+    /// Reads OUTSIDE every window against an arm-scoped binder are BODY
+    /// reads — the joined element's own scope — and those are the only reads
+    /// the all-cases join spares through `arm_name_used`
+    /// (`UsedLocalElements.addElement` expanding a
+    /// `JoinPatternVariableElementImpl`'s transitiveVariables,
+    /// unused_local_elements_verifier.dart:1237-1241).
+    fn guard_spans(&self) -> Vec<(u32, u32)> {
+        let mut spans = Vec::new();
+        let tokens = self.tokens.as_slice();
+        for i in 0..tokens.len() {
+            if tokens[i].kind
+                != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::When)
+            {
+                continue;
+            }
+            let mut end = tokens[i].utf16_offset;
+            let mut j = i + 1;
+            while j < tokens.len() {
+                match tokens[j].kind {
+                    dartq_scanner::TokenKind::Colon
+                    | dartq_scanner::TokenKind::Function
+                    | dartq_scanner::TokenKind::Semicolon
+                    | dartq_scanner::TokenKind::CloseCurly
+                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case)
+                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default) => {
+                        end = tokens[j].utf16_offset;
+                        break;
+                    }
+                    // A group opener's whole extent jumps past its close —
+                    // `:`/`=>` inside `f(…)`, `[…]`, `{…}` is the group's own.
+                    dartq_scanner::TokenKind::OpenParen
+                    | dartq_scanner::TokenKind::OpenSquare
+                    | dartq_scanner::TokenKind::OpenCurly => {
+                        j = self.tokens.matching_end(j).unwrap_or(j) + 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            spans.push((tokens[i].utf16_offset, end));
+        }
+        spans
+    }
+
     /// A spread operand's window: the tokens between the `...` operator
     /// and the element boundary at the operator's own nesting depth (the
     /// next `,` or closing bracket; the boundary's index rides along for
@@ -1902,24 +2048,71 @@ impl<'a> Engine<'a> {
         // another.
         let mut group_used: FxHashMap<u32, bool> = FxHashMap::default();
         let mut arm_name_used: FxHashSet<(u32, StringId)> = FxHashSet::default();
-        for decl in &self.locals[mark..] {
+        // The write-position hits that still ride `local_hits`: a bare
+        // for-in loop target (`for (i in xs)`'s `i`) resolves a read credit
+        // the official `_isReadIdentifier` refuses — the loop assigns `i`,
+        // it never reads it. The hit's offset is the write position; the
+        // count of a declaration's surviving read credits that sit on a
+        // write offset is subtracted before the `uses > 0` gate below.
+        let for_in_writes = if self.local_hits.is_empty() {
+            FxHashSet::default()
+        } else {
+            self.for_in_write_offsets()
+        };
+        // The arm-scope split the official shared-case-scope join draws:
+        // a `when` guard's read resolves the case head's OWN binder (the
+        // individual `BindPatternVariableElement`), while a body-statement
+        // read resolves the joined element — and only the join's
+        // transitiveVariables expansion marks every same-named sibling used.
+        // `guard_spans` gives the `when` extents; a `(group, name)` spelling
+        // joins (spares all) iff a same-named binder took a BODY read — a
+        // crediting hit outside every guard window. A binder's own `uses`
+        // still spares itself below; this set only models the cross-arm join.
+        let guard_spans = self.guard_spans();
+        // Precompute the per-declaration effective read counts (the closures
+        // would hold an immutable borrow across the mutable `stage_usage`
+        // below): `effective[i]` = `uses` minus the for-in write-position
+        // hits, `body_read[i]` = whether a surviving credit sits outside a
+        // `when` guard.
+        let mut effective_uses = Vec::with_capacity(self.locals.len() - mark);
+        for (offset, decl) in self.locals[mark..].iter().enumerate() {
+            let index = mark + offset;
+            let write_hits = if for_in_writes.is_empty() {
+                0
+            } else {
+                self.local_hits
+                    .iter()
+                    .filter(|(o, hit)| **hit as usize == index && for_in_writes.contains(*o))
+                    .count() as u32
+            };
+            let body_read = self.local_hits.iter().any(|(o, hit)| {
+                *hit as usize == index
+                    && !guard_spans
+                        .iter()
+                        .any(|(s, e)| *o >= *s && *o < *e)
+            });
+            effective_uses.push((decl.uses.saturating_sub(write_hits), body_read));
+        }
+        for (offset, decl) in self.locals[mark..].iter().enumerate() {
+            let (effective, body_read) = effective_uses[offset];
             match decl.group {
                 Some(group) if group >= ARM_SCOPE_SENTINEL_BASE => {
-                    if decl.uses > 0 {
+                    if effective > 0 && body_read {
                         arm_name_used.insert((group, decl.name));
                     }
                 }
                 Some(group) => {
-                    *group_used.entry(group).or_default() |= decl.uses > 0;
+                    *group_used.entry(group).or_default() |= effective > 0;
                 }
                 None => {}
             }
         }
         for index in mark..self.locals.len() {
-            let (name, range, kind, uses, group) = {
+            let (name, range, kind, group) = {
                 let decl = &self.locals[index];
-                (decl.name, decl.range, decl.kind, decl.uses, decl.group)
+                (decl.name, decl.range, decl.kind, decl.group)
             };
+            let uses = effective_uses[index - mark].0;
             // Parameters feed the declaration site's body-reference rule
             // (`unused_element_parameter`); they never emit per se.
             if let LocalKind::Parameter { site: Some(site) } = kind {
