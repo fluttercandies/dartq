@@ -2965,6 +2965,16 @@ impl<'a> Engine<'a> {
             .and_then(|level| level.named_head)
             .or(self.pending_bare_creation)
             .or_else(|| levels.as_ref().and_then(|level| level.unnamed_head));
+        // #3208 — the creation's call-site instantiation. A `new`/`const`
+        // creation and a named-selector creation (`C.named(`) carry no
+        // callee row (the constructor reference resolves the head as a
+        // type use and the selector pushes none — the fold arms below own
+        // the group), so the send-close solver never ran and the fold
+        // falls back to the bare head: `C<dynamic>`. Solve the class's
+        // parameters from the group's own argument types first — the same
+        // upward constraints a member send's close solve reads — and hand
+        // the instantiated face to the fold.
+        let creation_ty = self.creation_call_site_ty(levels.as_ref(), bare_head);
         if let Some(level) = &levels {
             self.capture_ffi_invocation(level, close);
         } else {
@@ -3056,7 +3066,7 @@ impl<'a> Engine<'a> {
                         })
                     })
                     .map_or_else(
-                        || Ty::named(class),
+                        || creation_ty.unwrap_or_else(|| Ty::named(class)),
                         |args| self.boundary.args.borrow_mut().named(class, false, &args),
                     );
                 self.rows.push(Row {
@@ -3081,6 +3091,7 @@ impl<'a> Engine<'a> {
                     head,
                     ContainerKind::Class,
                     None,
+                    creation_ty,
                 );
             }
             // The prefix-resolved creation (`const fb.Reader().vTableGet`,
@@ -3112,6 +3123,7 @@ impl<'a> Engine<'a> {
                     head,
                     resolved.kind,
                     Some((resolved, owner)),
+                    None,
                 );
             }
         }
@@ -3482,7 +3494,9 @@ impl<'a> Engine<'a> {
     /// `ctor` is the declaring container and owner file a prefix-resolved
     /// head already carried — the bare namespace walk would read a
     /// same-named container in the wrong scope (the prefixed member
-    /// verdicts' own posture).
+    /// verdicts' own posture). `solved` is the call site's instantiation
+    /// ([`Engine::creation_call_site_ty`]): it types the created row when
+    /// the head spells no written `<...>` group.
     fn fold_unnamed_creation_row(
         &mut self,
         start: u32,
@@ -3491,6 +3505,7 @@ impl<'a> Engine<'a> {
         head: StringId,
         kind: ContainerKind,
         ctor: Option<(&'a Container, FileId)>,
+        solved: Option<Ty>,
     ) {
         let open = self.creation_open_offset(head_range.end());
         let kept = self.rows.partition_point(|row| row.range.offset < open);
@@ -3543,7 +3558,7 @@ impl<'a> Engine<'a> {
                 self.literal_group_args(token)
             })
             .map_or_else(
-                || Ty::named(head),
+                || solved.unwrap_or_else(|| Ty::named(head)),
                 |args| self.boundary.args.borrow_mut().named(head, false, &args),
             );
         self.rows.push(Row {
@@ -3555,6 +3570,194 @@ impl<'a> Engine<'a> {
             write_op: None,
             ty,
         });
+    }
+
+    /// The created type a creation's own arguments instantiate: the
+    /// class's declared parameters solved from the argument types'
+    /// upward constraints ([`Engine::unify_ctor_upward`]) — the same
+    /// structural walk the member send's close solve runs, which a
+    /// constructor send never reaches (constructors are not member rows,
+    /// and the creation's head resolves as a type use, so no callee row
+    /// links). Every parameter materializes: a solved slot keeps its
+    /// single decidable candidate (an agreeing repeat holds; a
+    /// disagreement keeps no binding — under-report beats an invented
+    /// LUB merge), an unsolved one takes its declared bound, else
+    /// `dynamic` (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/generic_inferrer.dart's
+    /// `chooseFinalTypes`, whose still-free parameters read
+    /// `_inferer.typeVariableForSubtype`'s bound over the
+    /// instantiate-to-bounds fill).
+    ///
+    /// `None` keeps the caller's raw-head face (the to-bounds `<dynamic>`
+    /// display residual): an explicit `<...>` group always outranks
+    /// inference, a linked callee row already ran the close solve, and an
+    /// unresolvable head or constructor table leaves nothing to pair.
+    fn creation_call_site_ty(
+        &mut self,
+        level: Option<&ArgLevel>,
+        bare_head: Option<(StringId, SourceRange)>,
+    ) -> Option<Ty> {
+        let level = level?;
+        if level.args.is_empty() || self.invokes.last().is_some_and(|slot| slot.is_some()) {
+            return None;
+        }
+        let (head, head_range) = bare_head?;
+        // The head this group belongs to: the class segment of a named
+        // selector (`C.named(`) or the keyworded head itself (`new C(`).
+        // A resolved class is the only creation head; an implicit send
+        // (`x.foo(`) keeps its own faces.
+        let (class, selector, class_offset) = match self.creation_class_before(head_range) {
+            Some((class, class_offset)) => (class, head, class_offset),
+            None if self.keyword_creation_head(head_range.offset) => (head, head, head_range.offset),
+            None => return None,
+        };
+        if self.type_resolution(class).0 != TypeResolution::Type {
+            return None;
+        }
+        // Explicit type arguments outrank inference: a written `<...>`
+        // group fixes the instantiation even when the reduced parser
+        // cannot recover its members (`new C<int, dynamic>(1, "x")` keeps
+        // the written face, never the argument-solved one).
+        if self.creation_written_type_args(class, class_offset) {
+            return None;
+        }
+        let params: Vec<(StringId, Option<Ty>)> = match self.bounds.container_params(class) {
+            Some(params) if !params.is_empty() => params
+                .iter()
+                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
+                .collect(),
+            // A creation whose class declaration closes after the site
+            // reads no bounds capture mid-parse; the element model's
+            // parameter names stand in unbounded (the same fallback the
+            // argument check's `exec_params` takes).
+            _ => self
+                .foreign_container_params(class)?
+                .into_iter()
+                .map(|param| (param, None))
+                .collect(),
+        };
+        let formals = self.ctor_schema_formals(class, selector)?;
+        let mut candidates: Vec<(StringId, Ty)> = Vec::new();
+        let mut positional = 0usize;
+        for (name, ty, _literal, range) in &level.args {
+            let formal = match name {
+                Some(name) => self.named_formal_for(&formals, *name),
+                None => {
+                    let formal = formals.positional.get(positional);
+                    positional += 1;
+                    formal
+                }
+            };
+            let Some(formal) = formal else {
+                continue;
+            };
+            // A function-typed argument's row may carry no `Ty` — a
+            // closure literal's signature rides `level.closures`, a
+            // tear-off's `arg_sigs` — and still constrains the class's
+            // parameters (`C((int x) => x)` binds `T := int` through
+            // `T Function(T)`). A member-read argument resolves its
+            // accessor return for the solve only, the same face the
+            // send-close walk reads.
+            let arg_ty = if *ty != Ty::UNKNOWN {
+                *ty
+            } else {
+                let sig: Option<Box<FnVarSig>> =
+                    self.arg_sigs.get(&range.offset).cloned().or_else(|| {
+                        level
+                            .closures
+                            .iter()
+                            .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
+                            .map(|(.., sig)| sig.clone())
+                    });
+                match sig {
+                    Some(sig) => self.fn_sig_ty(&sig),
+                    None => match self.solve_arg_member_ty(range.offset) {
+                        Some(ty) => ty,
+                        None => continue,
+                    },
+                }
+            };
+            if arg_ty != Ty::UNKNOWN {
+                self.unify_ctor_upward(formal.ty, arg_ty, &params, &mut candidates);
+            }
+        }
+        let mut solved: Vec<Option<Ty>> = vec![None; params.len()];
+        let mut poisoned: FxHashSet<usize> = FxHashSet::default();
+        for (param, ty) in candidates {
+            let Some(index) = params.iter().position(|(candidate, _)| *candidate == param) else {
+                continue;
+            };
+            if poisoned.contains(&index) || !self.schema_type_is_decidable(ty) {
+                continue;
+            }
+            match solved[index] {
+                None => solved[index] = Some(ty),
+                Some(kept) if kept == ty => {}
+                Some(_) => {
+                    poisoned.insert(index);
+                    solved[index] = None;
+                }
+            }
+        }
+        if solved.iter().all(Option::is_none) {
+            return None;
+        }
+        let args: Vec<Ty> = params
+            .iter()
+            .zip(&solved)
+            .map(|((_param, bound), slot)| slot.or(*bound).unwrap_or(Ty::Dynamic))
+            .collect();
+        Some(self.boundary.args.borrow_mut().named(class, false, &args))
+    }
+
+    /// Whether the creation's class segment spells a written `<...>`
+    /// group (trivia aside): the head's own bytes open an angle group
+    /// before the selector or the argument list.
+    fn creation_written_type_args(&self, name: StringId, offset: u32) -> bool {
+        let head_len = self.strings.resolve(name).encode_utf16().count() as u32;
+        let mut cursor = self.byte_of(offset.saturating_add(head_len));
+        let bytes = self.source.as_bytes();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        cursor < bytes.len() && bytes[cursor] == b'<'
+    }
+
+    /// The upward constraint for one constructor argument: the send-close
+    /// solver's structural walk ([`Engine::unify_upward`]) plus the
+    /// nullable-writable formal arm — a `T?` parameter (`C(T? v)`) binds
+    /// `T` from the argument's non-null head (official `A? <: T?`; the
+    /// same rule the closure-schema unifier applies).
+    fn unify_ctor_upward(
+        &self,
+        formal: Ty,
+        arg: Ty,
+        params: &[(StringId, Option<Ty>)],
+        out: &mut Vec<(StringId, Ty)>,
+    ) {
+        if let Ty::Named {
+            name,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        } = formal
+            && params.iter().any(|(param, _)| *param == name)
+        {
+            let bound = match arg {
+                Ty::Named {
+                    name,
+                    args,
+                    nullable: true,
+                } => Ty::Named {
+                    name,
+                    args,
+                    nullable: false,
+                },
+                other => other,
+            };
+            out.push((name, bound));
+            return;
+        }
+        self.unify_upward(formal, arg, params, out);
     }
 
     /// Starts a new argument in the open argument list (the row window the
@@ -14490,3 +14693,13 @@ mod tests {
 #[cfg(test)]
 #[path = "ticket_2990_tests.rs"]
 mod ticket_2990_tests;
+
+/// The #3208 pins (the constructor send's call-site instantiation —
+/// `new`/`const`/named-selector creations solve the class's parameters
+/// from the group's own argument types, the folded `Created` row carrying
+/// the instantiated face instead of the bare head's `<dynamic>`
+/// residual). Registered here, not in `diagnose.rs` (other lanes' file),
+/// via `#[path]`.
+#[cfg(test)]
+#[path = "ticket_3208_tests.rs"]
+mod ticket_3208_tests;
