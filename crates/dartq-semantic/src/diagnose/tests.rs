@@ -17786,3 +17786,13 @@ mod ticket_3276_tests;
 #[cfg(test)]
 #[path = "ticket_3255_tests.rs"]
 mod ticket_3255_tests;
+
+// The #3250 pins (the void-callee face of a bare invocation send: a
+// `void`-annotated parameter, local or variable invoked bare reports
+// `use_of_void_result` at the callee — upstream
+// `function_expression_invocation_resolver.dart`'s
+// `_checkForUseOfVoidResult(function, function.typeOrThrow)` — while a
+// void-RETURNING function-typed callee stays the legal discard).
+#[cfg(test)]
+#[path = "ticket_3250_tests.rs"]
+mod ticket_3250_tests;

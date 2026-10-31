@@ -11907,6 +11907,26 @@ impl<'a> Engine<'a> {
                     ..
                 } = ty
                 else {
+                    // The void-callee use (`function_expression_invocation_
+                    // resolver.dart:86-96`): the resolver reads
+                    // `function.typeOrThrow` BEFORE the callability walk and
+                    // hands THAT to `_checkForUseOfVoidResult` (:214-222) — an
+                    // invoked expression whose own static type is `void`
+                    // reports at the callee expression and leaves the
+                    // invocation unresolved (`_unresolved(node,
+                    // DynamicTypeImpl.instance)`), so no non-function verdict
+                    // follows and the send's result face stays unknown here.
+                    // The shape is a `void`-annotated parameter or local
+                    // (`void f(void x) { x(); }`) or a `void`-typed variable:
+                    // a function-typed callee never reaches this arm — its
+                    // signature rides `fn_var_sigs` (returned above) or the
+                    // `Ty::Named` alias/`Function` legs below, which is why
+                    // `void Function() f; f();` stays the legal discard.
+                    if *ty == Ty::Void {
+                        let range = row.range;
+                        self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+                        return;
+                    }
                     // A record-typed callee reports both ways the record
                     // face answers upstream: a `call`-named field resolves
                     // through the `recordField != null` arm and a record
