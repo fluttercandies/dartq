@@ -663,6 +663,12 @@ pub(crate) struct Expr {
     /// fire through this flag ([`Interp::guaranteed_non_null`], official
     /// `type.isNonNullable` on the literal's real static type).
     pub non_null_literal: bool,
+    /// The declared return of a captured top-level callable this
+    /// expression reads (see [`crate::record::TopVar::ret`]): a bare
+    /// `Ev::Send` on the read adopts it as the invocation's result — the
+    /// `Never f()` → `f()` exits face (the official's invocation
+    /// result-type `flowEnd`, dead_code_verifier.dart:227-230).
+    pub ret: Option<(Ty, u32)>,
 }
 
 impl Expr {
@@ -684,6 +690,7 @@ impl Expr {
             non_reference_invalid: false,
             ref_chain: false,
             non_null_literal: false,
+            ret: None,
         }
     }
 
@@ -705,6 +712,7 @@ impl Expr {
             non_reference_invalid: false,
             ref_chain: false,
             non_null_literal: false,
+            ret: None,
         }
     }
 
@@ -2271,6 +2279,22 @@ impl<'o> Interp<'o> {
             && self.dead.as_ref().is_some_and(|window| {
                 !window.suppressed && window.anchor.range.offset > short.recv_offset
             });
+        if !close
+            && let Some(window) = &mut self.dead
+            && window.anchor.range.offset <= short.recv_offset
+            && window.trim_end == Some(short.face_end)
+        {
+            // A provisional inner poll (`a?[0]`'s operand literal, polled
+            // before the post-order wrapper lifted the anchor to the
+            // statement's head) may have frozen this chain's own face into
+            // `trim_end` — the lifted anchor sits AT or BEFORE the
+            // receiver, so the interval is the enclosing construct's and
+            // the stale freeze must release (`return; a?[0];` reports
+            // `a?[0];`, never trimmed to `]`). Only THIS short's face is
+            // released — a ForParts updater trim or an enclosing chain's
+            // face keeps its freeze.
+            window.trim_end = None;
+        }
         if close {
             let window = self.dead.take().expect("close gate checked the window");
             let offset = window.anchor.range.offset;
@@ -3898,12 +3922,14 @@ impl Interp<'_> {
         // opening an interval, so the loop's exit path is unaffected (a
         // live condition keeps the tail row-free, probe u3) and a wholly
         // dead loop folds the updaters into its own row instead (probe
-        // u5). First-dead-wins: a window still OPEN when the updaters
-        // begin (an anchor inside the body — the element poll of a
-        // fold-killed for-element) owns the updaters too (the official
-        // `_visitNode` never re-anchors onto a later node); a CLOSED row
-        // leaves the updaters first-dead.
-        if !self.reachable() && !had_dead && self.dead.is_none() {
+        // u5). The gate is ONLY the condition-end snapshot
+        // (`state._firstDeadNodeAsOfConditionEnd == null`,
+        // dead_code_verifier.dart:355): a window OPENED inside the body —
+        // the element poll of a fold-killed for-element — does not
+        // suppress the updaters' own row (`[for (;; 1) ...[throw '', 2]]`
+        // reports `1` and `2]];` — the body's interval keeps its own
+        // anchor and close).
+        if !self.reachable() && !had_dead {
             let mut begin: Option<TokenSpan> = None;
             let mut last: Option<u32> = None;
             for event in &events[bounds.upd.clone()] {

@@ -261,6 +261,31 @@ pub struct Flow<'t> {
     /// now open (`begin_variables_declaration` .. `end_variables_declaration`);
     /// every declarator of the list reads it.
     top_decl: Option<TopVar>,
+    /// The name token of the top-level declaration now open — a
+    /// method/getter/setter (`TopLevelFunctionDeclaration` context) or a
+    /// typedef (`TypedefDeclaration` context) — latched at
+    /// `handle_identifier`, interned and registered into
+    /// [`Flow::top_level`] / [`Flow::type_aliases`] at the declaration's
+    /// end hook. Interning at the end (not the latch) keeps the name
+    /// table's insertion order unchanged for the body's own spellings —
+    /// `Name(id)` baselines never shift from a declaration's capture.
+    top_fn_name: Option<Token>,
+    /// Armed at `begin_top_level_method` when the method opens the
+    /// executable: the FIRST signature type event (`handle_type`,
+    /// `handle_no_type`, `handle_void_keyword`, `end_function_type`) is the
+    /// declared return — later rows are parameter types. [`Flow::top_ret`]
+    /// keeps what it resolved.
+    top_ret_pending: bool,
+    /// The top-level method's declared return (see
+    /// [`Flow::top_ret_pending`]): the invocation-result face a bare send
+    /// on the name adopts; `None` when untyped/`void`/unset.
+    top_ret: Option<(crate::ty::Ty, u32)>,
+    /// The type-position face of each captured typedef (see
+    /// [`Flow::top_fn_name`]): the aliased type a `x is fx`/`x as fx`
+    /// spelling tests, at the name level. `handle_type` substitutes it for
+    /// the raw `Name(id)` face so `topx is! fx` folds through the same
+    /// subtype verdict the official's resolved typedef answers.
+    type_aliases: FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// Open class-like containers (class/mixin/enum/extension/extension
     /// type): a variables declaration under one is a member, not a
     /// top-level declaration.
@@ -353,13 +378,16 @@ pub struct Flow<'t> {
     max_step_permille: u64,
 }
 
-/// One captured top-level variable declaration's read face: the written
-/// type (name-level). Untyped headers answer unknown — the initializer's
-/// inferred type is the type layer's increment.
+/// One captured top-level declaration's read face: the written type
+/// (name-level). Untyped headers answer unknown — the initializer's
+/// inferred type is the type layer's increment. A callable's `ret` is the
+/// declared return a bare invocation adopts (`f()`'s result); `None` for
+/// non-callables and unknown returns.
 #[derive(Clone, Copy)]
 pub(crate) struct TopVar {
     pub(crate) ty: crate::ty::Ty,
     pub(crate) args: u32,
+    pub(crate) ret: Option<(crate::ty::Ty, u32)>,
 }
 
 impl<'t> Flow<'t> {
@@ -411,6 +439,10 @@ impl<'t> Flow<'t> {
             as_type_head: None,
             in_local_fn: false,
             top_decl: None,
+            top_fn_name: None,
+            top_ret_pending: false,
+            top_ret: None,
+            type_aliases: FxHashMap::default(),
             container_depth: 0,
             closed: crate::ty::ClosedNames::default(),
             ops: None,
@@ -1261,11 +1293,50 @@ impl ParserListener for Flow<'_> {
         _augment: Option<Token>,
         _external: Option<Token>,
     ) {
+        // Arm the return-type latch before the signature parses (see
+        // [`Flow::top_ret_pending`]): only a method that opens the
+        // executable declares a face the unit's own reads resolve — an
+        // executable already open means a nested parse context this layer
+        // does not reach here anyway.
+        self.top_ret_pending = self.buffer.is_none();
+        self.top_ret = None;
         self.exec_begin(false);
     }
 
-    fn end_top_level_method(&mut self, _begin: Token, _get_or_set: Option<Token>, end: Token) {
+    fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, end: Token) {
         self.exec_end(false, end);
+        // The callable/readable face (see [`Flow::top_fn_name`] and
+        // [`Flow::top_ret`]): the name latched at the declaration's own
+        // identifier, the return at the first signature type row. A
+        // getter/setter reads its declared type directly (`Never get
+        // foo`'s `foo` read exits — `is_bottom` on the read face); a
+        // method reads as a function-typed tear-off whose `ret` a bare
+        // invocation adopts (`Never f()`'s `f()` exits — the official's
+        // `expressionOrFunctionInvocation` records the invoked element's
+        // return and the send's `flowEnd` exits on the bottom face,
+        // dead_code_verifier.dart:227-230).
+        let ret = self.top_ret.take();
+        self.top_ret_pending = false;
+        if let Some(name_token) = self.top_fn_name.take() {
+            let name = self.name(name_token);
+            let is_get_set = get_or_set.is_some();
+            let face = if is_get_set {
+                ret.unwrap_or((crate::ty::Ty::UNKNOWN, crate::ty::EMPTY_ARGS))
+            } else {
+                (
+                    crate::ty::Ty {
+                        base: crate::ty::Base::Function,
+                        nullable: false,
+                    },
+                    crate::ty::EMPTY_ARGS,
+                )
+            };
+            self.top_level.entry(name).or_insert(TopVar {
+                ty: face.0,
+                args: face.1,
+                ret: if is_get_set { None } else { ret },
+            });
+        }
     }
 
     fn begin_method(
@@ -1747,10 +1818,15 @@ impl ParserListener for Flow<'_> {
             // change member faces the unresolved read keeps).
             let final_header = is_final && late_kw.is_none();
             self.top_decl = header
-                .map(|(ty, args)| TopVar { ty, args })
+                .map(|(ty, args)| TopVar {
+                    ty,
+                    args,
+                    ret: None,
+                })
                 .or(final_header.then_some(TopVar {
                     ty: crate::ty::Ty::UNKNOWN,
                     args: crate::ty::EMPTY_ARGS,
+                    ret: None,
                 }));
         }
     }
@@ -1901,6 +1977,18 @@ impl ParserListener for Flow<'_> {
         // types; an argument row nested in an open group joins it.
         let args = std::mem::take(&mut self.pending_type_args);
         let nullable = question.is_some();
+        // A typedef head carries its aliased face (see
+        // [`Flow::type_aliases`]): `x is fx` tests the alias's own type, so
+        // the row must spell it — `topx is! fx` folds on the name-level
+        // subtype verdict the official's resolved alias answers.
+        let (base, args, nullable) = match self.type_aliases.get(&id) {
+            Some(&(aliased_ty, aliased_args)) if aliased_args == crate::ty::EMPTY_ARGS => (
+                aliased_ty.base,
+                aliased_args,
+                nullable || aliased_ty.nullable,
+            ),
+            _ => (base, args, nullable),
+        };
         if let Some(group) = self.type_arg_groups.last_mut() {
             group.push(crate::ty::ArgTy {
                 base,
@@ -1925,6 +2013,15 @@ impl ParserListener for Flow<'_> {
         // it.
         if self.buffer.is_none() {
             self.top_last_type = Some((crate::ty::Ty { base, nullable }, args));
+        }
+        // The method-return latch (see [`Flow::top_ret_pending`]): the
+        // first signature type row is the declared return — the HEAD row
+        // only: a nested argument row fires first inside its open group
+        // (`List<String>?`'s `String` precedes `List`), so the latch waits
+        // for a row with no open argument group.
+        if self.top_ret_pending && self.type_arg_groups.is_empty() {
+            self.top_ret_pending = false;
+            self.top_ret = Some((crate::ty::Ty { base, nullable }, args));
         }
         // A head row (no open argument group) inside a type-variable
         // completion is that variable's bound — the definitive face for
@@ -1995,6 +2092,9 @@ impl ParserListener for Flow<'_> {
         if self.buffer.is_none() {
             self.top_last_type = None;
         }
+        // An untyped method's return answers unknown too (see
+        // [`Flow::top_ret_pending`]).
+        self.top_ret_pending = false;
     }
 
     fn end_function_type(&mut self, _function: Token, question: Option<Token>) {
@@ -2006,6 +2106,10 @@ impl ParserListener for Flow<'_> {
         if self.buffer.is_none() {
             self.top_last_type = None;
         }
+        // A function-typed method return resolves to the `Function` face —
+        // the same non-`Never` answer an untyped header gives, so the
+        // pending arm simply discharges.
+        self.top_ret_pending = false;
         // A function-type bound's definitive face: fires after its return
         // keyword and any nested argument captures, so it wins. (A `void`
         // return's earlier capture is overwritten here.)
@@ -2039,6 +2143,10 @@ impl ParserListener for Flow<'_> {
         if self.buffer.is_none() {
             self.top_last_type = None;
         }
+        // A `void` method return discharges the pending arm — a void
+        // result never exits, so `ret` stays `None` (see
+        // [`Flow::top_ret_pending`]).
+        self.top_ret_pending = false;
         // A bare `void` bound's provisional face (a top type); a
         // function-type bound overwrites at its own end event.
         if self.tv_capturing() {
@@ -2157,8 +2265,42 @@ impl ParserListener for Flow<'_> {
         });
     }
 
+    fn end_typedef(
+        &mut self,
+        _augment: Option<Token>,
+        _typedef: Token,
+        _equals: Option<Token>,
+        _end: Token,
+    ) {
+        // A typedef's type-position face (see [`Flow::type_aliases`]): the
+        // old-style `typedef fx(x);` aliases a function type; the new-style
+        // `typedef fx = <type>` aliases whatever head the RHS left on
+        // `top_last_type` (a `Function(...)` spelling's own end row clears
+        // the latch, so it lands on the same `Function` face). `handle_type`
+        // substitutes it so `x is fx` folds through the name-level subtype
+        // verdict the official's resolved alias answers.
+        let aliased = self.top_last_type.take().unwrap_or((
+            crate::ty::Ty {
+                base: crate::ty::Base::Function,
+                nullable: false,
+            },
+            crate::ty::EMPTY_ARGS,
+        ));
+        if let Some(name_token) = self.top_fn_name.take() {
+            let name = self.name(name_token);
+            self.type_aliases.entry(name).or_insert(aliased);
+        }
+    }
+
     fn end_top_level_declaration(&mut self, _end: Token) {
         self.boundaries.clear();
+        // A declaration whose name latch went unconsumed (a recovered
+        // shape that never reached its end hook) must not leak the name
+        // or the header type into the next declaration's capture.
+        self.top_fn_name = None;
+        self.top_last_type = None;
+        self.top_ret_pending = false;
+        self.top_ret = None;
     }
 
     fn handle_invalid_top_level_declaration(&mut self, _end: Token) {
@@ -2643,6 +2785,17 @@ impl ParserListener for Flow<'_> {
                 self.pending_labels.push(id);
                 if self.pending_label_token.is_none() {
                     self.pending_label_token = Some(token);
+                }
+            }
+            // The declaration-name latch (see [`Flow::top_fn_name`]): the
+            // name token of the top-level method/getter/setter or typedef
+            // now parsing. The contexts fire only at unit level — a method
+            // name arrives inside its own open executable buffer, so the
+            // container gate alone carries the "top-level" check.
+            IdentifierContext::TopLevelFunctionDeclaration
+            | IdentifierContext::TypedefDeclaration => {
+                if self.container_depth == 0 {
+                    self.top_fn_name = Some(token);
                 }
             }
             _ => {}

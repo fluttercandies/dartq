@@ -219,6 +219,7 @@ impl Interp<'_> {
                             }
                             let mut expr = Expr::trivial(top.ty);
                             expr.args = top.args;
+                            expr.ret = top.ret;
                             expr.read_span = Some(*token);
                             expr.name = Some(*name);
                             // No constant feed: the official never folds a
@@ -401,7 +402,13 @@ impl Interp<'_> {
                 // `checkUnreachableNode` face [`Ev::Int`] carries for the
                 // init/updater slices (`for (;; true, throw 1, false)`'s
                 // trailing `false`); see that arm for the official basis.
-                if self.for_header_depth > self.header_cond_depth {
+                // Outside a header the poll also fires to OPEN the interval
+                // (`dead.is_none()`): a literal element reached dead inside
+                // a collection is the official's first dead node —
+                // `[1, 2, f(), 4]` on `Never f()` anchors `4`. An open
+                // interval keeps ownership (later nodes extend), and the
+                // wrapper's re-anchor lifts statement-level anchors.
+                if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
                     self.dead_code(*span);
                 }
                 // The literal's static type is `bool` (official
@@ -440,8 +447,12 @@ impl Interp<'_> {
                 // fold through [`Interp::arm_dead_depth`]; an open interval
                 // keeps ownership — the poll folds into the enclosing dead
                 // range exactly like the official's `_firstDeadNode !=
-                // null` ignore.
-                if self.for_header_depth > self.header_cond_depth {
+                // null` ignore. Outside a header the poll also fires to
+                // OPEN the interval (`dead.is_none()`): a literal element
+                // reached dead inside a collection is the official's
+                // first dead node — `[1, 2, f(), 4]` on `Never f()`
+                // anchors `4`, the covering close runs to `]`.
+                if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
                     self.dead_code(*span);
                 }
                 // The literal's static type is `int` — the same
@@ -468,8 +479,10 @@ impl Interp<'_> {
                 self.exprs.push(expr);
             }
             Ev::Double { span } => {
-                // The same header-part leaf poll `Ev::Int` carries.
-                if self.for_header_depth > self.header_cond_depth {
+                // The same header-part leaf poll `Ev::Int` carries —
+                // outside a header it also fires to OPEN the interval
+                // (`dead.is_none()`, the dead collection-element face).
+                if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
                     self.dead_code(*span);
                 }
                 // `Ev::Int`'s `double` twin (`num? d = 1.5` promotes `d`
@@ -2503,6 +2516,25 @@ impl Interp<'_> {
                 // identifier keeps its variable reference and promoted type
                 // (a plain assignment's target is exactly such a reference).
                 if let Some(mut callee) = self.exprs.pop() {
+                    // The captured top-level callable's declared return
+                    // (see [`Expr::ret`]): `f()` over `Never f()` adopts
+                    // `Never` as its result — the official's
+                    // `expressionOrFunctionInvocation` records the
+                    // invoked element's return type, so the send's own
+                    // `flowEnd` exits on the bottom face
+                    // (dead_code_verifier.dart:227-230 + the
+                    // `firstDeadNode` poll at the trailing nodes). Only a
+                    // real invocation (`Ev::Send` after `ArgumentsEnd`)
+                    // adopts: a bare `Send` on a leaf is the send-less
+                    // selector face the read already typed.
+                    if matches!(ev, Ev::Send { .. })
+                        && matches!(events.get(i.wrapping_sub(1)), Some(Ev::ArgumentsEnd { .. }))
+                        && let Some((ret_ty, ret_args)) = callee.ret
+                    {
+                        callee.ty = ret_ty;
+                        callee.args = ret_args;
+                        callee.ret = None;
+                    }
                     // An invoked bare head that resolved to nothing: the
                     // head's spelling decides the face. A class-head
                     // spelling (`C()`/`C<T>()` without `new`/`const`) is
