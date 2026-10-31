@@ -2877,12 +2877,52 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // follower is `var`, not `f` (a real name like `super. foo f;`
         // anchors the `(`-expect on the real follower `f`).
         let mut spliced_name_span: Option<TokenSpan> = None;
+        // Span of a reserved keyword the official template CONSUMES as the
+        // `super.` member name with `expectedIdentifierButGotKeyword`
+        // (`ExpressionIdentifierContext.ensureIdentifier` recovery,
+        // identifier_context_impl.dart:429-441): a non-statement-start
+        // reserved head (`super. const f;` → `const`) is the name — the
+        // `(`-expect then anchors on the real follower `f`. Statement-start
+        // keywords (`var`/`final`/`void`/`assert`/...) and junk take the
+        // splice path below instead.
+        let mut keyword_name_span: Option<TokenSpan> = None;
         if self.cursor.look_kind(n) == TokenKind::Period {
             n += 1;
             let name = self.cursor.look_kind(n);
             if !(is_identifier(name) || name == TokenKind::Keyword(Keyword::New)) {
-                // Official `expressionContinuation.ensureIdentifier`.
-                spliced_name_span = Some(self.look_span_at(n));
+                // The template's keyword-as-name arm reaches only reserved
+                // heads that do NOT start a statement (`looksLikeStatementStart`
+                // = assert/break/continue/do/else/final/for/if/return/switch/
+                // try/var/void/while, identifier_context.dart:402-431) — a
+                // statement-start head (`var`/`final`/`void`) splices a name
+                // and stays for the member loop instead.
+                let statement_start_keyword = matches!(
+                    name,
+                    TokenKind::Keyword(
+                        Keyword::Assert
+                            | Keyword::Break
+                            | Keyword::Continue
+                            | Keyword::Do
+                            | Keyword::Else
+                            | Keyword::Final
+                            | Keyword::For
+                            | Keyword::If
+                            | Keyword::Return
+                            | Keyword::Switch
+                            | Keyword::Try
+                            | Keyword::Var
+                            | Keyword::Void
+                            | Keyword::While
+                    )
+                );
+                if matches!(name, TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved)
+                    && !statement_start_keyword
+                {
+                    keyword_name_span = Some(self.look_span_at(n));
+                } else {
+                    // Official `expressionContinuation.ensureIdentifier`.
+                    spliced_name_span = Some(self.look_span_at(n));
+                }
             }
             n += 1;
         }
@@ -2893,8 +2933,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // (`insertParens(includeIdentifier: false)`, parser_impl.dart:4918:
         // the spliced identifier's `next` is `var`, never the `=` after it).
         // A spliced name therefore always routes to the `(`-expect arm — the
-        // `=` declaring-class rider only fires when the name was real
-        // (`super. foo =`), never for a recovered one (`super. var =`).
+        // `=` declaring-class rider only fires when the name was real or
+        // keyword-consumed (`super. foo =` / `super. const =`), never for a
+        // spliced one (`super. var =`).
         let dispatch = if spliced_name_span.is_some() {
             self.cursor.look_kind(n - 1)
         } else {
@@ -2982,6 +3023,37 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.look_span_at(n - 1),
                     );
                 }
+            } else if dispatch != TokenKind::OpenParen && n == 1 {
+                // Bare `super` whose follower is not `(`/`=`/`?.`/`.`
+                // (`C() : super}` / `C() : super foo` /
+                // `C() : super get g => 0;`, parser_impl.dart:4896-4924 —
+                // the `.`-slot check fails before any name step, so `next`
+                // is the construct delimiter itself): the official wraps the
+                // follower in empty parens via
+                // `insertParens(token, includeIdentifier: false)` and
+                // reports `expectedAfterButGot('(')` ON the follower, then
+                // the `parseExpression` re-read consumes `super` + the
+                // spliced `()` as a `super()` send — the delimiter (`}`/
+                // `foo`/`get`) stays current for the member loop.
+                //
+                // The cursor splices synthetics at the cursor only, so the
+                // `()` pair cannot ride mid-stream like the official
+                // rewriter pair — drive the `super()` send directly:
+                // consume `super`, fire `handleSuperExpression`, report the
+                // `(`-expect at the follower, queue the empty `()` at its
+                // offset, run the argument send over it, and return the
+                // initializer end — leaving the delimiter current.
+                self.cursor.advance(); // `super`
+                self.listener
+                    .handle_super_expression(head, IdentifierContext::Expression);
+                let at = self.peek_span();
+                self.report(msg::expected_after_but_got("("), at);
+                self.synthetic(TokenKind::OpenParen, at.range.offset);
+                self.synthetic(TokenKind::CloseParen, at.range.offset);
+                let end = self.parse_arguments_rest();
+                self.listener.handle_send(head, end);
+                self.listener.end_initializer(end);
+                return end;
             } else if dispatch != TokenKind::OpenParen {
                 // `expectedAfterButGot('(')` + `insertParens(includeIdentifier:
                 // false)` (:4948-4952): wrap the follower in empty parens.
@@ -3019,10 +3091,30 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     // and replaces with a synthetic name — `parse_primary`
                     // reads the operand, the `missing_identifier` row fires on
                     // it (the selector-arm law, ast_builder.dart:918).
+                    // A non-statement-start RESERVED head (`super. const f;`)
+                    // is the template's keyword-as-name arm: the official
+                    // consumes it with `expectedIdentifierButGotKeyword`
+                    // (never `parse_primary` — `const f` is not a const
+                    // expression here, the name slot wins).
                     let operand_kind = self.peek_kind();
-                    let operand = self.parse_primary(
-                        IdentifierContext::ExpressionContinuation,
-                    );
+                    let operand = if let Some(kw_span) = keyword_name_span {
+                        self.report(
+                            msg::expected_identifier_but_got_keyword(
+                                self.cursor.lexeme(kw_span.id),
+                            ),
+                            kw_span,
+                        );
+                        self.cursor.advance();
+                        self.listener.handle_identifier(
+                            kw_span,
+                            IdentifierContext::ExpressionContinuation,
+                        );
+                        kw_span
+                    } else {
+                        self.parse_primary(
+                            IdentifierContext::ExpressionContinuation,
+                        )
+                    };
                     let junk_literal = matches!(
                         operand_kind,
                         TokenKind::Int
@@ -3144,6 +3236,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if let Some(at) = spliced_name_span {
             self.report(msg::missing_identifier(), at);
             self.synthetic(TokenKind::Identifier, at.range.offset);
+        }
+        // A non-statement-start reserved head on the same arms
+        // (`super. const = ...`, `super. class (`) takes the template's
+        // keyword-as-name face instead — `expectedIdentifierButGotKeyword`
+        // on the keyword, consumed by the re-read's name slot.
+        if let Some(at) = keyword_name_span {
+            self.report(
+                msg::expected_identifier_but_got_keyword(self.cursor.lexeme(at.id)),
+                at,
+            );
         }
         let end = self.parse_initializer_expression_rest();
         if reject {

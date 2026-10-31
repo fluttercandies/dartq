@@ -209,6 +209,73 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             crate::listener::IdentifierContext::LocalVariableDeclaration => {
                 self.looks_like_statement_start_at(0)
             }
+            // `LocalFunctionDeclarationIdentifierContext.ensureIdentifier`
+            // (identifier_context_impl.dart:805-810): the local-function name
+            // slot splices a synthetic name when the head starts a statement
+            // (`var`/`final`/`void`/`for`/`if`/`return`/...) — the keyword
+            // stays current for the statement loop instead of being eaten as
+            // the function name.
+            crate::listener::IdentifierContext::LocalFunctionDeclaration => {
+                self.looks_like_statement_start_at(0)
+            }
+            // `DottedNameIdentifierContext.ensureIdentifier` recovery arm
+            // (identifier_context_impl.dart:259-266): a top-level-declaration
+            // head in a conditional-uri name slot splices a synthetic name and
+            // stays for the declaration loop — `import 'a.dart' if ( class A {}`
+            // reports `missing_identifier` at `class` and reparses the class at
+            // top level instead of eating `class` as the configuration name.
+            // The other keep-heads (`.`/`==`/`)`/EOF, :236-241) are never
+            // keywords, so this arm covers the whole keyword face.
+            crate::listener::IdentifierContext::DottedName
+            | crate::listener::IdentifierContext::DottedNameContinuation => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+            }
+            // `FieldDeclarationIdentifierContext.ensureIdentifier` recovery
+            // arm (identifier_context_impl.dart:484-492): a member-start head
+            // in the field name slot splices a synthetic name and stays for
+            // the member loop — `class C { A f, var f; }` reports
+            // `missing_identifier` at `var` (never
+            // `expectedIdentifierButGotKeyword`) and `var f;` reparses as the
+            // next field. Reserved member-starts are the modifier set plus
+            // `void` (`isModifier` = abstract/augment/const/covariant/
+            // external/final/late/required/static/var); every other reserved
+            // head (`class`, `enum`, `assert`, ...) keeps the tolerant
+            // consume face — oracle `int class = 42;` carries
+            // `expected_identifier_but_got_keyword` only.
+            crate::listener::IdentifierContext::FieldDeclaration => {
+                self.looks_like_start_of_next_class_member_at(0)
+            }
+            // `MethodDeclarationIdentifierContext.ensureIdentifier` recovery
+            // arm (identifier_context_impl.dart:1159-1166): the same
+            // member-start keep-set on the method name slot and its
+            // continuation/operator/primary-constructor flavors — all four
+            // upstream constants share the impl class. `.`/`(`/`{`/`=>`/`}`/
+            // EOF keep-heads are non-keyword junk handled by
+            // `leave_for_grammar`.
+            crate::listener::IdentifierContext::MethodDeclaration
+            | crate::listener::IdentifierContext::MethodDeclarationContinuation
+            | crate::listener::IdentifierContext::OperatorName
+            | crate::listener::IdentifierContext::PrimaryConstructorDeclaration => {
+                self.looks_like_start_of_next_class_member_at(0)
+            }
+            // `TopLevelDeclarationIdentifierContext.ensureIdentifier`
+            // (identifier_context_impl.dart:1324-1330) for the function-name
+            // flavor: a top-level-declaration head splices a synthetic name
+            // unless the follower continues the function signature —
+            // `followingValues` (`identifier_context.dart:154-162`) is `<`
+            // `(` `{` `=>` `async` `sync` EOF.
+            crate::listener::IdentifierContext::TopLevelFunctionDeclaration => {
+                self.looks_like_start_of_next_top_level_declaration_at(0)
+                    && !matches!(
+                        self.cursor.look_kind(1),
+                        TokenKind::Lt
+                            | TokenKind::OpenParen
+                            | TokenKind::OpenCurly
+                            | TokenKind::Function
+                            | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
+                            | TokenKind::Eof
+                    )
+            }
             // `EnumValueDeclarationIdentifierContext.ensureIdentifier`
             // (identifier_context_impl.dart:346-357): the value-name slot's
             // first recovery arm inserts a synthetic name when the head is a
@@ -429,6 +496,15 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         | crate::listener::IdentifierContext::PartName
                         | crate::listener::IdentifierContext::PartNameContinuation
                         | crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                        | crate::listener::IdentifierContext::TopLevelFunctionDeclaration
+                        | crate::listener::IdentifierContext::FieldDeclaration
+                        | crate::listener::IdentifierContext::MethodDeclaration
+                        | crate::listener::IdentifierContext::MethodDeclarationContinuation
+                        | crate::listener::IdentifierContext::OperatorName
+                        | crate::listener::IdentifierContext::PrimaryConstructorDeclaration
+                        | crate::listener::IdentifierContext::LocalFunctionDeclaration
+                        | crate::listener::IdentifierContext::DottedName
+                        | crate::listener::IdentifierContext::DottedNameContinuation
                         | crate::listener::IdentifierContext::Combinator
                         | crate::listener::IdentifierContext::LocalVariableDeclaration
                         | crate::listener::IdentifierContext::MetadataReference
@@ -463,8 +539,28 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         || context == crate::listener::IdentifierContext::PartName
                         || context == crate::listener::IdentifierContext::PartNameContinuation
                         || context == crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                        // `TopLevelDeclarationIdentifierContext.ensureIdentifier`
+                        // (:1312-1321) gates the built-in top-level head on the
+                        // follower — `void typedef f()` splices (`f` is not a
+                        // signature follower) while `void typedef()` keeps the
+                        // keyword as the name. The arm's follower test is the
+                        // context's `followingValues` (`<` `(` `{` `=>`
+                        // `async` `sync` EOF), so the admit is safe.
+                        || context == crate::listener::IdentifierContext::TopLevelFunctionDeclaration
                         || context == crate::listener::IdentifierContext::Combinator
                         || context == crate::listener::IdentifierContext::TypedefDeclaration
+                        // `DottedNameIdentifierContext` is deliberately NOT
+                        // here: built-in top-level heads (`import`/`library`/
+                        // `part`/`export`/`extension`/`mixin`/`typedef`) take
+                        // the follower-gated identifier arm below — `import.a`
+                        // keeps `import` as the configuration name while
+                        // `import A {}` splices and reparses the directive.
+                        // `FieldDeclaration`/`MethodDeclaration` and their
+                        // continuations are excluded for the same reason
+                        // upstream excludes them: `identifier.isIdentifier`
+                        // early-returns every built-in head silently, so the
+                        // recovery arm is reserved-word-only
+                        // (identifier_context_impl.dart:480-482/:1147-1149).
                         // `TypeVariableDeclarationIdentifierContext.ensureIdentifier`
                         // (identifier_context_impl.dart:1589-1603) tests the
                         // keep-set BEFORE the built-in face: a built-in that
@@ -619,6 +715,82 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 self.listener.handle_identifier(span, context);
                 return span;
             }
+            // `DottedNameIdentifierContext.ensureIdentifier` first arm
+            // (identifier_context_impl.dart:248-256): an identifier-shaped
+            // `isTopLevelKeyword` head (token.dart: class/enum/export/
+            // extension/import/library/mixin/part/typedef — `get`/`set`/
+            // `var`/`void`/`const`/`final` are NOT in that set, so
+            // `if (get.x == 'y')` keeps `get` as the configuration name) is
+            // NOT the dotted name when its own follower leaves the grammar
+            // — the keep-set is `.` `==` `)` EOF (:236-241), so
+            // `import 'a.dart' if (import A {}` splices a synthetic name at
+            // `import` and reparses the import directive, while
+            // `if (import.a == 'x')` keeps `import` as the name. Reserved
+            // heads (`class`, `enum`) never reach this arm — they take the
+            // `reserved_name_recovery_at` arm, which has no follower gate
+            // because a reserved head is never a legal dotted name.
+            if matches!(
+                context,
+                crate::listener::IdentifierContext::DottedName
+                    | crate::listener::IdentifierContext::DottedNameContinuation
+            ) && matches!(
+                peek.kind,
+                TokenKind::Keyword(
+                    Keyword::Export
+                        | Keyword::Extension
+                        | Keyword::Import
+                        | Keyword::Library
+                        | Keyword::Mixin
+                        | Keyword::Part
+                        | Keyword::Typedef
+                )
+            ) && !matches!(
+                    self.cursor.look_kind(1),
+                    TokenKind::Period
+                        | TokenKind::EqEq
+                        | TokenKind::CloseParen
+                        | TokenKind::Eof
+                )
+            {
+                self.report(msg::missing_identifier(), peek.span);
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+                self.cursor.drain_to(id);
+                let span = self.span_of(id);
+                self.listener.handle_identifier(span, context);
+                return span;
+            }
+            // `TopLevelDeclarationIdentifierContext.ensureIdentifier` first
+            // arm (identifier_context_impl.dart:1312-1321) for the
+            // function-name flavor: an identifier-shaped top-level head is
+            // NOT the function name when its follower leaves the signature
+            // grammar — `followingValues` is `<` `(` `{` `=>` `async` `sync`
+            // EOF (`identifier_context.dart:154-162`), so `int typedef() {}`
+            // keeps `typedef` as the name while `int typedef f() {}` splices
+            // and reparses the typedef. Reserved heads take the
+            // `reserved_name_recovery_at` arm (same follower gate).
+            if context == crate::listener::IdentifierContext::TopLevelFunctionDeclaration
+                && self.looks_like_start_of_next_top_level_declaration_at(0)
+                && !matches!(
+                    self.cursor.look_kind(1),
+                    TokenKind::Lt
+                        | TokenKind::OpenParen
+                        | TokenKind::OpenCurly
+                        | TokenKind::Function
+                        | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
+                        | TokenKind::Eof
+                )
+            {
+                self.report(msg::missing_identifier(), peek.span);
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+                self.cursor.drain_to(id);
+                let span = self.span_of(id);
+                self.listener.handle_identifier(span, context);
+                return span;
+            }
             // Analyzer field/variable name check: a built-in keyword that
             // names a top-level declaration (`mixin`, `extension`, ...) is a
             // legal variable name only while the next token continues the
@@ -648,9 +820,14 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         | Keyword::Part
                         | Keyword::Typedef
                 )
+            // The follower keep-set is the context's `followingValues`
+            // (`identifier_context.dart:143`: `=` `,` `;` EOF — a `mixin`/
+            // `typedef` head at statement end IS the variable name, oracle
+            // `int mixin` + EOF reports `expected_token ';'` at `mixin`,
+            // never `missing_identifier`).
             ) && !matches!(
                 self.cursor.look_kind(1),
-                TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon
+                TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon | TokenKind::Eof
             ) {
                 self.report(msg::missing_identifier(), peek.span);
                 let id = self
@@ -786,6 +963,48 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 ))
                 || matches!(peek.kind, TokenKind::Keyword(kw) if !is_identifier(TokenKind::Keyword(kw)))
                 || self.looks_like_statement_start_at(0)
+        } else if matches!(
+            context,
+            crate::listener::IdentifierContext::DottedName
+                | crate::listener::IdentifierContext::DottedNameContinuation
+        ) {
+            // `DottedNameIdentifierContext._isOneOfFollowingValues`
+            // (identifier_context_impl.dart:236-241): the configuration-name
+            // keep-set is `.` `==` `)` EOF plus the next-declaration probe
+            // (:260-261) — `if (.)`/`if (== )`/`if ()` keep the junk current
+            // so the enclosing conditional-uri grammar reads it (oracle
+            // `import 'a' if () 'b.dart';`: one `missing_identifier` at `)`,
+            // no consume-in-doubt).
+            matches!(
+                peek.kind,
+                TokenKind::Period
+                    | TokenKind::EqEq
+                    | TokenKind::CloseParen
+                    | TokenKind::Eof
+            ) || self.looks_like_start_of_next_top_level_declaration_at(0)
+        } else if matches!(
+            context,
+            crate::listener::IdentifierContext::MethodDeclaration
+                | crate::listener::IdentifierContext::MethodDeclarationContinuation
+                | crate::listener::IdentifierContext::OperatorName
+                | crate::listener::IdentifierContext::PrimaryConstructorDeclaration
+        ) {
+            // `MethodDeclarationIdentifierContext.ensureIdentifier`
+            // (:1159-1166): the method-name keep-set joins the signature
+            // followers (`.` `(` `{` `=>` `}` EOF) with the member-start
+            // probe — `int . foo() {}`/`int () {}`/`int => 0;` splice the
+            // synthetic name in front of the follower and the signature
+            // parses on, while a member-start keyword (`static`/`get`/`var`/
+            // `void`/...) stays for the member loop.
+            matches!(
+                peek.kind,
+                TokenKind::Period
+                    | TokenKind::OpenParen
+                    | TokenKind::OpenCurly
+                    | TokenKind::Function
+                    | TokenKind::CloseCurly
+                    | TokenKind::Eof
+            ) || self.looks_like_start_of_next_class_member_at(0)
         } else {
             matches!(
                 peek.kind,
@@ -1201,6 +1420,31 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             && is_keyword_or_identifier(peek.kind)
         {
             let id = self.cursor.advance();
+            let span = self.span_of(id);
+            self.listener
+                .handle_identifier(span, crate::listener::IdentifierContext::CatchParameter);
+            return span;
+        }
+        if !self.looks_like_statement_start_at(0)
+            && !matches!(
+                peek.kind,
+                TokenKind::Comma | TokenKind::CloseParen | TokenKind::Eof
+            )
+        {
+            // Consume-in-doubt (identifier_context_impl.dart:40-43):
+            // non-keyword junk (`catch (e, {}` — `{`, literals, brackets,
+            // `@`) lands behind the parse pointer and the synthetic name
+            // splices AFTER it, so the junk's `}`/follower is what the
+            // `)`-check and the clause-body `ensureBlock` see — the oracle
+            // reports `expectedCatchClauseBody`/`expected_token '}'` on the
+            // body's `}` and the relocated `)`-expect on the function's
+            // closing `}` (partial_code try_statement catch_head family).
+            self.cursor.advance();
+            let id = self.cursor.insert_synthetic(
+                TokenKind::Identifier,
+                peek.span.range.offset + peek.span.range.length,
+            );
+            self.cursor.advance();
             let span = self.span_of(id);
             self.listener
                 .handle_identifier(span, crate::listener::IdentifierContext::CatchParameter);
