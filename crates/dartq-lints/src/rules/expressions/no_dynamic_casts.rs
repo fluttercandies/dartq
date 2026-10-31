@@ -298,21 +298,27 @@ fn return_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 }
 
 /// The arrow-body face (:189-195): the `ExpressionBody` row is a
-/// childless marker — the body expression tiles beside it under the
-/// enclosing declaration (the same `remove_referenced` tiling). The
-/// run is the parent's children minus the marker itself.
+/// childless marker sealed after its expression completed, so the body's
+/// rows tile as the marker's preceding siblings under the enclosing
+/// declaration (the read `avoid_returning_null_for_void` and
+/// `async_return_with_no_await` share). The run is the sibling tail
+/// opening past the marker's head token — the arrow; the declaration's
+/// header rows (return type, name, formals) all open before it.
 fn body_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let node = c.node();
     let Some(parent) = c.unit.ast.parent(node) else {
         return;
     };
-    // The body rows tile as the marker's right siblings — drop every
-    // direct child up to and including the `ExpressionBody` row itself.
     let kids = c.collect_direct(parent);
     let Some(pos) = kids.iter().position(|&kid| kid == node) else {
         return;
     };
-    return_or_body_face(c, analysis, &kids[pos + 1..]);
+    let arrow = c.head_token(node);
+    let start = kids[..pos]
+        .iter()
+        .rposition(|&kid| c.head_token(kid) <= arrow)
+        .map_or(0, |i| i + 1);
+    return_or_body_face(c, analysis, &kids[start..pos]);
 }
 
 /// The boolean-condition faces (the `boolType` targets of :39-60): the
