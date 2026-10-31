@@ -603,6 +603,61 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                     )
                     | TokenKind::Eof
             )
+        } else if context == crate::listener::IdentifierContext::MetadataReference {
+            // MetadataReferenceIdentifierContext (:1065-1074): the keep set
+            // is the brace/paren groupers, the close square, EOF, the
+            // next-declaration probes, and the statement-start probe; other
+            // junk (`;` `:` literals) takes the consume-in-doubt branch
+            // below, so `@ ;` / `@ 5;` / `@ :` absorb the junk and the
+            // member-head no-progress guard reports on the FOLLOWER (oracle
+            // `class C { @ ; }`: one missing_identifier at the junk plus
+            // `expected_class_member` at the `}`; keeping the junk current
+            // minted the member row on the junk itself).
+            matches!(
+                peek.kind,
+                TokenKind::OpenCurly
+                    | TokenKind::CloseCurly
+                    | TokenKind::OpenParen
+                    | TokenKind::CloseParen
+                    | TokenKind::CloseSquare
+                    | TokenKind::Eof
+            ) || self.looks_like_start_of_next_top_level_declaration_at(0)
+                || self.looks_like_start_of_next_class_member_at(0)
+                || self.looks_like_statement_start_at(0)
+        } else if context == crate::listener::IdentifierContext::LocalVariableDeclaration {
+            // LocalVariableDeclarationIdentifierContext (:1011-1029): keep
+            // `;` `=` `,` `{` `}` EOF, string literals, statement-start
+            // heads, and reserved-keyword junk; the scanner-parked SYNTHETIC
+            // closers (an unclosed `(` pins a `)` at the stall offset) keep
+            // like their real counterparts — they are recovery furniture,
+            // not junk. Other junk consumes in doubt, so `var 5 = 1;`
+            // absorbs the `5` behind the parse pointer and the initializer
+            // reads cleanly (oracle: one missing_identifier at the `5`, no
+            // `expected_token ';'` cascade). Reserved keywords keep: the
+            // official ensureIdentifier leaves the junk standing, so the
+            // following ensureSemicolon anchors on the last REAL token
+            // (oracle `await for x in y;` body: `Expected ';'` at the `x`,
+            // not at the consumed `in`).
+            let (_, peek_synthetic) = self.cursor.resolve(peek.span.id);
+            matches!(
+                peek.kind,
+                TokenKind::Semicolon
+                    | TokenKind::Eq
+                    | TokenKind::Comma
+                    | TokenKind::OpenCurly
+                    | TokenKind::CloseCurly
+                    | TokenKind::Eof
+                    | TokenKind::String
+            ) || (peek_synthetic
+                && matches!(
+                    peek.kind,
+                    TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::OpenParen
+                        | TokenKind::OpenSquare
+                ))
+                || matches!(peek.kind, TokenKind::Keyword(kw) if !is_identifier(TokenKind::Keyword(kw)))
+                || self.looks_like_statement_start_at(0)
         } else {
             matches!(
                 peek.kind,
@@ -641,6 +696,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                     | crate::listener::IdentifierContext::FieldDeclaration
                     | crate::listener::IdentifierContext::TypedefDeclaration
                     | crate::listener::IdentifierContext::Combinator
+                    | crate::listener::IdentifierContext::MetadataReference
+                    | crate::listener::IdentifierContext::LocalVariableDeclaration
             ) {
             let junk_end = peek.span.range.offset + peek.span.range.length;
             self.cursor.advance();
@@ -661,6 +718,14 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 context,
                 crate::listener::IdentifierContext::TypedefDeclaration
                     | crate::listener::IdentifierContext::Combinator
+                    // The metadata and local-variable name slots read their
+                    // follower (`.`/`(`-hug check, `=`-initializer check)
+                    // straight off the cursor, so the spliced name must be
+                    // consumed now — `var 5 = 1;` resumes on the `=`,
+                    // `@ ;` on the member tail (upstream resumes from the
+                    // RETURNED synthetic, whose next is junk.next).
+                    | crate::listener::IdentifierContext::MetadataReference
+                    | crate::listener::IdentifierContext::LocalVariableDeclaration
             ) {
                 self.cursor.advance();
             }
@@ -907,6 +972,18 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         )
     }
 
+    /// `looksLikeStartOfNextClassMember` (identifier_context_impl.dart:1641)
+    /// evaluated at cursor-relative offset `n`: a member modifier, an
+    /// annotation head, `get`/`set`/`void`, or EOF.
+    fn looks_like_start_of_next_class_member_at(&self, n: usize) -> bool {
+        matches!(
+            self.cursor.look_kind(n),
+            TokenKind::At
+                | TokenKind::Keyword(Keyword::Get | Keyword::Set | Keyword::Void)
+                | TokenKind::Eof
+        ) || self.is_modifier_at(n)
+    }
+
     /// The follower keep-set that lets a declaration-head keyword be eaten
     /// as the name: `LibraryIdentifierContext._isOneOfFollowingValues`
     /// (identifier_context_impl.dart:953-957 — `.` `;` EOF) and the
@@ -1108,7 +1185,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// surface as a single row). `at` carries the closer's handle + its
     /// as-scanned span; the encoded range is the translation's law above, not
     /// `at` verbatim.
-    fn report_unmatched_row(&mut self, lexeme: &'static str, at: TokenSpan) {
+    pub(crate) fn report_unmatched_row(&mut self, lexeme: &'static str, at: TokenSpan) {
         let eof = self.table.last().utf16_offset;
         let offset = if at.range.offset >= eof {
             eof

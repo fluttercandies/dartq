@@ -359,8 +359,48 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     self.drain_spill_run();
                 } else {
                     // No progress: report the current token and move forward.
+                    // The 3.13.1 guard reports the statement's END token, and
+                    // a stalled statement ends at the semicolon-recovery
+                    // synthetic (`ensureSemicolon` returns the inserted `;`,
+                    // parser_impl.dart:5058) — so the row quotes that token,
+                    // `Unexpected text ';'.` at its offset, never the junk
+                    // token it was spliced in front of (oracle `void f() {
+                    // : }`, `{ case 1: }`, `{ default: }`, `{ 5: print(1);}`,
+                    // `{ , ; }`; dartq quoted the junk and minted `Unexpected
+                    // text ':'.`). The zero-width synthetic borrows the
+                    // follower's span length (the same offset/length face as
+                    // `report_missing_identifier`'s walk). The
+                    // excluded-punctuation comma is the one stall whose
+                    // official end stays the junk itself when no real `;`
+                    // follows (oracle `{ , }` quotes ',').
                     let at = self.peek_span();
-                    self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+                    let semi = self
+                        .cursor
+                        .last_consumed_id()
+                        .filter(|id| {
+                            let (kind, _) = self.cursor.resolve(*id);
+                            kind == TokenKind::Semicolon
+                        })
+                        .map(|id| self.span_of(id));
+                    match semi {
+                        Some(semi) if semi.range.offset == at.range.offset => {
+                            if self.cursor.lexeme(at.id) != ","
+                                || self.cursor.look_kind(1) == TokenKind::Semicolon
+                            {
+                                let span = crate::token_id::TokenSpan::new(
+                                    semi.id,
+                                    dartq_source::SourceRange {
+                                        offset: semi.range.offset,
+                                        length: at.range.length,
+                                    },
+                                );
+                                self.report(msg::unexpected_token(";"), span);
+                            } else {
+                                self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+                            }
+                        }
+                        _ => self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at),
+                    }
                     self.force_advance();
                 }
             }
@@ -489,6 +529,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         for_parts: bool,
     ) -> ExprStmtOrDecl {
         let entry = self.cursor.mark();
+        // Queue-aware snapshot for the for-parts lane (`progress_at` drops
+        // the queued-synthetic term, so a mark comparison misreads the
+        // for-header synthetic `(...)` group's pending synthetics as
+        // "progress made"); statement mode keeps the mark comparison —
+        // stall-recovery leftovers park the queue too and their frozen
+        // faces depend on the mark semantics.
+        let entry_progress = self.cursor.progress();
         let mut metadata_done = false;
         if self.peek_kind() == TokenKind::At {
             self.parse_metadata_star();
@@ -577,7 +624,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
         }
 
-        let no_modifiers = self.cursor.progress() == TokenCursor::progress_at(entry);
+        let no_modifiers = if for_parts {
+            self.cursor.progress() == entry_progress
+        } else {
+            self.cursor.progress() == TokenCursor::progress_at(entry)
+        };
         self.parse_expression_statement_or_declaration_after_modifiers(
             late_kw,
             var_final_or_const,
@@ -598,6 +649,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         no_modifiers: bool,
     ) -> ExprStmtOrDecl {
         let before_type = self.cursor.mark();
+        // Queue-aware snapshot, same scoping as `entry_progress` above; the
+        // post-`reset(before_type)` comparisons below read the restored
+        // state exactly.
+        let before_type_progress = self.cursor.progress();
 
         // Pattern variable declarations (`var (a, b) = ...`, `final [a] = ...`).
         if self.features.patterns_enabled
@@ -738,7 +793,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // reads as the expression it is).
         if no_modifiers
             && var_final_or_const.is_none()
-            && self.cursor.progress() == TokenCursor::progress_at(before_type)
+            && self.cursor.progress()
+                == if for_parts {
+                    before_type_progress
+                } else {
+                    TokenCursor::progress_at(before_type)
+                }
         {
             if for_parts {
                 return ExprStmtOrDecl::NotDecl;
@@ -795,7 +855,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         self.cursor.reset(before_type);
         // `final <int> foo = ...`: missing type name before type arguments.
         let missing_type_name = self.peek_kind() == TokenKind::Lt
-            && self.cursor.progress() == TokenCursor::progress_at(before_type);
+            && self.cursor.progress()
+                == if for_parts {
+                    before_type_progress
+                } else {
+                    TokenCursor::progress_at(before_type)
+                };
         if missing_type_name {
             // Official `insertSyntheticIdentifier` + `computeType` over the
             // linked list `id <...>`. This engine's `compute_type` requires a
@@ -1167,31 +1232,27 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             paren
         } else {
             // Official `parseForLoopPartsStart` recovery: a fully synthetic
-            // `(...)` group plus a synthetic variable declaration.
+            // empty C-style `(...)` group. The synthetics queue in stream
+            // order and the parts parse runs entirely on them — empty
+            // initializer on the first synthetic `;`, the rest's separators
+            // landing on the synthetic `)` — and the body parse opens on the
+            // REAL head, which stays for the statement (oracle `for x;` /
+            // `for ;` / `await for x;` / `await for x in y;`: the single `(`
+            // report; the pinned 3.13.7 source's synthetic `name in name`
+            // trio is not what the pinned 3.13.1 oracle carries — `await for
+            // x in y;` probes to the same one-row face, so the synthetic
+            // declaration tail is a version drift). dartq advanced past every
+            // synthetic and read the real head as the condition, cascading
+            // `expected ';'`, `expected ')'`, `missing_identifier` and the
+            // await-for rows the oracle never carries.
             let at = self.peek_span();
             self.report(msg::expected_but_got("("), at);
             let offset = at.range.offset;
             self.synthetic(TokenKind::OpenParen, offset);
             self.cursor.advance();
-            if await_kw.is_some() {
-                self.synthetic(TokenKind::Identifier, offset);
-                self.cursor.advance();
-                self.synthetic(TokenKind::Keyword(Keyword::In), offset);
-                self.cursor.advance();
-                self.synthetic(TokenKind::Identifier, offset);
-                self.cursor.advance();
-            } else {
-                self.synthetic(TokenKind::Semicolon, offset);
-                self.cursor.advance();
-                self.synthetic(TokenKind::Semicolon, offset);
-                self.cursor.advance();
-            }
-            let close = self.synthetic(TokenKind::CloseParen, offset);
-            self.cursor.advance();
-            self.synthetic(TokenKind::Identifier, offset);
-            self.cursor.advance();
             self.synthetic(TokenKind::Semicolon, offset);
-            self.cursor.advance();
+            self.synthetic(TokenKind::Semicolon, offset);
+            let close = self.synthetic(TokenKind::CloseParen, offset);
             close
         };
         // The landing report belongs to the C-style `parseForLoopPartsRest`
@@ -1288,7 +1349,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         if self.peek_kind() == TokenKind::Semicolon {
             if let Some(await_token) = await_kw {
-                self.report(msg::invalid_await_for(), await_token);
+                // A for-recovery synthetic `;` is queued zero-width recovery,
+                // not the initializer's real terminator — the pinned oracle
+                // carries no invalidAwaitFor on the no-`(` shapes (`await for
+                // x;` probes to the single `(` row); a real `;` initializer
+                // end keeps the report.
+                let (_, synthetic) = self.cursor.resolve(self.cursor.peek_id());
+                if !synthetic {
+                    self.report(msg::invalid_await_for(), await_token);
+                }
             }
         } else if self.peek_kind() != TokenKind::Keyword(Keyword::In) {
             if self.peek_kind() == TokenKind::Colon {
@@ -1647,7 +1716,37 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 }
             }
         }
-        let end = self.ensure_close_paren(open);
+        // Official `parseAssert` closes on its own end-group recovery, not
+        // `ensureCloseParen`: the group's `)` is consumed when it is the
+        // immediate next token; a scanner-synthetic closer is relocated
+        // (`moveSynthetic`); anything else is reported with `unexpectedToken`
+        // at its own face and the real `)` is consumed
+        // (parser_impl.dart:11091-11102). `assert(x 1);` probes to one row
+        // `Unexpected text '1'.` at the junk — the shared `ensureCloseParen`
+        // face (`Expected to find ')'.`) belongs to other call sites, while
+        // `assert(x;` keeps it: the unclosed `(`'s synthetic closer
+        // relocates to the `;`.
+        let end = match self.cursor.table_matching_end(open.id) {
+            Some(close_id) if self.cursor.peek_id() == close_id => {
+                self.mark_spill_run(close_id);
+                self.cursor.advance();
+                self.span_of(close_id)
+            }
+            Some(close_id) => {
+                let (_, synthetic) = self.cursor.resolve(close_id);
+                if synthetic {
+                    self.move_synthetic_close(open, close_id, TokenKind::CloseParen, ")")
+                } else {
+                    let at = self.peek_span();
+                    self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
+                    self.skip_to_token(close_id);
+                    let close = self.peek_span();
+                    self.cursor.advance();
+                    close
+                }
+            }
+            None => self.ensure_close_paren(open),
+        };
         self.may_parse_function_expressions = saved;
         if kind == AssertKind::Statement {
             self.ensure_semicolon();

@@ -260,6 +260,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
             self.parse_fields(
                 DeclarationKind::TopLevel,
+                None,
                 before_start,
                 mods,
                 before_type,
@@ -880,6 +881,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
             self.parse_fields(
                 kind,
+                enclosing_declaration_name,
                 after_type,
                 mods,
                 before_type,
@@ -1825,7 +1827,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 self.cursor.advance();
             }
         } else {
-            self.parse_fields(kind, before_type, mods, before_type, type_info, None, false);
+            self.parse_fields(
+                kind,
+                enclosing_declaration_name,
+                before_type,
+                mods,
+                before_type,
+                type_info,
+                None,
+                false,
+            );
         }
     }
 
@@ -1856,6 +1867,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     fn parse_fields(
         &mut self,
         kind: DeclarationKind,
+        enclosing_declaration_name: Option<&'s str>,
         _before_start: crate::cursor::CursorMark,
         mods: MemberModifiers,
         before_type: crate::cursor::CursorMark,
@@ -2063,12 +2075,24 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             None => self.cursor.lexeme(first_name.id),
         };
         let mut field_count = 1usize;
-        self.parse_field_initializer_opt(first_name, first_name_text, kind, &mods);
+        self.parse_field_initializer_opt(
+            first_name,
+            first_name_text,
+            kind,
+            &mods,
+            enclosing_declaration_name,
+        );
         while self.peek_kind() == TokenKind::Comma {
             self.cursor.advance();
             let name = self.ensure_identifier(context);
             let name_text = self.cursor.lexeme(name.id);
-            self.parse_field_initializer_opt(name, name_text, kind, &mods);
+            self.parse_field_initializer_opt(
+                name,
+                name_text,
+                kind,
+                &mods,
+                enclosing_declaration_name,
+            );
             field_count += 1;
         }
         let had_semicolon = self.peek_kind() == TokenKind::Semicolon;
@@ -2151,7 +2175,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         name_text: &'s str,
         kind: DeclarationKind,
         mods: &MemberModifiers,
+        enclosing: Option<&'s str>,
     ) {
+        // Official `parseFieldInitializerOpt` (:4646-4648): a field named
+        // like its enclosing declaration reports on the name, in the plain
+        // face (`int C = 1;`) and the recovery face alike (`class C { C }` —
+        // the unnamed field group reads the `C` as the name with a missing
+        // `;`); extension fields fire too (`extension Ex on int { int Ex =
+        // 1; }`). A synthetic recovery name never matches (its lexeme is
+        // empty).
+        if enclosing == Some(name_text) {
+            self.report(msg::member_with_same_name_as_class(), name);
+        }
         self.listener.begin_initialized_identifier(name);
         if self.peek_kind() == TokenKind::Eq {
             self.parse_variable_initializer_opt();
