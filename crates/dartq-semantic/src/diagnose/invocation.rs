@@ -1313,18 +1313,23 @@ impl<'a> Engine<'a> {
                 // swaps the message text and adds the context, never the
                 // anchor or severity.
                 // The causing operator's own spelling drives the context
-                // lexeme and span (`?.`/2 for a member or index root,
-                // `?..`/3 for a cascade-section root, `?`/1 for a `?[`
-                // question token — `previousShortCircuitingOperator`'s
-                // IndexExpression arm answers the question TOKEN,
-                // error_verifier.dart:7314-7318).
+                // lexeme and span (`?.`/2 for a member root, `?..`/3 for a
+                // cascade-section root, `?`/1 for a `?[` question token —
+                // `previousShortCircuitingOperator`'s IndexExpression arm
+                // answers the question TOKEN, error_verifier.dart:7314-7318).
                 let prior = self
                     .dead_null_chains
                     .iter()
                     .find(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end)
                     .map(|(op, _, _, prior_kind, _)| match prior_kind {
-                        crate::diagnose::types::DeadChainKind::Member
-                        | crate::diagnose::types::DeadChainKind::Index => (*op, "?.", 2u32),
+                        // The member face answers the written `?.` token;
+                        // the INDEX face answers the index expression's
+                        // `question` token alone (`?`, 1 column) —
+                        // `previousShortCircuitingOperator`'s
+                        // IndexExpression arm (:7314-7318) never returns the
+                        // `[` its anchor pair carries.
+                        crate::diagnose::types::DeadChainKind::Member => (*op, "?.", 2u32),
+                        crate::diagnose::types::DeadChainKind::Index => (*op, "?", 1u32),
                         crate::diagnose::types::DeadChainKind::CascadeMember
                         | crate::diagnose::types::DeadChainKind::CascadeIndex => {
                             (*op, "?..", 3u32)
@@ -1334,14 +1339,18 @@ impl<'a> Engine<'a> {
                     // short-circuiter when no latched chain covers this
                     // operator — `l?[0]?.length`'s `?.` reads the pre-lift
                     // element, so the causing operator is the `?[` whose
-                    // dead-chain extent already ended at `]`.
+                    // dead-chain extent already ended at `]`. The context
+                    // anchors the question token itself, so whitespace
+                    // ahead of the `?` stays outside it.
                     .or_else(|| {
                         if shorted_elem_ty.is_some() && !self.in_cascade {
                             receiver_offset.and_then(|offset| {
                                 self.index_result_recvs
                                     .get(&offset)
                                     .and_then(|(indexed, null_aware)| {
-                                        null_aware.then_some((indexed.end(), "?", 1u32))
+                                        null_aware.then(|| {
+                                            (self.skip_whitespace(indexed.end()), "?", 1u32)
+                                        })
                                     })
                             })
                         } else {
@@ -14473,3 +14482,11 @@ mod tests {
         assert_eq!(rows, vec![(at, "S<int>".len() as u32)], "{rows:?}");
     }
 }
+
+/// The #2990 `?[`/`?..[` index-face pins (the operator anchor per written
+/// operator, the pre-lift element face a following `?.`/`?[` decides on,
+/// and the `?`-token short-circuit context), kept as a standalone module so
+/// the shared `pins` rig stays untouched while its lane is in flight.
+#[cfg(test)]
+#[path = "ticket_2990_tests.rs"]
+mod ticket_2990_tests;
