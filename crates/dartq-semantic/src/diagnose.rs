@@ -4090,7 +4090,15 @@ fn synthesize_unknown_scrutinee_dead_cases(
                 // dead_code_test.dart's switch-expression faces).
                 let offset = slice[clause.head].utf16_offset;
                 let last = clause.end - 1;
-                let length = slice[last].utf16_offset + slice[last].byte_len - offset;
+                // `byte_len` is not the utf16 length — a non-ASCII arm-end
+                // token (a string/identifier past ASCII) would under-count
+                // the row; measure the lexeme's utf16 width.
+                let last_len = tokens
+                    .lexeme(source, last)
+                    .chars()
+                    .map(char::len_utf16)
+                    .sum::<usize>() as u32;
+                let length = slice[last].utf16_offset + last_len - offset;
                 if length == 0 || anchored.contains(&offset) {
                     continue;
                 }
