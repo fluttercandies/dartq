@@ -5869,8 +5869,6 @@ mod ticket_3123_tests;
 /// (`param_bound_of`).
 #[cfg(test)]
 mod ticket_3125_tests;
-#[cfg(test)]
-mod dbg_probe;
 
 /// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
 /// type-check verdict under-emits on (function-type test spellings, type
@@ -5911,6 +5909,14 @@ mod ticket_3122_tests;
 #[cfg(test)]
 mod ticket_3127_tests;
 
+/// The #3128 pins — `operator==` member-entry capture: `formals`/`return_ty`
+/// in the collector model must read the honest written signature (never
+/// `formals=None` — which forces `override_broken`'s suppress arm — and
+/// never `return_ty` leaking the `extends` clause's armed type), and the
+/// `invalid_override` emission that honest capture unblocks.
+#[cfg(test)]
+mod ticket_3128_tests;
+
 /// The #3121 pins — `return_of_invalid_type`: the sync void-source arm
 /// (rtv.dart:222-226's `_isVoidDynamic`), the async `flatten(S) <: T_v`
 /// subtype leg (rtv.dart:274-289, type_system.dart:425-471), the
@@ -5936,3 +5942,25 @@ mod ticket_uf_tests;
 /// condition/negation verdicts.
 #[cfg(test)]
 mod ticket_3119_tests;
+
+/// The #3129 pins — `unnecessary_type_check`: the verdict is one
+/// `isSubtypeOf(leftType, rightType)` ask
+/// (best_practices_verifier.dart:985-1038), and the under-report roots
+/// lived in the generic-signature legs — the interned `Ty::Function`
+/// shapes carry `type_params_named`, but every re-decision read the
+/// count-only column. `signature_leg_subtype` recurses the positional
+/// unification (relateTypeParameters, type_system.dart:1581-1635), the
+/// `to`-parameter leaves answer through their bounds on a leg's left
+/// (subtype.dart:484-493), and the tear-off face carries the
+/// declaration's written bounds.
+#[cfg(test)]
+mod ticket_3129_tests;
+
+/// The #3132 pins — `body_might_complete_normally`'s async-union verdict:
+/// the synthesized `FutureOr<V>` head is materialized by the type system
+/// (never gated on the user scope's `dart:async` import,
+/// resolver.dart:538-611's `_contextTypeForImposed` arm), and the union's
+/// nullability is the future value type's own (`FutureOr<int?>` /
+/// `FutureOr<Object?>` reach the NULLABLE twin).
+#[cfg(test)]
+mod ticket_3132_tests;

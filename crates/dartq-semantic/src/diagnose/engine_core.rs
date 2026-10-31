@@ -2762,7 +2762,16 @@ impl<'a> Engine<'a> {
                     nullable: false,
                     args: ArgListId::EMPTY,
                 } if name == self.intern("Function") => true,
-                Ty::Function { .. } => self.slot_subtype(sub, sup) == Some(true),
+                // A generic signature pair decides through the positional
+                // unification first (`relateTypeParameters` — the interned
+                // shapes carry `type_params_named`, which the pooled
+                // `FnVarSig` rebuild in `function_shape_sig` cannot spell:
+                // count-only entries never decide). Non-generic pairs and
+                // every undecidable generic face keep the slot walk.
+                Ty::Function { .. } => match self.generic_signature_subtype(sub, sup) {
+                    Some(answer) => answer,
+                    None => self.slot_subtype(sub, sup) == Some(true),
+                },
                 _ => false,
             },
             Ty::Record { .. } => match sup {
@@ -3569,12 +3578,13 @@ impl<'a> Engine<'a> {
         // static type is the declaration's own signature as a function
         // type ([`Self::capture_local_fn_tearoff`]'s capture).
         if self.frames.iter().any(|f| f.locals.contains(&operand.name)) {
-            // The local capture records no parameter group (its verdict
-            // face keeps the count-only posture) — the display
-            // under-reports the group, the same additive posture.
+            // The local capture records its own parameter group — the
+            // pooled face carries the names and written bounds the
+            // signature unification reads (`lf is Fn` over a local generic
+            // fn); a capture with no group keeps the empty face.
             return self
                 .local_fn_sig(operand.name)
-                .map(|sig| self.tear_off_fn_ty(sig, &[]));
+                .map(|sig| self.tear_off_fn_ty(sig, &sig.params[..]));
         }
         if !matches!(
             operand.shape,
@@ -3586,13 +3596,31 @@ impl<'a> Engine<'a> {
         // gate): the signature interns whole, the declaration's own
         // parameter spellings beside it (#2878).
         if let Some(sig) = self.tear_off_sig(operand) {
+            // The declaration's own parameter group rides the shape — names
+            // AND written bounds (`fn is Fn` over `fn<T extends num>`
+            // unifies the real bound against the typedef's — the
+            // `relateTypeParameters` equality leg reads it). The bounds
+            // live in the per-executable captures (`TopDecl` carries no
+            // bound column); a miss keeps the unbounded (`None`) face.
             let type_params: Vec<(StringId, Option<Ty>)> = self
                 .top_level_decl(operand.name)
                 .map(|decl| {
+                    let bounds = self
+                        .exec_bounds
+                        .get(&operand.name)
+                        .or_else(|| self.method_exec_bounds.get(&operand.name));
                     decl.type_param_names
                         .iter()
                         .copied()
-                        .map(|name| (name, None))
+                        .map(|name| {
+                            let bound = bounds.and_then(|window| {
+                                window
+                                    .iter()
+                                    .find(|(param, _)| *param == name)
+                                    .map(|(_, bound)| *bound)
+                            });
+                            (name, bound.flatten())
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -4052,6 +4080,97 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The alias fold's function-RHS arm for a `Named` the `type_params ==
+    /// 0` gate refused (`fold_alias_ty`'s `alias_decl_rhs`): a typedef
+    /// spelling a function right-hand side reads that resolved shape
+    /// whole — the same stand-for-the-whole rule the fold's `Ty::Function`
+    /// arm applies. Two capture faces answer it, richest first: the
+    /// `index.aliases` row (`AliasRhs::Fn`) carries the RHS signature's OWN
+    /// parameter bounds (`Function<T extends num>`); the declaration's
+    /// `var_ty` keeps the pooled shape where the alias row dropped out.
+    /// Only a function-RHS alias answers — a `Named`/`Record` RHS stays
+    /// unfolded, the under-report direction.
+    fn alias_function_ty(&self, ty: Ty) -> Option<Ty> {
+        let Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        } = ty
+        else {
+            return None;
+        };
+        // The `index.aliases` face carries the RHS signature's own
+        // parameter bounds (`AliasRhs::Fn.type_params`); populated on the
+        // real pipeline it answers the bounded-typedef pair (`xn is Xn`).
+        // A rig-side alias whose capture dropped (the nested
+        // function-RHS's stray-root arm) falls to `var_ty` below.
+        if let Some((_, type_params, ret, positional, named, _)) =
+            self.bounds.alias_fn_shape(name)
+        {
+            let ret = ret.map_or(Ty::Dynamic, |tree| self.tree_ty(tree));
+            let positional: Vec<Ty> =
+                positional.iter().map(|tree| self.tree_ty(tree)).collect();
+            let named: Vec<(StringId, Ty)> = named
+                .iter()
+                .map(|(name, tree, _)| (*name, self.tree_ty(tree)))
+                .collect();
+            let type_params: Vec<(StringId, Option<Ty>)> = type_params
+                .iter()
+                .map(|(name, bound, _)| {
+                    (*name, bound.as_ref().map(|b| self.tree_ty(b)))
+                })
+                .collect();
+            return Some(self.boundary.args.borrow_mut().function_generic(
+                &type_params,
+                ret,
+                &positional,
+                &named,
+                nullable,
+            ));
+        }
+        // The armed-annotation face: `var_ty` already interned the resolved
+        // `Ty::Function` at capture (a nested function-RHS typedef drops
+        // out of `index.aliases` on the stray-root guard but keeps this
+        // shape); its `type_params_named` entries carry the parameter
+        // names, their written bounds where the pooled shape recorded them.
+        let decl = self.top_level_decl(name)?;
+        if decl.kind != MicroKind::TypeAlias {
+            return None;
+        }
+        match decl.var_ty {
+            Ty::Function {
+                shape,
+                nullable: rhs_nullable,
+            } => Some(Ty::Function {
+                shape,
+                nullable: nullable || rhs_nullable,
+            }),
+            _ => None,
+        }
+    }
+
+    /// One subtype leg inside a signature comparison: a nested generic
+    /// function pair (`Function<S>(S)` against `Function<S>(T)` inside a
+    /// typedef's return) decides through [`Self::generic_signature_subtype`]
+    /// — the interned leaves carry `type_params_named`, which the pooled
+    /// `FnVarSig` rebuild behind [`Self::slot_subtype`] cannot spell; every
+    /// other face keeps the slot ask. `outer` carries the enclosing
+    /// unification's `to`-parameter bounds: upstream's shared fresh set
+    /// spans every nesting level, so a `to`-param leaf spelled inside a
+    /// nested signature is the SAME fresh variable its outer position
+    /// introduced.
+    fn signature_leg_subtype(
+        &self,
+        from: Ty,
+        to: Ty,
+        outer: &FxHashMap<StringId, Option<Ty>>,
+    ) -> Option<bool> {
+        if let Some(answer) = self.generic_signature_subtype_at(from, to, outer) {
+            return Some(answer);
+        }
+        self.slot_subtype(from, to)
+    }
+
     /// The generic-signature unification at the type-check verdict
     /// (`relateTypeParameters` — upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/element/type_system.dart:1581-1635, which
@@ -4068,6 +4187,21 @@ impl<'a> Engine<'a> {
     /// entries, non-function pairs, nullable shapes — the strict ask
     /// strips those itself).
     fn generic_signature_subtype(&self, from: Ty, to: Ty) -> Option<bool> {
+        self.generic_signature_subtype_at(from, to, &FxHashMap::default())
+    }
+
+    /// [`Self::generic_signature_subtype`] with an inherited parameter
+    /// context: `outer` is the enclosing level's `to`-parameter bound map
+    /// (upstream's shared fresh set crosses nesting levels — a nested
+    /// signature's `to` leaf that spells an outer parameter name IS the
+    /// outer variable). The inner `to` parameters shadow the outer map on
+    /// a same-spelling collision (the inner level's own variable wins).
+    fn generic_signature_subtype_at(
+        &self,
+        from: Ty,
+        to: Ty,
+        outer: &FxHashMap<StringId, Option<Ty>>,
+    ) -> Option<bool> {
         let (
             Ty::Function {
                 shape: from_shape,
@@ -4113,6 +4247,46 @@ impl<'a> Engine<'a> {
             .zip(to_params.iter())
             .map(|((from_name, _), (to_name, _))| (*from_name, Ty::named(*to_name)))
             .collect();
+        // Upstream instantiates both signatures with one shared fresh set —
+        // the `to` parameters ARE those fresh variables here: a `to`-param
+        // leaf on a leg's LEFT answers through its bound (Left Type
+        // Variable Bound, subtype.dart:484-493 — `zn is Yn`'s inner `T`
+        // satisfies `num` through its own `extends num`), on the RIGHT it
+        // is a fresh variable no concrete face subtypes (`Some(false)` —
+        // the unproved ask the verdict reports silent). The map merges the
+        // inherited `outer` bindings (the shared set's outer variables)
+        // with this level's own parameters — the inner spelling shadows a
+        // same-named outer one (the inner variable is a different fresh
+        // entry upstream).
+        let to_bounds: FxHashMap<StringId, Option<Ty>> = outer
+            .iter()
+            .map(|(name, bound)| (*name, *bound))
+            .chain(to_params.iter().map(|(name, bound)| (*name, *bound)))
+            .collect();
+        let ask = |this: &Self, a: Ty, b: Ty| -> Option<bool> {
+            if a == b {
+                return Some(true);
+            }
+            if let Ty::Named {
+                name,
+                args: ArgListId::EMPTY,
+                nullable: false,
+            } = a
+                && let Some(&bound) = to_bounds.get(&name)
+            {
+                return this.signature_leg_subtype(bound.unwrap_or(Ty::Dynamic), b, &to_bounds);
+            }
+            if let Ty::Named {
+                name,
+                args: ArgListId::EMPTY,
+                nullable: false,
+            } = b
+                && to_bounds.contains_key(&name)
+            {
+                return Some(false);
+            }
+            this.signature_leg_subtype(a, b, &to_bounds)
+        };
         for ((_, from_bound), (_, to_bound)) in from_params.iter().zip(to_params.iter()) {
             if from_bound.is_none() && to_bound.is_none() {
                 // Both unwritten: the implicit bounds coincide.
@@ -4121,8 +4295,8 @@ impl<'a> Engine<'a> {
             let from_bound = self.subst_named_leaves(from_bound.unwrap_or(Ty::Dynamic), &unify);
             let to_bound = to_bound.unwrap_or(Ty::Dynamic);
             match (
-                self.slot_subtype(from_bound, to_bound),
-                self.slot_subtype(to_bound, from_bound),
+                ask(self, from_bound, to_bound),
+                ask(self, to_bound, from_bound),
             ) {
                 (Some(true), Some(true)) => {}
                 (Some(false), _) | (_, Some(false)) => return Some(false),
@@ -4130,7 +4304,7 @@ impl<'a> Engine<'a> {
             }
         }
         // Return covariance over the substituted source face.
-        match self.slot_subtype(self.subst_named_leaves(from_ret, &unify), to_ret) {
+        match ask(self, self.subst_named_leaves(from_ret, &unify), to_ret) {
             Some(false) => return Some(false),
             Some(true) => {}
             None => return None,
@@ -4139,7 +4313,7 @@ impl<'a> Engine<'a> {
             return Some(false);
         }
         for (index, to_formal) in to_pos.iter().enumerate() {
-            match self.slot_subtype(*to_formal, self.subst_named_leaves(from_pos[index], &unify)) {
+            match ask(self, *to_formal, self.subst_named_leaves(from_pos[index], &unify)) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -4158,7 +4332,7 @@ impl<'a> Engine<'a> {
             else {
                 return Some(false);
             };
-            match self.slot_subtype(*to_formal, self.subst_named_leaves(from_formal, &unify)) {
+            match ask(self, *to_formal, self.subst_named_leaves(from_formal, &unify)) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -4519,6 +4693,20 @@ impl<'a> Engine<'a> {
         // face, the unwritten columns' `dynamic` leaves; the `Never`
         // unit fold canonicalizes its written formal leaves (#2842).
         let mut checked = self.normalized_never(self.official_fn_face(self.fold_alias_ty(checked)));
+        // A function-RHS typedef whose own `<T>` group went missing
+        // (`typedef Fn = void Function<S>(S) Function<T>(T)` — the RHS's
+        // first signature group sealed `pending.type_params`, so the decl
+        // reads generic and the `type_params == 0` alias-fold gate refuses)
+        // still folds here: `var_ty` already interned the resolved
+        // `Ty::Function` at capture, the same face `fold_alias_ty` would
+        // answer had the gate admitted it. A genuinely parameterized alias
+        // keeps `type_params > 0` the honest way — but its `var_ty` is a
+        // `Ty::Named` RHS, never a `Ty::Function`, so the function check
+        // below refuses it and the fold only fires on the captured
+        // function shape.
+        if let Some(folded) = self.alias_function_ty(checked) {
+            checked = self.normalized_never(self.official_fn_face(folded));
+        }
         // A prefixed `is p.T` arms the prefix token's name (the parser's
         // `handle_type` anchors the qualified head at `p`, never `T`):
         // `Named{p}` resolves to the import prefix, not a type. The real
@@ -4567,6 +4755,13 @@ impl<'a> Engine<'a> {
         // before any structural leg asks.
         let operand_ty =
             self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
+        // The function-RHS typedef arm above fires on the operand face too:
+        // `Alias f; f is F` reads `f`'s declared `Alias` head, whose
+        // captured `Ty::Function` the verdict's function rule answers.
+        let operand_ty = self
+            .alias_function_ty(operand_ty)
+            .map(|ty| self.normalized_never(self.official_fn_face(ty)))
+            .unwrap_or(operand_ty);
         if operand_ty == Ty::Unknown
             || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)

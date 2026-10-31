@@ -203,14 +203,40 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     break;
                 }
                 _ => {
-                    // Recovery: id-id suggests a missing comma (reported,
-                    // tokens kept); everything else routes through
-                    // `ensure_close_paren` — the official tail's single
-                    // recovery exit (:1975-1985), whose `moveSynthetic`
-                    // adoption reports the unmatched-group row at the
-                    // relocation point and latches the pair for the parse-end
-                    // pass.
-                    end = self.recover_parameter_group_end(begin);
+                    // The official tail's recovery arms
+                    // (`parser_impl.dart:1966-1984`), in the upstream
+                    // priority order. A scanner-synthesized group closer is
+                    // adopted FIRST (`begin.endGroup!.isSynthetic` →
+                    // `moveSynthetic`, :1969-1972): the unmatched-group row
+                    // anchors at the relocation point and the parse resumes
+                    // on the current token — oracle `void f(int x int y` (no
+                    // `)` at all) reports only the `)` face, never the
+                    // missing-comma face. Then `id id` reads as a missing
+                    // comma (:1975-1981): report at the follower, insert the
+                    // synthetic comma in front of it, and CONTINUE the loop
+                    // on the comma so the follower parses as the next formal
+                    // (`void f(int x int y) {}` is a single row, both formals
+                    // kept). Everything else funnels into
+                    // [`Self::ensure_close_paren`], whose `moveSynthetic`
+                    // adoption and distant-closer jump are the tail's single
+                    // remaining exit.
+                    let close_synthetic = self
+                        .cursor
+                        .table_matching_end(begin.id)
+                        .is_some_and(|close| self.cursor.resolve(close).1);
+                    if close_synthetic {
+                        end = self.ensure_close_paren(begin);
+                        break;
+                    }
+                    let next = self.cursor.peek();
+                    if is_identifier(next.kind) && is_identifier(self.cursor.look_kind(1)) {
+                        self.report(msg::expected_but_got(","), next.span);
+                        self.cursor
+                            .insert_synthetic(TokenKind::Comma, next.span.range.offset);
+                        self.cursor.advance(); // the inserted comma
+                        continue;
+                    }
+                    end = self.ensure_close_paren(begin);
                     break;
                 }
             }
@@ -222,26 +248,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         end
     }
 
-    /// The `parseFormalParametersRest` tail recovery: `id id` reports a
-    /// missing comma and continues, everything else funnels into
-    /// [`Self::ensure_close_paren`] — the official tail has no separate
-    /// silent-adoption arm (`parser_impl.dart:1975-1985`); a scanner-synthetic
-    /// closer adopts through `ensureCloseParen`'s `moveSynthetic`, which
-    /// reports the unmatched-group row at the relocation point (the analyzer
-    /// translation reads `begin.endGroup.charOffset` post-parse; the scanner
-    /// itself emits no row — the pair list on the token table is the only
-    /// scan-time record) and latches the begin so the parse-end pass skips
-    /// it. A pre-#1485 silent relocation here relied on the scanner's own
-    /// row, which no longer exists.
-    fn recover_parameter_group_end(&mut self, begin: TokenSpan) -> TokenSpan {
-        let next = self.cursor.peek();
-        let next_next = self.cursor.look_kind(1);
-        if is_identifier(next.kind) && is_identifier(next_next) {
-            self.report(msg::expected_but_got(","), next.span);
-            return self.peek_span(); // caller re-enters the loop
-        }
-        self.ensure_close_paren(begin)
-    }
+    /// The `parseFormalParametersRest` tail recovery lives inline in
+    /// [`Self::parse_formal_parameters_rest`]: the upstream
+    /// `parser_impl.dart:1966-1984` arms (synthetic closer adoption →
+    /// missing-comma insert + loop continue → `ensure_close_paren`) run in
+    /// the upstream priority order, so the comma arm can `continue` the
+    /// loop directly. A scanner-synthetic closer adopts through
+    /// [`Self::ensure_close_paren`]'s `moveSynthetic`, which reports the
+    /// unmatched-group row at the relocation point (the analyzer
+    /// translation reads `begin.endGroup.charOffset` post-parse; the
+    /// scanner itself emits no row — the pair list on the token table is
+    /// the only scan-time record) and latches the begin so the parse-end
+    /// pass skips it. A pre-#1485 silent relocation here relied on the
+    /// scanner's own row, which no longer exists.
+
 
     /// Official `parseOptionalPositionalParameters`: `[`-bracketed group.
     fn parse_optional_positional_parameters(&mut self, kind: MemberKind) -> TokenSpan {
@@ -1263,5 +1283,142 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 | TokenKind::Colon
                 | TokenKind::Eof
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::expr_const::test_support::parser;
+    use crate::listener::ParserListener;
+    use crate::message::Message;
+    use crate::token_id::TokenSpan;
+
+    /// Parser-tier faces as `(code, start, end)`, sorted by position then
+    /// code — the `tests::gate_*` harness shape, so each pin below is the
+    /// frozen oracle row set (offset+length form; zero-width recovery rows
+    /// have `start == end`).
+    #[derive(Default)]
+    struct RowLog {
+        rows: Vec<(String, u32, u32)>,
+    }
+
+    impl ParserListener for RowLog {
+        fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, end: TokenSpan) {
+            self.rows.push((
+                message.code.name.to_owned(),
+                start.range.offset,
+                end.range.offset + end.range.length,
+            ));
+        }
+    }
+
+    fn faces(source: &'static str) -> Vec<(String, u32, u32)> {
+        let mut p = parser(source, RowLog::default());
+        p.parse_unit();
+        let mut rows = p.listener.rows.clone();
+        rows.sort();
+        rows
+    }
+
+    fn leaked(source: &str) -> &'static str {
+        Box::leak(source.to_owned().into_boxed_str())
+    }
+
+    fn assert_faces(source: &str, expected: &[(&str, u32, u32)]) {
+        let rows = faces(leaked(source));
+        let expected: Vec<(String, u32, u32)> = expected
+            .iter()
+            .map(|(c, s, e)| ((*c).to_owned(), *s, *e))
+            .collect();
+        assert_eq!(rows, expected, "faces for {source:?}");
+    }
+
+    // —— the `parseFormalParametersRest` missing-comma arm
+    // (parser_impl.dart:1975-1981) ————————————————————————————————————
+
+    #[test]
+    fn missing_comma_reports_once_and_keeps_both_formals() {
+        // `void f(int x int y) {}`: exactly one `expected_token ','` at the
+        // insertion point (end of `x`, riding the follower token's width —
+        // the oracle's machine row renders this `Expected to find ','.` at
+        // 13|0), and the list continues so `int y` parses as the second
+        // formal: no missing-body/`;` cascade from an early group close.
+        assert_faces("void f(int x int y) {}", &[("expected_token", 13, 16)]);
+    }
+
+    #[test]
+    fn two_missing_commas_report_per_gap() {
+        // `void f(int a int b int c) {}`: one row per gap — the continue
+        // re-enters the tail after each inserted comma (oracle rows 13|0 and
+        // 19|0).
+        assert_faces(
+            "void f(int a int b int c) {}",
+            &[("expected_token", 13, 16), ("expected_token", 19, 22)],
+        );
+    }
+
+    #[test]
+    fn missing_comma_after_function_typed_formal() {
+        // `void f(void cb() int x) {}`: the arm fires behind an inline
+        // function-typed formal too — the row anchors past the `)` closer
+        // (oracle `expected_token` at 17|0).
+        assert_faces("void f(void cb() int x) {}", &[("expected_token", 17, 20)]);
+    }
+
+    #[test]
+    fn missing_comma_in_member_formals() {
+        // `class C { void m(int x int y) {} }`: the member formal list takes
+        // the same arm — one row, the method closes and the body parses
+        // (oracle 23|0).
+        assert_faces("class C { void m(int x int y) {} }", &[("expected_token", 23, 26)]);
+    }
+
+    #[test]
+    fn missing_comma_parse_resumes_after_the_group() {
+        // `void f(int x int y) {} void g() {}`: the continue must not swallow
+        // the rest of the unit — `g` parses silently behind the repaired
+        // list (oracle: the single comma row 13|0).
+        assert_faces("void f(int x int y) {} void g() {}", &[("expected_token", 13, 16)]);
+    }
+
+    // —— the synthetic-closer priority (:1969-1972) ————————————————————
+
+    #[test]
+    fn synthetic_group_closer_beats_the_comma_arm() {
+        // `void f(int x int y` with no `)` anywhere: the scanner parked a
+        // synthetic `)`, so the `begin.endGroup!.isSynthetic` arm runs FIRST
+        // — the unmatched-`)` face at the relocation point (end of `x`,
+        // length-1 like every unmatched-closer row) and NO missing-comma
+        // row; the unit then resumes on `int y` (the declaration cascade is
+        // the oracle's: `)` 13|0, `;` 17|0, missing_function_body 13|0;
+        // `not_initialized_non_nullable_variable` is a semantic face outside
+        // this crate).
+        assert_faces(
+            "void f(int x int y",
+            &[
+                ("expected_token", 13, 14), // the relocated `)`
+                ("expected_token", 17, 18), // the `int y` declaration's `;`
+                ("missing_function_body", 13, 16),
+            ],
+        );
+    }
+
+    // —— the tail's silent exits stay silent ————————————————————————————
+
+    #[test]
+    fn trailing_comma_and_plain_lists_stay_clean() {
+        // The comma arm must not fire for well-formed lists.
+        assert_faces("void f(int x, int y) {}", &[]);
+        assert_faces("void f(int x,) {}", &[]);
+        assert_faces("void f(int x, [int y, int z]) {}", &[]);
+        assert_faces("void f(int x, {int y, int z}) {}", &[]);
+    }
+
+    #[test]
+    fn junk_behind_a_typed_formal_takes_the_close_arm() {
+        // `void f(int 5) {}`: junk is no identifier — the ensureCloseParen
+        // arm carries the single row anchored past the type (oracle:
+        // `Expected to find ')'` at 11|0, no missing_identifier).
+        assert_faces("void f(int 5) {}", &[("expected_token", 11, 12)]);
     }
 }

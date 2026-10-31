@@ -517,7 +517,30 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // Record with named expression (:7662-7670); `(:` takes the
                 // same path (ensure_identifier reports the missing name).
                 was_record = true;
-                let name = self.ensure_identifier(IdentifierContext::NamedRecordFieldReference);
+                // NamedRecordFieldReferenceIdentifierContext.ensureIdentifier
+                // (identifier_context_impl.dart:1258-1284): identifiers take
+                // the plain consume, keywords the tolerant consume
+                // (`expectedIdentifierButGotKeyword`), `:`/EOF splice the
+                // synthetic name in front (branch 2 keep), and every OTHER
+                // junk token is REPLACED by the synthetic — branch 3's
+                // `insertSyntheticIdentifier(identifier)` (:1283) consumes
+                // the junk, so the expect-`:` and the record close stay
+                // silent (oracle `var r = (5: 1);`: one `missing_identifier`
+                // at the `5`, never an `expected_token ':'` cascade; value
+                // junk like `'a'` spans its own length).
+                let name = if crate::members::is_keyword_or_identifier(self.peek_kind())
+                    || matches!(self.peek_kind(), TokenKind::Colon | TokenKind::Eof)
+                {
+                    self.ensure_identifier(IdentifierContext::NamedRecordFieldReference)
+                } else {
+                    let at = self.peek_span();
+                    let junk_end = at.range.offset + at.range.length;
+                    self.report(msg::missing_identifier(), at);
+                    self.cursor.advance();
+                    let id = self.cursor.insert_synthetic(TokenKind::Identifier, junk_end);
+                    self.cursor.advance();
+                    self.span_of(id)
+                };
                 let colon_token = self.expect_lexeme_but_got(":");
                 let _ = name;
                 colon = Some(colon_token);

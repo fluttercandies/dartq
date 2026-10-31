@@ -4435,6 +4435,34 @@ impl<'a> Engine<'a> {
             {
                 return None;
             }
+            // `FutureOr<V>` reads its nullability through `V` — upstream
+            // `isPotentiallyNonNullable(FutureOr<T>)` delegates to the
+            // argument, so a nullable element (`FutureOr<int?>`,
+            // `FutureOr<Object?>` — the unimported-`FutureOr`'s
+            // `InvalidType` → `Object?` face) reaches the NULLABLE twin,
+            // while a non-nullable element's union is potentially
+            // non-nullable (`FutureOr<int>` → the ERROR twin). The scope
+            // gate is the written-head arm's `named_type_is_type` — the
+            // async path's `ret` head is a materialized union, always a
+            // real type.
+            Ty::Named {
+                name,
+                nullable: false,
+                ..
+            } if name == self.intern("FutureOr") =>
+            {
+                if !self.named_type_is_type(name) && !*is_async {
+                    return None;
+                }
+                match self.future_or_base(ret) {
+                    Ty::Named { nullable: true, .. }
+                    | Ty::Record { nullable: true, .. }
+                    | Ty::Function { nullable: true, .. } => {
+                        SemanticCode::BodyMightCompleteNormallyNullable
+                    }
+                    _ => SemanticCode::BodyMightCompleteNormally,
+                }
+            }
             Ty::Named {
                 name,
                 nullable: false,
@@ -4519,7 +4547,11 @@ impl<'a> Engine<'a> {
     /// future value type. The verdict reads the union's faces through the
     /// same arms as any written `FutureOr`, and the nullable twin renders
     /// the union itself — the oracle's display text (`'FutureOr<int>'` for
-    /// `Future<int> f() async {}`).
+    /// `Future<int> f() async {}`). The union's `?` lives on the future
+    /// value type (`FutureOr<int?>` spells the argument's `?`, never a
+    /// `FutureOr<int?>?` head suffix) — its nullability reaches the
+    /// verdict through [`Self::future_or_base`]'s structural read, not a
+    /// head flag.
     pub(crate) fn async_completion_context(&self, declared: Ty) -> Ty {
         let value = self.future_value_type(declared);
         Ty::Named {
@@ -4535,7 +4567,12 @@ impl<'a> Engine<'a> {
     /// `dynamic`/`void` stay themselves, and every other head answers
     /// `Object?`. The recovery leaves (`Never`/`Null`/records/functions)
     /// never reach the answer alive — the async-legality gate silences
-    /// them at staging — so the `Object?` arm is the totality face.
+    /// them at staging — so the `Object?` arm is the totality face. An
+    /// unimported `FutureOr` head is `InvalidType` upstream (its element
+    /// resolution fails without the `dart:async` import) — `InvalidType`
+    /// falls to the `_`/`Object?` arm, so the unwrap gate is the same
+    /// scope question [`Self::named_type_is_type`] asks; `Future` resolves
+    /// through dart:core's own re-export and always counts.
     pub(crate) fn future_value_type(&self, ty: Ty) -> Ty {
         match ty {
             Ty::Named {
@@ -4548,7 +4585,8 @@ impl<'a> Engine<'a> {
                 args,
             }),
             Ty::Named { name, args, .. }
-                if name == self.intern("Future") || name == self.intern("FutureOr") =>
+                if (name == self.intern("Future") || name == self.intern("FutureOr"))
+                    && self.named_type_is_type(name) =>
             {
                 if args == ArgListId::EMPTY {
                     return Ty::Dynamic;

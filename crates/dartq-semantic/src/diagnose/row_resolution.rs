@@ -1584,6 +1584,35 @@ impl<'a> Engine<'a> {
                     },
                 };
             }
+            // A cascade SELECTOR that recorded no receiver (`..foo()`,
+            // `..foo = v` — the invocation/assignment fold left the
+            // section's receiver `Unknown`) still resolves against the
+            // cascade target: the oracle binds every section to
+            // `cascade.target`'s static type, so the selector's miss is the
+            // target's own member verdict. Inherit the prior section
+            // read's recorded receiver (`C()..foo..foo()` — `..foo`'s
+            // `Created`/`Typed` face) — the same latch the promoted arm
+            // above reads for a nullable target.
+            if matches!(recv, Receiver::Unknown) {
+                // The receiver the FIRST section recorded is the cascade
+                // target — a continuation section's own read latches
+                // `Unknown`, so the walk back keeps the newest read that
+                // still carries a receiver (the target's `Created`/`Typed`
+                // face), bounded at the cascade's own statement.
+                let src = self
+                    .member_reads
+                    .iter()
+                    .rev()
+                    .find(|read| {
+                        read.offset < row.range.offset && read.recv != Receiver::Unknown
+                    })
+                    .copied();
+                if let Some(read) = src
+                    && !self.semicolon_between(read.offset, row.range.offset)
+                {
+                    return read.recv;
+                }
+            }
             return recv;
         }
         // The newest cascade section strictly below the row: binary-search
@@ -4191,6 +4220,13 @@ impl<'a> Engine<'a> {
         if let Some(container) = container_face
             && !self.is_scope_param(container)
             && self.param_bound(container).is_none()
+            // The pass-2 bound window (`param_bound_of`): the scope/param
+            // tables the two probes above read are torn down by the member
+            // walk, so a `void f<T>(T t)` receiver spelled `T` reads as an
+            // invalid container here. A name any captured bound window
+            // declares IS a scope parameter — keep the member face (its own
+            // bound walk decides), never the invalid-container bail.
+            && self.param_bound_of(container).is_none()
             && !matches!(
                 self.strings.resolve(container),
                 "Symbol" | "Version" | "VersionConstraint"

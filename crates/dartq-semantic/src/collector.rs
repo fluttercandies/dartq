@@ -6370,6 +6370,61 @@ mod tests {
         assert!(formals.is_some(), "no-return control");
     }
 
+    /// #3128: `operator==` captures its honest signature like every other
+    /// operator — `kind=Method`, the depth-0 formals, and the written return
+    /// annotation. The `==` name token is the operator spelling (no
+    /// `MethodDeclaration` identifier event), so the return annotation
+    /// latches through the operator-spelling arm at `begin_formal_parameters`
+    /// — never `formals=None` (which would force `override_broken`'s
+    /// `(None, Some)` suppress) and never `return_ty` reading the `extends`
+    /// clause's armed type. The `+`/`[]=` controls pin the shared latch.
+    #[test]
+    fn operator_eq_captures_honest_signature() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class A { \
+               bool operator ==(Object o) => true; \
+             } \
+             class B extends A { \
+               bool operator ==(B o) => true; \
+               num operator +(num o) => o; \
+               void operator []=(int i, String s) {} \
+             }",
+            &strings,
+        );
+        let member = |class_name: &str, name: &str| {
+            elements
+                .container(id(&strings, class_name))
+                .expect(class_name)
+                .members
+                .get(&id(&strings, name))
+                .unwrap_or_else(|| panic!("member {class_name}.{name}"))
+        };
+        let eq = member("B", "==");
+        assert_eq!(eq.kind, MemberKind::Method);
+        assert_eq!(eq.return_ty, Ty::named(id(&strings, "bool")));
+        let formals = eq.formals.as_deref().expect("== formals captured");
+        assert_eq!(formals.positional.len(), 1);
+        assert_eq!(formals.positional[0].name, id(&strings, "o"));
+        assert_eq!(formals.positional[0].ty, Ty::named(id(&strings, "B")));
+        // The super's `==` captures identically — `Object` param, `bool`
+        // return — so the override face has both honest signatures.
+        let a_eq = member("A", "==");
+        assert_eq!(a_eq.return_ty, Ty::named(id(&strings, "bool")));
+        let a_formals = a_eq.formals.as_deref().expect("A.== formals");
+        assert_eq!(a_formals.positional[0].ty, Ty::named(id(&strings, "Object")));
+        // Controls: `+`/`[]=` carry their own signatures.
+        let plus = member("B", "+");
+        assert_eq!(plus.return_ty, Ty::named(id(&strings, "num")));
+        assert_eq!(
+            plus.formals.as_deref().unwrap().positional[0].ty,
+            Ty::named(id(&strings, "num"))
+        );
+        let idx = member("B", "[]=");
+        assert_eq!(idx.return_ty, Ty::Void);
+        assert_eq!(idx.formals.as_deref().unwrap().positional.len(), 2);
+    }
+
     /// Type-parameter counts per declaration, from the depth-1 group only:
     /// containers, generic methods, generic functions, typedefs; body
     /// declarations never clobber a header count.

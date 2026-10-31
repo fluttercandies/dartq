@@ -344,8 +344,19 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             TokenKind::PlusPlus | TokenKind::MinusMinus => {
                 let operator = self.peek_span();
                 self.cursor.advance();
-                self.listener.handle_unary_prefix_expression(operator);
-                self.parse_pattern_unary(ConstantPatternContext::None)
+                let end = self.parse_pattern_unary(ConstantPatternContext::None);
+                // Official `handleUnaryPrefixAssignmentExpression`
+                // (ast_builder.dart:5647-5656): a non-assignable operand
+                // reports `missingAssignableSelector` at the operand's
+                // endToken (`case --1:` anchors on the `1`, `case ++super:`
+                // on the `super`); an assignable operand stays silent
+                // (`case ++x:`).
+                if !self.operand_ends_assignable() {
+                    self.report(msg::missing_assignable_selector(), end);
+                }
+                self.listener
+                    .handle_unary_prefix_assignment_expression(operator);
+                end
             }
             TokenKind::Keyword(Keyword::Await) => {
                 let begin = self.peek_span();
@@ -715,12 +726,26 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     end = close;
                 }
                 TokenKind::PlusPlus | TokenKind::MinusMinus => {
-                    // Official precedence-loop POSTFIX arm (:7312-7318):
-                    // postfix `++`/`--` consume silently in any
-                    // constant-pattern context (oracle const_patterns_binary
-                    // 86/87 — `case o++:`/`case o--:` are parser-silent).
+                    // Official precedence-loop POSTFIX arm (:7312-7318) plus
+                    // `handleUnaryPostfixAssignmentExpression`
+                    // (ast_builder.dart:5620-5642): an assignable operand is
+                    // parser-silent (const_patterns_binary 86/87 —
+                    // `case o++:`/`case o--:`), a non-assignable one reports
+                    // `illegalAssignmentToNonAssignable` anchored on the
+                    // operator (`case 1++:` at the `++`). The operand's end
+                    // is the loop's own `end` — read it BEFORE consuming the
+                    // operator, which becomes the cursor's last-consumed
+                    // token.
                     let operator = self.peek_span();
+                    let operand_assignable = matches!(
+                        self.span_kind(end.id),
+                        kind if crate::recovery::is_identifier(kind)
+                            || kind == TokenKind::CloseSquare
+                    );
                     self.cursor.advance();
+                    if !operand_assignable {
+                        self.report(msg::illegal_assignment_to_non_assignable(), operator);
+                    }
                     self.listener
                         .handle_unary_postfix_assignment_expression(operator);
                     end = operator;
