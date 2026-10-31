@@ -64,6 +64,7 @@ mod ticket_3050;
 mod ticket_3051;
 mod ticket_3052;
 mod ticket_3053;
+mod ticket_3054_tests;
 mod ticket_3071;
 mod ticket_3072;
 mod ticket_2995;
