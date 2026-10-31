@@ -5833,6 +5833,16 @@ mod ticket_3118_tests;
 #[cfg(test)]
 mod ticket_3117_tests;
 
+/// The #3120 pins: the `_resolveType` clause-element-kind check — a clause
+/// head that resolves to a non-class/non-mixin element (or misses scope
+/// resolution entirely) reports the clause's own code at the written head,
+/// never the resolver's `undefined_class`/`not_a_type` (upstream Dart SDK
+/// source, pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:1169-1241;
+/// the clause-parent suppression `named_type_resolver.dart:673-680` keeps for
+/// every clause EXCEPT `MixinOnClause`).
+#[cfg(test)]
+mod ticket_3120_tests;
+
 /// The #3124 pins: the `conflicting_static_and_instance` body-close hook
 /// for `enum` and `extension type` — `end_enum_declaration` /
 /// `end_extension_type_declaration` now invoke

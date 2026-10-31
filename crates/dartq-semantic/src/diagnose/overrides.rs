@@ -159,7 +159,46 @@ enum Instantiated {
 /// suppression direction.
 struct HeaderClause {
     params: Vec<StringId>,
-    supers: Vec<(StringId, Vec<Ty>)>,
+    supers: Vec<SuperEntry>,
+}
+
+/// The clause a written supertype entry belongs to (upstream Dart SDK
+/// source, `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart`
+/// `_resolveType`'s clause switch :1209-1227 — the diagnostic code keys on
+/// the clause kind, not on the face's own position). `AliasHead` is the
+/// named mixin application's superclass slot (`class C = S with ...`) and
+/// a plain extends head when the declaration also carries a `with` clause:
+/// both spell the `mixin_with_non_class_superclass` code upstream
+/// (:1212-1219).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SuperTag {
+    /// A class declaration's `extends` head.
+    Extends,
+    /// A named mixin application's head type or an extends head on a
+    /// `with`-carrying declaration.
+    AliasHead,
+    /// A `with` clause entry.
+    With,
+    /// An `implements` clause entry.
+    Implements,
+    /// A mixin's `on` constraint entry.
+    On,
+}
+
+/// One written supertype-clause entry as scanned from the source tokens:
+/// the clause it sits in, the head's bare-leaf spelling (`StringId::NONE`
+/// for the `void`/`dynamic` keyword heads — the entry carries a dedicated
+/// [`Ty`] then), the import prefix when the face was spelled `p.C`, the
+/// oracle's anchor span (the bare head, or prefix-head through local end
+/// for `p.C` — `resolution_visitor.dart:1235-1237`), and the written type
+/// list (`vec![whole_named_ty]`, the same convention the old
+/// `(StringId, Vec<Ty>)` entries kept for [`Engine::clause_instantiation`]).
+struct SuperEntry {
+    tag: SuperTag,
+    head: StringId,
+    prefix: Option<StringId>,
+    span: SourceRange,
+    args: Vec<Ty>,
 }
 
 /// One inherited-member candidate the override faces resolved: the entry
@@ -1308,8 +1347,8 @@ impl<'a> Engine<'a> {
             let clause = facts.get_or_insert_with(|| self.scan_header_clauses());
             clause
                 .get(&container)
-                .and_then(|c| c.supers.iter().find(|(head, _)| *head == mixin))
-                .and_then(|(_, stored)| self.face_args(stored))
+                .and_then(|c| c.supers.iter().find(|entry| entry.head == mixin))
+                .and_then(|entry| self.face_args(&entry.args))
         };
         let Some(written) = written else {
             return Instantiated::Undecidable;
@@ -2375,6 +2414,52 @@ impl<'a> Engine<'a> {
                 count,
             );
         }
+        // The enum header's clause check drains here: the enum arm of
+        // `arm_modifier_checks` latches `container: None` and the enum
+        // body-open event never calls [`Self::run_modifier_use_sites`]
+        // (its `deferred_modifier` is discarded outright at the enum end
+        // event), so `enum E with M implements I` would miss the
+        // resolved-element half of the oracle's `_resolveType` clause
+        // check entirely (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/dart/resolver/scope_context.dart:144-167`
+        // — `EnumDeclaration` visits `withClause` and `implementsClause`
+        // through the same `_resolveType` walk). `implements` is the enum
+        // grammar's LAST clause — its close (or absent-clause `count` = 0)
+        // fires when the header is complete.
+        let enum_container = match self.container_context() {
+            Some((name, ContainerKind::Enum)) => Some(name),
+            _ => None,
+        };
+        if let Some(container) = enum_container {
+            let window = self
+                .deferred_modifier
+                .as_ref()
+                .map(|deferred| Self::clause_window_offsets(&deferred.spans))
+                .unwrap_or_default();
+            self.check_clause_element_kinds(container, &window);
+        }
+    }
+
+    /// The whole clause-window's captured type spans: every offset the
+    /// header's `note_header_type_span` latch recorded — extends head,
+    /// buffered with/recovery entries, and the claimed
+    /// `implements`/`on` tails. [`Self::check_clause_element_kinds`] sweeps
+    /// the `clause_miss` ledger against this set: an offset here that no
+    /// scanned [`SuperEntry`] owns is a parser-recovery artifact (the
+    /// `parse_type_not_void` re-fire that pushes a `Missing` row at the
+    /// `{`/`,` position after a `void` head — the oracle's own clause
+    /// switch anchors nothing there), so the ledger entry and the row both
+    /// silence.
+    fn clause_window_offsets(spans: &HeaderClauseSpans) -> Vec<u32> {
+        spans
+            .extends
+            .iter()
+            .map(|span| span.offset)
+            .chain(spans.super_candidate.iter().map(|span| span.offset))
+            .chain(spans.buffered.iter().map(|span| span.offset))
+            .chain(spans.implements.iter().map(|span| span.offset))
+            .chain(spans.on.iter().map(|span| span.offset))
+            .collect()
     }
 
     /// The mixin `on` clause completed: the same trailing-count claim as
@@ -2395,8 +2480,48 @@ impl<'a> Engine<'a> {
         };
         if !deferred.use_sites_done {
             deferred.use_sites_done = true;
-            if let Some(container) = deferred.container {
-                self.check_modifier_use_sites(container, deferred.name_range, &deferred.spans);
+            // The clause-element-kind pass runs for EVERY container family
+            // whose header scanned faithfully — the modifier use-site half
+            // skips unnamed enums (`deferred.container` is `None` for them,
+            // listener.rs's enum arm), but the oracle's clause switch keys
+            // on the CLAUSE kind alone (upstream Dart SDK source,
+            // `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart`
+            // `_resolveType` :1209-1227 — `EnumDeclaration` reaches the same
+            // `with`/`implements` `_resolveType` walk through
+            // `scope_context.dart:144-167`), so the enum's container context
+            // supplies the name the deferred slot never latched. A mixin
+            // application's `container` IS set (named mixin application
+            // `class C = S with M`) and drains through the same path.
+            let clause_container = deferred.container.or_else(|| {
+                self.container_context()
+                    .map(|(name, _)| name)
+            });
+            if let Some(container) = clause_container {
+                if deferred.container.is_some() {
+                    self.check_modifier_use_sites(
+                        container,
+                        deferred.name_range,
+                        &deferred.spans,
+                    );
+                }
+                // An enum header drains at its own
+                // `handle_implements`/`handle_no_implements` event —
+                // `use_sites_done` still single-shots it here for the
+                // no-implements path (`enum E;`, `enum E {}`).
+                if deferred.container.is_none()
+                    && matches!(
+                        self.index
+                            .get(self.file)
+                            .and_then(|e| e.container(container))
+                            .map(|c| c.kind),
+                        Some(ContainerKind::Enum)
+                    )
+                {
+                    // Already drained at the implements claim.
+                } else {
+                    let window = Self::clause_window_offsets(&deferred.spans);
+                    self.check_clause_element_kinds(container, &window);
+                }
             }
         }
         self.deferred_modifier = Some(deferred);
@@ -5189,8 +5314,8 @@ impl<'a> Engine<'a> {
             let incoming: Option<Vec<Ty>> = if index == 0 {
                 clause(self, facts)
                     .get(&container)
-                    .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop))
-                    .and_then(|(_, stored)| self.face_args(stored))
+                    .and_then(|c| c.supers.iter().find(|entry| entry.head == hop))
+                    .and_then(|entry| self.face_args(&entry.args))
             } else {
                 let (prev, prev_file) = chain[index - 1];
                 if prev_file != self.file {
@@ -5198,8 +5323,8 @@ impl<'a> Engine<'a> {
                 } else {
                     clause(self, facts)
                         .get(&prev)
-                        .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop))
-                        .and_then(|(_, stored)| self.face_args(stored))
+                        .and_then(|c| c.supers.iter().find(|entry| entry.head == hop))
+                        .and_then(|entry| self.face_args(&entry.args))
                 }
             };
             let Some(args) = incoming else {
@@ -5242,8 +5367,8 @@ impl<'a> Engine<'a> {
         if foreign_single && chain.len() == 1 && free.len() == 1 {
             let incoming = clause(self, facts)
                 .get(&container)
-                .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop_name))
-                .and_then(|(_, stored)| self.face_args(stored));
+                .and_then(|c| c.supers.iter().find(|entry| entry.head == hop_name))
+                .and_then(|entry| self.face_args(&entry.args));
             if let Some([arg]) = incoming.as_deref() {
                 let mut map = FxHashMap::default();
                 map.insert(free[0], *arg);
@@ -5468,10 +5593,323 @@ impl<'a> Engine<'a> {
             .get(&container)?
             .supers
             .iter()
-            .find(|(name, _)| *name == super_name)
-            .map(|(_, args)| args.clone())
+            .find(|entry| entry.head == super_name)
+            .map(|entry| entry.args.clone())
     }
 
+    /// Rewrites one pending type-position row into the suppressed `Missing`
+    /// shape at the clause-check time ([`Self::check_clause_element_kinds`]):
+    /// the row still resolves later (its `record_miss` bookkeeping and the
+    /// `Missing` arm's clause/context chains keep running), but the report
+    /// gate drops it — the oracle's `hasErrorReported` and the clause-parent
+    /// suppressions leave the resolver silent once the clause code emits
+    /// (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:1178-1180`
+    /// and `named_type_resolver.dart:673-680`). `Prefixed`/`NonType` rows do
+    /// not honor the flag their own arms read, so the rewrite normalizes the
+    /// verdict itself — the row's name and range are the miss's identity.
+    fn suppress_type_row(&mut self, range: SourceRange) {
+        for row in self.rows.iter_mut().chain(self.deferred_miss_rows.iter_mut()) {
+            // A `Prefixed` row records the leaf's own span while a scanned
+            // entry's span opens at the prefix token — the row matches when
+            // it sits inside the entry's span, not only when it equals it.
+            if row.range.offset >= range.offset
+                && row.range.end() <= range.end()
+                && matches!(
+                    row.shape,
+                    RowShape::TypeUse(
+                        TypeVerdict::Missing | TypeVerdict::NonType | TypeVerdict::Prefixed { .. },
+                        _
+                    )
+                )
+            {
+                row.shape = RowShape::TypeUse(TypeVerdict::Missing, true);
+            }
+        }
+    }
+
+    /// [`Self::suppress_type_row`] at a bare offset — the recovery-artifact
+    /// sweep's face (its `Missing` row sits at the offset itself, the
+    /// `parse_type_not_void` re-fire's `{`/`,` token).
+    fn suppress_type_row_offset(&mut self, offset: u32) {
+        for row in self.rows.iter_mut().chain(self.deferred_miss_rows.iter_mut()) {
+            if row.range.offset == offset
+                && matches!(
+                    row.shape,
+                    RowShape::TypeUse(
+                        TypeVerdict::Missing | TypeVerdict::NonType | TypeVerdict::Prefixed { .. },
+                        _
+                    )
+                )
+            {
+                row.shape = RowShape::TypeUse(TypeVerdict::Missing, true);
+            }
+        }
+    }
+
+    /// Drops one clause-ledger entry at `offset` without emitting —
+    /// [`Self::take_clause_miss`]'s consumption cousin for the resolved-
+    /// element clause check. A scanned entry that resolved to a clause-legal
+    /// kind, or one the upstream walk never reaches (a mixin declaration's
+    /// `with` entries, a trailing `extends` overflow), leaves its ledger
+    /// slot behind; an unresolved entry keeps it — the pass-2 `Missing` arm
+    /// reports the clause code through it. The ledger stays sorted by
+    /// offset (removal only).
+    fn remove_clause_miss(&mut self, offset: u32) {
+        if let Ok(index) = self
+            .clause_miss
+            .binary_search_by_key(&offset, |entry| entry.0)
+        {
+            self.clause_miss.remove(index);
+        }
+    }
+
+    /// The resolved-element half of the oracle's `_resolveType` clause
+    /// check (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart`
+    /// :1169-1241 — the clause-kind switch keys the diagnostic on the
+    /// CLAUSE, never on what the element resolved to): for each scanned
+    /// [`SuperEntry`] of `container`'s header, answer the head's element
+    /// and report the clause code when the kind is illegal for the clause
+    /// — `ClassElement` is legal for every clause, `MixinElement` only for
+    /// `implements`/`with`/`on` (:1194-1202), and every other outcome —
+    /// enum, extension-type, alias-to-non-class, type parameter,
+    /// `dynamic`, `void`, a resolved non-type, a miss — falls to the
+    /// clause arm (:1209-1227).
+    ///
+    /// Drained once at the body open (the deferred modifier's
+    /// `use_sites_done` flag), or at the `implements` claim for an enum —
+    /// its arm carries `container: None` and never reaches the body-open
+    /// drain. Each entry also re-decides its own resolver row: a
+    /// resolved-but-illegal face silences the resolver
+    /// (`named_type_resolver.dart`'s `reportNullOrNonTypeElement`
+    /// clause-parent suppression :673-680 covers every clause EXCEPT
+    /// `MixinOnClause` — the `on` constraint keeps its `undefined_class`/
+    /// `not_a_type` row beside `mixin_super_class_constraint_non_
+    /// interface`), so the pending row at the same span is suppressed and
+    /// the clause-ledger slot consumed here.
+    ///
+    /// `window` is the header's whole captured type-span set — a
+    /// clause-ledger offset no scanned [`SuperEntry`] owns is a
+    /// parser-recovery artifact (the `parse_type_not_void` re-fire's
+    /// `Missing` row at the `{`/`,` position after a `void` head) and
+    /// silences with its row.
+    fn check_clause_element_kinds(
+        &mut self,
+        container: StringId,
+        window: &[u32],
+    ) {
+        let Some(facts) = self.scan_header_clauses().remove(&container) else {
+            return;
+        };
+        let Some(kind) = self
+            .index
+            .get(self.file)
+            .and_then(|elements| elements.container(container))
+            .map(|container| container.kind)
+        else {
+            return;
+        };
+        let has_with = facts.supers.iter().any(|entry| entry.tag == SuperTag::With);
+        // Reachability across the entry walk: upstream's parser keeps only
+        // the FIRST `extends` clause (`handleClassExtends` — a second
+        // `extends` and a comma-overflow both fold into
+        // `multiple_extends_clauses`, their heads never resolving), EXCEPT a
+        // trailing `extends` after `implements` (the ordering-recovery tail
+        // — `implements_before_extends` reorders the clauses, and that tail
+        // head DOES reach `_resolveType`). Flags:
+        // `first_extends_consumed` — an earlier Extends entry already claimed
+        // the clause slot; `implements_since_extends` — an Implements entry
+        // intervened since the last Extends, reopening the tail.
+        let mut first_extends_consumed = false;
+        let mut implements_since_extends = false;
+        for entry in &facts.supers {
+            let span = entry.span;
+            // The upstream clause-code decision keys on (declaration,
+            // clause) — `class C = S ...` reaches `visitClassTypeAlias` with
+            // `clause: null`, and `scope_context.dart`'s recovery shapes
+            // route `class A on X` through the `ExtendsClause` arm and
+            // `mixin M extends X` through `MixinOnClause` (upstream's
+            // `EXPECTED_INSTEAD` recoveries keep the clause's own arm).
+            let clause_code = match (kind, entry.tag) {
+                (ContainerKind::Class, SuperTag::On) => {
+                    if has_with {
+                        SemanticCode::MixinWithNonClassSuperclass
+                    } else {
+                        SemanticCode::ExtendsNonClass
+                    }
+                }
+                (ContainerKind::Mixin, SuperTag::Extends) => {
+                    SemanticCode::MixinSuperClassConstraintNonInterface
+                }
+                (_, SuperTag::AliasHead) => SemanticCode::MixinWithNonClassSuperclass,
+                (_, SuperTag::Extends) => {
+                    if has_with {
+                        SemanticCode::MixinWithNonClassSuperclass
+                    } else {
+                        SemanticCode::ExtendsNonClass
+                    }
+                }
+                (_, SuperTag::With) => SemanticCode::MixinOfNonClass,
+                (_, SuperTag::Implements) => SemanticCode::ImplementsNonClass,
+                (_, SuperTag::On) => SemanticCode::MixinSuperClassConstraintNonInterface,
+            };
+            // The upstream legality by clause (`:1194-1202`): every clause
+            // accepts a `ClassElement`; `implements`/`with`/`on` also
+            // accept a `MixinElement`.
+            let clause_accepts_mixin = matches!(
+                entry.tag,
+                SuperTag::Implements | SuperTag::With | SuperTag::On
+            );
+            let legal = |resolved: Option<ContainerKind>| {
+                match resolved {
+                    Some(ContainerKind::Class) => true,
+                    Some(ContainerKind::Mixin) => clause_accepts_mixin,
+                    _ => false,
+                }
+            };
+            // A head the upstream `_resolveType` walk never reaches —
+            // silence the row and the ledger entry without a report:
+            //   * a second+ `extends` head on a class (`extends B extends C`,
+            //     `extends B, C` — `multiple_extends_clauses` recovery keeps
+            //     only the first clause), unless an `implements` entry
+            //     intervened (`implements B extends C` — the
+            //     `implements_before_extends` recovery tail head DOES
+            //     resolve);
+            //   * a mixin declaration's `with` entries (`mixin_with_clause`
+            //     recovery — the mixin grammar has no `with` clause);
+            //   * enum `extends`/`on`/alias-super residue (`scope_context`
+            //     routes enums to with/implements only).
+            if entry.tag == SuperTag::Implements {
+                implements_since_extends = true;
+            }
+            let unreachable = (entry.tag == SuperTag::Extends
+                && kind == ContainerKind::Class
+                && first_extends_consumed
+                && !implements_since_extends)
+                || (kind == ContainerKind::Mixin && entry.tag == SuperTag::With)
+                || (kind == ContainerKind::Enum
+                    && matches!(entry.tag, SuperTag::Extends | SuperTag::On | SuperTag::AliasHead));
+            if entry.tag == SuperTag::Extends {
+                first_extends_consumed = true;
+                implements_since_extends = false;
+            }
+            if unreachable {
+                self.suppress_type_row(span);
+                self.remove_clause_miss(span.offset);
+                continue;
+            }
+            // The head's resolved element: `void`/`dynamic` keyword heads
+            // carry a dedicated `Ty` (never a container); a prefixed head
+            // resolves the leaf through the prefix's merged table; a bare
+            // name resolves bare — a type alias's RHS head folds through
+            // [`Self::alias_container_head`] (the same fold the override
+            // faces keep, `resolution_visitor.dart`'s `type.element` read
+            // reaches the alias's instantiated element).
+            let resolved: Option<ContainerKind> = if entry.head == StringId::NONE {
+                None
+            } else if let Some(prefix) = entry.prefix {
+                match self
+                    .namespaces
+                    .lookup_prefixed(self.graph, self.lib, prefix, entry.head)
+                {
+                    Lookup::Found(NamespaceEntry::Decl(owner)) => self
+                        .index
+                        .get(owner)
+                        .and_then(|f| f.container(entry.head))
+                        .map(|c| c.kind),
+                    _ => None,
+                }
+            } else {
+                let scoped = lookup_scoped(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    entry.head,
+                );
+                match scoped {
+                    ScopedHit::Local(decl) => match decl.kind {
+                        crate::model::MicroKind::TypeAlias => self
+                            .alias_container_head(entry.head, self.lib, self.file)
+                            .map(|(container, _, _)| container.kind),
+                        crate::model::MicroKind::Class | crate::model::MicroKind::Mixin => self
+                            .index
+                            .get(self.file)
+                            .and_then(|f| f.container(entry.head))
+                            .map(|c| c.kind),
+                        _ => None,
+                    },
+                    ScopedHit::Found(NamespaceEntry::Decl(owner)) => self
+                        .index
+                        .get(owner)
+                        .and_then(|f| f.container(entry.head))
+                        .map(|c| c.kind),
+                    _ => None,
+                }
+            };
+            if legal(resolved) {
+                // A clause-legal entry resolves without a report — its
+                // ledger slot stays behind only because the resolver never
+                // consumed it.
+                self.remove_clause_miss(span.offset);
+                continue;
+            }
+            // The additive face: `on` (and the recovered `mixin M extends
+            // X`) keeps the resolver's own row beside the clause code
+            // (`MixinOnClause` is the one clause parent
+            // `reportNullOrNonTypeElement` does not suppress,
+            // `named_type_resolver.dart:673-680`). Every other face
+            // silences the resolver row with the clause code
+            // (`hasErrorReported`, `resolution_visitor.dart:1178-1180`).
+            let additive = matches!(
+                (kind, entry.tag),
+                (ContainerKind::Mixin, SuperTag::On) | (ContainerKind::Mixin, SuperTag::Extends)
+            );
+            if additive {
+                self.remove_clause_miss(span.offset);
+            } else {
+                self.suppress_type_row(span);
+                self.remove_clause_miss(span.offset);
+            }
+            // `shouldIgnoreUndefinedNamedType`'s broken-import posture
+            // (:1205-1207) suppresses the clause row itself when the
+            // (possibly prefixed) name sits in a broken import's `show`
+            // list — the guard consults prefix + leaf the same way it
+            // does for the resolver's `undefined_class`.
+            if !self.guard.ignore(entry.prefix, entry.head) {
+                if clause_code == SemanticCode::ExtendsNonClass
+                    || clause_code == SemanticCode::ImplementsNonClass
+                {
+                    // The correction-carrying clause faces — the oracle's
+                    // `correctionMessage` rows land beside the diagnostic
+                    // (`emit_clause_miss`'s convention).
+                    let message = clause_code.message("", "");
+                    self.emit_message_with_correction(clause_code, span, message);
+                } else {
+                    self.emit(clause_code, span, "", "");
+                }
+            }
+        }
+        // The recovery-artifact sweep: a `clause_miss` offset inside the
+        // window that no scanned entry owns is the `parse_type_not_void`
+        // re-fire's `Missing` row (its own `void`-head span precedes it)
+        // or a claim/count disagreement in a recovery shape — both silence
+        // with their rows, never reporting the clause code.
+        let mut owned: Vec<u32> = facts
+            .supers
+            .iter()
+            .map(|entry| entry.span.offset)
+            .collect();
+        owned.sort_unstable();
+        for offset in window {
+            if owned.binary_search(offset).is_err() {
+                self.suppress_type_row_offset(*offset);
+                self.remove_clause_miss(*offset);
+            }
+        }
+    }
     /// The prefixed supertype-clause faces of this file's container headers:
     /// `(writer container, face local name)` → the written prefix head. The
     /// element model keeps only the clause continuation (`implements idl.X`
@@ -5809,16 +6247,28 @@ impl<'a> Engine<'a> {
             }
         }
         // The clause window: supertype faces until the body opens.
-        let mut supers: Vec<(StringId, Vec<Ty>)> = Vec::new();
+        let mut supers: Vec<SuperEntry> = Vec::new();
         let mut faithful = true;
         let mut end = i;
         while let Some(lex) = lex_at(end) {
             match lex {
                 "{" | ";" => break,
                 "extends" | "with" | "implements" | "on" | "=" => {
+                    // The `=` head is the named mixin application's
+                    // superclass slot; a plain `extends` head upgrades to
+                    // the same alias-super arm when the header also
+                    // carries a `with` clause — decided at emit time
+                    // (the scan keeps the written clause tag verbatim).
+                    let tag = match lex {
+                        "extends" => SuperTag::Extends,
+                        "with" => SuperTag::With,
+                        "implements" => SuperTag::Implements,
+                        "on" => SuperTag::On,
+                        _ => SuperTag::AliasHead,
+                    };
                     end += 1;
                     loop {
-                        match self.scan_clause_type(end, &mut supers) {
+                        match self.scan_clause_type(end, tag, &mut supers) {
                             Some(next) => end = next,
                             None => {
                                 faithful = false;
@@ -5862,33 +6312,70 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Parses one clause type at `i` — `Head`, `Head<...args...>`, `Head?`,
-    /// `dynamic`/`void` — appending `(head, [whole_named_ty])` to `supers`
-    /// (the one stored value is the face's whole `Ty::Named`; its own
+    /// Parses one clause type at `i` — `Head`, `p.Head`, `Head<...args...>`,
+    /// `Head?`, `dynamic`/`void` — appending one [`SuperEntry`] to `supers`
+    /// (the stored `args` value is the face's whole `Ty::Named`; its own
     /// `args` list is the real argument list — `face_args`/`mixin_env`
     /// unwrap it) and returns the position past it. `None` marks the clause
     /// unfaithful (a non-identifier head, an unbalanced group, a function-
-    /// or record-typed argument): the header contributes no facts.
+    /// or record-typed argument): the header contributes no facts. The
+    /// recorded `span` is the oracle's clause-check anchor — the bare head,
+    /// or `p` through `Head` for a prefixed face
+    /// (`resolution_visitor.dart:1235-1237`).
     fn scan_clause_type(
         &self,
         start: usize,
-        supers: &mut Vec<(StringId, Vec<Ty>)>,
+        tag: SuperTag,
+        supers: &mut Vec<SuperEntry>,
     ) -> Option<usize> {
         let toks = self.tokens.as_slice();
         let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
+        let tok_span = |i: usize| {
+            let tok = toks.get(i)?;
+            Some(SourceRange {
+                offset: tok.byte_offset,
+                length: tok.byte_len,
+            })
+        };
         let mut i = start;
-        let head_ty = match lex_at(i)? {
+        match lex_at(i)? {
             "dynamic" => {
-                supers.push((StringId::NONE, vec![Ty::Dynamic]));
-                return Some(i + 1);
+                supers.push(SuperEntry {
+                    tag,
+                    head: StringId::NONE,
+                    prefix: None,
+                    span: tok_span(i)?,
+                    args: vec![Ty::Dynamic],
+                });
+                Some(i + 1)
             }
             "void" => {
-                supers.push((StringId::NONE, vec![Ty::Void]));
-                return Some(i + 1);
+                supers.push(SuperEntry {
+                    tag,
+                    head: StringId::NONE,
+                    prefix: None,
+                    span: tok_span(i)?,
+                    args: vec![Ty::Void],
+                });
+                Some(i + 1)
             }
             _ => {
-                let head = self.intern_checked(i)?;
+                let first = self.intern_checked(i)?;
+                let head_start = toks.get(i)?.byte_offset;
                 i += 1;
+                // A prefixed clause face (`p.C`): the prefix stays the
+                // spelling's head, the local name becomes the leaf — the
+                // same bare-leaf convention the element model keeps.
+                let (prefix, head) = if lex_at(i) == Some(".")
+                    && self.intern_checked(i + 1).is_some()
+                {
+                    let local = self.intern_checked(i + 1)?;
+                    i += 2;
+                    (Some(first), local)
+                } else {
+                    (None, first)
+                };
+                let head_end = toks.get(i - 1)?.byte_offset + toks.get(i - 1)?.byte_len;
                 let mut args: Vec<Ty> = Vec::new();
                 if lex_at(i) == Some("<") {
                     i = self.scan_type_args(i, &mut args)?;
@@ -5897,7 +6384,7 @@ impl<'a> Engine<'a> {
                 if nullable {
                     i += 1;
                 }
-                if args.is_empty() {
+                let head_ty = if args.is_empty() {
                     Ty::Named {
                         name: head,
                         nullable,
@@ -5909,11 +6396,20 @@ impl<'a> Engine<'a> {
                         nullable,
                         args: self.boundary.intern_list(&args),
                     }
-                }
+                };
+                supers.push(SuperEntry {
+                    tag,
+                    head,
+                    prefix,
+                    span: SourceRange {
+                        offset: head_start,
+                        length: head_end - head_start,
+                    },
+                    args: vec![head_ty],
+                });
+                Some(i)
             }
-        };
-        supers.push((self.intern_checked(start)?, vec![head_ty]));
-        Some(i)
+        }
     }
 
     /// Parses a balanced `<...>` type-argument group into `args`, returning
