@@ -903,21 +903,48 @@ impl<'a> Engine<'a> {
         } else {
             declared_faces.push((entry.kind, None));
         }
-        // Per declared face (getter / setter): the inherited members already
-        // judged broken, keyed by pointer — one diagnostic per inherited
-        // member.
-        let mut broken_seen: Vec<(bool, *const MemberEntry)> = Vec::new();
-        for face in faces {
-            for (face_kind, face_entry) in &declared_faces {
-                let setter_face = *face_kind == MemberKind::Setter;
-                // A field's setter face resolves under the setter spelling;
-                // every other face keeps the written name (a real setter
-                // declaration arrives spelled `name=` already).
-                let lookup = if face_entry.is_some() {
-                    self.setter_spelling(spelling)
-                } else {
-                    spelling
-                };
+        // Per declared face (getter / setter) — the oracle's
+        // `_checkDeclaredField` runs one `_checkDeclaredMember` per executable
+        // element, each with its own helper: the function-subtype pass over
+        // the direct super-faces, then the `CovariantParametersVerifier`.
+        for (face_kind, face_entry) in &declared_faces {
+            let setter_face = *face_kind == MemberKind::Setter;
+            // A field's setter face resolves under the setter spelling;
+            // every other face keeps the written name (a real setter
+            // declaration arrives spelled `name=` already).
+            let lookup = if face_entry.is_some() {
+                self.setter_spelling(spelling)
+            } else {
+                spelling
+            };
+            // The covariance faces: every transitive superinterface's OWN
+            // member (upstream `correct_override.dart:96-138`
+            // `CovariantParametersVerifier._superParameters` over
+            // `classHierarchy.implementedInterfaces`; `_correspondingMember`
+            // reads each interface element's own declarations). They carry
+            // both the propagated `covariant` marks and the verifier rows.
+            let super_faces = self.covariant_own_faces(container, lookup, *face_kind, &mut facts);
+            // The `_inheritCovariance` propagation
+            // (`inheritance_manager3.dart:1063-1130`): a parameter is
+            // covariant when this member or any overridden member declares it
+            // so. The marks drive `_computeThisTypeForSubtype`'s `Object?`
+            // rewrite (the subtype pass skips every covariant pair) and the
+            // verifier gate.
+            let base = face_entry.as_ref().unwrap_or(entry);
+            let marked = self.inherit_covariance(base, &super_faces);
+            let declared_cmp: &MemberEntry = marked.as_ref().unwrap_or(base);
+            // The inherited members already judged broken within this
+            // declared face, keyed by pointer — one diagnostic per inherited
+            // member.
+            let mut broken_seen: Vec<*const MemberEntry> = Vec::new();
+            // The rows this declared face already emitted, keyed by
+            // `(setter code, declared text, face text, inherited text)`:
+            // identical rows collapse (the oracle's diagnostic dedup), and
+            // the verifier pass below skips a row the subtype pass landed
+            // (`String m(covariant String a)` over `int m(num a)` texts the
+            // same row from both gates).
+            let mut emitted: Vec<(bool, String, String, String)> = Vec::new();
+            for face in faces.iter().copied() {
                 let Some(hit) = self.override_face_member(container, face, lookup, &mut facts)
                 else {
                     // Unresolvable or cyclic face chain: suppression
@@ -953,10 +980,7 @@ impl<'a> Engine<'a> {
                 // entry where one exists and stay per-face where the oracle
                 // reports per superinterface.
                 if let Some(ptr) = hit.identity() {
-                    if broken_seen
-                        .iter()
-                        .any(|(tag, p)| *tag == setter_face && *p == ptr)
-                    {
+                    if broken_seen.contains(&ptr) {
                         continue;
                     }
                 }
@@ -984,77 +1008,202 @@ impl<'a> Engine<'a> {
                     }
                     Instantiated::Undecidable => continue,
                 };
-                let declared_cmp = face_entry.as_ref().unwrap_or(entry);
-                // The `CovariantParametersVerifier` gate (upstream
-                // `inheritance_override.dart:541-544`): the function-subtype
-                // check rewrites a covariant parameter to `Object?`, so an
-                // unrelated covariant parameter passes `override_broken`
-                // unflagged; the oracle's second verifier still reports
-                // `invalid_override` (never the setter code) when the
-                // parameter type relates to the super parameter in neither
-                // direction.
-                let covariant_unrelated = self.covariant_param_unrelated(
+                if !self.override_broken(
                     declared_cmp,
                     (self.file, container),
                     inherited_ref,
                     (hit.origin, hit.face_name),
+                ) {
+                    continue;
+                }
+                if let Some(ptr) = hit.identity() {
+                    broken_seen.push(ptr);
+                }
+                let code = if setter_face {
+                    SemanticCode::InvalidOverrideSetter
+                } else {
+                    SemanticCode::InvalidOverride
+                };
+                let display = self.strings.resolve(spelling);
+                let display = self.member_display_name(display);
+                let container_text = self.strings.resolve(container);
+                let declared_text = self.override_signature_text(declared_cmp);
+                let face_text = self.strings.resolve(hit.face_name);
+                let inherited_text = self.override_signature_text(inherited_ref);
+                emitted.push((
+                    setter_face,
+                    declared_text.clone(),
+                    face_text.to_owned(),
+                    inherited_text.clone(),
+                ));
+                self.emit5_with_context(
+                    code,
+                    range,
+                    display,
+                    container_text,
+                    &declared_text,
+                    face_text,
+                    &inherited_text,
+                    overridden_member_context(inherited_ref, hit.origin, setter_face),
                 );
-                let subtype_broken = self.override_broken(
-                    declared_cmp,
-                    (self.file, container),
-                    inherited_ref,
-                    (hit.origin, hit.face_name),
-                );
-                if subtype_broken || covariant_unrelated {
-                    if let Some(ptr) = hit.identity() {
-                        broken_seen.push((setter_face, ptr));
+            }
+            // The `CovariantParametersVerifier` pass (upstream
+            // `correct_override.dart:96-138`, wired from
+            // `inheritance_override.dart:548-555` for the declared-member
+            // path only — never the mixin-application face): every parameter
+            // the propagated marks carry covariant must be RELATED to the
+            // corresponding parameter of every transitive superinterface's
+            // own member — `thisType <: superType || superType <: thisType`.
+            // A pair related in neither direction lands one plain
+            // `invalid_override` row per super member (never the setter
+            // code), anchored at this member's name with that super member's
+            // declaring interface and instantiated signature in the slots.
+            let Some(declared_formals) = declared_cmp.formals.as_deref() else {
+                continue;
+            };
+            for (super_entry, super_name, super_file) in &super_faces {
+                let Some(super_formals) = super_entry.formals.as_deref() else {
+                    continue;
+                };
+                let super_owner = (*super_file, *super_name);
+                for (index, d) in declared_formals.positional.iter().enumerate() {
+                    if !d.covariant {
+                        continue;
                     }
-                    let display = self.strings.resolve(spelling);
-                    let display = self.member_display_name(display);
-                    let container_text = self.strings.resolve(container);
-                    let declared_text = self.override_signature_text(declared_cmp);
-                    let face_text = self.strings.resolve(hit.face_name);
-                    let inherited_text = self.override_signature_text(inherited_ref);
-                    // The subtype verdict keeps the setter spelling's own
-                    // code; the covariant verifier always reports the plain
-                    // `invalid_override` (upstream `correct_override.dart`
-                    // `CovariantParametersVerifier.verify` — no setter arm).
-                    // Both gates firing on a non-setter face lands two
-                    // identical (code, span) rows — the oracle's diagnostic
-                    // dedup collapses them, so the second emit is setter-
-                    // face-only there.
-                    if subtype_broken {
-                        let code = if setter_face {
-                            SemanticCode::InvalidOverrideSetter
-                        } else {
-                            SemanticCode::InvalidOverride
-                        };
-                        self.emit5_with_context(
-                            code,
-                            range,
-                            display,
-                            container_text,
-                            &declared_text,
-                            face_text,
-                            &inherited_text,
-                            overridden_member_context(inherited_ref, hit.origin, setter_face),
-                        );
+                    let Some(i) = super_formals.positional.get(index) else {
+                        continue;
+                    };
+                    if !self.covariant_pair_unrelated(
+                        declared_cmp,
+                        (self.file, container),
+                        super_entry,
+                        super_owner,
+                        d,
+                        i,
+                    ) {
+                        continue;
                     }
-                    if covariant_unrelated && (!subtype_broken || setter_face) {
-                        self.emit5_with_context(
-                            SemanticCode::InvalidOverride,
-                            range,
-                            display,
-                            container_text,
-                            &declared_text,
-                            face_text,
-                            &inherited_text,
-                            overridden_member_context(inherited_ref, hit.origin, setter_face),
-                        );
+                    self.emit_covariant_row(
+                        &mut emitted,
+                        range,
+                        spelling,
+                        container,
+                        declared_cmp,
+                        super_entry,
+                        *super_name,
+                        *super_file,
+                    );
+                }
+                for d in &declared_formals.named {
+                    if !d.covariant {
+                        continue;
                     }
+                    let Some(i) = super_formals.named_formal(d.name) else {
+                        continue;
+                    };
+                    if !self.covariant_pair_unrelated(
+                        declared_cmp,
+                        (self.file, container),
+                        super_entry,
+                        super_owner,
+                        d,
+                        i,
+                    ) {
+                        continue;
+                    }
+                    self.emit_covariant_row(
+                        &mut emitted,
+                        range,
+                        spelling,
+                        container,
+                        declared_cmp,
+                        super_entry,
+                        *super_name,
+                        *super_file,
+                    );
                 }
             }
         }
+    }
+
+    /// One `CovariantParametersVerifier` row, skipped when the subtype pass
+    /// already emitted the identical row (`code`, declaring text, face text,
+    /// inherited text are the oracle's diagnostic identity).
+    #[allow(clippy::too_many_arguments)] // the row's slots, mirroring emit5
+    fn emit_covariant_row(
+        &mut self,
+        emitted: &mut Vec<(bool, String, String, String)>,
+        range: SourceRange,
+        spelling: StringId,
+        container: StringId,
+        declared: &MemberEntry,
+        inherited: &MemberEntry,
+        face: StringId,
+        face_file: FileId,
+    ) {
+        let display = self.strings.resolve(spelling);
+        let display = self.member_display_name(display);
+        let container_text = self.strings.resolve(container);
+        let declared_text = self.override_signature_text(declared);
+        let face_text = self.strings.resolve(face);
+        let inherited_text = self.override_signature_text(inherited);
+        let key = (
+            false,
+            declared_text.clone(),
+            face_text.to_owned(),
+            inherited_text.clone(),
+        );
+        if emitted.contains(&key) {
+            return;
+        }
+        emitted.push(key);
+        self.emit5_with_context(
+            SemanticCode::InvalidOverride,
+            range,
+            display,
+            container_text,
+            &declared_text,
+            face_text,
+            &inherited_text,
+            overridden_member_context(inherited, face_file, false),
+        );
+    }
+
+    /// One `CovariantParametersVerifier` pair's relatedness (upstream
+    /// `correct_override.dart:113-118`):
+    /// `thisType <: superType || superType <: thisType`, asked through the
+    /// shared subtype decision. Unrelated only when BOTH directions fail —
+    /// an undecidable direction (`None`, an unresolvable head or a type
+    /// parameter) keeps the under-report the subtype face grants.
+    fn covariant_pair_unrelated(
+        &self,
+        declared: &MemberEntry,
+        declared_owner: (FileId, StringId),
+        inherited: &MemberEntry,
+        inherited_owner: (FileId, StringId),
+        d: &Formal,
+        i: &Formal,
+    ) -> bool {
+        let world = self.name_world();
+        let forward = self.override_decide(
+            d.ty,
+            declared_owner,
+            declared,
+            i.ty,
+            inherited_owner,
+            inherited,
+            &world,
+        );
+        let backward = self.override_decide(
+            i.ty,
+            inherited_owner,
+            inherited,
+            d.ty,
+            declared_owner,
+            declared,
+            &world,
+        );
+        matches!(forward, Some(false)) && matches!(backward, Some(false))
     }
 
     /// The with-clause mixin-application anchor face (upstream Dart SDK
@@ -6688,25 +6837,19 @@ impl<'a> Engine<'a> {
                 // The parameter faces, contravariant (the function-subtype
                 // rule's parameter arm): the declared parameter must accept
                 // the inherited parameter's values. A `covariant` formal is
-                // exempt — the oracle rewrites its type to `Object?` before
-                // the subtype question (correct_override.dart
+                // exempt — the oracle rewrites the DECLARED parameter's type
+                // to `Object?` before the subtype question
+                // (correct_override.dart:70-93
                 // `_computeThisTypeForSubtype`), so a covariant parameter
                 // never makes the override invalid; its narrowing is
-                // enforced by the runtime check instead. A covariant
-                // INHERITED formal flips the face covariant: the override
-                // may narrow the parameter to any subtype of the
-                // inherited type (the petitparser `hasEqualProperties`
-                // shape — the live oracle reports no `invalid_override`
-                // there).
+                // enforced by the runtime check instead. The flag is
+                // propagated along the override chain
+                // (`_inheritCovariance`, inheritance_manager3.dart:1063-1130),
+                // so an INHERITED covariant formal marks this parameter too
+                // (`B.m` over `A.m(covariant num)` passes however it
+                // narrows or widens); both sides therefore skip the face.
                 for (d, i) in a.positional.iter().zip(&b.positional) {
-                    if i.covariant {
-                        match decide(declared_at(d.ty), inherited_at(i.ty)) {
-                            Some(false) => return true,
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if d.covariant {
+                    if d.covariant || i.covariant {
                         continue;
                     }
                     match decide(inherited_at(i.ty), declared_at(d.ty)) {
@@ -6723,10 +6866,6 @@ impl<'a> Engine<'a> {
                         return false;
                     };
                     if i.covariant {
-                        match decide(declared_at(d.ty), inherited_at(i.ty)) {
-                            Some(false) => return true,
-                            _ => {}
-                        }
                         continue;
                     }
                     match decide(inherited_at(i.ty), declared_at(d.ty)) {
@@ -6796,24 +6935,41 @@ impl<'a> Engine<'a> {
             return Some(true);
         }
         // The override faces read the SUBTYPE matrix, not the
-        // dynamic-dispatch assignment face (`subtype.dart`'s top rules):
-        // `dynamic` is a top type here, so `dynamic Function()` is no
-        // subtype of `int Function()` even though an expression of type
-        // `dynamic` assigns anywhere — the inferred/written `dynamic`
-        // override rows decide on this arm.
-        if matches!(from_ty, Ty::Dynamic) {
-            return Some(match to_ty {
-                Ty::Dynamic => true,
-                Ty::Named {
-                    name,
-                    nullable: true,
-                    ..
-                } => name == self.intern("Object"),
-                _ => false,
-            });
+        // dynamic-dispatch assignment face (`subtype.dart:52-66`'s top
+        // rules): `Right Top` — `dynamic`, `void`, and `Object?` take every
+        // source, so `dynamic Function()` and `void Function()` are no
+        // subtypes of `int Function()` while every result satisfies a
+        // `void`/`dynamic`/`Object?` inherited face. `Left Top` — a
+        // `dynamic`/`void` source is a subtype only of a top target:
+        // `void m()` over `int m()` breaks, `int m()` over `void m()` and
+        // `dynamic m()` over `void m()` do not (a `void`/`dynamic`
+        // *expression* assigns anywhere, but the override question asks the
+        // subtype relation). Decided here rather than through `assignable`,
+        // whose arms carry the assignment face's leniency.
+        // A `void` source against an unmodeled target keeps the under-report
+        // direction instead of answering `Left Top`'s `false`: `Ty::Unknown`
+        // is the model's blind spot (a names-only SDK signature, an unwritten
+        // slot — a setter's implicit return reads `Unknown`), and turning it
+        // into a report would fabricate rows on every half-modeled face.
+        if matches!(from_ty, Ty::Void) && matches!(to_ty, Ty::Unknown) {
+            return None;
         }
-        if matches!(to_ty, Ty::Dynamic) {
+        let is_top = |ty: Ty| {
+            matches!(ty, Ty::Dynamic | Ty::Void)
+                || matches!(
+                    ty,
+                    Ty::Named {
+                        name,
+                        nullable: true,
+                        ..
+                    } if name == self.intern("Object")
+                )
+        };
+        if is_top(to_ty) {
             return Some(true);
+        }
+        if matches!(from_ty, Ty::Dynamic | Ty::Void) {
+            return Some(false);
         }
         self.assignable(from_ty, to_ty, false).or_else(|| {
             let (
@@ -6842,84 +6998,176 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// The `CovariantParametersVerifier` gate (upstream Dart SDK source,
-    /// `pkg/analyzer/lib/src/error/correct_override.dart:96-138` —
-    /// `verify`/`_superParameters`; wired from
-    /// `inheritance_override.dart:541-544` for the declared-member path
-    /// only, never the mixin-application face). A `covariant` declared
-    /// parameter is exempt from the function-subtype check (its type reads
-    /// as `Object?` there), but the oracle still requires the parameter's
-    /// declared type to be RELATED to every corresponding superinterface
-    /// parameter — `thisType <: superType || superType <: thisType` —
-    /// reporting `invalid_override` (never the setter code) when neither
-    /// direction holds (`void f(covariant String)` over `void f(int)`).
-    /// Correspondence is positional by index and named by name. An
-    /// undecidable pair (`None` — unresolvable head, type parameter) keeps
-    /// the under-report direction.
-    fn covariant_param_unrelated(
+    /// Every transitive superinterface's OWN `spelling` member of the
+    /// verifier's kind, instantiated at the edge arguments — the
+    /// `CovariantParametersVerifier`'s face set (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/correct_override.dart:96-138`:
+    /// `classHierarchy.implementedInterfaces` yields every TRANSITIVE
+    /// interface, and `_correspondingMember` reads that interface element's
+    /// own declarations — `InterfaceElementImpl.getMethod/getGetter
+    /// /getSetter` walk the element's own tables, so an intermediate class
+    /// that declares the name contributes beside its ancestors, which is why
+    /// the nearest hit alone under-reports). The walk follows the written
+    /// clauses (`extends`, the `with` mixins, `implements`, the mixin `on`
+    /// constraints) transitively; the implicit `Object`/`Enum` face stays
+    /// out — its signatures carry no parameter a covariant mark could
+    /// correspond to (`toString`, `hashCode`, `index` are nullary, `==`
+    /// declares no covariant parameter). Each row is the substituted
+    /// signature plus its declaring interface's name and file (the message's
+    /// overridden slots).
+    fn covariant_own_faces(
         &self,
-        declared: &MemberEntry,
-        declared_owner: (FileId, StringId),
-        inherited: &MemberEntry,
-        inherited_owner: (FileId, StringId),
-    ) -> bool {
-        let (Some(a), Some(b)) = (declared.formals.as_deref(), inherited.formals.as_deref())
+        container: StringId,
+        spelling: StringId,
+        face_kind: MemberKind,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Vec<(MemberEntry, StringId, FileId)> {
+        if face_kind == MemberKind::Getter {
+            // A getter face declares no parameter list: no covariant mark
+            // and no verifier row can exist.
+            return Vec::new();
+        }
+        let mut out: Vec<(MemberEntry, StringId, FileId)> = Vec::new();
+        let Some(decl) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
         else {
-            return false;
+            return out;
         };
-        // The gate fires only when a covariant parameter is present;
-        // building the lattice world lazily keeps the common
-        // non-covariant member free of its table work.
-        let mut world = None;
-        let mut unrelated = |d: &Formal, i: &Formal| {
-            let world = world.get_or_insert_with(|| self.name_world());
-            let forward = self.override_decide(
-                d.ty,
-                declared_owner,
-                declared,
-                i.ty,
-                inherited_owner,
-                inherited,
-                world,
-            );
-            let backward = self.override_decide(
-                i.ty,
-                inherited_owner,
-                inherited,
-                d.ty,
-                declared_owner,
-                declared,
-                world,
-            );
-            matches!(forward, Some(false)) && matches!(backward, Some(false))
-        };
-        for (index, d) in a.positional.iter().enumerate() {
-            let Some(i) = b.positional.get(index) else {
+        // (face, its writer, writer file, writer scope library, hop chain).
+        let mut stack: Vec<(
+            StringId,
+            StringId,
+            FileId,
+            LibraryId,
+            Vec<(StringId, FileId)>,
+        )> = Vec::new();
+        for face in decl
+            .superclass
+            .iter()
+            .copied()
+            .chain(decl.with_clause.iter().copied())
+            .chain(decl.implements_clause.iter().copied())
+            .chain(decl.on_clause.iter().copied())
+        {
+            stack.push((face, container, self.file, self.lib, Vec::new()));
+        }
+        let mut seen: FxHashSet<(StringId, FileId)> = FxHashSet::default();
+        while let Some((face, writer, file, lib, chain)) = stack.pop() {
+            // A clause cycle (or a pathological depth) stops this branch.
+            if chain.len() >= 32 {
+                continue;
+            }
+            let Some((found, found_owner)) = self.resolve_clause_face(writer, file, lib, face)
+            else {
                 continue;
             };
-            // The oracle's `parameter.isCovariant` covers the propagated
-            // covariance too (instance-member inference marks the
-            // overriding parameter covariant when any overridden parameter
-            // is), so either side's flag puts the pair on this gate.
-            if !d.covariant && !i.covariant {
+            if !seen.insert((face, found_owner)) {
                 continue;
             }
-            if unrelated(d, i) {
-                return true;
+            let mut hop_chain = chain;
+            hop_chain.push((face, found_owner));
+            if let Some(hit) = self.face_own_hit(
+                found_owner,
+                face,
+                found,
+                spelling,
+                hop_chain.clone(),
+            ) {
+                let kind_matches = match face_kind {
+                    MemberKind::Getter => {
+                        matches!(hit.entry().kind, MemberKind::Getter | MemberKind::Field)
+                    }
+                    _ => hit.entry().kind == face_kind,
+                };
+                if kind_matches {
+                    match self.instantiate_inherited(&hop_chain, hit.entry(), container, facts) {
+                        Instantiated::Unchanged => {
+                            out.push((hit.entry().clone(), face, found_owner));
+                        }
+                        Instantiated::Applied(env) => {
+                            out.push((self.substitute_entry(hit.entry(), &env), face, found_owner));
+                        }
+                        Instantiated::Undecidable => {}
+                    }
+                }
+            }
+            // The hop's own supertypes join `implementedInterfaces` too.
+            let found_lib = self.owner_library_of(found_owner, face).unwrap_or(lib);
+            for next in found
+                .superclass
+                .iter()
+                .copied()
+                .chain(found.with_clause.iter().copied())
+                .chain(found.implements_clause.iter().copied())
+                .chain(found.on_clause.iter().copied())
+            {
+                stack.push((next, face, found_owner, found_lib, hop_chain.clone()));
             }
         }
-        for d in &a.named {
-            let Some(i) = b.named_formal(d.name) else {
+        out
+    }
+
+    /// The oracle's covariance propagation (`_inheritCovariance`,
+    /// `inheritance_manager3.dart:1063-1130`): a member's parameter is
+    /// covariant when the member itself or any overridden member declares it
+    /// so — the interface map's chosen signature carries the propagated
+    /// mark, which is what `_computeThisTypeForSubtype`
+    /// (`correct_override.dart:70-93`) rewrites to `Object?` and what gates
+    /// [`Engine::covariant_own_faces`]' verifier. Correspondence is
+    /// `_correspondingParameter`'s: positionals by index, named by name.
+    /// `None` = no mark was added (the caller keeps its own entry — the
+    /// common uncovariant shape pays the scan only).
+    fn inherit_covariance(
+        &self,
+        entry: &MemberEntry,
+        super_faces: &[(MemberEntry, StringId, FileId)],
+    ) -> Option<MemberEntry> {
+        let formals = entry.formals.as_deref()?;
+        let mut covariant_positional: Vec<usize> = Vec::new();
+        let mut covariant_named: Vec<StringId> = Vec::new();
+        for (super_entry, _, _) in super_faces {
+            let Some(super_formals) = super_entry.formals.as_deref() else {
                 continue;
             };
-            if !d.covariant && !i.covariant {
-                continue;
+            for (index, p) in super_formals.positional.iter().enumerate() {
+                if p.covariant && !covariant_positional.contains(&index) {
+                    covariant_positional.push(index);
+                }
             }
-            if unrelated(d, i) {
-                return true;
+            for p in &super_formals.named {
+                if p.covariant && !covariant_named.contains(&p.name) {
+                    covariant_named.push(p.name);
+                }
             }
         }
-        false
+        let needs_marks = formals
+            .positional
+            .iter()
+            .enumerate()
+            .any(|(index, p)| !p.covariant && covariant_positional.contains(&index))
+            || formals
+                .named
+                .iter()
+                .any(|p| !p.covariant && covariant_named.contains(&p.name));
+        if !needs_marks {
+            return None;
+        }
+        let mut marked = entry.clone();
+        if let Some(marked_formals) = marked.formals.as_deref_mut() {
+            for (index, p) in marked_formals.positional.iter_mut().enumerate() {
+                if covariant_positional.contains(&index) {
+                    p.covariant = true;
+                }
+            }
+            for p in marked_formals.named.iter_mut() {
+                if covariant_named.contains(&p.name) {
+                    p.covariant = true;
+                }
+            }
+        }
+        Some(marked)
     }
 
     /// Whether a `Ty::Named` head is the oracle's `InvalidType` — a
@@ -7004,8 +7252,15 @@ impl<'a> Engine<'a> {
                             parts.push(format!("[{optional}]"));
                         }
                         if !formals.named.is_empty() {
-                            let named = formals
-                                .named
+                            // The oracle renders a function type's named
+                            // parameters in name order, not declaration
+                            // order (`FunctionTypeImpl` sorts the named set
+                            // in its constructor, upstream Dart SDK source
+                            // `pkg/analyzer/lib/src/dart/element/type.dart:153-185`).
+                            let mut named_params: Vec<&Formal> =
+                                formals.named.iter().collect();
+                            named_params.sort_by_key(|f| self.strings.resolve(f.name));
+                            let named = named_params
                                 .iter()
                                 .map(|f| {
                                     let text = format!(
