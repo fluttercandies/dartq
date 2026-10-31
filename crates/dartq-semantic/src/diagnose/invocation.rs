@@ -3069,6 +3069,7 @@ impl<'a> Engine<'a> {
                         || creation_ty.unwrap_or_else(|| Ty::named(class)),
                         |args| self.boundary.args.borrow_mut().named(class, false, &args),
                     );
+                self.publish_creation_instantiation(class_offset, ty);
                 self.rows.push(Row {
                     name: class,
                     range,
@@ -3116,6 +3117,7 @@ impl<'a> Engine<'a> {
                     head,
                 )
             {
+                let solved = self.creation_context_instantiation(head, prefix_offset);
                 self.fold_unnamed_creation_row(
                     prefix_offset,
                     head_range,
@@ -3123,7 +3125,7 @@ impl<'a> Engine<'a> {
                     head,
                     resolved.kind,
                     Some((resolved, owner)),
-                    None,
+                    solved,
                 );
             }
         }
@@ -3561,6 +3563,7 @@ impl<'a> Engine<'a> {
                 || solved.unwrap_or_else(|| Ty::named(head)),
                 |args| self.boundary.args.borrow_mut().named(head, false, &args),
             );
+        self.publish_creation_instantiation(start, ty);
         self.rows.push(Row {
             name: head,
             range,
@@ -3598,9 +3601,6 @@ impl<'a> Engine<'a> {
         bare_head: Option<(StringId, SourceRange)>,
     ) -> Option<Ty> {
         let level = level?;
-        if level.args.is_empty() || self.invokes.last().is_some_and(|slot| slot.is_some()) {
-            return None;
-        }
         let (head, head_range) = bare_head?;
         // The head this group belongs to: the class segment of a named
         // selector (`C.named(`) or the keyworded head itself (`new C(`).
@@ -3620,6 +3620,17 @@ impl<'a> Engine<'a> {
         // the written face, never the argument-solved one).
         if self.creation_written_type_args(class, class_offset) {
             return None;
+        }
+        // A linked callee row already ran the send close's own solve.
+        if self.invokes.last().is_some_and(|slot| slot.is_some()) {
+            return None;
+        }
+        // No argument constrains the class's parameters: the context type
+        // is the only downward source (`LinkedHashSet<int> s =
+        // LinkedHashSet()` infers `<int>`; upstream resolves every
+        // instance creation under the enclosing expression's context).
+        if level.args.is_empty() {
+            return self.creation_context_instantiation(class, class_offset);
         }
         let params: Vec<(StringId, Option<Ty>)> = match self.bounds.container_params(class) {
             Some(params) if !params.is_empty() => params
@@ -3682,6 +3693,18 @@ impl<'a> Engine<'a> {
             }
         }
         let mut solved: Vec<Option<Ty>> = vec![None; params.len()];
+        // The downward seed: a context type naming the same class pairs its
+        // type arguments with the declared parameters ahead of the
+        // argument-side constraints (upstream's `InferenceContext` supplies
+        // the `T` mappings first and `chooseFinalTypes` upgrades them with
+        // the argument types).
+        if let Some(seed) = self.creation_context_seed(class, class_offset, params.len()) {
+            for (slot, ty) in solved.iter_mut().zip(seed) {
+                if !matches!(ty, Ty::Dynamic | Ty::Unknown) {
+                    *slot = Some(ty);
+                }
+            }
+        }
         let mut poisoned: FxHashSet<usize> = FxHashSet::default();
         for (param, ty) in candidates {
             let Some(index) = params.iter().position(|(candidate, _)| *candidate == param) else {
@@ -3708,6 +3731,294 @@ impl<'a> Engine<'a> {
             .map(|((_param, bound), slot)| slot.or(*bound).unwrap_or(Ty::Dynamic))
             .collect();
         Some(self.boundary.args.borrow_mut().named(class, false, &args))
+    }
+
+    /// Publishes a creation's instantiation where the created row's readers
+    /// resolve it: `call_type_args`, the slot a written `<...>` group rides
+    /// and [`Engine::creation_row_ty`] peeks — the return/arrow-body and
+    /// cascade faces type a `Created` row through that face, never its
+    /// `row.ty`. A written group outranks inference before every caller
+    /// reaches here, so the entry carries the solved (downward) arguments
+    /// alone; zero-length spans keep the bounds faces (which only read
+    /// consumed written groups) inert. A `Named` without arguments (the
+    /// to-bounds residual) publishes nothing.
+    fn publish_creation_instantiation(&mut self, offset: u32, ty: Ty) {
+        let Ty::Named { args, .. } = ty else {
+            return;
+        };
+        if args == ArgListId::EMPTY {
+            return;
+        }
+        // A written group already owns the slot (its real spans feed the
+        // bounds diagnostics): the written instantiation equals the
+        // published one, so the entry stands.
+        if self.call_type_args.iter().any(|(at, _)| *at == offset) {
+            return;
+        }
+        let tys = self.boundary.args.borrow().get(args).to_vec();
+        let spans = vec![
+            SourceRange {
+                offset,
+                length: 0,
+            };
+            tys.len()
+        ];
+        self.call_type_args.push((
+            offset,
+            CallTypeArgs {
+                tys: tys.into_boxed_slice(),
+                spans: spans.into_boxed_slice(),
+            },
+        ));
+    }
+
+    /// The creation's static type when only its context names the class's
+    /// parameters: `LinkedHashSet<int> s = LinkedHashSet()` instantiates
+    /// the created type with the context's own arguments (upstream resolves
+    /// every `InstanceCreationExpression` under the enclosing expression's
+    /// context type, so the constructor's parameters are solved downward
+    /// before the argument-side constraints). A context naming another
+    /// class — the supertype-context shapes (`Set<int> s = LinkedHashSet()`
+    /// needs the supertype walk this face does not run) — or an untyped
+    /// context keeps the caller's to-bounds fallback.
+    fn creation_context_instantiation(&mut self, class: StringId, start: u32) -> Option<Ty> {
+        let context = self.creation_context_ty(start)?;
+        let Ty::Named { name, args, .. } = self.fold_alias_ty(context) else {
+            return None;
+        };
+        (name == class && args != ArgListId::EMPTY).then_some(Ty::Named {
+            name: class,
+            nullable: false,
+            args,
+        })
+    }
+
+    /// [`Engine::creation_context_instantiation`]'s positional split: the
+    /// context's type arguments when they pair 1:1 with `count` declared
+    /// parameters. `None` keeps the argument-side solve alone.
+    fn creation_context_seed(
+        &mut self,
+        class: StringId,
+        start: u32,
+        count: usize,
+    ) -> Option<Vec<Ty>> {
+        let context = self.creation_context_ty(start)?;
+        let Ty::Named { name, args, .. } = self.fold_alias_ty(context) else {
+            return None;
+        };
+        if name != class || args == ArgListId::EMPTY {
+            return None;
+        }
+        let args = self.boundary.args.borrow().get(args).to_vec();
+        (args.len() == count).then_some(args)
+    }
+
+    /// The context type the creation at `start` resolves under — the
+    /// downward half of upstream's instance-creation inference
+    /// (`visitInstanceCreationExpression` analyzes the creation under the
+    /// enclosing expression's context type). The channels the surrounding
+    /// grammar reaches, innermost first: an enclosing grouping parenthesis
+    /// (climbed, a `const`/`new` keyworded head included), the declaration
+    /// initializer's armed annotation, an assignment target's write type,
+    /// the host executable's declared return (a function literal's
+    /// `ctx_ret` stands in for its function-typed context), and the
+    /// conditional a `?`/`:` branch operand sits in (both branches inherit
+    /// the whole conditional's context). Every other position — an
+    /// argument slot, a collection element, a binary operand — answers
+    /// `None` (the no-context posture).
+    fn creation_context_ty(&mut self, start: u32) -> Option<Ty> {
+        self.creation_context_ty_at(start, 0)
+    }
+
+    fn creation_context_ty_at(&mut self, start: u32, depth: u8) -> Option<Ty> {
+        use dartq_scanner::{Keyword, TokenKind as K};
+        if depth > 8 {
+            return None;
+        }
+        let tokens = self.tokens.as_slice();
+        let mut at = tokens.partition_point(|token| token.utf16_offset < start);
+        loop {
+            let index = at.checked_sub(1)?;
+            let token = tokens[index];
+            match token.kind {
+                // An enclosing grouping parenthesis: the expression's own
+                // position is the group's. A `(` left of an operand-ending
+                // token is a call/index argument list instead — an
+                // argument slot this face does not resolve.
+                K::OpenParen => {
+                    if Self::creation_operand_end(tokens[index.checked_sub(1)?].kind) {
+                        return None;
+                    }
+                    at = index;
+                }
+                // A `const`/`new` keyworded head and an `await` operand
+                // inherit the whole expression's position.
+                K::Keyword(Keyword::Const)
+                | K::Keyword(Keyword::New)
+                | K::Keyword(Keyword::Await) => {
+                    at = index;
+                }
+                K::Eq => {
+                    return if self.in_initializer && self.frames.len() == self.init_frame_depth {
+                        self.pending_decl_ty.map(|ty| self.fold_alias_ty(ty))
+                    } else {
+                        self.assignment_context_at(token.utf16_offset)
+                    };
+                }
+                K::QuestionQuestionEq => return self.assignment_context_at(token.utf16_offset),
+                // The host's declared return, or a function literal's
+                // context return (`arm_closure_completion`'s `ctx_ret`).
+                K::Function | K::Keyword(Keyword::Return) => return self.enclosing_return_ty(),
+                // A conditional operand inherits the conditional's own
+                // context: `a = c ? b : C()` reads the `=` target through
+                // the else operand exactly as the then operand does.
+                K::Question => {
+                    let condition = self.conditional_condition_start(index)?;
+                    return self.creation_context_ty_at(condition, depth + 1);
+                }
+                K::Colon => {
+                    let question = self.conditional_question_before(index)?;
+                    let condition = self.conditional_condition_start(question)?;
+                    return self.creation_context_ty_at(condition, depth + 1);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Whether `kind` can end an operand (the token left of a `(` decides
+    /// grouping from call argument list): identifiers, literals, and the
+    /// closing brackets.
+    fn creation_operand_end(kind: dartq_scanner::TokenKind) -> bool {
+        use dartq_scanner::{Keyword, TokenKind as K};
+        matches!(
+            kind,
+            K::Identifier
+                | K::Int
+                | K::Double
+                | K::Hexadecimal
+                | K::String
+                | K::StringInterpolationIdentifier
+                | K::CloseParen
+                | K::CloseSquare
+                | K::Keyword(Keyword::This)
+                | K::Keyword(Keyword::Super)
+                | K::Keyword(Keyword::True)
+                | K::Keyword(Keyword::False)
+                | K::Keyword(Keyword::Null)
+        )
+    }
+
+    /// The write type of the `=`/`??=` operator at `limit`: the target row
+    /// read through the assignment check's own face — the constructor
+    /// initializer's bare target resolves through the field table so a
+    /// same-named formal never lends its type. An index write (`c[i] = e`,
+    /// the target row under an operator mark) answers `None`.
+    fn assignment_context_at(&mut self, limit: u32) -> Option<Ty> {
+        let target = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))?
+            .clone();
+        if matches!(target.intent, Intent::Operator(..)) {
+            return None;
+        }
+        let ty = match (self.initializer_depth > 0, &target.shape) {
+            (true, RowShape::Bare(_)) if !target.qualified => {
+                match self.init_rows.get(&target.range.offset).copied() {
+                    Some(container) => self.member_write_ty(container, target.name),
+                    None => self.assignment_target_ty(&target),
+                }
+            }
+            _ => self.assignment_target_ty(&target),
+        };
+        Some(ty)
+    }
+
+    /// The declared return of the innermost executable frame — the host
+    /// `return e` / `=> e` context — with a function literal's context
+    /// return standing in when the literal's own frame declares none.
+    fn enclosing_return_ty(&self) -> Option<Ty> {
+        let frame = self
+            .frames
+            .iter()
+            .rev()
+            .find(|frame| matches!(frame.kind, FrameKind::Executable { .. }))?;
+        match &frame.kind {
+            FrameKind::Executable { ret: Some(ret), .. } => Some(self.fold_alias_ty(ret.ty)),
+            FrameKind::Executable { ctx_ret, .. } => *ctx_ret,
+            _ => None,
+        }
+    }
+
+    /// The `?` the conditional's `:` at `colon` pairs with: a backward scan
+    /// over the else operand that skips bracket groups and nested
+    /// conditionals (`a ? b ? c : d : e` pairs the outer `?` with the last
+    /// `:`). `None` when no pairing `?` sits before it.
+    fn conditional_question_before(&self, colon: usize) -> Option<usize> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let mut depth = 0usize;
+        let mut index = colon;
+        while index > 0 {
+            index -= 1;
+            match tokens[index].kind {
+                K::CloseParen | K::CloseSquare | K::CloseCurly => depth += 1,
+                K::OpenParen | K::OpenSquare | K::OpenCurly => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                K::Colon => depth += 1,
+                K::Question => {
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The first token offset of the condition operand of the conditional
+    /// whose `?` sits at `question`: the token after the nearest depth-0
+    /// expression boundary (`=`, `,`, `;`, `return`, `=>`, an opening
+    /// bracket, or a preceding conditional operator).
+    fn conditional_condition_start(&self, question: usize) -> Option<u32> {
+        use dartq_scanner::{Keyword, TokenKind as K};
+        let tokens = self.tokens.as_slice();
+        let mut depth = 0usize;
+        let mut index = question;
+        while index > 0 {
+            index -= 1;
+            let token = tokens[index];
+            match token.kind {
+                K::CloseParen | K::CloseSquare | K::CloseCurly => depth += 1,
+                K::OpenParen | K::OpenSquare | K::OpenCurly => {
+                    if depth == 0 {
+                        return tokens.get(index + 1).map(|token| token.utf16_offset);
+                    }
+                    depth -= 1;
+                }
+                K::Eq
+                | K::Comma
+                | K::Semicolon
+                | K::Colon
+                | K::Question
+                | K::Function
+                | K::Keyword(Keyword::Return)
+                    if depth == 0 =>
+                {
+                    return tokens.get(index + 1).map(|token| token.utf16_offset);
+                }
+                _ => {}
+            }
+        }
+        tokens.first().map(|token| token.utf16_offset)
     }
 
     /// Whether the creation's class segment spells a written `<...>`
@@ -12650,10 +12961,23 @@ impl<'a> Engine<'a> {
                 // The solved instantiation lands here: the fold replaced
                 // the callee row, and the assignment/argument checks read
                 // the merged face, not the pre-fold unknown.
-                let solved = match self.pending_send_ty.take() {
+                let mut solved = match self.pending_send_ty.take() {
                     Some((row, ty)) if row == callee => ty,
                     _ => Ty::UNKNOWN,
                 };
+                // The downward half of the creation's inference: with no
+                // argument-derived instantiation, the context type names
+                // the parameters (`LinkedHashSet<int> s = LinkedHashSet()`
+                // infers `<int>`; upstream's `InstanceCreationExpression`
+                // resolves under the enclosing context). The instantiation
+                // publishes where the return/arrow-body/cascade faces read
+                // a created row's type ([`Engine::creation_row_ty`]).
+                if solved == Ty::UNKNOWN && !self.creation_written_type_args(name, range.offset) {
+                    if let Some(ty) = self.creation_context_instantiation(name, range.offset) {
+                        self.publish_creation_instantiation(range.offset, ty);
+                        solved = ty;
+                    }
+                }
                 self.rows[callee] = Row {
                     name,
                     range,
@@ -12663,6 +12987,37 @@ impl<'a> Engine<'a> {
                     write_op: None,
                     ty: solved,
                 };
+                // A cascade target whose instantiation was inferred
+                // (`LinkedHashSet<int> s = LinkedHashSet()..addAll(...)`):
+                // the cascade reads its target's static type off the row
+                // stack's top (`begin_cascade`), and a `Created` row answers
+                // only its bare head there — so the solved instantiation
+                // rides an explicit value row above the fold row, which the
+                // cascade's target read adopts and its own value stand-in
+                // then inherits.
+                let cascade_follows = {
+                    let tokens = self.tokens.as_slice();
+                    let next = tokens
+                        .partition_point(|token| token.utf16_offset < end.range.end());
+                    tokens.get(next).is_some_and(|token| {
+                        matches!(
+                            token.kind,
+                            dartq_scanner::TokenKind::PeriodPeriod
+                                | dartq_scanner::TokenKind::QuestionPeriodPeriod
+                        )
+                    })
+                };
+                if solved != Ty::UNKNOWN && cascade_follows {
+                    self.rows.push(Row {
+                        name,
+                        range,
+                        qualified: false,
+                        shape: RowShape::Value,
+                        intent: Intent::Read,
+                        write_op: None,
+                        ty: solved,
+                    });
+                }
             }
         } else {
             // The plain-send fold (`f(x)`, `c.m(x)`, `f<T>(x)`): upstream the

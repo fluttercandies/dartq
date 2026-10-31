@@ -17849,3 +17849,28 @@ mod ticket_3284_tests;
 #[cfg(test)]
 #[path = "ticket_3256_tests.rs"]
 mod ticket_3256_tests;
+
+// The #3270 pins (the `Receiver::Created` write face carries the
+// creation's written type arguments: `Box<B>().slot` writes against `B`,
+// never the container's bare `T` — the same `member_recv_env`
+// instantiation the `Receiver::Typed` arm already composed; a raw `Box()`
+// keeps the instantiate-to-bounds residual). Registered here via `#[path]`
+// (`diagnose.rs` is a live-lane file out of this ticket's write scope);
+// the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3270_tests.rs"]
+mod ticket_3270_tests;
+
+// The #3274 pins (the context-driven type-argument inference of an instance
+// creation: an omitted `<...>` group takes its parameters from the enclosing
+// expression's context type — declaration initializer, assignment target,
+// host return, constructor-initializer field, conditional operand — so
+// `LinkedHashSet<int> s = LinkedHashSet()` no longer types the creation
+// `LinkedHashSet<dynamic>` and no longer reports the spurious
+// `invalid_assignment`/`return_of_invalid_type` family). Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3274_tests.rs"]
+mod ticket_3274_tests;

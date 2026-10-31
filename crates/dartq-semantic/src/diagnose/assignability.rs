@@ -2330,43 +2330,28 @@ impl<'a> Engine<'a> {
                 // the instance write face is the declaring container's —
                 // the setter's value formal or the field's declared type
                 // (upstream `getWriteType`, the same answer
-                // [`Engine::member_write_ty`] gives). The fold keeps no
-                // written arguments, so a generic head's `T` stands
-                // unsubstituted here (the under-instantiated residual the
-                // `Receiver::Typed` arm below solves where the receiver
-                // still spells its instantiation).
-                Receiver::Created { name, .. } => self.member_write_ty(*name, row.name),
+                // [`Engine::member_write_ty`] gives). The receiver's written
+                // arguments instantiate the member face exactly like the
+                // `Receiver::Typed` arm below: `Box<B>().slot` writes against
+                // `B`, never the container's bare `T`. The staged
+                // member-read record keys the receiver's span (the creation
+                // head's offset), and [`Engine::creation_row_ty`] re-derives
+                // the written `<B>` from it; a raw `Box()` spells no group,
+                // so the instantiate-to-bounds residual
+                // ([`Engine::instantiated_head_ty`]) answers `Box<bounds>`
+                // the oracle's `staticType` reports.
+                Receiver::Created { name, .. } => {
+                    let recv_ty = self
+                        .member_reads
+                        .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                        .ok()
+                        .map(|index| self.member_reads[index].recv_span)
+                        .and_then(|span| self.creation_row_ty(*name, false, span.offset))
+                        .unwrap_or_else(|| self.instantiated_head_ty(Ty::named(*name)));
+                    self.instantiated_member_write_ty(*name, row.name, recv_ty)
+                }
                 Receiver::Typed { type_name, ty } => {
-                    let declared = self.member_write_ty(*type_name, row.name);
-                    // The instantiated write face (upstream Dart SDK source,
-                    // pkg/analyzer/lib/src/generated/
-                    // error_detection_helpers.dart:72-75 — the verdict asks
-                    // `correspondingParameter.type`, the already-instantiated
-                    // formal): a generic receiver's declared member face
-                    // spells the container's `T`, but the oracle's write
-                    // type substitutes the receiver's written arguments —
-                    // `C<String>`'s `T? field` writes against `String?`,
-                    // never `T?`. The environment composes the same way the
-                    // member send's does
-                    // ([`Engine::member_recv_env`]): the field, else the
-                    // `name=` setter the write resolves against, supplies
-                    // the entry the parameter-name pairing needs.
-                    let member = self.setter_spelling(row.name);
-                    let entry = match self.walk_members(*type_name, row.name) {
-                        Walk::Found(entry) if entry.kind == MemberKind::Field => Some(entry),
-                        _ => match self.walk_members(*type_name, member) {
-                            Walk::Found(entry) if entry.kind == MemberKind::Setter => Some(entry),
-                            _ => None,
-                        },
-                    };
-                    let instantiated = entry
-                        .and_then(|entry| self.member_recv_env(*ty, *type_name, &entry))
-                        .map(|env| {
-                            let keys: FxHashMap<StringId, Ty> = env.into_iter().collect();
-                            self.substitute_ty(declared, &keys)
-                        })
-                        .unwrap_or(declared);
-                    instantiated
+                    self.instantiated_member_write_ty(*type_name, row.name, *ty)
                 }
                 Receiver::Container {
                     name: container, ..
@@ -2405,6 +2390,45 @@ impl<'a> Engine<'a> {
             },
             _ => Ty::UNKNOWN,
         }
+    }
+
+    /// The member write face of `member` on `container`, instantiated by the
+    /// receiver's own static type `recv_ty` (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/error_detection_helpers.dart:72-75 —
+    /// the verdict asks `correspondingParameter.type`, the
+    /// already-instantiated formal): a generic receiver's declared member
+    /// face spells the container's `T`, but the oracle's write type
+    /// substitutes the receiver's written arguments — `C<String>`'s
+    /// `T? field` writes against `String?`, never `T?`. The environment
+    /// composes the same way the member send's does
+    /// ([`Engine::member_recv_env`]): the field, else the `name=` setter the
+    /// write resolves against, supplies the entry the parameter-name
+    /// pairing needs. A receiver with no written arguments (a bare head, or
+    /// `recv_ty` carrying `ArgListId::EMPTY`) keeps the declared face —
+    /// [`Engine::member_recv_env`] answers `None` and the result is the
+    /// `declared` answer unchanged.
+    fn instantiated_member_write_ty(
+        &mut self,
+        container: StringId,
+        member_name: StringId,
+        recv_ty: Ty,
+    ) -> Ty {
+        let declared = self.member_write_ty(container, member_name);
+        let setter = self.setter_spelling(member_name);
+        let entry = match self.walk_members(container, member_name) {
+            Walk::Found(entry) if entry.kind == MemberKind::Field => Some(entry),
+            _ => match self.walk_members(container, setter) {
+                Walk::Found(entry) if entry.kind == MemberKind::Setter => Some(entry),
+                _ => None,
+            },
+        };
+        entry
+            .and_then(|entry| self.member_recv_env(recv_ty, container, &entry))
+            .map(|env| {
+                let keys: FxHashMap<StringId, Ty> = env.into_iter().collect();
+                self.substitute_ty(declared, &keys)
+            })
+            .unwrap_or(declared)
     }
 
     /// A top-level name's write face (`getWriteType` over the library's
