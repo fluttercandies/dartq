@@ -4651,6 +4651,25 @@ impl<'a> Engine<'a> {
         if in_return_position {
             self.open_return_span = Some(span);
         }
+        // An operator head latches `ret` at `begin_method` with the armed
+        // slot still empty — the return annotation's `endType` lands AFTER
+        // the head event for `int operator >` (the parser commits to the
+        // method at the `operator` keyword). The first completion still in
+        // the header window — outside any formal list, before the body
+        // opens — is that annotation: it backfills the latched UNKNOWN
+        // face. An untyped operator's first formal (`operator >(C o)`)
+        // completes under `(` and a local variable's annotation completes
+        // after `body_mark` — neither reaches this window, so the honest
+        // `dynamic` target survives.
+        if self.formal_list_depth == 0
+            && self.body_mark.is_none()
+            && let Some(ty) = self.armed_ty
+            && let Some(frame) = self.frames.last_mut()
+            && let FrameKind::Executable { ret: Some(ret), .. } = &mut frame.kind
+            && ret.ty == Ty::UNKNOWN
+        {
+            ret.ty = ty;
+        }
     }
 
     /// The `non_void_return_for_setter` face (error_verifier.dart:7015-7025,
@@ -4710,12 +4729,30 @@ impl<'a> Engine<'a> {
                 ),
             )
         };
+        // The constructor element's return type is the enclosing class's
+        // `thisType` — a generic container spells `A<T>` (the declared
+        // parameters, element.dart:1004), not the bare head and not the
+        // instantiate-to-bounds `A<dynamic>`: the message's `{1}` and the
+        // verdict's target both read it.
+        let ty = self
+            .bounds
+            .container_params(container)
+            .filter(|params| !params.is_empty())
+            .map(|params| {
+                let args: Vec<Ty> = params.iter().map(|(p, _, _)| Ty::named(*p)).collect();
+                Ty::Named {
+                    name: container,
+                    nullable: false,
+                    args: self.boundary.intern_list(&args),
+                }
+            })
+            .unwrap_or_else(|| Ty::named(container));
         if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable { ret, .. } = &mut frame.kind
             && ret.is_none()
         {
             *ret = Some(ExecReturn {
-                ty: Ty::named(container),
+                ty,
                 host: ExecKind::Constructor,
                 name,
                 display,

@@ -3000,12 +3000,49 @@ impl<'a> Engine<'a> {
                 return;
             }
         };
+        // The `await e` operand's row anchors at `e`, but the oracle's
+        // `.at(expression)` is the AwaitExpression — the `await` keyword
+        // through the operand's own end (`reportTypeError`,
+        // rtv.dart:155-205). `await_operand_extents` carries the
+        // `(keyword end, end-token start)` of every await that closed
+        // inside this frame: an operand row that starts inside the extent
+        // and closes over its end token is that operand, so the staged
+        // span re-anchors at the widest enclosing await (a nested
+        // `await await e` takes the outermost keyword's start — the
+        // official's outermost AwaitExpression node). The verdict's own
+        // lookups keep the operand's span — the untyped-literal and
+        // cast-rewrite maps key the row, not the wrapper.
+        let operand_range = range;
+        let mut range = range;
+        let mut widest: Option<(u32, u32)> = None;
+        for &(operand_start, end_start) in &self.await_operand_extents {
+            // The row is the await's operand when it sits strictly inside
+            // the recorded extent — the head row's span need not reach the
+            // operand's own end (`await s()`'s `s` row is one column, so
+            // the row's end is the operand's head, not its `)`). A nested
+            // `await await e` matches every enclosing extent, and the
+            // minimum start lands on the outermost keyword — the
+            // official's outermost AwaitExpression; the matching extent's
+            // own end stands in for the row's (the whole expression end).
+            if operand_start <= range.offset && range.end() <= end_start {
+                widest = Some(match widest {
+                    Some((w, e)) if w <= operand_start => (w, e),
+                    _ => (operand_start, end_start),
+                });
+            }
+        }
+        if let Some((operand_start, end_start)) = widest {
+            range = SourceRange {
+                offset: operand_start.saturating_sub(5), // `await` keyword
+                length: end_start - operand_start.saturating_sub(5),
+            };
+        }
         // An unannotated collection literal's row carries no type of its
         // own: the host's declared return is the context that resolves it
         // (`typed_literal_resolver.dart` `_fromContextType` — the context
         // decides list/set/map, an empty `{}` adopts a Map/Set context and
         // defaults to a map without one).
-        let from = match self.untyped_literals.get(&range.offset) {
+        let from = match self.untyped_literals.get(&operand_range.offset) {
             Some(&kind) => self.literal_return_ty(kind, to),
             None => from,
         };
@@ -3034,7 +3071,9 @@ impl<'a> Engine<'a> {
         let from = self
             .cast_rewrites
             .iter()
-            .find(|(cast, _)| cast.offset <= range.offset && range.end() <= cast.end())
+            .find(|(cast, _)| {
+                cast.offset <= operand_range.offset && operand_range.end() <= cast.end()
+            })
             .map(|(_, ty)| *ty)
             .unwrap_or(from);
         // The invalid-source twin: a written value type whose head resolves
@@ -3330,7 +3369,11 @@ impl<'a> Engine<'a> {
                     self.return_param_source_verdict(from, to)
                 }
                 _ => match from {
-                    Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
+                    // A `void` return expression fits only the
+                    // `void`/`dynamic` hosts (rtv.dart:222-226 — the
+                    // official reports whenever `T` is not
+                    // `_isVoidDynamic`).
+                    Ty::Void => Some(matches!(to, Ty::Void | Ty::Dynamic)),
                     // A `dynamic` return expression is a subtype only of the
                     // top-type hosts; the strict-casts mode rejects the rest
                     // (the same overlay [`Engine::assignable`] applies — the
@@ -3448,10 +3491,15 @@ impl<'a> Engine<'a> {
             return Some(matches!(t_v, Ty::Void | Ty::Dynamic | Ty::Unknown));
         }
         let verdict = self.assignable(from, t_v, from_literal);
-        if verdict == Some(false) && self.name_subtype(flatten_s, t_v) {
+        if verdict == Some(true) || self.name_subtype(flatten_s, t_v) {
             return Some(true);
         }
-        verdict
+        // An undecidable direct ask still reports when the declared
+        // hierarchy proves `S` fits no `T_v` face (rtv.dart:274-289 asks
+        // the element-level `isAssignableTo` — `Future<String>` into a
+        // `Future<int>` host's `int` is a closed-world false the
+        // written-shape matrix suppresses).
+        verdict.or_else(|| self.declared_subtype_negative(&from, &t_v))
     }
 
     /// A single-row expression's type since `mark`, for the body/return

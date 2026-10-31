@@ -1328,6 +1328,15 @@ impl ParserListener for DiagnoseListener<'_> {
         // The collector joins the operator spelling as a method member at
         // its own `begin_method`; mirror that site note here.
         if !name_is_identifier {
+            // The punctuation operator head (`>`, `==`, `[]=`) is the
+            // declaration's name token — no `MethodDeclaration` identifier
+            // event follows it, so the armed return annotation latches
+            // HERE (an operator is a `MethodElement` upstream, host word
+            // `method`: `int operator >(C o) => "s";` reports `... from
+            // the method '>'`). The `C::OperatorName` arm stays as the
+            // identifier-shaped operator twin (`ret.is_none()` keeps the
+            // latch single-fire).
+            engine.latch_return_type(ExecKind::Method, spelling, name_range);
             let is_static = engine.open_member_static;
             let container = engine.container_context().map_or(spelling, |(c, _)| c);
             let site = engine.note_decl_site(
@@ -3256,26 +3265,6 @@ impl ParserListener for DiagnoseListener<'_> {
                     // function-typed RETURN annotation's stash is not a
                     // variable's.
                     engine.fn_stash_drop();
-                    // The accessor face (`get`/`set`) is a
-                    // `PropertyAccessorElement` upstream — its return-check
-                    // host word is `function`, never `method`
-                    // (`EnclosingExecutableContext.isFunction`,
-                    // error_verifier.dart:164-166; the corpus face:
-                    // `I3 get a => null;` reports `... from the function
-                    // 'a'`).
-                    let host = if engine.open_member_accessor {
-                        ExecKind::Function
-                    } else {
-                        ExecKind::Method
-                    };
-                    engine.latch_return_type(host, name, token.range);
-                    // #2430: the method header's declaring name joins the
-                    // FAM10 pairing — its type-variable window lands in
-                    // `method_exec_bounds` at the close, the bound-aware
-                    // nullability/never-match gates' read of the
-                    // enclosing method's own parameter bounds.
-                    engine.pending_exec_name = Some((name, token.range.offset));
-                    engine.pending_exec_is_method = true;
                     // A constructor head also rides this event;
                     // `begin_constructor` already opened the head's site
                     // and its provisional range is this same token, so the
@@ -3288,6 +3277,45 @@ impl ParserListener for DiagnoseListener<'_> {
                         engine.ctor_pending,
                         Some((_, Some(site))) if engine.decl_sites[site].range == token.range
                     );
+                    if ctor_head {
+                        // A generative constructor's return check is the
+                        // constructor face: `ConstructorElement.returnType`
+                        // is the enclosing class's `thisType`
+                        // (element.dart:1004) and the message host is
+                        // `constructor` (rtv.dart's
+                        // `EnclosingExecutableContext.isConstructor`), not
+                        // the armed `Method` latch — a generative head
+                        // parses no return annotation, so the armed slot is
+                        // empty anyway. `=> e` bodies report
+                        // `return_of_invalid_type` against `C` (`C() => 3`
+                        // reports `int` can't be returned from the
+                        // constructor 'C'`).
+                        if let Some((container, _)) = engine.ctor_pending {
+                            engine.latch_factory_return(container, name, token.range);
+                        }
+                    } else {
+                        // The accessor face (`get`/`set`) is a
+                        // `PropertyAccessorElement` upstream — its
+                        // return-check host word is `function`, never
+                        // `method`
+                        // (`EnclosingExecutableContext.isFunction`,
+                        // error_verifier.dart:164-166; the corpus face:
+                        // `I3 get a => null;` reports `... from the
+                        // function 'a'`).
+                        let host = if engine.open_member_accessor {
+                            ExecKind::Function
+                        } else {
+                            ExecKind::Method
+                        };
+                        engine.latch_return_type(host, name, token.range);
+                    }
+                    // #2430: the method header's declaring name joins the
+                    // FAM10 pairing — its type-variable window lands in
+                    // `method_exec_bounds` at the close, the bound-aware
+                    // nullability/never-match gates' read of the
+                    // enclosing method's own parameter bounds.
+                    engine.pending_exec_name = Some((name, token.range.offset));
+                    engine.pending_exec_is_method = true;
                     if ctor_head {
                         if let Some((_, Some(site))) = engine.ctor_pending {
                             engine.open_exec_site = Some(site);
@@ -3343,6 +3371,15 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::OperatorName => {
                 if let Some(name) = name {
+                    // The operator name is a declaration-name boundary like
+                    // every executable's (a function-typed return
+                    // annotation's stash must not cross it), and the
+                    // operator's own `ret` latches the armed return type —
+                    // an operator is a `MethodElement` upstream, so its
+                    // host word is `method` (`int operator >(C o) => "s";`
+                    // reports `... from the method '>'`).
+                    engine.fn_stash_drop();
+                    engine.latch_return_type(ExecKind::Method, name, token.range);
                     let container = engine.container_context().map_or(name, |(c, _)| c);
                     engine.note_decl_site(
                         name,
@@ -3389,18 +3426,22 @@ impl ParserListener for DiagnoseListener<'_> {
                     }
                     // The completion row's anchor is the compound name
                     // (`ConstructorDeclaration.errorRange`: the type name
-                    // through the selector's end — `factory A.named() {}`
-                    // reports at `A.named`). The head event latched the
-                    // bare container name; the selector's end widens it
-                    // here (the factory frames only — `ret.ctor`).
-                    if let Some((head, _)) = engine.factory_head
-                        && let Some(frame) = engine.frames.last_mut()
+                    // through the selector's end — `A.named() {}` reports
+                    // at `A.named`). The head event latched the bare
+                    // container name; the selector's end widens it here —
+                    // for every constructor frame (`ret.ctor`), factory
+                    // heads read their `factory_head` anchor and
+                    // generative heads keep their own latched offset.
+                    if let Some(frame) = engine.frames.last_mut()
                         && let FrameKind::Executable { ret: Some(ret), .. } = &mut frame.kind
                         && ret.ctor
                     {
+                        let head_offset = engine
+                            .factory_head
+                            .map_or(ret.name_span.offset, |(head, _)| head.offset);
                         ret.name_span = SourceRange {
-                            offset: head.offset,
-                            length: token.range.end().saturating_sub(head.offset),
+                            offset: head_offset,
+                            length: token.range.end().saturating_sub(head_offset),
                         };
                         // The constructor's message display joins the
                         // selector (`C.named`,

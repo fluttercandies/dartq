@@ -5911,6 +5911,15 @@ mod ticket_3122_tests;
 #[cfg(test)]
 mod ticket_3127_tests;
 
+/// The #3121 pins — `return_of_invalid_type`: the sync void-source arm
+/// (rtv.dart:222-226's `_isVoidDynamic`), the async `flatten(S) <: T_v`
+/// subtype leg (rtv.dart:274-289, type_system.dart:425-471), the
+/// AwaitExpression row anchor (rtv.dart:155-205), the operator's `method`
+/// host word, and the constructor faces (`ConstructorElement.returnType`
+/// is the enclosing `thisType`, element.dart:1004).
+#[cfg(test)]
+mod ticket_3121_tests;
+
 /// The #3126 pins: `unnecessary_final` fires only inside a declaration
 /// formal list — the `FieldFormalParameter`/`SuperFormalParameter` reach —
 /// including the `[`/`{` optional/named group nested in it; it stays

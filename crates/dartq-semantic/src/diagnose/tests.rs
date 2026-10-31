@@ -8102,14 +8102,18 @@ fn primitive_return_narrowing_decides_both_ways() {
 /// Both pairs were `assignable`'s `None` before the lattice routing.
 #[test]
 fn declared_subtype_return_decides_both_ways() {
+    // The `=> throw` bodies keep `return_of_invalid_type` silent (a
+    // `Never` source assigns to every declared face) so the override
+    // verdict owns the report set — an `int` literal into an `A`/`B`
+    // method return is the oracle's real ROIT row.
     let rep = report(
-        "class A {} class B extends A {} class S { A f() => 1; } \
-             class C extends S { B f() => 2; }",
+        "class A {} class B extends A {} class S { A f() => throw 0; } \
+             class C extends S { B f() => throw 0; }",
     );
     assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     let rep = report(
-        "class A {} class B extends A {} class S { B f() => 1; } \
-             class C extends S { A f() => 2; }",
+        "class A {} class B extends A {} class S { B f() => throw 0; } \
+             class C extends S { A f() => throw 0; }",
     );
     assert_eq!(
         code_names(&rep),
