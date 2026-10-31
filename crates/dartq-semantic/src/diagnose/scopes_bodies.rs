@@ -777,43 +777,39 @@ impl<'a> Engine<'a> {
                 self.eq_spans.pop();
             }
         }
-        let non_null = lhs_is_bool_comparison
-            || mark
-                .checked_sub(1)
-                .and_then(|index| self.rows.get(index))
-                // An operator-marked row is the index/`+` geometry, never
-                // the read's own type (`m[k] ?? d` reads `Map.[]`'s `V?` —
-                // #2172's `groupSetsBy`/`groupBy` rows). An invoked row
-                // reads its send result through the shared verdict, whose
-                // bound-aware posture keeps a generic key send
-                // (`m[keyOf(e)] ?? d`) from anchoring.
-                .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
-                // An unfolded index (`f()[k] ?? d`, a call-result receiver
-                // keeps its operand rows) leaves the KEY as the top row:
-                // the left operand is the `[]` read, never the key.
-                .filter(|lhs| !self.is_index_key_row(lhs))
-                // The operand node is the whole expression: a row that
-                // stops short of the operator with real tokens between its
-                // expression span and the operator is an inner operand of a
-                // larger one (`(true ? x : 499)`'s branch, a parenthesized
-                // conditional), never the operand the oracle types. The
-                // span (not the bare row) answers because an invocation's
-                // row is its callee head (`a.b()`, a dot shorthand's
-                // `.new(1)`).
-                .filter(|lhs| {
-                    let span = self.staged_expression_span(lhs.range);
-                    self.trivia_between(span.end(), op_range.offset)
-                })
-                .is_some_and(|lhs| self.coalesce_operand_never_null(lhs, true));
+        // The left operand's own row: an operator-marked row is the
+        // index/`+` geometry, never the read's own type (`m[k] ?? d`
+        // reads `Map.[]`'s `V?` — #2172's `groupSetsBy`/`groupBy` rows).
+        // An invoked row reads its send result through the shared
+        // verdict, whose bound-aware posture keeps a generic key send
+        // (`m[keyOf(e)] ?? d`) from anchoring. An unfolded index
+        // (`f()[k] ?? d`, a call-result receiver keeps its operand rows)
+        // leaves the KEY as the top row: the left operand is the `[]`
+        // read, never the key. And the operand node is the whole
+        // expression: a row that stops short of the operator with real
+        // tokens between its expression span and the operator is an
+        // inner operand of a larger one (`(true ? x : 499)`'s branch, a
+        // parenthesized conditional), never the operand the oracle types.
+        // The span (not the bare row) answers because an invocation's row
+        // is its callee head (`a.b()`, a dot shorthand's `.new(1)`).
+        let lhs = mark
+            .checked_sub(1)
+            .and_then(|index| self.rows.get(index))
+            .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
+            .filter(|lhs| !self.is_index_key_row(lhs))
+            .filter(|lhs| {
+                let span = self.staged_expression_span(lhs.range);
+                self.trivia_between(span.end(), op_range.offset)
+            });
+        let non_null =
+            lhs_is_bool_comparison || lhs.is_some_and(|lhs| self.coalesce_operand_never_null(lhs, true));
 
-        if !non_null {
-            return;
-        }
-        // The row's range IS the right operand's own node range
-        // (`_checkForDeadNullCoalesce` reports at `node.rightOperand`):
-        // first token after the operator through the rhs-end latch — a
+        // The report range (`node.rightOperand`'s own node range): first
+        // token after the operator through the rhs-end latch — a
         // degenerate value row (a collection literal's closing-token face)
         // cannot spell it, and an open latch beats a stale row geometry.
+        // Computed before the verdict so the promotion re-decision's
+        // staging can carry it (the row stack is gone by teardown).
         let range = match rhs_end {
             Some(end) if end > rhs_offset => SourceRange {
                 offset: rhs_offset,
@@ -828,6 +824,23 @@ impl<'a> Engine<'a> {
                     length: 0,
                 }),
         };
+
+        if !non_null {
+            // The walk's declared-type verdict missed — the flow's
+            // promoted type may still anchor the dead face
+            // (`_checkForDeadNullCoalesce` reads `leftOperand.staticType`,
+            // flow-augmented: `x` promoted non-null by `if (x != null)`
+            // is dead). The read types only join at teardown, so the
+            // re-decision stages the operand's own local-read span
+            // against this report range.
+            if let Some(lhs_range) = lhs.map(|lhs| lhs.range)
+                && self.local_hits.contains_key(&lhs_range.offset)
+                && range.length > 0
+            {
+                self.coalesce_staged.push((lhs_range, range));
+            }
+            return;
+        }
         if range.length > 0 {
             self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
         }
@@ -939,9 +952,8 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        if !self.coalesce_operand_never_null(target, false) {
-            return;
-        }
+        let target_range = target.range;
+        let never_null = self.coalesce_operand_never_null(target, false);
         // The report anchors at `node.value`'s own expression span, never an
         // inner operand row (`bad()`'s head, `-42`'s digits, `[]`'s closing
         // bracket): from the operand's first token through the value row's
@@ -957,6 +969,19 @@ impl<'a> Engine<'a> {
             offset,
             length: span.end().saturating_sub(offset),
         };
+        if !never_null {
+            // The declared-type verdict missed — the `??=` write's own
+            // promotion may anchor the dead face (`x ??= 1` re-promotes a
+            // nullable `x` to non-null, so a following `x ??= 2` reports;
+            // `visitIfNullAssignment` reads the target's flow-aware
+            // `readResolution.type`). The promotion joins only at
+            // teardown, so the re-decision stages the target's own
+            // local-read span against this report range.
+            if self.local_hits.contains_key(&target_range.offset) && range.length > 0 {
+                self.coalesce_staged.push((target_range, range));
+            }
+            return;
+        }
         self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
     }
 
@@ -5194,3 +5219,12 @@ void f([int? optional]) {\n\
 #[cfg(test)]
 #[path = "ticket_3151_tests.rs"]
 mod ticket_3151_tests;
+
+/// The #3116 `??`/`??=` dead-coalesce promotion pins: the staged
+/// re-decision that anchors the dead face on the operand's flow-promoted
+/// type — `local_hits`-keyed spans ride `coalesce_staged` to the
+/// `flush_null_aware_staged` teardown join. `#[path]` resolves against
+/// this file's directory — `diagnose/`.
+#[cfg(test)]
+#[path = "ticket_3116_tests.rs"]
+mod ticket_3116_tests;

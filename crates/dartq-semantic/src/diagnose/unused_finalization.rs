@@ -4070,6 +4070,23 @@ impl<'a> Engine<'a> {
                 self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, bang, "");
             }
         }
+        // The `??`/`??=` dead-coalesce re-decision
+        // (`_checkForDeadNullCoalesce`, error_verifier.dart:4733-4739): the
+        // operand read's flow-promoted type — a declared-nullable local the
+        // walk's static verdict could not anchor (`if (x != null) x ?? d`,
+        // `x ??= 1` then `x ??= 2` through the `??=` write's own
+        // promotion). Each staged pair carries the operand's read span and
+        // the report range the walk already computed (the `??` right
+        // operand's node range / the `??=` value's expression span).
+        let coalesces = std::mem::take(&mut self.coalesce_staged);
+        for (read, range) in coalesces {
+            if promotions
+                .promoted(read)
+                .is_some_and(Ty::is_strictly_non_nullable)
+            {
+                self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
+            }
+        }
     }
 
     /// The enclosing executable's lookup spelling once its name has fired

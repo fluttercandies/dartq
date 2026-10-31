@@ -3590,6 +3590,23 @@ pub(crate) struct Engine<'a> {
     /// against the promoted receiver type (`_checkForUnnecessaryNullAware`'s
     /// gate on the flow type).
     pub(crate) null_aware_staged: Vec<(SourceRange, SourceRange, NullAwareKind)>,
+    /// `??`/`??=` dead-coalesce operands whose walk-time declared type did
+    /// NOT anchor the dead face: `(operand read span, report range)`
+    /// re-decided at teardown against the flow's promoted type —
+    /// `_checkForDeadNullCoalesce` reads `leftOperand.staticType` / the
+    /// `??=` target's `readResolution.type`, both flow-augmented (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/generated/
+    /// error_verifier.dart:4733-4739). The read types only materialize at
+    /// the teardown join (`Engine::read_types` fills after pass 1 — the
+    /// walk sees them empty), so a promoted operand (`x` non-null after
+    /// `if (x != null)`, a `??=` write promotion) anchors the dead face
+    /// only here. The report range is decided at stage time (the `??`
+    /// right operand's node range, the `??=` value's expression span) —
+    /// the row stack the ranges derive from is gone by teardown. Only
+    /// LOCAL reads stage: the flow promotion table keys on the local
+    /// read's own span (`local_hits`), so a member/unknown operand's
+    /// staging would never join.
+    pub(crate) coalesce_staged: Vec<(SourceRange, SourceRange)>,
     /// The promoted-receiver candidates (#1465): `receiver.member` merges
     /// whose receiver was a bare declared-type read, keyed by the merged
     /// member row's offset and carrying the receiver read's span — the same

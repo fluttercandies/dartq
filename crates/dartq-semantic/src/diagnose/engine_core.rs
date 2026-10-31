@@ -417,6 +417,7 @@ impl<'a> Engine<'a> {
             dead_null_chains: Vec::new(),
             null_assert_staged: Vec::new(),
             null_aware_staged: Vec::new(),
+            coalesce_staged: Vec::new(),
             promoted_recv_reads: Vec::new(),
             inferred_formal_containers: FxHashSet::default(),
             inferred_recv_used_members: FxHashSet::default(),
