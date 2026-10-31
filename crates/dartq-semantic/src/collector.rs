@@ -3307,19 +3307,35 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             offset: function.range.offset,
             length: question.map_or(function.range, |q| q.range).end() - function.range.offset,
         };
+        // The close seals the level `begin_function_type` opened; a drifted
+        // pair (no function level on top) seals nothing, so the arming below
+        // must not claim a root that this close did not push.
+        let sealed = builder
+            .capture
+            .as_ref()
+            .is_some_and(|site| site.top_is_function());
         if let Some(site) = builder.capture.as_mut() {
             site.end_function(question.is_some(), range);
         }
         // A top-level function annotation arms itself: no `handle_type`
         // head ever completes the whole shape, so the root moves onto the
         // armed slot here — `take_armed` interns it like a completed
-        // named tree.
-        if let Some(site) = builder.capture.as_mut()
+        // named tree. The just-sealed shape is the LAST root, the same
+        // last-root discipline `end_record_type` keeps: a type-parameter
+        // bound's completed arguments, or a default value's construction
+        // (`const Foo<List<int>>()` — the default-value arm suppresses
+        // `handle_type`, so that group's root is never armed away), can sit
+        // beside it. Requiring a single-root window stranded the real
+        // function shape: the formal then kept whatever the annotation had
+        // armed on the way in (`bool Function()?` degraded to the `bool`
+        // return type alone).
+        if sealed
+            && let Some(site) = builder.capture.as_mut()
             && site.stack.is_empty()
-            && site.done.len() == 1
+            && !site.done.is_empty()
         {
             let mut site = builder.capture.take().expect("checked above");
-            let tree = site.done.pop().expect("one root");
+            let tree = site.done.pop().expect("the sealed shape");
             builder.armed_tree = Some(tree);
             builder.armed_ty = None; // `take_armed` converts the function arm.
         }
