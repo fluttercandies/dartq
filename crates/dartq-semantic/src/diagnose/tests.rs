@@ -17878,3 +17878,13 @@ mod ticket_3274_tests;
 #[cfg(test)]
 #[path = "ticket_3257_tests.rs"]
 mod ticket_3257_tests;
+
+// The #3290 pins (the two constructor-declaration faces: the
+// `redirect_to_non_const_constructor` target-constness gate, which must
+// read an enum's unnamed constructor as const, and the
+// `const_constructor_with_non_final_field` declaration face). Registered
+// here via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3290_tests.rs"]
+mod ticket_3290_tests;

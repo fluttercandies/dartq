@@ -2136,37 +2136,18 @@ impl<'a> Engine<'a> {
             // reports at the target — the selector for a `this.b()` shape
             // (`constructorSelector?.name2 ?? thisKeyword`), the `= C.name`
             // extent for a factory. The target's element must resolve (the
-            // null redirectedElement arm skips): a same-file declaration
-            // reads its own const bit, a same-file implicit unnamed default
-            // is non-const, anything foreign or missing stays silent.
-            if edge.is_const {
-                let target_const = self
-                    .ctor_decl_site(edge.target_container, edge.target)
-                    .map(|site| site.const_ctor)
-                    .or_else(|| {
-                        let (decl, owner) = resolve_container(
-                            self.graph,
-                            self.namespaces,
-                            self.index,
-                            self.lib,
-                            self.file,
-                            edge.target_container,
-                        )?;
-                        if owner != self.file
-                            || !self.ctor_face_exists(decl, edge.target_container, edge.target)
-                        {
-                            return None;
-                        }
-                        Some(false) // the implicit unnamed default: never const
-                    });
-                if target_const == Some(false) {
-                    let span = if edge.factory {
-                        edge.span
-                    } else {
-                        edge.target_span
-                    };
-                    self.emit(SemanticCode::RedirectToNonConstConstructor, span, "", "");
-                }
+            // null redirectedElement arm skips); the enum posture lives in
+            // the query (an enum's generative constructors are implicitly
+            // const).
+            if edge.is_const
+                && self.redirect_target_is_const(edge.target_container, edge.target) == Some(false)
+            {
+                let span = if edge.factory {
+                    edge.span
+                } else {
+                    edge.target_span
+                };
+                self.emit(SemanticCode::RedirectToNonConstConstructor, span, "", "");
             }
             let mut current_container = edge.target_container;
             let mut current = edge.target;

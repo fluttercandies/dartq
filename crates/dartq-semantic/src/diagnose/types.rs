@@ -6139,6 +6139,53 @@ impl<'a> Engine<'a> {
             idx,
         ))
     }
+
+    /// The const-ness of one redirect target constructor — the oracle's
+    /// `redirectedElement.isConst` in `_checkForRedirectToNonConstConstructor`
+    /// (error_verifier.dart:7330-7347): `Some(true)`/`Some(false)` when the
+    /// target resolves to a constructor face of this file, `None` when it
+    /// resolves to no constructor at all (the oracle's null
+    /// `redirectedElement`: the gate never reports).
+    ///
+    /// An enum's generative constructors are implicitly const — with the
+    /// primary-constructors feature a generative constructor in an enum body
+    /// may drop the `const` keyword, and an enum primary constructor carries
+    /// it implicitly (`const_constructor_with_non_final_field`'s upstream
+    /// sibling rule, upstream `enum_implicit_const_constructor_test`). The
+    /// written `const` bit alone would read a `const`-less enum constructor
+    /// as non-const, and a primary constructor holds no declaration site at
+    /// all — both over-report a `const` redirect inside the enum. Every
+    /// generative target face inside an enum therefore reads const; an enum
+    /// factory keeps its own written bit (its constness is declarative).
+    pub(crate) fn redirect_target_is_const(
+        &self,
+        container: StringId,
+        selector: StringId,
+    ) -> Option<bool> {
+        let resolved = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        );
+        // A foreign container's constructor set is not modeled here (the
+        // under-report posture the gate already held).
+        let decl = resolved.and_then(|(decl, owner)| (owner == self.file).then_some(decl));
+        let enum_target = decl.is_some_and(|decl| decl.kind == ContainerKind::Enum);
+        if let Some(site) = self.ctor_decl_site(container, selector) {
+            return Some(site.const_ctor || (enum_target && !site.is_factory));
+        }
+        let decl = decl?;
+        if !self.ctor_face_exists(decl, container, selector) {
+            return None;
+        }
+        // No declaration site: the implicit unnamed default is never const
+        // upstream, while an enum's is the implicit const constructor its
+        // values are instances of.
+        Some(enum_target)
+    }
 }
 
 // The #2815 pins (the B2 unchecked-nullable family). Registered here,
