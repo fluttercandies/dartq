@@ -910,10 +910,11 @@ impl<'a> Boundary<'a> {
                     // the diagnosing pool.
                     return Ty::Dynamic;
                 };
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_params_named, return_ty, positional, named) = {
                     let shape = foreign.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.type_params_named.to_vec(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
@@ -926,8 +927,26 @@ impl<'a> Boundary<'a> {
                     .into_iter()
                     .map(|(n, t)| (n, self.ty(owner, t)))
                     .collect();
-                return self.args.borrow_mut().function(
-                    type_params,
+                // The signature's own `<T extends B>` group rides across
+                // pools verbatim when the source shape recorded it (the
+                // `function_generic` producer — the count-only `function`
+                // would strip the very names the generic tear-off's
+                // display spells); a count-only shape keeps its count.
+                if type_params_named.is_empty() {
+                    return self.args.borrow_mut().function(
+                        type_params,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    );
+                }
+                let type_params_named: Vec<(StringId, Option<Ty>)> = type_params_named
+                    .into_iter()
+                    .map(|(n, bound)| (n, bound.map(|b| self.ty(owner, b))))
+                    .collect();
+                return self.args.borrow_mut().function_generic(
+                    &type_params_named,
                     return_ty,
                     &positional,
                     &named,
@@ -1117,11 +1136,12 @@ impl<'a> Boundary<'a> {
                 if shape == crate::model::FnShapeId::EMPTY {
                     return ty;
                 }
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_params_named, return_ty, positional, named) = {
                     let pool = self.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.type_params_named.to_vec(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
@@ -1136,17 +1156,38 @@ impl<'a> Boundary<'a> {
                     .iter()
                     .map(|&(n, t)| (n, self.canonical_dotted_ty(t)))
                     .collect();
+                let new_type_params_named: Vec<(StringId, Option<Ty>)> = type_params_named
+                    .iter()
+                    .map(|&(n, bound)| (n, bound.map(|b| self.canonical_dotted_ty(b))))
+                    .collect();
                 if new_return_ty == return_ty
                     && new_positional == positional
                     && new_named
                         .iter()
                         .zip(named.iter())
                         .all(|(a, b)| a == b)
+                    && new_type_params_named
+                        .iter()
+                        .zip(type_params_named.iter())
+                        .all(|(a, b)| a == b)
                 {
                     return ty;
                 }
-                self.args.borrow_mut().function(
-                    type_params,
+                // The signature's `<T extends B>` group survives the
+                // canonicalization verbatim — a named shape re-interns
+                // through `function_generic`, a count-only one keeps its
+                // count (the generic tear-off's display reads the group).
+                if new_type_params_named.is_empty() {
+                    return self.args.borrow_mut().function(
+                        type_params,
+                        new_return_ty,
+                        &new_positional,
+                        &new_named,
+                        nullable,
+                    );
+                }
+                self.args.borrow_mut().function_generic(
+                    &new_type_params_named,
                     new_return_ty,
                     &new_positional,
                     &new_named,
@@ -1270,6 +1311,40 @@ impl<'a> Boundary<'a> {
         self.args
             .borrow_mut()
             .function(type_params, return_ty, positional, named, nullable)
+    }
+
+    /// [`Self::intern_function_ty`] with the signature's own
+    /// `<T extends B>` group spelled (`function_generic`): a generic
+    /// member's tear-off carries its declaration's parameters into the
+    /// substituted face, and the `undefined_operator`/`ty_display` render
+    /// spells the group verbatim (`<T>void Function(T)`). A count-only
+    /// source delegates to the count-only producer (its `type_params`
+    /// would be lost through the names-only slice).
+    pub(crate) fn intern_function_ty_generic(
+        &self,
+        type_params: u16,
+        type_params_named: &[(StringId, Option<Ty>)],
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty)],
+        nullable: bool,
+    ) -> Ty {
+        if type_params_named.is_empty() {
+            return self.intern_function_ty(
+                type_params,
+                return_ty,
+                positional,
+                named,
+                nullable,
+            );
+        }
+        self.args.borrow_mut().function_generic(
+            type_params_named,
+            return_ty,
+            positional,
+            named,
+            nullable,
+        )
     }
 }
 
@@ -3332,6 +3407,14 @@ pub(crate) struct Engine<'a> {
     /// The `on`-type name of the catch clause in flight (the first type
     /// reference before the catch parameters).
     pub(crate) catch_on_type: Option<StringId>,
+    /// The clause in flight's `on` head opened a record type (`on (A, B)`,
+    /// or a paren head the recovered parse walks as one). Upstream resolves
+    /// such a head to a null/record `exceptionType`, which the
+    /// `_CatchClausesVerifier` reads as the catch-all face (a record type is
+    /// never `isDartCoreObject`) — so the clause fact carries `on_type:
+    /// None` even though the head's field types fired `TypeReference`
+    /// events that would otherwise claim [`Self::catch_on_type`].
+    pub(crate) catch_on_record: bool,
     /// The catch clauses' `on`-type row offsets: a TypeUse miss at one of
     /// them codes `non_type_in_catch_clause` instead of `undefined_class`
     /// (the F-P recovered-clause routing, pinned by the parser's gate
@@ -3347,6 +3430,12 @@ pub(crate) struct Engine<'a> {
     /// The catch clause's first token (`on`/`catch`) — the clause fact's
     /// start anchor.
     pub(crate) catch_clause_start: Option<SourceRange>,
+    /// Where the clause's head ended (the token after it, as an exclusive
+    /// end offset). Only a clause whose body block never materialized
+    /// (`on X;` — the `expected_body` recovery) reads it: the fact ends at
+    /// the head instead of at a block end that never came (upstream's
+    /// `CatchClause.end` is the recovered head's last consumed token).
+    pub(crate) catch_head_end: Option<u32>,
     /// Catch parameters seen in the clause in flight (0 = none, 1 =
     /// exception, 2 = exception + stack trace).
     pub(crate) catch_params: u8,
@@ -6239,3 +6328,12 @@ mod boundary_projection {
 #[cfg(test)]
 #[path = "ticket_3150_tests.rs"]
 mod ticket_3150_tests;
+
+// The #3177 pins (`Ty::Function.type_params_named` across the pool
+// projection/dotted-canonicalization seams — the generic tear-off's
+// verbatim `<T extends B>` group, plus the `ty.render` function/record
+// faces). Same `#[path]` registration as #3150: the module stays inside
+// the `diagnose` subtree so `super::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3177_tests.rs"]
+mod ticket_3177_tests;
