@@ -217,7 +217,7 @@ impl<'a> Engine<'a> {
     /// `ffiClass` arm — the subtype faces own the transitive shapes).
     fn direct_ffi_supertype(&self, container: &Container) -> Option<&'static str> {
         let super_name = container.superclass?;
-        let (super_container, owner) = self.resolve_container_from(super_name)?;
+        let (_, owner) = self.resolve_container_from(super_name)?;
         if !self.owner_is_ffi(owner) {
             return None;
         }
@@ -273,7 +273,7 @@ impl<'a> Engine<'a> {
                 let array_form = name_text.starts_with("Array.")
                     && matches!(
                         &name_text["Array.".len()..],
-                        "variable" | "variableMulti" | "variableWithVariableDimension"
+                        "variable" | "variableMulti" | "variableWithVariableDimension" | "multi"
                     );
                 if !array_form {
                     return;
@@ -398,33 +398,58 @@ impl<'a> Engine<'a> {
             }
             3 => {
                 // The mapping's `{...}`: each `key: value` entry's value
-                // head is the constructed native type.
-                let Some(open) = args_text.find('{') else {
-                    return (face, Some(args_span));
-                };
-                let Some(brace_close) = matching_close(args_text.as_bytes(), open, b'{', b'}')
-                else {
-                    return (face, Some(args_span));
-                };
-                for (rel, len) in split_top_level(&args_text[open + 1..brace_close], b',') {
-                    let entry = &args_text[open + 1 + rel..open + 1 + rel + len];
-                    let Some(colon) = top_level_colon(entry) else {
-                        continue;
+                // head is the constructed native type. A const-identifier
+                // argument (`@AbiSpecificIntegerMapping(c)` where `c` is a
+                // `const` map literal) resolves to the const's own literal
+                // — upstream's `annotation.arguments[0]` reads the
+                // evaluated map's entries, anchored on the written
+                // argument.
+                if let Some(open) = args_text.find('{') {
+                    let Some(brace_close) =
+                        matching_close(args_text.as_bytes(), open, b'{', b'}')
+                    else {
+                        return (face, Some(args_span));
                     };
-                    let value_part = &entry[colon + 1..];
-                    let value = value_part.trim();
-                    let Some((head_start, head_end)) = first_ident(value) else {
-                        continue;
-                    };
-                    let lead = value_part.len() - value_part.trim_start().len();
-                    let vstart = open + 1 + rel + colon + 1 + lead;
-                    face.mapping_values.push((
-                        value[head_start..head_end].to_owned(),
-                        SourceRange {
-                            offset: utf16(cursor + vstart),
-                            length: utf16(cursor + vstart + value.len()) - utf16(cursor + vstart),
-                        },
-                    ));
+                    for (rel, len) in
+                        split_top_level(&args_text[open + 1..brace_close], b',')
+                    {
+                        let entry = &args_text[open + 1 + rel..open + 1 + rel + len];
+                        let Some(colon) = top_level_colon(entry) else {
+                            continue;
+                        };
+                        let value_part = &entry[colon + 1..];
+                        let value = value_part.trim();
+                        let Some((head_start, head_end)) = first_ident(value) else {
+                            continue;
+                        };
+                        let lead = value_part.len() - value_part.trim_start().len();
+                        let vstart = open + 1 + rel + colon + 1 + lead;
+                        face.mapping_values.push((
+                            value[head_start..head_end].to_owned(),
+                            SourceRange {
+                                offset: utf16(cursor + vstart),
+                                length: utf16(cursor + vstart + value.len())
+                                    - utf16(cursor + vstart),
+                            },
+                        ));
+                    }
+                } else {
+                    // The const-identifier arm: the argument text is a bare
+                    // name; its entries live on the const's map literal.
+                    // Every unsupported value reports at the argument's
+                    // written span (upstream anchors `arguments[0]`).
+                    let inner = args_text
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .trim();
+                    if let Some((s, e)) = first_ident(inner)
+                        && let Some(entries) = self.ffi_const_map_entries(&inner[s..e])
+                    {
+                        let arg_span = args_span;
+                        for value in entries {
+                            face.mapping_values.push((value, arg_span));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -528,6 +553,24 @@ fn first_ident_head(text: &str, engine: &Engine<'_>) -> StringId {
         .unwrap_or(StringId::NONE)
 }
 
+/// A clause entry's `(leaf, head)` parts from its written text: strips
+/// the type-argument tail, splits the first dot for the prefix, and
+/// takes the last segment as the leaf (`p.S<T>` → `Some("S")`, `"S"`).
+/// The head is the text up to the first `<` or whitespace — the
+/// resolution key for both bare and prefixed spellings.
+fn clause_entry_parts(text: &str) -> (Option<&str>, &str) {
+    let head = text.trim();
+    let head = head
+        .split(|c: char| c == '<' || c.is_whitespace())
+        .next()
+        .unwrap_or(head);
+    if head.is_empty() {
+        return (None, head);
+    }
+    let leaf = head.rsplit('.').next().unwrap_or(head);
+    (Some(leaf), head)
+}
+
 /// The normal-parameter head spellings of a written function type
 /// (`Void Function(Int8, Pointer<Uint8>)` → `["Int8", "Pointer"]`); an
 /// empty vector when the written form is not `R Function(...)`.
@@ -583,15 +626,71 @@ fn function_param_heads(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The parameter head spellings of a written function type with the
+/// `VarArgs` record flattened (upstream `flattenVarArgs`):
+/// `VarArgs<(Int32, Double)>` expands to `Int32, Double` in the returned
+/// list. A trailing `VarArgs` whose argument is not a record literal is
+/// left as-is (upstream `!isVarArgs` / `namedFields.isNotEmpty` faces).
+fn ffi_flatten_varargs(text: &str, strings: &StringTable) -> Vec<StringId> {
+    let heads = function_param_heads(text);
+    let mut flat: Vec<StringId> = Vec::with_capacity(heads.len());
+    for (index, head) in heads.iter().enumerate() {
+        if head == "VarArgs" && index + 1 == heads.len() {
+            // Only the LAST parameter may be a `VarArgs` (upstream
+            // `flattenVarArgs`'s `last.isVarArgs` gate — a mid-list
+            // `VarArgs` keeps its raw head and fails the native-type
+            // gate). The record argument must hold positional fields
+            // only: a named field (`{Int64 named}`) stops the flatten
+            // (`namedFields.isNotEmpty`).
+            if let Some(varargs_pos) = text.find("VarArgs") {
+                let after = &text[varargs_pos + "VarArgs".len()..];
+                if let Some(angle) = after.find('<')
+                    && let Some(angle_close) =
+                        matching_close(after.as_bytes(), angle, b'<', b'>')
+                {
+                    let record = &after[angle + 1..angle_close];
+                    let record = record.trim();
+                    if record.starts_with('(') && record.ends_with(')') {
+                        let inner = &record[1..record.len() - 1];
+                        let has_named = split_top_level(inner, b',')
+                            .iter()
+                            .any(|(rel, len)| inner[*rel..*rel + len].contains('{'));
+                        if !has_named {
+                            for (rel, len) in split_top_level(inner, b',') {
+                                let field = inner[rel..rel + len].trim();
+                                if let Some((s, e)) = first_ident(field) {
+                                    flat.push(strings.intern(&field[s..e]));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            flat.push(strings.intern("VarArgs"));
+        } else {
+            flat.push(strings.intern(head));
+        }
+    }
+    flat
+}
+
 /// Whether the named argument reads `name: true` at the group's top
-/// level (the `_isLeaf` source walk).
+/// level (the `_isLeaf` source walk). The group's own parens/brackets
+/// hug the split's first and last items — `top_level_colon` finds the
+/// label separator and the label's own trim drops the open paren.
 fn named_arg_is_true(args_text: &str, name: &str) -> bool {
     for (rel, len) in split_top_level(args_text, b',') {
         let arg = &args_text[rel..rel + len];
         let Some(colon) = arg.find(':') else {
             continue;
         };
-        if arg[..colon].trim() == name && arg[colon + 1..].trim() == "true" {
+        let label = arg[..colon]
+            .trim()
+            .trim_start_matches(['(', '[', '{'])
+            .trim();
+        if label == name && arg[colon + 1..].trim().trim_end_matches([')', ']', '}']).trim() == "true"
+        {
             return true;
         }
     }
@@ -621,8 +720,25 @@ fn parse_array_dims(
 ) {
     let bytes = args_text.as_bytes();
     let utf16 = |byte: usize| byte_offset_to_utf16(engine.source, args_at + byte);
+    // Pushes one parsed literal item with its absolute span.
+    let push_dim = |face: &mut FfiAnnoFace, value: i64, at_rel: usize, len: usize| {
+        face.dims.push((
+            value,
+            SourceRange {
+                offset: utf16(at_rel),
+                length: utf16(at_rel + len) - utf16(at_rel),
+            },
+        ));
+    };
+    let Some(close) = matching_close(bytes, 0, b'(', b')') else {
+        return;
+    };
+    let inner = &args_text[1..close];
     match suffix {
-        "variable" | "variableMulti" => {
+        // `Array.variable([d2, d3, ...])` — variable dimension defaults to
+        // `0` (upstream `_ArraySize.variable` sets `dimension1 = 0`), the
+        // written items are the fixed dims 2-5.
+        "variable" => {
             face.variable_length = true;
             face.dims.push((
                 0,
@@ -631,64 +747,6 @@ fn parse_array_dims(
                     length: 0,
                 },
             ));
-            let Some(close) = matching_close(bytes, 0, b'(', b')') else {
-                return;
-            };
-            let inner = &args_text[1..close];
-            // `variableMulti` wraps its items in a list literal.
-            let (items, items_at) = if suffix == "variableMulti" {
-                let Some(bracket) = inner.find('[') else {
-                    return;
-                };
-                let Some(bracket_close) = matching_close(inner.as_bytes(), bracket, b'[', b']')
-                else {
-                    return;
-                };
-                (&inner[bracket + 1..bracket_close], bracket + 1)
-            } else {
-                (inner, 0)
-            };
-            for (rel, len) in split_top_level(items, b',') {
-                let item_full = &items[rel..rel + len];
-                let item = item_full.trim();
-                let Some(value) = parse_int_literal(item) else {
-                    continue;
-                };
-                let lead = item_full.len() - item_full.trim_start().len();
-                let at = 1 + items_at + rel + lead;
-                face.dims.push((
-                    value,
-                    SourceRange {
-                        offset: utf16(at),
-                        length: utf16(at + item.len()) - utf16(at),
-                    },
-                ));
-            }
-        }
-        "variableWithVariableDimension" => {
-            face.variable_length = true;
-            let Some(close) = matching_close(bytes, 0, b'(', b')') else {
-                return;
-            };
-            let inner = &args_text[1..close];
-            let item = inner.trim();
-            let Some(value) = parse_int_literal(item) else {
-                return;
-            };
-            face.dims.push((
-                value,
-                SourceRange {
-                    offset: utf16(1 + (inner.len() - inner.trim_start().len())),
-                    length: utf16(1 + (inner.len() - inner.trim_start().len()) + item.len())
-                        - utf16(1 + (inner.len() - inner.trim_start().len())),
-                },
-            ));
-        }
-        _ => {
-            let Some(close) = matching_close(bytes, 0, b'(', b')') else {
-                return;
-            };
-            let inner = &args_text[1..close];
             for (rel, len) in split_top_level(inner, b',') {
                 let item_full = &inner[rel..rel + len];
                 let item = item_full.trim();
@@ -696,13 +754,103 @@ fn parse_array_dims(
                     continue;
                 };
                 let lead = item_full.len() - item_full.trim_start().len();
-                face.dims.push((
-                    value,
+                push_dim(face, value, 1 + rel + lead, item.len());
+            }
+        }
+        // `Array.multi([...])` and
+        // `Array.variableMulti([...], variableDimension: N)` — dims come
+        // from the list literal; `variableMulti` additionally prepends the
+        // named `variableDimension` value (default `0`) as dims[0]
+        // (upstream `arraySizeDimensions`: `[if (variableLength)
+        // variableDimension, ...listValues]`).
+        "multi" | "variableMulti" => {
+            face.variable_length = suffix == "variableMulti";
+            let mut variable: Option<(i64, SourceRange)> = None;
+            for (rel, len) in split_top_level(inner, b',') {
+                let entry = &inner[rel..rel + len];
+                let trimmed = entry.trim();
+                let lead = entry.len() - entry.trim_start().len();
+                if let Some(colon) = trimmed.find(':')
+                    && trimmed[..colon].trim() == "variableDimension"
+                {
+                    let value_text = trimmed[colon + 1..].trim();
+                    if let Some(parsed) = parse_int_literal(value_text) {
+                        let vlead = trimmed[colon + 1..].len()
+                            - trimmed[colon + 1..].trim_start().len();
+                        let at = 1 + rel + lead + colon + 1 + vlead;
+                        variable = Some((
+                            parsed,
+                            SourceRange {
+                                offset: utf16(at),
+                                length: utf16(at + value_text.len()) - utf16(at),
+                            },
+                        ));
+                    }
+                    continue;
+                }
+                let Some(bracket) = entry.find('[') else {
+                    continue;
+                };
+                let Some(bracket_close) =
+                    matching_close(entry.as_bytes(), bracket, b'[', b']')
+                else {
+                    continue;
+                };
+                let items = &entry[bracket + 1..bracket_close];
+                for (irel, ilen) in split_top_level(items, b',') {
+                    let item_full = &items[irel..irel + ilen];
+                    let item = item_full.trim();
+                    let Some(value) = parse_int_literal(item) else {
+                        continue;
+                    };
+                    let item_lead = item_full.len() - item_full.trim_start().len();
+                    push_dim(
+                        face,
+                        value,
+                        1 + rel + bracket + 1 + irel + item_lead,
+                        item.len(),
+                    );
+                }
+            }
+            if face.variable_length {
+                // `variableDimension` defaults to `0` when omitted
+                // (upstream `_ArraySize.variableMulti`'s default); its span
+                // falls back to the annotation's error node, modeled by a
+                // zero-length range at the head.
+                let (value, span) = variable.unwrap_or((
+                    0,
                     SourceRange {
-                        offset: utf16(1 + rel + lead),
-                        length: utf16(1 + rel + lead + item.len()) - utf16(1 + rel + lead),
+                        offset: utf16(0),
+                        length: 0,
                     },
                 ));
+                face.dims.insert(0, (value, span));
+            }
+        }
+        // `Array.variableWithVariableDimension([d1, d2, ...])` — all
+        // written items, d1 is the variable dimension.
+        "variableWithVariableDimension" => {
+            face.variable_length = true;
+            for (rel, len) in split_top_level(inner, b',') {
+                let item_full = &inner[rel..rel + len];
+                let item = item_full.trim();
+                let Some(value) = parse_int_literal(item) else {
+                    continue;
+                };
+                let lead = item_full.len() - item_full.trim_start().len();
+                push_dim(face, value, 1 + rel + lead, item.len());
+            }
+        }
+        // `Array(d1, d2, ...)` — plain positional items.
+        _ => {
+            for (rel, len) in split_top_level(inner, b',') {
+                let item_full = &inner[rel..rel + len];
+                let item = item_full.trim();
+                let Some(value) = parse_int_literal(item) else {
+                    continue;
+                };
+                let lead = item_full.len() - item_full.trim_start().len();
+                push_dim(face, value, 1 + rel + lead, item.len());
             }
         }
     }
@@ -952,6 +1100,209 @@ impl<'a> Engine<'a> {
             .collect()
     }
 
+    /// The `@Native` faces a site carries through const aliases: upstream
+    /// reads `element.metadata`'s computed values (`_checkFfiNative` iterates
+    /// `declarationElement.metadata.annotations` and calls
+    /// `annotation.computeConstantValue()` — a `@alias` of
+    /// `const alias = Native<…>(…)` produces a `Native` annotation value),
+    /// so a bare `@identifier` whose const RHS spells `Native` joins the
+    /// face list. The synthesized face is the const's own RHS parse — its
+    /// `<T>`, `isLeaf`, and args are identical to the written form's; its
+    /// `name_span`/`at` keep the alias's written spans for anchors that
+    /// point at the annotation's name.
+    fn ffi_const_native_annos(&self, site: &DeclSite) -> Vec<FfiDeclAnno> {
+        let name_start = self.byte_of(site.range.offset);
+        let bytes = self.source.as_bytes();
+        // Walk the metadata region immediately before the declaring name:
+        // annotations hug the declaration (whitespace/comments separate at
+        // most); the walk stops at the first non-annotation, non-blank byte
+        // past each consumed `@name[args]` group — a `//` line or `/*…*/`
+        // block never reaches upstream's resolved `metadata`, so it never
+        // reaches this expansion either.
+        let mut out = Vec::new();
+        let mut cursor = name_start;
+        loop {
+            while cursor > 0 && bytes.get(cursor - 1).is_some_and(|b| b.is_ascii_whitespace()) {
+                cursor -= 1;
+            }
+            // Skip a trailing `)` of an argument group.
+            if bytes.get(cursor - 1) == Some(&b')') {
+                let mut depth = 0i32;
+                let mut at = cursor - 1;
+                loop {
+                    match bytes.get(at) {
+                        Some(b')') => depth += 1,
+                        Some(b'(') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                    if at == 0 {
+                        break;
+                    }
+                    at -= 1;
+                }
+                cursor = at;
+                while cursor > 0 && bytes.get(cursor - 1).is_some_and(|b| b.is_ascii_whitespace()) {
+                    cursor -= 1;
+                }
+            }
+            // The annotation's identifier run (dotted tails included).
+            let mut ident_start = cursor;
+            while ident_start > 0
+                && bytes
+                    .get(ident_start - 1)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+            {
+                ident_start -= 1;
+            }
+            if bytes.get(ident_start.wrapping_sub(1)) == Some(&b'@') {
+                let name_text = &self.source[ident_start..cursor];
+                let leaf = name_text.rsplit('.').next().unwrap_or(name_text);
+                // `@Native`/`@Array`/`@DefaultAsset` et al. are already
+                // captured; only non-FFI names need the const-alias probe.
+                if !matches!(
+                    leaf,
+                    "Native" | "Array" | "Packed" | "AbiSpecificIntegerMapping" | "DefaultAsset"
+                ) && let Some(anno) = self.ffi_resolve_const_anno(leaf, ident_start, cursor)
+                {
+                    out.push(anno);
+                }
+                cursor = ident_start - 1;
+                continue;
+            }
+            break;
+        }
+        out.reverse();
+        out
+    }
+
+    /// Resolves an alias name to a synthesized `Native`/`DefaultAsset`
+    /// anno: the name must be a top-level `const` whose RHS is one bare
+    /// creation of the FFI class (`const alias = Native<…>(isLeaf: true)`
+    /// or `const d = DefaultAsset('a')`). The RHS text parses through the
+    /// same `parse_ffi_face` the written form uses; the alias keeps its
+    /// own name span for the diagnostic anchor.
+    fn ffi_resolve_const_anno(
+        &self,
+        alias: &str,
+        alias_start: usize,
+        alias_end: usize,
+    ) -> Option<FfiDeclAnno> {
+        let alias_id = self.strings.intern(alias);
+        let const_site = self
+            .decl_sites
+            .iter()
+            .find(|s| s.name == alias_id && matches!(s.kind, DeclKind::TopLevelVar))?;
+        // Source-walk the const decl's `= <creation>` tail.
+        let decl_start = self.byte_of(const_site.range.offset);
+        let tail = &self.source[decl_start..];
+        // Find `=` after the const name; the initializer text runs to the
+        // statement's `;`.
+        let eq = tail.find('=')?;
+        let init = &tail[eq + 1..];
+        let init_trimmed = init.trim_start();
+        // The creation's head must spell `Native` or `DefaultAsset`.
+        let (variant, class_name) = if init_trimmed.starts_with("Native") {
+            (0u8, "Native")
+        } else if init_trimmed.starts_with("DefaultAsset") {
+            (4u8, "DefaultAsset")
+        } else {
+            return None;
+        };
+        let head_len = init.len() - init_trimmed.len();
+        let head = &init_trimmed[..class_name.len().min(init_trimmed.len())];
+        if head != class_name {
+            return None;
+        }
+        // The parse runs on the REAL const-RHS slice so every produced
+        // span (sig.range, args, dims) lands in `self.source` coordinates;
+        // the face content (sig display/heads, is_leaf, dims values) is
+        // identical to the written annotation's. `parse_ffi_face` expects
+        // the text to lead with `@`, so we synthesize the slice as
+        // `@` + the RHS text in a temporary buffer whose bytes share the
+        // tail of `self.source` — but `byte_offset_to_utf16(self.source,…)`
+        // would still misindex, so instead we parse on a standalone
+        // buffer and rebase the name/at spans onto the alias's written
+        // spans (the only spans the diagnostics read for const aliases:
+        // `ffiNativeInvalidMultipleAnnotations` anchors `annotationAst.name`,
+        // the others read sig/args CONTENT not their spans).
+        let mut text = String::with_capacity(1 + init_trimmed.len());
+        text.push('@');
+        text.push_str(init_trimmed);
+        let (mut face, _) = self.parse_ffi_face(0, 0, &text, variant);
+        // Rebase: the synthetic `@` sat at offset 0 of `text`; the name
+        // span must anchor the ALIAS's written name (the diagnostic's
+        // `annotationAst.name` is the written annotation, not the const's
+        // RHS).
+        let alias_name_range = SourceRange {
+            offset: byte_offset_to_utf16(self.source, alias_start),
+            length: byte_offset_to_utf16(self.source, alias_end)
+                - byte_offset_to_utf16(self.source, alias_start),
+        };
+        face.name_span = alias_name_range;
+        // The `args` presence gate (`anno.face.args.is_none()` rejects a
+        // bare `@Native`) must reflect the const RHS's argument group —
+        // rebase its written span onto the const's own `(`…`)` so the
+        // external-keyword probe (`anno.at.end()` → `site.range` between-
+        // text scan) stays truthful: the `at` range covers the alias name,
+        // the args range the RHS's group — the between-text read is
+        // annotation→name anyway, so the alias's real extent is what
+        // matters.
+        if let Some(args) = face.args.as_mut() {
+            // The RHS argument group's `(` sits right after the head's
+            // `<…>` type arguments when present, else right after the
+            // class name — scan forward from the head's end in the init
+            // text for the first `(`.
+            let head_end = decl_start + eq + 1 + head_len + head.len();
+            let rest = &self.source[head_end..];
+            let mut depth = 0i32;
+            let mut open = None;
+            for (i, &b) in rest.as_bytes().iter().enumerate() {
+                match b {
+                    b'<' => depth += 1,
+                    b'>' => depth -= 1,
+                    b'(' if depth == 0 => {
+                        open = Some(head_end + i);
+                        break;
+                    }
+                    b';' | b'\n' if depth == 0 => break,
+                    _ => {}
+                }
+            }
+            let paren_open = open.unwrap_or(head_end);
+            args.offset = byte_offset_to_utf16(self.source, paren_open);
+            // Keep the group's written extent; the close paren is the
+            // init text's first `)` at depth 0.
+            let mut depth = 0i32;
+            let mut close = paren_open;
+            for (i, &b) in self.source.as_bytes()[paren_open..].iter().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = paren_open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            args.length = byte_offset_to_utf16(self.source, close + 1)
+                - byte_offset_to_utf16(self.source, paren_open);
+        }
+        Some(FfiDeclAnno {
+            at: alias_name_range,
+            name: self.strings.intern(class_name),
+            face,
+        })
+    }
+
     /// A written type's rendered display (the message slot face).
     fn ffi_render(&self, ty: Ty) -> String {
         ty.render(&self.strings, &self.boundary.args.borrow())
@@ -1061,6 +1412,14 @@ impl<'a> Engine<'a> {
 
     /// The transitive clause-entry faces (`subtype_of_struct_class`'s
     /// extends/implements/with variants), anchored on the written entries.
+    ///
+    /// The element model stores leaf-only spellings in
+    /// `container.*_clause` (`p.A` → `A`), so a prefixed entry would
+    /// resolve in the wrong scope or not at all. Every entry is resolved
+    /// through its written span text: the span covers `p.A` whole, the
+    /// first dot splits prefix from leaf, and `prefixed_container` answers
+    /// the imported library's container — matching upstream's element-level
+    /// `NamedType.type` resolution.
     fn ffi_check_clause_entries(&mut self, name: StringId, container: &Container) {
         let name_text = self.strings.resolve(name).to_owned();
         let Some(spans) = self.ffi_clause_spans.get(&name) else {
@@ -1068,51 +1427,274 @@ impl<'a> Engine<'a> {
         };
         let spans = spans.clone();
         // The extends entry: report only when the head is NOT itself an
-        // ffi class (the direct arm consumed that shape).
-        if let Some(span) = spans.extends
-            && let Some(super_name) = container.superclass
-            && !self.ffi_class_spelling(super_name)
-            && self.clause_entry_is_compound(super_name)
-        {
-            let super_text = self.strings.resolve(super_name).to_owned();
-            self.emit(
-                SemanticCode::SubtypeOfStructClassInExtends,
-                span,
-                &name_text,
-                &super_text,
-            );
+        // ffi class (the direct arm consumed that shape). The leaf name
+        // and the FFI-spelling check ride the leaf; the compound walk
+        // resolves the written spelling (a prefixed `p.S` resolves
+        // through the prefix, not the bare scope).
+        if let Some(span) = spans.extends {
+            let text = self.ffi_type_text(span);
+            let (leaf, _) = clause_entry_parts(&text);
+            if let Some(leaf_name) = leaf {
+                let leaf_id = self.strings.intern(leaf_name);
+                if !self.ffi_class_spelling(leaf_id)
+                    && self.clause_entry_text_is_compound(&text)
+                {
+                    self.emit(
+                        SemanticCode::SubtypeOfStructClassInExtends,
+                        span,
+                        &name_text,
+                        leaf_name,
+                    );
+                }
+            }
         }
         let implements = spans
             .implements
             .iter()
             .zip(container.implements_clause.iter());
         for (span, entry) in implements {
-            let text = self.strings.resolve(*entry);
-            if matches!(text, "Allocator" | "Finalizable") {
+            let leaf_text = self.strings.resolve(*entry);
+            if matches!(leaf_text, "Allocator" | "Finalizable") {
                 continue;
             }
-            if self.clause_entry_is_compound(*entry) {
-                let super_text = text.to_owned();
+            let written = self.ffi_type_text(*span);
+            if self.clause_entry_text_is_compound(&written) {
                 self.emit(
                     SemanticCode::SubtypeOfStructClassInImplements,
                     *span,
                     &name_text,
-                    &super_text,
+                    leaf_text,
                 );
             }
         }
-        let withs = spans.withs.iter().zip(container.with_clause.iter());
-        for (span, entry) in withs {
-            if self.clause_entry_is_compound(*entry) {
-                let super_text = self.strings.resolve(*entry).to_owned();
+        // The `with` faces: `spans.withs` is drained before this pass runs
+        // (the modifier-checks drain consumes the buffered clause spans),
+        // so the written entries are recovered by a source walk from the
+        // class name — upstream `visitClassDeclaration`'s `withClause`
+        // walk. The entries' types resolve through the same span-text path
+        // as `implements` (prefixed spellings included).
+        if container.with_clause.is_empty() {
+            return;
+        }
+        for (entry, span) in self.ffi_with_clause_entries(name) {
+            if self.clause_entry_text_is_compound(&entry) {
                 self.emit(
                     SemanticCode::SubtypeOfStructClassInWith,
-                    *span,
+                    span,
                     &name_text,
-                    &super_text,
+                    &entry,
                 );
             }
         }
+    }
+
+    /// The `with` clause's written entries, source-walked from the class
+    /// name span: the comma-separated type spellings between the `with`
+    /// keyword and the body/`implements`/`on` clause that follows.
+    /// `(spelling, span)` per entry — the spelling is the source text
+    /// (`p.S` whole), the span its written range.
+    fn ffi_with_clause_entries(&self, name: StringId) -> Vec<(String, SourceRange)> {
+        let Some(name_span) = self.ffi_container_name_span(name) else {
+            return Vec::new();
+        };
+        let name_start = self.byte_of(name_span.offset);
+        let bytes = self.source.as_bytes();
+        // Walk forward from the class name past the (optional) type
+        // parameters, superclass clause, and any `extends` entry, looking
+        // for the `with` keyword at depth 0 before the body `{`.
+        let mut cursor = name_start + self.strings.resolve(name).len();
+        let mut entries = Vec::new();
+        while cursor < bytes.len() {
+            // Skip whitespace and comments.
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor + 1 < bytes.len()
+                && bytes[cursor] == b'/'
+                && bytes[cursor + 1] == b'/'
+            {
+                while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                    cursor += 1;
+                }
+                continue;
+            }
+            if cursor + 1 < bytes.len()
+                && bytes[cursor] == b'/'
+                && bytes[cursor + 1] == b'*'
+            {
+                cursor += 2;
+                while cursor + 1 < bytes.len()
+                    && !(bytes[cursor] == b'*' && bytes[cursor + 1] == b'/')
+                {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(bytes.len());
+                continue;
+            }
+            if cursor >= bytes.len() {
+                break;
+            }
+            match bytes[cursor] {
+                // The body opens: no `with` clause.
+                b'{' | b';' => return entries,
+                // Type-parameter group.
+                b'<' => {
+                    let Some(close) = matching_close(bytes, cursor, b'<', b'>') else {
+                        return entries;
+                    };
+                    cursor = close + 1;
+                }
+                // `extends` — skip its single entry (the superclass clause
+                // is one type), then continue scanning for `with` or
+                // `implements`.
+                _ if self.source[cursor..].starts_with("extends") => {
+                    cursor += "extends".len();
+                    // Skip the superclass entry (one comma-free type
+                    // spelling: head + optional `<...>`).
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    // The head identifier (possibly prefixed).
+                    while cursor < bytes.len()
+                        && (bytes[cursor].is_ascii_alphanumeric()
+                            || bytes[cursor] == b'_'
+                            || bytes[cursor] == b'$'
+                            || bytes[cursor] == b'.')
+                    {
+                        cursor += 1;
+                    }
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    if cursor < bytes.len() && bytes[cursor] == b'<' {
+                        if let Some(close) = matching_close(bytes, cursor, b'<', b'>') {
+                            cursor = close + 1;
+                        }
+                    }
+                }
+                _ if self.source[cursor..].starts_with("with") => {
+                    cursor += "with".len();
+                    // The comma-separated entries until the body or the
+                    // next clause keyword at depth 0.
+                    let mut entry_start = cursor;
+                    let mut depth = 0i32;
+                    while cursor < bytes.len() {
+                        match bytes[cursor] {
+                            b'<' | b'(' | b'[' => depth += 1,
+                            b'>' | b')' | b']' => depth -= 1,
+                            b',' if depth == 0 => {
+                                let text = self.source[entry_start..cursor].trim();
+                                if !text.is_empty() {
+                                    let lead = entry_start
+                                        + (self.source[entry_start..cursor].len()
+                                            - self.source[entry_start..cursor].trim_start().len());
+                                    let span = SourceRange {
+                                        offset: byte_offset_to_utf16(self.source, lead),
+                                        length: byte_offset_to_utf16(
+                                            self.source,
+                                            lead + text.len(),
+                                        ) - byte_offset_to_utf16(self.source, lead),
+                                    };
+                                    entries.push((text.to_owned(), span));
+                                }
+                                entry_start = cursor + 1;
+                            }
+                            b'{' | b';' if depth == 0 => {
+                                let text = self.source[entry_start..cursor].trim();
+                                if !text.is_empty() {
+                                    let lead = entry_start
+                                        + (self.source[entry_start..cursor].len()
+                                            - self.source[entry_start..cursor].trim_start().len());
+                                    let span = SourceRange {
+                                        offset: byte_offset_to_utf16(self.source, lead),
+                                        length: byte_offset_to_utf16(
+                                            self.source,
+                                            lead + text.len(),
+                                        ) - byte_offset_to_utf16(self.source, lead),
+                                    };
+                                    entries.push((text.to_owned(), span));
+                                }
+                                return entries;
+                            }
+                            // The next clause keyword at depth 0 ends the
+                            // `with` list (`with M implements I` — the
+                            // `implements` tail is not a mixin).
+                            _ if depth == 0
+                                && (self.source[cursor..].starts_with("implements")
+                                    || self.source[cursor..].starts_with("on")) =>
+                            {
+                                let text = self.source[entry_start..cursor].trim();
+                                if !text.is_empty() {
+                                    let lead = entry_start
+                                        + (self.source[entry_start..cursor].len()
+                                            - self.source[entry_start..cursor].trim_start().len());
+                                    let span = SourceRange {
+                                        offset: byte_offset_to_utf16(self.source, lead),
+                                        length: byte_offset_to_utf16(
+                                            self.source,
+                                            lead + text.len(),
+                                        ) - byte_offset_to_utf16(self.source, lead),
+                                    };
+                                    entries.push((text.to_owned(), span));
+                                }
+                                return entries;
+                            }
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+                    return entries;
+                }
+                _ if self.source[cursor..].starts_with("implements")
+                    || self.source[cursor..].starts_with("on") =>
+                {
+                    // A clause keyword ahead of `with` means no `with`
+                    // clause follows.
+                    return entries;
+                }
+                _ => {
+                    cursor += 1;
+                }
+            }
+        }
+        entries
+    }
+
+    /// The written clause-entry spelling resolves to a container whose
+    /// supertype chain reaches an FFI compound or `AbiSpecificInteger`
+    /// — the span-text variant of [`Self::clause_entry_is_compound`] that
+    /// handles prefixed spellings (`p.S` resolves through the import
+    /// prefix, matching upstream's `NamedType.type`).
+    fn clause_entry_text_is_compound(&self, text: &str) -> bool {
+        // Strip the type-argument tail (`S<T>` → `S`) and take the leaf
+        // after the last dot (`p.S` → `S` for the resolution path, `p.S`
+        // for the prefix split).
+        let head = text.trim();
+        let head = head.split('<').next().unwrap_or(head).trim();
+        if head.is_empty() {
+            return false;
+        }
+        let resolved = if let Some((prefix, leaf)) = head.split_once('.') {
+            let prefix_id = self.strings.intern(prefix);
+            let leaf_id = self.strings.intern(leaf);
+            prefixed_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                prefix_id,
+                leaf_id,
+            )
+            .map(|(container, owner)| (leaf_id, container, owner))
+        } else {
+            let name = self.strings.intern(head);
+            self.resolve_container_from(name)
+                .map(|(container, owner)| (name, container, owner))
+        };
+        let Some((leaf_name, container, owner)) = resolved else {
+            return false;
+        };
+        self.chain_reaches_ffi(&[(leaf_name, container, owner)])
     }
 
     /// `InterfaceElement.isEmptyStruct`: no field carries a sized type.
@@ -1172,7 +1754,6 @@ impl<'a> Engine<'a> {
         container: &Container,
         name_span: SourceRange,
     ) {
-        let name_text = self.strings.resolve(name).to_owned();
         // Exactly one member, a const unnamed constructor (upstream
         // `_validateAbiSpecificIntegerAnnotation`; constructors are no
         // `MemberEntry` rows, so the member set must be empty).
@@ -1597,7 +2178,9 @@ impl<'a> Engine<'a> {
 
     /// `_checkFfiNative` over every `@Native`-annotated declaration. The
     /// `container` arm walks the container's own member sites; `None`
-    /// walks the top-level sites.
+    /// walks the top-level sites — plus every member whose container name
+    /// never resolved to a real container entry (the unnamed-extension
+    /// placeholder `""`, whose members live on `ExtensionFace`s).
     fn ffi_check_native_decls(&mut self, container: Option<(StringId, &'a Container)>) {
         let sites: Vec<(usize, DeclSite)> = self
             .decl_sites
@@ -1611,28 +2194,44 @@ impl<'a> Engine<'a> {
                     Some((name, _)),
                 ) => *owner == name,
                 (DeclKind::TopLevelFn | DeclKind::TopLevelVar, None) => true,
+                (DeclKind::Member { container: owner, .. }, None) => self
+                    .index
+                    .get(self.file)
+                    .is_some_and(|elements| elements.container(*owner).is_none()),
                 _ => false,
             })
             .map(|(index, site)| (index, site.clone()))
             .collect();
         for (index, site) in sites.iter() {
-            let native_annos: Vec<FfiDeclAnno> =
+            let mut native_annos: Vec<FfiDeclAnno> =
                 self.ffi_native_annos(*index).into_iter().cloned().collect();
+            // The const-alias arm (upstream reads `element.metadata`'s
+            // computed values, so `@alias` of `const alias = Native<…>()`
+            // counts as a `@Native` annotation — `const_creations` keeps
+            // only bare-creation consts; the RHS face parses like the
+            // written form's).
+            native_annos.extend(self.ffi_const_native_annos(site));
             if native_annos.is_empty() {
                 continue;
             }
-            if native_annos.len() > 1 {
-                for extra in native_annos.iter().skip(1) {
-                    self.emit(
-                        SemanticCode::FfiNativeInvalidMultipleAnnotations,
-                        extra.face.name_span,
-                        "",
-                        "",
-                    );
-                }
+            // Upstream reports the first extra `@Native` and stops
+            // (`_checkFfiNative`'s `break` at :491).
+            if let Some(extra) = native_annos.get(1) {
+                self.emit(
+                    SemanticCode::FfiNativeInvalidMultipleAnnotations,
+                    extra.face.name_span,
+                    "",
+                    "",
+                );
             }
             let mut native_annos = native_annos;
             let anno = native_annos.remove(0);
+            // A bare `@Native` (no argument group) is a malformed
+            // annotation — upstream's `annotation.arguments` gate rejects
+            // it before any decl checks run.
+            if anno.face.args.is_none() {
+                continue;
+            }
             self.ffi_check_native_decl(site, &anno, *index);
         }
     }
@@ -1764,9 +2363,25 @@ impl<'a> Engine<'a> {
                 )
             }
             DeclKind::Member { container, .. } => {
-                let member = elements
+                if let Some(member) = elements
                     .container(*container)
-                    .and_then(|c| c.members.get(&site.name));
+                    .and_then(|c| c.members.get(&site.name))
+                {
+                    return (
+                        member.var_ty,
+                        member.return_ty,
+                        member.formals.as_ref(),
+                    );
+                }
+                // An unnamed extension's members live on its
+                // `ExtensionFace` (collector.rs:1963-1981 — the face owns
+                // the member map outright; the placeholder `container`
+                // name never joins `containers`).
+                let member = elements
+                    .extension_faces()
+                    .iter()
+                    .filter(|face| face.name.is_none())
+                    .find_map(|face| face.members.get(&site.name));
                 (
                     member.map(|m| m.var_ty).unwrap_or(Ty::UNKNOWN),
                     member.map(|m| m.return_ty).unwrap_or(Ty::UNKNOWN),
@@ -1778,7 +2393,14 @@ impl<'a> Engine<'a> {
     }
 
     /// `_checkFfiNativeFunction`: the count, receiver-Pointer, leaf and
-    /// validity faces over the written signature.
+    /// validity faces over the written signature (upstream
+    /// ffi_verifier.dart:641-829).
+    ///
+    /// `ffiParameterTypes` is the flattened VarArgs list (`VarArgs<(A,B)>`
+    /// → `[A,B]`); `ffiParameters` is the raw formal list. Both are sliced
+    /// after the receiver for instance members; the extension-like arm
+    /// slices `ffiParameterTypes` but keeps `ffiParameters` whole because
+    /// the augmented `dartType` already carries a synthetic receiver.
     fn ffi_check_native_function(
         &mut self,
         site: &DeclSite,
@@ -1790,16 +2412,71 @@ impl<'a> Engine<'a> {
         let dart_param_count = formals
             .map(|f| f.positional.len() + f.named.len())
             .unwrap_or(0);
-        let sig_param_count = sig.param_heads.len();
+        let flat_params = ffi_flatten_varargs(&sig.display, self.strings);
         let ret_head = first_ident_head(&sig.display, self);
         if face.is_leaf {
             self.ffi_leaf_check(&ret_head, &sig.param_heads, site.range);
         }
+
+        // The extension-like arm (upstream :669-722): the annotated member
+        // lives on an extension or extension type. The receiver is an
+        // implicit extra parameter — `formalParameters.length + 1` must
+        // equal the flattened ffi count, and the receiver's own Pointer
+        // gate rides the raw first element.
+        let is_extension_like = instance_member && self.ffi_is_extension_member(site);
+        if is_extension_like {
+            if dart_param_count + 1 != flat_params.len() {
+                let (a0, a1) = ((dart_param_count + 1).to_string(), flat_params.len().to_string());
+                self.emit(
+                    SemanticCode::FfiNativeUnexpectedNumberOfParameters,
+                    site.range,
+                    &a0,
+                    &a1,
+                );
+                return;
+            }
+            if flat_params.first() == Some(&self.intern("Pointer"))
+                && !self.ffi_extension_receiver_extends_nfwc(site)
+            {
+                self.emit(
+                    SemanticCode::FfiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer,
+                    site.range,
+                    "",
+                    "",
+                );
+                return;
+            }
+            // Slice the receiver off the flattened list for the
+            // validity/compat face; `ffiParameters` stays whole (the
+            // augmented dart sig carries the synthetic receiver).
+            let sliced = &flat_params[1..];
+            let param_heads: Vec<StringId> = sliced.to_vec();
+            if !self.ffi_valid_native_signature(&ret_head, &param_heads) {
+                self.emit(
+                    SemanticCode::MustBeANativeFunctionType,
+                    site.range,
+                    &sig.display,
+                    "Native",
+                );
+                return;
+            }
+            if !self.ffi_native_compat_sig(site, sig, sliced, true) {
+                self.emit3(
+                    SemanticCode::MustBeASubtype,
+                    site.range,
+                    &sig.display,
+                    "Native",
+                    "",
+                );
+            }
+            return;
+        }
+
         if instance_member {
-            if dart_param_count + 1 != sig_param_count {
+            if dart_param_count + 1 != flat_params.len() {
                 let (a0, a1) = (
                     (dart_param_count + 1).to_string(),
-                    sig_param_count.to_string(),
+                    flat_params.len().to_string(),
                 );
                 self.emit(
                     SemanticCode::FfiNativeUnexpectedNumberOfParametersWithReceiver,
@@ -1811,7 +2488,7 @@ impl<'a> Engine<'a> {
             }
             // The receiver may only be `Pointer` over a
             // `NativeFieldWrapperClass1` subclass.
-            if sig.param_heads.first() == Some(&self.intern("Pointer"))
+            if flat_params.first() == Some(&self.intern("Pointer"))
                 && let DeclKind::Member { container, .. } = &site.kind
                 && let Some(elements) = self.index.get(self.file)
                 && let Some(declaring) = elements.container(*container)
@@ -1825,8 +2502,8 @@ impl<'a> Engine<'a> {
                 );
                 return;
             }
-        } else if dart_param_count != sig_param_count {
-            let (a0, a1) = (sig_param_count.to_string(), dart_param_count.to_string());
+        } else if dart_param_count != flat_params.len() {
+            let (a0, a1) = (flat_params.len().to_string(), dart_param_count.to_string());
             self.emit(
                 SemanticCode::FfiNativeUnexpectedNumberOfParameters,
                 site.range,
@@ -1837,15 +2514,16 @@ impl<'a> Engine<'a> {
         }
         // A Pointer signature parameter needs a Pointer/typed-data/
         // NativeFieldWrapperClass1 formal.
-        let param_offset = usize::from(instance_member);
+        let param_offset = usize::from(instance_member && !is_extension_like);
+        let check_params = &flat_params[param_offset.min(flat_params.len())..];
         if let Some(formals) = formals {
-            for (i, head) in sig.param_heads.iter().enumerate().skip(param_offset) {
+            for (i, head) in check_params.iter().enumerate() {
                 if self.strings.resolve(*head) != "Pointer" {
                     continue;
                 }
                 let formal_ty = formals
                     .positional
-                    .get(i - param_offset)
+                    .get(i)
                     .map(|formal| formal.ty);
                 let ok = match formal_ty {
                     Some(Ty::Named { name, .. }) => {
@@ -1867,7 +2545,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let param_heads: Vec<StringId> = sig.param_heads.to_vec();
+        let param_heads: Vec<StringId> = check_params.to_vec();
         if !self.ffi_valid_native_signature(&ret_head, &param_heads) {
             self.emit(
                 SemanticCode::MustBeANativeFunctionType,
@@ -1875,7 +2553,141 @@ impl<'a> Engine<'a> {
                 &sig.display,
                 "Native",
             );
+            return;
         }
+        // The compat arm (upstream :812-827): the written native signature
+        // must be a subtype of the Dart face (nativeToDart, with
+        // nativeFieldWrappersAsPointer).
+        if !self.ffi_native_compat_sig(site, sig, check_params, false) {
+            self.emit3(
+                SemanticCode::MustBeASubtype,
+                site.range,
+                &sig.display,
+                "Native",
+                "",
+            );
+        }
+    }
+
+    /// The annotated member lives on an extension or extension type (the
+    /// `isExtensionLikeInstanceMember` arm): a `DeclKind::Member` whose
+    /// container is an `ExtensionFace` or `ExtensionType`.
+    fn ffi_is_extension_member(&self, site: &DeclSite) -> bool {
+        let DeclKind::Member { container, .. } = &site.kind else {
+            return false;
+        };
+        let Some(elements) = self.index.get(self.file) else {
+            return false;
+        };
+        // Named extension: `elements.extension_faces` holds a face named
+        // `container`. An unnamed extension's members register under the
+        // empty placeholder name (`push_container_frame` interns `""`) —
+        // their face is found by member ownership, not by name.
+        if elements.container(*container).is_none() {
+            return elements
+                .extension_faces()
+                .iter()
+                .any(|face| {
+                    face.name == Some(*container)
+                        || (face.name.is_none() && face.members.contains_key(&site.name))
+                });
+        }
+        false
+    }
+
+    /// The extension member's receiver type (the `extendedType` of the
+    /// enclosing extension, or the `thisType` of an extension type) reaches
+    /// `NativeFieldWrapperClass1` transitively.
+    fn ffi_extension_receiver_extends_nfwc(&self, site: &DeclSite) -> bool {
+        let DeclKind::Member { container, .. } = &site.kind else {
+            return false;
+        };
+        let Some(elements) = self.index.get(self.file) else {
+            return false;
+        };
+        // The receiver face: a named extension answers by name; an
+        // unnamed extension answers by member ownership.
+        if let Some(face) = elements.extension_faces().iter().find(|face| {
+            face.name == Some(*container)
+                || (face.name.is_none() && face.members.contains_key(&site.name))
+        }) {
+            if let Ty::Named { name, .. } = face.on_ty {
+                return self.ffi_extends_wrapper_by_name(name);
+            }
+            return false;
+        }
+        // Extension type: `thisType` is the container itself.
+        elements
+            .container(*container)
+            .is_some_and(|c| self.ffi_extends_native_field_wrapper(c))
+    }
+
+    /// The `mustBeASubtype` compat face: the written native signature
+    /// (return + flattened param heads, sliced past the receiver) against
+    /// the Dart face (return + formal types, with the receiver prepended
+    /// for extension-like members). Upstream `_validateCompatibleFunctionTypes`
+    /// at the head level: equal positional counts, then per-slot
+    /// `ffi_compatible_native_value`.
+    fn ffi_native_compat_sig(
+        &self,
+        site: &DeclSite,
+        sig: &FfiSigFace,
+        ffi_params: &[StringId],
+        extension_like: bool,
+    ) -> bool {
+        let (_, return_ty, formals) = self.ffi_decl_types(site);
+        let dart_ret = match return_ty {
+            Ty::Named { name, .. } => name,
+            Ty::Void => self.intern("void"),
+            _ => return false,
+        };
+        let dart_params: Vec<StringId> = formals
+            .map(|f| {
+                let mut heads: Vec<StringId> = f
+                    .positional
+                    .iter()
+                    .filter_map(|formal| match formal.ty {
+                        Ty::Named { name, .. } => Some(name),
+                        _ => None,
+                    })
+                    .collect();
+                if extension_like {
+                    // The receiver is the synthetic first slot (upstream
+                    // builds `dartType` with a synthetic receiver
+                    // prepended); its type is the extension's on-type or
+                    // the extension type itself.
+                    let receiver = self.ffi_extension_receiver_head(site);
+                    let mut all = Vec::with_capacity(heads.len() + 1);
+                    all.push(receiver.unwrap_or(StringId::NONE));
+                    all.append(&mut heads);
+                    all
+                } else {
+                    heads
+                }
+            })
+            .unwrap_or_default();
+        let native_ret = first_ident_head(&sig.display, self);
+        self.ffi_compatible_functions(&dart_ret, &dart_params, &native_ret, ffi_params)
+    }
+
+    /// The receiver type head for an extension-like member's `dartType`
+    /// (the extension's `extendedType` or the extension type itself).
+    fn ffi_extension_receiver_head(&self, site: &DeclSite) -> Option<StringId> {
+        let DeclKind::Member { container, .. } = &site.kind else {
+            return None;
+        };
+        let elements = self.index.get(self.file)?;
+        if let Some(face) = elements.extension_faces().iter().find(|face| {
+            face.name == Some(*container)
+                || (face.name.is_none() && face.members.contains_key(&site.name))
+        }) {
+            if let Ty::Named { name, .. } = face.on_ty {
+                return Some(name);
+            }
+            return None;
+        }
+        // Extension type: `thisType` is the container itself.
+        elements.container(*container).map(|_| *container)
     }
 
     /// `NativeFieldWrapperClass1` reachability by container name.
@@ -1885,7 +2697,9 @@ impl<'a> Engine<'a> {
     }
 
     /// `_checkFfiNativeField`: the static posture, the omitted-signature
-    /// inference, and the Handle/NativeFunction rejections.
+    /// inference, the `mustBeASubtype` compat, then the Handle/NativeFunction
+    /// rejections and the `@Array` size annotation (upstream
+    /// ffi_verifier.dart:570-639).
     fn ffi_check_native_field(
         &mut self,
         site: &DeclSite,
@@ -1927,7 +2741,27 @@ impl<'a> Engine<'a> {
             return;
         };
         let native_text = self.strings.resolve(native_head);
-        if matches!(native_text, "Handle" | "NativeFunction") {
+        // The compat arm (upstream :606-623): the Dart field type must be
+        // a subtype-compatible face of the native type (allowFunctions:
+        // true — the nativeFunction arm below reports the more specific
+        // diagnostic for function-typed fields).
+        let compat = self.ffi_compatible_native_value(var_ty, native_head, false);
+        if !compat {
+            let dart_display = self.ffi_render(var_ty);
+            let native_display = self.ffi_render(*native_ty);
+            self.emit3(
+                SemanticCode::MustBeASubtype,
+                site.range,
+                &dart_display,
+                &native_display,
+                "Native",
+            );
+            return;
+        }
+        if native_text == "Array" {
+            // Array native fields need an `@Array` size annotation.
+            self.ffi_validate_size_annotation(site_index, 1, false, site.range);
+        } else if matches!(native_text, "Handle" | "NativeFunction") {
             let display = self.ffi_render(*native_ty);
             self.emit(
                 SemanticCode::NativeFieldInvalidType,
@@ -1935,11 +2769,6 @@ impl<'a> Engine<'a> {
                 &display,
                 "",
             );
-            return;
-        }
-        if native_text == "Array" {
-            // Array native fields need an `@Array` size annotation.
-            self.ffi_validate_size_annotation(site_index, 1, false, site.range);
         }
     }
 
@@ -1968,9 +2797,35 @@ impl<'a> Engine<'a> {
                 .all(|head| self.ffi_valid_native_type(*head, false, true))
     }
 
-    /// `_isValidFfiNativeType` at the head level: native primitives, the
-    /// void/handle gates, and compound/abi subtypes.
-    fn ffi_valid_native_type(&self, head: StringId, allow_void: bool, allow_handle: bool) -> bool {
+    /// `_isValidFfiNativeType` at the head level (upstream
+    /// ffi_verifier.dart:918-984): native primitives, the
+    /// void/handle/empty-struct/Opaque gates, the Pointer arg rule, the
+    /// `isOpaqueSubtype`/`isAbiSpecificIntegerSubtype` walk, and the
+    /// `NativeFunction` recursion.
+    ///
+    /// `allow_array` is only `true` for the `@Native` field face
+    /// (upstream `allowArray` rides the `_checkFfiNativeField` call);
+    /// function signatures never allow `Array` as a parameter type.
+    fn ffi_valid_native_type(
+        &self,
+        head: StringId,
+        allow_void: bool,
+        allow_handle: bool,
+    ) -> bool {
+        self.ffi_valid_native_type_full(head, allow_void, false, false, allow_handle, false)
+    }
+
+    /// The full gate matrix — the `allow_*` parameters mirror upstream's
+    /// named arguments.
+    fn ffi_valid_native_type_full(
+        &self,
+        head: StringId,
+        allow_void: bool,
+        allow_empty_struct: bool,
+        allow_array: bool,
+        allow_handle: bool,
+        allow_opaque: bool,
+    ) -> bool {
         let text = self.strings.resolve(head);
         match text {
             "Void" => allow_void,
@@ -1978,9 +2833,87 @@ impl<'a> Engine<'a> {
             "Dynamic" => false,
             _ if NATIVE_INT_TYPES.contains(&text) => true,
             _ if matches!(text, "Float" | "Double" | "Bool") => true,
-            "Pointer" | "Opaque" => true,
-            _ => self.clause_entry_is_compound(head),
+            "NativeFunction" => {
+                // `NativeFunction<T>` recurses on the written type
+                // argument — the sig display's `<...>` face. At the head
+                // level the argument is not resolvable, so the recursion
+                // reads the element model's type (upstream
+                // `nativeType.typeArguments.single`).
+                self.ffi_native_function_arg_valid(head)
+            }
+            "Pointer" => {
+                // `Pointer<T>` is valid when `T` is itself a valid native
+                // type (void/empty-struct/handle/Opaque allowed), a
+                // compound subtype, or `NativeType` (upstream :945-956).
+                self.ffi_pointer_arg_valid(head, allow_empty_struct)
+            }
+            "Opaque" => allow_opaque,
+            "Array" => allow_array,
+            _ => {
+                // The compound/abi walk: `isCompoundSubtype` needs the
+                // empty-struct gate; `isOpaqueSubtype` and
+                // `isAbiSpecificIntegerSubtype` are unconditional.
+                let Some((container, owner)) = self.resolve_container_from(head) else {
+                    return false;
+                };
+                if self.chain_reaches_ffi(&[(head, container, owner)]) {
+                    if !allow_empty_struct {
+                        // The empty-struct rejection (upstream :959-964):
+                        // a compound subtype whose every field is unsized
+                        // is not a valid native type.
+                        if self.ffi_is_empty_compound(container) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                // `isOpaqueSubtype` / `isAbiSpecificIntegerSubtype`.
+                let text = self.strings.resolve(head);
+                if text == "AbiSpecificInteger" {
+                    return self
+                        .resolve_container_from(head)
+                        .is_some_and(|(_, owner)| self.owner_is_ffi(owner));
+                }
+                // A user class extending `Opaque` is an opaque subtype.
+                if let Some((container, _)) = self.resolve_container_from(head) {
+                    let mut cursor = container;
+                    let mut depth = 0;
+                    while let Some(super_name) = cursor.superclass {
+                        if depth > 16 {
+                            break;
+                        }
+                        depth += 1;
+                        let super_text = self.strings.resolve(super_name);
+                        if super_text == "Opaque" {
+                            return true;
+                        }
+                        let Some((next, _)) = self.resolve_container_from(super_name) else {
+                            break;
+                        };
+                        cursor = next;
+                    }
+                }
+                false
+            }
         }
+    }
+
+    /// `NativeFunction<T>`'s type argument is itself a valid native
+    /// function type — the recursion reads the sig display's `<...>` face
+    /// or the element model's instantiated alias.
+    fn ffi_native_function_arg_valid(&self, _head: StringId) -> bool {
+        // The head-level path can't recover the type argument; the
+        // element-model path resolves it. Conservatively accept (upstream
+        // `_isValidFfiNativeFunctionType` on the type argument).
+        true
+    }
+
+    /// `Pointer<T>`'s type argument is a valid native type, a compound
+    /// subtype, or `NativeType` (upstream :945-956).
+    fn ffi_pointer_arg_valid(&self, _head: StringId, _allow_empty_struct: bool) -> bool {
+        // Head-level can't recover the type argument; the element-model
+        // path resolves it. Conservatively accept.
+        true
     }
 }
 
@@ -2094,7 +3027,10 @@ impl<'a> Engine<'a> {
             .filter(|head| *head != StringId::NONE)
             .and_then(|head| self.ffi_tearoff_type(head));
         if let (Some((dart_ret, dart_params)), Some(f)) = (&dart_fn, invocation.args.first()) {
-            if !self.ffi_compatible_functions(dart_ret, dart_params, &ret_head, &native_params) {
+            // The tear-off compat is `dartToNative` (upstream
+            // `_validateFromFunction` — the Dart callback becomes the
+            // native function).
+            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret_head, &native_params) {
                 let dart_display = self.ffi_render_function(dart_ret, dart_params);
                 // The supertype display is the WRITTEN type argument
                 // (`mustBeASubtype`'s second placeholder keeps the source
@@ -2134,7 +3070,10 @@ impl<'a> Engine<'a> {
             return;
         }
         let exceptional = &invocation.args[1].1;
-        let compatible = self.ffi_compatible_native_value(exceptional.ty, ret_head);
+        // The exceptionalReturn compat is `dartToNative` (upstream
+        // `_validateNativeCallable`'s `_validateCompatibleNativeType` at
+        // :1982 — the Dart exception value becomes the native return).
+        let compatible = self.ffi_compatible_native_value(exceptional.ty, ret_head, true);
         if !compatible {
             let dart_display = self.ffi_render(exceptional.ty);
             let native_display = native_ret_text.clone();
@@ -2146,10 +3085,7 @@ impl<'a> Engine<'a> {
                 callee,
             );
         }
-        if exceptional.invocation_shaped
-            && exceptional.head != StringId::NONE
-            && !self.const_ctor_target(exceptional.head)
-        {
+        if !self.ffi_arg_is_const(exceptional) {
             self.emit(
                 SemanticCode::ArgumentMustBeAConstant,
                 self.ffi_whole_arg_span(exceptional.range),
@@ -2281,8 +3217,7 @@ impl<'a> Engine<'a> {
         // `isLeaf` must be a constant.
         for (name, shape) in &invocation.args {
             if name.is_some_and(|name| self.strings.resolve(name) == "isLeaf")
-                && shape.invocation_shaped
-                && !self.const_ctor_target(shape.head)
+                && !self.ffi_arg_is_const(shape)
             {
                 self.emit(
                     SemanticCode::ArgumentMustBeAConstant,
@@ -2292,45 +3227,115 @@ impl<'a> Engine<'a> {
                 );
             }
         }
-        // The written Dart signature must be subtype-compatible.
+        // The written Dart signature must be subtype-compatible
+        // (upstream `_validateAsFunction`: the Dart `asFunction<T>` type
+        // argument must be a subtype of the native `NativeFunction<S>`'s
+        // signature; `subtype` is the Dart face, `supertype` the native).
         if let Some(written) = self.ffi_type_arg(invocation)
             && let Some((dart_ret, dart_params)) = self.ffi_type_arg_shape(&written)
         {
             if !self.ffi_compatible_functions(&dart_ret, &dart_params, &sig_ret, &sig_params) {
                 let dart_display = self.ffi_render_function(&dart_ret, &dart_params);
                 let native_display = self.ffi_render_function(&sig_ret, &sig_params);
-                let written = written.display.to_string();
                 self.emit3(
                     SemanticCode::MustBeASubtype,
                     invocation.whole,
-                    &written,
                     &dart_display,
+                    &native_display,
                     "asFunction",
                 );
             }
         }
     }
 
-    /// `_validateLookupFunction`'s native-signature face.
+    /// `_validateLookupFunction`'s native-signature face. `lookupFunction`
+    /// writes two type arguments (`<S, F>`): `S` is the native signature,
+    /// `F` the Dart function type — each reports onto its own span.
     fn ffi_check_lookup_function(&mut self, invocation: &FfiInvocation) {
-        let Some(native) = self.ffi_type_arg(invocation) else {
+        let type_args = self.ffi_split_type_args(invocation);
+        let Some((s_text, s_span)) = type_args.first().cloned() else {
             return;
         };
-        let Some((ret, params)) = self.ffi_type_arg_shape(&native) else {
+        // The native signature `S`: a written `R Function(P...)` reads its
+        // heads directly; a bare spelling (an alias or type parameter)
+        // folds through the element model's function shape.
+        let s_head = first_ident_head(&s_text, self);
+        let sig = if s_text.contains("Function") {
+            let params: Vec<StringId> = function_param_heads(&s_text)
+                .into_iter()
+                .map(|h| self.intern(&h))
+                .collect();
+            Some((s_head, params))
+        } else {
+            self.ffi_function_shape(Ty::named(s_head))
+        };
+        let Some((ret, raw_params)) = sig else {
             self.emit(
                 SemanticCode::MustBeANativeFunctionType,
-                native.span,
-                &native.display,
+                s_span,
+                &s_text,
                 "lookupFunction",
             );
             return;
         };
+        // The validity gate (upstream `_isValidFfiNativeFunctionType` over
+        // the signature, `flattenVarArgs` applied — a `VarArgs` survives
+        // only as the last positional field record). The flattened list
+        // is the compat/leaf input too (`normalParameterTypes
+        // .flattenVarArgs()` upstream).
+        let varargs = self.intern("VarArgs");
+        let params = if raw_params.contains(&varargs) {
+            ffi_flatten_varargs(&s_text, self.strings)
+        } else {
+            raw_params
+        };
+        if !self.ffi_valid_native_signature(&ret, &params) {
+            self.emit(
+                SemanticCode::MustBeANativeFunctionType,
+                s_span,
+                &s_text,
+                "lookupFunction",
+            );
+            return;
+        }
+        // The S-vs-F compat arm (upstream `_validateLookupFunction`
+        // :1769-1779): the written `S` (the native signature) must be a
+        // subtype of `F` (the Dart function type).
+        if let Some((f_text, f_span)) = type_args.get(1).cloned() {
+            let f_ret = first_ident_head(&f_text, self);
+            let f_params: Vec<StringId> = function_param_heads(&f_text)
+                .into_iter()
+                .map(|h| self.intern(&h))
+                .collect();
+            if !self.ffi_compatible_functions(&f_ret, &f_params, &ret, &params) {
+                self.emit3(
+                    SemanticCode::MustBeASubtype,
+                    f_span,
+                    &s_text,
+                    &f_text,
+                    "lookupFunction",
+                );
+            }
+        }
         let is_leaf = invocation.args.iter().any(|(name, shape)| {
             name.is_some_and(|name| self.strings.resolve(name) == "isLeaf")
                 && self.ffi_arg_is_true(shape)
         });
         if is_leaf {
             self.ffi_leaf_check(&ret, &params, invocation.head);
+        }
+        // `isLeaf` must be a constant (upstream `_validateIsLeafIsConst`).
+        for (name, shape) in &invocation.args {
+            if name.is_some_and(|name| self.strings.resolve(name) == "isLeaf")
+                && !self.ffi_arg_is_const(shape)
+            {
+                self.emit(
+                    SemanticCode::ArgumentMustBeAConstant,
+                    shape.range,
+                    "isLeaf",
+                    "",
+                );
+            }
         }
     }
 
@@ -2399,6 +3404,42 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The second type argument's written text and span of a
+    /// The written `<S, F>` type-argument group's per-argument faces:
+    /// [`FfiTypeArg`] captures the whole inner text as one face (the head
+    /// is the first identifier), so `lookupFunction<S, F>`'s `S`/`F` split
+    /// re-derives here — each top-level comma-separated run's text plus
+    /// its own source span (the anchors `mustBeANativeFunctionType` and
+    /// `mustBeASubtype` write onto).
+    fn ffi_split_type_args(&self, invocation: &FfiInvocation) -> Vec<(String, SourceRange)> {
+        let Some(native) = invocation.type_arg.as_ref() else {
+            return Vec::new();
+        };
+        let base = self.byte_of(native.span.offset);
+        split_top_level(&native.display, b',')
+            .into_iter()
+            .filter_map(|(off, len)| {
+                let run = native.display.get(off..off + len)?.trim();
+                if run.is_empty() {
+                    return None;
+                }
+                // The run's own span: its trimmed start through end in the
+                // source (the `display` bytes mirror `span`'s source run).
+                let lead = len - native.display.get(off..off + len)?.trim_start().len();
+                let start = base + off + lead;
+                let end = start + run.len();
+                Some((
+                    run.to_owned(),
+                    SourceRange {
+                        offset: byte_offset_to_utf16(self.source, start),
+                        length: byte_offset_to_utf16(self.source, end)
+                            .saturating_sub(byte_offset_to_utf16(self.source, start)),
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// The written bare-`true` posture: the argument's source text is the
     /// `true` literal (`isLeaf: true` — a literal, so its captured head is
     /// unset and the answer reads the bytes).
@@ -2410,8 +3451,65 @@ impl<'a> Engine<'a> {
             .is_some_and(|text| text.trim() == "true")
     }
 
+    /// `_isConst` at the head level (upstream ffi_verifier.dart:842-845 —
+    /// `expr.computeConstantValue()?.value != null`): a literal or
+    /// `const`-prefixed expression, an identifier bound to a const
+    /// declaration, or a const-constructor creation. A local variable,
+    /// parameter, or compound expression is never const.
+    fn ffi_arg_is_const(&self, shape: &FfiArgShape) -> bool {
+        let start = self.byte_of(shape.range.offset);
+        let end = self.byte_of(shape.range.end()).min(self.source.len());
+        let Some(text) = self.source.get(start..end) else {
+            return false;
+        };
+        let text = text.trim();
+        if text.starts_with("const") {
+            return true;
+        }
+        if shape.invocation_shaped {
+            return shape.head != StringId::NONE && self.const_ctor_target(shape.head);
+        }
+        // A bare identifier: const only when it names a `const`
+        // declaration. `decl()` keeps the var's const bit in `var_ty`'s
+        // face? — the const flag rides the `DeclSite`'s annotations-free
+        // path; the source check before the name covers `const`/`final`
+        // (a `final` local is not a compile-time constant upstream —
+        // `computeConstantValue` answers null for it — so only `const`
+        // qualifies).
+        let is_ident = !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        if is_ident {
+            let name = self.strings.intern(text);
+            return self.decl_sites.iter().any(|site| {
+                if site.name != name || !matches!(site.kind, DeclKind::TopLevelVar) {
+                    return false;
+                }
+                // Source-walk back from the declaring name for `const`.
+                let decl_start = self.byte_of(site.range.offset);
+                self.source[..decl_start]
+                    .rsplit(|c: char| c.is_alphanumeric() || c == '_')
+                    .next()
+                    .is_some_and(|prev| prev == "const")
+            });
+        }
+        // Literals and other non-identifier expressions compute a constant
+        // only in the literal forms — numbers, strings, `true`/`false`,
+        // `null`, and sign-prefixed numerics. Everything else (operators,
+        // conditionals, calls) is not.
+        matches!(text, "true" | "false" | "null")
+            || text.chars().next().is_some_and(|c| {
+                c.is_ascii_digit() || c == '"' || c == '\''
+            })
+            || (text.starts_with('-') || text.starts_with('+'))
+                && text[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+    }
+
     /// `_validateNativeAddressOf`: the argument must name a `@Native`
-    /// declaration.
+    /// declaration, and its inferred native type must match the
+    /// `NativeFunction<T>` type argument (upstream
+    /// ffi_verifier.dart:1788-1911).
     fn ffi_check_address_of(&mut self, invocation: &FfiInvocation) {
         // The receiver must be the FFI `Native` class.
         let Ty::Named { name: recv, .. } = invocation.recv_ty else {
@@ -2423,6 +3521,25 @@ impl<'a> Engine<'a> {
         let Some((_, shape)) = invocation.args.first() else {
             return;
         };
+        // A non-identifier argument (lambda, non-constant expression) is
+        // not a `@Native` reference — upstream `referencedElement == null`
+        // → `argumentMustBeNative`.
+        let arg_text = self
+            .source
+            .get(
+                self.byte_of(shape.range.offset)
+                    ..self.byte_of(shape.range.end()).min(self.source.len()),
+            )
+            .unwrap_or_default();
+        let is_identifier = arg_text
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            && !arg_text.trim().is_empty();
+        if !is_identifier {
+            self.emit(SemanticCode::ArgumentMustBeNative, shape.range, "", "");
+            return;
+        }
         let target = if shape.head == StringId::NONE {
             match shape.ty {
                 Ty::Named { name, .. } => name,
@@ -2437,24 +3554,195 @@ impl<'a> Engine<'a> {
             .any(|site| site.name == target && site.annotations.contains(&self.intern("Native")));
         if !annotated {
             self.emit(SemanticCode::ArgumentMustBeNative, shape.range, "", "");
+            return;
+        }
+        // The `NativeFunction<T>` compat arm (upstream :1821-1833): the
+        // `@Native` annotation's written type must equal the
+        // `NativeFunction<T>` type argument's function type.
+        if let Some(native) = self.ffi_type_arg(invocation)
+            && self.strings.resolve(native.head) == "NativeFunction"
+        {
+            // The target's `@Native` annotation's written signature.
+            let annotated_sig = self
+                .decl_sites
+                .iter()
+                .position(|site| site.name == target)
+                .and_then(|index| {
+                    self.ffi_native_annos(index).first().and_then(|anno| {
+                        anno.face
+                            .sig
+                            .as_ref()
+                            .map(|sig| (sig.display.clone(), sig.ret_head, sig.param_heads.clone()))
+                    })
+                });
+            if let Some((_, a_ret, a_params)) = annotated_sig
+                && let Some((t_ret, t_params)) = self.ffi_type_arg_shape(&native)
+                && (t_ret != a_ret || *t_params != *a_params)
+            {
+                self.emit(
+                    SemanticCode::MustBeASubtype,
+                    invocation.head,
+                    &self.ffi_render_function(&a_ret, &a_params),
+                    &self.ffi_render_function(&t_ret, &t_params),
+                );
+            }
         }
     }
 
-    /// `_validateNativeCallable`'s listener arm: the signature must return
-    /// `void`.
-    fn ffi_check_native_callable_listener(&mut self, invocation: &FfiInvocation) {
-        let Some(native) = self.ffi_type_arg(invocation) else {
-            return;
+    /// The `ConstructorName` span of a named-selector creation
+    /// (`NativeCallable<T>.listener`): `invocation.head` carries the class
+    /// head only, so the name's `.selector` tail is source-walked — the
+    /// optional `<…>` group, the `.`, and the selector identifier (upstream
+    /// `node.constructorName`, which anchors `mustBeANativeFunctionType`
+    /// and `missingExceptionValue` on `NativeCallable`). Falls back to the
+    /// head when no selector reads.
+    fn ffi_constructor_name_span(&self, invocation: &FfiInvocation) -> SourceRange {
+        let head = invocation.head;
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(head.end());
+        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'<') {
+            let Some(close) = matching_close(bytes, cursor, b'<', b'>') else {
+                return head;
+            };
+            cursor = close + 1;
+            while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+                cursor += 1;
+            }
+        }
+        if bytes.get(cursor) != Some(&b'.') {
+            return head;
+        }
+        let mut end = cursor + 1;
+        while bytes
+            .get(end)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+        {
+            end += 1;
+        }
+        if end == cursor + 1 {
+            return head;
+        }
+        SourceRange {
+            offset: head.offset,
+            length: byte_offset_to_utf16(self.source, end).saturating_sub(head.offset),
+        }
+    }
+
+    /// A named argument's whole span (`exceptionalReturn: 4`): the fold's
+    /// argument range carries the value expression only, so the `name :`
+    /// prefix is walked back — upstream `.at(arguments[i])` on the
+    /// `NamedExpression` anchors `invalidExceptionValue`. Falls back to the
+    /// value range when no `name :` reads.
+    fn ffi_named_arg_span(&self, invocation: &FfiInvocation, index: usize) -> SourceRange {
+        let Some((Some(name), shape)) = invocation.args.get(index) else {
+            return invocation
+                .args
+                .get(index)
+                .map(|(_, shape)| shape.range)
+                .unwrap_or(invocation.head);
         };
-        let Some((ret, _)) = self.ffi_type_arg_shape(&native) else {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(shape.range.offset);
+        // Walk back over the `:` and whitespace to the name's start.
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b':' {
+            return shape.range;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let name_text = self.strings.resolve(*name);
+        let name_len = name_text.len();
+        if cursor >= name_len && &self.source[cursor - name_len..cursor] == name_text {
+            cursor -= name_len;
+            SourceRange {
+                offset: byte_offset_to_utf16(self.source, cursor),
+                length: shape.range.end().saturating_sub(byte_offset_to_utf16(self.source, cursor)),
+            }
+        } else {
+            shape.range
+        }
+    }
+
+    /// `_validateNativeCallable`'s shared head (upstream
+    /// ffi_verifier.dart:1915-1939): the argument-count gate plus the
+    /// type-argument validity gate. `mustBeANativeFunctionType` anchors at
+    /// `node.constructorName`; a missing type argument renders as
+    /// `Function` (the oracle's inferred `T` face). Returns the
+    /// signature's `(return head, parameter heads)` when valid.
+    fn ffi_native_callable_signature(
+        &mut self,
+        invocation: &FfiInvocation,
+        isolate_local: bool,
+    ) -> Option<(StringId, Vec<StringId>)> {
+        let arg_count = invocation.args.len();
+        if !(arg_count == 1 || (isolate_local && arg_count == 2)) {
+            return None;
+        }
+        let native = self.ffi_type_arg(invocation);
+        let shape = native
+            .as_ref()
+            .and_then(|native| self.ffi_type_arg_shape(native));
+        let valid = shape
+            .as_ref()
+            .is_some_and(|(ret, params)| self.ffi_valid_native_signature(ret, params));
+        if !valid {
+            let display = native
+                .as_ref()
+                .map(|native| native.display.to_string())
+                .unwrap_or_else(|| "Function".to_string());
+            let at = self.ffi_constructor_name_span(invocation);
             self.emit(
                 SemanticCode::MustBeANativeFunctionType,
-                native.span,
-                &native.display,
+                at,
+                &display,
                 "NativeCallable",
             );
+            return None;
+        }
+        shape
+    }
+
+    /// `_validateNativeCallable`'s listener arm (upstream
+    /// ffi_verifier.dart:1941-1958, :2005-2011): the Dart callback must be
+    /// `dartToNative`-compatible, and the native signature must return
+    /// `Void`.
+    fn ffi_check_native_callable_listener(&mut self, invocation: &FfiInvocation) {
+        let Some((ret, params)) = self.ffi_native_callable_signature(invocation, false) else {
             return;
         };
+        // The Dart callback's tear-off compat (dartToNative).
+        let dart_fn = invocation
+            .args
+            .first()
+            .map(|(_, shape)| shape.head)
+            .filter(|head| *head != StringId::NONE)
+            .and_then(|head| self.ffi_tearoff_type(head));
+        if let (Some((dart_ret, dart_params)), Some((_, shape))) =
+            (&dart_fn, invocation.args.first())
+        {
+            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret, &params) {
+                let dart_display = self.ffi_render_function(dart_ret, dart_params);
+                let written = self
+                    .ffi_type_arg(invocation)
+                    .map(|native| native.display.to_string())
+                    .unwrap_or_default();
+                self.emit3(
+                    SemanticCode::MustBeASubtype,
+                    shape.range,
+                    &dart_display,
+                    &written,
+                    "NativeCallable",
+                );
+                return;
+            }
+        }
         if self.strings.resolve(ret) != "Void" {
             let display = self.ffi_render(ret_ty(ret));
             let Some((_, shape)) = invocation.args.first() else {
@@ -2464,20 +3752,112 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// `isolateLocal`'s exception-value faces (the fromFunction shape).
+    /// `_validateNativeCallable`'s isolateLocal arm (upstream
+    /// ffi_verifier.dart:1960-2004): the Dart callback must be
+    /// `dartToNative`-compatible, then the exception-value faces decide on
+    /// the native return's void/pointer/compound shape.
     fn ffi_check_native_callable_isolate_local(&mut self, invocation: &FfiInvocation) {
-        if invocation.args.is_empty() || invocation.args.len() > 2 {
+        let Some((ret, params)) = self.ffi_native_callable_signature(invocation, true) else {
+            return;
+        };
+        // The Dart callback's tear-off compat (dartToNative); a mismatch
+        // reports `mustBeASubtype` at the callback and ends the check.
+        let dart_fn = invocation
+            .args
+            .first()
+            .map(|(_, shape)| shape.head)
+            .filter(|head| *head != StringId::NONE)
+            .and_then(|head| self.ffi_tearoff_type(head));
+        if let (Some((dart_ret, dart_params)), Some((_, shape))) =
+            (&dart_fn, invocation.args.first())
+        {
+            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret, &params) {
+                let dart_display = self.ffi_render_function(dart_ret, dart_params);
+                let written = self
+                    .ffi_type_arg(invocation)
+                    .map(|native| native.display.to_string())
+                    .unwrap_or_default();
+                self.emit3(
+                    SemanticCode::MustBeASubtype,
+                    shape.range,
+                    &dart_display,
+                    &written,
+                    "NativeCallable",
+                );
+                return;
+            }
+        }
+        let ret_text = self.strings.resolve(ret).to_owned();
+        let void_like = ret_text == "Void"
+            || ret_text == "Pointer"
+            || ret_text == "Handle"
+            || self.clause_entry_is_compound(ret);
+        if void_like {
+            if invocation.args.len() == 2 {
+                let at = self.ffi_named_arg_span(invocation, 1);
+                self.emit(
+                    SemanticCode::InvalidExceptionValue,
+                    at,
+                    "isolateLocal",
+                    "",
+                );
+            }
             return;
         }
-        self.ffi_check_from_function(invocation, "isolateLocal");
+        if invocation.args.len() == 1 {
+            self.emit(
+                SemanticCode::MissingExceptionValue,
+                invocation.whole,
+                "isolateLocal",
+                "",
+            );
+            return;
+        }
+        let exceptional = &invocation.args[1].1;
+        // The exceptionalReturn compat is `dartToNative` (upstream :1982).
+        if !self.ffi_compatible_native_value(exceptional.ty, ret, true) {
+            let dart_display = self.ffi_render(exceptional.ty);
+            self.emit3(
+                SemanticCode::MustBeASubtype,
+                exceptional.range,
+                &dart_display,
+                &ret_text,
+                "isolateLocal",
+            );
+        }
+        if !self.ffi_arg_is_const(exceptional) {
+            self.emit(
+                SemanticCode::ArgumentMustBeAConstant,
+                exceptional.range,
+                "exceptionalReturn",
+                "",
+            );
+        }
     }
 
     /// A generative creation of a compound subtype (upstream
     /// `visitInstanceCreationExpression`: only factory creations are
     /// legal — a factory target never reaches this capture, which keys on
-    /// the written head).
+    /// the written head). The gate is the DIRECT supertype: the created
+    /// class's declared superclass must be `Struct` or `Union`
+    /// (`class_.isStructSubclass || class_.isUnionSubclass`), not a
+    /// transitive compound reach.
     fn ffi_check_compound_creation(&mut self, invocation: &FfiInvocation) {
-        if !self.clause_entry_is_compound(invocation.callee) {
+        let Some((container, _)) = self.resolve_container_from(invocation.callee) else {
+            return;
+        };
+        let Some(super_name) = container.superclass else {
+            return;
+        };
+        let super_text = self.strings.resolve(super_name);
+        if !matches!(super_text, "Struct" | "Union") {
+            return;
+        }
+        // The supertype must resolve into `dart:ffi`.
+        if !self
+            .resolve_container_from(super_name)
+            .is_some_and(|(_, owner)| self.owner_is_ffi(owner))
+        {
             return;
         }
         self.emit(
@@ -2536,24 +3916,40 @@ impl<'a> Engine<'a> {
     }
 
     /// The invocation's callee resolves to a `@Native(isLeaf: true)`
-    /// declaration (upstream `isNativeLeafInvocation`).
+    /// declaration (upstream `isNativeLeafInvocation` — the const-alias
+    /// arm included: the resolved annotation's `isLeaf` field, not the
+    /// written name's).
     fn ffi_invocation_is_leaf(&self, invocation: &FfiInvocation) -> bool {
         self.decl_sites.iter().any(|site| {
-            site.name == invocation.callee
-                && site.annotations.contains(&self.intern("Native"))
+            if site.name != invocation.callee {
+                return false;
+            }
+            let written = site.annotations.contains(&self.intern("Native"))
                 && self.ffi_decl_annos.values().flatten().any(|anno| {
                     anno.name == self.intern("Native")
                         && anno.face.is_leaf
                         && anno.at.offset < site.range.offset
                         && site.range.offset - anno.at.offset < 512
-                })
+                });
+            if written {
+                return true;
+            }
+            // The const-alias leaf: a `@alias` before the site whose RHS
+            // is `Native<…>(isLeaf: true)` — the same expansion
+            // `ffi_const_native_annos` runs, read only for its leaf bit.
+            self.ffi_const_native_annos(site)
+                .iter()
+                .any(|anno| anno.face.is_leaf)
         })
     }
 
     // —— the library directive ————————————————————————————————————————
 
     /// `_visitLibraryDirective`: at most one `@DefaultAsset` annotation
-    /// attaches to the library.
+    /// attaches to the library. The chain walk skips `//` and `/* */`
+    /// comments between the annotation and `library` (upstream
+    /// `visitLibraryDirective` sees the resolved AST, comments never
+    /// reach it).
     fn ffi_check_library_default_asset(&mut self) {
         let needle = "@DefaultAsset";
         let bytes = self.source.as_bytes();
@@ -2573,12 +3969,34 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
-            // The annotation chain after this occurrence walks the
-            // sibling annotations (`@DefaultAsset('a') @DefaultAsset('b')
-            // library;` — every chain member attaches); a chain ending at
-            // any other token is a declaration's annotation.
-            while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
-                cursor += 1;
+            // Skip whitespace and comments after the annotation.
+            while cursor < bytes.len() {
+                while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+                    cursor += 1;
+                }
+                if cursor + 1 < bytes.len()
+                    && bytes[cursor] == b'/'
+                    && bytes[cursor + 1] == b'/'
+                {
+                    while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                        cursor += 1;
+                    }
+                    continue;
+                }
+                if cursor + 1 < bytes.len()
+                    && bytes[cursor] == b'/'
+                    && bytes[cursor + 1] == b'*'
+                {
+                    cursor += 2;
+                    while cursor + 1 < bytes.len()
+                        && !(bytes[cursor] == b'*' && bytes[cursor + 1] == b'/')
+                    {
+                        cursor += 1;
+                    }
+                    cursor = (cursor + 2).min(bytes.len());
+                    continue;
+                }
+                break;
             }
             if bytes.get(cursor) == Some(&b'(')
                 && let Some(close) = matching_close(bytes, cursor, b'(', b')')
@@ -2590,14 +4008,39 @@ impl<'a> Engine<'a> {
                 while bytes.get(chain).is_some_and(|b| b.is_ascii_whitespace()) {
                     chain += 1;
                 }
+                // Skip comments inside the annotation chain.
+                if chain + 1 < bytes.len()
+                    && bytes[chain] == b'/'
+                    && bytes[chain + 1] == b'/'
+                {
+                    while chain < bytes.len() && bytes[chain] != b'\n' {
+                        chain += 1;
+                    }
+                    continue;
+                }
+                if chain + 1 < bytes.len()
+                    && bytes[chain] == b'/'
+                    && bytes[chain + 1] == b'*'
+                {
+                    chain += 2;
+                    while chain + 1 < bytes.len()
+                        && !(bytes[chain] == b'*' && bytes[chain + 1] == b'/')
+                    {
+                        chain += 1;
+                    }
+                    chain = (chain + 2).min(bytes.len());
+                    continue;
+                }
                 if bytes.get(chain) == Some(&b'@') {
                     chain += 1;
+                    let name_start = chain;
                     while bytes
                         .get(chain)
                         .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
                     {
                         chain += 1;
                     }
+                    let name_end = chain;
                     while bytes.get(chain).is_some_and(|b| b.is_ascii_whitespace()) {
                         chain += 1;
                     }
@@ -2605,6 +4048,28 @@ impl<'a> Engine<'a> {
                         && let Some(close) = matching_close(bytes, chain, b'(', b')')
                     {
                         chain = close + 1;
+                    }
+                    // A chained `@alias` whose const RHS spells
+                    // `DefaultAsset(…)` is a second `@DefaultAsset` —
+                    // upstream's resolved metadata carries the class
+                    // name, not the alias's.
+                    let alias = &self.source[name_start..name_end];
+                    if alias != "DefaultAsset" {
+                        seen += usize::from(
+                            self.ffi_const_alias_is(alias, "DefaultAsset"),
+                        );
+                        if seen > 1 {
+                            let offset = byte_offset_to_utf16(self.source, name_start);
+                            self.emit(
+                                SemanticCode::FfiNativeInvalidDuplicateDefaultAsset,
+                                SourceRange {
+                                    offset,
+                                    length: (name_end - name_start) as u32,
+                                },
+                                "",
+                                "",
+                            );
+                        }
                     }
                     continue;
                 }
@@ -2627,6 +4092,54 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    /// The map-literal entries of a top-level `const` whose RHS is one
+    /// `{k: v(), …}` literal — each entry's VALUE type head in source
+    /// order (the `AbiSpecificIntegerMapping(const)` arm's entries).
+    fn ffi_const_map_entries(&self, alias: &str) -> Option<Vec<String>> {
+        let alias_id = self.strings.intern(alias);
+        let const_site = self
+            .decl_sites
+            .iter()
+            .find(|s| s.name == alias_id && matches!(s.kind, DeclKind::TopLevelVar))?;
+        let decl_start = self.byte_of(const_site.range.offset);
+        let tail = &self.source[decl_start..];
+        let open = tail.find('{')?;
+        let close = matching_close(tail.as_bytes(), open, b'{', b'}')?;
+        let mut values = Vec::new();
+        for (rel, len) in split_top_level(&tail[open + 1..close], b',') {
+            let entry = &tail[open + 1 + rel..open + 1 + rel + len];
+            let Some(colon) = top_level_colon(entry) else {
+                continue;
+            };
+            let value = entry[colon + 1..].trim();
+            let Some((s, e)) = first_ident(value) else {
+                continue;
+            };
+            values.push(value[s..e].to_owned());
+        }
+        Some(values)
+    }
+
+    /// Whether `alias` is a top-level `const` whose RHS spells
+    /// `class_name(…)` — the const-alias resolution shared by the
+    /// `DefaultAsset` chain walk.
+    fn ffi_const_alias_is(&self, alias: &str, class_name: &str) -> bool {
+        let alias_id = self.strings.intern(alias);
+        let Some(const_site) = self
+            .decl_sites
+            .iter()
+            .find(|s| s.name == alias_id && matches!(s.kind, DeclKind::TopLevelVar))
+        else {
+            return false;
+        };
+        let decl_start = self.byte_of(const_site.range.offset);
+        let tail = &self.source[decl_start..];
+        let Some(eq) = tail.find('=') else {
+            return false;
+        };
+        tail[eq + 1..].trim_start().starts_with(class_name)
     }
 
     // —— shared decision helpers ——————————————————————————————————————
@@ -2709,47 +4222,142 @@ impl<'a> Engine<'a> {
         if dart_params.len() != native_params.len() {
             return false;
         }
-        if !self.ffi_compatible_native_value(Ty::named(*dart_ret), *native_ret) {
+        // The return direction is `nativeToDart` (the native return value
+        // becomes the Dart value); the parameter direction reverses
+        // (`dartToNative` — the Dart argument becomes the native value).
+        if !self.ffi_compatible_native_value(Ty::named(*dart_ret), *native_ret, false) {
             return false;
         }
         dart_params
             .iter()
             .zip(native_params.iter())
             .all(|(dart, native)| {
-                // The parameter direction reverses: the native type must
-                // accept the Dart value.
-                self.ffi_compatible_native_value(Ty::named(*dart), *native)
+                self.ffi_compatible_native_value(Ty::named(*dart), *native, true)
+            })
+    }
+
+    /// The `dartToNative` mirror of `ffi_compatible_functions` (upstream
+    /// `_FfiTypeCheckDirection.dartToNative` at :1945/:1670/:1983): the
+    /// Dart face is the callback the native signature must accept — the
+    /// return maps `dartToNative`, the params `nativeToDart`
+    /// (`direction.reverse`).
+    fn ffi_compatible_functions_d2n(
+        &self,
+        dart_ret: &StringId,
+        dart_params: &[StringId],
+        native_ret: &StringId,
+        native_params: &[StringId],
+    ) -> bool {
+        if dart_params.len() != native_params.len() {
+            return false;
+        }
+        if !self.ffi_compatible_native_value(Ty::named(*dart_ret), *native_ret, true) {
+            return false;
+        }
+        dart_params
+            .iter()
+            .zip(native_params.iter())
+            .all(|(dart, native)| {
+                self.ffi_compatible_native_value(Ty::named(*dart), *native, false)
             })
     }
 
     /// `_validateCompatibleNativeType` at the head level (nativeToDart):
-    /// the native class maps onto the Dart face.
-    fn ffi_compatible_native_value(&self, dart_ty: Ty, native_head: StringId) -> bool {
+    /// the native class maps onto the Dart face (upstream
+    /// ffi_verifier.dart:1431-1490).
+    ///
+    /// `direction` mirrors upstream's `_FfiTypeCheckDirection` — `true` for
+    /// `dartToNative` (the Dart value is the source), `false` for
+    /// `nativeToDart` (the Dart value is the target). The void arm is
+    /// direction-sensitive: a Dart `void` accepts only `Void` in
+    /// `dartToNative`, any native void in `nativeToDart`.
+    fn ffi_compatible_native_value(
+        &self,
+        dart_ty: Ty,
+        native_head: StringId,
+        dart_to_native: bool,
+    ) -> bool {
         let native_text = self.strings.resolve(native_head);
         let dart_head = match dart_ty {
             Ty::Named { name, .. } => self.strings.resolve(name).to_owned(),
             Ty::Void => "void".to_owned(),
             _ => return false,
         };
+        // The primitive native faces first (upstream :1439-1453).
         if NATIVE_INT_TYPES.contains(&native_text) {
             return dart_head == "int";
         }
         match native_text {
             "Float" | "Double" => dart_head == "double",
             "Bool" => dart_head == "bool",
-            "Void" => dart_head == "void",
-            "Handle" => true,
-            "Pointer" | "Array" => {
-                dart_head == native_text
-                    || self.clause_entry_is_compound(match dart_ty {
-                        Ty::Named { name, .. } => name,
-                        _ => StringId::NONE,
-                    })
+            "Void" => {
+                if dart_head == "void" {
+                    return true;
+                }
+                // nativeToDart: a Dart `void` accepts any native type
+                // (upstream :1449-1450 — `direction == dartToNative ||
+                // dartType is VoidType`).
+                !dart_to_native
             }
-            _ => self.clause_entry_is_compound(match dart_ty {
-                Ty::Named { name, .. } => name,
-                _ => StringId::NONE,
-            }),
+            "Handle" => true,
+            _ => {
+                // Dart `void` + a non-void native: only `nativeToDart`
+                // permits it (upstream :1451-1453 — `dartType is VoidType`
+                // → `nativeReturnType == void_`).
+                if dart_head == "void" {
+                    return !dart_to_native;
+                }
+                // The interface-type arm (upstream :1457-1473): NFWC1
+                // subclasses as Pointer, typed-data, and the
+                // direction-sensitive subtype approximation.
+                let dart_named = match dart_ty {
+                    Ty::Named { name, .. } => name,
+                    _ => StringId::NONE,
+                };
+                if self.ffi_extends_wrapper_by_name(dart_named) {
+                    // `NativeFieldWrapperClass1` subclasses map to
+                    // `Pointer<Void>` (upstream :1459-1465).
+                    return native_text == "Pointer";
+                }
+                // Typed data (upstream `_isValidTypedData`): the Dart
+                // side is a typed-data class and the native side is its
+                // element type.
+                if self.ffi_is_typed_data(dart_named, native_head) {
+                    return true;
+                }
+                // The fallback: both sides are interface types — the
+                // direction-sensitive subtype approximation. At the head
+                // level, same-head or compound-subtype reach.
+                if dart_head == native_text {
+                    return true;
+                }
+                if dart_to_native {
+                    self.clause_entry_is_compound(dart_named)
+                } else {
+                    self.clause_entry_is_compound(native_head)
+                }
+            }
+        }
+    }
+
+    /// `_isValidTypedData` at the head level: `Float`→`Float32List`,
+    /// `Double`→`Float64List`, `IntN`/`UintN`/`IntPtr`→`IntNList`/`UintNList`.
+    fn ffi_is_typed_data(&self, dart_head: StringId, native_head: StringId) -> bool {
+        let dart = self.strings.resolve(dart_head);
+        let native = self.strings.resolve(native_head);
+        match (native, dart) {
+            ("Float", "Float32List") => true,
+            ("Double", "Float64List") => true,
+            _ => {
+                // `Int8`→`Int8List`, `Uint16`→`Uint16List`, `IntPtr`→`IntPtrList`.
+                if let Some(list) = dart.strip_suffix("List") {
+                    list == native
+                        && (NATIVE_INT_TYPES.contains(&native)
+                            || matches!(native, "IntPtr"))
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -2774,3 +4382,7 @@ impl FfiInvocation {
         self.head
     }
 }
+
+#[cfg(test)]
+#[path = "ticket_3155_tests.rs"]
+mod ticket_3155_tests;
