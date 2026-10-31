@@ -595,39 +595,101 @@ impl<'a> Engine<'a> {
     }
 
     /// The dead-coalesce operand's never-null verdict
-    /// (`_checkForDeadNullCoalesce`'s operand face): the row's own type,
-    /// widened to the nullable face when a `?.` merge stands at the row's
-    /// offset (`x?.f ?? d` keeps the null union the merge could not join —
-    /// the same member-offset latch `null_comparison`'s operand face
-    /// re-arms), and the send's RESULT for an invoked operand (`a.b() ?? c`
-    /// reads `b`'s declared return — the row keeps the callee's declared
-    /// type, never the send's; the same shape `initializer_static_ty`'s
-    /// Invoke arm answers). A type-parameter send result suppresses the
-    /// verdict — the written name carries no bound (`null_comparison`'s
-    /// posture), so `m[key(e)] ?? d`'s generic key send never anchors the
-    /// dead face.
-    fn coalesce_operand_never_null(&self, row: &Row) -> bool {
-        if self.null_aware_members.contains(&row.range.offset) {
-            return Self::nullable_form(row.ty).is_strictly_non_nullable();
+    /// (`_checkForDeadNullCoalesce`'s operand face, error_verifier.dart
+    /// :4733-4739): the operand's static type as the oracle reads it —
+    /// `node.leftOperand.staticType` for `??`, the target's
+    /// `ReadResolutionImpl.type` for `??=`.
+    ///
+    /// The type is a leading-dot shorthand's context-type member
+    /// ([`Self::dot_shorthand_ty`]) or the operand's re-derived static type
+    /// (a member's declared accessor type, a type literal's `Type`, an
+    /// invoked callee's declared return, a bare read's declared face —
+    /// `Self::operand_static_ty`).
+    ///
+    /// `widen_null_aware` is the `??` face's reading: the operand's
+    /// `staticType` carries the null-aware join the member merge could not
+    /// spell (`c?.m1 ?? d` reads `double?` and stays silent). The `??=`
+    /// face reads the target's read RESOLUTION, which is the access's own
+    /// type WITHOUT that join (`c?.m1 ??= 42` reports over a non-nullable
+    /// `m1`: the official `visitIfNullAssignment` reads `target.read`).
+    ///
+    /// An invalid-typed operand suspends the verdict (the official
+    /// `isStrictlyNonNullable(InvalidType)` answers nothing — an undefined
+    /// class's field never anchors the dead face), a type parameter decides
+    /// through its written bound ([`Self::strictly_non_nullable`]), and a
+    /// `super` receiver's read is never null (the official AST arm).
+    ///
+    /// The flow-promoted face (`if (a is Object) a ?? c`, `x ??= 1; x ??= 2`)
+    /// is NOT read here: the promotion table only materializes at the
+    /// teardown join (`PromotionStaging` — the same feed the deferred
+    /// `unnecessary_non_null_assertion` re-decision consumes), never during
+    /// the walk, so a promoted operand anchors the dead face only once that
+    /// re-decision exists for this family. Every other face answers the
+    /// declared/static type, the same under-report the face carried before.
+    fn coalesce_operand_never_null(&self, row: &Row, widen_null_aware: bool) -> bool {
+        let declared = match self.dot_shorthand_ty(row) {
+            Some(ty) => ty,
+            None => self.operand_static_ty(row),
+        };
+        let ty = if self.null_aware_members.contains(&row.range.offset) && widen_null_aware {
+            Self::nullable_form(declared)
+        } else {
+            declared
+        };
+        if self.written_ty_invalid(ty) {
+            return false;
         }
-        if matches!(row.intent, Intent::Invoke) {
-            let ty = self.operand_static_ty(row);
-            if ty != Ty::UNKNOWN {
-                return match ty {
-                    Ty::Named {
-                        name,
-                        nullable: false,
-                        ..
-                    } if self.type_params.contains(&name)
-                        || self.pending_type_params.contains(&name) =>
-                    {
-                        false
+        self.strictly_non_nullable(ty)
+            || matches!(
+                row.shape,
+                RowShape::Receiver(Receiver::Super { .. })
+                    | RowShape::Member {
+                        recv: Receiver::Super { .. },
                     }
-                    _ => ty.is_strictly_non_nullable(),
-                };
-            }
+            )
+    }
+
+    /// The leading-dot shorthand's static type. A `DotShorthandNameExpression`
+    /// / `DotShorthandPropertyAccess` / `DotShorthandConstructorInvocation`
+    /// resolves its name against the CONTEXT type — the declaration group's
+    /// written annotation (`ConstructorClass v = .new(1)`, `.blue` over an
+    /// `enum Color`), never a receiver. A constructor spelling (`.new`,
+    /// `.named`) builds the context type itself; a static member spelling
+    /// answers the member's declared face. `None` on every other shape: a
+    /// real receiver, no armed declaration context, an unresolved or
+    /// instance member (the latter reports through
+    /// `dot_shorthand_undefined_member`).
+    fn dot_shorthand_ty(&self, row: &Row) -> Option<Ty> {
+        if !self.dot_shorthand_context(row.range.offset) {
+            return None;
         }
-        row.ty.is_strictly_non_nullable()
+        let Ty::Named {
+            name: context,
+            nullable,
+            args,
+        } = self.pending_decl_ty?
+        else {
+            return None;
+        };
+        if self.ctor_decl_site(context, row.name).is_some() {
+            return Some(Ty::Named {
+                name: context,
+                nullable,
+                args,
+            });
+        }
+        let Walk::Found(entry) = self.walk_members(context, row.name) else {
+            return None;
+        };
+        if !entry.is_static {
+            return None;
+        }
+        let ty = if entry.var_ty != Ty::UNKNOWN {
+            entry.var_ty
+        } else {
+            entry.return_ty
+        };
+        (ty != Ty::UNKNOWN).then_some(ty)
     }
 
     /// `end_binary_expression` for `??`: the right operand's row anchors
@@ -671,14 +733,26 @@ impl<'a> Engine<'a> {
                 // the read's own type (`m[k] ?? d` reads `Map.[]`'s `V?` —
                 // #2172's `groupSetsBy`/`groupBy` rows). An invoked row
                 // reads its send result through the shared verdict, whose
-                // type-parameter posture keeps a generic key send
+                // bound-aware posture keeps a generic key send
                 // (`m[keyOf(e)] ?? d`) from anchoring.
                 .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
                 // An unfolded index (`f()[k] ?? d`, a call-result receiver
                 // keeps its operand rows) leaves the KEY as the top row:
                 // the left operand is the `[]` read, never the key.
                 .filter(|lhs| !self.is_index_key_row(lhs))
-                .is_some_and(|lhs| self.coalesce_operand_never_null(lhs));
+                // The operand node is the whole expression: a row that
+                // stops short of the operator with real tokens between its
+                // expression span and the operator is an inner operand of a
+                // larger one (`(true ? x : 499)`'s branch, a parenthesized
+                // conditional), never the operand the oracle types. The
+                // span (not the bare row) answers because an invocation's
+                // row is its callee head (`a.b()`, a dot shorthand's
+                // `.new(1)`).
+                .filter(|lhs| {
+                    let span = self.staged_expression_span(lhs.range);
+                    self.trivia_between(span.end(), op_range.offset)
+                })
+                .is_some_and(|lhs| self.coalesce_operand_never_null(lhs, true));
 
         if !non_null {
             return;
@@ -754,13 +828,6 @@ impl<'a> Engine<'a> {
             .insert(rhs.range.offset, (lhs.range.offset, joined));
     }
 
-    /// `handle_assignment_expression` for `??=`: the target's read type
-    /// strictly non-nullable anchors the report at the value (the official
-    /// `_checkForDeadNullCoalesce`'s `??=` arm). An operator-marked row is
-    /// never the target: `m[k] ??= v` reads through `Map.[]`, whose `V?`
-    /// the name-level model does not type on the receiver row — the
-    /// receiver's own non-nullability is not the read's (#2172's
-    /// `groupSetsBy`/`groupBy` rows).
     /// Drops the dead null-aware chains the assignment writes through (the
     /// live verifier reports no dead face for any null-aware WRITE —
     /// `verifyReceiverIndexExpression` fires on the read form only, and the
@@ -787,40 +854,88 @@ impl<'a> Engine<'a> {
             });
     }
 
+    /// `handle_assignment_expression` for `??=`: the target's read type
+    /// strictly non-nullable anchors the report at the value (the official
+    /// `visitIfNullAssignment` → `_checkForDeadNullCoalesce(target.read's
+    /// type, node.value)`, error_verifier.dart:1519-1527/:4733-4739).
+    ///
+    /// The target row must be the WHOLE target ([`Self::trivia_between`]):
+    /// `x++ ??= y`, `((a, _) && r) ??= x` and `[a, _] ??= x` leave a shorter
+    /// inner row before the operator, and the official parser rejects those
+    /// shapes as assignment targets outright (`visitIfNullAssignment`'s
+    /// `InvalidExpressionAssignmentTargetImpl` arm reports nothing). An
+    /// index target (`m[k] ??= v`, `x?[i] ??= v`) leaves its key row
+    /// adjacent to the `]`, so the gate keeps the read-through-`[]` shape
+    /// silent: the read's type is the operator's return, which the
+    /// name-level model does not type (#2172's `groupSetsBy`/`groupBy`
+    /// rows).
     pub(crate) fn check_dead_null_assignment(&mut self, operator: Token) {
         if self.text_of(operator) != Some("??=") {
             return;
         }
         let limit = operator.range.offset;
-        // The index-write shape reads through `Map.[]`, whose `V?` no row
-        // carries: the compound mark lands on the key expression's row (the
-        // nearest non-value before the operator), whose return type is not
-        // the read's — the index-read target's type is the unmodeled
-        // operator return, and the face stays silent (`groupBy`'s
-        // `(map[key(element)] ??= []).add(element)`, #2172).
-        if self
+        let rhs_offset = self
+            .tokens
+            .get(operator.id as usize + 1)
+            .map(|token| token.utf16_offset)
+            .unwrap_or_else(|| operator.range.end());
+        let Some(target) = self
             .rows
             .iter()
             .rev()
-            .filter(|row| row.range.end() <= limit)
-            .any(|row| matches!(row.write_op, Some(OpWrite::Compound)))
-        {
+            .find(|row| self.is_assignment_target(row, limit))
+        else {
+            return;
+        };
+        if !self.coalesce_operand_never_null(target, false) {
             return;
         }
-        let non_null = self
-            .rows
-            .iter()
-            .rev()
-            .find(|row| {
-                row.range.end() <= limit
-                    && !matches!(row.shape, RowShape::Value)
-                    && !matches!(row.intent, Intent::Operator(..))
-            })
-            .is_some_and(|target| self.coalesce_operand_never_null(target));
-        if non_null && let Some(value) = self.rows.last() {
-            let range = value.range;
-            self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
+        // The report anchors at `node.value`'s own expression span, never an
+        // inner operand row (`bad()`'s head, `-42`'s digits, `[]`'s closing
+        // bracket): from the operand's first token through the value row's
+        // own expression end. An invalid value stages no row at all — the
+        // official report then anchors a synthetic empty node the row model
+        // cannot spell, and the face stays silent (under-report).
+        let Some(value) = self.rows.last().filter(|row| row.range.offset >= rhs_offset) else {
+            return;
+        };
+        let span = self.staged_expression_span(value.range);
+        let offset = span.offset.min(rhs_offset);
+        let range = SourceRange {
+            offset,
+            length: span.end().saturating_sub(offset),
+        };
+        self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
+    }
+
+    /// Whether `row` is the whole assignment target of the operator starting
+    /// at `limit` — [`Self::check_dead_null_assignment`]'s gate. A target is
+    /// a NAME or a member access: the record and collection folds leave a
+    /// `)`/`]`/`}` row where a pattern stands, which is no name, and a
+    /// literal, a type use, or a send result is no target either — the
+    /// official resolver rejects all of them outright
+    /// (`visitIfNullAssignment`'s `InvalidExpressionAssignmentTargetImpl`
+    /// arm reports nothing). The row must also END at the operator: an
+    /// `x++ ??= y` latches the `x` row, an inner operand of a larger
+    /// expression, never that expression's own row.
+    fn is_assignment_target(&self, row: &Row, limit: u32) -> bool {
+        if row.range.end() > limit || matches!(row.intent, Intent::Operator(..) | Intent::Invoke)
+        {
+            return false;
         }
+        let named = match &row.shape {
+            RowShape::Member { .. }
+            | RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. }) => true,
+            RowShape::Bare(_) => self.starts_a_name(row.range.offset),
+            _ => false,
+        };
+        named && self.trivia_between(row.range.end(), limit)
+    }
+
+    /// Whether the source at a UTF-16 offset starts a Dart identifier.
+    fn starts_a_name(&self, offset: u32) -> bool {
+        self.byte_at(offset)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$')
     }
 
     /// The local declaration `name` resolves to, innermost frame first
@@ -4638,5 +4753,236 @@ impl<'a> Engine<'a> {
                 row.shape = RowShape::Value;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_3098 {
+    //! The `dead_null_aware_expression` verdict pins: the operand's static
+    //! type (upstream `_checkForDeadNullCoalesce`, error_verifier.dart
+    //! :4733-4739) is read the way the oracle reads it, and the report
+    //! anchors the value's own expression span.
+    //!
+    //! Oracle provenance: `dart analyze` 3.13.1 machine format — every
+    //! expectation below is a row the conformance corpus's `expected.tsv`
+    //! carries for the same shape (`int-to-double/assignment_class_member_*`,
+    //! `dot_shorthands/*_if_null_error_test`, `if_null/assignment_behavior_test`,
+    //! `super/conditional_operator_test`, `join_return_with_assignment`,
+    //! `nnbd/operator_type_test`).
+    //!
+    //! The FLOW-PROMOTED operand face (`if (a is Object) a ?? c`,
+    //! `x ??= 1; x ??= 2`) has no pin: the promotion table only materializes
+    //! at the teardown join, so those rows stay missing until the deferred
+    //! re-decision lands (see `Engine::coalesce_operand_never_null`).
+
+    use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
+
+    /// `(offset, length)` of the `nth` (0-based) occurrence of `needle` in
+    /// the FIXTURE text, shifted past the prelude the rig mounts ahead of
+    /// it. Every fixture here is ASCII, so byte and UTF-16 offsets coincide.
+    fn at(source: &str, needle: &str, nth: usize) -> (u32, u32) {
+        let found = source
+            .match_indices(needle)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("`{needle}` occurrence #{nth} missing"));
+        (
+            found.0 as u32 + CORE_PRELUDE.len() as u32,
+            needle.len() as u32,
+        )
+    }
+
+    /// The `dead_null_aware_expression` rows as `(offset, length)`,
+    /// source-ordered.
+    fn dead_rows(source: &str) -> Vec<(u32, u32)> {
+        let report = report_ops(source);
+        let mut rows: Vec<(u32, u32)> = report
+            .diagnostics
+            .iter()
+            .filter(|row| row.code.name == "dead_null_aware_expression")
+            .map(|row| (row.range.offset, row.range.length))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// `??` reads the operand's `staticType`; a non-nullable static field's
+    /// `??=` is dead, and the null-aware `?.` spelling of the same target is
+    /// too (the read resolution carries no null-aware join for `??=`).
+    #[test]
+    fn if_null_assignment_reads_static_and_null_aware_member_targets() {
+        let source = "\
+class C {\n\
+\x20 static double s = -42;\n\
+}\n\
+void f() {\n\
+\x20 C.s ??= 11;\n\
+\x20 C?.s ??= 22;\n\
+}\n";
+        assert_eq!(
+            dead_rows(source),
+            vec![at(source, "11", 0), at(source, "22", 0)]
+        );
+    }
+
+    /// A nullable receiver's `?.` member still reads the accessor's own
+    /// type under `??=` (`c?.m1 ??= 11` is dead) while the `??` face keeps
+    /// the null-aware join (`c?.m1 ?? 22` is live).
+    #[test]
+    fn if_null_assignment_keeps_the_accessor_face_that_if_null_widens() {
+        let source = "\
+class C {\n\
+\x20 double m1 = 1;\n\
+}\n\
+void f(C? c) {\n\
+\x20 c?.m1 ??= 11;\n\
+\x20 var r = c?.m1 ?? 22;\n\
+}\n";
+        assert_eq!(dead_rows(source), vec![at(source, "11", 0)]);
+    }
+
+    /// A type parameter decides through its written bound: a nullable bound
+    /// (or the implicit `Object?`) is potentially null and never anchors,
+    /// a non-nullable bound does.
+    #[test]
+    fn if_null_decides_type_parameters_through_their_bounds() {
+        let source = "\
+void maybeBound<BQ extends bool?>(BQ cond) {\n\
+\x20 cond ?? null;\n\
+}\n\
+void nonNullBound<T extends Object>(T v) {\n\
+\x20 v ?? null;\n\
+}\n";
+        assert_eq!(dead_rows(source), vec![at(source, "null", 1)]);
+    }
+
+    /// An undefined class's field carries an invalid type — the official
+    /// `isStrictlyNonNullable(InvalidType)` answers nothing.
+    #[test]
+    fn if_null_assignment_over_an_undefined_class_stays_silent() {
+        let source = "\
+class A {\n\
+\x20 B _lazyInstance;\n\
+\x20 static B get instance {\n\
+\x20   _lazyInstance ??= B();\n\
+\x20   return _lazyInstance;\n\
+\x20 }\n\
+}\n";
+        assert_eq!(dead_rows(source), Vec::new());
+    }
+
+    /// An increment result and a pattern are no assignment targets: the
+    /// official `visitIfNullAssignment` returns before the deadness check
+    /// (`InvalidExpressionAssignmentTargetImpl`), so no row anchors.
+    #[test]
+    fn if_null_assignment_over_an_invalid_target_stays_silent() {
+        let source = "\
+void f(num x, int y) {\n\
+\x20 x++ ??= y;\n\
+}\n\
+void g() {\n\
+\x20 int a1 = 42;\n\
+\x20 Record r1 = ();\n\
+\x20 ((a1, _) && r1) ??= (1, 2);\n\
+\x20 int a2 = 3;\n\
+\x20 [a2, _] ??= [1, 2];\n\
+\x20 var a4 = 3;\n\
+\x20 (a4, _) ??= (1, 2);\n\
+}\n";
+        assert_eq!(dead_rows(source), Vec::new());
+    }
+
+    /// The report anchors `node.value`'s own expression span, never the
+    /// inner operand row (`sideEffect()`'s callee head, `-42`'s digits).
+    #[test]
+    fn if_null_assignment_anchors_the_whole_value_expression() {
+        let source = "\
+void sideEffect() {}\n\
+void f() {\n\
+\x20 int l = 1;\n\
+\x20 l ??= sideEffect();\n\
+\x20 int n = 2;\n\
+\x20 n ??= -42;\n\
+}\n";
+        assert_eq!(
+            dead_rows(source),
+            vec![at(source, "sideEffect()", 1), at(source, "-42", 0)]
+        );
+    }
+
+    /// A leading-dot shorthand resolves against the declaration's context
+    /// type: a constructor spelling builds that type (non-nullable), so the
+    /// `??` right operand is dead; a static getter answers its return type.
+    #[test]
+    fn if_null_reads_a_dot_shorthand_through_its_context_type() {
+        let source = "\
+class ConstructorClass {\n\
+\x20 final int? x;\n\
+\x20 ConstructorClass(this.x);\n\
+\x20 ConstructorClass.regular(this.x);\n\
+}\n\
+class Integer {\n\
+\x20 final int value;\n\
+\x20 Integer(this.value);\n\
+\x20 static Integer get one => Integer(1);\n\
+}\n\
+void f(ConstructorClass firstFallback, ConstructorClass secondFallback, Integer thirdFallback) {\n\
+\x20 ConstructorClass first = .new(1) ?? firstFallback;\n\
+\x20 ConstructorClass second = .regular(2) ?? secondFallback;\n\
+\x20 Integer third = .one ?? thirdFallback;\n\
+}\n";
+        assert_eq!(
+            dead_rows(source),
+            vec![
+                at(source, "firstFallback", 1),
+                at(source, "secondFallback", 1),
+                at(source, "thirdFallback", 1),
+            ]
+        );
+    }
+
+    /// A nullable static getter's shorthand keeps the nullable face: the
+    /// right operand stays live.
+    #[test]
+    fn if_null_keeps_a_nullable_dot_shorthand_member_live() {
+        let source = "\
+class Integer {\n\
+\x20 final int value;\n\
+\x20 Integer(this.value);\n\
+\x20 static Integer? get nullable => null;\n\
+}\n\
+void f(Integer fallback) {\n\
+\x20 Integer pick = .nullable ?? fallback;\n\
+}\n";
+        assert_eq!(dead_rows(source), Vec::new());
+    }
+
+    /// `super` cannot be null, so its read is never null however the
+    /// (illegal) `?.` spelling reads.
+    #[test]
+    fn if_null_assignment_over_a_super_member_is_never_null() {
+        let source = "\
+class B {\n\
+\x20 int field = 1;\n\
+}\n\
+class C extends B {\n\
+\x20 void test() {\n\
+\x20   super?.field ??= 11;\n\
+\x20 }\n\
+}\n";
+        assert_eq!(dead_rows(source), vec![at(source, "11", 0)]);
+    }
+
+    /// An invalid right operand stages no expression row: the official
+    /// report then anchors a synthetic empty node, which the row model
+    /// cannot spell — the face stays silent rather than anchoring the
+    /// target.
+    #[test]
+    fn if_null_assignment_without_a_value_row_stays_silent() {
+        let source = "\
+void f([int? optional]) {\n\
+\x20 optional ??= ...;\n\
+}\n";
+        assert_eq!(dead_rows(source), Vec::new());
     }
 }
