@@ -5888,3 +5888,14 @@ mod ticket_3110_tests;
 /// (error_detection_helpers.dart:72-75).
 #[cfg(test)]
 mod ticket_3122_tests;
+
+/// The #3127 pins — `invalid_override`: the member-override contract
+/// (`correct_override.dart`'s function-subtype check plus the
+/// `CovariantParametersVerifier` covariant-parameter relation,
+/// inheritance_override.dart:498-546 `_checkDeclaredMember`). A declared
+/// member's parameter/return/arity/getter-setter face compares against the
+/// inherited signature through every superinterface; the display pins the
+/// operator-name rendering (`==`/`[]=` render intact, only a real setter's
+/// `name=` marker strips).
+#[cfg(test)]
+mod ticket_3127_tests;

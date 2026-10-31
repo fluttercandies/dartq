@@ -758,6 +758,31 @@ impl<'a> Engine<'a> {
     /// the oracle's per-superinterface loop. Each row carries the oracle's
     /// context row anchored at the overridden member's declaration
     /// ([`overridden_member_context`]).
+    /// The member name as the oracle's `invalid_override` message renders
+    /// it: a setter's model spelling is `name=` (the setter marker
+    /// [`Self::setter_spelling`] appends), rendered back as the bare `name`;
+    /// an operator whose own spelling ends in `=` (`==`, `[]=`) is NOT a
+    /// setter spelling — its trailing `=` is part of the declared name and
+    /// renders intact (`bool operator==(Object)` displays `'B.=='`, never
+    /// `'B.='`). The discriminator is the character before the `=`: a real
+    /// setter spelling follows an identifier char, an operator's `=` follows
+    /// `=`/`]`/another operator glyph (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/element.dart`'s
+    /// `Element.displayName` — the element name carries no setter marker).
+    fn member_display_name<'n>(&self, spelling_text: &'n str) -> &'n str {
+        match spelling_text.strip_suffix('=') {
+            Some(bare)
+                if bare
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') =>
+            {
+                bare
+            }
+            _ => spelling_text,
+        }
+    }
+
     pub(crate) fn check_override(&mut self, spelling: StringId, range: SourceRange) {
         // Member declarations parse inside a container frame; extensions and
         // extension types have no inheritance faces.
@@ -985,7 +1010,7 @@ impl<'a> Engine<'a> {
                         broken_seen.push((setter_face, ptr));
                     }
                     let display = self.strings.resolve(spelling);
-                    let display = display.strip_suffix('=').unwrap_or(display);
+                    let display = self.member_display_name(display);
                     let container_text = self.strings.resolve(container);
                     let declared_text = self.override_signature_text(declared_cmp);
                     let face_text = self.strings.resolve(hit.face_name);
@@ -1270,7 +1295,7 @@ impl<'a> Engine<'a> {
                             broken_seen.push((setter_face, ptr));
                         }
                         let display = self.strings.resolve(*spelling);
-                        let display = display.strip_suffix('=').unwrap_or(display);
+                        let display = self.member_display_name(display);
                         let container_text = self.strings.resolve(mixin);
                         let declared_text = self.override_signature_text(declared_cmp);
                         let face_text = self.strings.resolve(hit.face_name);
@@ -4119,7 +4144,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let display = self.strings.resolve(*name);
-            let display = display.strip_suffix('=').unwrap_or(display);
+            let display = self.member_display_name(display);
             let concrete_text = self.strings.resolve(concrete.owner_name);
             let concrete_sig = self.override_signature_text(&concrete.entry);
             let specific_text = self.strings.resolve(specific.owner_name);
