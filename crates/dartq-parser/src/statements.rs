@@ -450,6 +450,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // here because the arm cannot see the statement context. The face
         // keys on the statement head followed by an assignment operator (any
         // compound form, `super += 3;`/`super ??= 3;` included).
+        //
+        // This entry point IS the initializer-lane gate: constructor
+        // initializer entries parse through `parse_initializer` ->
+        // `parse_expression` (members.rs), never through this function, so
+        // `C() : this = 0;` can never reach the rider. That lane's
+        // redirecting-head recovery re-reads `<synthetic> = this …` through
+        // the expression engine, and the arm's bare-`this` target stays
+        // selector-silent there via [`Parser::assignment_op_spliced`]
+        // (`C() : this = 0;` carries expected_token '.' +
+        // missing_assignment_in_initializer, never a selector or the rider).
         let head_assigns =
             matches!(head, TokenKind::Keyword(Keyword::Super | Keyword::This))
                 && self.precedence_of(self.cursor.look_kind(1))
