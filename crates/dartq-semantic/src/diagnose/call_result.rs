@@ -68,6 +68,20 @@ impl Engine<'_> {
         for (param, ty) in raw {
             keys.entry(param).or_insert(ty);
         }
+        // A parameter the call site leaves free falls back to its declared
+        // bound — the oracle's instantiate-to-bounds residual — never the
+        // `Unknown` stand-in (upstream `generic_inferrer.dart`'s
+        // `_inferer.typeVariableForSubtype` reads `param.bound` when no
+        // constraint decided it). `f<T extends num>(x)` with no constraint
+        // answers `num`, not the free-parameter `Unknown`.
+        for (param, bound) in &params {
+            if keys.contains_key(param) {
+                continue;
+            }
+            if let Some(bound) = bound {
+                keys.insert(*param, *bound);
+            }
+        }
         let out = if keys.is_empty() {
             declared
         } else {
@@ -145,3 +159,13 @@ impl Engine<'_> {
         raw
     }
 }
+
+/// The F6-B pins (the call-site inference residual — a free callee
+/// parameter the send's own facts cannot bind falls to its declared
+/// bound, the oracle's instantiate-to-bounds face, never the
+/// `Unknown` stand-in). Registered here, not in `diagnose.rs` (other
+/// lanes' file), via `#[path]`: the module stays untouched by the
+/// registration.
+#[cfg(test)]
+#[path = "ticket_f6b_tests.rs"]
+mod ticket_f6b_tests;
