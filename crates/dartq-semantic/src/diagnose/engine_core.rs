@@ -8983,18 +8983,28 @@ impl<'a> Engine<'a> {
     }
 
     /// The clause entry's SDK-face head when the entry names a restricted
-    /// supertype (#2972): `None` for everything the analysis set resolves
-    /// (a local or imported element — upstream keys the restriction on the
-    /// RESOLVED element's library), a one-level chase through a non-generic
-    /// bare alias (`typedef A = int`, the written-shape face the element
-    /// model keeps in `var_ty`), then the closed spelling set. Returns the
-    /// head spelling (the chased one for an alias) so the caller can apply
-    /// the `Enum`-in-`with` exemption; the REPORT's `{0}` stays the entry's
-    /// written name (`Classes can't mixin 'T'.`, messages.yaml :17358).
+    /// supertype (#2972, #3154): `None` when the entry resolves to a USER
+    /// element (a same-named declaration shadows the SDK face — upstream
+    /// keys the restriction on the RESOLVED element's library,
+    /// `isNonSubtypableClass`, type_provider.dart:547-555), `Some` when it
+    /// resolves to a `dart:*` library element (the restricted SDK face) or
+    /// stays unresolved (the closed-spelling face). A one-level chase through
+    /// a non-generic bare alias (`typedef A = int`, the written-shape face
+    /// the element model keeps in `var_ty`) peels the alias head before the
+    /// same decision. `Enum` never reaches `isNonSubtypableClass` upstream —
+    /// the `isDartCoreEnum` arm in `_checkDirectSuperType`
+    /// (inheritance_override.dart:610-620) intercepts it for every clause —
+    /// so the head is filtered before the table lookup. Returns the head
+    /// spelling (the chased one for an alias); the REPORT's `{0}` stays the
+    /// entry's written name (`Classes can't mixin 'T'.`, messages.yaml
+    /// :17358).
     fn disallowed_subtype_head(&self, entry: StringId) -> Option<StringId> {
-        // A resolved element is its own declaration — never the SDK face
-        // (`isNonSubtypableClass`, type_provider.dart:547-555).
-        if resolve_container(
+        let mut head = entry;
+        // An unresolved alias-shape entry keeps the written head; a resolved
+        // one chases the aliased face. `resolve_container` runs on the
+        // written entry first: a user typedef named `int` shadows the SDK
+        // `int` before its `var_ty` is ever read.
+        let resolved_owner = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -9002,44 +9012,70 @@ impl<'a> Engine<'a> {
             self.file,
             entry,
         )
-        .is_some()
-        {
-            return None;
+        .map(|(_, owner_file)| owner_file);
+        match resolved_owner {
+            Some(owner_file) => {
+                // The resolved element's library decides the restriction:
+                // `dart:*` is the SDK face, anything else is a user shadow
+                // (type_provider.dart:550-553).
+                let is_sdk = self
+                    .graph
+                    .library_of_file(owner_file)
+                    .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
+                if !is_sdk {
+                    return None;
+                }
+            }
+            None => {
+                // Unresolved at the entry: the only chase the model keeps is
+                // the bare non-generic alias arm.
+                if let Some(decl) = self.index.get(self.file).and_then(|f| f.decl(entry)) {
+                    if decl.kind != MicroKind::TypeAlias || decl.type_params != 0 {
+                        return None;
+                    }
+                    // The head is the resolved type's element name — a
+                    // spelled `FutureOr<int>` still lands on `FutureOr` the
+                    // way `F`'s interface-type expansion hands upstream its
+                    // `dart:async` element (a spelled argument never changes
+                    // the restricted face `isNonSubtypableClass` reads).
+                    match decl.var_ty {
+                        Ty::Named { name, .. } => head = name,
+                        // The collector folds the unshadowed `Null` spelling
+                        // to the dedicated variant (its annotation fold) —
+                        // that is dart:core's restricted `Null` at this
+                        // model's grade.
+                        Ty::Null => head = self.intern("Null"),
+                        _ => return None,
+                    }
+                    // The chased head still goes through the same
+                    // resolution decision: a user element under the chased
+                    // name stays silent, an SDK element keeps the face.
+                    if let Some((_, owner_file)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        head,
+                    ) {
+                        let is_sdk = self
+                            .graph
+                            .library_of_file(owner_file)
+                            .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
+                        if !is_sdk {
+                            return None;
+                        }
+                    }
+                }
+            }
         }
-        let mut head = entry;
-        if let Some(decl) = self.index.get(self.file).and_then(|f| f.decl(entry)) {
-            // Only the bare non-generic alias shape models here; anything
-            // else (generic, argument-bearing, imported alias) keeps the
-            // under-report direction.
-            if decl.kind != MicroKind::TypeAlias || decl.type_params != 0 {
-                return None;
-            }
-            match decl.var_ty {
-                // The bare named head (`typedef T = FutureOr`); a written
-                // argument group stays unmodelled.
-                Ty::Named {
-                    name,
-                    args: ArgListId::EMPTY,
-                    ..
-                } => head = name,
-                // The collector folds the unshadowed `Null` spelling to
-                // the dedicated variant (its annotation fold) — that is
-                // dart:core's restricted `Null` at this model's grade.
-                Ty::Null => head = self.intern("Null"),
-                _ => return None,
-            }
-            if resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                head,
-            )
-            .is_some()
-            {
-                return None;
-            }
+        // `Enum`'s every clause face routes through the dedicated
+        // `isDartCoreEnum` arm upstream — `isNonSubtypableClass` never sees
+        // it (inheritance_override.dart:610-620); the `with` conjunct at
+        // error_verifier.dart:2461-2463 carries the same carve-out on the
+        // older path.
+        if self.strings.resolve(head) == "Enum" {
+            return None;
         }
         NON_SUBTYPABLE_SDK_NAMES
             .contains(&self.strings.resolve(head))
@@ -9072,7 +9108,7 @@ impl<'a> Engine<'a> {
         };
         // The face list collects first — the emit loop needs `&mut self`
         // while the element index and the classifier read shared state.
-        let mut faces: Vec<(SemanticCode, StringId, SourceRange)> = Vec::new();
+        let mut faces: Vec<(SemanticCode, SourceRange)> = Vec::new();
         for (decl_name, container) in elements.containers() {
             let Some(site) = self
                 .decl_sites
@@ -9126,21 +9162,273 @@ impl<'a> Engine<'a> {
                 // supertype faces.
                 _ => continue,
             }
+            // Per-clause-entry ordinals keyed on (code, entry): the n-th
+            // pushed row for `entry` under `code` anchors the n-th written
+            // `entry` under that clause keyword in source (the model's
+            // clause lists are in written order).
+            let mut ordinals: FxHashMap<(SemanticCode, StringId), usize> =
+                FxHashMap::default();
             for (code, entry) in entries {
-                let Some(head) = self.disallowed_subtype_head(entry) else {
-                    continue;
-                };
-                if matches!(code, SemanticCode::SubtypeOfDisallowedTypeInWith)
-                    && self.strings.resolve(head) == "Enum"
-                {
-                    continue;
+                // `Enum` never reaches this table (filtered inside
+                // `disallowed_subtype_head` — upstream's `isDartCoreEnum`
+                // arm, inheritance_override.dart:610-620).
+                if self.disallowed_subtype_head(entry).is_some() {
+                    let ordinal = ordinals.entry((code, entry)).or_insert(0);
+                    let range = self
+                        .clause_entry_range(site.range, code, entry, *ordinal)
+                        .unwrap_or(site.range);
+                    *ordinal += 1;
+                    faces.push((code, range));
                 }
-                faces.push((code, entry, site.range));
             }
         }
-        for (code, entry, range) in faces {
-            let text = self.strings.resolve(entry).to_string();
+        for (code, range) in faces {
+            let text = self.disallowed_subtype_message(range);
             self.emit_corrected(code, range, &text);
+        }
+    }
+
+    /// The clause-entry span for `entry` under the `code`'s own clause in
+    /// the header opened at `site`'s declaring name (#3154): walks source
+    /// forward from the name's end, skips the container's own
+    /// type-parameter group, then tokenizes the header — only entries
+    /// under `code`'s own clause keyword are candidates, so `class A
+    /// extends Null implements Null` anchors each row on its own arm
+    /// (`SubtypeOfDisallowedTypeInExtends` reads the `extends` list only,
+    /// `…InImplements` reads `implements`, `…InWith` reads `with`,
+    /// `…InOn` reads `on`). `None` for a header whose written shape no
+    /// longer carries the entry; the caller falls back to the declaring
+    /// name's span then.
+    fn clause_entry_range(
+        &self,
+        site: SourceRange,
+        code: SemanticCode,
+        entry: StringId,
+        ordinal: usize,
+    ) -> Option<SourceRange> {
+        let entry_text = self.strings.resolve(entry);
+        let bytes = self.source.as_bytes();
+        // The clause keyword this code's entries live under, plus whether
+        // a bare `=` head counts (`extends` reads the named mixin
+        // application's `class A = S` head as its own superclass face).
+        let (clause_kw, alias_head): (&[u8], bool) = match code {
+            SemanticCode::SubtypeOfDisallowedTypeInExtends => (b"extends", true),
+            SemanticCode::SubtypeOfDisallowedTypeInWith => (b"with", false),
+            SemanticCode::SubtypeOfDisallowedTypeInImplements => (b"implements", false),
+            SemanticCode::SubtypeOfDisallowedTypeInOn => (b"on", false),
+            _ => return None,
+        };
+        let mut at = self.byte_of(site.end());
+        at = self.skip_angle_group(at);
+        // `matched` counts written entries under `clause_kw` whose head
+        // spells `entry_text`: the n-th pushed row anchors the n-th match
+        // in source (the element model's clause lists are in written
+        // order, so entry `i` pairs with written entry `i`).
+        let mut matched = 0usize;
+        loop {
+            let probe = self.skip_ws_bytes(at);
+            match bytes.get(probe) {
+                Some(b'{') | Some(b';') | None => return None,
+                Some(b'(') | Some(b'[') => return None,
+                Some(b'=') => {
+                    // A named mixin application's `=` head: the `extends`
+                    // code's own superclass face (`class A = S with M`'s
+                    // `S`); other codes skip it and keep walking toward
+                    // their own clause keyword.
+                    if alias_head {
+                        let head_at = self.skip_ws_bytes(probe + 1);
+                        let (span, next) =
+                            self.scan_clause_type_at(head_at, entry_text);
+                        if let Some(span) = span {
+                            if matched == ordinal {
+                                return Some(span);
+                            }
+                            matched += 1;
+                        }
+                        at = next;
+                    } else {
+                        at = probe + 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let Some((_, kw_end, kw)) = self.scan_ident_at(probe) else {
+                return None;
+            };
+            if kw == clause_kw {
+                let mut cur = kw_end;
+                loop {
+                    let head_at = self.skip_ws_bytes(cur);
+                    let (span, next) = self.scan_clause_type_at(head_at, entry_text);
+                    if let Some(span) = span {
+                        if matched == ordinal {
+                            return Some(span);
+                        }
+                        matched += 1;
+                    }
+                    cur = next;
+                    let comma = self.skip_ws_bytes(cur);
+                    if bytes.get(comma) == Some(&b',') {
+                        cur = comma + 1;
+                        continue;
+                    }
+                    break;
+                }
+                at = cur;
+            } else {
+                at = kw_end;
+            }
+        }
+    }
+
+    /// The byte offset past one balanced `<…>` group when `at` opens one;
+    /// `at` unchanged otherwise. The container's own type-parameter group
+    /// is the only arm this scanner needs (`class C<T extends Bound>`'s
+    /// `Bound` is a bound, never a clause entry).
+    fn skip_angle_group(&self, at: usize) -> usize {
+        let bytes = self.source.as_bytes();
+        if bytes.get(at) != Some(&b'<') {
+            return at;
+        }
+        let mut depth = 0i32;
+        let mut probe = at;
+        while let Some(&b) = bytes.get(probe) {
+            match b {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return probe + 1;
+                    }
+                }
+                _ => {}
+            }
+            probe += 1;
+        }
+        at
+    }
+
+    /// The identifier bytes at `at` (skipping leading whitespace and
+    /// comments): `(start, end, spelling)`. `None` past the unit's end.
+    fn scan_ident_at(&self, at: usize) -> Option<(usize, usize, &[u8])> {
+        let bytes = self.source.as_bytes();
+        let mut probe = self.skip_ws_and_comments(at);
+        let start = probe;
+        while let Some(&b) = bytes.get(probe) {
+            if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'$') {
+                break;
+            }
+            probe += 1;
+        }
+        if probe == start {
+            return None;
+        }
+        Some((start, probe, &bytes[start..probe]))
+    }
+
+    /// Whitespace and `//`/`/*…*/` runs skipped (the header's own tokens).
+    fn skip_ws_and_comments(&self, at: usize) -> usize {
+        let bytes = self.source.as_bytes();
+        let mut at = at;
+        loop {
+            while let Some(&b) = bytes.get(at) {
+                if b.is_ascii_whitespace() {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            if bytes.get(at) == Some(&b'/') && bytes.get(at + 1) == Some(&b'/') {
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\n' {
+                        break;
+                    }
+                    at += 1;
+                }
+                continue;
+            }
+            if bytes.get(at) == Some(&b'/') && bytes.get(at + 1) == Some(&b'*') {
+                let mut probe = at + 2;
+                while probe + 1 < bytes.len() {
+                    if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
+                        break;
+                    }
+                    probe += 1;
+                }
+                at = (probe + 2).min(bytes.len());
+                continue;
+            }
+            return at;
+        }
+    }
+
+    /// Whitespace skipped, returning the byte offset of the next
+    /// non-whitespace byte (the entry scan works in bytes).
+    fn skip_ws_bytes(&self, at: usize) -> usize {
+        self.skip_ws_and_comments(at)
+    }
+
+    /// One clause-entry's span at byte offset `at`, returned paired with
+    /// the next byte to scan: `(Some(range), next)` when the entry parses
+    /// AND its head spelling matches `entry_text`, `(None, next)` when it
+    /// parses but the head is a different name. The span covers the head
+    /// (with any `p.` prefix) through the `<…>` group's closer or a
+    /// trailing `?`, mirroring upstream's whole-NamedType anchor
+    /// (`note_header_type_span`).
+    fn scan_clause_type_at(&self, at: usize, entry_text: &str) -> (Option<SourceRange>, usize) {
+        let bytes = self.source.as_bytes();
+        let head_start = at;
+        let Some((_, first_end, _)) = self.scan_ident_at(at) else {
+            return (None, at);
+        };
+        let mut probe = first_end;
+        // A `p.S` continuation extends the head's written span through the
+        // leaf name.
+        if bytes.get(probe) == Some(&b'.') {
+            let after_dot = self.skip_ws_bytes(probe + 1);
+            if let Some((_, leaf_end, _)) = self.scan_ident_at(after_dot) {
+                probe = leaf_end;
+            }
+        }
+        // Optional `<…>` group and trailing `?` extend the entry's span.
+        let mut end = probe;
+        if bytes.get(end) == Some(&b'<') {
+            end = self.skip_angle_group(end);
+        }
+        if bytes.get(end) == Some(&b'?') {
+            end += 1;
+        }
+        let head_bytes = &bytes[head_start..probe];
+        // The leaf spelling decides the match: the element model keys the
+        // clause lists on the dot-joined spelling (`p.S`), while a bare
+        // name is its own leaf.
+        let leaf = head_bytes
+            .rsplit(|&b| b == b'.')
+            .next()
+            .unwrap_or(head_bytes);
+        let matches = head_bytes == entry_text.as_bytes() || leaf == entry_text.as_bytes();
+        let range = matches.then(|| SourceRange {
+            offset: self.utf16_of(head_start),
+            length: self.utf16_of(end) - self.utf16_of(head_start),
+        });
+        (range, end)
+    }
+
+    /// The `{0}` argument of a `subtype_of_disallowed_type` row (#3154):
+    /// the written clause entry's type display — `int`, `Null`, `FutureOr`
+    /// — with `FutureOr`'s bare head widening to `FutureOr<dynamic>`
+    /// (upstream's `namedType.type` display: the bare `FutureOr` resolves
+    /// to `FutureOr<dynamic>`, `DartType.getDisplayString`,
+    /// inheritance_override.dart:648-649).
+    fn disallowed_subtype_message(&self, range: SourceRange) -> String {
+        let start = self.byte_of(range.offset);
+        let end = self.byte_of(range.end()).min(self.source.len());
+        let text = &self.source[start..end];
+        if text == "FutureOr" {
+            "FutureOr<dynamic>".to_string()
+        } else {
+            text.to_string()
         }
     }
 }
