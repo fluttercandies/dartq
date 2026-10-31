@@ -6589,27 +6589,33 @@ impl<'a> Engine<'a> {
                 shape,
                 nullable: false,
             } => {
-                let (type_params, return_ty, positional, named) = {
+                let (type_params, type_params_named, return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.type_params_named.clone(),
                         shape.return_ty,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
                 };
-                Some(Box::new(FnVarSig {
-                    // The interned shape carries only the type-parameter
-                    // count — anonymous entries (no name, no bound) feed
-                    // the count rule of [`Engine::fn_sig_subtype`];
-                    // their bounds are unknown and never decide. Named,
-                    // bounded entries exist only through the
-                    // written-signature stash (`fn_var_sigs`) and the
-                    // alias faces the bounds capture serves.
-                    params: (0..usize::from(type_params))
+                // The interned shape's own `<T extends B>` group rides the
+                // signature when the producer recorded it (#2878's
+                // `type_params_named` column — tear-offs and the folded
+                // parameterized-alias faces carry names and written
+                // bounds, which `fn_sig_subtype`'s `relateTypeParameters`
+                // equality leg decides over; a count-only shape keeps the
+                // anonymous entries — no name, no bound, never deciding.
+                let params: Vec<(StringId, Option<Ty>)> = if type_params_named.is_empty() {
+                    (0..usize::from(type_params))
                         .map(|_| (StringId::NONE, None))
-                        .collect(),
+                        .collect()
+                } else {
+                    type_params_named.into()
+                };
+                Some(Box::new(FnVarSig {
+                    params: params.into(),
                     required_positional: u16::try_from(positional.len()).unwrap_or(u16::MAX),
                     positional: positional.into(),
                     named: named.iter().map(|(name, ty)| (*name, *ty, false)).collect(),
@@ -8021,3 +8027,12 @@ mod ticket_2487_tests;
 #[cfg(test)]
 #[path = "ticket_3202_tests.rs"]
 mod ticket_3202_tests;
+
+// The #3209 pins (bounds_conformance — the isSubtypeOf
+// instantiate-to-bounds residual, the super-bounds arm, and the
+// generic-bound residual). Same `#[path]` registration as the pins
+// above: the module stays inside the `diagnose` subtree so
+// `super::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_bounds_tests.rs"]
+mod ticket_bounds_tests;
