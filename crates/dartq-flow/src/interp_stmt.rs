@@ -1256,13 +1256,25 @@ impl Interp<'_> {
                 // Nested lists swap-and-save the enclosing context (#1051,
                 // paired at `VarDeclEnd`) — an inner list's header must not
                 // discard the outer list's type for its remaining items.
-                let ty = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
+                let pending = self.pending_ty.take();
+                let ty = pending.unwrap_or(Ty::UNKNOWN);
                 let args = std::mem::take(&mut self.pending_ty_args);
+                let pending_written = std::mem::take(&mut self.pending_ty_written);
+                // The declared/written distinction (official
+                // `isImplicitlyTyped` inverted): the header counts as
+                // written only when a real annotation event delivered the
+                // pending type — `Ev::NoType` lands the same `UNKNOWN`
+                // face but marks the declarator inferred, and a stale
+                // leftover pending type (an annotation that survived its
+                // own consumer's construct) must not masquerade as this
+                // declaration's header.
+                let written = pending.is_some() && pending_written;
                 let outer = std::mem::replace(
                     &mut self.decl,
                     DeclCtx {
                         late: *late,
                         is_final: *is_final,
+                        written,
                         // The header's annotation arrives as `Type`/`NoType`
                         // events immediately ahead of this event (statements
                         // and fields both parse the type before
@@ -1295,6 +1307,7 @@ impl Interp<'_> {
                     args: self.decl.args,
                     late: self.decl.late,
                     is_final: self.decl.is_final,
+                    written: self.decl.written,
                     decl_span: Some(token.range),
                     // The initializer's proven constant lands at
                     // `InitializerEnd` when the declaration is
@@ -1354,6 +1367,14 @@ impl Interp<'_> {
             }
             Ev::InitializerEnd => {
                 self.init_exec_depth = None;
+                // An annotation that survived to the initializer's end was
+                // written INSIDE it (a local function's return type, a
+                // test/cast the consumer already dropped) — it never was
+                // the next declaration's header, so it must not wait in
+                // `pending_ty` to be adopted by the following `VarDeclBegin`
+                // (the stale-annotation leak).
+                self.pending_ty = None;
+                self.pending_ty_written = false;
                 // The deferred-context pair closes (the late note at
                 // `InitializerBegin`): a late initializer's interior state
                 // restores — the declaration's own initialize write below
@@ -1428,12 +1449,20 @@ impl Interp<'_> {
                     } else {
                         None
                     };
-                    // The declared-type slot the written header left unknown
-                    // adopts the initializer's inferred face (#2140): the
-                    // semantic layer's staged type wins when present.
-                    // Otherwise the fold's own initializer read is the
-                    // official `_inferLocalVariable` input, so a nullable
-                    // spelled face adopts whole — the written-argument tree
+                    // The inferred-face adoption is the official's
+                    // implicitly-typed arm ONLY (`_inferLocalVariable` —
+                    // `isImplicitlyTyped` in `flow_analysis.dart` `declare`):
+                    // a WRITTEN annotation owns the declared slot outright
+                    // (`int? q = 0` keeps `int?` — the initializer's `int`
+                    // never replaces it), and the `Unknown` base alone
+                    // cannot tell "no annotation" from "the annotation
+                    // never reached the slot". #3075.
+                    //
+                    // For the implicitly-typed declarator the semantic
+                    // layer's staged type wins when present. Otherwise the
+                    // fold's own initializer read is the official
+                    // `_inferLocalVariable` input, so a nullable spelled
+                    // face adopts whole — the written-argument tree
                     // included, which the staging seam cannot carry
                     // (#2243). A non-nullable spelled face keeps the
                     // unknown slot: every null-check disjointness and
@@ -1453,7 +1482,7 @@ impl Interp<'_> {
                     // reads unpromoted where the official's
                     // `_inferLocalVariable` typed them nullable.
                     if let Some(meta) = self.vars.get_mut(var as usize)
-                        && meta.ty.base == crate::ty::Base::Unknown
+                        && !meta.written
                     {
                         let staged = meta
                             .decl_span
@@ -1536,12 +1565,14 @@ impl Interp<'_> {
                     // type itself (nothing to promote toward), and a
                     // `final`/`const` local's initializer never promotes
                     // (`final Object? o = true` stays `Object?` upstream).
-                    // The implicit face is the written header's unknown
-                    // slot; `rhs.literal` rides the same collection-literal
+                    // `decl.written` is `!isImplicitlyTyped` verbatim — the
+                    // `Unknown` base alone could not tell an implicit `var`
+                    // from an annotation that never reached the slot.
+                    // `rhs.literal` rides the same collection-literal
                     // bridge the plain-assign write passes
                     // (`Object? o = <num>[]` promotes `o` to `Object`).
                     let promote_to_interest = !self.decl.is_final
-                        && self.decl.ty.base != crate::ty::Base::Unknown;
+                        && self.decl.written;
                     self.apply_write(
                         var,
                         rhs.ty,
@@ -1598,11 +1629,13 @@ impl Interp<'_> {
                     Some(ty) => ty,
                 };
                 let args = std::mem::take(&mut self.pending_ty_args);
+                let written = std::mem::take(&mut self.pending_ty_written);
                 let meta = VarMeta {
                     ty,
                     args,
                     late: false,
                     is_final: false,
+                    written,
                     decl_span: Some(token.range),
                     // A parameter carries no proven constant — its value
                     // arrives from the caller.

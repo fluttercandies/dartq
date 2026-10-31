@@ -45,6 +45,13 @@ pub(crate) struct VarMeta {
     /// the SSA node's null-on-write equivalent), so a reassigned local
     /// folds nothing.
     pub const_bool: Option<bool>,
+    /// Whether the declarator carried a written type annotation (the
+    /// `DeclCtx::written` snapshot taken at `InitializedIdent`; the
+    /// official's `isImplicitlyTyped` inverted). The `InitializerEnd`
+    /// inferred-face adoption must never overwrite a written annotation —
+    /// the declared slot keeps it even when the annotation's spelling
+    /// reduced to the unknown face.
+    pub written: bool,
 }
 
 /// One lexical scope frame: name id to variable id.
@@ -533,6 +540,14 @@ pub(crate) struct DeclCtx {
     /// The declared type's written arguments (arena index), beside
     /// [`DeclCtx::ty`].
     pub args: u32,
+    /// Whether the declaration's header carried a written type annotation
+    /// (the official `isImplicitlyTyped` inverted): `Ev::Type`/
+    /// `FunctionType`/`VoidType` written, `Ev::NoType` not. This is the
+    /// declared/written distinction the inferred-local adoption and the
+    /// type-of-interest promotion key on (`flow_analysis.dart` `declare`'s
+    /// `isImplicitlyTyped` arm) — `ty.base == Unknown` conflates "no
+    /// annotation" with "the annotation never reached the slot".
+    pub written: bool,
 }
 
 impl Default for DeclCtx {
@@ -542,6 +557,7 @@ impl Default for DeclCtx {
             is_final: false,
             ty: Ty::UNKNOWN,
             args: crate::ty::EMPTY_ARGS,
+            written: false,
         }
     }
 }
@@ -1280,6 +1296,11 @@ pub(crate) struct Interp<'o> {
     /// The pending declared type's written arguments (formal, pattern
     /// variable consumers), beside [`Interp::pending_ty`].
     pub(crate) pending_ty_args: u32,
+    /// Whether `pending_ty` came from a written annotation event
+    /// (`Ev::Type`/`FunctionType`/`VoidType`) rather than `Ev::NoType` —
+    /// the declared/written half of the header the next `VarDeclBegin`
+    /// adopts into [`DeclCtx::written`].
+    pub(crate) pending_ty_written: bool,
     pub(crate) in_decl: bool,
     pub(crate) in_type_test: bool,
     pub(crate) in_as_cast: bool,
@@ -1631,6 +1652,7 @@ impl<'o> Interp<'o> {
             tested_args: crate::ty::EMPTY_ARGS,
             as_cast_args: crate::ty::EMPTY_ARGS,
             pending_ty_args: crate::ty::EMPTY_ARGS,
+            pending_ty_written: false,
             in_decl: false,
             in_type_test: false,
             in_as_cast: false,
@@ -4138,16 +4160,18 @@ impl Interp<'_> {
             if let Some((staged_ty, staged_args)) = staged {
                 element_ty = (staged_ty, staged_args);
                 // The declared slot the `final e`/`var e` head left
-                // unknown adopts the element type — the same inferred-type
-                // fill `InitializerEnd` performs for `var v = e`.
+                // unwritten adopts the element type — the same
+                // inferred-type fill `InitializerEnd` performs for
+                // `var v = e` (`meta.written` keeps a written head's
+                // annotation, the #3075 distinction).
                 if let Some(meta) = self.vars.get_mut(var as usize)
-                    && meta.ty.base == crate::ty::Base::Unknown
+                    && !meta.written
                 {
                     meta.ty = staged_ty;
                     meta.args = staged_args;
                 }
             } else if let Some(meta) = self.vars.get_mut(var as usize)
-                && meta.ty.base == crate::ty::Base::Unknown
+                && !meta.written
             {
                 meta.ty = element_ty.0;
                 meta.args = element_ty.1;

@@ -509,11 +509,13 @@ impl Interp<'_> {
                 // alternation beside it still anchors
                 // (`Rectangle(:var areaAsInt || var areaAsInt)` over a
                 // `Shape` scrutinee).
+                let written = std::mem::take(&mut self.pending_ty_written);
                 let meta = VarMeta {
                     ty: declared,
                     args: declared_args,
                     late: false,
                     is_final: *is_final,
+                    written,
                     decl_span: Some(token.range),
                     // Pattern binders never carry a proven constant: the
                     // matched value is a runtime extraction, not a fold.
@@ -643,6 +645,7 @@ impl Interp<'_> {
                 // collect pre-pass (the rollback does not cover `pattern`).
                 let declared = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
                 let declared_args = std::mem::take(&mut self.pending_ty_args);
+                self.pending_ty_written = false;
                 // An untyped `_` at depth 1 leaves the case's unmatched
                 // chain to the semantic layer's chain-start emission — the
                 // flow kill here would duplicate those rows through the
