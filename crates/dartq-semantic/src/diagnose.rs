@@ -5768,6 +5768,14 @@ mod ticket_3064_tests;
 #[cfg(test)]
 mod ticket_3067_tests;
 
+/// The #3063 pins — the binary operator's node type: `num + double`
+/// refines to `double` (the shadow guard tests `num`'s absence, never the
+/// receiver's own spelling), and the resolved operator's declared
+/// signature instantiates over the receiver's written arguments
+/// (`Box<int> + Box<int>` answers `Box<int>`, never the raw `Box<T>`).
+#[cfg(test)]
+mod ticket_3063_tests;
+
 /// The #2499 pins: the unnamed extension face's members report exactly
 /// once — the `DeclKind::Member` arm defers every unnamed-face verdict to
 /// the extension face loop (the duplicate emission staged the row from

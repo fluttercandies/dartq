@@ -1,78 +1,78 @@
-//! The #2569 pins: dead-code and switch exhaustiveness sweep — fill in as roots close. The rig
-//! declares no imports, so every pin spells custom types only.
+//! The #2569 pins: dead-code and switch-exhaustiveness sweep.
+//!
+//! The first root closed here is the C-style `for` **condition** death: a
+//! condition slice that turns the flow unreachable mid-expression opens no
+//! dead interval of its own (the literal polls inside a condition are gated
+//! off as header parts), so the updaters' own row and the body block's row
+//! stood in for the official's single condition-anchored row. The official
+//! verifier anchors on the first node it VISITS after the kill
+//! (upstream Dart SDK source,
+//! pkg/analyzer/lib/src/error/dead_code_verifier.dart:183-205) — the
+//! argument after the `throw`, not the throwing argument itself — and the
+//! enclosing close folds out to the loop's end. Both statement and
+//! collection-element forms share the face.
 
+use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::*;
-use crate::collector::collect;
-use dartq_language::{FeatureSet, LanguageVersion};
-use dartq_resolution::LibraryGraphBuilder;
-use dartq_scanner::ScanConfig;
-use dartq_source::FileTable;
-use std::path::Path;
 
-/// Diagnoses `source` as the sole file of a library with no imports —
-/// the single-file rig (`ticket_2564_tests`' shape).
-fn report(source: &str) -> FileReport {
-    let strings = StringTable::new();
-    let mut files = FileTable::new();
-    let file = files.intern(Path::new("main.dart"));
-    let scanned = dartq_scanner::scan(
-        source,
-        ScanConfig {
-            enable_triple_shift: true,
-            enable_augmentations: true,
-        },
-        file,
-    );
-    assert!(
-        scanned.diagnostics.is_empty(),
-        "scanner diagnostics: {source:?}"
-    );
-    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
-    let features = ParserFeatures::from_feature_set(set);
-    let elements = collect(source, &scanned.tokens, features, &strings);
-    let mut builder = LibraryGraphBuilder::new(&strings);
-    let lib = builder.intern("package:t/main.dart");
-    let mut index = ElementIndex::default();
-    index.insert(file, elements.clone());
-    for (name, decl) in elements.declarations() {
-        if decl.kind == MicroKind::TypeParam {
-            continue;
-        }
-        builder.declare(lib, name, file);
-    }
-    let graph = builder.finish();
-    let namespaces = Namespaces::build(&graph);
-    let fold = fold_unit(
-        source,
-        &scanned.tokens,
-        features,
-        &strings,
-        file,
-        lib,
-        &graph,
-        &namespaces,
-        &index,
-        StrictModes::default(),
-        &LibraryClassModifiers::default(),
-        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
-    );
-    let mut report = fold.report;
-    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
-    report
+/// The absolute fixture offset of `needle` (the prelude the rig prepends
+/// included; the fixtures are ASCII, so byte offset == UTF-16 offset).
+fn at(fixture: &str, needle: &str) -> usize {
+    CORE_PRELUDE.len() + fixture.find(needle).unwrap()
 }
 
-fn count_code(report: &FileReport, name: &str) -> usize {
+/// The analyzed text [`report_ops`] diagnoses — the slice domain the row
+/// offsets address.
+fn analyzed(fixture: &str) -> String {
+    format!("{CORE_PRELUDE}{fixture}")
+}
+
+/// The `dead_code` rows as `offset:length`, the span convention under pin.
+fn dead_rows(report: &FileReport) -> Vec<String> {
     report
         .diagnostics
         .iter()
-        .filter(|d| d.code.name == name)
-        .count()
-}
-
-fn messages(report: &FileReport) -> Vec<String> {
-    report
-        .diagnostics
-        .iter()
-        .map(|d| format!("{}: {}", d.code.name, d.message))
+        .filter(|d| d.code.name == "dead_code")
+        .map(|d| format!("{}:{}", d.range.offset, d.range.length))
         .collect()
+}
+
+/// Pin 1 — the statement form. `g(throw 0, 1)`'s second argument is the
+/// first node the walk visits after the `throw` killed the flow, so the row
+/// opens there and runs through the loop's tail: oracle `3:21|9` over
+/// `1); 2) {}`. The pre-fix rows were the updater (`2`) and the body block
+/// (`{}`) — two rows the oracle never emits.
+#[test]
+fn for_condition_death_anchors_at_the_post_throw_argument() {
+    let source = "\
+void f(bool Function(Object?, Object?) g) {
+  for (; g(throw 0, 1); 2) {}
+}
+";
+    let report = report_ops(source);
+    let start = at(source, "1); 2) {}");
+    assert_eq!(
+        dead_rows(&report),
+        vec![format!("{start}:9")],
+        "{:#?}",
+        rows(&report)
+    );
+    assert_eq!(&analyzed(source)[start..start + 9], "1); 2) {}");
+}
+
+/// Pin 2 — the collection-element form shares the face: the same
+/// condition-anchored row, folded out to the arrow body's `;` (oracle
+/// `2:60|10` over `1); 2) 0];`).
+#[test]
+fn for_element_condition_death_shares_the_condition_anchor() {
+    let source = "f(bool Function(Object?, Object?) g) => [for (; g(throw 0, 1); 2) 0];\n";
+    let report = report_ops(source);
+    let start = at(source, "1); 2) 0];");
+    assert_eq!(
+        dead_rows(&report),
+        vec![format!("{start}:10")],
+        "{:#?}",
+        rows(&report)
+    );
+    assert_eq!(&analyzed(source)[start..start + 10], "1); 2) 0];");
 }

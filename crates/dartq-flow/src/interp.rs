@@ -1349,6 +1349,14 @@ pub(crate) struct Interp<'o> {
     /// still reads a live state, so a following statement compares the
     /// exit position with its own begin.
     pub(crate) exit_at: Option<u32>,
+    /// Index of the last event whose step turned a reachable state
+    /// unreachable ([`Interp::run_range`]). The official verifier anchors
+    /// the dead interval on the first node it VISITS after the flow died —
+    /// a node the event that killed the flow does not carry (`for (;
+    /// g(throw 0, 1); 2)`'s `1`, dead_code_verifier.dart:183-205). A
+    /// header part replays as its own event slice, so the condition's
+    /// post-death anchor is recovered from this index.
+    pub(crate) death_index: Option<usize>,
     /// The outermost executable's own end offset when it is a `;` (an
     /// arrow body's terminator — the official covering node is the
     /// ExpressionFunctionBody, whose `node.end` includes it). Zero for
@@ -1663,6 +1671,7 @@ impl<'o> Interp<'o> {
             arm_dead_depth: 0,
             stmt_began_dead: false,
             exit_at: None,
+            death_index: None,
             outer_exec_end: 0,
             if_null_skips: Vec::new(),
             vacuous_object: None,
@@ -3289,9 +3298,19 @@ impl Interp<'_> {
     pub(crate) fn run_range(&mut self, events: &[Ev], range: Range<usize>, match_of: &[u32]) {
         let mut i = range.start;
         while i < range.end && !self.bailed {
+            let live = self.reachable();
+            let at = i;
             match self.step(events, i, match_of) {
                 Control::Continue => i += 1,
                 Control::Jump(to) => i = to.max(range.start),
+            }
+            // Remember where the flow died: the official verifier anchors
+            // the dead interval on the first node it visits AFTER the kill,
+            // which is the next spanned event of the same slice (the kill
+            // itself carries no span: `Ev::Throw`/`Ev::Exit`). Collect
+            // runs roll their reachability back and record nothing.
+            if live && !self.reachable() && !self.collecting() {
+                self.death_index = Some(at);
             }
         }
     }
@@ -3732,11 +3751,12 @@ impl Interp<'_> {
         // covering close's full fold (`for (throw 0; c;) {}` reports
         // `c;) {}`). A DEEPER anchor (a dead argument inside the condition
         // — its parent is an ArgumentList, the arm misses) keeps the fold
-        // too: `for (; g(throw 0, 1); 2) {}` reports `1; 2) {}`. The
-        // condition's own offset is its first spanned event's (the
-        // post-order stream keeps leaf order). Statement and element
-        // forms share the face (oracle rows 3:17|7 and 2:23|7). A
-        // recovery-spliced header (the comma-init list's `ForInit` marker
+        // too: `for (; g(throw 0, 1); 2) {}` anchors at the argument
+        // (oracle row `3:21|9` over `1); 2) {}`, the element form's
+        // `2:60|10`), which `run_header_expr`'s post-death anchor opens and
+        // this freeze must leave alone. The condition's own offset is its
+        // first spanned event's (the post-order stream keeps leaf order).
+        // A recovery-spliced header (the comma-init list's `ForInit` marker
         // lands past the offset scan's updater boundary) inverts the
         // condition region — every other consumer iterates it (an empty
         // walk); the raw slice here must do the same and answer no
@@ -3948,9 +3968,32 @@ impl Interp<'_> {
     ) -> Option<Expr> {
         self.for_header_depth += 1;
         self.header_cond_depth += 1;
-        self.run_range(events, range, match_of);
+        self.run_range(events, range.clone(), match_of);
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
         self.header_cond_depth = self.header_cond_depth.saturating_sub(1);
+        // The condition's post-death anchor (official `_visitNode`'s
+        // first-unreachable-node rule, dead_code_verifier.dart:183-205).
+        // The C-for condition replays as its own slice, and the literal
+        // polls inside a condition are gated off (`for_header_depth ==
+        // header_cond_depth`'s header-part face), so a condition that kills
+        // the flow mid-slice opens no interval at all — the updaters' own
+        // row plus the body's would stand in for the official's single
+        // condition-anchored row (`for (; g(throw 0, 1); 2) {}` reports
+        // `1); 2) {}` once, never the updater and the body). The first
+        // spanned event after the kill is that node; the kill event itself
+        // (`Ev::Throw`/`Ev::Exit`) carries no span, and an anchor an inner
+        // poll already opened keeps ownership.
+        if !self.collecting()
+            && !self.reachable()
+            && self.dead.is_none()
+            && let Some(death) = self.death_index
+            && range.contains(&death)
+            && let Some(anchor) = events[death + 1..range.end]
+                .iter()
+                .find_map(|event| event.span())
+        {
+            self.dead_code(anchor);
+        }
         // The slice is one expression: null-shorting opened inside it ends
         // here (official `finishNullShorting` at the dispatch boundary); an
         // enclosing `?` chain stays open.
