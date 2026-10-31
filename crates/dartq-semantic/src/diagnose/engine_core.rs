@@ -389,9 +389,11 @@ impl<'a> Engine<'a> {
             exports: Vec::new(),
             label_scopes: Vec::new(),
             catch_on_type: None,
+            catch_on_record: false,
             catch_on_miss_rows: Vec::new(),
             catch_on_nullable: None,
             catch_clause_start: None,
+            catch_head_end: None,
             catch_params: 0,
             catch_trace_slot: false,
             catch_formal_group: None,
@@ -616,7 +618,7 @@ impl<'a> Engine<'a> {
     /// answers both: an `Intent::Invoke` row spans the callee's name
     /// token (the `.at(methodName)` anchor), every other operand row spans
     /// its own expression. A non-`void` operand is a no-op.
-    fn emit_use_of_void_result(&mut self, ty: Ty, operand: &Row) {
+    pub(crate) fn emit_use_of_void_result(&mut self, ty: Ty, operand: &Row) {
         if ty == Ty::Void {
             self.emit(SemanticCode::UseOfVoidResult, operand.range, "", "");
         }

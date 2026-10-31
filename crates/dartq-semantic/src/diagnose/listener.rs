@@ -962,6 +962,23 @@ impl ParserListener for DiagnoseListener<'_> {
         // enclosing catch clause's `on` head (`on (e) { ... }` — the
         // records-feature ambiguity recovery).
         self.engine.record_type_depth += 1;
+        // A record that OPENS the clause's `on` head (`on (A, B)` — the
+        // head is a paren token with no name reference, so no
+        // `TypeReference` ever claims it) is the catch-all face: upstream's
+        // resolved `exceptionType` is never `isDartCoreObject` here, so the
+        // clause must keep `on_type: None` while its field types' references
+        // go about their normal rows. The guard reads the head window: the
+        // clause is open, no parameter was consumed, and no name head has
+        // claimed the clause yet. A record type inside the clause BODY
+        // (`on String { var (A, B) x = …; }`) misses the third leg, and a
+        // body record after an already-record head misses the latch itself.
+        if self.engine.catch_clause_start.is_some()
+            && self.engine.catch_params == 0
+            && self.engine.catch_on_type.is_none()
+            && !self.engine.catch_on_record
+        {
+            self.engine.catch_on_record = true;
+        }
         // The written-record capture (F-R): the field types collect on the
         // level until `end_record_type` interns the shape.
         self.engine.record_ty_stack.push(RecordTyLevel::default());
@@ -1922,9 +1939,15 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.catch_clause_start = Some(token.range);
         engine.catch_on_type = None;
+        engine.catch_on_record = false;
         engine.catch_on_nullable = None;
+        engine.catch_head_end = None;
         engine.catch_params = 0;
         engine.catch_trace_slot = false;
+        // The clause fact's end is ITS body block's end: a recovered clause
+        // with no block (`on X;` — `expected_body`) must not inherit the end
+        // of whatever block closed before it.
+        engine.last_block_end = None;
         engine.push_block_frame();
     }
 
@@ -1932,7 +1955,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_catch_clause(token);
 
         // The frame pop moved to `handle_catch_block` (the clause's body
-        // block parses between the two events).
+        // block parses between the two events). The peek token opens the
+        // body, so its offset is the head's exclusive end — the fact's end
+        // only when no body block materialized (`on X;`).
+        self.engine.catch_head_end = Some(token.range.offset);
     }
 
     fn begin_for_statement(&mut self, token: Token) {
@@ -12532,3 +12558,12 @@ mod ticket_3172_tests;
 #[cfg(test)]
 #[path = "ticket_3165_tests.rs"]
 mod ticket_3165_tests;
+
+/// The #3179 pins (the `on`-head shapes that resolve to a null/record
+/// `exceptionType` upstream — a record type, a named-record recovery, and
+/// the bare `on (…)` parse — joining the try's clause list as the catch-all
+/// face, plus the `on Object?` subtype arm;
+/// dead_code_verifier.dart:552-608).
+#[cfg(test)]
+#[path = "ticket_3179_tests.rs"]
+mod ticket_3179_tests;

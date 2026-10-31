@@ -432,7 +432,7 @@ impl<'a> Engine<'a> {
     /// leave scope only after the body.
     pub(crate) fn finish_catch_clause(&mut self) {
         let mark = self.frame_local_marks.last().copied();
-        let auto = self.catch_on_type.is_none()
+        let auto = (self.catch_on_type.is_none() && !self.catch_on_record)
             || mark.is_some_and(|mark| {
                 self.locals[mark..]
                     .iter()
@@ -446,22 +446,42 @@ impl<'a> Engine<'a> {
             }
         }
         self.catch_params = 0;
+        let record_head = std::mem::take(&mut self.catch_on_record);
         let Some(start) = self.catch_clause_start.take() else {
             self.catch_on_type = None;
             self.catch_on_nullable = None;
+            self.catch_head_end = None;
             // The `on`-type miss offsets stay: pass 2 resolves the TypeUse
             // rows after the clauses closed, and each offset is consumed
             // by exact match.
             return;
         };
-        let on_type = self.catch_on_type.take();
+        // A record-typed (or otherwise paren-headed) `on` head resolves to
+        // a null/record `exceptionType` upstream — never `isDartCoreObject`
+        // — so the clause joins the list as the catch-all face (bare
+        // `catch`), which is what makes the FOLLOWING clauses report
+        // `dead_code_catch_following_catch`. The head's own name references
+        // (a valid record type's field types) already ran their rows; they
+        // must not turn the clause into a named on-clause.
+        let on_type = self.catch_on_type.take().filter(|_| !record_head);
         let on_nullable = self.catch_on_nullable.take().unwrap_or(false);
+        // A clause whose body block never materialized (`on X;` —
+        // `expected_body`) ends at its head's recovery boundary, not at a
+        // block end that never came.
+        let end = self.last_block_end.unwrap_or(SourceRange {
+            offset: start.offset,
+            length: self
+                .catch_head_end
+                .take()
+                .unwrap_or(start.offset)
+                .saturating_sub(start.offset),
+        });
         if let Some(clauses) = self.try_clauses.last_mut() {
             clauses.push(CatchClauseFact {
                 on_type,
                 on_nullable,
                 start,
-                end: self.last_block_end.unwrap_or(start),
+                end,
             });
         }
         self.pop_frame();
@@ -722,6 +742,20 @@ impl<'a> Engine<'a> {
         };
         let rhs_end = self.if_null_rhs_end.take();
         self.stage_if_null_result(mark, op_range);
+        // The void-operand use (upstream `visitBinaryExpression` →
+        // `checkForUseOfVoidResult(node.leftOperand)` at error_verifier.
+        // dart:482): `x ?? d` reads the LEFT operand's value unconditionally
+        // — a `void`-typed `x` reports at its own span. The left operand is
+        // the row directly below the `??` group mark.
+        if let Some(left) = mark
+            .checked_sub(1)
+            .and_then(|index| self.rows.get(index))
+            .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
+            && self.operand_static_ty(left) == Ty::Void
+        {
+            let range = left.range;
+            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        }
         let mut lhs_is_bool_comparison = false;
         if let Some(eq) = self.eq_spans.last().copied() {
             // The comparison's own extent: its two operand rows — the eq
