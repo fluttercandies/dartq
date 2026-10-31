@@ -2610,6 +2610,22 @@ impl<'a> Engine<'a> {
                 .as_ref()
                 .map(|deferred| Self::clause_window_offsets(&deferred.spans))
                 .unwrap_or_default();
+            // The outside-library modifier families drive enums too: the
+            // oracle's `visitEnumDeclaration` runs `_checkClassInheritance`
+            // with a null superclass and the enum's `with`/`implements`
+            // clauses whenever either exists (upstream Dart SDK source,
+            // `pkg/analyzer/lib/src/generated/error_verifier.dart:823-863`),
+            // so `enum E implements BaseClass` owes
+            // `base_class_implemented_outside_of_library` at the written
+            // entry exactly like a class does (the co19 Class-modifiers
+            // suite's `test_enum_outside` family). The deferred slot is
+            // taken for the call and restored, so the later `@sealed` drain
+            // still reads it.
+            let deferred = self.deferred_modifier.take();
+            if let Some(deferred) = deferred.as_ref() {
+                self.check_modifier_use_sites(container, deferred.name_range, &deferred.spans);
+            }
+            self.deferred_modifier = deferred;
             self.check_clause_element_kinds(container, &window);
         }
     }
@@ -2985,7 +3001,11 @@ impl<'a> Engine<'a> {
     /// base-or-final subtype requirement (`BaseOrFinalTypeVerifier
     /// .checkElement`) anchors the declaring name — `.at(nameToken)`.
     /// Classes and named mixin applications carry extends/with/implements,
-    /// mixins implements/`on`; enums have no official drive.
+    /// mixins implements/`on`; enums ride the class drive with a null
+    /// superclass and the `with`/`implements` clauses the grammar allows
+    /// (`visitEnumDeclaration` → `_checkClassInheritance`,
+    /// error_verifier.dart:823-863), drained from the enum's own
+    /// implements-claim event.
     pub(crate) fn check_modifier_use_sites(
         &mut self,
         container: StringId,
@@ -3135,16 +3155,31 @@ impl<'a> Engine<'a> {
     /// _currentLibrary`, error_verifier.dart:5619-5622/:5917-5921/:3725-3730)
     /// compare the right pair.
     pub(crate) fn resolve_super(&self, name: StringId) -> Option<((FileId, StringId), LibraryId)> {
-        let (_, owner) = resolve_container(
+        if let Some((_, owner)) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
             self.lib,
             self.file,
             name,
-        )?;
-        let lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(self.lib);
-        Some(((owner, name), lib))
+        ) {
+            let lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(self.lib);
+            return Some(((owner, name), lib));
+        }
+        // A type ALIAS in clause position resolves to its right-hand head:
+        // every outside-library family reads `namedType.type` — the resolved
+        // interface type — so `class B implements TypedefBase` sees the
+        // aliased class (the diagnostic names the CLASS, never the alias)
+        // while the row still anchors on the written entry
+        // (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/generated/error_verifier.dart:3317-3345`
+        // `_checkForBaseClassOrMixinImplementedOutsideOfLibrary` and the
+        // sibling `_checkFor*OutsideOfLibrary` reads; the co19
+        // Class-modifiers `*_t0x` suites name their shapes through
+        // `typedef TypedefBaseClass = BaseClass;`).
+        let (_, owner, head) = self.alias_container_head(name, self.lib, self.file)?;
+        let lib = owner_library(self.graph, self.lib, owner, head).unwrap_or(self.lib);
+        Some(((owner, head), lib))
     }
 
     /// The use-site decisions, computed read-only and emitted by the caller:
@@ -3202,13 +3237,42 @@ impl<'a> Engine<'a> {
                 span: spans.extends.unwrap_or(name_range),
             });
         }
-        for name in &decl.with_clause {
+        // The `with` faces' written spans: the UNCLAIMED tail of the clause
+        // buffer — the implements claim consumed the entries written ahead of
+        // them, and nothing claims the `with` window, so the last
+        // `with_clause` entries are the `with` faces in application order
+        // (the same tail slice [`Self::check_modifier_use_sites`] hands the
+        // `dart:ffi` face). A `with`-only header never closes its extends
+        // window, so its FIRST entry sits in the (never committed) candidate
+        // slot and the buffer stays short — the clause scanner's `With` rows
+        // then supply the spans ([`Self::header_with_entry_spans`]). The
+        // sealed rows anchor there (`.at(namedType)`,
+        // error_verifier.dart:7019-7034); a missing span (a claim/count
+        // disagreement in a recovery shape) falls back to the declaring name.
+        let with_spans: Vec<SourceRange> = {
+            let count = decl.with_clause.len();
+            let mut tail: Vec<SourceRange> = Vec::new();
+            if count > 0 {
+                if decl.superclass.is_none() {
+                    tail.extend(spans.super_candidate);
+                }
+                tail.extend(spans.buffered.iter().copied());
+            }
+            if count == 0 {
+                Vec::new()
+            } else if tail.len() >= count {
+                tail[tail.len() - count..].to_vec()
+            } else {
+                self.header_with_entry_spans(container)
+            }
+        };
+        for (index, name) in decl.with_clause.iter().enumerate() {
             if let Some((handle, lib)) = self.resolve_super(*name) {
                 withs.push(ResolvedSuper {
                     handle,
                     lib,
                     relation: Relation::MixesIn,
-                    span: name_range,
+                    span: with_spans.get(index).copied().unwrap_or(name_range),
                 });
             }
         }
@@ -3241,9 +3305,11 @@ impl<'a> Engine<'a> {
             ),
         };
         let mut findings = Vec::new();
-        // The class-family/mixin drive split (error_verifier.dart:2770-2784
-        // and :8195-8206): enums carry neither.
-        let class_family = decl.kind == ContainerKind::Class;
+        // The class-family/mixin drive split (error_verifier.dart:2327-2370
+        // and :7808-7845): an ENUM rides the class drive with a null
+        // superclass (`visitEnumDeclaration` → `_checkClassInheritance`,
+        // :823-863), so it carries the `with` face and never the `on` one.
+        let class_drive = matches!(decl.kind, ContainerKind::Class | ContainerKind::Enum);
         // Pass 1 — the base-implemented walks (`implements` entries, the
         // named type plus its transitive supertypes, first report per
         // entry; :3712-3752).
@@ -3343,16 +3409,22 @@ impl<'a> Engine<'a> {
         }
         // Pass 4 — the sealed faces, every written face checked
         // independently (the official NamedType lists: class drive
-        // superclass + `implements`, mixin drive `implements` + `on`;
-        // :7424-7437). The official class drive also lists the `with` types
-        // (:2780-2784), but that drive sits behind the
-        // `_checkForAllMixinErrorCodes` gate (:2746-2752) and a sealed
-        // *proper mixin* cannot exist (the declaration matrix forbids
-        // `sealed mixin`) — every reachable `with` input trips the gate's
-        // with-non-mixin problem, so the observable oracle never reports
-        // sealed through `with`. The `with` face stays out of the list.
-        let sealed_faces: Vec<&ResolvedSuper> = if class_family {
-            extends.iter().chain(implements.iter()).collect()
+        // superclass + `with` + `implements` — error_verifier.dart:2363-2367
+        // `[?superclass, ...?withClause?.mixinTypes,
+        // ...?implementsClause?.interfaces]`; mixin drive `implements` +
+        // `on` — :7838-7841). The class drive sits behind the
+        // `_checkForAllMixinErrorCodes` gate (:2338-2342), but that gate's
+        // class-used-as-mixin arm reports its own row WITHOUT setting
+        // `problemReported` (:2488-2500), so a sealed class reached through
+        // `with` reports beside `class_used_as_mixin`
+        // (`test_mixinOutside_rawClass`). Enums ride the class drive with a
+        // null superclass, so their `with` entries join here too.
+        let sealed_faces: Vec<&ResolvedSuper> = if class_drive {
+            extends
+                .iter()
+                .chain(withs.iter())
+                .chain(implements.iter())
+                .collect()
         } else {
             implements.iter().chain(ons.iter()).collect()
         };
@@ -3372,7 +3444,7 @@ impl<'a> Engine<'a> {
         // (base_or_final_type_verifier.dart:47-74). The `{1}` slot names
         // the nearest explicit `base`/`final` ancestor, not the direct
         // super (:198/:222-315).
-        let subtype_faces: Vec<&ResolvedSuper> = if class_family {
+        let subtype_faces: Vec<&ResolvedSuper> = if class_drive {
             extends
                 .iter()
                 .chain(implements.iter())
@@ -3406,6 +3478,26 @@ impl<'a> Engine<'a> {
                 via_implements: entry.relation == Relation::Implements,
             };
             if let Some(code) = subtype_restriction_violation(&input) {
+                // The verifier's `implements`-anchored base arm
+                // (base_or_final_type_verifier.dart:239-256) is spelled
+                // `base_class_implemented_outside_of_library` /
+                // `base_mixin_implemented_outside_of_library` with ONE
+                // argument — the explicitly `base` ancestor's name — and
+                // anchors on the WRITTEN implements entry, which is exactly
+                // Pass 1's row (the base-implemented walk reaches the same
+                // ancestor through `implements`). Pass 1 owns it: emitting
+                // here under the subtype family's declaring-name anchor and
+                // container argument would fabricate a second, mis-shaped
+                // row (the co19 `*Sealed*Implement` families: `The class
+                // 'SimpleSealedExtendImplement' can't be implemented outside
+                // of its library...` at the declaring name).
+                if matches!(
+                    code,
+                    ModifierCode::BaseClassImplementedOutsideOfLibrary
+                        | ModifierCode::BaseMixinImplementedOutsideOfLibrary
+                ) {
+                    break;
+                }
                 findings.push(ModifierFinding {
                     code,
                     a0: display(container),
@@ -3416,6 +3508,26 @@ impl<'a> Engine<'a> {
             }
         }
         findings
+    }
+
+    /// The written `with` entries' spans of `container`, read from the clause
+    /// scanner ([`Self::scan_header_clauses`]) — the fallback anchor source
+    /// for the sealed class-drive rows when the header window kept no buffer
+    /// tail (a `with`-only header parks its first entry in the never-committed
+    /// extends candidate slot, and the listener's own with-item capture that
+    /// feeds `class_used_as_mixin` never reaches
+    /// [`HeaderClauseSpans`]). One bounded token walk, paid only by headers
+    /// whose window channel came up short.
+    fn header_with_entry_spans(&self, container: StringId) -> Vec<SourceRange> {
+        let Some(facts) = self.scan_header_clauses().remove(&container) else {
+            return Vec::new();
+        };
+        facts
+            .supers
+            .iter()
+            .filter(|entry| entry.tag == SuperTag::With)
+            .map(|entry| entry.span)
+            .collect()
     }
 
     // —— abstract completeness + interface conflicts (#498) ———————————
@@ -6015,11 +6127,25 @@ impl<'a> Engine<'a> {
                             .map(|c| c.kind),
                         _ => None,
                     },
-                    ScopedHit::Found(NamespaceEntry::Decl(owner)) => self
-                        .index
-                        .get(owner)
-                        .and_then(|f| f.container(entry.head))
-                        .map(|c| c.kind),
+                    ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
+                        // A FOREIGN type alias folds to its right-hand head
+                        // exactly like the local arm above: the oracle's
+                        // `_resolveType` reads `type.element` of the
+                        // instantiated alias (`resolution_visitor.dart`
+                        // :1170-1185), so `implements TypedefBase` over
+                        // `typedef TypedefBase = BaseClass;` is a legal
+                        // class entry, never `implements_non_class`.
+                        match self.index.get(owner).and_then(|f| f.decl(entry.head)).map(|d| d.kind) {
+                            Some(crate::model::MicroKind::TypeAlias) => self
+                                .alias_container_head(entry.head, self.lib, self.file)
+                                .map(|(container, _, _)| container.kind),
+                            _ => self
+                                .index
+                                .get(owner)
+                                .and_then(|f| f.container(entry.head))
+                                .map(|c| c.kind),
+                        }
+                    }
                     _ => None,
                 }
             };
