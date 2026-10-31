@@ -215,17 +215,25 @@ impl TreeSink {
     /// nullability and any `?` extension into the node. Without the merge
     /// the re-fired head would double-count as an extra argument and
     /// poison the capture.
+    ///
+    /// Inside a type-variables group (`<Y extends X>`) a leaf is a bound's
+    /// head, never a shape column: on a function level it joins `bounds`
+    /// (the same slot [`Self::push_node`] feeds a bound's completed
+    /// arguments into — the signature's own `<Y extends X>` pair rides the
+    /// function node, #2878/#3215), and the re-fired merge applies there
+    /// identically (`Y extends List<int>?` completes through `end_group`
+    /// into `bounds`, then the `?`-carrying head merges onto it); on every
+    /// other level it drops (the group's count is the only face the model
+    /// carries there — the bounds.rs window captures container bounds by
+    /// its own discipline).
     pub(crate) fn leaf(&mut self, head: StringId, nullable: bool, range: SourceRange) {
-        // A type-variable bound's head is not a shape column (the
-        // group's count is) — its node drops.
-        if self
-            .stack
-            .last()
-            .is_some_and(|level| level.in_type_variables)
-        {
-            return;
-        }
         let siblings = match self.stack.last_mut() {
+            Some(level) if level.in_type_variables => {
+                if !level.function {
+                    return;
+                }
+                &mut level.bounds
+            }
             Some(level) => &mut level.nodes,
             None => &mut self.done,
         };

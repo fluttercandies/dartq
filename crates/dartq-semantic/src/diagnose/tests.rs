@@ -17505,3 +17505,13 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
     let r = report(&fixture(1100));
     assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
 }
+
+// The #3215 pins (F6-A bound-head residual — the `var`-inferred
+// folded-alias `from` whose type-parameter bound is a bare leaf, fixed
+// in `capture.rs`'s `TreeSink::leaf`). Registered here because the
+// brief's named hosts (`diagnose.rs`/`assignability.rs`) are live-lane
+// files out of this ticket's write scope; `#[path]` keeps the module
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3215_tests.rs"]
+mod ticket_3215_tests;
