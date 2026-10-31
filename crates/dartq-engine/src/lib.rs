@@ -2744,6 +2744,12 @@ fn citations(rest: &str) -> Vec<DartIgnoreEntry> {
 #[path = "ticket_3045_tests.rs"]
 mod ticket_3045_tests;
 
+/// #3066 pins: the `uri_does_not_exist` emitter faces, locked to the
+/// `dart analyze` 3.13.7 oracle rows.
+#[cfg(test)]
+#[path = "ticket_3066_tests.rs"]
+mod ticket_3066_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

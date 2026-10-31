@@ -1,5 +1,26 @@
 use super::*;
 
+/// The send-position shape the downward-context face resolves
+/// ([`Engine::send_position`]).
+enum SendPosition {
+    /// The index argument of `a[e]`: the `[`'s token index, and whether
+    /// the access is a pure write (`a[e] = v` — the `[]=` formal's
+    /// context).
+    Index {
+        lbracket: usize,
+        write_only: bool,
+    },
+    /// A call argument: the enclosing `(`'s token index, the selector
+    /// spelling before it, the named label (`m(x: e)`), and the
+    /// positional index among the depth-0 commas.
+    Argument {
+        open: usize,
+        selector: StringId,
+        label: Option<StringId>,
+        index: usize,
+    },
+}
+
 /// The receiver-expression walk's recursion cap (see
 /// `Engine::recv_walk_depth`): past it a hop degrades to the record's
 /// classified receiver instead of recursing toward a worker-thread stack
@@ -6183,7 +6204,23 @@ impl<'a> Engine<'a> {
         let ty = match self.invoked_callee_result(row) {
             Some(ty) => ty,
             None if row.intent == Intent::Invoke && row.ty == Ty::UNKNOWN => {
-                self.callee_return_ty(row)
+                let declared = self.callee_return_ty(row);
+                // The downward-context face (#3064): a generic send whose
+                // declared return is its own free inference parameter
+                // (`T f<T>()`) answers the context its argument position
+                // supplies — `h(a.remainder(f()))` infers `T = int`
+                // through the numeric context ladder, and the index
+                // argument of `a[g()]++` infers from `[]`'s first formal —
+                // the upstream `staticType` the oracle's argument checks
+                // read (resolver.dart:3378's `analyzeExpression(node.index,
+                // indexContextType)`, binary_expression_resolver.dart:346's
+                // operator-param context). `Unknown` stands when no
+                // concrete context resolves.
+                if declared != Ty::UNKNOWN {
+                    declared
+                } else {
+                    self.context_invoke_ty(row).unwrap_or(declared)
+                }
             }
             // A folded creation whose row carries nothing: the expression's
             // static type is the instantiated head (`A<int>()` is
@@ -6210,6 +6247,433 @@ impl<'a> Engine<'a> {
         } else {
             ty
         }
+    }
+
+    // —— the generic send's downward context (#3064) ————————————————————
+    //
+    // Upstream resolves every send under a context type
+    // (`analyzeExpression(node, contextType)`): an argument's schema is
+    // its formal's type, and the `+`/`-`/`*`/`%`/`remainder`/`clamp`
+    // faces refine it (`refineNumericInvocationContext`,
+    // type_system.dart:1881-1990) over the receiver's static type —
+    // `h(a.remainder(f()))` with `h(int x)` hands `f<T>` the context
+    // `int`, so `T` binds `int` and the invocation's static type is
+    // `int`. The row model reads the same answer off the token table:
+    // the position shapes are syntactic, and the numeric ladder needs
+    // only the receiver's face and the enclosing formal.
+
+    /// The send-position shape of the send `row`: an index argument
+    /// (`a[e]`), or a call argument with its enclosing open paren,
+    /// selector spelling, named label, and positional index. `None` for
+    /// every other neighborhood (a statement tail, a binary operand, a
+    /// collection element — the shapes whose context this face does not
+    /// resolve).
+    fn send_position(&self, row: &Row) -> Option<SendPosition> {
+        let tokens = self.tokens.as_slice();
+        let open = tokens.partition_point(|token| token.utf16_offset < row.range.end());
+        if tokens.get(open)?.kind != dartq_scanner::TokenKind::OpenParen {
+            return None;
+        }
+        let close = self.tokens.matching_end(open)?;
+        match tokens.get(close + 1)?.kind {
+            // `a[ f() ]` — the `]` closes the bracket the send sits in.
+            dartq_scanner::TokenKind::CloseSquare => {
+                // The matching `[`: backward from the send's own `(`,
+                // skipping the nested groups its arguments opened.
+                let mut depth = 0usize;
+                let mut j = open;
+                let lbracket = loop {
+                    if j == 0 || open - j > 128 {
+                        return None;
+                    }
+                    j -= 1;
+                    match tokens[j].kind {
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare
+                        | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                        dartq_scanner::TokenKind::OpenSquare => {
+                            if depth == 0 {
+                                if self.tokens.matching_end(j) == Some(close + 1) {
+                                    break j;
+                                }
+                                return None;
+                            }
+                            depth -= 1;
+                        }
+                        dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenCurly => {
+                            if depth == 0 {
+                                return None;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                };
+                // The receiver-expression gate: a token that can end an
+                // operand stands before the `[` (`a[f()]`, `m[k][f()]`);
+                // a type-argument list's `>` (`<int>[f()]`) or an
+                // assignment `=` marks a collection literal instead.
+                if lbracket == 0 || !Self::operand_ending_kind(tokens[lbracket - 1].kind) {
+                    return None;
+                }
+                // The pure-write face: `a[e] = v` resolves the index under
+                // `[]=`'s first formal (`resolveForWrite`'s
+                // `hasRead: false` — property_element_resolver.dart:1108's
+                // `writeElement?.firstParameterType`); the read and the
+                // compound twins use `[]`'s (`hasRead: true`).
+                let write_only = tokens
+                    .get(close + 2)
+                    .is_some_and(|token| token.kind == dartq_scanner::TokenKind::Eq);
+                Some(SendPosition::Index {
+                    lbracket,
+                    write_only,
+                })
+            }
+            // `p(f(), …)` / `p(…, f())` — an argument of the enclosing call.
+            dartq_scanner::TokenKind::Comma | dartq_scanner::TokenKind::CloseParen => {
+                let mut depth = 0usize;
+                let mut j = open;
+                let parent_open = loop {
+                    if j == 0 || open - j > 128 {
+                        return None;
+                    }
+                    j -= 1;
+                    match tokens[j].kind {
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare
+                        | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                        dartq_scanner::TokenKind::OpenParen => {
+                            if depth == 0 {
+                                break j;
+                            }
+                            depth -= 1;
+                        }
+                        // A collection literal between the send and the
+                        // paren (`h([f()])`) — the send is no argument.
+                        dartq_scanner::TokenKind::OpenSquare | dartq_scanner::TokenKind::OpenCurly => {
+                            if depth == 0 {
+                                return None;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                };
+                // The selector must be an identifier — control-flow
+                // parens (`if (f())`) and parenthesized groups spell
+                // keywords or operators here.
+                let sel = tokens.get(parent_open.checked_sub(1)?)?;
+                if sel.kind != dartq_scanner::TokenKind::Identifier {
+                    return None;
+                }
+                let selector = self.intern(&self.source[sel.byte_range()]);
+                // The named-label face: `m(x: f())` reads the named
+                // formal the label spells. A member send's row anchors at
+                // its member token, but the argument — and the label —
+                // begin at the receiver (`m(x: a.b.f())` labels at `a`).
+                // The label must open the argument — `(` or a depth-0
+                // comma stands before it — so a conditional expression's
+                // `:` (`f(a ? b : f())`) never masquerades as one.
+                let head = self.expression_start(row);
+                let at = tokens.partition_point(|token| token.utf16_offset < head);
+                let label = (at >= 3
+                    && tokens[at - 1].kind == dartq_scanner::TokenKind::Colon
+                    && tokens[at - 2].kind == dartq_scanner::TokenKind::Identifier
+                    && matches!(
+                        tokens[at - 3].kind,
+                        dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::Comma
+                    ))
+                    .then(|| self.intern(&self.source[tokens[at - 2].byte_range()]));
+                // The positional index: the depth-0 commas between the
+                // enclosing `(` and the send's own head. The backward scan
+                // above broke at depth 0, so the counter restarts there.
+                let mut index = 0usize;
+                for token in &tokens[parent_open + 1..at] {
+                    match token.kind {
+                        dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare
+                        | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare
+                        | dartq_scanner::TokenKind::CloseCurly => depth -= 1,
+                        dartq_scanner::TokenKind::Comma if depth == 0 => index += 1,
+                        _ => {}
+                    }
+                }
+                Some(SendPosition::Argument {
+                    open: parent_open,
+                    selector,
+                    label,
+                    index,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The context type the send at `row` resolves under: an index
+    /// argument reads its `[]`/`[]=` formal, a call argument reads the
+    /// enclosing formal refined by the numeric context ladder
+    /// ([`Self::refine_numeric_context`]). `None` keeps the
+    /// unknown-suppress posture — a statement tail, a binary operand
+    /// (the operator-param context needs the enclosing assignment's own
+    /// context to decide `int` vs `num`, a climb the pinned faces do not
+    /// need and the unknown answer matches today's suppression), or an
+    /// unresolvable position.
+    fn invoke_downward_context(&self, row: &Row) -> Option<Ty> {
+        match self.send_position(row)? {
+            SendPosition::Index {
+                lbracket,
+                write_only,
+            } => self.index_formal_context(lbracket, write_only),
+            SendPosition::Argument {
+                open, selector, ..
+            } => {
+                // The enclosing send's callee row: the last row spelling
+                // the selector that closed before its argument list —
+                // the same resolution the row stack already landed.
+                let open_offset = self.tokens.as_slice()[open].utf16_offset;
+                let at = self
+                    .rows
+                    .iter()
+                    .rposition(|probe| probe.name == selector && probe.range.end() <= open_offset)?;
+                let parent = &self.rows[at];
+                // A cascade section resolves without the enclosing context
+                // (upstream `test_remainder_int_context_cascaded` infers
+                // `num` where the plain call infers `int` — the section's
+                // own resolution never sees the outer argument's formal).
+                let cascade = self.cascade_selector_before(parent.range.offset);
+                let context = if cascade {
+                    None
+                } else {
+                    self.send_position_context(parent)
+                };
+                // The ladder reads the enclosing send's receiver face and
+                // its selector spelling. At the argument flush the parent
+                // send has NOT merged yet (the dot reduction follows the
+                // send's own close), so the receiver is the row below the
+                // parent's callee row — a member parent only (a bare
+                // callee has no receiver).
+                let recv_ty = if parent.qualified {
+                    match self.rows.get(at.checked_sub(1)?) {
+                        Some(recv_row) if recv_row.range.end() <= parent.range.offset => {
+                            self.receiver_static_ty(recv_row)
+                        }
+                        _ => Ty::UNKNOWN,
+                    }
+                } else {
+                    Ty::UNKNOWN
+                };
+                let name = self.strings.resolve(parent.name);
+                self.refine_numeric_context(&name, recv_ty, context)
+            }
+        }
+    }
+
+    /// The context at a send's OWN position — the plain formal its
+    /// argument sits against (the upstream contextType stack pushes the
+    /// written formal, unrefined; only the faces *inside* the send get
+    /// the numeric ladder). One climb, no deeper.
+    fn send_position_context(&self, callee: &Row) -> Option<Ty> {
+        match self.send_position(callee)? {
+            SendPosition::Index {
+                lbracket,
+                write_only,
+            } => self.index_formal_context(lbracket, write_only),
+            SendPosition::Argument {
+                open,
+                selector,
+                label,
+                index,
+            } => {
+                let open_offset = self.tokens.as_slice()[open].utf16_offset;
+                let at = self
+                    .rows
+                    .iter()
+                    .rposition(|probe| probe.name == selector && probe.range.end() <= open_offset)?;
+                let formals = self.send_formals(&self.rows[at])?;
+                let formal = match label {
+                    Some(label) => formals.named_formal(label)?.ty,
+                    None => formals.positional.get(index)?.ty,
+                };
+                (formal != Ty::UNKNOWN).then_some(formal)
+            }
+        }
+    }
+
+    /// The first index formal of the receiver whose `[` opens at
+    /// `lbracket`: `[]`'s first formal for a read/compound access, the
+    /// `[]=` spelling for a pure write (`a[e] = v`) — with the write
+    /// spelling as the read fallback when the receiver declares no `[]`
+    /// (a write-only index). Unresolved receivers and missing formals
+    /// keep `None`.
+    fn index_formal_context(&self, lbracket: usize, write_only: bool) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let bracket_offset = tokens[lbracket].utf16_offset;
+        // The receiver row: the closest row wholly before the `[` — the
+        // same geometry `handle_indexed_expression`'s fold reads (the
+        // `[]` operator mark lands AFTER the staging ask, so the shape —
+        // not the intent — decides here).
+        let at = self
+            .rows
+            .iter()
+            .rposition(|probe| probe.range.end() <= bracket_offset)?;
+        let recv = match &self.rows[at].shape {
+            RowShape::Member { recv } => *recv,
+            RowShape::Bare(info) => Engine::receiver_of_bare(*info),
+            _ => return None,
+        };
+        let read = self.intern("[]");
+        let write = self.intern("[]=");
+        let spellings: &[StringId] = if write_only { &[write] } else { &[read, write] };
+        for &spelling in spellings {
+            let ty = self
+                .member_formals_full(&recv, spelling)
+                .as_deref()
+                .and_then(|formals| formals.positional.first())
+                .map(|formal| formal.ty)
+                .filter(|ty| *ty != Ty::UNKNOWN);
+            if let Some(ty) = ty {
+                return Some(ty);
+            }
+        }
+        None
+    }
+
+    /// The formal table of the send `row`'s callee: a member send walks
+    /// its receiver's face ([`Self::member_formals_full`]), a bare send
+    /// reads the top-level declaration.
+    fn send_formals(&self, row: &Row) -> Option<Formals> {
+        match &row.shape {
+            RowShape::Member { recv } => self
+                .member_formals_full(recv, row.name)
+                .map(|formals| formals.into_owned()),
+            RowShape::Bare(_) => self
+                .top_level_decl(row.name)
+                .and_then(|decl| decl.formals.as_deref().cloned()),
+            _ => None,
+        }
+    }
+
+    /// Whether the selector at `offset` follows a cascade operator
+    /// (`a..m(...)`, `a?..m(...)`).
+    fn cascade_selector_before(&self, offset: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < offset);
+        at > 0
+            && matches!(
+                tokens[at - 1].kind,
+                dartq_scanner::TokenKind::PeriodPeriod
+                    | dartq_scanner::TokenKind::QuestionPeriodPeriod
+            )
+    }
+
+    /// The expression's own start offset for the token-position reads: a
+    /// member send's row anchors at its member token, while the
+    /// expression — the argument's label and comma geometry — begins at
+    /// the receiver.
+    fn expression_start(&self, row: &Row) -> u32 {
+        if row.qualified {
+            let range = row.range;
+            return self
+                .property_access_span(SourceRange {
+                    offset: range.offset,
+                    length: range.end() - range.offset,
+                })
+                .map_or(row.range.offset, |span| span.offset);
+        }
+        row.range.offset
+    }
+
+    /// `refineNumericInvocationContext`'s ladder
+    /// (type_system.dart:1881-1990): on a `+`/`-`/`*`/`%`/`remainder`/
+    /// `clamp` face whose receiver `T` reads `num?`-bounded, the context
+    /// is `int` when `C` admits `int` but not `num` and `T <: int?`,
+    /// `double` when `C` admits `double` but not `num` and not
+    /// `T <: double?`, `num` otherwise. `C = None` reads as the
+    /// inference top (`UnknownInferredType` admits everything — both
+    /// refinements fail and the answer is `num`, the upstream
+    /// no-context posture). A receiver outside the `num` family or any
+    /// other selector keeps `None` — no context resolves, the send
+    /// stays untyped.
+    fn refine_numeric_context(&self, name: &str, t: Ty, c: Option<Ty>) -> Option<Ty> {
+        if !matches!(name, "+" | "-" | "*" | "%" | "remainder" | "clamp") {
+            return None;
+        }
+        let (int, double, num) = (
+            self.members.primitive_ids[0],
+            self.members.primitive_ids[1],
+            self.members.primitive_ids[2],
+        );
+        let named_q = |head| Ty::Named {
+            name: head,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        if !self.name_subtype(t, named_q(num)) {
+            return None;
+        }
+        // `C` admits `head`: the empty context is the inference top —
+        // every type is below it.
+        let admits = |head| c.is_none_or(|c| self.name_subtype(Ty::named(head), c));
+        if admits(int) && !admits(num) && self.name_subtype(t, named_q(int)) {
+            return Some(Ty::named(int));
+        }
+        if admits(double) && !admits(num) && !self.name_subtype(t, named_q(double)) {
+            return Some(Ty::named(double));
+        }
+        Some(Ty::named(num))
+    }
+
+    /// The identity-generic send's context answer: `T f<T>()` — the
+    /// declared return IS the single free inference parameter — binds
+    /// `T` to the position's concrete context. Every other shape (a
+    /// composite return spelling a parameter, a non-generic callee, a
+    /// context the ladder declines) keeps `None`, and `dynamic` never
+    /// infers (the closure schema's own rule).
+    fn context_invoke_ty(&self, row: &Row) -> Option<Ty> {
+        let declared = match &row.shape {
+            RowShape::Member { recv } => {
+                let container = match recv {
+                    Receiver::Typed { type_name, .. } => *type_name,
+                    Receiver::This { container, .. }
+                    | Receiver::Super { container, .. }
+                    | Receiver::Created { name: container, .. }
+                    | Receiver::Container { name: container, .. } => *container,
+                    _ => return None,
+                };
+                let entry = self.resolved_member(container, row.name)?;
+                (entry.kind == MemberKind::Method).then(|| entry.return_ty)?
+            }
+            RowShape::Bare(_) => self.top_level_decl(row.name)?.return_ty,
+            _ => return None,
+        };
+        let Ty::Named {
+            name: param,
+            args: ArgListId::EMPTY,
+            nullable: false,
+        } = self.fold_alias_ty(declared)
+        else {
+            return None;
+        };
+        let recv = match &row.shape {
+            RowShape::Member { recv } => *recv,
+            RowShape::Bare(info) => Engine::receiver_of_bare(*info),
+            _ => return None,
+        };
+        let params = self.closure_callee_params(&recv, row.name)?;
+        let bound = params.0.iter().find(|(name, _)| *name == param)?.1;
+        let context = self.invoke_downward_context(row)?;
+        if !matches!(context, Ty::Named { .. }) {
+            return None;
+        }
+        // An unsatisfiable binding falls back upstream (`T extends num`
+        // under a `String` context answers the bound, never the
+        // context) — the unknown stand-in is the same under-report.
+        if let Some(bound) = bound && !self.name_subtype(context, self.fold_alias_ty(bound)) {
+            return None;
+        }
+        Some(context)
     }
 
     /// The member-read row's static type for the `var`-inference window —

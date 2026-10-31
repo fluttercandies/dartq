@@ -4611,6 +4611,47 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 from_ty
             };
+            // `x ??= e` writes the if-null assignment's OWN static type —
+            // `LUB(NonNull(T1), T2)` (assignment_expression_resolver.dart
+            // `_resolveTypes`, the spec's if-null rule), never the bare RHS
+            // face the plain `=` carries. A `null` right side joins
+            // `NonNull(T1)` into the declared `T1?` form (the RHS context
+            // rule: the write face is the declared type), and a nullable
+            // right side keeps its `?` on the joined head — so the flow
+            // write face and every later read (`f(x)`'s argument ask
+            // included) see the same static type the oracle's
+            // `recordStaticType` records (#3061). The join mirrors
+            // `ifnull_initializer_ty`'s name-level shape: the same head
+            // keeps the right side's instantiation, different heads keep
+            // the left head with the right side's nullability.
+            let from_ty = if text == "??=" {
+                let base = Engine::non_null_form(engine.receiver_static_ty(&engine.rows[target]));
+                match (base, from_ty) {
+                    (_, Ty::Null) => Engine::nullable_form(base),
+                    (
+                        Ty::Named { name: l, .. },
+                        Ty::Named {
+                            name: r,
+                            nullable: rn,
+                            args: ra,
+                        },
+                    ) if l == r => Ty::Named {
+                        name: r,
+                        nullable: rn,
+                        args: ra,
+                    },
+                    (Ty::Named { name: l, args: la, .. }, Ty::Named { nullable: rn, .. }) => {
+                        Ty::Named {
+                            name: l,
+                            nullable: rn,
+                            args: la,
+                        }
+                    }
+                    _ => from_ty,
+                }
+            } else {
+                from_ty
+            };
             if let Ty::Named {
                 name,
                 nullable,

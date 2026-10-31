@@ -3270,6 +3270,24 @@ impl<'a> Engine<'a> {
                     Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
                 },
                 Ty::Unknown => None,
+                // A declared return that spells a type parameter is a
+                // genuine `TypeParameterType` target (subtype.dart's Left
+                // Variable arm — `S <: T` is `false` for every interface
+                // source): `return T` asks `Type <: T`, `return 3` asks
+                // `int <: T`, and both reject. The file's decl table
+                // decides param-ness — pass 1 sees the live frame's sets;
+                // the teardown re-decision runs with every frame popped,
+                // so only the file-scoped `MicroKind::TypeParam` decl
+                // survives. This arm is safe to read the decl table BECAUSE
+                // `to` is always a declared return here — never a solved
+                // formal or a bound-substituted alias slot, which is why
+                // [`Engine::assignable`] restricts its own param detection
+                // to the live sets.
+                Ty::Named { name: to_name, .. }
+                    if self.return_target_is_type_param(to_name) =>
+                {
+                    self.return_param_source_verdict(from, to)
+                }
                 _ => match from {
                     Ty::Void => Some(!matches!(to, Ty::Void | Ty::Dynamic)),
                     // A `dynamic` return expression is a subtype only of the
@@ -3293,6 +3311,45 @@ impl<'a> Engine<'a> {
         // or a closed closure that never names the target), so the
         // under-report direction survives on every open question.
         verdict.or_else(|| self.declared_subtype_negative(&from, &to))
+    }
+
+    /// Whether a declared return's head names a type parameter — the live
+    /// sets at pass 1, the file's decl table once the frames are popped
+    /// (the teardown re-decision). Reading the decl table is safe only on
+    /// this declared-return path: `to` is provably the executable's own
+    /// return type, so a `MicroKind::TypeParam` hit is a real parameter
+    /// target, never a foreign callee's solved formal or a typedef's
+    /// bound slot.
+    fn return_target_is_type_param(&self, to_name: StringId) -> bool {
+        self.type_params.contains(&to_name)
+            || self.pending_type_params.contains(&to_name)
+            || self
+                .index
+                .get(self.file)
+                .and_then(|f| f.decl(to_name))
+                .is_some_and(|decl| decl.kind == MicroKind::TypeParam)
+    }
+
+    /// The `S <: T` verdict over a parameter target (subtype.dart's Left
+    /// Variable arm): an interface, record, or function source never
+    /// subtypes a bare parameter — `Some(false)`. A parameter SOURCE
+    /// (`S` also a parameter — the promoted-bound or reflexivity arm)
+    /// stays undecidable on the name-level lattice (`None`). `Null`,
+    /// `Never`, `dynamic`, `void`, and `Unknown` sources keep the generic
+    /// matrix's own answers — `Null <: T` rejects on the non-nullable
+    /// param, `Never` and the top faces ride their own rules — so they
+    /// defer to [`Engine::assignable`] over the real target rather than
+    /// take the interface refusal.
+    fn return_param_source_verdict(&self, from: Ty, to: Ty) -> Option<bool> {
+        match from {
+            Ty::Named { name: from_name, .. }
+                if self.return_target_is_type_param(from_name) =>
+            {
+                None
+            }
+            Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
+            _ => self.assignable(from, to, false),
+        }
     }
 
     /// The `async` body's return verdict matrix (`rtv.dart:258-289`): the
@@ -5092,6 +5149,27 @@ impl<'a> Engine<'a> {
             // Same head, differing written arguments: the covariant
             // interface rule decides through the boundary pool.
             return self.covariant_args(from_name, from_args, to_args);
+        }
+        // A type-parameter target (subtype.dart's Left Variable arm —
+        // `T0 <: T1` where `T1` is a `TypeParameterType` is decided ONLY by
+        // the promoted-bound/reflexivity arms: an interface, record, or
+        // function source never subtypes a bare parameter, so the question
+        // is decidable-false the moment the target spells one. The
+        // source-side twin (a param source against a param target —
+        // `S <: T`) stays undecidable: the bound chain is the M1 model's
+        // blind spot. Param-ness reads the LIVE sets only — a name in the
+        // file's decl table is NOT enough: a type alias's parameter or a
+        // foreign callee's solved formal both spell a `MicroKind::TypeParam`
+        // name into this slot without being a target the Left Variable arm
+        // decides. The declared-return teardown carries its own param
+        // detection (the staged `Return` re-decision — `filter_staged`),
+        // where the target is provably the executable's declared return.
+        let to_is_param = self.type_params.contains(&to_name)
+            || self.pending_type_params.contains(&to_name);
+        if to_is_param {
+            let from_is_param = self.type_params.contains(&from_name)
+                || self.pending_type_params.contains(&from_name);
+            return if from_is_param { None } else { Some(false) };
         }
         // Distinct non-primitive heads: the supertype-graph walk decides.
         // A definite miss is the reportable assignability face

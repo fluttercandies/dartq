@@ -100,7 +100,11 @@ fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::Scan
     scanned
 }
 
-fn report_ops_with(source: &str, imports: &[RigImport<'_>], wildcards: Option<bool>) -> FileReport {
+pub(super) fn report_ops_with(
+    source: &str,
+    imports: &[RigImport<'_>],
+    wildcards: Option<bool>,
+) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));

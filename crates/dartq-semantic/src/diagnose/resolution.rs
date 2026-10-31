@@ -1785,10 +1785,17 @@ impl<'a> Engine<'a> {
         if self.type_params.contains(&name) || self.pending_type_params.contains(&name) {
             // A still-parked parameter belongs to the header being parsed:
             // its own bound and its later siblings' bounds are in scope from
-            // its declaration (`class C<T extends A<T>>`).
+            // its declaration (`class C<T extends A<T>>`). The read itself is
+            // a TypeLiteral — the reified `Type` object, never the parameter's
+            // own type (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+            // resolver/simple_identifier_resolver.dart:268-269, the
+            // `TypeParameterElement` arm answering `_typeProvider.typeType`).
+            // `return T` therefore asks `Type` against the declared return
+            // and reports `return_of_invalid_type` wherever the parameter's
+            // face is not `Type`-compatible — the #3056 family.
             return (
                 BareInfo::Plain {
-                    ty: Ty::named(name),
+                    ty: Ty::named(self.intern("Type")),
                 },
                 RefTarget::TypeParam,
             );

@@ -2894,6 +2894,30 @@ impl<'a> Engine<'a> {
                     }
                 })
                 .map(Formals::clone)
+                // An unnamed extension keeps no container entry — its
+                // member tables live on the nameless application face
+                // (`close_container` moves them out of the container open).
+                // The face's own member entry answers here so the
+                // parameter pass reads the same written list upstream's
+                // `visitFormalParameterList` walks.
+                .or_else(|| {
+                    if matches!(site.kind, DeclKind::Member { .. }) {
+                        self.index.get(self.file).and_then(|f| {
+                            f.extension_faces()
+                                .iter()
+                                .find(|face| {
+                                    face.name.is_none()
+                                        && self.is_nameless(c)
+                                        && face.members.contains_key(&site.name)
+                                })
+                                .and_then(|face| face.members.get(&site.name))
+                                .and_then(|m| m.formals.as_deref())
+                                .map(Formals::clone)
+                        })
+                    } else {
+                        None
+                    }
+                })
                 .or_else(|| {
                     (site.is_augment && matches!(site.kind, DeclKind::Constructor { .. }))
                         .then(|| augment_ctor_formals(self, c))
@@ -2935,7 +2959,37 @@ impl<'a> Engine<'a> {
         // public class's private-selector constructor (`A._n`) is NOT
         // publicly accessible upstream, so the derived `ctor_spelling`
         // answers where the container-keyed site name could not.
-        if self.is_publicly_accessible(ctor_spelling, site.kind, site.is_factory) {
+        //
+        // An unnamed extension's member is never publicly accessible:
+        // `_isPubliclyAccessible`'s extension arm answers
+        // `enclosingElement.isPublic` outright (the enclosing element is
+        // an `ExtensionElement`, never an `InterfaceElement`), and a
+        // nameless extension is never public
+        // (`ExtensionElement.isPublic` requires a name — element.dart:
+        // 3264-3267, upstream Dart SDK source), so its parameters report
+        // exactly like a private extension's. The exemption rides here
+        // and not in the shared helper because the member/constructor
+        // faces own their unnamed-extension handling in the face loop —
+        // the helper's container-miss default answers public there, and
+        // a flip would double-report the element row the loop already
+        // emits. The nameless-extension membership check keeps a
+        // recovered nameless class/mixin frame (whose null name maps to
+        // PUBLIC through the fragment, unlike an extension) on the
+        // helper's public default.
+        let unnamed_extension_member = match &site.kind {
+            DeclKind::Member { container, .. } => {
+                self.is_nameless(*container)
+                    && self.index.get(self.file).is_some_and(|f| {
+                        f.extension_faces().iter().any(|face| {
+                            face.name.is_none() && face.members.contains_key(&site.name)
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if !unnamed_extension_member
+            && self.is_publicly_accessible(ctor_spelling, site.kind, site.is_factory)
+        {
             return;
         }
         let overridden = match site.kind {

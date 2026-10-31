@@ -2006,8 +2006,9 @@ pub(crate) mod simple_directive_paths {
         }
 
         /// The file-target seam: relative paths normalize and decode,
-        /// scheme/authority forms have no file face
-        /// (`conditional_uri_does_not_exist`'s documented under-report).
+        /// scheme/authority forms have no file face (the
+        /// `conditional_uri_does_not_exist` `dart:`/`package:` candidates
+        /// answer from their own faces, not from this walk).
         #[test]
         fn relative_file_target_faces() {
             assert_eq!(relative_file_path("a/../b.dart"), Some("b.dart".to_owned()));
@@ -2076,19 +2077,37 @@ pub(crate) mod conditional_uri_does_not_exist {
     //! value, when present, precedes it) — the shape the
     //! `avoid_relative_lib_imports` fixture pins.
     //!
-    //! Approximation (documented): the official existence check resolves
-    //! every URI form through the SDK library table and the package
-    //! config (the missing `dart:`/`package:` faces of the upstream
-    //! corpus, `test_missingDartLibraries`/`test_missingPackages`); this
-    //! face carries neither table, so the relative-URI form is the ported
-    //! one — resolve against the analyzed file's directory (the
-    //! `contextUri` face, the unit's own path for parts) and test the
-    //! file system. Scheme'd and authority'd candidates stay silent:
-    //! unresolvable-library forms under-report, a resolvable target is
-    //! silent both ways. The recovery-spliced empty candidate and an
-    //! interpolated one never report. A pathless unit stays silent (no
-    //! directory to resolve against). Message: `diagnostic.g.dart`
+    //! Resolution face: upstream reports exactly when the candidate
+    //! string is present and resolves to no existing source — every
+    //! parseable candidate carries a relative URI string
+    //! (`DirectiveUriWithRelativeUriImpl extends
+    //! DirectiveUriWithRelativeUriStringImpl`, element.dart:1479-1496)
+    //! and only resolved ones add a source
+    //! (`DirectiveUriWithSourceImpl`, :1502). The ported faces: the
+    //! relative form resolves against the analyzed file's directory (the
+    //! `contextUri` face, the unit's own path for parts) and tests the
+    //! file system; the `dart:` form answers from [`SDK_LIBRARY_NAMES`]
+    //! (the oracle's own library map — `internalMapDartUri` misses
+    //! report, sdk.dart:248-268); the `package:` form answers from the
+    //! workspace facts. The recovery-spliced empty candidate (resolves
+    //! to the importing file, which exists) and an interpolated one
+    //! never report. Message: `diagnostic.g.dart`
     //! `conditionalUriDoesNotExist`.
+    //!
+    //! Approximation (documented): a tabulated `dart:` name's part path
+    //! (`dart:async/nope.dart` — upstream stats the part file,
+    //! sdk.dart:270-281) is not existence-checked and stays silent where
+    //! upstream reports. The `package:` face has no package config: the
+    //! own package resolves exactly against the workspace `lib_dir`, a
+    //! declared dependency stands in for present (its root is not a
+    //! mounted fact — a missing file inside a registered dependency
+    //! stays silent where upstream reports; the exact face needs a
+    //! driver-mounted dep-roots table), and any other name is the
+    //! no-source miss. Without workspace facts the `package:` face stays
+    //! silent. Other scheme'd candidates (`http:`, `file:`) and
+    //! authority-carrying relative spellings stay silent — upstream
+    //! reports the unresolvable ones (no corpus face exercises them). A
+    //! pathless unit stays silent (no directory to resolve against).
 
     use std::path::PathBuf;
 
@@ -2100,6 +2119,69 @@ pub(crate) mod conditional_uri_does_not_exist {
         check,
     );
 
+    /// The oracle's `dart:` library-name map: the flat `libraries.dart`
+    /// table `dart analyze`'s source factory answers every `dart:`
+    /// URI-existence question from — internal (`_`-prefixed) names
+    /// included, `web_sql` tabulated by neither side. Mirror of
+    /// `dartq-sdk`'s generated `FLAT_LIBRARIES` (pinned oracle SDK
+    /// 3.13.1): this crate has no `dartq-sdk` edge, so the names are
+    /// duplicated here and must be regenerated together when the SDK pin
+    /// moves — the sentinel pins in `wave1_pins` catch drift. Sorted;
+    /// binary-searched.
+    #[rustfmt::skip]
+    pub(crate) static SDK_LIBRARY_NAMES: &[&str] = &[
+        "_async_status_codes",
+        "_dart2js_only",
+        "_dart2js_runtime_metrics",
+        "_foreign_helper",
+        "_http",
+        "_interceptors",
+        "_internal",
+        "_invocation_mirror_constants",
+        "_js",
+        "_js_annotations",
+        "_js_embedded_names",
+        "_js_helper",
+        "_js_interop_wasm",
+        "_js_names",
+        "_js_primitives",
+        "_js_shared_embedded_names",
+        "_js_types",
+        "_late_helper",
+        "_load_library_priority",
+        "_metadata",
+        "_native_typed_data",
+        "_recipe_syntax",
+        "_rti",
+        "_vm",
+        "_wasm",
+        "async",
+        "cli",
+        "collection",
+        "concurrent",
+        "convert",
+        "core",
+        "developer",
+        "ffi",
+        "html",
+        "html_common",
+        "indexed_db",
+        "io",
+        "isolate",
+        "js",
+        "js_interop",
+        "js_interop_unsafe",
+        "js_util",
+        "math",
+        "mirrors",
+        "nativewrappers",
+        "svg",
+        "typed_data",
+        "vmservice_io",
+        "web_audio",
+        "web_gl",
+    ];
+
     fn check(c: &mut Check<'_>) {
         let Some((range, candidate)) = candidate_uri(c, c.node()) else {
             return;
@@ -2107,6 +2189,21 @@ pub(crate) mod conditional_uri_does_not_exist {
         // An empty candidate resolves to the importing file itself, which
         // exists (the recovery splice and the written `''` form alike).
         if candidate.is_empty() {
+            return;
+        }
+        if let Some(library) = candidate.strip_prefix("dart:") {
+            // The oracle's `internalMapDartUri` (sdk.dart:248-268): the
+            // name is the segment before the first `/`; a name outside
+            // the table — an empty one (`dart://host/x`) included —
+            // returns no source and reports.
+            let name = library.split('/').next().unwrap_or("");
+            if SDK_LIBRARY_NAMES.binary_search(&name).is_err() {
+                c.report(range, &[candidate.as_str()]);
+            }
+            return;
+        }
+        if let Some(rest) = candidate.strip_prefix("package:") {
+            check_package(c, range, &candidate, rest);
             return;
         }
         let Some(path) = super::simple_directive_paths::relative_file_path(&candidate) else {
@@ -2127,6 +2224,59 @@ pub(crate) mod conditional_uri_does_not_exist {
         if !target.exists() {
             c.report(range, &[candidate.as_str()]);
         }
+    }
+
+    /// The `package:` face over the workspace facts. Upstream resolves
+    /// through the package config: a config'd name's target is
+    /// `<packageUri>/<path>` and reports only when that file is missing,
+    /// an unconfig'd name has no source at all and reports. The mounted
+    /// pubspec names stand in for the config: the own package's
+    /// `packageUri` directory is known exactly, a declared dependency
+    /// stands in for present, every other name is the no-source miss.
+    fn check_package(
+        c: &mut Check<'_>,
+        range: core::ops::Range<u32>,
+        candidate: &str,
+        rest: &str,
+    ) {
+        let Some(workspace) = c.unit.workspace else {
+            return;
+        };
+        let name = rest.split('/').next().unwrap_or("");
+        if name.is_empty() {
+            // `package:/x`: the empty name has no config entry.
+            c.report(range, &[candidate]);
+            return;
+        }
+        let after_name = rest[name.len()..].strip_prefix('/').unwrap_or("");
+        if name == workspace.own_package {
+            // The exact file face. A bare `package:<own>` (no `/`) and
+            // the `./` emptiness walk denote the lib directory itself,
+            // which exists.
+            let Some(relative) = super::simple_directive_paths::relative_file_path(after_name)
+            else {
+                return;
+            };
+            let target = if relative.starts_with('/') {
+                PathBuf::from(relative)
+            } else {
+                workspace.lib_dir.join(relative)
+            };
+            if !target.exists() {
+                c.report(range, &[candidate]);
+            }
+            return;
+        }
+        // A declared dependency stands in for present: its root is not a
+        // mounted fact, so the file face cannot be tested (the
+        // documented under-report).
+        if workspace.dependencies.contains(name)
+            || workspace.dev_dependencies.contains(name)
+        {
+            return;
+        }
+        // No config entry: the oracle's source factory returns no source.
+        c.report(range, &[candidate]);
     }
 }
 
@@ -3264,6 +3414,7 @@ mod wave1_pins {
 
     use rustc_hash::FxHashSet;
 
+    use super::conditional_uri_does_not_exist::SDK_LIBRARY_NAMES;
     use crate::WorkspaceFacts;
     use crate::registry::rule_by_name;
     use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
@@ -3561,18 +3712,95 @@ mod wave1_pins {
         let _ = std::fs::remove_file(dir.join("exists.dart"));
     }
 
-    /// The documented out-of-face forms stay silent: `dart:`/`package:`
-    /// candidates (no SDK/package tables here), the empty recovery splice,
-    /// an interpolated candidate.
+    /// The `dart:` face over the SDK name table
+    /// (`test_missingDartLibraries`): an untabulated name reports at the
+    /// clause literal with the candidate in the message; a tabulated one
+    /// (`dart:async`) passes. No workspace needed — the table is static.
     #[test]
-    fn conditional_uri_skipped_forms_stay_silent() {
-        let dir = std::env::temp_dir().join("dartq_w1_cond_skipped");
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    fn conditional_uri_dart_library_faces() {
         let mut f = Fixture::parse(
-            "import 'd.dart' if (x) 'dart:missing' if (y) 'package:nope/nope.dart' if (z) '' if (w) '$v.dart';\n",
+            "import 'd.dart' if (a) 'dart:missing_1' if (b) 'dart:async' if (c) 'dart:missing_2';\n",
         );
-        f.path = dir.join("a.dart");
+        f.path = PathBuf::from("/pkg/lib/a.dart");
+        let h = hits(&f, "conditional_uri_does_not_exist");
+        assert_eq!(h.len(), 2, "{h:?}");
+        let one = tok(&f.source, &f.tokens, "'dart:missing_1'", 0);
+        let two = tok(&f.source, &f.tokens, "'dart:missing_2'", 0);
+        assert_eq!(h[0].0, utf16_at(&f, one));
+        assert_eq!(h[1].0, utf16_at(&f, two));
+        assert_eq!(
+            h[0].2,
+            "The target of the conditional URI 'dart:missing_1' doesn't exist."
+        );
+    }
+
+    /// An authority-carrying `dart:` spelling composes an empty library
+    /// name — the same table miss the oracle's `internalMapDartUri`
+    /// answers (sdk.dart:253-262: the name is the segment before the
+    /// first `/`, `getSdkLibrary("")` misses) — and reports.
+    #[test]
+    fn conditional_uri_dart_authority_reports() {
+        let mut f = Fixture::parse("import 'd.dart' if (a) 'dart://host/x';\n");
+        f.path = PathBuf::from("/pkg/lib/a.dart");
+        assert_eq!(hits(&f, "conditional_uri_does_not_exist").len(), 1);
+    }
+
+    /// The `package:` face over the workspace facts
+    /// (`test_missingPackages`): an unregistered name is the no-source
+    /// miss and reports; a declared dependency stands in for present and
+    /// stays silent; the own package's file face is exact (missing under
+    /// `lib/` reports, existing passes).
+    #[test]
+    fn conditional_uri_package_faces() {
+        let dir = std::env::temp_dir().join("dartq_w1_cond_package");
+        let lib = dir.join("lib");
+        std::fs::create_dir_all(&lib).expect("temp dir");
+        std::fs::write(lib.join("exists.dart"), "library e;").expect("fixture file");
+        let own = facts("own", &["meta"], &dir);
+        let mut f = Fixture::parse(
+            "import 'd.dart' if (a) 'package:nope/nope.dart' if (b) 'package:meta/meta.dart' if (c) 'package:own/gone.dart' if (d) 'package:own/exists.dart' if (e) 'package:own';\n",
+        );
+        let path = lib.join("a.dart");
+        let h = workspace_hits(
+            &mut f,
+            path.to_str().expect("utf-8 temp path"),
+            "conditional_uri_does_not_exist",
+            &own,
+        );
+        assert_eq!(h.len(), 2, "{h:?}");
+        let nope = tok(&f.source, &f.tokens, "'package:nope/nope.dart'", 0);
+        let gone = tok(&f.source, &f.tokens, "'package:own/gone.dart'", 0);
+        assert_eq!(h[0].0, utf16_at(&f, nope));
+        assert_eq!(h[1].0, utf16_at(&f, gone));
+        let _ = std::fs::remove_file(lib.join("exists.dart"));
+    }
+
+    /// Without workspace facts the `package:` face stays silent (the
+    /// no-facts posture), alongside the two never-report forms: the
+    /// empty recovery splice (resolves to the importing file) and an
+    /// interpolated candidate (no `stringValue`).
+    #[test]
+    fn conditional_uri_no_facts_and_splice_faces_stay_silent() {
+        let f = Fixture::parse(
+            "import 'd.dart' if (x) '' if (y) '$v.dart' if (z) 'package:nope/nope.dart';\n",
+        );
         assert!(hits(&f, "conditional_uri_does_not_exist").is_empty());
+    }
+
+    /// The [`SDK_LIBRARY_NAMES`] mirror stays sorted (the binary
+    /// search's precondition) and pinned at sentinel faces — the
+    /// regeneration drift catchers (the canonical table is `dartq-sdk`'s
+    /// generated `FLAT_LIBRARIES`; `web_sql` is tabulated by neither
+    /// side).
+    #[test]
+    fn conditional_uri_sdk_name_table_sentinels() {
+        assert!(SDK_LIBRARY_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
+        for present in ["async", "cli", "io", "html", "web_gl", "_internal", "_wasm"] {
+            assert!(SDK_LIBRARY_NAMES.binary_search(&present).is_ok(), "{present}");
+        }
+        for absent in ["web_sql", "missing_1", ""] {
+            assert!(SDK_LIBRARY_NAMES.binary_search(&absent).is_err(), "{absent}");
+        }
     }
 
     /// An `==` comparison value is not the candidate — the report names

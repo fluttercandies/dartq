@@ -3239,10 +3239,24 @@ impl<'a> Engine<'a> {
             return;
         }
         let arg = self.rows.get(mark).filter(|_| hi == mark + 1).map(|row| {
+            // A `?.`-merged argument reads the short-circuit's nullable
+            // result (`g(a?.b)` offers `B?`).
+            let ty = self.expression_row_ty(row);
+            // The await flatten re-applies on the on-demand read — the same
+            // face `flush_argument` gives the claimed argument (a member/send
+            // operand's close-time row still carries the raw `Future<T>`).
+            let ty = if ty != Ty::UNKNOWN
+                && self
+                    .await_operand_extents
+                    .iter()
+                    .any(|&(start, end)| row.range.offset >= start && row.range.end() <= end)
+            {
+                self.flatten(ty)
+            } else {
+                ty
+            };
             (
-                // A `?.`-merged argument reads the short-circuit's nullable
-                // result (`g(a?.b)` offers `B?`).
-                self.expression_row_ty(row),
+                ty,
                 Self::primitive_literal(row, &self.members.primitive_ids),
                 row.range,
                 self.tear_off_sig(row),
@@ -3310,6 +3324,28 @@ impl<'a> Engine<'a> {
                         Ty::UNKNOWN
                     } else {
                         self.expression_row_ty(row)
+                    };
+                    // An `await` operand's row rewrite (`end_await_expression`)
+                    // flattened only the close-time stored `ty` — a
+                    // member/send operand resolves in the later pass, so the
+                    // on-demand read here answers the raw `Future<T>` face.
+                    // The operand's static type IS `flatten(operand)`
+                    // (`analyzeAwaitExpression`, type_analyzer.dart:542-548 —
+                    // the same face the var-inferred bind, the assignment
+                    // staging, and the prefix operand re-apply), so the
+                    // argument ask (`checkForArgumentTypesNotAssignableInList`
+                    // reads each argument's resolved `staticType`) must see
+                    // the flattened `T` too (#3061: `f(await fut)` offered
+                    // `Future<dynamic>` against `num`).
+                    let ty = if ty != Ty::UNKNOWN
+                        && self
+                            .await_operand_extents
+                            .iter()
+                            .any(|&(start, end)| row.range.offset >= start && row.range.end() <= end)
+                    {
+                        self.flatten(ty)
+                    } else {
+                        ty
                     };
                     Some((
                         ty,
@@ -4619,6 +4655,19 @@ impl<'a> Engine<'a> {
         if self.prefix_head_ty(from) {
             return None;
         }
+        // The built-in `Map<K, V> <: Iterable<E>` relation (the language's
+        // Map-as-Iterable face — `Map` declares no supertype clause in the
+        // SDK source, so the declared-edge walk sees no `Iterable` hop and
+        // answers a definite miss the oracle never makes: `f(someMap)`
+        // against `f(Iterable<Object?> x)` over-reported
+        // `Map<dynamic,dynamic> => Iterable<Object?>`). The element
+        // relation decides: `MapEntry<K, V> <: E`. Raw heads read
+        // `dynamic` for their arguments (the raw-type erasure). Core
+        // spellings only — a same-file `Map`/`Iterable`/`MapEntry`
+        // declaration keeps the ordinary declared-edge verdict.
+        if let Some(verdict) = self.builtin_map_iterable_verdict(from, to) {
+            return Some(verdict);
+        }
         match self.assignable(from, to, literal) {
             Some(verdict) => Some(verdict),
             None => match (from, to) {
@@ -4639,6 +4688,71 @@ impl<'a> Engine<'a> {
                 _ => None,
             },
         }
+    }
+
+    /// The built-in `Map<K, V> <: Iterable<E>` relation the argument
+    /// verdict asks first ([`Engine::argument_verdict`]'s Map-as-Iterable
+    /// face): `Some` only where the heads are the core spellings the
+    /// analyzing file does not itself declare — a same-file
+    /// `Map`/`Iterable`/`MapEntry` declaration shadows the core face and
+    /// keeps the declared-edge verdict. The element relation
+    /// `MapEntry<K, V> <: E` decides through the ordinary matrix; raw
+    /// heads erase to `dynamic` arguments.
+    fn builtin_map_iterable_verdict(&self, from: Ty, to: Ty) -> Option<bool> {
+        let Ty::Named {
+            name: map,
+            args: map_args,
+            nullable: false,
+        } = from
+        else {
+            return None;
+        };
+        let Ty::Named {
+            name: iterable,
+            args: iter_args,
+            nullable: false,
+        } = to
+        else {
+            return None;
+        };
+        if map != self.intern("Map") || iterable != self.intern("Iterable") {
+            return None;
+        }
+        let shadowed = |engine: &Self, name: StringId| {
+            engine
+                .index
+                .get(engine.file)
+                .is_some_and(|unit| unit.container(name).is_some())
+        };
+        let entry_head = self.intern("MapEntry");
+        if shadowed(self, map) || shadowed(self, iterable) || shadowed(self, entry_head) {
+            return None;
+        }
+        // Each read scopes its own pool borrow: `intern_list` below takes
+        // the args cell's `borrow_mut`, and a held `Ref` would panic the
+        // cell (the #2594 live-repro shape).
+        let (k, v) = {
+            let pool = self.boundary.pool();
+            match pool.get(map_args) {
+                [] => (Ty::Dynamic, Ty::Dynamic),
+                [k, v] => (*k, *v),
+                _ => return None,
+            }
+        };
+        let elem = {
+            let pool = self.boundary.pool();
+            match pool.get(iter_args) {
+                [] => Ty::Dynamic,
+                [elem] => *elem,
+                _ => return None,
+            }
+        };
+        let entry = Ty::Named {
+            name: entry_head,
+            nullable: false,
+            args: self.boundary.intern_list(&[k, v]),
+        };
+        self.assignable(entry, elem, false)
     }
 
     /// Whether `ty`'s head is an import prefix rather than a type — the
@@ -4748,11 +4862,24 @@ impl<'a> Engine<'a> {
         // selected constructor (`a(test: 0)` gives `test`): the
         // `unused_element_parameter` rule counts them like any other
         // invocation's (probed: dart analyze 3.13.1 — `a(test: 0)` over
-        // `const E({this.test = 0})` reports nothing).
+        // `const E({this.test = 0})` reports nothing). The positional
+        // supply joins the same index (`visitEnumConstantDeclaration` →
+        // `_addParametersForArguments` over the constant's whole
+        // argumentList, upstream unused_local_elements_verifier.dart:146-153):
+        // `E(0)` gives the selected constructor's first positional formal.
         for (given, ..) in &level.args {
             if let Some(given) = given {
                 self.named_given.insert((key, *given));
             }
+        }
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        if positional > named {
+            let given = self.positional_given.entry(key).or_default();
+            *given = (*given).max(positional - named);
         }
         // The unnamed face over an enum with NO declared constructor
         // resolves the synthetic `const E()` — a zero-formal table that
@@ -4814,11 +4941,6 @@ impl<'a> Engine<'a> {
         // rightParenthesis` — the first named label, else the closer); a
         // surplus reports at the first extra positional. `given` is the
         // positional supply — the parser's total less the named entries.
-        let named = level
-            .args
-            .iter()
-            .filter(|(name, ..)| name.is_some())
-            .count() as u16;
         let given = positional.saturating_sub(named);
         let required = formals.positional.iter().filter(|f| f.required).count() as u16;
         if given < required {
@@ -6819,6 +6941,45 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// The givens lookup spelling of an invoked selector: the written
+    /// spelling, except the reserved `new` selector — the unnamed
+    /// constructor's alias — which keys under the class segment it hangs
+    /// off (`C.new(...)` credits the `C`-keyed formal table, the
+    /// collector's own `A()`/`A.new` normalization). A bare `.new(`
+    /// dot-shorthand names no class and credits nothing (`None`).
+    fn givens_key(&self, selector: StringId, selector_range: SourceRange) -> Option<StringId> {
+        if selector != self.intern("new") {
+            return Some(selector);
+        }
+        self.creation_class_before(selector_range)
+            .map(|(class, _)| class)
+    }
+
+    /// The call-site givens index (`_addParametersForArguments`, upstream
+    /// Dart SDK source, `pkg/analyzer/lib/src/error/
+    /// unused_local_elements_verifier.dart:394-399`): the invocation credits
+    /// what it wrote — the positional supply (the parser's total count less
+    /// the named entries) and each named label — keyed by the callee's
+    /// lookup spelling. Runs ahead of any formals resolution: the
+    /// `unused_element_parameter` rule counts call-site givens, not
+    /// resolutions.
+    fn record_argument_givens(&mut self, key: StringId, level: &ArgLevel, positional: u16) {
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        if positional > named {
+            let given = self.positional_given.entry(key).or_default();
+            *given = (*given).max(positional - named);
+        }
+        for (given, ..) in &level.args {
+            if let Some(given) = given {
+                self.named_given.insert((key, *given));
+            }
+        }
+    }
+
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
     /// the assignability walk (`extra_positional_arguments[_could_be_named]`
@@ -6872,6 +7033,19 @@ impl<'a> Engine<'a> {
                 start > 0 && self.source.as_bytes()[start - 1] == b'.'
             });
             if dot_preceded {
+                // The dot-shorthand/named-selector send credits what it
+                // wrote before any resolution face
+                // (`visitDotShorthandConstructorInvocation` /
+                // `visitDotShorthandInvocation` → `_addParametersForArguments`,
+                // upstream unused_local_elements_verifier.dart:121-134): the
+                // latch holds the selector the givens index keys (a `new`
+                // selector under its class segment), so `C.new(used)` spares
+                // `used` even though no callee row answers here.
+                if let Some((selector, selector_range)) = self.pending_bare_creation
+                    && let Some(key) = self.givens_key(selector, selector_range)
+                {
+                    self.record_argument_givens(key, &level, positional);
+                }
                 self.report_alias_selector_face();
             } else if !self.report_alias_invocation_of_non_function() {
                 // The explicit-keyword unnamed creation (`const A()`,
@@ -7120,24 +7294,30 @@ impl<'a> Engine<'a> {
         // less the attributed named entries. Callee-spelling keys — a
         // same-named member elsewhere suppresses, never false-positives.
         let callee_spelling = row.name;
-        let named = level
-            .args
-            .iter()
-            .filter(|(name, ..)| name.is_some())
-            .count() as u16;
-        if positional > named {
-            let given = self.positional_given.entry(callee_spelling).or_default();
-            *given = (*given).max(positional - named);
-        }
         // The given-named face registers before the formals gate: an
         // invocation whose formals cannot resolve here (an
         // initializer-list redirect `this._(v: v)`, an enum-constant
         // argument list) still supplies what it wrote — the
         // `unused_element_parameter` rule counts call-site givens, not
-        // resolutions.
-        for (given, ..) in &level.args {
-            if let Some(given) = given {
-                self.named_given.insert((callee_spelling, *given));
+        // resolutions. The reserved `new` selector keys under its class
+        // segment — the spelling the constructor's formal table sealed on.
+        // Field-level writes ([`Self::record_argument_givens`] takes `&mut
+        // self`, and the callee row's borrow stays open for the formals
+        // match below).
+        if let Some(key) = self.givens_key(row.name, row.range) {
+            let named = level
+                .args
+                .iter()
+                .filter(|(name, ..)| name.is_some())
+                .count() as u16;
+            if positional > named {
+                let given = self.positional_given.entry(key).or_default();
+                *given = (*given).max(positional - named);
+            }
+            for (given, ..) in &level.args {
+                if let Some(given) = given {
+                    self.named_given.insert((key, *given));
+                }
             }
         }
         // Cloned: the assignability path below reads the table while the
@@ -7888,6 +8068,11 @@ impl<'a> Engine<'a> {
         // argument beyond the capacity; a compound operand's window stays
         // unattributed, so the surplus anchor degrades to the closing paren
         // (a documented span divergence, the code identical).
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
         if let Some(given) = positional.checked_sub(named) {
             let given = usize::from(given);
             let required = formals.positional.iter().filter(|f| f.required).count();
@@ -8406,21 +8591,53 @@ impl<'a> Engine<'a> {
             // `correspondingParameter` walk (resolver.dart:522,
             // `checkForArgumentTypesNotAssignableInList`) — a `() => 0`
             // against `void Function(int)` reports exactly like a
-            // tear-off.
-            let arg_sig = self.arg_sigs.remove(&range.offset).or_else(|| {
+            // tear-off. The closure capture's `FnVarSig` return is a
+            // `void` STUB (`closure_capture_end` hardcodes `Ty::Void`),
+            // never a real inference: the formal's return is the downward
+            // context the literal re-infers under (`inferLocalFunction`'s
+            // cap — the `S = R` posture the capture's own Value row
+            // carries), so the stub re-types BEFORE the ask and the
+            // decision rides the arity and parameter slots (#3061's
+            // re-decide, applied up front).
+            let tear_off_sig = self.arg_sigs.remove(&range.offset);
+            let closure_sig = if tear_off_sig.is_none() {
                 level
                     .closures
                     .iter()
                     .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
                     .map(|(.., sig)| sig.clone())
-            });
+            } else {
+                None
+            };
+            let arg_sig = tear_off_sig.or(closure_sig.clone());
             if let Some(arg_sig) = arg_sig {
                 if let Some(formal_sig) = formal_sig {
-                    match self.fn_sig_subtype(&arg_sig, &formal_sig) {
+                    // The literal's downward face runs BEFORE the ask: a
+                    // closure stub's `void` return is never an inference —
+                    // the formal's return is the context the body re-infers
+                    // under (`inferLocalFunction`'s cap), so the stub
+                    // re-types and ONE ask decides on the real faces: the
+                    // return covariance reads the context return, and the
+                    // arity/parameter slots produce the row the oracle's
+                    // `checkForArgumentTypesNotAssignableInList` emits
+                    // (resolver.dart:519-536). A satisfying body stays
+                    // silent, a genuine mismatch reports the context-typed
+                    // literal (the oracle's resolved `FunctionExpression`
+                    // type: written formals, context return). A tear-off's
+                    // signature is a real written one and asks unchanged.
+                    let decided = match closure_sig.as_ref() {
+                        Some(stub) => {
+                            let mut sig = (**stub).clone();
+                            sig.return_ty = formal_sig.return_ty;
+                            sig
+                        }
+                        None => (*arg_sig).clone(),
+                    };
+                    match self.fn_sig_subtype(&decided, &formal_sig) {
                         Some(true) => continue,
                         Some(false) => {
                             let code = SemanticCode::ArgumentTypeNotAssignable;
-                            let from_text = self.fn_sig_display(&arg_sig);
+                            let from_text = self.fn_sig_display(&decided);
                             let to_text = self.fn_sig_display(&formal_sig);
                             let message = code.message3(&from_text, &to_text, "");
                             // The why-not-promoted rows hang on the argument's
@@ -8444,7 +8661,9 @@ impl<'a> Engine<'a> {
                     // falls through to the ordinary face below. The
                     // substituted type decides (#2873): `test<Foo>(foo)`
                     // unfolds the alias instantiation the written argument
-                    // bound, never the raw parameter spelling.
+                    // bound, never the raw parameter spelling. The closure
+                    // stub's return re-infers from the alias RHS's return —
+                    // the same downward face the direct formal arm applies.
                     if let Some(alias_sig) = match formal_ty {
                         Ty::Named {
                             name,
@@ -8453,11 +8672,23 @@ impl<'a> Engine<'a> {
                         } => self.alias_fn_sig(name),
                         _ => None,
                     } {
-                        match self.fn_sig_subtype(&arg_sig, &alias_sig) {
+                        // The same downward face the direct formal arm runs:
+                        // the stub re-types from the alias RHS's return (the
+                        // written RHS is the context the oracle decides
+                        // against) and one ask decides.
+                        let decided = match closure_sig.as_ref() {
+                            Some(stub) => {
+                                let mut sig = (**stub).clone();
+                                sig.return_ty = alias_sig.return_ty;
+                                sig
+                            }
+                            None => (*arg_sig).clone(),
+                        };
+                        match self.fn_sig_subtype(&decided, &alias_sig) {
                             Some(true) => continue,
                             Some(false) => {
                                 let code = SemanticCode::ArgumentTypeNotAssignable;
-                                let from_text = self.fn_sig_display(&arg_sig);
+                                let from_text = self.fn_sig_display(&decided);
                                 let to_text = self.ty_display(formal_ty);
                                 let message = code.message3(&from_text, &to_text, "");
                                 let index = self.report.diagnostics.len();
@@ -8503,6 +8734,51 @@ impl<'a> Engine<'a> {
                         self.emit_message_with_correction(code, *range, message);
                         self.pending_non_promotion.push((index, range.offset));
                         continue;
+                    }
+                    // The unknown-row fallback: a captured signature whose
+                    // callee carries no written-signature table entry while
+                    // the element formal IS a function shape (the foreign
+                    // and SDK callees the `fn_formal_sigs` capture never
+                    // sees), on a row that stayed Unknown (no matched
+                    // context at the literal's capture — the ordinary face
+                    // below cannot ask `Unknown` against anything). The
+                    // stub re-types from the formal shape's return (the cap
+                    // posture) and the pair decides through the ordinary
+                    // ask — `assignable` unfolds the formal's function
+                    // shape and runs the same `_isFunctionSubtypeOf`
+                    // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+                    // element/subtype.dart) the direct arm decides with;
+                    // the arity and parameter slots produce the row
+                    // (resolver.dart:522). A tear-off's real return needs
+                    // no re-typing.
+                    let folded_formal = self.fold_alias_ty(formal_ty);
+                    if *ty == Ty::Unknown
+                        && matches!(
+                            folded_formal,
+                            Ty::Function {
+                                nullable: false,
+                                ..
+                            }
+                        )
+                    {
+                        let mut decided = (*arg_sig).clone();
+                        if closure_sig.is_some()
+                            && let Some(ret) = self.function_shape_return(folded_formal)
+                        {
+                            decided.return_ty = ret;
+                        }
+                        if self.assignable(self.fn_sig_ty(&decided), folded_formal, false)
+                            == Some(false)
+                        {
+                            let code = SemanticCode::ArgumentTypeNotAssignable;
+                            let from_text = self.fn_sig_display(&decided);
+                            let to_text = self.ty_display(formal_ty);
+                            let message = code.message3(&from_text, &to_text, "");
+                            let index = self.report.diagnostics.len();
+                            self.emit_message_with_correction(code, *range, message);
+                            self.pending_non_promotion.push((index, range.offset));
+                            continue;
+                        }
                     }
                 }
             }

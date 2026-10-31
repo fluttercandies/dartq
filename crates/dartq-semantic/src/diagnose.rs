@@ -5678,6 +5678,19 @@ mod ticket_3007_tests;
 #[cfg(test)]
 mod ticket_3016_tests;
 #[cfg(test)]
+mod ticket_3065_tests;
+
+/// The #3069 pins — the call-site givens the `unused_element_parameter`
+/// rule reads for the invocations that slipped the recording: the
+/// reserved `new` selector keys under its class segment (`C.new(used)`
+/// credits the `C`-keyed formal table), a dot-shorthand send credits
+/// through its selector spelling (`visitDotShorthandInvocation`,
+/// unused_local_elements_verifier.dart:129-134), and an enum constant's
+/// positional arguments join the named ones (`visitEnumConstantDeclaration`,
+/// :146-153).
+#[cfg(test)]
+mod ticket_3069_tests;
+#[cfg(test)]
 mod ticket_3026_tests;
 #[cfg(test)]
 mod ticket_3035_tests;
@@ -5691,3 +5704,45 @@ mod ticket_3035_tests;
 /// implicit application invoked through a cascade on a fresh receiver.
 #[cfg(test)]
 mod ticket_3040_tests;
+
+/// The #3056 pins — the type-parameter value read reifies a `Type` literal
+/// (simple_identifier_resolver.dart:268-269 answers `typeType`), so
+/// `return T` asks `Type <: T` — and a type-parameter target is
+/// decidable-false for every interface source (subtype.dart's Left Variable
+/// arm), which lands the `return T` / `int <: T` family.
+#[cfg(test)]
+mod ticket_3056_tests;
+
+/// The #3061 pins — the argument-type over-emission family: the await
+/// flatten on argument rows (`analyzeAwaitExpression`'s `flatten(e)`
+/// static type), the closure literal's downward return inference
+/// (`inferLocalFunction`'s context-return cap), the built-in
+/// `Map<K, V> <: Iterable<E>` argument relation (element-wise
+/// `MapEntry<K, V> <: E`), and the if-null assignment's own
+/// `LUB(NonNull(T1), T2)` write face (`_resolveTypes`).
+#[cfg(test)]
+mod ticket_3061_tests;
+
+/// The #3062 pins — the closure-argument signature walk: the downward
+/// return face re-types the captured stub BEFORE the function-subtype ask
+/// (`inferLocalFunction`'s cap), so the arity and parameter slots decide
+/// the row (`resolver.dart:523 checkForArgumentTypesNotAssignableInList`,
+/// `_isFunctionSubtypeOf` at subtype.dart:338).
+#[cfg(test)]
+mod ticket_3062_tests;
+
+/// The #3064 pins — the generic send's downward context: the index
+/// formal (`a[g()]++` — `[]`/`[]=`'s first formal as the read/write
+/// context, resolver.dart:3378's `indexContextType`) and the numeric
+/// argument context (`h(a.remainder(f()))` —
+/// `refineNumericInvocationContext`, type_system.dart:1881-1990).
+#[cfg(test)]
+mod ticket_3064_tests;
+
+/// The #3067 pins — suspends-body closure literals keep their capture:
+/// the async/generator wrap rides the typed row (the `void` stub's sync
+/// cap would re-type it away), and a no-context untyped formal infers
+/// `dynamic` instead of poisoning the capture (`inferLocalFunction` with
+/// no formal-inference source).
+#[cfg(test)]
+mod ticket_3067_tests;

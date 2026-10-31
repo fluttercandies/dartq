@@ -1370,7 +1370,9 @@ impl<'a> Engine<'a> {
     /// downward answer (`greatestClosure(Qi)`, `Object?` for `Qi <: Null`,
     /// `dynamic` when the context supplies nothing —
     /// `inferLocalFunction`'s `Ri`). An untyped formal under no context
-    /// poisons, the same under-report posture as before.
+    /// keeps `dynamic` (`inferLocalFunction` with no formal-inference
+    /// source — the parameter's downward answer IS `dynamic`): the
+    /// literal's own signature still lands instead of poisoning.
     pub(crate) fn closure_formal(&mut self) {
         let depth = self.formal_list_depth;
         let ty = self.armed_ty;
@@ -1393,10 +1395,9 @@ impl<'a> Engine<'a> {
                     self.closure_ctx_formal_ty(ctx, index)
                         .unwrap_or(Ty::Dynamic),
                 ),
-                // No context: the type is the solver's downward answer,
-                // which this face does not compute — the same under-report
-                // poison as before.
-                None => None,
+                // No context: the untyped formal keeps `dynamic` — the
+                // literal's capture stays un-poisoned.
+                None => Some(Ty::Dynamic),
             },
         };
         let Some(capture) = self.closure_caps.last_mut() else {
@@ -1410,9 +1411,13 @@ impl<'a> Engine<'a> {
 
     /// `end_function_expression` (the literal's frame still open): closes
     /// the capture and hands an exact signature to the enclosing argument
-    /// list. An `async`/generator body changes the literal's return type
-    /// (`Future<void>`), which this capture does not render — poisoned.
-    /// Returns the literal's span start plus the final inferred type when
+    /// list. A suspends body (`async`/`sync*`/`async*`) changes the
+    /// literal's static return — `Future<…>` through the capture-ctx
+    /// rewrite (`note_async_modifier`), `Iterable`/`Stream` for the
+    /// generators — so the literal keeps only the typed row and drops the
+    /// `void` stub (whose re-type-to-formal-return mechanism is the sync
+    /// cap and would silently undo the wrap). Returns the literal's span
+    /// start plus the final inferred type when
     /// a matched context `K` supplied one (`inferLocalFunction`'s
     /// `(R0, …, Rn) -> M'`: written-and-inferred formals, the context
     /// return under the cap `S = T if T <: R else S = R` — the body's
@@ -1433,16 +1438,29 @@ impl<'a> Engine<'a> {
             // arguments by span, not by the captured signature.
             self.invalid_closure_spans.push((capture.offset, end));
         }
-        let suspends = self.frames.last().is_some_and(|frame| {
-            matches!(
-                frame.kind,
-                FrameKind::Executable { is_async: true, .. }
-                    | FrameKind::Executable {
-                        generator: true,
-                        ..
-                    }
-            )
-        });
+        // The literal's own body modifier reads off its still-open frame.
+        // A suspends body changes the literal's static return: `async`
+        // wraps the downward context's return through `Future<flatten(R)>`
+        // (the rewrite already sits on the capture's ctx —
+        // `note_async_modifier`), and a generator body returns
+        // `Iterable`/`Stream`. The `void` stub's whole mechanism is the
+        // sync cap (`S = R` — the argument face re-types the stub's return
+        // to the formal's before asking), which is FALSE for a suspends
+        // literal: the re-typed stub would silently undo the wrap and
+        // erase the row the oracle reports (`g(() async {})` over
+        // `int Function()` answers `Future<Null> Function()`, never the
+        // re-typed `int Function()`). A suspends literal skips the stub —
+        // the argument channel then decides through the ordinary ask on
+        // the typed row's wrapped face.
+        let (suspends, is_async, generator) =
+            match self.frames.last().map(|frame| &frame.kind) {
+                Some(FrameKind::Executable {
+                    is_async,
+                    generator,
+                    ..
+                }) => (*is_async || *generator, *is_async, *generator),
+                _ => (false, false, false),
+            };
         // The upstream match gate closes at the literal's own group count
         // (`typeContext.typeParameters.length == functionTypeParameters
         // .length`): a counted literal under a mismatched-count context
@@ -1451,19 +1469,21 @@ impl<'a> Engine<'a> {
         let ctx = capture
             .ctx
             .filter(|ctx| self.closure_ctx_matches(*ctx, capture.type_params));
-        if capture.poisoned || capture.list_depth == 0 || suspends {
+        if capture.poisoned || capture.list_depth == 0 {
             return None;
         }
-        let required = capture.optional_from.unwrap_or(capture.positional.len());
-        let sig = Box::new(FnVarSig {
-            params: Box::default(),
-            required_positional: u16::try_from(required).unwrap_or(u16::MAX),
-            positional: capture.positional.clone().into_boxed_slice(),
-            named: Box::default(),
-            return_ty: Ty::Void,
-        });
-        if let Some(level) = self.arg_levels.last_mut() {
-            level.closures.push((capture.offset, end, sig));
+        if !suspends {
+            let required = capture.optional_from.unwrap_or(capture.positional.len());
+            let sig = Box::new(FnVarSig {
+                params: Box::default(),
+                required_positional: u16::try_from(required).unwrap_or(u16::MAX),
+                positional: capture.positional.clone().into_boxed_slice(),
+                named: Box::default(),
+                return_ty: Ty::Void,
+            });
+            if let Some(level) = self.arg_levels.last_mut() {
+                level.closures.push((capture.offset, end, sig));
+            }
         }
         // The final literal type rides the pushed Value row: the context's
         // return under the cap over the literal's own resolved formals.
@@ -1472,6 +1492,41 @@ impl<'a> Engine<'a> {
         // and return channels read the same face the oracle infers.
         ctx.and_then(|ctx| {
             let ret = self.function_shape_return(ctx)?;
+            // A generator body's static return is `Iterable<T>`/`Stream<T>`
+            // (`sync*` spells `Iterable`, `async*` `Stream`). The element
+            // type infers from the body's yields; the imposed context's
+            // own `Iterable`/`Stream`-headed return supplies it ahead of
+            // that (`Stream<int> Function() f = () async* {}` infers the
+            // `int` element — the official's downward element inference),
+            // and an element-less context answers the empty-body
+            // `dynamic` (`() sync* {}` alone answers `Iterable<dynamic>
+            // Function()`).
+            let ret = if generator {
+                let element = match ret {
+                    Ty::Named { name, args, .. }
+                        if args != ArgListId::EMPTY
+                            && (name == self.intern("Iterable")
+                                || name == self.intern("Stream")) =>
+                    {
+                        self.boundary
+                            .pool()
+                            .get(args)
+                            .first()
+                            .copied()
+                            .unwrap_or(Ty::Dynamic)
+                    }
+                    _ => Ty::Dynamic,
+                };
+                let head = self.intern(if is_async { "Stream" } else { "Iterable" });
+                let args = self.boundary.intern_list(&[element]);
+                Ty::Named {
+                    name: head,
+                    nullable: false,
+                    args,
+                }
+            } else {
+                ret
+            };
             let ty =
                 self.boundary
                     .args
