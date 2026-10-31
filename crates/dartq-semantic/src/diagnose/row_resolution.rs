@@ -2536,8 +2536,18 @@ impl<'a> Engine<'a> {
                         // type (`extension on M` applied inside a class
                         // implementing `M` — the same implicit application
                         // a qualified send reads; the application credits
-                        // the member and import the same way).
+                        // the member and import the same way). The
+                        // enclosing class's OWN members claim the name
+                        // first (static-extensions uniqueness — the
+                        // oracle's `extension_member_resolver` only runs
+                        // when the interface lookup found nothing): a
+                        // `static set foo` on the class blocks every
+                        // application of `foo`, leaving the row the
+                        // class's own `undefined_method` face
+                        // (UndefinedMethodTest
+                        // test_extensionMethodHiddenByStaticSetter).
                         if let Some(container) = this_type
+                            && !self.container_declares_member(container, row.name)
                             && matches!(
                                 self.extension_application(
                                     container,
@@ -4271,8 +4281,21 @@ impl<'a> Engine<'a> {
                     // guard-free like every member face (the oracle's
                     // `_isIgnored` consults `shouldIgnoreUndefined` only on
                     // the unqualified/prefixed *name* domains — an
-                    // instance-member miss never reaches it).
-                    self.emit(code, row.range, name_text, "InvalidType");
+                    // instance-member miss never reaches it). The display
+                    // splits by intent: the invocation face names the
+                    // invocation resolver's `<unknown>` receiverClassName
+                    // (method_invocation_resolver.dart — only an
+                    // `InterfaceType`/`FunctionType` receiver escapes the
+                    // default), the read/write faces name the `InvalidType`
+                    // the failed lookup left (probe: `Undefined.new()`
+                    // reports `<unknown>`, `var x = Undefined.new` reports
+                    // `InvalidType`).
+                    let type_text = if row.intent == Intent::Invoke {
+                        "<unknown>"
+                    } else {
+                        "InvalidType"
+                    };
+                    self.emit(code, row.range, name_text, type_text);
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
                 }
@@ -4455,6 +4478,46 @@ impl<'a> Engine<'a> {
                 }
             }
             Receiver::Container { name, kind } => {
+                // A cascade section's receiver is the target's VALUE: for a
+                // type-literal target (`C..foo()`) that value is the `Type`
+                // instance, so the section resolves an INSTANCE lookup on
+                // `Type` — the container's own statics never answer
+                // (`C..bar()` over C's own `static void bar()` reports
+                // `undefined_method` naming `Type`, probed 3.13.7; reads
+                // name it `undefined_getter`, writes `undefined_setter`),
+                // while the `Object` face (`C..toString()`) resolves and
+                // stays silent. The static-container face never runs for a
+                // section.
+                if self.cascade_sections.contains(&row.range.offset) {
+                    if !self.members.object_members.contains(&row.name)
+                        && row.name != self.intern("==")
+                    {
+                        let name_text = self.strings.resolve(row.name);
+                        match row.intent {
+                            Intent::Invoke => self.emit(
+                                SemanticCode::UndefinedMethod,
+                                row.range,
+                                name_text,
+                                "Type",
+                            ),
+                            Intent::Read => self.emit(
+                                SemanticCode::UndefinedGetter,
+                                row.range,
+                                name_text,
+                                "Type",
+                            ),
+                            Intent::Write | Intent::ReadWrite => self.emit(
+                                SemanticCode::UndefinedSetter,
+                                row.range,
+                                name_text,
+                                "Type",
+                            ),
+                            Intent::Operator(..) => {}
+                        }
+                    }
+                    self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                    return;
+                }
                 self.check_container_member(row, name, kind);
             }
             // The prefix-resolved container (`io.Directory.gone`): the
@@ -5391,13 +5454,20 @@ impl<'a> Engine<'a> {
                 } => self.ty_display(ty),
                 _ => self.strings.resolve(container).to_string(),
             };
+            // The invocation face names the receiver's bare element display —
+            // never the written instantiation or nullability (`List<int> l;
+            // l.removeMiddle()` names `List`, `A<int>? a; a?.foo()` names `A`;
+            // the oracle 3.13.7 renders the method face through the element's
+            // display name while the getter/setter faces keep the full
+            // `getDisplayString` render).
+            let method_text = self.strings.resolve(container).to_string();
             match row.intent {
                 Intent::Invoke => {
                     self.emit(
                         SemanticCode::UndefinedMethod,
                         row.range,
                         name_text,
-                        &type_text,
+                        &method_text,
                     );
                 }
                 Intent::Read => {
@@ -5586,12 +5656,19 @@ impl<'a> Engine<'a> {
             (Receiver::Typed { .. }, ty @ Ty::Named { .. }) => self.ty_display(ty),
             _ => self.strings.resolve(report_on).to_string(),
         };
+        // The invocation face names the receiver's bare element display —
+        // never the written instantiation or nullability (`A<int> a;
+        // a.foo()` names `A`, `V<String> v; v.fooInt()` names `V`; the
+        // oracle 3.13.7 renders the method face through the element's
+        // display name while the getter/setter faces keep the full
+        // `getDisplayString` render).
+        let method_text = self.strings.resolve(report_on).to_string();
         match row.intent {
             Intent::Invoke => self.emit(
                 SemanticCode::UndefinedMethod,
                 row.range,
                 name_text,
-                &type_text,
+                &method_text,
             ),
             Intent::Write | Intent::ReadWrite => {
                 // A compound write checks the read face first (the oracle
@@ -7845,6 +7922,33 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the container's OWN declaration spells the name — the bare
+    /// member spelling or its setter twin (`static set foo` claims `foo`
+    /// for every invocation intent). Only the container's own map counts:
+    /// an inherited claimant resolves the row before it ever reaches the
+    /// miss faces (the lexical-shadow gate for the implicit-`this`
+    /// application — upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart
+    /// runs only when the interface lookup found nothing).
+    pub(crate) fn container_declares_member(
+        &mut self,
+        container: StringId,
+        name: StringId,
+    ) -> bool {
+        let setter = self.setter_spelling(name);
+        resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .is_some_and(|(decl, _)| {
+            decl.members.contains_key(&name) || decl.members.contains_key(&setter)
+        })
+    }
+
     /// The implicit-application outcome for `member` against a receiver
     /// whose resolved container is `receiver`
     /// (`extension_member_resolver.dart:85-128` `findExtension` +
@@ -8504,8 +8608,16 @@ impl<'a> Engine<'a> {
         if receiver_valid {
             for &(face, face_file) in faces {
                 let Some(on) = face.on_type else { continue };
-                if !(face.members.contains_key(&member)
-                    || (accept_setter && face.members.contains_key(&setter)))
+                // Only the extension's INSTANCE members participate in an
+                // application (`extension_member_resolver.dart` instantiates
+                // the extension for the receiver and looks the member up in
+                // the instantiated interface — a `static` member of the
+                // extension never answers an instance access, so
+                // `extension E on C { static void a() {} }` leaves `c.a()`
+                // the class's own `undefined_method` face).
+                if !(face.members.get(&member).is_some_and(|e| !e.is_static)
+                    || (accept_setter
+                        && face.members.get(&setter).is_some_and(|e| !e.is_static)))
                 {
                     continue;
                 }

@@ -1771,7 +1771,16 @@ impl<'a> Engine<'a> {
                 self.report.diagnostics.remove(index);
             } else {
                 let name_text = self.strings.resolve(read.name).to_string();
-                let face_text = self.render_ty(face);
+                // The re-rendered method face names the settled face's bare
+                // element display — never the written instantiation or
+                // nullability (the oracle renders `undefined_method` through
+                // the element's display name; the getter/setter faces keep
+                // the full `getDisplayString` render).
+                let face_text = if matches!(code, SemanticCode::UndefinedMethod) {
+                    self.strings.resolve(face_head).to_string()
+                } else {
+                    self.render_ty(face)
+                };
                 self.report.diagnostics[index] = Diagnostic::new(
                     code.severity(),
                     code.code_info(),
