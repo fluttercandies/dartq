@@ -5142,7 +5142,11 @@ impl<'a> Engine<'a> {
             // same extends arm). When this solve's ONLY unsatisfied
             // origins are ExtendsClauses, the seam's row is byte-identical
             // — emit nothing a second time (`B()` where `B<X extends B<X>>`
-            // would otherwise double-report).
+            // would otherwise double-report). The arm still counts as
+            // reported: upstream sets `hasErrorReported` on ANY unsatisfied
+            // parameter (generic_inferrer.dart `tryChooseFinalTypes`) and
+            // gates `_checkArgumentsNotMatchingBounds` on it, so the seam's
+            // row must also silence the instantiated-bound twin.
             if !success
                 && unnamed_creation
                 && constraints[index].iter().all(|c| {
@@ -5150,9 +5154,10 @@ impl<'a> Engine<'a> {
                         || matches!(origins[c.origin], InferOrigin::ExtendsClause { .. })
                 })
             {
+                reported = true;
                 continue;
             }
-            
+
             if !success {
                 let detail = self.infer_format_error(params[index].0, inferred_ty, &constraints[index], &origins);
                 let parameter = self.strings.resolve(params[index].0).to_string();
