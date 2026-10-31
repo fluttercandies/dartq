@@ -4305,6 +4305,23 @@ impl<'a> Engine<'a> {
         }
         match recv {
             Receiver::Unknown => {
+                // The type-literal receiver face runs BEFORE the
+                // invalid-receiver one: a head that SPELLS a type —
+                // `dynamic`, `Never`, or an ungrounded type alias —
+                // denotes the `Type` INSTANCE even when the receiver
+                // face never resolved, and that verdict owns the row
+                // ([`Self::check_type_literal_receiver`] claims it; the
+                // alias's INVOKE twin is the invocation walk's
+                // `report_alias_selector_face`, which already emitted).
+                // Without this order `Fn.new()` over
+                // `typedef Fn = void Function()` paired the correct
+                // `Type` row with this arm's `<unknown>` twin; probe
+                // 3.13.7: `dynamic.new()` and `Never.new()` also name
+                // `Type`, while `Undefined.new()` — no type literal —
+                // keeps `<unknown>` below.
+                if self.check_type_literal_receiver(row) {
+                    return;
+                }
                 // The `new` selector face (`prefix.C.new` after the prefix
                 // failed, cascade `..new()` over an unknown target): the
                 // official property lookup answers `needsGetterError`
@@ -11723,3 +11740,12 @@ mod ticket_3175_tests;
 #[cfg(test)]
 #[path = "ticket_3183_tests.rs"]
 mod ticket_3183_tests;
+
+// The #3186 pins — the type-literal receiver face runs BEFORE the
+// invalid-receiver `new` arm: `Alias.new()` reports ONE `Type` row (the
+// alias invoke twin is `report_alias_selector_face`'s, claimed here)
+// instead of pairing it with `<unknown>`, while a head that spells no type
+// keeps the `<unknown>` display.
+#[cfg(test)]
+#[path = "ticket_3186_tests.rs"]
+mod ticket_3186_tests;
