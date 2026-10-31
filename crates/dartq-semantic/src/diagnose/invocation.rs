@@ -1153,10 +1153,23 @@ impl<'a> Engine<'a> {
             } else {
                 NullAwareKind::Access
             };
-            // The bound-aware strictly face: an in-scope parameter
-            // receiver decides through its written bound (`T extends
-            // AstNodeImpl?` keeps `?.` legal, `T extends C` reports).
-            if self.strictly_non_nullable(receiver_ty) {
+            // The static-qualifier face (`C?.x`, `p.C?.x`, `C?.x = v`,
+            // `C?.f()`): a type spelling in the receiver slot carries no
+            // InstanceReceiver, so upstream's per-visit callers report the
+            // operator unconditionally — no type check at all
+            // (error_verifier.dart's visitReceiverMethodInvocation /
+            // visitReceiverPropertyExtraction /
+            // visitReceiverPropertyAssignmentTarget `StaticQualifier` arms,
+            // :2048-2053/:2083/:2119: the receiver IS the type, the `?.`
+            // can never be meaningful). `Receiver::Container` is the
+            // bare-head static face (`C`, `E`, a `dart:`-synthetic head);
+            // `PrefixedContainer` is the `p.C` join. A `Receiver::Created`
+            // (`C()?.x`) is an instance value — its declared type answers
+            // below like any expression receiver.
+            if matches!(
+                recv,
+                Receiver::Container { .. } | Receiver::PrefixedContainer { .. }
+            ) {
                 let (op, replacement) = kind.lexemes();
                 self.emit3(
                     SemanticCode::InvalidNullAwareOperator,
@@ -1165,6 +1178,81 @@ impl<'a> Engine<'a> {
                     replacement,
                     "",
                 );
+            // The bound-aware strictly face: an in-scope parameter
+            // receiver decides through its written bound (`T extends
+            // AstNodeImpl?` keeps `?.` legal, `T extends C` reports).
+            } else if self.strictly_non_nullable(receiver_ty) {
+                // The short-circuit variant
+                // (`_checkForUnnecessaryNullAware`'s
+                // `previousShortCircuitingOperator` walk): a `?.`/`?..`/`?[`
+                // whose receiver is non-null only because an EARLIER
+                // null-aware operator in the same chain already shorted it
+                // reports the `after_short_circuit` message and carries the
+                // causing operator as a context row — `s?.length?.isEven`'s
+                // second `?.`. The chain ledger's windows key the search:
+                // this operator's offset inside a prior chain's extent means
+                // that chain's `?.`/`?[` did the shorting (error_verifier
+                // .dart:7721-7740). The receiver's own declared-nullability
+                // handles the `strictly` verdict either way — the variant
+                // swaps the message text and adds the context, never the
+                // anchor or severity.
+                let prior = self
+                    .dead_null_chains
+                    .iter()
+                    .find(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end)
+                    .map(|(op, _, _, kind, _)| (*op, *kind));
+                let (op, replacement) = kind.lexemes();
+                if let Some((prior_offset, prior_kind)) = prior {
+                    // The causing operator's own spelling drives the context
+                    // lexeme (`?.` for a member/index root, `?..` for a
+                    // cascade-section root) and its span (2 columns for
+                    // `?.`, 3 for `?..`).
+                    let (prior_lexeme, prior_len) = match prior_kind {
+                        crate::diagnose::types::DeadChainKind::Member
+                        | crate::diagnose::types::DeadChainKind::Index => ("?.", 2u32),
+                        crate::diagnose::types::DeadChainKind::CascadeMember
+                        | crate::diagnose::types::DeadChainKind::CascadeIndex => ("?..", 3u32),
+                    };
+                    let message = format!(
+                        "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '{op}' can't be used."
+                    );
+                    let context = vec![ContextMessage {
+                        message: SharedStr::from(format!(
+                            "The operator '{prior_lexeme}' is causing the short circuiting."
+                        )),
+                        file: self.file,
+                        range: SourceRange {
+                            offset: prior_offset,
+                            length: prior_len,
+                        },
+                    }];
+                    let code = SemanticCode::InvalidNullAwareOperator;
+                    self.report.diagnostics.push(
+                        Diagnostic::new(
+                            code.severity(),
+                            code.code_info(),
+                            message,
+                            self.file,
+                            op_range,
+                            // The verbatim replace correction
+                            // (diagnostic.g.dart's
+                            // invalidNullAwareOperatorAfterShortCircuit
+                            // correctionMessage :9473-9478).
+                            Some(format!(
+                                "Try replacing the operator '{op}' with '{replacement}'."
+                            )),
+                        )
+                        .with_context(context),
+                    );
+                } else {
+                    self.emit3(
+                        SemanticCode::InvalidNullAwareOperator,
+                        op_range,
+                        op,
+                        replacement,
+                        "",
+                    );
+                }
             } else if was_local {
                 // The walk-time type decides nothing (the declared nullable
                 // /dynamic shape): re-decide at teardown against the flow's

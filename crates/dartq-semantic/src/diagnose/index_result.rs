@@ -409,3 +409,12 @@ int f(int index) {
         );
     }
 }
+
+/// The #3160 `invalid_null_aware_operator` family pins (the
+/// short-circuit-variant message, the `?[`/`?..`/`...?` anchor spans, the
+/// static-qualifier `C?.x` face, and the collection element/map-entry
+/// markers), kept as a standalone module so the shared `pins` rig stays
+/// untouched while its lane is in flight.
+#[cfg(test)]
+#[path = "ticket_3160_tests.rs"]
+mod ticket_3160_tests;

@@ -6394,9 +6394,20 @@ impl ParserListener for DiagnoseListener<'_> {
             offset: open.range.offset,
             length: close.range.end() - open.range.offset,
         };
-        // `#279: e1[e2]` is a spec constant the subset cannot value —
-        // both operands defer through an opaque leaf.
-        engine.const_capture.indexed(bracket);
+        // `e1[e2]` is never a constant expression — upstream's constant
+        // verifier flags the whole IndexExpression (`const x = a[0]`
+        // reports at `a[0]`, receiver start through `]`), so the capture
+        // pushes a non-constant leaf over the whole access rather than
+        // deferring through an opaque one.
+        let index_span = engine
+            .rows
+            .iter()
+            .rposition(|row| row.range.end() <= open.range.offset)
+            .map_or(bracket, |pos| SourceRange {
+                offset: engine.rows[pos].range.offset,
+                length: close.range.end() - engine.rows[pos].range.offset,
+            });
+        engine.const_capture.push_non_constant(index_span);
         // The receiver: the closest row wholly before the `[`.
         let Some(pos) = engine
             .rows
@@ -6423,10 +6434,21 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 ty
             };
-            // The `?[`/`?..` operator is the anchor
-            // (`atOffset(operator.offset, operator.next.end -
-            // operator.offset)`), not the receiver row.
-            let op_range = question_range;
+            // The `?[`/`?..` operator is the anchor, not the receiver row.
+            // The index arm anchors `operator.offset` through the bracket's
+            // own end (`_checkForUnnecessaryNullAware`'s `atOffset(operator
+            // .offset, operator.next!.end - operator.offset)` — the `?[`'s
+            // `?` token's `next` is the `[`, so the range covers both),
+            // while the `?..[` cascade's `?` stands in for the whole `?..`
+            // (its span already runs `?` through `..`).
+            let op_range = if question.is_some() {
+                SourceRange {
+                    offset: question_range.offset,
+                    length: open.range.end() - question_range.offset,
+                }
+            } else {
+                question_range
+            };
             let recv = engine.rows[pos].range;
             let kind = if question.is_some() {
                 NullAwareKind::Index
@@ -6437,14 +6459,60 @@ impl ParserListener for DiagnoseListener<'_> {
             // receiver decides through its written bound (`T extends C?`
             // keeps `?[` legal, `T extends C` reports).
             if engine.strictly_non_nullable(ty) {
+                // The short-circuit variant — an earlier `?.`/`?[`/`?..` in
+                // the same chain already shorted this receiver, so the
+                // operator reports `after_short_circuit` and carries the
+                // causing operator as a context row (`x?[0]?[1]`'s second
+                // `?[`, `s?.a?[0]`'s `?[`). `indexExpression` is one of the
+                // `canParticipateInShortCircuiting` kinds
+                // (error_verifier.dart :7679-7740).
+                let prior = engine
+                    .dead_null_chains
+                    .iter()
+                    .find(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end)
+                    .map(|(op, _, _, k, _)| (*op, *k));
                 let (op, replacement) = kind.lexemes();
-                engine.emit3(
-                    SemanticCode::InvalidNullAwareOperator,
-                    op_range,
-                    op,
-                    replacement,
-                    "",
-                );
+                if let Some((prior_offset, prior_kind)) = prior {
+                    let (prior_lexeme, prior_len) = match prior_kind {
+                        crate::diagnose::types::DeadChainKind::Member
+                        | crate::diagnose::types::DeadChainKind::Index => ("?.", 2u32),
+                        crate::diagnose::types::DeadChainKind::CascadeMember
+                        | crate::diagnose::types::DeadChainKind::CascadeIndex => ("?..", 3u32),
+                    };
+                    let code = SemanticCode::InvalidNullAwareOperator;
+                    engine.report.diagnostics.push(
+                        Diagnostic::new(
+                            code.severity(),
+                            code.code_info(),
+                            format!(
+                                "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '{op}' can't be used."
+                            ),
+                            engine.file,
+                            op_range,
+                            Some(format!(
+                                "Try replacing the operator '{op}' with '{replacement}'."
+                            )),
+                        )
+                        .with_context(vec![ContextMessage {
+                            message: SharedStr::from(format!(
+                                "The operator '{prior_lexeme}' is causing the short circuiting."
+                            )),
+                            file: engine.file,
+                            range: SourceRange {
+                                offset: prior_offset,
+                                length: prior_len,
+                            },
+                        }]),
+                    );
+                } else {
+                    engine.emit3(
+                        SemanticCode::InvalidNullAwareOperator,
+                        op_range,
+                        op,
+                        replacement,
+                        "",
+                    );
+                }
             } else if engine.local_hits.contains_key(&recv.offset) {
                 engine.null_aware_staged.push((recv, op_range, kind));
                 if Engine::is_nullable_ty(ty) {
@@ -8584,6 +8652,62 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_literal_map_entry(colon, end, nk, nv);
 
         self.engine.const_capture.literal_map_entry(colon.range);
+
+        // The `{?k: v}`/`{k: ?v}` null-aware entry faces (upstream
+        // `visitMapLiteralEntry` :1714-1729 → `_checkForUnnecessaryNullAware`
+        // with `kind: mapEntryKey`/`mapEntryValue`): a strictly non-nullable
+        // key/value operand makes the `?` dead — the report anchors the `?`
+        // token ("The map entry key/value can't be null, so the null-aware
+        // operator '?' is unnecessary."). The operand row is the closest
+        // row wholly before its `?` marker.
+        // The operand row is the expression immediately AFTER the `?`
+        // marker (upstream `node.key2`/`node.value2`): for the value face
+        // it is the last row pushed (`{k: ?v}`'s `v` completes right before
+        // the entry event); for the key face it is the row ending before
+        // the `:` separator (`{?k: v}`'s `k` sits left of it while `v` is
+        // already stacked).
+        let engine = &mut self.engine;
+        for (question, side, before) in [
+            (nk, "key", Some(colon.range.offset)),
+            (nv, "value", None),
+        ]
+        .into_iter()
+        .filter_map(|(q, side, b)| q.map(|q| (q, side, b)))
+        {
+            let pos = match before {
+                Some(bound) => engine
+                    .rows
+                    .iter()
+                    .rposition(|row| row.range.end() <= bound),
+                None => engine.rows.len().checked_sub(1),
+            };
+            let Some(pos) = pos else {
+                continue;
+            };
+            let ty = Engine::receiver_row_ty(&engine.rows[pos]);
+            let ty = if ty == Ty::UNKNOWN {
+                engine.receiver_static_ty(&engine.rows[pos])
+            } else {
+                ty
+            };
+            if engine.strictly_non_nullable(ty) {
+                // The `_mapEntryKey`/`_mapEntryValue` uniqueNames' verbatim
+                // pair (diagnostic.g.dart invalidNullAwareMapEntryKey/Value
+                // :9418-9445): the side-named message and the bare-remove
+                // correction, never the `{0}`/`{1}` replace template.
+                let code = SemanticCode::InvalidNullAwareOperator;
+                engine.report.diagnostics.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    format!(
+                        "The map entry {side} can't be null, so the null-aware operator '?' is unnecessary."
+                    ),
+                    engine.file,
+                    question.range,
+                    Some("Try removing the operator '?'.".to_string()),
+                ));
+            }
+        }
     }
 
     fn end_parenthesized_expression(&mut self, token: Token) {
@@ -9128,7 +9252,15 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.nsm_poison();
-        engine.const_capture.end_opaque_group(begin.range);
+        // An `await` is never a constant expression (upstream's constant
+        // verifier flags the whole AwaitExpression — `const x = await f()`
+        // reports at `await f()`, the `await` keyword through the operand's
+        // end): close the group with the whole-expression span so the
+        // non-constant leaf it pushes anchors where the oracle anchors.
+        engine.const_capture.end_opaque_group(SourceRange {
+            offset: begin.range.offset,
+            length: end.range.end().saturating_sub(begin.range.offset),
+        });
         // The await expression's static type is `flatten(operand)`
         // (`analyzeAwaitExpression`, type_analyzer.dart:542-548 —
         // `Future<S>`/`FutureOr<S>` → `S`, nullability preserved, every
@@ -10591,6 +10723,39 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_null_aware_element(&mut self, token: Token) {
         self.flow().handle_null_aware_element(token);
+        // The `?e` collection element (upstream `visitNullAwareElement`
+        // :1912-1918 → `_checkForUnnecessaryNullAware(_, node.question,
+        // kind: element)`): when the element VALUE's static type is
+        // strictly non-nullable the `?` is dead — oracle reports at the `?`
+        // token alone ("The element can't be null, so the null-aware
+        // operator '?' is unnecessary."). The operand (`node.value2`) is the
+        // expression AFTER the `?` — the last row pushed, which completes
+        // right before the marker event fires.
+        let engine = &mut self.engine;
+        if let Some(pos) = engine.rows.len().checked_sub(1) {
+            let ty = Engine::receiver_row_ty(&engine.rows[pos]);
+            let ty = if ty == Ty::UNKNOWN {
+                engine.receiver_static_ty(&engine.rows[pos])
+            } else {
+                ty
+            };
+            if engine.strictly_non_nullable(ty) {
+                // The `_element` uniqueName's verbatim pair
+                // (diagnostic.g.dart invalidNullAwareElement :9404-9415):
+                // the shared-name row's own message and the bare-remove
+                // correction, never the `{0}`/`{1}` replace template.
+                let code = SemanticCode::InvalidNullAwareOperator;
+                engine.report.diagnostics.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    "The element can't be null, so the null-aware operator '?' is unnecessary."
+                        .to_string(),
+                    engine.file,
+                    token.range,
+                    Some("Try removing the operator '?'.".to_string()),
+                ));
+            }
+        }
     }
 
     fn handle_pattern_assignment(&mut self, equals: Token) {
@@ -10708,6 +10873,37 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_spread_expression(&mut self, operator: Token) {
         self.flow().handle_spread_expression(operator);
         self.engine.const_capture.begin_ctl_element();
+
+        // The `...?e` null-aware spread (upstream `visitSpreadElement`
+        // :2176-2184 → `_checkForUnnecessaryNullAware(_, spreadOperator,
+        // kind: spread)`): a strictly non-nullable spread operand makes the
+        // `...?` dead — oracle reports at the whole operator token ("The
+        // receiver can't be null, so the null-aware operator '?...' is
+        // unnecessary.", len 4 covering `...?`). The operand
+        // (`node.expression2`) is the expression AFTER the `...?` token —
+        // the last row pushed, which completes right before the event.
+        // The `...?` lexeme is the only 4-column spread operator; `...`
+        // (len 3) never checks.
+        if operator.range.length == 4 {
+            let engine = &mut self.engine;
+            if let Some(pos) = engine.rows.len().checked_sub(1) {
+                let ty = Engine::receiver_row_ty(&engine.rows[pos]);
+                let ty = if ty == Ty::UNKNOWN {
+                    engine.receiver_static_ty(&engine.rows[pos])
+                } else {
+                    ty
+                };
+                if engine.strictly_non_nullable(ty) {
+                    engine.emit3(
+                        SemanticCode::InvalidNullAwareOperator,
+                        operator.range,
+                        "?...",
+                        "...",
+                        "",
+                    );
+                }
+            }
+        }
     }
 
     fn handle_switch_case_no_when_clause(&mut self, token: Token) {
