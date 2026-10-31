@@ -14,13 +14,12 @@
 //! * an absent member still reports, so the face above cannot swallow a
 //!   real miss.
 //!
-//! The residual corpus shape is a synthesized core-return receiver
-//! (`CORE_MEMBER_RETURNS`' `("Iterable", "map", CoreRet::BareHead(..))`
-//! chain) whose extension provenance is decided in
-//! `row_resolution.rs::extension_application` — the receiver-container
-//! provenance gate added by #2505. That gate is outside this lane's scope;
-//! the fixture below mirrors the SDK face so the crate-side half stays
-//! pinned.
+//! The synthesized core-return receiver (`CORE_MEMBER_RETURNS`'
+//! `("Iterable", "map", CoreRet::BareHead(..))` chain — the
+//! `_fragments.expand(...).map(...).nonNulls` shape) is pinned below too:
+//! its extension provenance is decided in
+//! `row_resolution.rs::extension_application`, and the face must apply
+//! there exactly as it does for a written declaration.
 
 use super::test_rig::{CORE_PRELUDE, report_ops};
 
@@ -114,5 +113,40 @@ fn non_nulls_face_does_not_cover_a_non_iterable_receiver() {
         vec![at(source, "nonNulls")],
         "{:?}",
         report.diagnostics
+    );
+}
+
+/// The SYNTHESIZED core-return receiver: `map`/`expand` answered by the
+/// SDK surrogate table (`CORE_MEMBER_RETURNS`'
+/// `("Iterable", "map") → CoreRet::BareHead("Iterable")`) instead of a
+/// written declaration. The chain hands the getter an `Iterable` head with
+/// no declaration site of its own — the shape `element.dart`'s
+/// `_fragments.expand(...).map(...).nonNulls` rides — so the face must
+/// still apply. This is the one the #2506 report called out as residual;
+/// the fixture above only covers the WRITTEN-`map` twin.
+#[test]
+fn non_nulls_resolves_on_a_synthesized_core_return_head() {
+    let source = "extension NullableIterableExtensions<T extends Object> on Iterable<T?> {\n\
+                  \x20 Iterable<T> get nonNulls => throw 0;\n\
+                  }\n\
+                  class Holder<E> extends Iterable<E> {\n\
+                  \x20 Iterator<E> get iterator => throw 0;\n\
+                  }\n\
+                  class L { L? get parent => null; }\n\
+                  void f(Holder<L?> h) {\n\
+                  \x20 var y1 = h.map((e) => e).nonNulls;\n\
+                  \x20 var y2 = h.expand((e) => [e]).nonNulls;\n\
+                  \x20 print(y1); print(y2);\n\
+                  }\n";
+    let report = report_ops(source);
+    assert_eq!(
+        undefined_getters(&report),
+        Vec::<u32>::new(),
+        "{:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range.offset, d.message.as_str()))
+            .collect::<Vec<_>>()
     );
 }
