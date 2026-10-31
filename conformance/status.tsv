@@ -15,7 +15,7 @@ diagnostic	abstract_static_method	1	1	0	0	1	green
 diagnostic	abstract_super_member_reference	24	8	16	0	16	red
 diagnostic	address_position	17	7	10	0	10	red
 diagnostic	address_receiver	11	2	9	0	7	red
-diagnostic	ambiguous_export	12	9	3	0	9	red
+diagnostic	ambiguous_export	12	11	1	0	9	red
 diagnostic	ambiguous_extension_member_access	48	16	32	0	33	red
 diagnostic	ambiguous_import	33	1	32	0	32	red
 diagnostic	ambiguous_set_or_map_literal_both	94	28	66	0	73	red
@@ -83,7 +83,7 @@ diagnostic	body_might_complete_normally	300	161	139	0	238	red
 diagnostic	body_might_complete_normally_catch_error	10	6	4	0	4	red
 diagnostic	body_might_complete_normally_nullable	40	22	18	0	31	red
 diagnostic	break_label_on_switch_member	7	2	5	0	5	red
-diagnostic	break_outside_of_loop	82	76	6	0	82	red
+diagnostic	break_outside_of_loop	82	80	2	0	82	red
 diagnostic	built_in_identifier_as_type	103	83	20	0	102	red
 diagnostic	built_in_identifier_in_declaration	127	110	17	0	127	red
 diagnostic	camera_permissions_incompatible	2	2	0	0	1	green
@@ -165,7 +165,7 @@ diagnostic	constant_variable_augmentation	26	0	26	0	26	red
 diagnostic	constructor_with_return_type	7	7	0	0	7	green
 diagnostic	constructor_with_type_arguments	5	0	5	0	5	red
 diagnostic	continue_label_invalid	5	0	5	0	5	red
-diagnostic	continue_outside_of_loop	97	91	6	0	97	red
+diagnostic	continue_outside_of_loop	97	95	2	0	97	red
 diagnostic	continue_without_label_in_case	2	2	0	0	2	green
 diagnostic	could_not_infer	108	17	91	0	102	red
 diagnostic	covariant_and_static	17	17	0	0	17	green
@@ -173,7 +173,7 @@ diagnostic	covariant_constructor	1	1	0	0	1	green
 diagnostic	covariant_member	11	7	4	0	11	red
 diagnostic	creation_of_struct_or_union	10	6	4	0	7	red
 diagnostic	creation_with_non_type	196	157	39	0	189	red
-diagnostic	dead_code	1374	914	460	0	1325	red
+diagnostic	dead_code	1374	915	459	0	1325	red
 diagnostic	dead_code_catch_following_catch	28	19	9	0	25	red
 diagnostic	dead_code_on_catch_subtype	18	7	11	0	16	red
 diagnostic	dead_null_aware_expression	88	49	39	0	81	red
@@ -259,12 +259,12 @@ diagnostic	equal_keys_in_const_map	44	24	20	0	34	red
 diagnostic	equal_keys_in_map	14	9	5	0	10	red
 diagnostic	equal_keys_in_map_pattern	21	10	11	0	11	red
 diagnostic	equality_cannot_be_equality_operand	26	26	0	0	26	green
-diagnostic	expected_body	539	355	184	0	539	red
+diagnostic	expected_body	539	415	124	0	539	red
 diagnostic	expected_case_or_default	1	1	0	0	1	green
 diagnostic	expected_class_member	86	38	48	0	86	red
 diagnostic	expected_else_or_comma	4	2	2	0	4	red
 diagnostic	expected_executable	210	187	23	0	209	red
-diagnostic	expected_identifier_but_got_keyword	283	187	96	0	283	red
+diagnostic	expected_identifier_but_got_keyword	243	187	56	0	243	red
 diagnostic	expected_instead	61	61	0	0	61	green
 diagnostic	expected_list_or_map_literal	1	1	0	0	1	green
 diagnostic	expected_named_type	22	0	22	0	22	red
@@ -274,7 +274,7 @@ diagnostic	expected_one_set_type_arguments	7	1	6	0	6	red
 diagnostic	expected_representation_field	43	43	0	0	43	green
 diagnostic	expected_representation_type	9	0	9	0	9	red
 diagnostic	expected_string_literal	167	155	12	0	167	red
-diagnostic	expected_token	3162	2813	349	0	3160	red
+diagnostic	expected_token	3162	2877	285	0	3160	red
 diagnostic	expected_two_map_pattern_type_arguments	8	3	5	0	5	red
 diagnostic	expected_two_map_type_arguments	14	2	12	0	12	red
 diagnostic	expected_type_name	441	378	63	0	440	red
@@ -330,7 +330,7 @@ diagnostic	extra_annotation_on_struct_field	6	6	0	0	3	green
 diagnostic	extra_positional_arguments	191	54	137	0	184	red
 diagnostic	extra_positional_arguments_could_be_named	28	13	15	0	26	red
 diagnostic	extra_size_annotation_carray	7	7	0	0	3	green
-diagnostic	extraneous_modifier	346	288	58	0	337	red
+diagnostic	extraneous_modifier	342	288	54	0	333	red
 diagnostic	extraneous_modifier_in_extension_type	6	0	6	0	6	red
 diagnostic	extraneous_modifier_in_primary_constructor	3	0	3	0	3	red
 diagnostic	factory_constructor_new_name	4	4	0	0	4	green
@@ -579,7 +579,7 @@ diagnostic	missing_function_keyword	1	1	0	0	1	green
 diagnostic	missing_function_parameters	152	124	28	0	152	red
 diagnostic	missing_get	1	1	0	0	1	green
 diagnostic	missing_hex_digit	4	4	0	0	4	green
-diagnostic	missing_identifier	1736	1510	226	0	1736	red
+diagnostic	missing_identifier	1732	1545	187	0	1732	red
 diagnostic	missing_initializer	35	28	7	0	35	red
 diagnostic	missing_keyword_operator	14	10	4	0	14	red
 diagnostic	missing_method_parameters	44	36	8	0	44	red
@@ -645,7 +645,7 @@ diagnostic	must_return_void	6	5	1	0	4	red
 diagnostic	name_not_string	2	2	0	0	1	green
 diagnostic	named_function_expression	65	65	0	0	65	green
 diagnostic	named_function_type	1	1	0	0	1	green
-diagnostic	named_parameter_outside_group	35	27	8	0	35	red
+diagnostic	named_parameter_outside_group	27	27	0	0	27	green
 diagnostic	native_clause_in_non_sdk_code	7	7	0	0	7	green
 diagnostic	native_clause_should_be_annotation	1	1	0	0	1	green
 diagnostic	native_field_invalid_type	9	8	1	0	6	red
@@ -861,7 +861,7 @@ diagnostic	top_level_cycle	35	0	35	0	35	red
 diagnostic	top_level_operator	8	5	3	0	8	red
 diagnostic	type_alias_cannot_reference_itself	51	3	47	1	48	red
 diagnostic	type_annotation_deferred_class	32	1	31	0	31	red
-diagnostic	type_argument_not_matching_bounds	466	225	241	0	433	red
+diagnostic	type_argument_not_matching_bounds	466	226	240	0	433	red
 diagnostic	type_arguments_on_type_variable	1	1	0	0	1	green
 diagnostic	type_before_factory	2	1	1	0	1	red
 diagnostic	type_check_with_null	21	15	6	0	20	red
@@ -874,7 +874,7 @@ diagnostic	type_test_with_undefined_name	16	14	2	0	15	red
 diagnostic	typedef_augmentation	9	4	5	0	9	red
 diagnostic	typedef_in_class	2	2	0	0	1	green
 diagnostic	unawaited_return_in_try_block	28	13	15	0	20	red
-diagnostic	unchecked_use_of_nullable_value	672	206	466	0	474	red
+diagnostic	unchecked_use_of_nullable_value	674	206	468	0	474	red
 diagnostic	undefined_annotation	295	249	46	0	289	red
 diagnostic	undefined_class	1079	926	153	0	1067	red
 diagnostic	undefined_constructor_in_initializer	64	6	58	0	56	red
@@ -887,7 +887,7 @@ diagnostic	undefined_extension_setter	17	11	6	0	13	red
 diagnostic	undefined_function	230	211	19	0	223	red
 diagnostic	undefined_getter	420	191	229	0	317	red
 diagnostic	undefined_hidden_name	7	5	2	0	6	red
-diagnostic	undefined_identifier	1619	1406	213	0	1576	red
+diagnostic	undefined_identifier	1619	1414	205	0	1576	red
 diagnostic	undefined_identifier_await	7	6	1	0	6	red
 diagnostic	undefined_lint	8	1	7	0	5	red
 diagnostic	undefined_method	402	119	283	0	261	red
@@ -901,7 +901,7 @@ diagnostic	undefined_super_member	71	22	49	0	65	red
 diagnostic	undone	2	2	0	0	0	green
 diagnostic	unexpected_dollar_in_string	2	2	0	0	1	green
 diagnostic	unexpected_separator_in_number	15	15	0	0	15	green
-diagnostic	unexpected_token	405	184	221	0	405	red
+diagnostic	unexpected_token	361	249	112	0	361	red
 diagnostic	unexpected_tokens	1	1	0	0	1	green
 diagnostic	unignorable_ignore	4	3	1	0	4	red
 diagnostic	unknown_platform	2	2	0	0	1	green
@@ -934,13 +934,13 @@ diagnostic	unterminated_multi_line_comment	3	3	0	0	2	green
 diagnostic	unterminated_string_literal	24	23	1	0	24	red
 diagnostic	unused_catch_clause	129	98	31	0	123	red
 diagnostic	unused_catch_stack	153	119	34	0	150	red
-diagnostic	unused_element	1660	1254	406	0	1336	red
+diagnostic	unused_element	1660	1262	398	0	1336	red
 diagnostic	unused_element_parameter	135	77	58	0	129	red
 diagnostic	unused_field	418	321	97	0	386	red
 diagnostic	unused_field_from_primary_constructor	36	32	4	0	29	red
 diagnostic	unused_import	825	695	130	0	778	red
-diagnostic	unused_label	97	66	31	0	93	red
-diagnostic	unused_local_variable	5022	4789	233	0	4990	red
+diagnostic	unused_label	97	70	27	0	93	red
+diagnostic	unused_local_variable	5022	4797	225	0	4990	red
 diagnostic	unused_result	119	103	16	0	26	red
 diagnostic	unused_shown_name	50	50	0	0	41	green
 diagnostic	uri_does_not_exist	712	629	83	0	712	red
@@ -1222,7 +1222,7 @@ lint	unnecessary_to_list_in_spreads	10	6	4	0	8	red
 lint	unnecessary_type_name_in_constructor	11	5	6	0	8	red
 lint	unnecessary_unawaited	14	8	6	0	8	red
 lint	unnecessary_underscores	24	23	1	0	13	red
-lint	unreachable_from_main	145	113	32	0	63	red
+lint	unreachable_from_main	145	117	28	0	63	red
 lint	unrelated_type_equality_checks	58	42	16	0	28	red
 lint	unsafe_html	1	1	0	0	1	green
 lint	unsafe_variance	23	23	0	0	9	green
