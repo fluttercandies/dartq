@@ -23,9 +23,16 @@
 //! The split is the established house posture (recorded here from
 //! overrides.rs in #2807): the collector does not carry the syntactic
 //! shapes' token facts, and adding them would duplicate what the parser
-//! already holds.
+//! already holds. The one token fact this layer reads for itself is the
+//! written-vs-synthesized representation type of the disabled-arm
+//! `expected_representation_type` row (#3198): the collector materializes
+//! `Object?` for the untyped spelling, so the element model cannot tell
+//! the two apart, and a model column would have to ride the persisted
+//! payload to survive a warm start — while this pass always holds the
+//! tokens the payload was captured from.
 
 use super::*;
+use dartq_scanner::{Keyword, TokenKind};
 
 impl Engine<'_> {
     /// The semantic representation checks for one extension type, mounted at
@@ -84,9 +91,11 @@ impl Engine<'_> {
             );
         }
         // The disabled-arm representation-type requirement
-        // (:5449-5452): a typeless representation formal — alongside, not
-        // instead of, the modifier check the parser owns.
-        if rep.formal.ty == Ty::UNKNOWN && !self.primary_constructors_enabled {
+        // (:5449-5452): a representation formal with NO WRITTEN type —
+        // alongside, not instead of, the modifier check the parser owns.
+        if !self.primary_constructors_enabled
+            && !self.has_written_representation_type(rep.name_range)
+        {
             self.emit(
                 SemanticCode::ExpectedRepresentationType,
                 rep.name_range,
@@ -115,6 +124,89 @@ impl Engine<'_> {
         // (`extension_type_implements_not_supertype`) decides at the
         // file-tail bounds pass ([`Self::finalize_ext_faces`]): the faces'
         // type arguments name declarations the parse has not reached yet.
+    }
+
+    /// Whether the representation formal named at `name_range` carries a
+    /// WRITTEN type annotation (`extension type E(int x)` over `extension
+    /// type E(x)`).
+    ///
+    /// The oracle decides on the syntax — `inner.type == null`
+    /// (`error_verifier.dart:5449-5452`) — never on a semantic type value,
+    /// and the collector materializes `Object?` for the untyped spelling,
+    /// so the element model cannot answer it. The token table answers it
+    /// at the emit site instead of the capture carrying a flag: a model
+    /// column would need the persisted-payload lane (and its version bump)
+    /// to survive a warm start, while this pass always holds the exact
+    /// tokens the payload was captured from.
+    ///
+    /// Only metadata and the formal's own modifier keywords can precede
+    /// the name ahead of a type once the parser has vetted the list, so
+    /// "no written type" is "the name is the first token after them".
+    /// The shapes whose formals the parser rejects outright (`this.x`,
+    /// `super.x`, `[x]`, a function-typed formal) count as written — their
+    /// rows are the parser's and never double here.
+    fn has_written_representation_type(&self, name_range: SourceRange) -> bool {
+        let toks = self.tokens.as_slice();
+        let name_at = toks.partition_point(|t| t.utf16_offset < name_range.offset);
+        let Some(open) = self.formal_list_open(name_at) else {
+            // Recovery left no recognizable opener: stay silent.
+            return true;
+        };
+        let mut at = open + 1;
+        while at < name_at {
+            match toks[at].kind {
+                TokenKind::At => match self.metadata_end(at + 1) {
+                    Some(next) => at = next,
+                    None => return true,
+                },
+                TokenKind::Keyword(Keyword::Covariant | Keyword::Final | Keyword::Var) => at += 1,
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    /// The token index of the `(` opening the formal list that holds the
+    /// token at `end` — a backward walk over balanced groups, so a
+    /// metadata argument list or a function-typed parameter's parentheses
+    /// are stepped over rather than read as the opener.
+    fn formal_list_open(&self, end: usize) -> Option<usize> {
+        let toks = self.tokens.as_slice();
+        let mut depth = 0u32;
+        let mut at = end;
+        while at > 0 {
+            at -= 1;
+            match toks[at].kind {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    depth += 1;
+                }
+                TokenKind::OpenParen if depth == 0 => return Some(at),
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The token index just past the metadata entry whose name starts at
+    /// `at` (the token after its `@`): the qualified name, its type
+    /// arguments, and its argument list when spelled. `None` when the
+    /// entry's extent can't be established (recovery residue) — the
+    /// caller then stays silent.
+    fn metadata_end(&self, at: usize) -> Option<usize> {
+        let toks = self.tokens.as_slice();
+        let mut at = at + 1;
+        while toks.get(at).is_some_and(|t| t.kind == TokenKind::Period) {
+            at += 2;
+        }
+        for kind in [TokenKind::Lt, TokenKind::OpenParen] {
+            if toks.get(at).is_some_and(|t| t.kind == kind) {
+                at = self.tokens.matching_end(at)? + 1;
+            }
+        }
+        Some(at)
     }
 
     /// The representation formal list's trailing comma, when it has one.
@@ -196,3 +288,10 @@ impl Engine<'_> {
 #[cfg(test)]
 #[path = "ticket_3195_tests.rs"]
 mod ticket_3195_tests;
+
+// The #3198 pins — the same disabled arm's written-vs-synthesized type
+// distinction (the collector materializes `Object?` for the untyped
+// spelling, so only the source tokens answer it).
+#[cfg(test)]
+#[path = "ticket_3198_tests.rs"]
+mod ticket_3198_tests;
