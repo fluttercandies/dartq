@@ -474,6 +474,21 @@ impl<'a> Engine<'a> {
     /// (`dead_code_verifier.dart`, `nextCatchClause`; the subtype arm,
     /// :589-604). Either way the span covers the first dead clause through
     /// the last one, and one dead-catch row per try at most (`_done`).
+    ///
+    /// Two faces the upstream text pins exactly:
+    ///
+    /// - The catch-all test reads the RESOLVED type:
+    ///   `exceptionType?.type == null || ....isDartCoreObject`, and
+    ///   `isDartCoreObject` is `Object` with the none nullability suffix. So
+    ///   `on Object?` is NOT catch-all — it takes the subtype arm and every
+    ///   later `on T` reports `dead_code_on_catch_subtype` (`T <: Object?`
+    ///   is the right-top rule, subtype.dart:52-56), never a
+    ///   `catch_following_catch` row anchored at the next clause.
+    /// - The subtype arm asks the written types. An unresolved `on` head is
+    ///   the official `InvalidType`, which answers `true` from either side
+    ///   of `isSubtypeOf` (subtype.dart:274-276, the 0c rule), so the
+    ///   oracle's `'InvalidType' is a subtype of 'T'` rows stand; the name
+    ///   lattice keeps that face (`Ty::Unknown` maps to the nullable top).
     pub(crate) fn finish_try_statement(&mut self) {
         let Some(clauses) = self.try_clauses.pop() else {
             return;
@@ -481,7 +496,10 @@ impl<'a> Engine<'a> {
         let object = self.intern("Object");
         let mut visited: Vec<Ty> = Vec::new();
         for (index, clause) in clauses.iter().enumerate() {
-            let catches_all = clause.on_type.is_none_or(|t| t == object);
+            let catches_all = match clause.on_type {
+                None => true,
+                Some(name) => name == object && !clause.on_nullable,
+            };
             if catches_all {
                 if index + 1 < clauses.len() {
                     let start = clauses[index + 1].start.offset;
