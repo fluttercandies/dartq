@@ -5392,6 +5392,17 @@ pub(crate) struct FoldHierarchy<'a> {
     pub(crate) lib: LibraryId,
     pub(crate) memo: RefCell<FxHashMap<(FileId, StringId), ClassModifiers>>,
     pub(crate) in_progress: RefCell<FxHashSet<(FileId, StringId)>>,
+    /// The per-library `class-modifiers` language posture the engine injects
+    /// per analyze ([`LibraryClassModifiers`]): a declaration in a library
+    /// that predates the feature carries NO modifier facts — upstream gates
+    /// the parser on it (`enableClassModifiers =
+    /// _featureSet.isEnabled(Feature.class_modifiers)`, upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/fasta/ast_builder.dart`), so the
+    /// `base`/`final`/`interface`/`sealed`/`mixin class` tokens written in
+    /// such a library only ever reported `experiment_not_enabled` and never
+    /// reached the element model. [`Self::declared`] applies the mask at the
+    /// one producer every modifier consumer reads.
+    pub(crate) class_modifiers: &'a LibraryClassModifiers,
     /// The clause-face alias fold (`with ListMixin<E>` — SDK 3.47 spells
     /// `typedef ListMixin<E> = ListBase<E>`; the application's real face is
     /// ListBase): supplied by the engine-backed constructors so the
@@ -5417,6 +5428,18 @@ pub(crate) type FaceHandles = (
 impl FoldHierarchy<'_> {
     /// The declared modifiers of `handle`, or `None` when the name resolves
     /// to no container in the index (a broken face — suppress).
+    ///
+    /// The flags are masked to none when the DECLARING library predates the
+    /// `class-modifiers` feature (`LibraryClassModifiers::is_enabled`, the
+    /// `enabledIn 3.0.0` boundary the `sealed-class` gate shares): upstream
+    /// parses such a library with the feature off, so a written
+    /// `base`/`final`/`interface`/`sealed`/`mixin class` produces only
+    /// `experiment_not_enabled` and the element model keeps no modifier —
+    /// every restriction family then stays silent, which is exactly what the
+    /// oracle answers for a pre-feature declaration consumed from any
+    /// library. Masking at this producer covers all of them at once: the
+    /// outside-library passes, the subtype verifier, the sealed induction
+    /// below, and the explicit-base/final ancestor walk.
     pub(crate) fn declared(&self, handle: (FileId, StringId)) -> Option<ClassModifiers> {
         let (owner_file, name) = handle;
         let (container, _) = resolve_container(
@@ -5427,7 +5450,18 @@ impl FoldHierarchy<'_> {
             owner_file,
             name,
         )?;
-        Some(container_modifiers(container))
+        let modifiers = container_modifiers(container);
+        if self.class_modifiers.is_enabled(self.library_of(handle)) {
+            return Some(modifiers);
+        }
+        Some(ClassModifiers {
+            is_base: false,
+            is_final: false,
+            is_interface: false,
+            is_sealed: false,
+            is_mixin_class: false,
+            ..modifiers
+        })
     }
 
     /// The effective modifiers: declared flags plus the sealed-class induced

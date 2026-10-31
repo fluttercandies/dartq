@@ -4924,6 +4924,7 @@ impl<'a> Engine<'a> {
             index: self.index,
             file: self.file,
             lib: self.lib,
+            class_modifiers: self.class_modifiers,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
             alias_head: Some(&alias_hop),
