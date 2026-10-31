@@ -5014,3 +5014,235 @@ mod method_invocation_2194 {
         assert_eq!((closed.span.offset, closed.span.end()), (0, 3));
     }
 }
+
+/// The #2455 pins: the const-set duplicate twin over const-variable
+/// references whose instance value routes through an unresolvable super
+/// chain (the census's `{diag.extendsNonClass, diag.implementsNonClass,
+/// diag.mixinOfNonClass}` set over the analyzer's `diagnostic.g.dart`,
+/// whose `DiagnosticCodeImpl` superclass lives in an absent dependency).
+///
+/// The oracle's equality is `DartObjectImpl ==` over the evaluated field
+/// map (value.dart:1528). That map keeps a creation's own this-class
+/// arguments plus whatever survives the super-constructor walk, and the
+/// walk's forwarded arguments evaporate where it stops evaluating (an
+/// unresolvable superclass answers `lookUpConstructor` nothing, so
+/// `_checkSuperConstructorCall` skips its whole block). Two constants of
+/// one container whose surviving written texts match therefore compare
+/// equal even when their written arguments differ, so the later ones
+/// report (`constant_verifier.dart`'s `visitSetOrMapLiteral` over
+/// `_SetVerifierConfig.uniqueValues`, keyed by `DartObject`). The census
+/// carried the pair as oracle-only rows; these pins keep the face closed
+/// in both directions: a resolvable super chain keeps distinct constants
+/// distinct, and a surviving own field's written text decides.
+#[cfg(test)]
+mod equal_const_refs_2455 {
+    use crate::collector::collect;
+    use crate::diagnose::{StrictModes, fold_unit};
+    use crate::library::ElementIndex;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::{ScanConfig, scan};
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// The `equal_elements_in_const_set` rows' written text, in report
+    /// order. Parse diagnostics fail the pin first — every fixture is
+    /// syntactically clean.
+    fn const_rows(source: &str) -> Vec<&str> {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let core_file = files.intern(Path::new("<dart:core>"));
+        let scanned = scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        // The file-to-library unit row: the const-ref key walk reads the
+        // declaring file's library back through `library_of_file`, so a
+        // rig without the unit row silently defers every reference key.
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == crate::model::MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        builder.seed_implicit_core(
+            lib,
+            core_file,
+            &[
+                "Object", "String", "int", "bool", "double", "num", "List", "Map",
+            ],
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        assert!(
+            fold.parse_diagnostics.is_empty(),
+            "parse diagnostics: {:?}",
+            fold.parse_diagnostics
+        );
+        fold.report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "equal_elements_in_const_set")
+            .map(|d| {
+                let (start, end) = byte_span(source, d.range.offset, d.range.end());
+                &source[start..end]
+            })
+            .collect()
+    }
+
+    /// Byte bounds of a (UTF-16) span; ASCII fixtures slice identically.
+    fn byte_span(source: &str, start: u32, end: u32) -> (usize, usize) {
+        let to_byte = |u16_off: u32| -> usize {
+            let mut units = 0u32;
+            for (byte_idx, ch) in source.char_indices() {
+                if units >= u16_off {
+                    return byte_idx;
+                }
+                units += ch.len_utf16() as u32;
+            }
+            source.len()
+        };
+        let start = to_byte(start);
+        (start, to_byte(end).max(start))
+    }
+
+    /// The F8 shape: three constants built by one const constructor whose
+    /// every formal forwards up a chain that stops at an unresolvable
+    /// superclass. No argument survives the walk, so all three evaluate
+    /// to the one empty field map and the later two report at their own
+    /// reference spans.
+    #[test]
+    fn invalid_super_chain_collapses_equal_constants() {
+        let rows = const_rows(
+            r#"
+import 'missing_dep.dart';
+
+class Mid extends MissingBase {
+  const Mid({required super.name});
+}
+
+class NoArgsImpl extends Mid {
+  const NoArgsImpl({required super.name});
+}
+
+const NoArgsImpl a = NoArgsImpl(name: 'a');
+const NoArgsImpl b = NoArgsImpl(name: 'b');
+const NoArgsImpl c = NoArgsImpl(name: 'c');
+
+const set = {a, b, c};
+"#,
+        );
+        assert_eq!(rows, ["b", "c"], "the later two references report");
+    }
+
+    /// The control: the same shape over a resolvable super chain keeps
+    /// every written field, so the three constants stay distinct and the
+    /// set is silent (no over-report from the collapse rule).
+    #[test]
+    fn resolved_super_chain_keeps_constants_distinct() {
+        let rows = const_rows(
+            r#"
+class MissingBase {
+  const MissingBase({required this.name});
+  final String name;
+}
+
+class Mid extends MissingBase {
+  const Mid({required super.name});
+}
+
+class NoArgsImpl extends Mid {
+  const NoArgsImpl({required super.name});
+}
+
+const NoArgsImpl a = NoArgsImpl(name: 'a');
+const NoArgsImpl b = NoArgsImpl(name: 'b');
+const NoArgsImpl c = NoArgsImpl(name: 'c');
+
+const set = {a, b, c};
+"#,
+        );
+        assert!(rows.is_empty(), "distinct resolved values stay silent");
+    }
+
+    /// The surviving own field decides by written text: two references
+    /// whose surviving argument text matches report, while a differing
+    /// surviving text defers (the key world never guesses an evaluated
+    /// value, so the pair under-reports rather than over-reports).
+    #[test]
+    fn surviving_own_field_text_decides() {
+        let matching = const_rows(
+            r#"
+import 'missing_dep.dart';
+
+class Mid extends MissingBase {
+  const Mid({required super.name, this.tags = const []});
+  final List<int> tags;
+}
+
+class NoArgsImpl extends Mid {
+  const NoArgsImpl({required super.name, super.tags});
+}
+
+const NoArgsImpl a = NoArgsImpl(name: 'a');
+const NoArgsImpl b = NoArgsImpl(name: 'b');
+
+const same = {a, b};
+"#,
+        );
+        assert_eq!(matching, ["b"], "matching text reports");
+
+        let differing = const_rows(
+            r#"
+import 'missing_dep.dart';
+
+class Mid extends MissingBase {
+  const Mid({required super.name, this.tags = const []});
+  final List<int> tags;
+}
+
+class NoArgsImpl extends Mid {
+  const NoArgsImpl({required super.name, super.tags});
+}
+
+const NoArgsImpl a = NoArgsImpl(name: 'a');
+const NoArgsImpl c = NoArgsImpl(name: 'c', tags: const [1]);
+
+const other = {a, c};
+"#,
+        );
+        assert!(differing.is_empty(), "differing text defers");
+    }
+}
