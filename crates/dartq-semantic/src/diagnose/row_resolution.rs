@@ -2273,10 +2273,16 @@ impl<'a> Engine<'a> {
                     // answers the chained-receiver family answers this
                     // one too. The bare INVOCATION's callee keeps its own
                     // gate (`f()` resolves through the send path).
+                    //
+                    // The parenthesized-group leg is the same question for
+                    // a grouped operand (`(a ?? b) + 1`): the group row's
+                    // face is the inner expression's own static type.
                     let ty = if ty == Ty::UNKNOWN
                         && (matches!(row.intent, Intent::Operator(..)) || adjacent.is_some())
                     {
-                        self.receiver_decl_shape(row.range).unwrap_or(ty)
+                        self.receiver_decl_shape(row.range)
+                            .or_else(|| self.group_expression_face(row.range))
+                            .unwrap_or(ty)
                     } else {
                         ty
                     };
@@ -3498,6 +3504,14 @@ impl<'a> Engine<'a> {
                 return compound;
             }
         }
+        // The parenthesized-group face (`(a ?? b).m`): the group row's own
+        // range is its closing paren alone, so the composite's type is not
+        // on record anywhere — the group's static type is its inner
+        // expression's own, re-derived through this same walk. The leg
+        // carries its own depth guard.
+        if let Some(group) = self.group_expression_face(read_span) {
+            return Some(group);
+        }
         let prev = self.chain_node_read(read_span, false)?;
         self.chained_read_static_ty(prev)
     }
@@ -3630,6 +3644,71 @@ impl<'a> Engine<'a> {
             );
         }
         None
+    }
+
+    /// The static type of a PARENTHESIZED receiver group
+    /// (`(a ?? b).m`, `(x ?? y) + 1`): the group's own row carries no
+    /// face — the `??` fold leaves the enclosing group row's range as its
+    /// closing paren alone, so nothing stages the composite's type and the
+    /// receiver resolves `Unknown`. `ParenthesizedExpression.staticType`
+    /// is the inner expression's own type, so the leg re-enters
+    /// [`Self::recv_expression_ty`] on the inner extent: the compound face
+    /// then joins the `??`/`?:` arms exactly as it does for a receiver
+    /// spanning the composite, and a chained inner read (`(a.b).c`) types
+    /// through the chain walk.
+    ///
+    /// The leg keys on the degenerate shape — one `CloseParen` token — and
+    /// walks back to its matched `(`, so a span that already covers its
+    /// own extent is left to the legs above. The walk visits the group's
+    /// own tokens (groups nest, never overlap) and the recursion rides the
+    /// same depth cap the chain and compound legs observe, so the face
+    /// stays bounded.
+    fn group_expression_face(&self, read_span: SourceRange) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let first = tokens.partition_point(|t| t.utf16_offset < read_span.offset);
+        let close = tokens.partition_point(|t| t.utf16_offset < read_span.end());
+        if close != first + 1 || tokens[first].kind != dartq_scanner::TokenKind::CloseParen {
+            return None;
+        }
+        let close = first;
+        // The matched `(`: a depth walk over the three unambiguous bracket
+        // families (`<`/`>` pair through the table but the raw kind is the
+        // relational operator too, so they stay uncounted).
+        let mut depth = 0usize;
+        let mut open = None;
+        for at in (0..close).rev() {
+            match tokens[at].kind {
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => match depth.checked_sub(1) {
+                    Some(next) => depth = next,
+                    None => {
+                        open = Some(at);
+                        break;
+                    }
+                },
+                _ => {}
+            }
+        }
+        let open = open?;
+        if open + 1 >= close || self.tokens.matching_end(open) != Some(close) {
+            return None;
+        }
+        let begin = tokens[open + 1].utf16_offset;
+        let inner = SourceRange {
+            offset: begin,
+            length: tokens[close].utf16_offset.saturating_sub(begin),
+        };
+        if self.recv_walk_depth.get() >= RECV_WALK_DEPTH_CAP {
+            return None;
+        }
+        self.recv_walk_depth.set(self.recv_walk_depth.get() + 1);
+        let ty = self.recv_expression_ty(inner);
+        self.recv_walk_depth.set(self.recv_walk_depth.get() - 1);
+        ty.filter(|ty| *ty != Ty::UNKNOWN)
     }
 
     /// One arm's expression span for the [`Self::recv_expression_ty`]

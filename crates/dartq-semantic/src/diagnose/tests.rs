@@ -17639,3 +17639,19 @@ mod ticket_3252_tests;
 #[cfg(test)]
 #[path = "ticket_3242_tests.rs"]
 mod ticket_3242_tests;
+// The #3230 pins (wave-B cluster B: the function-identifier receiver face —
+// `recv_expression_ty` answered no face for a bare function-declaration
+// read, so the operator/member verdicts on a tear-off stayed silent).
+// `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3230_tests.rs"]
+mod ticket_3230_tests;
+
+// The #3231 pins (wave-B cluster C: the compound receiver's static type —
+// `(c ? a : b).m` / `(a ?? b).m` resolve against the upstream
+// `least_upper_bound` join of the arms, which the engine's span-keyed row
+// model stages no fact for).
+#[cfg(test)]
+#[path = "ticket_3231_tests.rs"]
+mod ticket_3231_tests;
