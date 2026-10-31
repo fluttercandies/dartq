@@ -23,6 +23,7 @@ use crate::parser::Parser;
 use crate::recovery::is_identifier;
 use crate::token_id::TokenSpan;
 use crate::type_args::TypeParamOrArg;
+use crate::types::is_valid_non_record_type_reference;
 use crate::types::TypeInfo;
 
 /// `isTopLevelKeyword` (scanner keyword set).
@@ -738,6 +739,61 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     // typedef
     // ------------------------------------------------------------------
 
+    /// Degraded function-type alias probe: `Some(offset)` of the `Function`
+    /// intro when the alias RHS is a generalized function type whose
+    /// type-variable group never validates, so the official classification
+    /// falls back to the bare return type (`computeVoidGFT` /
+    /// `computeIdentifierGFT`, type_info_impl.dart:949/753). The group's
+    /// name position classifies as noType in `ComplexTypeParamOrArgInfo`
+    /// `.compute` (reserved heads and the member-keyword built-ins the type
+    /// recognizer rejects: `get`/`set`/`factory`/`operator`/`typedef` name)
+    /// with a bound or junk run after the name — the recovery skip then
+    /// sits in front of the name and `computeRest`'s `(`-check fails.
+    /// Identifiers, `required`-class built-ins, `dynamic`/`Function`/`void`
+    /// and immediate closers all validate, like the official compute loop.
+    fn degraded_gft_return_type_end(&self) -> Option<usize> {
+        // The return type cannot contain `Function`; the first one is the
+        // function-type intro.
+        let mut intro = self.cursor.real_pos();
+        loop {
+            match self.kind_at(intro) {
+                TokenKind::Keyword(Keyword::Function) => break,
+                TokenKind::Semicolon | TokenKind::Eof => return None,
+                _ => intro += 1,
+            }
+        }
+        if self.kind_at(intro + 1) != TokenKind::Lt {
+            return None;
+        }
+        let name = self.kind_at(intro + 2);
+        if matches!(name, TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt) {
+            // Empty group (`<>`): no name position, the classification
+            // validates.
+            return None;
+        }
+        let follower = self.kind_at(intro + 3);
+        let name_is_type = is_valid_non_record_type_reference(name, follower)
+            || name == TokenKind::OpenParen
+            || matches!(
+                name,
+                TokenKind::Keyword(kw)
+                    if kw.style() == dartq_scanner::KeywordStyle::BuiltIn
+                        && !matches!(
+                            kw,
+                            Keyword::Get
+                                | Keyword::Set
+                                | Keyword::Factory
+                                | Keyword::Operator
+                        )
+                        && !(kw == Keyword::Typedef && follower == TokenKind::Identifier),
+            );
+        let follower_is_closer = matches!(
+            follower,
+            TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt | TokenKind::Comma
+        );
+        (!name_is_type && !follower_is_closer).then_some(intro)
+    }
+
     /// Official `parseTypedef`; the cursor sits on `typedef`.
     fn parse_typedef(&mut self, typedef_keyword: TokenSpan) {
         let augment = self.pending_augment.take();
@@ -939,7 +995,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         handled = true;
                     }
                 }
-                if !handled {
+                if let Some(intro) = self.degraded_gft_return_type_end() {
+                    // Degraded alias face (see the probe): the alias type is
+                    // the bare return type. Consume it and close on it —
+                    // `ensureSemicolon` anchors `expectedToken(';')` on the
+                    // return type's last token (parser_impl.dart:5048) — and
+                    // let the declaration loop re-read the `Function<...>(...)`
+                    // tail as a top-level member whose `;` reports
+                    // `missingFunctionBody` (`parseFunctionBody`,
+                    // `diag.expectedBody`). The recovery arms above cannot
+                    // fire here: the return type's follower is `Function`,
+                    // never `(` or `<`.
+                    self.skip_to_token(self.real_id(intro));
+                } else if !handled {
                     type_info.ensure_type_or_void(self);
                 }
                 end = self.ensure_semicolon();
