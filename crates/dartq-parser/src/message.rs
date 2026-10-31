@@ -77,7 +77,8 @@ pub(crate) mod msg {
         ABSTRACT_CLASS_MEMBER, ABSTRACT_EXTERNAL_FIELD, ABSTRACT_FINAL_BASE_CLASS,
         ABSTRACT_FINAL_INTERFACE_CLASS, ABSTRACT_SEALED_CLASS, BASE_ENUM, CLASS_IN_CLASS,
         CONFLICTING_MODIFIERS, CONST_AND_FINAL, CONST_METHOD, CONSTRUCTOR_WITH_RETURN_TYPE,
-        COVARIANT_AND_STATIC, COVARIANT_MEMBER, DUPLICATED_MODIFIER, ENUM_IN_CLASS,
+        CONSTRUCTOR_WITH_TYPE_ARGUMENTS, COVARIANT_AND_STATIC, COVARIANT_MEMBER,
+        DUPLICATED_MODIFIER, ENUM_IN_CLASS,
         EXPECTED_CLASS_MEMBER, EXPECTED_EXECUTABLE, EXPECTED_INSTEAD,
         EXTENSION_DECLARES_CONSTRUCTOR, EXTENSION_TYPE_EXTENDS, EXTENSION_TYPE_WITH,
         EXTERNAL_CONSTRUCTOR_WITH_INITIALIZER, EXTERNAL_FACTORY_REDIRECTION,
@@ -853,6 +854,16 @@ pub(crate) mod msg {
         Message::new(
             CONSTRUCTOR_WITH_RETURN_TYPE,
             "Constructors can't have a return type.",
+        )
+    }
+
+    /// `constructorWithTypeArguments` (`new p.C.m<int>()` — messages.yaml
+    /// :1480, the `parseConstructorInvocationArguments` recovery report).
+    pub(crate) fn constructor_with_type_arguments() -> Message {
+        Message::with_correction(
+            CONSTRUCTOR_WITH_TYPE_ARGUMENTS,
+            "A constructor invocation can't have type arguments after the constructor name.",
+            "Try removing the type arguments or placing them after the class name.",
         )
     }
 

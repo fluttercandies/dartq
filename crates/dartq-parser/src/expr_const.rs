@@ -945,6 +945,35 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             );
             let _ = second;
             period_before_name = Some(period);
+            // Official `parseConstructorInvocationArguments` :8853-8866: when
+            // the token after the last-consumed constructor name is a
+            // type-argument group, the invocation caller reports
+            // `constructorWithTypeArguments` anchored on that name
+            // (`findNonZeroLengthToken` keeps the real-token anchor — corpus
+            // rows `a.b.c<C>` 2:17|1, `p.Foo.bar<int>` 5:13|3), consumes the
+            // group as invalid type arguments (`handleInvalidTypeArguments`),
+            // and then parses the `()` normally. Only a name from THIS period
+            // slot can reach that state: a group on the class head
+            // (`C<int>(...)`, `C.named<int>()`) was already consumed by the
+            // arm above, exactly where the official
+            // `parseConstructorReference` consumes it. The redirecting
+            // factory body takes no invocation arguments (official
+            // `parseRedirectingFactoryBody` :6425 goes to
+            // `ensureSemicolon`), so it never reports.
+            if !matches!(context, ConstructorReferenceContext::RedirectingFactory)
+                && self.peek_kind() == TokenKind::Lt
+            {
+                // The cursor sits on the peeked `<` here, so the group reads
+                // through the on-`<` variant (the plain variant looks one
+                // past the head).
+                let type_param = self.compute_type_param_or_arg_on_lt(false);
+                if !matches!(type_param, crate::types::TypeParamOrArg::None) {
+                    let name = self.last_consumed_span();
+                    self.report(msg::constructor_with_type_arguments(), name);
+                    let parsed = type_param.parse_arguments(self);
+                    self.listener.handle_invalid_type_arguments(parsed);
+                }
+            }
         } else {
             // Official :6430-6436 — the else of the period check fires the
             // no-continuation event for EVERY period-less reference, type

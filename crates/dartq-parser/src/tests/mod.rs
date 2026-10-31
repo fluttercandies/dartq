@@ -87,6 +87,7 @@ mod ticket_3185_tests;
 mod ticket_3189_tests;
 mod ticket_3190_tests;
 mod ticket_3191_tests;
+mod ticket_3192_tests;
 mod ticket_3193_tests;
 mod ticket_2571_tests;
 mod type_compute;
