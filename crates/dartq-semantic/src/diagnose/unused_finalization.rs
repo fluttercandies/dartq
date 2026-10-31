@@ -1023,6 +1023,359 @@ impl<'a> Engine<'a> {
                 self.credit_extension_import(face, face_file);
             }
         }
+        // The operator / index / implicit-`call` credit faces (the #3223
+        // census): the gather visitor records a member use for every
+        // operator or index access over the extended type
+        // (`visitBinaryExpression`/`visitIndexExpression`/
+        // `visitPrefixExpression`/`visitPostfixExpression` →
+        // `usedElements.addMember`, unused_local_elements_verifier.dart
+        // :59-64/:196-201/:256-267) and for a value's implicit `call`
+        // (`visitFunctionExpressionInvocation` :175-180). The resolve layer
+        // leaves those receivers untyped, so the row pool decides here: an
+        // operator row names its own operand (the row's captured type, or
+        // the literal's spelling), and a callee-less `Invoke` row is the
+        // invoked value. The credit stays over-report-proof: the member
+        // spelling must be declared by exactly one accessible face (the
+        // resolve-side ambiguity set) whose `on` head equals the
+        // receiver's head, and a real container operator takes the use
+        // (its own member join owns it).
+        let call_spelling = self.intern("call");
+        // The operator / index / implicit-`call` credit faces (the #3223
+        // census): the gather visitor records a member use for every
+        // operator or index access over the extended type
+        // (`visitBinaryExpression`/`visitIndexExpression`/
+        // `visitPrefixExpression`/`visitPostfixExpression` →
+        // `usedElements.addMember`, unused_local_elements_verifier.dart
+        // :59-64/:196-201/:256-267) and for a value's implicit `call`
+        // (`visitFunctionExpressionInvocation` :175-180). The row pool is
+        // drained by finalize time (the listener folds statements away as
+        // it goes), so the source bytes decide: a literal operand's head is
+        // its spelling (`true`/`false` → `bool`, a digit run → `int`) and
+        // the bracket or paren that follows it is the application. The
+        // credit stays over-report-proof through the same guard chain as
+        // every other arm: the member spelling must be declared by exactly
+        // one accessible face (the resolve-side ambiguity set) whose `on`
+        // head equals the receiver's head, and a real container member
+        // takes the use (`member_found`).
+        let bool_id = self.intern("bool");
+        let int_id = self.intern("int");
+        let bytes = self.source.as_bytes();
+        let ident_before = |bytes: &[u8], i: usize| {
+            i > 0
+                && matches!(
+                    bytes[i - 1],
+                    b'_' | b'$' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+                )
+        };
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let mut head = None;
+            let mut after = at;
+            if bytes[at..].starts_with(b"true") && !ident_before(bytes, at) {
+                head = Some(bool_id);
+                after = at + 4;
+            } else if bytes[at..].starts_with(b"false") && !ident_before(bytes, at) {
+                head = Some(bool_id);
+                after = at + 5;
+            } else if bytes[at].is_ascii_digit() && !ident_before(bytes, at) {
+                head = Some(int_id);
+                after = at
+                    + bytes[at..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit() || **b == b'.')
+                        .count();
+            }
+            if let Some(head) = head {
+                let mut next = after;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                match bytes.get(next) {
+                    // An index application: the read credits `[]`, the
+                    // write (`a[i] = v`) credits `[]=` — the token after
+                    // the matching `]` decides (`=` alone; `==` compares
+                    // the read and `=>` belongs to a closure body).
+                    Some(b'[') => {
+                        let member = if self.index_write_after(next) {
+                            self.intern("[]=")
+                        } else {
+                            self.intern("[]")
+                        };
+                        self.credit_face_member(&faces, &declarers, member, head);
+                    }
+                    // An implicit-`call` invocation (`0()`).
+                    Some(b'(') => {
+                        self.credit_face_member(&faces, &declarers, call_spelling, head);
+                    }
+                    _ => {}
+                }
+                at = after;
+            }
+            at += 1;
+        }
+        // The function-receiver arm: an `extension on Function` face
+        // applies to any function-valued receiver — a bare or
+        // generic-instantiated function reference (`foo.m<int>`,
+        // `foo<int>.m()`; the `ExtensionElement` arm of
+        // `visitSimpleIdentifier`, unused_local_elements_verifier.dart
+        // :341-348, credits `usedElements.members`). The resolve layer
+        // cannot type the instantiation, so the receiver's head identifier
+        // decides: a head that binds a top-level function, a local
+        // function, or a function-typed formal/local, with the source
+        // adjacency `head.member` (an optional balanced `<...>`
+        // instantiation may sit between) as the application.
+        let mut fn_heads: Vec<StringId> = self
+            .decl_sites
+            .iter()
+            .filter(|s| matches!(s.kind, DeclKind::TopLevelFn))
+            .map(|s| s.name)
+            .collect();
+        for frame in &self.frames {
+            fn_heads.extend(frame.local_fn_sigs.keys().copied());
+            fn_heads.extend(
+                frame
+                    .var_types
+                    .iter()
+                    .filter(|(_, ty)| matches!(ty, Ty::Function { .. }))
+                    .map(|(name, _)| *name),
+            );
+        }
+        for &(face, _) in &faces {
+            if !matches!(&face.on_ty, Ty::Named { name, .. }
+                if self.strings.resolve(*name) == "Function")
+            {
+                continue;
+            }
+            for member in face.members.keys() {
+                if declarers.get(member).copied() != Some(1) {
+                    continue;
+                }
+                let member_text = self.strings.resolve(*member);
+                let applied = fn_heads.iter().any(|&head| {
+                    !self.member_found(head, *member, false)
+                        && self.source_member_access(self.strings.resolve(head), &member_text)
+                });
+                if applied {
+                    self.credit_face_member(&faces, &declarers, *member, self.intern("Function"));
+                }
+            }
+        }
+    }
+
+    /// The shared operator/`call`/function-receiver credit path: the guard
+    /// chain (exactly one accessible face declares the member, no real
+    /// container member carries the spelling, the face's `on` head equals
+    /// the receiver head) then the element-level insert the member arms
+    /// read. Returns whether the credit landed.
+    fn credit_face_member(
+        &mut self,
+        faces: &[(&ExtensionFace, FileId)],
+        declarers: &FxHashMap<StringId, u32>,
+        member: StringId,
+        head: StringId,
+    ) -> bool {
+        if declarers.get(&member).copied() != Some(1) {
+            return false;
+        }
+        if self.member_found(head, member, false) {
+            return false;
+        }
+        let Some(&(face, face_file)) = faces.iter().find(|(face, _)| {
+            face.members.contains_key(&member)
+                && matches!(&face.on_ty, Ty::Named { name, .. } if *name == head)
+        }) else {
+            return false;
+        };
+        if let Some(face_index) = self
+            .index
+            .get(face_file)
+            .and_then(|elements| {
+                elements
+                    .extension_faces()
+                    .iter()
+                    .position(|entry| std::ptr::eq(entry, face))
+            })
+            .and_then(|index| u32::try_from(index).ok())
+        {
+            self.extension_member_used
+                .insert((face_file, face_index, member));
+            self.credit_extension_import(face, face_file);
+            return true;
+        }
+        false
+    }
+
+    /// Whether the index application opened at `open` (the `[` byte) is a
+    /// WRITE (`a[i] = v`): the matching `]` is followed by a lone `=`
+    /// (`==` compares the read, `=>` belongs to a closure body).
+    fn index_write_after(&self, open: usize) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut depth: i32 = 0;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let mut k = i + 1;
+                        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        return bytes.get(k) == Some(&b'=')
+                            && bytes.get(k + 1) != Some(&b'=')
+                            && bytes.get(k + 1) != Some(&b'>');
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Whether the source spells a member access `head.member` — an
+    /// optional balanced `<...>` instantiation may sit between the head
+    /// and the dot (the generic instantiation `foo<int>.m()`), and both
+    /// spellings are word-bounded (an identifier that merely CONTAINS the
+    /// head's spelling never matches). The byte walk is the same
+    /// finalize-time posture the closure-chain arm rides.
+    fn source_member_access(&self, head: &str, member: &str) -> bool {
+        if head.is_empty() || member.is_empty() {
+            return false;
+        }
+        let bytes = self.source.as_bytes();
+        let ident_byte = |b: u8| matches!(b, b'_' | b'$' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+        let mut from = 0usize;
+        while let Some(rel) = self.source[from..].find(head) {
+            let hit = from + rel;
+            let head_start_ok = hit == 0 || !ident_byte(bytes[hit - 1]);
+            let mut k = hit + head.len();
+            let head_end_ok = bytes.get(k).is_none_or(|b| !ident_byte(*b));
+            if head_start_ok && head_end_ok {
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if bytes.get(k) == Some(&b'<') {
+                    if let Some(end) = self.skip_balanced(k, b'<', b'>') {
+                        k = end;
+                    } else {
+                        k = bytes.len();
+                    }
+                }
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if bytes.get(k) == Some(&b'.') {
+                    let mut m = k + 1;
+                    while m < bytes.len() && bytes[m].is_ascii_whitespace() {
+                        m += 1;
+                    }
+                    if bytes[m..].starts_with(member.as_bytes()) {
+                        let tail = m + member.len();
+                        if bytes.get(tail).is_none_or(|b| !ident_byte(*b)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            from = hit + head.len();
+        }
+        false
+    }
+
+    /// Forward balanced-bracket walk from `open` (a `begin` byte); answers
+    /// the byte AFTER the matching `end`, or `None` when unbalanced.
+    fn skip_balanced(&self, open: usize, begin: u8, end: u8) -> Option<usize> {
+        let bytes = self.source.as_bytes();
+        let mut depth: i32 = 0;
+        let mut i = open;
+        while i < bytes.len() {
+            if bytes[i] == begin {
+                depth += 1;
+            } else if bytes[i] == end {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether the identifier at `[offset, end)` sits in a PURE-WRITE
+    /// position: the next token is a lone `=` (`==` compares, `=>` belongs
+    /// to a closure body, `+=`-family reads too — every compound and
+    /// null-aware form keeps the read credit, matching the upstream
+    /// write-credits-only-the-setter posture).
+    fn pure_write_at(&self, offset: u32, end: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let stop = self.byte_of(end).min(bytes.len());
+        let mut k = stop;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        bytes.get(k) == Some(&b'=')
+            && bytes
+                .get(k + 1)
+                .is_none_or(|b| *b != b'=' && *b != b'>')
+    }
+
+    /// Whether the source spells an object pattern's field reading
+    /// `member` off `container` — `container(_: sub)` or
+    /// `container<T>(_: sub)` (an object pattern REQUIRES the type
+    /// spelling, so the container-anchored needle is the shape itself;
+    /// `visitPatternField`'s `addMember`/`addReadMember`,
+    /// unused_local_elements_verifier.dart:249-253). Positional fields
+    /// (`container(: _)`) match by position, not spelling — a face the
+    /// byte walk cannot key — so they keep the report.
+    fn pattern_field_read_of(&self, container: StringId, member: StringId) -> bool {
+        let container_text = self.strings.resolve(container);
+        let member_text = self.strings.resolve(member);
+        if container_text.is_empty() || member_text.is_empty() {
+            return false;
+        }
+        let bytes = self.source.as_bytes();
+        let ident_byte =
+            |b: u8| matches!(b, b'_' | b'$' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+        let mut from = 0usize;
+        while let Some(rel) = self.source[from..].find(&container_text) {
+            let hit = from + rel;
+            let bounded = (hit == 0 || !ident_byte(bytes[hit - 1]))
+                && bytes
+                    .get(hit + container_text.len())
+                    .is_none_or(|b| !ident_byte(*b));
+            if bounded {
+                let mut k = hit + container_text.len();
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if bytes.get(k) == Some(&b'<') {
+                    k = self.skip_balanced(k, b'<', b'>').unwrap_or(bytes.len());
+                }
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if bytes.get(k) == Some(&b'(') {
+                    let mut m = k + 1;
+                    while m < bytes.len() && bytes[m].is_ascii_whitespace() {
+                        m += 1;
+                    }
+                    if bytes[m..].starts_with(member_text.as_bytes()) {
+                        let mut e = m + member_text.len();
+                        while e < bytes.len() && bytes[e].is_ascii_whitespace() {
+                            e += 1;
+                        }
+                        if bytes.get(e) == Some(&b':') {
+                            return true;
+                        }
+                    }
+                }
+            }
+            from = hit + container_text.len().max(1);
+        }
+        false
     }
 
     /// One self-use re-attribution: the container spelling keys the
@@ -1256,15 +1609,23 @@ impl<'a> Engine<'a> {
         //
         // `_isReadIdentifier` (upstream :429): a write `v = 3` adds the
         // SETTER element, never the variable — `v` reports `unused_element`
-        // unless a read also credits it. `refs` carries the resolution
-        // without intent; `rows` records the finalized write — a `Decl`
-        // name whose every `refs` row pairs a `Write` intent row at the
-        // same offset is write-only and reports.
+        // unless a read also credits it. `rows` records the finalized write,
+        // and the refs pool carries the resolution of every surviving
+        // identifier — the source bytes decide the intent (`v = 3` is a
+        // pure write; `v == 3` compares and `v += 1` reads too, so both
+        // keep the credit; `=>` belongs to a closure body).
         let write_offsets: FxHashSet<u32> = self
             .rows
             .iter()
             .filter(|row| matches!(row.intent, Intent::Write))
             .map(|row| row.range.offset)
+            .collect();
+        let pure_write_refs: FxHashSet<u32> = self
+            .refs
+            .iter()
+            .filter(|r| matches!(r.target, RefTarget::Decl { .. } | RefTarget::Missing))
+            .filter(|r| self.pure_write_at(r.range.offset, r.range.end()))
+            .map(|r| r.range.offset)
             .collect();
         let top_level_used: FxHashSet<StringId> = self
             .refs
@@ -1272,11 +1633,75 @@ impl<'a> Engine<'a> {
             .filter(|r| {
                 matches!(r.target, RefTarget::Decl { .. })
                     && !write_offsets.contains(&r.range.offset)
+                    && !pure_write_refs.contains(&r.range.offset)
             })
             .map(|r| r.name)
             .chain(self.type_uses.iter().map(|(_, name)| *name))
             .chain(missing_write_top_levels.iter().copied())
             .collect();
+        // The resolved member reads the refs pool already carries: the
+        // `member_refs` edge pool misses the access shapes whose credit the
+        // gather visitor still records — an object pattern's field read
+        // (`visitPatternField`'s `addMember`/`addReadMember`,
+        // unused_local_elements_verifier.dart:249-253) among them. Each
+        // entry keys the same (container, spelling) element tuple the
+        // member arms read, so those paths gain exactly the upstream
+        // credit and nothing more (a write intent stays excluded).
+        let ref_member_reads: FxHashSet<(StringId, StringId)> = self
+            .refs
+            .iter()
+            .filter_map(|r| match &r.target {
+                RefTarget::Member { container }
+                    if !write_offsets.contains(&r.range.offset)
+                        && !pure_write_refs.contains(&r.range.offset) =>
+                {
+                    Some((*container, r.name))
+                }
+                _ => None,
+            })
+            .collect();
+        // The write-side setter credit: a write whose resolution binds the
+        // setter spelling credits the SETTER element
+        // (`_useIdentifierElement(node.writeElement)`,
+        // unused_local_elements_verifier.dart:304-308) — `usedElements
+        // .elements` carries the accessor, and `_isUsedMember` spares it.
+        // The push-time row keeps the bare spelling and its write intent,
+        // so the name-level read set never sees it; re-resolve the setter
+        // spelling live for every Decl- or Missing-bound write (a bare
+        // setter write's plain-name lookup misses — only `_s=` resolves —
+        // so its ref lands `Missing` and the live probe recovers it). A
+        // variable element is never credited by a write — the added
+        // element is the accessor — so only setter sites read this set.
+        let decl_write_names: FxHashSet<StringId> = self
+            .refs
+            .iter()
+            .filter(|r| {
+                matches!(r.target, RefTarget::Decl { .. } | RefTarget::Missing)
+                    && (write_offsets.contains(&r.range.offset)
+                        || pure_write_refs.contains(&r.range.offset))
+            })
+            .map(|r| r.name)
+            .collect();
+        // (`resolve_bare` takes `&mut self`, so the probe runs after the
+        // `refs` borrow ends.)
+        let top_level_setter_writes: FxHashSet<StringId> = decl_write_names
+            .clone()
+            .into_iter()
+            .filter(|&name| {
+                let spelling = self.setter_spelling(name);
+                matches!(self.resolve_bare(spelling).1, RefTarget::Decl { .. })
+            })
+            .collect();
+        // The scope's first-wins slot: upstream's library scope binds each
+        // getter/setter spelling with `??=` (scope.dart:880-892), so a
+        // later same-spelling top-level declaration is shadowed — no name
+        // lookup reaches its element, the element never joins
+        // `usedElements.elements`, and
+        // `_visitTopLevelVariableElement` reports it whenever it is
+        // private (the shadowed top-level `_` face, #3241). The name-level
+        // `top_level_used` set would mask the twin behind the winning
+        // spelling's use, so every later claimant skips that credit.
+        let mut top_level_first_claims: FxHashSet<StringId> = FxHashSet::default();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
             let bare = self.bare_name(site.name);
@@ -1322,14 +1747,25 @@ impl<'a> Engine<'a> {
             }
             match site.kind {
                 DeclKind::TopLevelFn | DeclKind::TopLevelVar | DeclKind::TypeAlias => {
+                    // A nameless recovery site never claims the slot
+                    // (upstream's `_addGetter` skips a null lookupName
+                    // entirely — scope.dart:880-885 — so nameless elements
+                    // stay outside the first-wins map).
+                    let shadowed =
+                        !self.is_nameless(site.name) && !top_level_first_claims.insert(site.name);
                     // `_isUsedElement`'s else arm: a public name is used;
                     // otherwise a resolved top-level use spares it —
                     // `top_level_used` excludes locals, members, and
                     // parameters (element-level check, upstream
-                    // `usedElements.elements`).
+                    // `usedElements.elements`). A shadowed duplicate never
+                    // takes that credit (its element is unreachable by
+                    // name), and a written setter reads its own write
+                    // credit set — the accessor is the credited element.
+                    let is_setter_site = bare != site.name;
                     if !site.annotated
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
-                        && !top_level_used.contains(&bare)
+                        && (shadowed || !top_level_used.contains(&bare))
+                        && !(is_setter_site && top_level_setter_writes.contains(&bare))
                     {
                         // A nameless recovery declaration anchors at the file
                         // start — the spliced synthetic name never reaches
@@ -1461,7 +1897,16 @@ impl<'a> Engine<'a> {
                             .member_read_owners
                             .get(&bare)
                             .is_none_or(|owners| owners.is_empty());
-                    if self.member_was_read(container, &bare) || enum_values_read || unresolved_read
+                    if self.member_was_read(container, &bare)
+                        || enum_values_read
+                        || unresolved_read
+                        || ref_member_reads.contains(&(container, bare))
+                        || ref_member_reads.contains(&(container, site.name))
+                        // The object-pattern field read (`C(_: 42)`): the
+                        // resolve layer records the spelling (`resolved`),
+                        // the container-anchored needle proves the shape.
+                        || (resolved.contains(&bare)
+                            && self.pattern_field_read_of(container, bare))
                     {
                         continue;
                     }
@@ -1573,7 +2018,13 @@ impl<'a> Engine<'a> {
                         // ref credits the spelling).
                         _ => member_used_elements
                             .contains(&(self.file, container, site.name))
-                            || member_element_used.contains(&bare),
+                            || member_element_used.contains(&bare)
+                            || ref_member_reads.contains(&(container, site.name))
+                            || ref_member_reads.contains(&(container, bare))
+                            // The object-pattern field read (`C(_: 42)`)
+                            // spares the getter the same way.
+                            || (resolved.contains(&bare)
+                                && self.pattern_field_read_of(container, bare)),
                     };
                     let spared = unnamed_face_owns
                         || site.annotated

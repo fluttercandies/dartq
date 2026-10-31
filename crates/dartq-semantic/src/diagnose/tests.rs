@@ -17817,3 +17817,14 @@ mod ticket_3237_tests;
 #[cfg(test)]
 #[path = "ticket_3254_tests.rs"]
 mod ticket_3254_tests;
+
+// The #3241 pins (the `unused_element` used-credit lattice: the shadowed
+// top-level `_` face plus the used-credit joins the #3223 recon mapped onto
+// `finalize_usage` — pattern-field reads, the top-level setter's write
+// credit, operator/index/`call` extension applications, and the
+// `extension on Function` receiver faces). `diagnose.rs` is a live-lane
+// file out of this ticket's write scope; `#[path]` keeps the module inside
+// the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3241_tests.rs"]
+mod ticket_3241_tests;
