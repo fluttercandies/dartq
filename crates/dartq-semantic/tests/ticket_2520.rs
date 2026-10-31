@@ -24,11 +24,12 @@
 //! from diagnostics alone: the generic face's `act()` takes no positional
 //! argument, the plain face's `act(int)` requires one.
 //!
-//! Not covered here: the shape whose `on` arguments are a bare parameter
-//! against a concrete spelling (`on Bag<T>` vs `on Bag<Fragment>`). That
-//! pair is declined by the steps 3-4 gate before the structural read runs,
-//! so ordering it needs the receiver-instantiated comparison at that call
-//! site — see `try_bounds_subtype`'s seam note.
+//! The literal shape whose `on` arguments are a bare parameter against a
+//! concrete spelling (`on Bag<T>` vs `on Bag<Fragment>`) is the #3090 seam:
+//! steps 3-4 now compare each `on` type as the receiver INSTANTIATES it
+//! (`on Bag<T>` over `Bag<SubFragment>` reads `Bag<SubFragment>`), so the
+//! bare parameter orders by the real lattice instead of its spelling. The
+//! equal-instantiation control pins that a mutual pair stays ambiguous.
 
 use std::path::Path;
 
@@ -81,6 +82,45 @@ extension One on Bag<Fragment> {
   void act(int x) {}
 }
 extension Two on Bag<Fragment> {
+  void act() {}
+}
+void use(Bag<Fragment> b) {
+  b.act();
+}
+";
+
+/// The #2520 literal shape (#3090): the generic face's `on` type carries a
+/// bare parameter against the concrete twin's argument. The receiver
+/// instantiates the parameter (`T := SubFragment`), so `on Bag<T>` reads
+/// `Bag<SubFragment>`, strictly below `Bag<Fragment>` — the generic face
+/// dominates (oracle 3.13.1 on this exact unit: "No issues found!").
+const LITERAL_BARE_PARAM: &str = "\
+class Fragment {}
+class SubFragment extends Fragment {}
+class Bag<T> {}
+extension Plain on Bag<Fragment> {
+  void act(int x) {}
+}
+extension Gen<T extends Fragment> on Bag<T> {
+  void act() {}
+}
+void use(Bag<SubFragment> b) {
+  b.act();
+}
+";
+
+/// The equal-instantiation control: a `Bag<Fragment>` receiver instantiates
+/// the generic face to `Bag<Fragment>` too, so both faces are the same
+/// extended type and the pair stays mutually compatible — ambiguous (oracle
+/// 3.13.1 on this exact unit: `ambiguous_extension_member_access` at the
+/// `b.act()` call).
+const LITERAL_EQUAL_INSTANTIATION: &str = "\
+class Fragment {}
+class Bag<T> {}
+extension Plain on Bag<Fragment> {
+  void act(int x) {}
+}
+extension Gen<T extends Fragment> on Bag<T> {
   void act() {}
 }
 void use(Bag<Fragment> b) {
@@ -209,5 +249,39 @@ fn concrete_twin_faces_stay_ambiguous() {
     assert!(
         got.contains(&"ambiguous_extension_member_access"),
         "two equally specific concrete faces must stay ambiguous, got {got:?}"
+    );
+}
+
+/// #3090: the literal bare-parameter shape resolves to the oracle's row —
+/// the receiver instantiates `T := SubFragment`, so `on Bag<T>` reads
+/// `Bag<SubFragment>`, strictly below the concrete twin's `Bag<Fragment>`;
+/// the generic face dominates and its zero-argument `act()` resolves (no
+/// ambiguity, no positional deficit).
+#[test]
+fn literal_bare_parameter_orders_by_the_instantiated_on_type() {
+    let report = unit_report(LITERAL_BARE_PARAM);
+    let got = codes(&report);
+    assert!(
+        !got.contains(&"ambiguous_extension_member_access"),
+        "the bare `on Bag<T>`/concrete `on Bag<Fragment>` pair must order by \
+         the receiver-instantiated on types, got {got:?}"
+    );
+    assert!(
+        !got.contains(&"not_enough_positional_arguments"),
+        "the generic face's zero-argument act() must be the resolved member, got {got:?}"
+    );
+}
+
+/// #3090 control: a receiver both faces instantiate to the same type keeps
+/// the pair mutually compatible — the access stays ambiguous (the
+/// instantiated compare must never order a mutual pair; LEGACY name-level
+/// fallback and the equal form agree).
+#[test]
+fn literal_equal_instantiation_stays_ambiguous() {
+    let report = unit_report(LITERAL_EQUAL_INSTANTIATION);
+    let got = codes(&report);
+    assert!(
+        got.contains(&"ambiguous_extension_member_access"),
+        "a mutual instantiation must stay ambiguous, got {got:?}"
     );
 }

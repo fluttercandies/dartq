@@ -8463,7 +8463,8 @@ impl<'a> Engine<'a> {
             let face_params = self.strict_face_params(face, face_file)?;
             ops.extension_applies_strict(receiver_ty, on_ty, &face_params, &boundary.args.borrow())
         };
-        let mut applicable: Vec<(&ExtensionFace, Ty, FileId)> = Vec::new();
+        let mut applicable: Vec<(&ExtensionFace, Ty, FileId, Option<dartq_types::TypeId>)> =
+            Vec::new();
         if receiver_valid {
             for &(face, face_file) in faces {
                 let Some(on) = face.on_type else { continue };
@@ -8517,23 +8518,38 @@ impl<'a> Engine<'a> {
                 if !applicable_face {
                     continue;
                 }
-                applicable.push((face, on_ty, face_file));
+                // #3090: the receiver-instantiated `on` type rides the
+                // step-3-4 comparison below. A face parameter bound to the
+                // receiver's argument (`on Bag<T>` over `Bag<SubFragment>`)
+                // then orders by the real lattice instead of its spelling;
+                // a declined binding keeps the name-level read.
+                let instantiated = self.strict_face_params(face, face_file).and_then(|params| {
+                    self.ops.and_then(|ops| {
+                        ops.instantiated_on(receiver_ty, on_ty, &params, &boundary.args.borrow())
+                    })
+                });
+                applicable.push((face, on_ty, face_file, instantiated));
             }
         }
 
-        // `_isMoreSpecific` steps 3-4 at the name level: a face whose
-        // instantiated `on` type is a strict subtype of another applicable
-        // face's dominates it (`extension_member_resolver.dart:467-491`).
-        // The name-level subtype reads the two `on` types' shape: equal
-        // heads compare covariant argument-wise — a non-nullable argument
-        // subtypes its nullable twin (`List<ManifestNode>` vs
-        // `List<ManifestNode?>`), a subtype argument subtypes its
-        // supertype (`Map<K, FieldItem>` vs `Map<K, ManifestItem>`) — and
-        // unequal heads ride the declared supertype walk. A shape the
-        // name level cannot order (an own type parameter, nested argument
-        // lists, unknowns) answers compatible; those pairs fall to step
-        // 5's instantiate-to-bounds tail below.
-        let on_subtype = |sub: Ty, sup: Ty| -> bool {
+        // `_isMoreSpecific` steps 3-4: the oracle compares the extended
+        // types as `applicableTo` inferred them against the receiver
+        // (`extension_member_resolver.dart:484-497`), never their bare
+        // parameter spellings. `instantiated_on` supplies that form; when
+        // BOTH faces instantiate structurally the real lattice is
+        // authoritative in both directions — a definitive `false` must not
+        // fall back to the name-level shape read, which answers compatible
+        // for nested argument lists (`on Bag<List<T>>` vs
+        // `on Bag<List<Fragment>>`) and would hide the order. A declined
+        // binding (`None`) keeps the name-level arms verbatim.
+        let on_subtype = |sub: Ty,
+                          sup: Ty,
+                          sub_inst: Option<dartq_types::TypeId>,
+                          sup_inst: Option<dartq_types::TypeId>|
+         -> bool {
+            if let (Some(ops), Some(sub_inst), Some(sup_inst)) = (self.ops, sub_inst, sup_inst) {
+                return ops.subtype_ids(sub_inst, sup_inst);
+            }
             // #2508: the snapshot orders the instantiated `on` types
             // structurally where it can — a generic face's
             // `Iterable<Wrapper<int>>` subtyping its `Iterable<Base>`
@@ -8761,7 +8777,7 @@ impl<'a> Engine<'a> {
         // `package:`/path URIs.
         let sdk_origin: Vec<bool> = applicable
             .iter()
-            .map(|&(_, _, face_file)| {
+            .map(|&(_, _, face_file, _)| {
                 self.graph
                     .library_of_file(face_file)
                     .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"))
@@ -8769,12 +8785,12 @@ impl<'a> Engine<'a> {
             .collect();
         let mut specific: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
         let mut nullable: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
-        for (index, &(face, on_ty, face_file)) in applicable.iter().enumerate() {
+        for (index, &(face, on_ty, face_file, on_inst)) in applicable.iter().enumerate() {
             let dominated = applicable.iter().enumerate().any(|(other, _)| {
                 if other == index {
                     return false;
                 }
-                let (other_face, other_on_ty, other_file) = applicable[other];
+                let (other_face, other_on_ty, other_file, other_inst) = applicable[other];
                 // A face whose `on` type is non-nullable is inapplicable to
                 // a nullable receiver (`applicableTo` rejects it: `C?` is
                 // not assignable to the non-null `on` type), so it never
@@ -8806,8 +8822,8 @@ impl<'a> Engine<'a> {
                 {
                     return other < index;
                 }
-                if on_subtype(other_on_ty, on_ty) {
-                    if !on_subtype(on_ty, other_on_ty) {
+                if on_subtype(other_on_ty, on_ty, other_inst, on_inst) {
+                    if !on_subtype(on_ty, other_on_ty, on_inst, other_inst) {
                         // Steps 3-4: the instantiated `on` types order.
                         return true;
                     }
@@ -8854,7 +8870,37 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let display = self.extension_display(face);
-            if face.on_type_nullable {
+            // An `on` clause naming the face's OWN type parameter
+            // (`extension<T> on T`) instantiates that parameter to the
+            // receiver, so a nullable receiver is admitted SAFELY when the
+            // parameter's bound admits it — the implicit unbounded `Object?`
+            // (a `Ty::Dynamic`/absent bound) or a nullable written bound
+            // (`T extends num?`). Such a face is the nullable-safe match; it
+            // must not force the `UnsafeSingle` verdict (the
+            // `unchecked_use_of_nullable_value` row) that a non-nullable
+            // `on C` face earns. A non-nullable written bound (`T extends
+            // num`) over a nullable receiver stays in the `specific` bucket
+            // and keeps the unchecked row, exactly as the oracle reports it.
+            // Mirrors `this_extension_member_applies`'s `on T` arm (the
+            // oracle's `applicableTo` instantiates the parameter to the
+            // receiver, so the declared bound decides; upstream Dart SDK
+            // source, pkg/analyzer resolver/extension_member_resolver.dart
+            // `_getApplicable`).
+            let self_param_nullable_safe = receiver_nullable
+                && matches!(on_ty, Ty::Named { args: ArgListId::EMPTY, .. })
+                && face
+                    .on_type
+                    .and_then(|head| {
+                        face.type_param_names.iter().position(|&param| param == head)
+                    })
+                    .is_some_and(|index| match face.type_param_bounds.get(index).copied() {
+                        None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                        Some(bound) => matches!(
+                            boundary.ty(face_file, bound),
+                            Ty::Named { nullable: true, .. }
+                        ),
+                    });
+            if face.on_type_nullable || self_param_nullable_safe {
                 nullable.push((face, face_file, display));
             } else {
                 specific.push((face, face_file, display));

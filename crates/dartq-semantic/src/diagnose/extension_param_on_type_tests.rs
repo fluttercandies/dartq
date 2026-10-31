@@ -65,3 +65,59 @@ fn class_scope_parameter_argument_keeps_the_face() {
     );
     assert_silent(&report);
 }
+
+/// The #2568 residual: an unbounded `on T` face over a NULLABLE explicit
+/// receiver. The parameter instantiates to the receiver type (`T :=
+/// String?`), so the face applies safely and the access is a `Single`, not
+/// the `UnsafeSingle` that a non-nullable `on C` face earns — no
+/// `unchecked_use_of_nullable_value` (oracle 3.13.1: clean; the
+/// `expect/lib/static_type_helper.dart` `StaticType<T> on T` shape).
+#[test]
+fn unbounded_own_param_on_nullable_receiver_resolves_safely() {
+    let report = report_ops(
+        "class Exactly<S> {}\n\
+         extension StaticType<T> on T {\n\
+         \x20 T expectStaticType<R extends Exactly<T>>() => this;\n\
+         }\n\
+         void f(String? s) {\n\
+         \x20 s.expectStaticType<Exactly<String?>>();\n\
+         }\n",
+    );
+    assert_silent(&report);
+}
+
+/// The self-nullable bound arm: `T extends num?` admits the nullable
+/// receiver safely (the bound itself is nullable) — clean, where the
+/// non-nullable bound below reports (oracle 3.13.1: clean).
+#[test]
+fn nullable_bound_own_param_on_nullable_receiver_resolves_safely() {
+    let report = report_ops(
+        "class Exactly<S> {}\n\
+         extension NullBounded<T extends num?> on T {\n\
+         \x20 T id<R extends Exactly<T>>() => this;\n\
+         }\n\
+         void f(int? s) {\n\
+         \x20 s.id<Exactly<int?>>();\n\
+         }\n",
+    );
+    assert_silent(&report);
+}
+
+/// The non-nullable bound stays UNSAFE: `T extends num` cannot instantiate
+/// to `int?` (a `int?` receiver is not within `num`), so a nullable
+/// receiver resolving the member reads a possibly-null target — the
+/// oracle's `unchecked_use_of_nullable_value` (3.13.1). The nullable-safe
+/// reclassification must never swallow this row.
+#[test]
+fn non_nullable_bound_own_param_on_nullable_receiver_reports_unchecked() {
+    let report = report_ops(
+        "class Exactly<S> {}\n\
+         extension Bounded<T extends num> on T {\n\
+         \x20 T id<R extends Exactly<T>>() => this;\n\
+         }\n\
+         void f(int? s) {\n\
+         \x20 s.id<Exactly<int?>>();\n\
+         }\n",
+    );
+    assert_eq!(code_names(&report), ["unchecked_use_of_nullable_value"]);
+}
