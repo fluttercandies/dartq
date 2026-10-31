@@ -2157,25 +2157,37 @@ fn walk_import_export(
                 i += 1;
                 let mut names = Vec::new();
                 let mut name_spans: Vec<SourceRange> = Vec::new();
+                // `identifier (',' identifier)*` — the official
+                // `parseIdentifierList` (:1250) walks a name only after the
+                // clause keyword or a comma, so the post-name position never
+                // takes another bare name: `export 'x' show y export 'a.dart';`
+                // ends the first directive at `export`. A built-in identifier
+                // IN name position is a name (`show export;` is a shown name,
+                // `ensureIdentifier` takes it silently), which keeps the
+                // directive-head boundary below from mistaking it for the next
+                // directive's head.
+                let mut expect_name = true;
                 while let Some(next) = kind_at(tokens, i) {
-                    match next {
-                        TokenKind::Identifier => {
-                            let lexeme = tokens.lexeme(text, i);
-                            names.push(strings.intern(lexeme));
-                            // The written token's span rides with it — the
-                            // per-token combinator-warning anchor
-                            // (dead_code_verifier.dart:148-158).
-                            let token = tokens.get(i).expect("kind_at checked");
-                            let end = token.utf16_offset + utf16_len_of(lexeme);
-                            last_combinator_end = last_combinator_end.max(end);
-                            name_spans.push(SourceRange {
-                                offset: token.utf16_offset,
-                                length: utf16_len_of(lexeme),
-                            });
-                            i += 1;
-                        }
-                        TokenKind::Comma => i += 1,
-                        _ => break,
+                    if next == TokenKind::Comma {
+                        expect_name = true;
+                        i += 1;
+                    } else if expect_name && is_name_token(next) {
+                        let lexeme = tokens.lexeme(text, i);
+                        names.push(strings.intern(lexeme));
+                        // The written token's span rides with it — the
+                        // per-token combinator-warning anchor
+                        // (dead_code_verifier.dart:148-158).
+                        let token = tokens.get(i).expect("kind_at checked");
+                        let end = token.utf16_offset + utf16_len_of(lexeme);
+                        last_combinator_end = last_combinator_end.max(end);
+                        name_spans.push(SourceRange {
+                            offset: token.utf16_offset,
+                            length: utf16_len_of(lexeme),
+                        });
+                        expect_name = false;
+                        i += 1;
+                    } else {
+                        break;
                     }
                 }
                 let clause = if hide {
@@ -2184,6 +2196,20 @@ fn walk_import_export(
                     CombinatorClause::Show(names.into())
                 };
                 clauses.push((clause, name_spans.into()));
+            }
+            Some(kind) if is_directive_head(kind) => {
+                // A directive head in clause position means this directive
+                // has no `;`: the official parser's `ensureSemicolon`
+                // (parser_impl.dart:5048) splices a synthetic `;` in front
+                // of the follower and the declaring loop re-enters on it, so
+                // the head keeps its own directive face (dartq's parser
+                // `ensure_semicolon` leaves the head in the stream the same
+                // way). The diet walk ends at the same boundary — hand the
+                // index back untouched so the caller's dispatch parses the
+                // head as its own directive; consuming it here would drop
+                // that directive's whole face, its `uri_does_not_exist` row
+                // included.
+                break;
             }
             _ => i += 1,
         }

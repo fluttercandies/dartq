@@ -2750,6 +2750,13 @@ mod ticket_3045_tests;
 #[path = "ticket_3066_tests.rs"]
 mod ticket_3066_tests;
 
+/// #3103 pins: the directive recovery boundary — a `;`-less directive must
+/// not swallow the next directive head, locked to the `dart analyze` 3.13.7
+/// oracle rows.
+#[cfg(test)]
+#[path = "ticket_3103_tests.rs"]
+mod ticket_3103_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
