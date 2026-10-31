@@ -146,7 +146,24 @@ impl ConstLookup for Engine<'_> {
                         IdentVerdict::Constant
                     }
                 }
-                _ => IdentVerdict::Constant,
+                // A bare read of the enclosing container's own non-const
+                // field (`static int c` read as `c` inside `class C`): the
+                // oracle resolves it through the class scope, where the
+                // member is provably not a constant (`const x = c` fires at
+                // `c`). The composite key joins at `const_decl_name`.
+                _ => {
+                    if let Some((container, _)) = self.container_context() {
+                        let key = format!(
+                            "{}\u{2}{}",
+                            self.strings.resolve(container),
+                            self.strings.resolve(name)
+                        );
+                        if self.nonconst_top_level.contains(&self.strings.intern(&key)) {
+                            return IdentVerdict::NotConstant;
+                        }
+                    }
+                    IdentVerdict::Constant
+                }
             },
             // An unresolved name is never a constant value (the official
             // evaluates it `dynamic`, which fails every constant-argument
@@ -251,13 +268,98 @@ impl<'a> Engine<'a> {
 
     /// A declaration-group name: const groups queue it for their
     /// initializer windows; a non-const *top-level* variable joins the
-    /// provable non-const set (in-file, declaration order).
+    /// provable non-const set (in-file, declaration order). A non-const
+    /// field declaration joins the same set under a `{container}\u{2}{name}`
+    /// composite key — `finish_const_initializer`'s member walk answers
+    /// `C.c` on a type literal from it (the bare-name key stays reserved
+    /// for top-level variables).
     pub fn const_decl_name(&mut self, name: StringId, field_context: bool) {
         if self.const_group {
             self.const_group_names.push(name);
-        } else if field_context && self.frames.is_empty() {
-            self.nonconst_top_level.insert(name);
+        } else if field_context {
+            if let Some((container, _)) = self.container_context() {
+                let key = format!(
+                    "{}\u{2}{}",
+                    self.strings.resolve(container),
+                    self.strings.resolve(name)
+                );
+                let key = self.intern(&key);
+                self.nonconst_top_level.insert(key);
+            } else if self.frames.is_empty() {
+                self.nonconst_top_level.insert(name);
+            }
         }
+    }
+
+    /// The leftmost `recv.name` subtree of `node` that reads a declared
+    /// non-const field through a type literal (`const x = C.c`, and the
+    /// `C.c` inside `C.c.v`): `member()` defers every unresolved static
+    /// face to a silent constant, so the walk re-asks the resolution
+    /// layer — a `BareInfo::Container` receiver keyed `{container}\u{2}{name}`
+    /// into `nonconst_top_level` proves the field was declared non-const
+    /// in this file. Mirrors upstream's first-failure order (evaluation
+    /// is left-to-right), so only the smallest-offset candidate is kept.
+    fn nonconst_member_span(&self, node: &crate::const_eval::Node) -> Option<SourceRange> {
+        let mut best: Option<SourceRange> = None;
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            match &n.expr {
+                Expr::Member { recv, name } => {
+                    if let Expr::Ident(head) = &recv.expr
+                        && let BareInfo::Container { name: c, .. } =
+                            self.resolve_bare(*head).0
+                    {
+                        let key = format!(
+                            "{}\u{2}{}",
+                            self.strings.resolve(c),
+                            self.strings.resolve(*name)
+                        );
+                        if self.nonconst_top_level.contains(&self.strings.intern(&key))
+                            && best.is_none_or(|b| n.span.offset < b.offset)
+                        {
+                            best = Some(n.span);
+                        }
+                    }
+                    stack.push(recv);
+                }
+                Expr::Binary { left, right, .. } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+                Expr::Unary { operand, .. } => stack.push(operand),
+                Expr::Cond { cond, then, els } => {
+                    stack.push(cond);
+                    stack.push(then);
+                    stack.push(els);
+                }
+                Expr::Interp { parts }
+                | Expr::Adjacent(parts)
+                | Expr::List(parts)
+                | Expr::Set(parts)
+                | Expr::Record(parts) => {
+                    for part in parts {
+                        stack.push(part);
+                    }
+                }
+                Expr::Map(entries) => {
+                    for (key, value) in entries {
+                        stack.push(key);
+                        stack.push(value);
+                    }
+                }
+                Expr::Entry(key, value) => {
+                    stack.push(key);
+                    stack.push(value);
+                }
+                Expr::Call { args, .. } => {
+                    for arg in args {
+                        stack.push(arg);
+                    }
+                }
+                _ => {}
+            }
+        }
+        best
     }
 
     pub fn disarm_const_group(&mut self) {
@@ -332,7 +434,30 @@ impl<'a> Engine<'a> {
         let verdict = root
             .as_ref()
             .map_or(Verdict::Constant, |node| eval(node, self));
-        self.resolve_const_verdict(&verdict);
+        // A non-const field read through a type literal (`const x = C.c`)
+        // defers through `member()`'s silent arm — the walk re-discovers it
+        // and the smallest-offset candidate answers the oracle's
+        // left-to-right first failure (it beats a `NotConstant`/`Unresolved`
+        // verdict anchored further right; an allow-list fault keeps its own
+        // code).
+        let member_span = root
+            .as_ref()
+            .and_then(|node| self.nonconst_member_span(node));
+        let member_wins = match (&verdict, member_span) {
+            (Verdict::Fault(..) | Verdict::Value(_), _) | (_, None) => false,
+            (Verdict::NotConstant(s) | Verdict::Unresolved(s), Some(m)) => m.offset < s.offset,
+            (Verdict::Constant, Some(_)) => true,
+        };
+        if let Some(span) = member_span.filter(|_| member_wins) {
+            self.emit(
+                SemanticCode::ConstInitializedWithNonConstantValue,
+                span,
+                "",
+                "",
+            );
+        } else {
+            self.resolve_const_verdict(&verdict);
+        }
         // This initializer's creation candidates: an immediate failure
         // (a genuine non-constant operand) already reported — the oracle
         // codes one row per initializer, so the deferred entries drop; a
@@ -3654,3 +3779,7 @@ mod face_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ticket_3163_tests.rs"]
+mod ticket_3163_tests;

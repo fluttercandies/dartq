@@ -5452,7 +5452,13 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         engine.check_type_check(verdict_at, keyword_operand, not.is_some());
         engine.armed_ty = checked_saved;
-        engine.const_capture.not_constant(is_operator.range);
+        // An `is` test is const-transparent (upstream `visitIsExpression`,
+        // evaluation.dart:1106 — no arm of its own): the operand's own
+        // verdict is the result, so the operand node stays as the
+        // expression's root — `o is int` reports at `o` (the oracle's
+        // deepest-non-constant anchor), `1 is int` stays silent. No leaf
+        // is pushed: a shadowing node would discard the operand's
+        // non-constant face.
         // An `is` expression is statically `bool` — the enclosing condition
         // checkpoint spares the operand row.
         if let Some(row) = engine.operand_row() {
@@ -5648,7 +5654,11 @@ impl ParserListener for DiagnoseListener<'_> {
                 });
             }
         }
-        engine.const_capture.opaque_leaf(operator.range);
+        // An `as` cast is const-transparent like `is` (`visitAsExpression`
+        // carries no arm of its own): the operand's verdict is the result,
+        // so the operand node stays as the expression's root — `o as int`
+        // reports at `o`, `1 as int` stays silent. No leaf is pushed: an
+        // opaque shadow would discard the operand's non-constant face.
     }
 
     // —— suppression brackets —————————————————————————————————————————
