@@ -852,7 +852,18 @@ impl<'a> Engine<'a> {
         if *inst_args == ArgListId::EMPTY {
             return None;
         }
-        let params = self.bounds.container_params(head)?;
+        // The substitution domain is the head's parameter NAMES only —
+        // the same-file `container_params` snapshot is the canonical
+        // producer, and a FOREIGN generic (`Circle<T extends MetricUnits>`
+        // in the pattern helper's own unit) falls back to the declaring
+        // unit's `type_param_names` via `foreign_container_params` — the
+        // `resolve_container`-style face `instantiated_head_ty` already
+        // applies for the args side (#3180). Bounds and poison bits are
+        // never consulted here, so the names-only fallback suffices.
+        let params: Vec<StringId> = match self.bounds.container_params(head) {
+            Some(params) => params.iter().map(|(name, ..)| *name).collect(),
+            None => self.foreign_container_params(head)?,
+        };
         let inst_args = self.boundary.pool().get(*inst_args).to_vec();
         if params.len() != inst_args.len() {
             return None;
@@ -860,7 +871,7 @@ impl<'a> Engine<'a> {
         let env: FxHashMap<StringId, Ty> = params
             .iter()
             .zip(inst_args.iter())
-            .map(|((param, ..), ty)| (*param, *ty))
+            .map(|(param, ty)| (*param, *ty))
             .collect();
         let substituted = self.substitute_ty(result, &env);
         (substituted != result && substituted != Ty::UNKNOWN).then_some(substituted)
@@ -4366,6 +4377,14 @@ impl<'a> Engine<'a> {
                         .ok()
                         .map(|index| self.member_reads[index].recv_span)
                 {
+                    // The type-literal head (`dynamic`/`Never` spelled as
+                    // the receiver, an ungrounded alias): its answer is the
+                    // `Type` instance's face, and the flow faces below
+                    // never see a type token's read — the check runs
+                    // before them.
+                    if self.check_type_literal_receiver(row) {
+                        return;
+                    }
                     match self
                         .rebound_local_receiver(row.range.offset, &recv)
                         .or_else(|| self.recv_expression_ty(read_span))
@@ -4398,6 +4417,12 @@ impl<'a> Engine<'a> {
                         // shared unchecked code at the selector; an
                         // `Object` member stays exempt).
                         Some(face @ (Ty::Record { .. } | Ty::Function { .. })) => {
+                            // The type-literal head (the `dynamic` keyword or
+                            // an ungrounded alias spelling) denotes the
+                            // `Type` instance, never a value of the shape.
+                            if self.check_type_literal_receiver(row) {
+                                return;
+                            }
                             let receiver_nullable = match face {
                                 Ty::Record { nullable, .. }
                                 | Ty::Function { nullable, .. } => {
@@ -4454,6 +4479,12 @@ impl<'a> Engine<'a> {
                         }
                         _ => false,
                     };
+                    // The type-literal head (the `dynamic` keyword or an
+                    // ungrounded alias spelling) denotes the `Type`
+                    // instance, never a value of the shape.
+                    if self.check_type_literal_receiver(row) {
+                        return;
+                    }
                     let display = self.render_ty(record);
                     self.check_shape_receiver(row, record, &display, receiver_nullable);
                     return;
@@ -4860,6 +4891,70 @@ impl<'a> Engine<'a> {
     /// miss reports the getter read (the operator's invalid type never
     /// cascades). Mixin `on` constraints and extension `on` types are
     /// invisible to the model, so bodies of those containers record only.
+    /// The type-literal receiver face: a receiver head that spells a TYPE —
+    /// the `dynamic` keyword, `Never`, or an ungrounded type alias (a
+    /// function or record target; upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/ast/ast.dart `TypeLiteral.staticType`) —
+    /// denotes the `Type` INSTANCE, so the member lookup is an instance
+    /// lookup on `Type`: the alias's (or dynamic's) own statics never
+    /// answer, the `Object` face resolves, and a clean miss reports the
+    /// access-intent trio naming `Type` (`Cb.foo` over `typedef Cb = void
+    /// Function()` reports "The getter 'foo' isn't defined for the type
+    /// 'Type'." — the cascade sections' twin, `Receiver::Container`'s gate
+    /// above). A receiver head spelling a variable, field, or getter (a
+    /// VALUE of function/record type — `cb.gone` over a `void Function()`
+    /// formal) keeps the shape face's own display. True when the row was
+    /// answered here.
+    fn check_type_literal_receiver(&mut self, row: &Row) -> bool {
+        let span = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+            .ok()
+            .map(|index| self.member_reads[index].recv_span);
+        let Some(span) = span else {
+            return false;
+        };
+        let start = self.byte_of(span.offset);
+        let end = self.byte_of(span.offset + span.length);
+        let text = self.source.get(start..end).unwrap_or("");
+        let head = self.intern(text);
+        let is_literal = text == "dynamic"
+            || text == "Never"
+            || matches!(
+                self.top_level_decl(head).as_deref(),
+                Some(decl) if decl.kind == MicroKind::TypeAlias
+            );
+        if !is_literal {
+            return false;
+        }
+        if !self.members.object_members.contains(&row.name) && row.name != self.intern("==") {
+            let name_text = self.strings.resolve(row.name);
+            match row.intent {
+                Intent::Invoke => self.emit(
+                    SemanticCode::UndefinedMethod,
+                    row.range,
+                    name_text,
+                    "Type",
+                ),
+                Intent::Read => self.emit(
+                    SemanticCode::UndefinedGetter,
+                    row.range,
+                    name_text,
+                    "Type",
+                ),
+                Intent::Write | Intent::ReadWrite => self.emit(
+                    SemanticCode::UndefinedSetter,
+                    row.range,
+                    name_text,
+                    "Type",
+                ),
+                Intent::Operator(..) => {}
+            }
+        }
+        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+        true
+    }
+
     pub(crate) fn check_instance_member(
         &mut self,
         promotions: &PromotionStaging,
@@ -4872,7 +4967,12 @@ impl<'a> Engine<'a> {
         // the staged receiver row (`receiver_of_type_never`) and the send's
         // dead tail own the face, and `_resolveReceiverWithoutTarget`
         // answers nothing (`f().foo()` reports the receiver pair alone).
+        // A receiver head that SPELLS `Never` is the type literal, not a
+        // `Never`-typed value — its answer is the `Type` instance's face
+        // below (probe 3.13.7: `Never.gone;` reports "The getter 'gone'
+        // isn't defined for the type 'Type'.").
         if matches!(recv, Receiver::Typed { ty, .. } if self.is_never_ty(ty)) {
+            self.check_type_literal_receiver(row);
             return;
         }
         let (container, this_kind) = match recv {
@@ -4934,6 +5034,12 @@ impl<'a> Engine<'a> {
                 Ty::Record { .. } | Ty::Function { .. }
             )
         {
+            // A receiver head that spells the type (an ungrounded alias —
+            // `Cb.foo` over `typedef Cb = void Function()`) is the type
+            // literal's `Type` instance, never a value of the shape.
+            if self.check_type_literal_receiver(row) {
+                return;
+            }
             let folded = self.fold_alias_ty(ty);
             let mut receiver_nullable = match folded {
                 Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
@@ -11590,3 +11696,21 @@ mod tests {
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 }
+
+/// The #3175 pins — the type-literal receiver face on plain member reads:
+/// a receiver head spelling `dynamic`/`Never` or an ungrounded alias
+/// denotes the `Type` instance (the miss trio names `Type`, the `Object`
+/// face resolves), while value receivers of the same shapes keep their own
+/// displays.
+#[cfg(test)]
+#[path = "ticket_3175_tests.rs"]
+mod ticket_3175_tests;
+
+// The #3183 pins — the object-pattern shorthand env's foreign param
+// names: `Circle(area: v)` substitutes `Unit<T>` → `Unit<MetricUnits>`
+// through the declaring unit's `type_param_names` fallback in
+// `object_pattern_binder_ty`, never the raw schema nor the unknown the
+// same-file `container_params` miss used to leak.
+#[cfg(test)]
+#[path = "ticket_3183_tests.rs"]
+mod ticket_3183_tests;

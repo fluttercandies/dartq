@@ -7500,12 +7500,6 @@ impl ParserListener for DiagnoseListener<'_> {
             .pattern_stack
             .last_mut()
             .map_or(Vec::new(), |frame| std::mem::take(&mut frame.fields));
-        if std::env::var_os("DQ_PROBE_OPBT").is_some() {
-            eprintln!("OPBT_CLOSE head={:?} nfields={}", head, fields.len());
-            for f in &fields {
-                eprintln!("  field getter={:?} binder={:?}", f.getter, f.binder);
-            }
-        }
         if let Some(head) = head {
             for field in &fields {
                 if let Some((getter, at)) = field.getter {
