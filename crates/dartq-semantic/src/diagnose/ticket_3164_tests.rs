@@ -37,7 +37,7 @@ fn ticket_3164_binary_left_invocation_anchors_method_name() {
     let diagnostic = &report.diagnostics[0];
     assert_eq!(diagnostic.message, VOID_MSG);
     let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v()").unwrap();
+        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v() + 1").unwrap();
     assert_eq!(diagnostic.range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(diagnostic.range.length, 1, "{:?}", rows(&report));
 }
@@ -118,7 +118,7 @@ fn ticket_3164_negation_operand_fires_void_not_non_bool() {
     let names = code_names(&report);
     assert_eq!(names, ["use_of_void_result"], "{:?}", rows(&report));
     let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v()").unwrap();
+        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v();").unwrap();
     assert_eq!(
         report.diagnostics[0].range.offset as usize, offset,
         "{:?}",
