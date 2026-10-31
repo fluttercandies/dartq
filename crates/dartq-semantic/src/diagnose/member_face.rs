@@ -24,13 +24,15 @@
 //! calls `beginPrimaryConstructor` for every `X(…)`/`X.n(…)` head).
 //!
 //! The token-level mirror: a `final` is a field/super formal's iff it
-//! sits inside a parenthesis and the next two tokens are `this`/`super`
-//! + `.` (`this.x`/`super.x` can appear nowhere else in a formal list);
-//! the primary-constructor suppress is the enclosing paren group's
-//! head spelling `class`/`enum`/`mixin`/`extension` + name (`[.name]`)
-//! — the walk-back over the `(`-preceding `Identifier`/`.` run lands on
-//! the declaration keyword. The `for`/`if-case` head exclusions ride
-//! the same bracket walk as before (a `for`/`if` head holds no formal).
+//! sits inside a parenthesis and the parser's `fieldFormalParameter`
+//! shape follows it — an optional type annotation, then `this`/`super`
+//! + `.` (`final int this.x`, `final Map<String, int> this.m`; the
+//! receiver pair can appear nowhere else in a formal list); the
+//! primary-constructor suppress is the enclosing paren group's head
+//! spelling `class`/`enum`/`mixin`/`extension` + name (`[.name]`) — the
+//! walk-back over the `(`-preceding `Identifier`/`.` run lands on the
+//! declaration keyword. The `for`/`if-case` head exclusions ride the
+//! same bracket walk as before (a `for`/`if` head holds no formal).
 //!
 //! # `missing_required_param`, mirrored
 //!
@@ -86,12 +88,13 @@ struct BracketFrame {
     /// never visited) stay silent.
     formal_list: bool,
     /// The group is a **declaration body** — a class/enum/mixin/extension
-    /// body or the whole-unit top level — where an `Identifier(…)` opens a
-    /// declaration's formal list rather than a statement's call.
-    /// `check_unnecessary_final_parameters` feeds it to
-    /// `formal_list_paren`'s `)`-`;`/`Identifier` ambiguity resolution:
-    /// `class C { C(final this.x); }` (decl body) reports, `void m() {
-    /// g(final this.x); }` (statement body) stays silent.
+    /// body (never a function body, and never the unit's own top level,
+    /// which is a declaration region by having no enclosing group at all) —
+    /// where an `Identifier(…)` opens a declaration's formal list rather
+    /// than a statement's call. `check_unnecessary_final_parameters` feeds
+    /// it to `formal_list_paren`'s `)`-`;`/`Identifier` ambiguity
+    /// resolution: `class C { C(final this.x); }` (decl body) reports,
+    /// `void m() { g(final this.x); }` (statement body) stays silent.
     decl_body: bool,
     /// The group sits inside a primary-constructor declaration head —
     /// the `_inPrimaryConstructorDeclaration` suppress
@@ -103,11 +106,12 @@ struct BracketFrame {
 
 impl Engine<'_> {
     /// The whole-unit `unnecessary_final` pass: every `final` keyword
-    /// token inside a **declaration formal list** whose next two tokens
-    /// spell `this.`/`super.` — the `FieldFormalParameter`/
+    /// token inside a **declaration formal list** that introduces a
+    /// `this.`/`super.` receiver — the `FieldFormalParameter`/
     /// `SuperFormalParameter` gate (best_practices_verifier.dart:1040-1049,
     /// called only from `visitFieldFormalParameter`/`visitSuperFormalParameter`
-    /// :496-504/:902-910). The formal-list reach mirrors the parser: the
+    /// :496-504/:902-910), with the optional type annotation skipped
+    /// (`final int this.x`). The formal-list reach mirrors the parser: the
     /// `final` may sit directly in the `(` or inside its `[`/`{`
     /// optional/named group (`C({required final this.x})`), and stays
     /// silent inside a `Function(…)` type list, a parenthesized
@@ -152,7 +156,7 @@ impl Engine<'_> {
                         // `C([final this.x])`). Inside any other group it
                         // is a body/block, not a formal list.
                         formal_list: parent.is_some_and(|f| f.paren && f.formal_list),
-                        decl_body: self.decl_body_brace(tokens, index, parent),
+                        decl_body: decl_body_brace(tokens, index, parent),
                         primary_ctor: parent.is_some_and(|f| f.primary_ctor),
                     });
                 }
@@ -194,12 +198,12 @@ impl Engine<'_> {
                     // The field/super-formal gate (:1040-1049): the
                     // `final` must introduce `this.x`/`super.x` — the only
                     // formal kinds upstream visits (:496-504/:902-910).
-                    if !matches!(
-                        tokens.get(index + 1).map(|t| t.kind),
-                        Some(TokenKind::Keyword(Keyword::This))
-                            | Some(TokenKind::Keyword(Keyword::Super))
-                    ) || tokens.get(index + 2).map(|t| t.kind) != Some(TokenKind::Period)
-                    {
+                    // The parser's `fieldFormalParameter` shape allows a
+                    // type annotation between them (`final int this.x`,
+                    // `final List<T> this.items`; parser_impl.dart
+                    // `parseFormalParameter` type-atom then the
+                    // `this`/`super` arm), so the gate skips it.
+                    if !self.field_formal_final(tokens, index) {
                         continue;
                     }
                     let span = SourceRange {
@@ -211,6 +215,48 @@ impl Engine<'_> {
                 _ => {}
             }
         }
+    }
+
+    /// Whether the `final` at `index` introduces a **field/super formal** —
+    /// the parser's `fieldFormalParameter` production (`'final'
+    /// finalConstVarOrType? …`, `_fe_analyzer_shared` parser_impl.dart
+    /// `parseFormalParameter`: the type atom, then the `this`/`super` +
+    /// `.` + name arm). A type annotation may sit between the keyword and
+    /// the receiver (`final int this.x`, `final Map<String, int> this.m`,
+    /// `final void Function(int)? this.f`, `final (int, String) this.r`),
+    /// so the scan skips balanced groups of that annotation and stops at
+    /// the first formal boundary: `,` opens the next formal, a closer ends
+    /// the list, `=` starts the default value.
+    fn field_formal_final(&self, tokens: &[dartq_scanner::Token], index: usize) -> bool {
+        let mut cursor = index + 1;
+        while let Some(token) = tokens.get(cursor) {
+            match token.kind {
+                TokenKind::Keyword(Keyword::This) | TokenKind::Keyword(Keyword::Super) => {
+                    return tokens.get(cursor + 1).map(|t| t.kind) == Some(TokenKind::Period);
+                }
+                // Nested groups of a type annotation — a function type's
+                // parameter list, a record type's field list, a `<…>` type
+                // argument list — spell no field formal of their own.
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    match self.tokens.matching_end(cursor) {
+                        Some(end) => cursor = end + 1,
+                        None => return false,
+                    }
+                }
+                TokenKind::Lt => match self.angle_group_end(cursor) {
+                    Some(end) => cursor = end + 1,
+                    None => return false,
+                },
+                TokenKind::Comma
+                | TokenKind::CloseParen
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+                | TokenKind::Semicolon
+                | TokenKind::Eq => return false,
+                _ => cursor += 1,
+            }
+        }
+        false
     }
 
     /// Whether the `(` at `open` opens a **declaration formal list** —
@@ -287,45 +333,6 @@ impl Engine<'_> {
             // `?`, `.`, `in` — can only continue an expression, so the `(`
             // is a parenthesized expression, an argument list, or a record.
             _ => false,
-        }
-    }
-
-    /// Whether the `{`/`[` at `open` opens a **declaration body** — a
-    /// class/enum/mixin/extension body, or the unit's top level. A `{`
-    /// preceded by `)` or `=>` opens a function/method/lambda body (a
-    /// statement context — `Identifier(…)` inside it is a call, not a
-    /// formal list). Top level (no parent frame) is a declaration body.
-    /// A `[` is never a declaration body.
-    fn decl_body_brace(
-        &self,
-        tokens: &[dartq_scanner::Token],
-        open: usize,
-        parent: Option<BracketFrame>,
-    ) -> bool {
-        let Some(parent) = parent else {
-            // Top level: every `Identifier(…)` here is a declaration's
-            // formal list (a `;`-terminated `void f(…);` declares).
-            return tokens[open].kind == TokenKind::OpenCurly;
-        };
-        if tokens[open].kind == TokenKind::OpenSquare {
-            return false;
-        }
-        // A `{` inherits declaration-body context — a `{` inside a class
-        // body is still a declaration region only when it is a nested
-        // declaration's own group; a `{` after `)`/`=>`/`=` is a
-        // function/method body or initializer (a statement region).
-        match tokens.get(open.wrapping_sub(1)).map(|t| t.kind) {
-            // `) {` / `=> {` / `= {` open a function body, a lambda body,
-            // or an initializer — a statement region, never a declaration
-            // body even inside a class.
-            Some(TokenKind::CloseParen | TokenKind::Function | TokenKind::Eq) => false,
-            // Otherwise the `{` continues the enclosing body's role: a
-            // class body's nested `{` is a member's block only after a
-            // formal list — but the formal-list `(` is what reports, so a
-            // `{` not after `)`/`=>`/`=` inside a declaration body stays
-            // a declaration body (a nested `class`/`mixin`/`extension`
-            // body follows a declaration head directly).
-            _ => parent.decl_body,
         }
     }
 
@@ -937,6 +944,45 @@ fn primary_ctor_head(tokens: &[dartq_scanner::Token], open: usize) -> bool {
                 | TokenKind::Keyword(Keyword::Mixin)
                 | TokenKind::Keyword(Keyword::Extension)
         )
+}
+
+/// Whether the `{`/`[` at `open` opens a **declaration body** — the body of
+/// a `class`/`enum`/`mixin`/`extension`/`extension type` declaration, where
+/// an `Identifier(…)` declares a member's formal list. The head walk runs
+/// backward to the nearest `{`/`}`/`;` boundary and asks whether an
+/// introducer keyword sits inside that span (`class C<T> implements I with
+/// M`, `extension type E(int it)`, `enum E`, `augment class C`). A
+/// function, method, getter, setter, constructor, or lambda body (`{` after
+/// `)`, `=>`, `=`, or a non-introducer head such as `int get g`) reaches the
+/// boundary first and stays a statement region — `void f() { g(final
+/// this.x); }` calls, `class C { C(final this.x); }` declares. A `[` is
+/// never a declaration body, and neither is a `{` nested in a statement
+/// region: `void f() { class C { … } }` has no local declaration (the
+/// parser reads that `class` as an identifier and recovers), so its
+/// `Identifier(…)` stays a call.
+fn decl_body_brace(
+    tokens: &[dartq_scanner::Token],
+    open: usize,
+    parent: Option<BracketFrame>,
+) -> bool {
+    if tokens[open].kind == TokenKind::OpenSquare {
+        return false;
+    }
+    if parent.is_some_and(|frame| !frame.decl_body) {
+        return false;
+    }
+    let mut cursor = open;
+    while cursor > 0 {
+        cursor -= 1;
+        match tokens[cursor].kind {
+            TokenKind::OpenCurly | TokenKind::CloseCurly | TokenKind::Semicolon => return false,
+            TokenKind::Keyword(
+                Keyword::Class | Keyword::Enum | Keyword::Mixin | Keyword::Extension,
+            ) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The cooked first quoted string of an annotation argument group
