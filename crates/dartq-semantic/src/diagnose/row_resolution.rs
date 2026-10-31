@@ -11875,3 +11875,14 @@ mod ticket_3186_tests;
 #[cfg(test)]
 #[path = "ticket_3187_tests.rs"]
 mod ticket_3187_tests;
+
+// The #3210 (F1) pins — the aux-file `[]` receiver face in the
+// materialized co19 posture (`expect_common.dart` as a `part of` unit of
+// the `expect` library): the `deepEquals` local functions' index reads
+// resolve (promoted `Map`/`List` face, dynamic sibling) and the
+// empty-display `undefined_operator` cascade stays gone — the '' carrier's
+// production site was removed with #3058; these lock the family silent
+// beside the negative faces (a genuine miss still reports named types).
+#[cfg(test)]
+#[path = "ticket_f1_tests.rs"]
+mod ticket_f1_tests;
