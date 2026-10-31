@@ -3607,6 +3607,16 @@ pub(crate) struct Engine<'a> {
     /// read's own span (`local_hits`), so a member/unknown operand's
     /// staging would never join.
     pub(crate) coalesce_staged: Vec<(SourceRange, SourceRange)>,
+    /// The flow layer's dead intervals (`FlowFact::DeadCode` ranges),
+    /// re-homed for pass 2 before `resolve_rows` runs: a row anchored
+    /// inside one sits in the oracle's dead region, where the official
+    /// `ErrorVerifier` visits the node but the flow marks it dead and the
+    /// non-`dead_code` verification never fires. Only the spans
+    /// `emit_unchecked_nullable` would otherwise report on read through
+    /// this table — the `dead_null_aware_expression` arm stays a live
+    /// face (the official emits it INSIDE the dead window, so it never
+    /// consults the table).
+    pub(crate) dead_windows: Vec<SourceRange>,
     /// The promoted-receiver candidates (#1465): `receiver.member` merges
     /// whose receiver was a bare declared-type read, keyed by the merged
     /// member row's offset and carrying the receiver read's span — the same

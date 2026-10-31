@@ -418,6 +418,7 @@ impl<'a> Engine<'a> {
             null_assert_staged: Vec::new(),
             null_aware_staged: Vec::new(),
             coalesce_staged: Vec::new(),
+            dead_windows: Vec::new(),
             promoted_recv_reads: Vec::new(),
             inferred_formal_containers: FxHashSet::default(),
             inferred_recv_used_members: FxHashSet::default(),
@@ -610,6 +611,21 @@ impl<'a> Engine<'a> {
         ));
     }
 
+    /// Whether `range`'s head sits inside one of the flow layer's dead
+    /// intervals (`FlowFact::DeadCode` ranges re-homed into
+    /// [`Engine::dead_windows`]). The oracle's `ErrorVerifier` visits a
+    /// dead node but the flow marks it dead and the non-`dead_code`
+    /// verification never fires — the diagnostic faces that consult this
+    /// read the oracle's dead-node short-circuit. Containment keys on the
+    /// row's own head: a dead window covers the nodes inside it, and a
+    /// row whose head lands before the window's own anchor is the
+    /// enclosing live statement, never the dead content.
+    pub(crate) fn in_dead_window(&self, range: SourceRange) -> bool {
+        self.dead_windows
+            .iter()
+            .any(|w| range.offset >= w.offset && range.offset < w.end())
+    }
+
     /// `use_of_void_result` on one operand row (upstream
     /// `checkForUseOfVoidResult`, error_detection_helpers.dart:245-258):
     /// the operand's `staticType` is `VoidTypeImpl` and its value is
@@ -667,13 +683,19 @@ impl<'a> Engine<'a> {
     /// operator text for a binary-operator application, the property text
     /// for every other access — with the matching correction
     /// (type_property_resolver.dart:128-148, messages.yaml's four
-    /// shared-name variants).
+    /// shared-name variants). A range inside the flow's dead region
+    /// suppresses: the oracle's `ErrorVerifier` visits the dead node but
+    /// the non-`dead_code` verification never fires there — only the
+    /// `dead_code` row stands (the upstream dead-node short-circuit).
     pub(crate) fn emit_unchecked_nullable(
         &mut self,
         range: SourceRange,
         name: &str,
         kind: UncheckedNullableKind,
     ) {
+        if self.in_dead_window(range) {
+            return;
+        }
         let code = SemanticCode::UncheckedUseOfNullableValue;
         self.report.diagnostics.push(Diagnostic::new(
             code.severity(),
@@ -9506,6 +9528,15 @@ mod ticket_2935_tests;
 #[cfg(test)]
 #[path = "ticket_3164_tests.rs"]
 mod ticket_3164_tests;
+
+/// The #3104 dead-region suppression pins: the flow layer's `DeadCode`
+/// intervals re-home into [`Engine::dead_windows`] before `resolve_rows`,
+/// and `emit_unchecked_nullable` re-decides each candidate against them —
+/// a row anchored inside a dead region reports only `dead_code` upstream.
+/// `#[path]` resolves against this file's directory — `diagnose/`.
+#[cfg(test)]
+#[path = "ticket_3104_tests.rs"]
+mod ticket_3104_tests;
 
 #[cfg(test)]
 mod tests {

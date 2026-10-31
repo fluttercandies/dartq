@@ -1295,9 +1295,16 @@ pub fn fold_unit_with_ops<'t>(
     let mut matched_types: Vec<(SourceRange, Ty)> = Vec::new();
     let mut flow_diagnostics = Vec::new();
     let mut body_rows = Vec::new();
+    // The flow layer's dead intervals: every `DeadCode` fact's range is
+    // one unreachable region — a diagnostic face anchored inside it never
+    // fires upstream (the `ErrorVerifier`'s dead-node short-circuit). The
+    // engine reads the table across pass 2 (`resolve_rows`'s
+    // `unchecked_use_of_nullable_value` arm consults it before reporting).
+    let mut dead_windows: Vec<SourceRange> = Vec::new();
     for fact in &facts {
         match *fact {
             FlowFact::DeadCode { span } => {
+                dead_windows.push(span.range);
                 // The `??` right operand's dedicated row
                 // (`_checkForDeadNullCoalesce`'s
                 // `dead_null_aware_expression`) coexists with the generic
@@ -1598,6 +1605,11 @@ pub fn fold_unit_with_ops<'t>(
         rows: prop_promotions.rows.clone(),
     };
     engine.invalid_type_names = invalid_names.clone();
+    // The flow dead intervals ride into pass 2 beside the read types:
+    // `resolve_rows`'s `unchecked_use_of_nullable_value` arm re-decides
+    // each candidate row against them — a row anchored inside a dead
+    // region reports only `dead_code` upstream.
+    engine.dead_windows = dead_windows;
     engine.resolve_rows(&promotions);
     // The #3005 deferred `is`/`is!` verdicts re-decide now that the flow
     // rows stand: pass-1's `check_type_check` ran before the
