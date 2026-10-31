@@ -1266,6 +1266,19 @@ pub(crate) struct Interp<'o> {
     /// ([`Interp::exec_end`]) for the deferred contexts the recorder
     /// frames no executable for.
     pub(crate) late_init_saved: Vec<Option<State>>,
+    /// Whether the declarator just opened by `InitializedIdent` is a `late`
+    /// LOCAL wildcard (`_`): its initializer is never evaluated, so the
+    /// `dead_code_late_wildcard_variable_initializer` row reports there
+    /// (`DeadCodeVerifier.visitVariableDeclaration`, upstream
+    /// dead_code_verifier.dart:119-135 — a reachability-independent
+    /// report). Consumed by the next `InitializerBegin` and cleared by a
+    /// declarator without an initializer.
+    pub(crate) wildcard_late_decl: bool,
+    /// Open initializers' `InitializerBegin` event indices for the
+    /// wildcard face above (one per `InitializerBegin`, `None` for every
+    /// non-wildcard pair so a nested declaration pops without emitting —
+    /// the `late_init_saved` pairing).
+    pub(crate) wildcard_init_begin: Vec<Option<usize>>,
     pub(crate) pattern: Option<PatternState>,
     pub(crate) pattern_depth: usize,
     /// The open logical-or alternation's latch (depth-1 refutable
@@ -1648,6 +1661,8 @@ impl<'o> Interp<'o> {
             pending_writes: Vec::new(),
             pending_inits: Vec::new(),
             late_init_saved: Vec::new(),
+            wildcard_late_decl: false,
+            wildcard_init_begin: Vec::new(),
             pending_decl_bases: Vec::new(),
             pattern: None,
             pattern_depth: 0,
