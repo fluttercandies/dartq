@@ -308,9 +308,17 @@ pub enum Ev {
     },
     CaseEnd {
         statement_count: usize,
+        /// How many `case` heads the member carries (0 = a default-headed
+        /// member): the parser folds every head of one body-sharing group
+        /// into a single member (`case A: case B: default: <body>`), so a
+        /// merged member's `default` head ships no event of its own and its
+        /// member row is due at the clause end
+        /// (`Interp::report_merged_default_head`).
+        expression_count: usize,
         /// The group's `default` keyword, when its heads include one: the
         /// next group's opening consumes it (the dead first-default face,
-        /// probe table G rule 2).
+        /// probe table G rule 2), and a merged member rows its own keyword
+        /// from it.
         default_kw: Option<TokenSpan>,
     },
     SwitchEnd,

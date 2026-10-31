@@ -435,6 +435,12 @@ pub(crate) enum Frame {
         /// group's opening consumes it — the chain marks unreachable, and a
         /// case-headed opener reports the default's keyword row.
         dead_default: Option<(TokenSpan, bool)>,
+        /// The `default` head whose keyword row is already accounted for
+        /// (the opener's deferral, the default-headed member's own head
+        /// check, or the merged member's clause end): a later member
+        /// inherits the same `default_kw` from the parser and must not
+        /// re-row it.
+        default_row: Option<u32>,
         /// The switch's enclosing state was reachable at `SwitchExprBegin`:
         /// an arm entering dead under it owns its row; an arm dead under a
         /// dead parent inherits and folds (upstream `flowEnd(case_)` early-

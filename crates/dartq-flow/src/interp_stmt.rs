@@ -712,6 +712,7 @@ impl Interp<'_> {
                     group_combined: None,
                     body_depth: None,
                     dead_default: None,
+                    default_row: None,
                     arm_dead_entry: false,
                     parent_live: self.reachable(),
                     reported_kw: None,
@@ -834,6 +835,7 @@ impl Interp<'_> {
             | Ev::NoInitializer
             | Ev::EmptyBody => {}
             Ev::CaseEnd {
+                expression_count,
                 default_kw,
                 statement_count: _,
             } => {
@@ -845,10 +847,18 @@ impl Interp<'_> {
                 // head-time member row already fired is latched reported so
                 // the group close never re-reports it.
                 if let Some(frame_index) = self.switch_frame() {
+                    // A merged member's trailing `default` head ships no
+                    // head event of its own, so its keyword row is due at
+                    // the clause end.
+                    self.report_merged_default_head(frame_index, *expression_count, *default_kw);
                     let reported = match &self.stack[frame_index] {
-                        Frame::Switch { reported_kw, .. } => reported_kw.is_some_and(|offset| {
-                            default_kw.is_some_and(|kw| kw.range.offset == offset)
-                        }),
+                        Frame::Switch { reported_kw, default_row, .. } => {
+                            default_kw.is_some_and(|kw| {
+                                let offset = kw.range.offset;
+                                reported_kw.is_some_and(|kw_offset| kw_offset == offset)
+                                    || *default_row == Some(offset)
+                            })
+                        }
                         _ => false,
                     };
                     if let Frame::Switch { dead_default, .. } = &mut self.stack[frame_index] {
@@ -923,6 +933,7 @@ impl Interp<'_> {
                     group_combined: None,
                     body_depth: None,
                     dead_default: None,
+                    default_row: None,
                     arm_dead_entry: false,
                     parent_live: self.reachable(),
                     reported_kw: None,
@@ -1919,6 +1930,63 @@ impl Interp<'_> {
         }
     }
 
+    /// The merged member's `default` head row (`case A: case B: default:
+    /// <body>`): the parser folds every head that shares one body into a
+    /// single member, so no head event ever names the trailing `default`
+    /// and its member row has no other observable point. The official
+    /// driver visits each head with `switchStatement_beginAlternative` ->
+    /// `handleSwitchBeforeAlternative` -> (`handleDefault`, whose
+    /// `flowEnd(member)` reports at `node.keyword`) before the shared body
+    /// runs (upstream Dart SDK source, type_analyzer.dart:2253-2272;
+    /// dead_code_verifier.dart:237-246), and the clause's chain after its
+    /// case heads IS that head's entry state.
+    ///
+    /// The row stands only where the official interval does: an enclosing
+    /// dead region anchored at or before the head keeps ownership (the
+    /// official `checkUnreachableNode` ignores a later unreachable node),
+    /// while an interval already open after the keyword is the head's own
+    /// body — the official head-time row precedes it, so both stand. A
+    /// default-headed member (`expression_count == 0`) ran its head check
+    /// in the `CaseBegin` arm already.
+    fn report_merged_default_head(
+        &mut self,
+        frame_index: usize,
+        expression_count: usize,
+        default_kw: Option<TokenSpan>,
+    ) {
+        if expression_count == 0 {
+            return;
+        }
+        let Some(kw) = default_kw else {
+            return;
+        };
+        let offset = kw.range.offset;
+        let dead = match &self.stack[frame_index] {
+            Frame::Switch { unmatched, .. } => !self.reach.overall_reachable(unmatched.reach),
+            _ => return,
+        };
+        // An inherited `default_kw` (a `default` head of an earlier member,
+        // which the parser keeps carrying) was already accounted for.
+        let handled = match &self.stack[frame_index] {
+            Frame::Switch { default_row, .. } => *default_row == Some(offset),
+            _ => return,
+        };
+        if !dead
+            || handled
+            || self
+                .dead
+                .as_ref()
+                .is_some_and(|window| window.anchor_span().range.offset <= offset)
+        {
+            return;
+        }
+        self.emit(FlowFact::DeadCode { span: kw });
+        if let Frame::Switch { reported_kw, default_row, .. } = &mut self.stack[frame_index] {
+            *reported_kw = Some(offset);
+            *default_row = Some(offset);
+        }
+    }
+
     /// Consumes the previous group's latched `default` at the next group's
     /// opening: the chain's unmatched state goes unreachable (the
     /// default's alternative ends with a true guard and no pattern —
@@ -1936,8 +2004,9 @@ impl Interp<'_> {
         let Some((kw, reported)) = latched else {
             return;
         };
-        if let Frame::Switch { unmatched, .. } = &mut self.stack[frame_index] {
+        if let Frame::Switch { unmatched, default_row, .. } = &mut self.stack[frame_index] {
             *unmatched = unmatched.clone().set_unreachable(&mut self.reach);
+            *default_row = Some(kw.range.offset);
         }
         if case_opener && !reported {
             self.emit(FlowFact::DeadCode { span: kw });

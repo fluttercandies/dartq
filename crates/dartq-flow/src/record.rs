@@ -2708,7 +2708,7 @@ impl ParserListener for Flow<'_> {
     fn end_switch_case(
         &mut self,
         _label_count: usize,
-        _expression_count: usize,
+        expression_count: usize,
         default_kw: Option<Token>,
         _colon_after_default: Option<Token>,
         statement_count: usize,
@@ -2717,6 +2717,10 @@ impl ParserListener for Flow<'_> {
     ) {
         self.record(Ev::CaseEnd {
             statement_count,
+            // The merged member's `default` head row needs this: a member
+            // with case heads ships no head event for its trailing
+            // `default` (see `Ev::CaseEnd`).
+            expression_count,
             default_kw,
         });
     }

@@ -2934,6 +2934,7 @@ fn switch_statement_default_exhaustive_tail_dead() {
         },
         Ev::CaseEnd {
             statement_count: 1,
+            expression_count: 1,
             default_kw: None,
         },
         // `default:` — no case-expression events; the group opens at once.
@@ -2948,6 +2949,7 @@ fn switch_statement_default_exhaustive_tail_dead() {
         },
         Ev::CaseEnd {
             statement_count: 1,
+            expression_count: 0,
             default_kw: Some(span(5)),
         },
         Ev::SwitchBlockEnd,
