@@ -7181,27 +7181,23 @@ impl<'a> Engine<'a> {
             .iter()
             .rposition(|row| matches!(row.intent, Intent::Operator(o, _) if o == op));
         if left_index.is_none() {
-            // The statically-`bool` operators carry no mark
-            // (`mark_operator` only tags `USER_OPERATORS`) — the left
-            // operand is then the last row wholly before the operator: an
-            // interpolated-string right operand's inner reads end after
-            // the operator and never qualify. Without the fold the right
-            // operand stays on top and downstream type reads (`var`/
-            // `final` inference, `return`, enclosing conditions) see ITS
-            // type instead of `bool` — `flag = s == path` inferred the
-            // right operand's type and `if (x == '$a')` fired
-            // `non_bool_condition` on the literal row.
-            let bool_op = op == self.intern("==")
-                || op == self.intern("!=")
-                || op == self.intern("&&")
-                || op == self.intern("||")
-                || op == self.intern("<")
-                || op == self.intern(">")
-                || op == self.intern("<=")
-                || op == self.intern(">=");
-            if !bool_op {
-                return;
-            }
+            // No mark. Two shapes own one: the statically-`bool`
+            // operators (`mark_operator` only tags `USER_OPERATORS`), and
+            // an INVOKED left operand (`v() + 1`, `a.b() * 2`, `a[0] + 1`)
+            // whose row keeps `Intent::Invoke`/`Intent::Operator` — the
+            // mark's `Read` gate skips it, yet the oracle's operand check
+            // carries no operator whitelist at all (error_verifier.dart
+            // `visitBinaryOperatorInvocation` runs
+            // `checkForUseOfVoidResult(node.leftOperand)` for every
+            // binary). The left operand is then the last row wholly before
+            // the operator: an interpolated-string right operand's inner
+            // reads end after the operator and never qualify. Without the
+            // fold the right operand stays on top and downstream type
+            // reads (`var`/`final` inference, `return`, enclosing
+            // conditions) see ITS type instead of the node's —
+            // `flag = s == path` inferred the right operand's type,
+            // `if (x == '$a')` fired `non_bool_condition` on the literal
+            // row, and `v() + 1` never reached the void-operand verdict.
             left_index = self.rows.iter().rposition(|row| {
                 !matches!(row.shape, RowShape::TypeUse(..)) && row.range.end() <= op_range.offset
             });

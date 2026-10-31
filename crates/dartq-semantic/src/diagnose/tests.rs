@@ -17547,6 +17547,18 @@ mod ticket_3219_tests;
 #[path = "ticket_3224_tests.rs"]
 mod ticket_3224_tests;
 
+// The #3234 pins (`fold_binary`'s operand locator only accepted
+// `mark_operator`'s `Read`-gated mark, so a `void` invocation used as a
+// non-relation binary operand — `v() + 1` — never reached the void check;
+// the locator now falls back to the last row wholly before the operator
+// for every spelling). Registered here because `diagnose.rs` is a
+// live-lane file out of this ticket's write scope; `#[path]` keeps the
+// module inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3234_tests.rs"]
+mod ticket_3234_tests;
+
 // The #3229 pins (Cluster A of the undefined_* family — a wildcard `_`
 // local-scope declaration binds nothing under `wildcard-variables`, gated
 // across every frame-scope population surface in `scopes_bodies.rs`, with
