@@ -461,6 +461,10 @@ pub(crate) mod prefer_collection_literals {
     /// Residual (documented): a cross-file unit-declared `Map`/`Set`
     /// shadowing the core spelling stays outside a same-file scan — the
     /// official's static type silences it, this face does not see it.
+    /// Corpus parity: every one of the 54 official case shapes (the 49
+    /// reflective tests plus the five `messages.yaml` doc examples) is
+    /// pinned by emit count in
+    /// [`tests::collection_literals_corpus_parity`].
     /// Message: `diagnostic.g.dart` `preferCollectionLiterals`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "prefer_collection_literals",
@@ -3118,6 +3122,82 @@ mod tests {
 
         let f = Fixture::parse("void f(List<int> x) { x.toSet(); x[0].toSet(); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+    }
+
+    /// The corpus parity table: every shape of
+    /// `test/rules/prefer_collection_literals_test.dart` (the reflective
+    /// tests plus the five `messages.yaml` doc examples) with the official
+    /// emit count. Each row is the upstream body verbatim; the count is the
+    /// oracle's `prefer_collection_literals` rows for that case. An arm
+    /// change that shifts any row's verdict fails here with the row name.
+    #[test]
+    fn collection_literals_corpus_parity() {
+        const IMP: &str = "import 'dart:collection';\n";
+        let cases: &[(&str, String, usize)] = &[
+            ("test_assignment", format!("{IMP}void f(LinkedHashSet<int> s) {{\n  s = LinkedHashSet();\n}}\n"), 0),
+            ("test_assignment_withCascade", format!("{IMP}void f(LinkedHashSet<int> s) {{\n  s = LinkedHashSet()..addAll([1, 2, 3]);\n}}\n"), 0),
+            ("test_assignment_withParentheses", format!("{IMP}void f(LinkedHashSet<int> s) {{\n  s = ((LinkedHashSet()));\n}}\n"), 0),
+            ("test_closure_returns_linkedHashSet", format!("{IMP}void a(Set<int> Function() f) {{}}\n\nvoid c() {{\n  a(() => LinkedHashSet<int>());\n}}\n"), 1),
+            ("test_conditionalLeft", format!("{IMP}void f(LinkedHashMap<int, int> a, LinkedHashMap<int, int> b) {{\n  a = (1 == 2) ? LinkedHashMap() : b;\n}}\n"), 0),
+            ("test_conditionalRight", format!("{IMP}void f(LinkedHashMap<int, int> a, LinkedHashMap<int, int> b) {{\n  a = (1 == 2) ? b : LinkedHashMap();\n}}\n"), 0),
+            ("test_constructorInitializer", format!("{IMP}class Foo {{\n  LinkedHashMap<int, double> a;\n  Foo() : a = LinkedHashMap();\n}}\n"), 0),
+            ("test_functionExpression_functionDeclaration", format!("{IMP}LinkedHashMap<int, int> f() => LinkedHashMap();\n"), 0),
+            ("test_functionExpression_methodDeclaration", format!("{IMP}class C {{\n  LinkedHashMap<int, int> f() => LinkedHashMap();\n}}\n"), 0),
+            ("test_functionExpression_omittedReturnType", format!("{IMP}f() => LinkedHashMap();\n"), 1),
+            ("test_iterable_emptyConstructor_iterableDeclaration", "void f() {\n  Iterable x = Iterable.empty();\n}\n".to_owned(), 0),
+            ("test_linkedHashMap_unnamedConstructor", format!("{IMP}void f() {{\n  LinkedHashMap();\n}}\n"), 1),
+            ("test_linkedHashMap_unnamedConstructor_linkedHashMapParameterType", format!("{IMP}void f() {{\n  g(LinkedHashMap<int, int>());\n}}\nvoid g(LinkedHashMap<int, int> p) {{}}\n"), 0),
+            ("test_linkedHashMap_unnamedConstructor_mapParameterType", format!("{IMP}void f() {{\n  g(LinkedHashMap<int, int>());\n}}\nvoid g(Map<int, int> p) {{}}\n"), 1),
+            ("test_linkedHashSetParameter_named_type_required", format!("{IMP}class Foo {{}}\n\nvoid a({{required LinkedHashSet<Foo> some}}) {{}}\n\nvoid c() {{\n  a(some: LinkedHashSet<Foo>());\n}}\n"), 0),
+            ("test_linkedHashSetParameter_named_type_unrequired", format!("{IMP}class Foo {{}}\n\nvoid a({{required Set<Foo> some}}) {{}}\n\nvoid c() {{\n  a(some: LinkedHashSet<Foo>());\n}}\n"), 1),
+            ("test_linkedHashSetParameter_type_required", format!("{IMP}class Foo {{}}\n\nvoid b(LinkedHashSet<Foo> some) {{}}\n\nvoid c() {{\n  b(LinkedHashSet());\n}}\n"), 0),
+            ("test_linkedHashSetParameter_type_unrequired", format!("{IMP}class Foo {{}}\n\nvoid b(Set<Foo> some) {{}}\n\nvoid c() {{\n  b(LinkedHashSet<Foo>());\n}}\n"), 1),
+            ("test_linkedHashSet_fromConstructor", format!("{IMP}void f() {{\n  LinkedHashSet.from(['foo', 'bar', 'baz']);\n}}\n"), 1),
+            ("test_linkedHashSet_fromConstructor_linkedHashSetDeclaration", format!("{IMP}void f() {{\n  LinkedHashSet<int> x = LinkedHashSet.from([1, 2, 3]);\n}}\n"), 0),
+            ("test_linkedHashSet_fromConstructor_setDeclaration", format!("{IMP}void f() {{\n  Set<int> x = LinkedHashSet.from([1, 2, 3]);\n}}\n"), 1),
+            ("test_linkedHashSet_ofConstructor", format!("{IMP}void f() {{\n  LinkedHashSet.of(['foo', 'bar', 'baz']);\n}}\n"), 1),
+            ("test_linkedHashSet_unnamedConstructor", format!("{IMP}void f() {{\n  LinkedHashSet();\n}}\n"), 1),
+            ("test_linkedHashSet_unnamedConstructor_hashSetParameterType", format!("{IMP}void f() {{\n  g(LinkedHashSet<int>());\n}}\nvoid g(LinkedHashSet<int> p) {{}}\n"), 0),
+            ("test_linkedHashSet_unnamedConstructor_linkedHashSetDeclaration", format!("{IMP}void f() {{\n  LinkedHashSet<int> x = LinkedHashSet<int>();\n}}\n"), 0),
+            ("test_linkedHashSet_unnamedConstructor_moreArgs", format!("{IMP}void f() {{\n  LinkedHashSet(equals: (a, b) => false, hashCode: (o) => 13)\n    ..addAll({{}});\n}}\n"), 0),
+            ("test_linkedHashSet_unnamedConstructor_setDeclaration", format!("{IMP}void f() {{\n  Set<int> x = LinkedHashSet<int>();\n}}\n"), 1),
+            ("test_listLiteral", "void f() {\n  [];\n}\n".to_owned(), 0),
+            ("test_listLiteral_toSet", "void f() {\n  ['foo', 'bar', 'baz'].toSet();\n}\n".to_owned(), 1),
+            ("test_list_filledConstructor", "void f() {\n  List.filled(5, true);\n}\n".to_owned(), 0),
+            ("test_mapLiteral", "void f() {\n  var x = {};\n}\n".to_owned(), 0),
+            ("test_map_identityConstructor", "void f() {\n  Map.identity();\n}\n".to_owned(), 0),
+            ("test_map_unmodifiableConstructor", "void f() {\n  Map.unmodifiable({});\n}\n".to_owned(), 0),
+            ("test_map_unnamedConstructor", "void f() {\n  Map();\n}\n".to_owned(), 1),
+            ("test_returnStatement_async", format!("{IMP}Future<LinkedHashSet<int>> f() async {{\n  return LinkedHashSet();\n}}\n"), 0),
+            ("test_returnStatement_asyncStar", format!("{IMP}Stream<LinkedHashSet<int>> f() async* {{\n  yield LinkedHashSet();\n}}\n"), 0),
+            ("test_returnStatement_functionDeclaration", format!("{IMP}LinkedHashSet<int> f() {{\n  return LinkedHashSet();\n}}\n"), 0),
+            ("test_returnStatement_functionExpression", format!("{IMP}void f() {{\n  g(() {{\n    return LinkedHashSet();\n  }});\n}}\n\nvoid g(LinkedHashSet<int> Function()) {{}}\n"), 0),
+            ("test_returnStatement_methodDeclaration", format!("{IMP}class C {{\n  LinkedHashSet<int> f() {{\n    return LinkedHashSet();\n  }}\n}}\n"), 0),
+            ("test_returnStatement_syncStar", format!("{IMP}Iterable<LinkedHashSet<int>> f() sync* {{\n  yield LinkedHashSet();\n}}\n"), 0),
+            ("test_set_fromConstructor", "void f() {\n  Set.from(['foo', 'bar', 'baz']);\n}\n".to_owned(), 1),
+            ("test_set_fromConstructor_withTypeArgs", "void f() {\n  Set<int>.from([]);\n}\n".to_owned(), 1),
+            ("test_set_identityConstructor", "void f() {\n  Set.identity();\n}\n".to_owned(), 0),
+            ("test_set_ofConstructor", "void f() {\n  Set.of(['foo', 'bar', 'baz']);\n}\n".to_owned(), 1),
+            ("test_set_unnamedConstructor", "void f() {\n  Set();\n}\n".to_owned(), 1),
+            ("test_set_unnamedConstructor_objectParameterType", "void f() {\n  g(Set());\n}\nvoid g(Object p) {}\n".to_owned(), 1),
+            ("test_set_unnamedContsructor_explicitTypeArgs", "void f() {\n  Set<int>();\n}\n".to_owned(), 1),
+            ("test_typedefConstruction", "typedef MyMap = Map<int, int>;\n\nvar x = MyMap();\n".to_owned(), 0),
+            ("test_undefinedFunction", format!("{IMP}void f() {{\n  printUnresolved(LinkedHashSet<int>());\n}}\n"), 0),
+            ("doc_bad_0", "var m = Map<String, String>();\n".to_owned(), 1),
+            ("doc_bad_1", "var addresses = Map<String, String>();\nvar uniqueNames = Set<String>();\nvar ids = LinkedHashSet<int>();\nvar coordinates = LinkedHashMap<int, int>();\n".to_owned(), 2),
+            ("doc_good_0", "var m = <String, String>{};\n".to_owned(), 0),
+            ("doc_good_1", "var addresses = <String, String>{};\nvar uniqueNames = <String>{};\nvar ids = <int>{};\nvar coordinates = <int, int>{};\n".to_owned(), 0),
+            ("doc_good_2", "void main() {\n  LinkedHashSet<int> linkedHashSet =  LinkedHashSet.from([1, 2, 3]);\n  LinkedHashMap linkedHashMap = LinkedHashMap();\n\n  printSet(LinkedHashSet<int>());\n  printHashSet(LinkedHashSet<int>());\n\n  printMap(LinkedHashMap<int, int>());\n  printHashMap(LinkedHashMap<int, int>());\n}\n\nvoid printSet(Set<int> ids) => print('$ids!');\nvoid printHashSet(LinkedHashSet<int> ids) => printSet(ids);\nvoid printMap(Map map) => print('$map!');\nvoid printHashMap(LinkedHashMap map) => printMap(map);\n".to_owned(), 0),
+        ];
+        let mut bad = Vec::new();
+        for (name, src, want) in cases {
+            let f = Fixture::parse(src);
+            let got = f.run(&one_rule("prefer_collection_literals"));
+            if got.len() != *want {
+                bad.push(format!("{name}: want {want}, got {} {got:?}", got.len()));
+            }
+        }
+        assert!(bad.is_empty(), "corpus mismatch:\n{}", bad.join("\n"));
     }
 
     // —— unnecessary_to_list_in_spreads ————————————————————————————————————
