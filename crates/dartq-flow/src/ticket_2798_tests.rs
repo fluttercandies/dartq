@@ -122,7 +122,10 @@ fn a3_never_operand_is_check_anchors_dead_row_at_tested_type() {
     // engine resolves a call's type to Never, so the parser pipeline
     // alone cannot build this buffer.
     let events: Vec<Ev> = [
-        vec![Ev::ExecBegin { is_closure: false }, Ev::BlockBodyBegin],
+        vec![
+            Ev::ExecBegin { is_closure: false },
+            Ev::BlockBodyBegin { span: tspan(9) },
+        ],
         vec![
             // `neverFn()` — its type resolves to Never, the engine
             // records the exit at the call's end (offset 19).
@@ -144,7 +147,10 @@ fn a3_never_operand_is_check_anchors_dead_row_at_tested_type() {
             Ev::StmtEnd { end: 28 },
         ],
         vec![
-            Ev::BlockBodyEnd,
+            Ev::BlockBodyEnd {
+                begin: tspan(9),
+                end: 31,
+            },
             Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(30),

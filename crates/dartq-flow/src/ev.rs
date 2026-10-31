@@ -35,8 +35,13 @@ pub enum Ev {
         is_expr: bool,
         end: TokenSpan,
     },
-    BlockBodyBegin,
-    BlockBodyEnd,
+    /// A block function body's `{` (named members: functions, methods,
+    /// constructors, accessors — closure bodies frame through their own
+    /// `ExecBegin`). `span`: the body's `{` token.
+    BlockBodyBegin { span: TokenSpan },
+    /// The body's `}`: `begin` repeats the `{` token (the body-anchored-row
+    /// check), `end` is the `}` token's end offset.
+    BlockBodyEnd { begin: TokenSpan, end: u32 },
     /// `=>` body: consumes the body's value; the function's own value for
     /// the consumer is netted at `ExecEnd { is_expr: true }`.
     ExprBody,

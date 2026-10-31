@@ -813,8 +813,6 @@ impl Interp<'_> {
             Ev::SwitchEnd
             | Ev::CaseNoWhen
             | Ev::NoInitializer
-            | Ev::BlockBodyBegin
-            | Ev::BlockBodyEnd
             | Ev::EmptyBody => {}
             Ev::CaseEnd {
                 default_kw,
@@ -1630,11 +1628,21 @@ impl Interp<'_> {
                 // oracle-probed); a live branch's poll is a no-op (the
                 // reachability gate), and non-empty blocks keep the
                 // pre-existing poll.
+                let empty = matches!(events.get(i + 1), Some(Ev::EndBlock { .. }));
                 if matches!(kind, BlockKind::Statement)
                     && (!matches!(self.stack.last(), Some(Frame::If { .. }))
-                        || !matches!(events.get(i + 1), Some(Ev::EndBlock { .. }))
+                        || !empty
                         || self.if_branch_folded)
                 {
+                    self.dead_code(*span);
+                }
+                // An anonymous method's block body is a polled node too
+                // (official `visitBlockFunctionBody`'s
+                // `checkUnreachableNode`; named members' bodies frame through
+                // the dedicated `BlockBodyBegin`/`BlockBodyEnd` events): a
+                // dead one anchors at the block, whose span already carries
+                // the full `{ ... }` extent, `}` included.
+                if matches!(kind, BlockKind::FunctionBody) && !empty {
                     self.dead_code(*span);
                 }
                 self.push_scope();
@@ -1689,6 +1697,32 @@ impl Interp<'_> {
                     }
                     self.stack.pop();
                     self.scopes.truncate(scopes_base);
+                }
+            }
+            Ev::BlockBodyBegin { span } => {
+                // A function body is itself a polled node (official
+                // `visitBlockFunctionBody`'s `checkUnreachableNode`): a body
+                // the walk enters dead — a constructor after a throwing
+                // initializer — anchors its row at the body's `{`, and the
+                // covering executable close reports the body's full extent,
+                // `}` included (the covering `flowEnd(constructor)` applies
+                // no last-statement trim). An unreachable EMPTY body stays
+                // silent (dead_code_verifier.dart:252-256: a
+                // `BlockFunctionBody` firstDeadNode with an empty block is
+                // exempt).
+                let empty = matches!(events.get(i + 1), Some(Ev::BlockBodyEnd { .. }));
+                if !empty {
+                    self.dead_code(*span);
+                }
+            }
+            Ev::BlockBodyEnd { begin, end } => {
+                // Only a body-anchored interval widens to the `}`: a body
+                // entered live keeps its statement-anchored tail, trimmed to
+                // the last dead statement (`}` excluded).
+                if let Some(window) = &mut self.dead
+                    && window.anchor_at(begin.range.offset)
+                {
+                    window.extend(*end);
                 }
             }
             _ => return false,

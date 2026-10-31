@@ -616,7 +616,7 @@ fn never_typed_subexpression_exit_kills_the_rest() {
     let events: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
-            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::BlockBodyBegin { span: tspan(9) },
         ],
         // `never();` — the call's type resolves to Never.
         vec![
@@ -632,7 +632,10 @@ fn never_typed_subexpression_exit_kills_the_rest() {
             crate::ev::Ev::StmtEnd { end: 22 },
         ],
         vec![
-            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::BlockBodyEnd {
+                begin: tspan(9),
+                end: 24,
+            },
             crate::ev::Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(24),
@@ -694,7 +697,7 @@ fn dead_cast_tail_owns_the_initializer_row() {
     let events: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
-            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::BlockBodyBegin { span: tspan(12) },
         ],
         vec![
             crate::ev::Ev::VarDeclBegin {
@@ -719,7 +722,10 @@ fn dead_cast_tail_owns_the_initializer_row() {
             crate::ev::Ev::StmtEnd { end: 33 },
         ],
         vec![
-            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::BlockBodyEnd {
+                begin: tspan(12),
+                end: 35,
+            },
             crate::ev::Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(34),
@@ -771,7 +777,7 @@ fn dead_cast_tail_owns_the_initializer_row() {
     let nested: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
-            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::BlockBodyBegin { span: tspan(12) },
             crate::ev::Ev::VarDeclBegin {
                 late: false,
                 is_final: false,
@@ -803,7 +809,10 @@ fn dead_cast_tail_owns_the_initializer_row() {
             crate::ev::Ev::InitializerEnd,
             crate::ev::Ev::VarDeclEnd,
             crate::ev::Ev::StmtEnd { end: 33 },
-            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::BlockBodyEnd {
+                begin: tspan(12),
+                end: 36,
+            },
             crate::ev::Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(36),
@@ -4051,7 +4060,7 @@ fn never_call_in_body_kills_the_updaters_not_the_tail() {
     let events: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
-            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::BlockBodyBegin { span: tspan(9) },
             crate::ev::Ev::ForBegin { span: tspan(11) },
         ],
         // Condition `c;`.
@@ -4096,7 +4105,10 @@ fn never_call_in_body_kills_the_updaters_not_the_tail() {
             crate::ev::Ev::OtherExpr { span: tspan(38) },
         ],
         vec![
-            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::BlockBodyEnd {
+                begin: tspan(9),
+                end: 42,
+            },
             crate::ev::Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(41),
@@ -4150,7 +4162,7 @@ fn never_call_exit_folds_through_the_covering_statements() {
     let events: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
-            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::BlockBodyBegin { span: tspan(9) },
         ],
         // `boom();` — the call's type resolves to Never. The wrapper events
         // follow the expression's (statements.rs fires
@@ -4179,7 +4191,10 @@ fn never_call_exit_folds_through_the_covering_statements() {
             crate::ev::Ev::StmtEnd { end: 31 },
         ],
         vec![
-            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::BlockBodyEnd {
+                begin: tspan(9),
+                end: 33,
+            },
             crate::ev::Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(32),
@@ -4232,7 +4247,7 @@ fn never_call_exit_inside_arguments_keeps_the_stack() {
     let events: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
-            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::BlockBodyBegin { span: tspan(9) },
         ],
         // `g(boom());` — the argument's type resolves to Never. The wrapper
         // events follow the send's (statements.rs fires
@@ -4257,7 +4272,10 @@ fn never_call_exit_inside_arguments_keeps_the_stack() {
             crate::ev::Ev::StmtEnd { end: 24 },
         ],
         vec![
-            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::BlockBodyEnd {
+                begin: tspan(9),
+                end: 26,
+            },
             crate::ev::Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(25),
@@ -6781,7 +6799,10 @@ fn never_exit_in_then_arm_does_not_dead_post_join_throw() {
     use crate::facts::FlowFact;
     // `void g(bool c) { if (c) { boom(); } throw 'end'; }`
     let events: Vec<Ev> = [
-        vec![Ev::ExecBegin { is_closure: false }, Ev::BlockBodyBegin],
+        vec![
+            Ev::ExecBegin { is_closure: false },
+            Ev::BlockBodyBegin { span: tspan(15) },
+        ],
         vec![Ev::IfBegin { span: tspan(17) }],
         vec![Ev::OtherExpr { span: tspan(21) }],
         vec![
@@ -6810,7 +6831,10 @@ fn never_exit_in_then_arm_does_not_dead_post_join_throw() {
             Ev::StmtEnd { end: 47 },
         ],
         vec![
-            Ev::BlockBodyEnd,
+            Ev::BlockBodyEnd {
+                begin: tspan(15),
+                end: 49,
+            },
             Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(48),
@@ -6837,7 +6861,10 @@ fn never_exit_still_anchors_the_next_statement() {
     use crate::facts::FlowFact;
     // `void g() { boom(); print('x'); }`
     let events: Vec<Ev> = [
-        vec![Ev::ExecBegin { is_closure: false }, Ev::BlockBodyBegin],
+        vec![
+            Ev::ExecBegin { is_closure: false },
+            Ev::BlockBodyBegin { span: tspan(9) },
+        ],
         vec![
             Ev::OtherExpr { span: tspan(12) },
             Ev::Exit { end: tspan(17) },
@@ -6850,7 +6877,10 @@ fn never_exit_still_anchors_the_next_statement() {
             Ev::StmtEnd { end: 30 },
         ],
         vec![
-            Ev::BlockBodyEnd,
+            Ev::BlockBodyEnd {
+                begin: tspan(9),
+                end: 32,
+            },
             Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(31),

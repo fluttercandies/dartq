@@ -862,8 +862,8 @@ impl GapPass {
             // jump sub-event markers whose state moves at their End events,
             // and expression wrappers whose operands fold at their End
             // events.
-            Ev::BlockBodyBegin
-            | Ev::BlockBodyEnd
+            Ev::BlockBodyBegin { .. }
+            | Ev::BlockBodyEnd { .. }
             | Ev::AsyncModifier { .. }
             | Ev::EmptyBody
             | Ev::StmtEnd { .. }

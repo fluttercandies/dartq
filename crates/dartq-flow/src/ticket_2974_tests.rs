@@ -76,7 +76,7 @@ fn dead_ranges(events: &[Ev]) -> Vec<(u32, u32)> {
 fn dead_generic_instantiation_callee_anchors_at_paren() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(17) },
         // `x` at 19 — a `Never` local read: the exit lands at its end
         // (20), every later node dead.
         read(19),
@@ -102,7 +102,10 @@ fn dead_generic_instantiation_callee_anchors_at_paren() {
         },
         Ev::ExprStmt { span: tspan(19) },
         Ev::StmtEnd { end: 33 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(17),
+            end: 36,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(35),
@@ -118,7 +121,7 @@ fn dead_generic_instantiation_callee_anchors_at_paren() {
 fn dead_parenthesized_callee_anchors_at_paren() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(9) },
         Ev::ParenBegin,
         read(11),
         Ev::ParenEnd,
@@ -133,7 +136,10 @@ fn dead_parenthesized_callee_anchors_at_paren() {
         },
         Ev::ExprStmt { span: tspan(10) },
         Ev::StmtEnd { end: 16 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(9),
+            end: 18,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(18),
@@ -148,7 +154,7 @@ fn dead_parenthesized_callee_anchors_at_paren() {
 fn dead_index_callee_anchors_at_paren() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(9) },
         read(11),
         read(13),
         Ev::IndexAccess {
@@ -166,7 +172,10 @@ fn dead_index_callee_anchors_at_paren() {
         },
         Ev::ExprStmt { span: tspan(11) },
         Ev::StmtEnd { end: 18 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(9),
+            end: 20,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(20),
@@ -187,7 +196,7 @@ fn dead_index_callee_anchors_at_paren() {
 fn dead_argument_after_sibling_exit() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(27) },
         // `a` at 29 — live read.
         read(29),
         // `clamp` at 31 — the member continuation read (live state: no
@@ -212,7 +221,10 @@ fn dead_argument_after_sibling_exit() {
         },
         Ev::ExprStmt { span: tspan(29) },
         Ev::StmtEnd { end: 43 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(27),
+            end: 45,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(45),
@@ -230,7 +242,7 @@ fn dead_argument_after_sibling_exit() {
 fn live_argument_with_interior_exit_stays_silent() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(9) },
         read(11),
         Ev::ArgumentsBegin { open: tspan(12) },
         // `b` at 13 — a `Never` read: the exit lands at ITS end (14),
@@ -255,7 +267,10 @@ fn live_argument_with_interior_exit_stays_silent() {
         },
         Ev::ExprStmt { span: tspan(17) },
         Ev::StmtEnd { end: 20 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(9),
+            end: 22,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(22),
@@ -271,7 +286,7 @@ fn live_argument_with_interior_exit_stays_silent() {
 fn began_dead_statement_keeps_wrapper_anchor() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(9) },
         // `return;` at 11 — kills the flow live.
         Ev::ReturnBegin { span: tspan(11) },
         Ev::ReturnEnd {
@@ -289,7 +304,10 @@ fn began_dead_statement_keeps_wrapper_anchor() {
         },
         Ev::ExprStmt { span: tspan(19) },
         Ev::StmtEnd { end: 28 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(9),
+            end: 30,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(30),
@@ -309,7 +327,7 @@ fn began_dead_statement_keeps_wrapper_anchor() {
 fn dead_receiver_member_call_anchors_at_paren() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(23) },
         // `a` at 25 — the `Never` receiver: exit at its end (26).
         read(25),
         Ev::Exit { end: tspan(25) },
@@ -330,7 +348,10 @@ fn dead_receiver_member_call_anchors_at_paren() {
         },
         Ev::ExprStmt { span: tspan(25) },
         Ev::StmtEnd { end: 39 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(23),
+            end: 41,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(41),
@@ -346,7 +367,7 @@ fn dead_receiver_member_call_anchors_at_paren() {
 fn live_invocation_stays_silent() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
-        Ev::BlockBodyBegin,
+        Ev::BlockBodyBegin { span: tspan(9) },
         read(11),
         Ev::ArgumentsBegin { open: tspan(12) },
         read(13),
@@ -358,7 +379,10 @@ fn live_invocation_stays_silent() {
         },
         Ev::ExprStmt { span: tspan(11) },
         Ev::StmtEnd { end: 15 },
-        Ev::BlockBodyEnd,
+        Ev::BlockBodyEnd {
+            begin: tspan(9),
+            end: 17,
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(17),

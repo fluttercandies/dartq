@@ -1440,12 +1440,15 @@ impl ParserListener for Flow<'_> {
 
     // —— bodies ————————————————————————————————————————————————————————
 
-    fn begin_block_function_body(&mut self, _token: Token) {
-        self.record(Ev::BlockBodyBegin);
+    fn begin_block_function_body(&mut self, token: Token) {
+        self.record(Ev::BlockBodyBegin { span: token });
     }
 
-    fn end_block_function_body(&mut self, _count: usize, _begin: Token, _end: Token) {
-        self.record(Ev::BlockBodyEnd);
+    fn end_block_function_body(&mut self, _count: usize, begin: Token, end: Token) {
+        self.record(Ev::BlockBodyEnd {
+            begin,
+            end: end.range.end(),
+        });
     }
 
     fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
