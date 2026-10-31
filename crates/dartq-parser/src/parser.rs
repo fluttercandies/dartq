@@ -177,6 +177,14 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// (`ast_builder.dart:6475` — `set s;` stays silent), so the check reads
     /// this alongside [`Self::last_parameter_count`].
     pub(crate) synthetic_formals: bool,
+    /// The member dispatch's scan-face name candidate: the token the type
+    /// scan's `skipType` landed on (official `beforeName = typeInfo.skipType`,
+    /// parser_impl.dart:4245), paired with whether it is name-shaped. Set by
+    /// `parse_class_member_impl` before the member dispatch, consumed by
+    /// `parse_method` after its return-type re-parse to bound the recovered
+    /// group's overshoot (the official `assert(token.next == name)` invariant,
+    /// parser_impl.dart:5875).
+    pub(crate) member_scan_name: Option<(TokenSpan, bool)>,
     /// Set while an extension type's representation formals parse; the
     /// accumulated shape drives the representation-field error codes
     /// (analyzer `error_verifier` `_checkForExtensionTypeRepresentationErrorCodes`,
@@ -264,6 +272,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             in_constructor_formals: false,
             last_parameter_count: 0,
             synthetic_formals: false,
+            member_scan_name: None,
             rep_field_check: None,
             ext_type_name_next: None,
             spill_after: None,
@@ -616,6 +625,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             in_constructor_formals: self.in_constructor_formals,
             last_parameter_count: self.last_parameter_count,
             synthetic_formals: self.synthetic_formals,
+            member_scan_name: None,
             rep_field_check: None,
             ext_type_name_next: None,
             spill_after: self.spill_after,

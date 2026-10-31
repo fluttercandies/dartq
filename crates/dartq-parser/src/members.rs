@@ -586,6 +586,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let mut type_info = self.compute_type(false, true);
         type_info.skip_type_raw(self);
         let mut after_type = self.cursor.mark();
+        // Scan-face name candidate (official `beforeName = typeInfo.skipType`
+        // landing, parser_impl.dart:4245): the token the member dispatch reads
+        // as the member name. `parse_method` consumes this after its
+        // return-type re-parse to bound a recovered group's overshoot.
+        // Only the range and the name-shape flag survive past the re-parse's
+        // `reset(before_type)`; the id is never dereferenced afterwards.
+        self.member_scan_name = Some((self.peek_span(), is_keyword_or_identifier(self.peek_kind())));
 
         // `new` (primary constructor shape) or get/set names.
         let mut new_kw: Option<TokenSpan> = None;
@@ -1317,6 +1324,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // Return type.
         self.cursor.reset(before_type);
         type_info.parse_type(self);
+        // Official `parseMethod` asserts the return-type parse lands exactly
+        // before the member name (`assert(token.next == name)`,
+        // parser_impl.dart:5875). A recovered type-argument group can absorb
+        // past that landing: for `List<void Function<T 5 6>()>? x;` the group
+        // re-parse swallows `Function <T 5 6> ()` and strands the name
+        // position on `?`. When that happens the scan-designated name (the
+        // `skipType` landing, parser_impl.dart:4245) keeps the
+        // `missing_method_parameters` row — official
+        // `parseGetterOrFormalParameters` recovery reports on the name
+        // (parser_impl.dart:1684) — so the formals recovery re-anchors on it,
+        // and the body face stays silent: the method stays open and the
+        // class-body loop re-enters on the next member.
+        let scan_name = self.member_scan_name.take();
+        let type_overshot = scan_name
+            .as_ref()
+            .is_some_and(|(s, _)| self.peek_span().range.offset > s.range.offset);
         if let Some(gs) = get_or_set {
             // Official `token = getOrSet; ensureIdentifierPotentiallyRecovered`:
             // the identifier event is the name AFTER the `get`/`set`
@@ -1449,7 +1472,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
         };
 
-        let name_for_formals = name;
+        let name_for_formals = match (type_overshot, scan_name) {
+            (true, Some((s, true))) => s,
+            _ => name,
+        };
         self.external_ctor_field_formals = is_constructor && mods.external.is_some();
         self.in_constructor_formals = is_constructor;
         let begin_param = self.parse_getter_or_formal_parameters(
@@ -1490,6 +1516,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             let at = self.peek_span();
             self.report(msg::redirection_in_non_factory(), at);
             self.parse_redirecting_factory_body()
+        } else if type_overshot && self.peek_kind() == TokenKind::Question {
+            // Overshoot face: the recovered type-argument region ends at the
+            // `?` and no body position is left. Official `ensureBlock`
+            // (parser_impl.dart:4939) reports the missing body from the
+            // synthetic `{` it splices at the body position, and
+            // `reportRecoverableError` re-anchors a synthetic token on the
+            // first real follower (`findNonZeroLengthToken`, util.dart:56) —
+            // the next member's head. Consume the `?` and report on the
+            // follower so the class-body loop re-enters there.
+            self.cursor.advance();
+            let follower = self.peek_span();
+            self.report(msg::expected_body(), follower);
+            follower
         } else {
             let allow_abstract = (static_kw.is_none()
                 || mods.external.is_some()

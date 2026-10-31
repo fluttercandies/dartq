@@ -81,30 +81,21 @@ fn broken_gft_type_var_head_cascades_in_member_face() {
 /// `compute_rest` chain breaks on the non-`(` successor, so the member lane
 /// cascades instead of consuming a valid nullable GFT field.
 ///
-/// RESIDUAL (member-lane, out of #3072 scope): the oracle 3.13.1 row set is
-/// 5 rows (`expected_token` (17,21), `missing_method_parameters` (22,30),
-/// `missing_identifier` (40,41), `missing_function_body` +
-/// `missing_const_final_var_or_type` (42,43) — per the `ticket_3052.rs`
-/// residual report). dartq's member lane over-cascades the leftover
-/// `Function <T 5 6>()? x` tail (9 rows, operator/getter faces anchored at
-/// the pre-`x` gap). This pin freezes the post-fix face so the residual is
-/// tracked; a members.rs fix must retighten it to the oracle set.
+/// #3074 retightened the member cascade to the oracle 5-row set (this pin
+/// froze the 9-row pre-#3074 face and named the members.rs fix as its
+/// follow-up); the exact face now lives in `ticket_3074.rs`.
 #[test]
 fn broken_gft_type_var_head_in_type_args_cascades() {
     assert_eq!(
         sorted_rows("class A {\n  List<void Function<T 5 6>()>? x;\n}\n"),
         vec![
             code("expected_token", 17, 21),
-            code("invalid_operator", 40, 41),
             code("missing_const_final_var_or_type", 42, 43),
-            code("missing_function_body", 40, 41),
             code("missing_function_body", 42, 43),
             code("missing_identifier", 40, 41),
-            code("missing_keyword_operator", 40, 41),
-            code("missing_method_parameters", 40, 41),
-            code("missing_method_parameters", 42, 43),
+            code("missing_method_parameters", 22, 30),
         ],
-        "post-gate cascade for `List<void Function<T 5 6>()>? x;` (residual vs oracle 5 rows)"
+        "#3074 member cascade for `List<void Function<T 5 6>()>? x;` (oracle 5 rows)"
     );
 }
 
