@@ -87,16 +87,12 @@ fn check(c: &mut Check<'_>) {
                 // The rowless literal statement (`[];` — the parser
                 // seals the empty list literal away): the statement's
                 // own tokens minus the `;` are the expression, and the
-                // upstream `visitNode` face reports at it.
-                let range = c.unit.ast.token_range(c.node());
-                let content: Vec<u32> = (range.start..range.end)
-                    .filter(|&token| c.lexeme(token) != ";")
-                    .collect();
-                if let (Some(&first), Some(&last)) = (content.first(), content.last()) {
-                    let start = crate::rules::utf16_token_span(c, first).start;
-                    // The `[]`/`{}` tokens carry the pair as one token —
-                    // the token's own end is the literal close.
-                    let end = crate::rules::utf16_token_span(c, last).end;
+                // upstream `visitNode` face reports at it. The window is
+                // read off the statement's byte span, not its token range
+                // — the sealed-away literal leaves the childless statement
+                // row with an empty token range while the span still
+                // covers `expr;`.
+                if let Some((start, end)) = statement_content(c, c.node()) {
                     c.report(start..end, &[]);
                 }
                 return;
@@ -278,6 +274,38 @@ fn statement_run(c: &Check<'_>, stmt: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The expression extent of a childless statement row: the first and last
+/// non-`;` tokens whose spans sit inside the statement's byte window. The
+/// sealed-away empty literal (`[];`, `<dynamic, dynamic>{};`) leaves the
+/// statement row with no token range of its own, so the token scan reads
+/// the window off the span instead — the injective bound the parser's
+/// leaf stamp guarantees (`leaf_span` covers `expr;`).
+fn statement_content(c: &Check<'_>, stmt: u32) -> Option<(u32, u32)> {
+    let window = c.byte_span(stmt);
+    let (mut start, mut end) = (None, None);
+    for (index, token) in c.unit.tokens.as_slice().iter().enumerate() {
+        let at = token.byte_offset as usize;
+        let token_end = at + token.byte_len as usize;
+        if at < window.start || token_end > window.end || c.lexeme(index as u32) == ";" {
+            continue;
+        }
+        let span = crate::rules::utf16_token_span(c, index as u32);
+        start = Some(start.map_or(span.start, |start: u32| start.min(span.start)));
+        end = Some(end.map_or(span.end, |end: u32| end.max(span.end)));
+    }
+    Some((start?, end?))
+}
+
+/// The enclosing statement's content end when this report belongs to an
+/// `ExpressionStatement`; `None` for the `for`-header/updater faces, which
+/// carry no statement window of their own.
+fn statement_window_end(c: &Check<'_>) -> Option<u32> {
+    (c.kind(c.node()) == NodeKind::ExpressionStatement)
+        .then(|| statement_content(c, c.node()))
+        .flatten()
+        .map(|(_, end)| end)
+}
+
 /// The run's root row: the outermost completion — the last row in run
 /// order (postfix completion seals the wrapper last) — but only when its
 /// span covers every other row. A sibling marker row can sit last with a
@@ -300,7 +328,32 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
     // containment test fails on `~1;` / `!x.isEven;`. The leaf is the
     // expression root there: the official `super.visitPrefixExpression`
     // routes to `visitNode(node)` and reports the whole prefix.
-    (c.kind(root) == NodeKind::UnaryPrefix).then_some(root)
+    //
+    // The member-selector markers (`handle_dot_access` /
+    // `handle_qualified`) are childless handles anchored at the member
+    // name — `last_first_token` is the just-completed send's head — so
+    // `c.g` seals a `DotAccess` over `g` alone while the receiver's rows
+    // tile beside it. The marker is still the expression's outermost
+    // completion (nothing tiles past it: postfix completion seals last),
+    // and `report` bounds its extent from the run, so it is the root here
+    // too. Upstream's `PropertyAccess` node spans the whole selector and
+    // `visitNode` reports at it.
+    //
+    // The empty literal is the same shape one step further: the parser
+    // seals `[]` / `{}` as a zero-width row anchored on a synthetic
+    // bracket pair while the literal's text rides a sibling piece row
+    // (`[]` lexes as one token), so the row neither covers the run nor is
+    // covered by anything — `visitNode` still reports at the literal.
+    matches!(
+        c.kind(root),
+        NodeKind::UnaryPrefix
+            | NodeKind::DotAccess
+            | NodeKind::Qualified
+            | NodeKind::ListLiteral
+            | NodeKind::SetOrMapLiteral
+            | NodeKind::RecordLiteral
+    )
+    .then_some(root)
 }
 
 /// Reports at the whole expression `root`: the run's earliest head
@@ -313,7 +366,10 @@ fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
     // the content runs to the statement follower, so the token scan
     // bounds it.
     let mut end = if c.kind(root) == NodeKind::FunctionExpression {
-        token_content_end(c, root, start)
+        // The parameter list's own `)` is content (`() => …`), so the
+        // follower-bounded scan under-cuts; an enclosing statement window
+        // answers the extent exactly when there is one.
+        statement_window_end(c).unwrap_or_else(|| token_content_end(c, root, start))
     } else {
         let tail = content_end_row(c, root, run);
         let mut end = c.utf16_span(tail).end;
@@ -324,12 +380,16 @@ fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
         }
         end
     };
-    // A degenerate seal (the empty `[]` literal row anchors 0-width —
-    // the parser's seal collapses on the empty body) reads the
-    // expression's own tokens: from the root's head token forward
-    // until the statement follower.
+    // A degenerate seal (the empty `[]`/`<…>{}` literal row anchors
+    // 0-width on a synthetic bracket pair — the parser's seal collapses on
+    // the empty body) reads the expression's own tokens: the statement
+    // window when this report belongs to one, the follower-bounded token
+    // scan otherwise (a `for` updater segment).
     if end <= start {
-        end = token_content_end(c, root, start);
+        end = match statement_window_end(c) {
+            Some(window_end) if window_end > start => window_end,
+            _ => token_content_end(c, root, start),
+        };
     }
     let range = start..end;
     c.report(range, &[]);
@@ -339,12 +399,16 @@ fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
 /// report start opens the scan; every token until a follower (`;`,
 /// `,`, `)`, `}`) is content, and the last one bounds the end.
 fn token_content_end(c: &Check<'_>, root: u32, start: u32) -> u32 {
-    let mut index = c.head_token(root);
-    while index > 0 && crate::rules::utf16_token_span(c, index).start > start {
-        index -= 1;
+    let mut cursor = c.head_token(root);
+    // Open the scan at the *first* token at or past the report start. The
+    // walk-back compares the previous token, not the cursor: a degenerate
+    // literal row anchors on zero-width synthetics that sort *after* the
+    // real `[]` token, so a cursor-anchored test stops on the synthetic
+    // and the scan opens past the token carrying the literal's text.
+    while cursor > 0 && crate::rules::utf16_token_span(c, cursor - 1).start >= start {
+        cursor -= 1;
     }
     let mut end = c.utf16_span(root).end;
-    let mut cursor = index;
     while let Some(token) = c.unit.tokens.get(cursor as usize) {
         let lexeme = c.lexeme(cursor);
         if matches!(lexeme, ";" | "," | ")" | "}") || token.kind == dartq_scanner::TokenKind::Eof {
@@ -851,10 +915,22 @@ fn check_cascade(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
             continue;
         }
         if cascade_section_function_typed(c, analysis, marker) {
-            // The section marker's own span opens at the access's own
-            // tile — pass the marker as its own run (a leaf's head is
-            // its covered start).
-            report(c, marker, &[marker]);
+            // Upstream reports at the section (`reportAtNode(section)`), and
+            // a cascade section's node extent opens at the `..`/`?..`
+            // operator — the marker row itself anchors at the member name
+            // (the childless-handle contract), so the operator payload token
+            // answers the report start and the section's member bounds the
+            // end.
+            let start = c
+                .field(marker, PayloadField::Operator)
+                .map_or_else(|| c.utf16_span(marker).start, |op| {
+                    crate::rules::utf16_token_span(c, op).start
+                });
+            let end = c
+                .utf16_span(marker)
+                .end
+                .max(crate::rules::utf16_token_span(c, c.head_token(marker)).end);
+            c.report(start..end, &[]);
         }
     }
 }
@@ -908,7 +984,11 @@ fn cascade_section_function_typed(
         analysis.member_of(query_site(c, receiver), analysis.strings().intern(name))
     {
         let entry_ty = match member.entry.kind {
-            MemberKind::Method | MemberKind::Getter => member.entry.return_ty,
+            // A method read as a value is a tear-off: its static type is the
+            // method's own signature, a function type — never the declared
+            // return type (`:194` tests `staticType is FunctionType`).
+            MemberKind::Method => return true,
+            MemberKind::Getter => member.entry.return_ty,
             MemberKind::Field => member.entry.var_ty,
             MemberKind::Setter => Ty::Unknown,
         };
@@ -1067,3 +1147,8 @@ fn arm_runs(c: &Check<'_>, run: &[u32], root: u32) -> Vec<Vec<u32>> {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "ticket_3157_tests.rs"]
+mod ticket_3157_tests;
+
