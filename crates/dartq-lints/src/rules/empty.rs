@@ -808,15 +808,21 @@ pub(crate) mod unnecessary_final {
     }
 
     /// Face 1: the local declaration row. Field rows (`Fields` /
-    /// `TopLevelFields` parents) and for-parts rows (`ForIn` /
-    /// `ForStatement` parents) are the official's unvisited faces.
+    /// `TopLevelFields` parents) and for-parts rows (`ForIn` / `ForParts` /
+    /// `ForStatement` parents, plus the collection for-element's
+    /// `ForControlFlow` marker) are the official's unvisited faces.
     fn local_declaration(c: &mut Check<'_>, node: u32) {
         let Some(parent) = c.ancestor(1) else {
             return;
         };
         if matches!(
             c.kind(parent),
-            NodeKind::Fields | NodeKind::TopLevelFields | NodeKind::ForIn | NodeKind::ForStatement
+            NodeKind::Fields
+                | NodeKind::TopLevelFields
+                | NodeKind::ForIn
+                | NodeKind::ForParts
+                | NodeKind::ForStatement
+                | NodeKind::ForControlFlow
         ) {
             return;
         }
@@ -916,6 +922,18 @@ pub(crate) mod unnecessary_final {
         let Some(parent) = c.ancestor(1) else {
             return;
         };
+        // The official registers `visitForStatement` — a collection
+        // for-element (`[for (final x in xs) x]`, `{for (…) k: v}`) is a
+        // `ForElement`, never a `ForStatement`, so it is unvisited
+        // (unnecessary_final.dart:86, oracle 3.13.7: zero lint rows on
+        // collection for-elements). dartq tiles the same `ForIn`/`ForInParts`
+        // pair inside a `ForControlFlow` marker, so the gate is the
+        // grandparent kind: `ForStatement` only.
+        if c.ancestor(2)
+            .is_none_or(|gp| c.kind(gp) != NodeKind::ForStatement)
+        {
+            return;
+        }
         let kids = c.collect_direct(parent);
         if let Some(&decl) = kids
             .iter()
@@ -1068,6 +1086,112 @@ pub(crate) mod unnecessary_final {
             let f = Fixture::parse("void f(int x) { switch (x) { case final y: print(y); } }");
             let lints = f.run(&one_rule("unnecessary_final"));
             assert_eq!(lints.len(), 1);
+        }
+
+        /// A `Function(...)` group inside the written type can carry its
+        /// own `final` parameter modifier; the declaration keyword is still
+        /// the OUTER `final` — `node.variables.keyword`
+        /// (unnecessary_final.dart:112-118). The name-anchored backward
+        /// walk must not pick the bracketed group's `final`
+        /// (`function_typed_parameter_var` recovery keeps the inner token
+        /// in the stream). Oracle 3.13.7 anchors the lint at the outer
+        /// keyword (probed: `final void Function(final int x) g` reports
+        /// col 12, never the inner `final`).
+        #[test]
+        fn reports_the_outer_keyword_over_a_function_type_inner_final() {
+            let f = Fixture::parse(
+                "void f() { final void Function(final int x) g = (x) {}; print(g); }",
+            );
+            let lints = f.run(&one_rule("unnecessary_final"));
+            assert_eq!(lints.len(), 1);
+            assert_eq!(lints[0].range.start, crate::testsupport::utf16_at(&f, 5));
+        }
+
+        /// The same inner-modifier shadowing holds when the inner word is
+        /// `var`: the walk must skip it and keep the outer `final` — a
+        /// naive walk answers the inner `var` and the lint goes silent.
+        #[test]
+        fn reports_the_outer_keyword_over_an_inner_var() {
+            let f =
+                Fixture::parse("void f() { final void Function(var int x) g = (x) {}; print(g); }");
+            let lints = f.run(&one_rule("unnecessary_final"));
+            assert_eq!(lints.len(), 1);
+            assert_eq!(lints[0].range.start, crate::testsupport::utf16_at(&f, 5));
+        }
+
+        /// A `var` declaration whose type carries an inner `final`
+        /// modifier must NOT report — the walk resolves `var`, not the
+        /// bracketed `final` (oracle 3.13.7: zero lint rows on
+        /// `var void Function(final int x) g`).
+        #[test]
+        fn ignores_a_var_declaration_over_an_inner_final() {
+            let f =
+                Fixture::parse("void f() { var void Function(final int x) g = (x) {}; print(g); }");
+            assert!(f.run(&one_rule("unnecessary_final")).is_empty());
+        }
+
+        /// The named-parameter `{...}` group of a function type is a
+        /// bracketed group too (oracle 3.13.7: the lint anchors at the
+        /// outer keyword, col 12 on `final void Function({final int x})`).
+        #[test]
+        fn reports_the_outer_keyword_over_a_named_group_inner_final() {
+            let f = Fixture::parse(
+                "void f() { final void Function({final int x}) g = ({x = 0}) {}; print(g); }",
+            );
+            let lints = f.run(&one_rule("unnecessary_final"));
+            assert_eq!(lints.len(), 1);
+            assert_eq!(lints[0].range.start, crate::testsupport::utf16_at(&f, 5));
+        }
+
+        /// `late final` with an inner-modifier type: the walk passes the
+        /// inner `final` and answers the declaration `final` after `late`
+        /// (oracle 3.13.7 anchors at the `final`, not `late`).
+        #[test]
+        fn reports_a_late_final_over_an_inner_final() {
+            let f = Fixture::parse(
+                "void f() { late final void Function(final int x) g = (x) {}; print(g); }",
+            );
+            let lints = f.run(&one_rule("unnecessary_final"));
+            assert_eq!(lints.len(), 1);
+            // `late`(5) `final`(6): the row anchors at the `final`.
+            assert_eq!(lints[0].range.start, crate::testsupport::utf16_at(&f, 6));
+        }
+
+        /// The for-each loop variable reads the declaration keyword off
+        /// the same helper (unnecessary_final.dart:92-99): an inner
+        /// `final` in the loop variable's type must not shadow the real
+        /// keyword.
+        #[test]
+        fn reports_a_for_each_variable_over_an_inner_final() {
+            let f = Fixture::parse(
+                "void f(List<void Function(int)> l) { for (final void Function(final int x) g in l) { print(g); } }",
+            );
+            let lints = f.run(&one_rule("unnecessary_final"));
+            assert_eq!(lints.len(), 1);
+            // `for`(14) `(`(15) `final`(16): the row anchors at the
+            // declaration keyword, not the inner parameter `final`(20).
+            assert_eq!(lints[0].range.start, crate::testsupport::utf16_at(&f, 16));
+        }
+
+        /// The official registers `visitForStatement`; a for-element inside
+        /// a collection literal is a `ForElement`, never visited
+        /// (unnecessary_final.dart:86). Oracle 3.13.7: zero lint rows on
+        /// `[for (final x in xs) x]`.
+        #[test]
+        fn ignores_a_collection_for_element_declaration() {
+            let f = Fixture::parse("void f() { var l = [for (final x in [1]) x]; print(l); }");
+            assert!(f.run(&one_rule("unnecessary_final")).is_empty());
+        }
+
+        /// The pattern form inside a collection for-element is silent too —
+        /// same `ForElement` gate (`{for (final (a, b) in xs) a}` reports
+        /// nothing under the 3.13.7 oracle).
+        #[test]
+        fn ignores_a_collection_for_element_pattern() {
+            let f = Fixture::parse(
+                "void f() { var s = {for (final (a, b) in [(1, 2)]) a}; print(s); }",
+            );
+            assert!(f.run(&one_rule("unnecessary_final")).is_empty());
         }
     }
 }

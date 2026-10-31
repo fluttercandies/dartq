@@ -279,13 +279,29 @@ pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u
     if matches!(c.lexeme(head), "var" | "final" | "const") {
         return Some(head);
     }
+    // The name-anchored face recovers the keyword with a bounded backward
+    // walk. Between the name and the keyword sits only the written type —
+    // and a `Function(...)`/`{...}`/`[...]` group inside that type can
+    // carry its own `final`/`var`/`const` (function-typed parameter
+    // modifiers, `function_typed_parameter_var` recovery): `final void
+    // Function(final int x) g` must answer the OUTER `final`, so keyword
+    // words inside a bracketed group are skipped. `{`/`}` count as group
+    // delimiters (named parameters in a function type); a `;` stays a hard
+    // statement boundary at every depth.
     let mut token = head;
+    let mut depth = 0u32;
     for _ in 0..256 {
         token = token.checked_sub(1)?;
         match c.lexeme(token) {
-            "var" | "final" | "const" => return Some(token),
-            // `late` belongs to the same declaration's modifiers.
-            ";" | "{" | "}" => return None,
+            ")" | "]" | "}" => depth += 1,
+            "(" | "[" | "{" => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            "var" | "final" | "const" if depth == 0 => return Some(token),
+            ";" => return None,
             _ => {}
         }
     }
