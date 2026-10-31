@@ -12,6 +12,8 @@ enum UncheckedOperandFace {
     ForInIterator,
     /// `uncheckedUseOfNullableValueInSpread` — the spread operand.
     Spread,
+    /// `uncheckedUseOfNullableValueInYieldEach` — the `yield*` operand.
+    YieldEach,
 }
 
 impl UncheckedOperandFace {
@@ -25,6 +27,10 @@ impl UncheckedOperandFace {
             UncheckedOperandFace::Spread => (
                 "A nullable expression can't be used in a spread.",
                 "Try checking that the value isn't 'null' before using it in a spread, or use a null-aware spread.",
+            ),
+            UncheckedOperandFace::YieldEach => (
+                "A nullable expression can't be used in a yield-each statement.",
+                "Try checking that the value isn't 'null' before using it in a yield-each statement.",
             ),
         }
     }
@@ -1380,9 +1386,13 @@ impl<'a> Engine<'a> {
     /// (`if (l != null) for (var e in l)`) flows through the same row's
     /// non-nullable type and stays silent.
     fn stage_operand_faces(&self, out: &mut Vec<Diagnostic>) {
-        // Only files carrying a potentially-nullable read pay the token
-        // walk (a nullable read is a necessary condition of every
-        // candidate).
+        // Only files carrying a potentially-nullable operand pay the token
+        // walk (a nullable operand is a necessary condition of every
+        // candidate — the flow's read rows are the post-teardown operand
+        // face: a `void`/`Null` operand drops at the `ReadType` staging
+        // boundary and its pass-1 row is already consumed, so the
+        // declared-type fallback lives in the assignability pass that owns
+        // `use_of_void_result`, outside this teardown join).
         if !self
             .read_types
             .iter()
@@ -1426,6 +1436,27 @@ impl<'a> Engine<'a> {
                         continue;
                     };
                     self.emit_operand_face_row(UncheckedOperandFace::Spread, ty, range, out);
+                }
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Yield) => {
+                    // `yield* expression` — the verifier's
+                    // `uncheckedUseOfNullableValueInYieldEach` arm
+                    // (yield_statement_resolver.dart:163-168,
+                    // `nullableDereferenceVerifier.expression` gated on
+                    // `node.star != null`, `.at(expression)`); a bare
+                    // `yield` asks no operand face. The pseudo-keyword's
+                    // identifier reading (`var z = yield * 3` — a bare
+                    // multiplication statement) produces no operand read in
+                    // its own window, so it under-reports to nothing either
+                    // way.
+                    let Some((start, end, boundary_idx)) = self.yield_each_window(i) else {
+                        continue;
+                    };
+                    let Some((ty, range)) =
+                        self.single_reachable_read_between(start, end, boundary_idx)
+                    else {
+                        continue;
+                    };
+                    self.emit_operand_face_row(UncheckedOperandFace::YieldEach, ty, range, out);
                 }
                 _ => {}
             }
@@ -1702,6 +1733,39 @@ impl<'a> Engine<'a> {
                     | dartq_scanner::TokenKind::Eof
             ) {
                 let start = dots.utf16_offset + dots.byte_len;
+                let end = tokens[j].utf16_offset;
+                return (start < end).then_some((start, end, j));
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// A `yield*` operand's window: the tokens between the `*` marker and
+    /// the statement's `;` terminator at the marker's own nesting depth
+    /// (begin-groups jump whole, so a parenthesized or collection operand
+    /// never forges the boundary). A `yield` without the star (or a `yield`
+    /// used as an identifier — the pseudo-keyword's other reading) yields
+    /// no window. Returns `(operand start, operand end, boundary index)`.
+    fn yield_each_window(&self, yield_idx: usize) -> Option<(u32, u32, usize)> {
+        let tokens = self.tokens.as_slice();
+        let star = tokens.get(yield_idx + 1)?;
+        if star.is_synthetic() || star.kind != dartq_scanner::TokenKind::Star {
+            return None;
+        }
+        let mut j = yield_idx + 2;
+        while j < tokens.len() {
+            if let Some(close) = self.tokens.matching_end(j) {
+                j = close + 1;
+                continue;
+            }
+            if matches!(
+                tokens[j].kind,
+                dartq_scanner::TokenKind::Semicolon
+                    | dartq_scanner::TokenKind::CloseCurly
+                    | dartq_scanner::TokenKind::Eof
+            ) {
+                let start = star.utf16_offset + star.byte_len;
                 let end = tokens[j].utf16_offset;
                 return (start < end).then_some((start, end, j));
             }
@@ -7138,7 +7202,7 @@ impl<'a> Engine<'a> {
             Some((op, at)) => (SemanticCode::NonBoolOperand, op, Some(at)),
             None => (face.code(), "", None),
         };
-        let ty = self.operand_static_ty(row);
+        let ty = self.condition_operand_ty(row);
         if self.nullable_bool_ty(ty) {
             self.stage_condition_offset(row.range.offset);
             self.staged_checks.push(StagedCheck {
@@ -7334,10 +7398,30 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The condition/negation verdict's operand type: the operand's
+    /// static type as the official `checkForNonBool*` callers read it —
+    /// `expression.staticType`, which carries the `?.` short-circuit's
+    /// nullable join (`a?.foo` over `a: A?`, `foo: bool` reads `bool?`,
+    /// and `a?.foo.bar` reads `bar?` — the whole shorted chain's own
+    /// type). `null_aware_members` keys exactly that face (the `?.`-merged
+    /// selector plus every continuation selector of the shorted chain,
+    /// invocation.rs:1433-1464's `receiver_offset` join). This is the
+    /// `widen_null_aware` reading [`Self::coalesce_operand_never_null`]
+    /// gives the `??` operand — the static-type face, never the target's
+    /// read-resolution face (`??=`'s `a?.m ??= 1` reads `m` unwrapped).
+    fn condition_operand_ty(&self, row: &Row) -> Ty {
+        let ty = self.operand_static_ty(row);
+        if ty != Ty::UNKNOWN && self.null_aware_members.contains(&row.range.offset) {
+            Self::nullable_form(ty)
+        } else {
+            ty
+        }
+    }
+
     /// The `!` operand's classification: the nullable-bool staging runs,
     /// the condition face does not (the negation face owns the report).
     pub(crate) fn classify_negation_operand(&mut self, row: &Row) {
-        let ty = self.operand_static_ty(row);
+        let ty = self.condition_operand_ty(row);
         if !self.condition_staged.contains(&row.range.offset) && self.nullable_bool_ty(ty) {
             self.stage_condition_offset(row.range.offset);
             self.staged_checks.push(StagedCheck {
