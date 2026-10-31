@@ -235,8 +235,59 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         kind: BlockKind,
         message_kind: crate::message::BlockKind,
     ) -> TokenSpan {
+        self.parse_block_anchored(kind, message_kind, None)
+    }
+
+    /// [`Self::parse_block`] with the try-family clause-head anchor. Upstream
+    /// `ensureBlock`'s message flavors anchor the missing-`{` report on the
+    /// CALLER's token (`reportRecoverableError(token, message)`,
+    /// parser_impl.dart:4995-5002 — not the template flavors' `next`), and
+    /// the try dispatch passes the clause head: the `try` keyword (:10709),
+    /// the catch parameters' last consumed token (:10825 — the real `)`, or
+    /// the zero-width synthetic whose `findNonZeroLengthToken` walk lands on
+    /// the junk), the `finally` keyword (:10835), and the on-clause type's
+    /// last consumed token for a catchless on clause. So `try junk {}` pins
+    /// the body row on `try`, `catch (e) junk {}` on the `)`,
+    /// `finally junk {}` on `finally`, `on T junk {}` on `T` (oracle
+    /// try_statement corpus, probed 3.13.1). `anchor = None` keeps the
+    /// shared follower-walk arm of `ensure_block` for the other faces.
+    fn parse_block_anchored(
+        &mut self,
+        kind: BlockKind,
+        message_kind: crate::message::BlockKind,
+        anchor: Option<TokenSpan>,
+    ) -> TokenSpan {
         let had_open = self.peek_kind() == TokenKind::OpenCurly;
-        let (begin, close) = self.ensure_block(message_kind);
+        let (begin, close) = match (had_open, anchor) {
+            (_, None) | (true, Some(_)) => self.ensure_block(message_kind),
+            (false, Some(mut at)) => {
+                // `findNonZeroLengthToken` over the anchor (util.dart:56-61):
+                // a relocated/inserted synthetic catch closer sits at the
+                // junk's offset and the walk lands on the junk itself (oracle
+                // `catch junk (e) {}` and `catch (e junk) {}` pin the body row
+                // on `junk`); a real clause head carries the row directly.
+                if at.range.length == 0 {
+                    let mut n = 0usize;
+                    while self.cursor.look_kind(n) != TokenKind::Eof {
+                        let look = self.look_span_at(n);
+                        if look.range.length > 0 {
+                            at = look;
+                            break;
+                        }
+                        n += 1;
+                    }
+                }
+                let follower = self.peek_span();
+                self.report(
+                    msg::expected_block_body(message_kind, self.cursor.lexeme(follower.id)),
+                    at,
+                );
+                let offset = follower.range.offset;
+                let open = self.synthetic(TokenKind::OpenCurly, offset);
+                let close = self.synthetic(TokenKind::CloseCurly, offset);
+                (open, close)
+            }
+        };
         if had_open {
             // Official `ensureBlock` consumes the real `{`; for a synthetic
             // block nothing is consumed here (the `!had_open` path drains
@@ -1615,9 +1666,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let try_kw = self.peek_span();
         self.cursor.advance();
         self.listener.begin_try_statement(try_kw);
-        let mut last_consumed = self.parse_block(
+        let mut last_consumed = self.parse_block_anchored(
             BlockKind::TryStatement,
             crate::message::BlockKind::TryStatement,
+            Some(self.last_consumed_span()), // the `try` keyword
         );
         let mut catch_count = 0usize;
         loop {
@@ -1629,13 +1681,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             let mut on_kw = None;
             let mut catch_kw = None;
             let mut comma = None;
+            // The clause-head anchor for the block report: the on-type's last
+            // consumed token (:10825 passes `lastConsumed` = the
+            // `ensureTypeNotVoid` result), overwritten by the catch
+            // parameters' closer when a `catch` part follows.
+            let mut clause_anchor = None;
             if is_on {
                 // The `on` keyword unconditionally starts an on-clause here.
                 on_kw = Some(self.peek_span());
                 self.listener.begin_catch_clause(self.peek_span());
                 self.cursor.advance();
                 let type_info = self.compute_type(true, false);
-                let _ = type_info.ensure_type_not_void(self);
+                clause_anchor = Some(type_info.ensure_type_not_void(self));
             }
             if self.peek_kind() == TokenKind::Keyword(Keyword::Catch) {
                 if on_kw.is_none() {
@@ -1643,12 +1700,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 }
                 catch_kw = Some(self.peek_span());
                 self.cursor.advance();
-                let _ = self.parse_catch_parameters(&mut comma);
+                clause_anchor = Some(self.parse_catch_parameters(&mut comma));
             }
             self.listener.end_catch_clause(self.peek_span());
-            last_consumed = self.parse_block(
+            last_consumed = self.parse_block_anchored(
                 BlockKind::CatchClause,
                 crate::message::BlockKind::CatchClause,
+                clause_anchor,
             );
             catch_count += 1;
             self.listener.handle_catch_block(on_kw, catch_kw, comma);
@@ -1663,11 +1721,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         };
         if let Some(finally_kw) = finally_kw {
             // Official `parseBlock(finallyToken, ...)` (:1502): the `finally`
-            // token itself is consumed before the block's ensureBlock.
+            // token itself is consumed before the block's ensureBlock — and
+            // IS the ensureBlock anchor (:10835 passes `token`, the
+            // `finally` keyword).
             self.cursor.advance();
-            last_consumed = self.parse_block(
+            last_consumed = self.parse_block_anchored(
                 BlockKind::FinallyClause,
                 crate::message::BlockKind::FinallyClause,
+                Some(finally_kw),
             );
             self.listener.handle_finally_block(finally_kw);
         }
