@@ -1605,6 +1605,64 @@ pub fn fold_unit_with_ops<'t>(
     engine.prop_promotion_rows = PropPromotionStaging {
         rows: prop_promotions.rows.clone(),
     };
+    // The promoted-member-receiver backfill (#3214): a member access folded
+    // over a MEMBER read receiver (`c._f.expectStaticType`, `d._f.field`)
+    // owes its `receiver_nullable` verdict the promoted-property stand-down,
+    // but the fold-time chained latch only arms when the receiver read was
+    // itself already latched — a property read that never folded over a
+    // promoted receiver of its own (the common `x._f.use` shape) takes no
+    // latch, and its member row over-reports
+    // `unchecked_use_of_nullable_value` where the oracle resolves the use on
+    // the promoted static type (property_element_resolver.dart:2158-2166).
+    // The latch the prop arm needs is the receiver read's offset under the
+    // zero-length chained sentinel: `promotable_field_substitution` joins
+    // `prop_promotion_rows` on the offset alone, so a staged
+    // `PromotedPropertyRead` at the receiver's member token answers the
+    // substitution exactly as a head-linked read does. Latched rows and
+    // receivers that are not member reads keep their folded classification.
+    for member in 0..engine.member_reads.len() {
+        let MemberRead {
+            offset,
+            recv_span,
+            ..
+        } = engine.member_reads[member];
+        // Only a member-read receiver can carry a promoted-property fact —
+        // a bare/local receiver's stand-down is the folded variable latch's
+        // job, and an offset that names no member read resolves no field.
+        let is_member_receiver = engine
+            .member_reads
+            .binary_search_by(|row| row.offset.cmp(&recv_span.offset))
+            .is_ok_and(|index| engine.member_reads[index].offset == recv_span.offset);
+        if !is_member_receiver {
+            continue;
+        }
+        // The promoted-property gate: only a read the flow staged carries a
+        // fact to re-decide on; an unpromoted member receiver keeps its
+        // written nullable face.
+        let promoted = engine
+            .prop_promotion_rows
+            .rows
+            .binary_search_by(|row| row.offset.cmp(&recv_span.offset))
+            .is_ok();
+        if !promoted {
+            continue;
+        }
+        if let Err(index) = engine
+            .promoted_recv_reads
+            .binary_search_by(|(member, _)| member.cmp(&offset))
+        {
+            engine.promoted_recv_reads.insert(
+                index,
+                (
+                    offset,
+                    SourceRange {
+                        offset: recv_span.offset,
+                        length: 0,
+                    },
+                ),
+            );
+        }
+    }
     engine.invalid_type_names = invalid_names.clone();
     // The flow dead intervals ride into pass 2 beside the read types:
     // `resolve_rows`'s `unchecked_use_of_nullable_value` arm re-decides
@@ -6399,3 +6457,19 @@ mod ticket_2345_tests;
 /// after a returning catch. Exact oracle `(offset, length)` triples.
 #[cfg(test)]
 mod ticket_2464_tests;
+
+/// The #3214 F2 pins: a member access whose receiver is a promoted
+/// PROPERTY read (`c._f.expectStaticType<T>()`, `d._f.m()`) resolves on the
+/// promoted static type — `unchecked_use_of_nullable_value` stands down
+/// through the `PromotedPropertyRead` rows and the pass-2
+/// member-over-member-receiver backfill.
+#[cfg(test)]
+mod ticket_f2_tests;
+
+/// The #3213 pins: `dead_code`'s span-shape law — the dead conditional
+/// arm's marker is the arm expression alone (`;` excluded), the `for`'s
+/// dead body/updater pair carries the head markers while the cond-false
+/// exit stays live, and a `throw` tail merges the remaining statements
+/// into ONE span. Exact oracle `(offset, length)` triples.
+#[cfg(test)]
+mod ticket_3213_tests;
