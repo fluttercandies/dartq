@@ -4321,7 +4321,22 @@ impl<'a> Engine<'a> {
         if *generator || (*is_async && !self.legal_async_return(declared)) {
             return;
         }
-        let row = (end.range, declared, *body_brace, *is_async, anchor);
+        self.insert_body_completion(end.range, declared, *body_brace, *is_async, anchor);
+    }
+
+    /// The `body_completions` row insert shared by the named-executable end
+    /// events and the local-function frame pop: keyed by the body end
+    /// token's range, the fold's join point with the flow layer's
+    /// `BodyMayCompleteNormally` fact.
+    fn insert_body_completion(
+        &mut self,
+        end: SourceRange,
+        declared: Ty,
+        brace: Option<SourceRange>,
+        is_async: bool,
+        anchor: SourceRange,
+    ) {
+        let row = (end, declared, brace, is_async, anchor);
         match self
             .body_completions
             .binary_search_by(|(r, ..)| r.offset.cmp(&row.0.offset))
@@ -4334,6 +4349,56 @@ impl<'a> Engine<'a> {
             }
             Err(index) => self.body_completions.insert(index, row),
         }
+    }
+
+    /// The local-function completion staging: the declaration flavor's
+    /// `end_local_function_declaration` carries no dedicated staging call,
+    /// so its executable frame releases the row at its [`Engine::pop_frame`]
+    /// — the same staging `stage_body_completion` runs for named
+    /// executables (upstream `visitFunctionDeclaration`'s
+    /// `!node.isSetter` arm, resolver.dart:3109-3114; a local function can
+    /// never spell `set`, so no get/set gate applies). The staged type is
+    /// the declared return latched at the name event; the end token is the
+    /// body block's own `}`, resolved through the token table's
+    /// `matching_end` (the flow fact's `ExecEnd` span pairs it exactly).
+    /// `brace` is the block-body `{`; a `None` brace (arrow or body-less
+    /// recovery) stages nothing, mirroring the named path.
+    pub(crate) fn stage_local_fn_completion(
+        &mut self,
+        staged: Ty,
+        anchor: SourceRange,
+        brace: Option<SourceRange>,
+        is_async: bool,
+        generator: bool,
+    ) {
+        let Some(brace) = brace else {
+            return;
+        };
+        // The body block's matching `}`: the `{` token's `end_of` pair — a
+        // synthetic close (an unclosed body's recovery token) carries the
+        // parser's own span, which is exactly the fact's `ExecEnd` anchor.
+        let toks = self.tokens.as_slice();
+        let at = toks.partition_point(|t| t.utf16_offset < brace.offset);
+        let Some(end) = toks
+            .get(at)
+            .filter(|t| {
+                t.utf16_offset == brace.offset
+                    && t.kind == dartq_scanner::TokenKind::OpenCurly
+            })
+            .and_then(|_| self.tokens.matching_end(at))
+            .and_then(|close| self.tokens.get(close))
+        else {
+            return;
+        };
+        let end_range = SourceRange {
+            offset: end.utf16_offset,
+            length: self.utf16_of(end.byte_range().end) - end.utf16_offset,
+        };
+        let declared = self.completion_declared_ty(staged);
+        if generator || (is_async && !self.legal_async_return(declared)) {
+            return;
+        }
+        self.insert_body_completion(end_range, declared, Some(brace), is_async, anchor);
     }
 
     /// The name-level `_isLegalReturnType` for an `async` body: the top
@@ -5061,3 +5126,10 @@ void f([int? optional]) {\n\
         assert_eq!(dead_rows(source), Vec::new());
     }
 }
+
+/// The #3151 pins (`body_might_complete_normally`'s local-function arm —
+/// `visitFunctionDeclaration` stages no dedicated end-event call for the
+/// declaration flavor, so the frame pop releases the row).
+#[cfg(test)]
+#[path = "ticket_3151_tests.rs"]
+mod ticket_3151_tests;

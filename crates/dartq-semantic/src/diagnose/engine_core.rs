@@ -1981,6 +1981,38 @@ impl<'a> Engine<'a> {
             // frame that owns it; `close_frame_locals` consumes `frame`,
             // so the kind reads first.
             let was_executable = matches!(frame.kind, FrameKind::Executable { .. });
+            // A local function's executable frame releases its
+            // body-completion row at this pop (upstream runs
+            // `checkForBodyMayCompleteNormally` on the `FunctionDeclaration`
+            // walk — resolver.dart:3109 — and a local declaration's
+            // `end_local_function_declaration` carries no dedicated staging
+            // call). The popping frame is the local function's exactly when
+            // `local_fn_stack`'s top names its index (`note_local_function`
+            // records `frames.len() - 1` at the name event — the popped
+            // index after the pop above). Named executables stage from
+            // their own end events, so this release can only ever arm the
+            // declaration flavor; an unstaged non-local frame (the setter's
+            // early return, a recovery path) simply finds no stack entry.
+            if self
+                .local_fn_stack
+                .last()
+                .is_some_and(|(depth, _)| *depth == self.frames.len())
+                && let FrameKind::Executable {
+                    ret: Some(exec),
+                    body_brace,
+                    is_async,
+                    generator,
+                    ..
+                } = &frame.kind
+            {
+                self.stage_local_fn_completion(
+                    exec.ty,
+                    exec.name_span,
+                    *body_brace,
+                    *is_async,
+                    *generator,
+                );
+            }
             // The tear-off capture reads this frame's own type-parameter
             // window and tracked-locals window — both still untruncated
             // here (the truncate and the locals close run after).
