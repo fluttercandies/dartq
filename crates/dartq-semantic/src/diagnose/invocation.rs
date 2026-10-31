@@ -1,4 +1,5 @@
 use super::ffi::matching_close;
+use super::scopes_bodies::SchemaSlot;
 use super::*;
 use dartq_source::byte_offset_to_utf16;
 
@@ -9,6 +10,107 @@ use dartq_source::byte_offset_to_utf16;
 #[cfg(test)]
 #[path = "ticket_2931_tests.rs"]
 mod ticket_2931_tests;
+
+/// The #2938 pins (the generic-send `couldNotInfer` face — the real
+/// constraint gather/choose/check pipeline over `foo<T>(args)` and the
+/// context-driven `F<args> = source` solve).
+#[cfg(test)]
+#[path = "ticket_2938_tests.rs"]
+mod ticket_2938_tests;
+
+/// The #2500 pins (the downward closure-formal re-bind — an untyped
+/// literal formal under a member send whose signature stays unsolved at
+/// pass 1 gets the callee's substituted answer through
+/// `infer_rebind_closure_formals`).
+#[cfg(test)]
+#[path = "ticket_2500_tests.rs"]
+mod ticket_2500_tests;
+
+/// The #2516 pins (the upward twin: element-bearing member-read args
+/// feed the constraint gather through `solve_arg_member_ty` without
+/// lending their type to the `check_arguments` verdict face).
+#[cfg(test)]
+#[path = "ticket_2516_tests.rs"]
+mod ticket_2516_tests;
+
+/// Where one merged constraint came from — upstream's
+/// `TypeConstraintOrigin` (`type_constraint.dart`), the error-message
+/// column identity. Each gather round stamps one origin; equal origins
+/// group, and `_formatError` prints each surviving group once.
+#[derive(Clone)]
+enum InferOrigin {
+    /// `TypeConstraintFromArgument` — one argument constrained against
+    /// its written formal.
+    Argument {
+        parameter: StringId,
+        declared: Ty,
+        argument: Ty,
+    },
+    /// `TypeConstraintFromReturnType` — the declared return matched
+    /// the send's downward context.
+    ReturnType { declared: Ty, context: Ty },
+    /// `TypeConstraintFromFunctionContext` — a generic tear-off
+    /// argument's own instantiation infer (`inferTearOff`).
+    FunctionContext { function: Ty, context: Ty },
+    /// `TypeConstraintFromExtendsClause` — the parameter's substituted
+    /// bound, checked last in the per-parameter sequence.
+    ExtendsClause {
+        parameter: StringId,
+        raw_bound: Ty,
+        bound: Ty,
+    },
+}
+
+impl InferOrigin {
+    /// `formatError` (upstream `type_constraint.dart`) — the one-to-three
+    /// part line (`prefix`, `middle`, optional `end`) `_formatConstraints`
+    /// pads into columns.
+    fn format_error(&self, engine: &Engine<'_>) -> Vec<String> {
+        match self {
+            Self::Argument {
+                parameter,
+                declared,
+                argument,
+            } => vec![
+                format!("Parameter '{}'", engine.strings.resolve(*parameter)),
+                format!("declared as     '{}'", engine.ty_display(*declared)),
+                format!("but argument is '{}'.", engine.ty_display(*argument)),
+            ],
+            Self::ReturnType { declared, context } => vec![
+                "Return type".to_string(),
+                format!("declared as '{}'", engine.ty_display(*declared)),
+                format!("used where  '{}' is required.", engine.ty_display(*context)),
+            ],
+            Self::FunctionContext { function, context } => vec![
+                "Function type".to_string(),
+                format!("declared as '{}'", engine.ty_display(*function)),
+                format!("used where  '{}' is required.", engine.ty_display(*context)),
+            ],
+            Self::ExtendsClause {
+                parameter,
+                raw_bound,
+                bound,
+            } => vec![
+                format!("Type parameter '{}'", engine.strings.resolve(*parameter)),
+                format!(
+                    "is declared to extend '{}' producing '{}'.",
+                    engine.ty_display(*raw_bound),
+                    engine.ty_display(*bound)
+                ),
+            ],
+        }
+    }
+}
+
+/// One round's merged constraint on one parameter — upstream's
+/// `MergedTypeConstraint` (`lower <: T <: upper`; `Ty::Unknown` is the
+/// `_` unconstrained side) with its origin's slot in the round table.
+#[derive(Clone)]
+struct InferConstraint {
+    lower: Ty,
+    upper: Ty,
+    origin: usize,
+}
 
 /// The chain-root static type behind a receiver classification: the
 /// declared type of a `Typed` receiver's head (`data` of `data.address`,
@@ -3786,6 +3888,1788 @@ impl<'a> Engine<'a> {
             }
             _ => {}
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The real constraint solve (#2938): upstream `GenericInferrer`'s
+    // gather → preliminary-choose → gather-args → final-choose → check
+    // pipeline, on the element model's `Ty`. `Ty::Unknown` IS the schema
+    // `_` — `isKnownType` answers false on it, `isSatisfiedBy` treats it as
+    // the unconstrained side, and `chooseTypeFromConstraint` reads a
+    // `(_ , X)` constraint through the closure arms exactly as upstream's
+    // `UnknownInferredType` does.
+    // ---------------------------------------------------------------------
+
+    /// Whether `ty` is fully grounded — upstream's `isKnownType`: a bare
+    /// `_` hole or any hole inside a compound face makes the type
+    /// "not known". A type-parameter leaf is known (it names a concrete
+    /// declaration-site variable, never an inference hole).
+    fn infer_known(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Unknown => false,
+            Ty::Named { args, .. } => {
+                let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                list.iter().all(|&arg| self.infer_known(arg))
+            }
+            Ty::Function { shape, .. } => {
+                let shape = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                self.infer_known(shape.return_ty)
+                    && shape.positional.iter().all(|&t| self.infer_known(t))
+                    && shape.named.iter().all(|&(_, t)| self.infer_known(t))
+            }
+            Ty::Record { shape, .. } => {
+                let shape = {
+                    let pool = self.boundary.pool();
+                    pool.record_shape(shape).clone()
+                };
+                shape.positional.iter().all(|&t| self.infer_known(t))
+                    && shape.named.iter().all(|&(_, t)| self.infer_known(t))
+            }
+            _ => true,
+        }
+    }
+
+    /// The greatest/least closure of `ty` over the inference parameters
+    /// (`greatest_closure`, upstream `type_analyzer_operations.dart`'s
+    /// closure of a type schema): a covariant occurrence of a parameter
+    /// reads `Object?`, a contravariant one `Never`; a bare parameter leaf
+    /// in the target set reads `Object?` under `covariant` else `Never`.
+    /// Named/record args stay covariant; a function shape's return is
+    /// covariant and its formals contravariant (the polarity flip the
+    /// `T Function(T)` → `Object? Function(Never)` closure carries).
+    fn infer_closure(&self, ty: Ty, params: &[(StringId, Option<Ty>)], covariant: bool) -> Ty {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if args == ArgListId::EMPTY && params.iter().any(|(p, _)| *p == name) {
+                    return if covariant {
+                        Ty::Named {
+                            name: self.intern("Object"),
+                            nullable: true,
+                            args: ArgListId::EMPTY,
+                        }
+                    } else {
+                        Ty::Never
+                    };
+                }
+                if args == ArgListId::EMPTY {
+                    return ty;
+                }
+                // Materialize the argument list BEFORE recursing — the
+                // recursion re-interns through the same `args` pool
+                // (`intern_list`/`function_generic` take `borrow_mut`), and a
+                // read borrow held across it panics the RefCell.
+                let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                let list: Vec<Ty> = list
+                    .iter()
+                    .map(|&arg| self.infer_closure(arg, params, covariant))
+                    .collect();
+                Ty::Named {
+                    name,
+                    nullable,
+                    args: self.boundary.intern_list(&list),
+                }
+            }
+            Ty::Function { shape, nullable } => {
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                let return_ty = self.infer_closure(pool_shape.return_ty, params, covariant);
+                let positional: Vec<Ty> = pool_shape
+                    .positional
+                    .iter()
+                    .map(|&t| self.infer_closure(t, params, !covariant))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = pool_shape
+                    .named
+                    .iter()
+                    .map(|&(n, t)| (n, self.infer_closure(t, params, !covariant)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .function_generic(
+                        &pool_shape.type_params_named,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+            }
+            Ty::Record { shape, nullable } => {
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.record_shape(shape).clone()
+                };
+                let positional: Vec<Ty> = pool_shape
+                    .positional
+                    .iter()
+                    .map(|&t| self.infer_closure(t, params, covariant))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = pool_shape
+                    .named
+                    .iter()
+                    .map(|&(n, t)| (n, self.infer_closure(t, params, covariant)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, nullable)
+            }
+            _ => ty,
+        }
+    }
+
+    /// `P <: Q` constraint generation over the inference parameters —
+    /// `performSubtypeConstraintGenerationInternal` (upstream
+    /// `type_analyzer_operations.dart:2196-2441`). `round` receives each
+    /// implied constraint as `(param_index, lower, upper)`; the caller
+    /// merges them into the round's per-param `(lower, upper)` pair.
+    /// `_` (`Ty::Unknown`) on either side, an `isQuestionType` P
+    /// occurrence, or a non-member parameter short-circuits without a
+    /// constraint. The Q-side parameter arm carries the bound-gate
+    /// (`inference_using_bounds`, default on): `P <: T` registers only
+    /// when `T` declares no bound or `P <: greatestClosure(bound)` — the
+    /// gate that keeps a failed-bound argument silent (the constructor
+    /// `C(myF)` face, where `NotA` never reaches `A`'s closure).
+    fn infer_gather(
+        &self,
+        p: Ty,
+        q: Ty,
+        params: &[(StringId, Option<Ty>)],
+        left_schema: bool,
+        round: &mut Vec<(usize, Ty, Ty)>,
+    ) -> bool {
+        let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
+        let push = |round: &mut Vec<(usize, Ty, Ty)>, index: usize, lower: Ty, upper: Ty| {
+            round.push((index, lower, upper));
+        };
+        // `_` shorts: a hole on either side matches anything.
+        if p == Ty::Unknown || q == Ty::Unknown {
+            return true;
+        }
+        // P is an inference parameter → `Q <: P` upper.
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = p
+            && args == ArgListId::EMPTY
+            && let Some(index) = param_index(name)
+        {
+            push(round, index, Ty::Unknown, q);
+            return true;
+        }
+        // Q is an inference parameter → `P <: Q` lower, with the bound gate.
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = q
+            && args == ArgListId::EMPTY
+            && let Some(index) = param_index(name)
+        {
+            let gate_passes = match params[index].1 {
+                None => true,
+                Some(bound) => {
+                    let closed = self.infer_closure(bound, params, true);
+                    self.assignable(p, closed, false) == Some(true)
+                }
+            };
+            if gate_passes {
+                push(round, index, p, Ty::Unknown);
+            }
+            return true;
+        }
+        if p == q {
+            return true;
+        }
+        match (p, q) {
+            (
+                Ty::Named {
+                    name: p_head,
+                    args: p_args,
+                    ..
+                },
+                Ty::Named {
+                    name: q_head,
+                    args: q_args,
+                    ..
+                },
+            ) => {
+                let pool = self.boundary.args.borrow();
+                let (p_args, q_args) = (pool.get(p_args).to_vec(), pool.get(q_args).to_vec());
+                drop(pool);
+                if p_head == q_head {
+                    if p_args.len() != q_args.len() {
+                        return false;
+                    }
+                    // Covariant argwise (the parser drops the written
+                    // variance token, so `inout` faces read covariant —
+                    // under-report against a double-constraint oracle).
+                    for (&pa, &qa) in p_args.iter().zip(q_args.iter()) {
+                        if !self.infer_gather(pa, qa, params, left_schema, round) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                // Different heads: the P-side climbs its super-interface
+                // chain to the Q head and substitutes (`asInstanceOf`).
+                let Some(inst) = self.super_instantiation(p_head, q_head) else {
+                    return false;
+                };
+                if inst.len() != q_args.len() {
+                    return false;
+                }
+                let map: Vec<(StringId, Ty)> = self
+                    .bounds
+                    .container_params(p_head)
+                    .map(|capture| {
+                        capture
+                            .iter()
+                            .map(|(param, _, _)| *param)
+                            .zip(inst.iter().copied())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // `p_args`/`q_args` already materialized above — the map
+                // substitutes the p-side's own parameters through the
+                // super-instantiation.
+                let p_inst_args: Vec<Ty> = p_args
+                    .iter()
+                    .map(|&arg| self.subst_params(arg, &map).unwrap_or(arg))
+                    .collect();
+                for (&pa, &qa) in p_inst_args.iter().zip(q_args.iter()) {
+                    if !self.infer_gather(pa, qa, params, left_schema, round) {
+                        return false;
+                    }
+                }
+                true
+            }
+            (
+                Ty::Function {
+                    shape: p_shape, ..
+                },
+                Ty::Function {
+                    shape: q_shape, ..
+                },
+            ) => {
+                let (p_shape, q_shape) = {
+                    let pool = self.boundary.pool();
+                    (
+                        pool.function_shape(p_shape).clone(),
+                        pool.function_shape(q_shape).clone(),
+                    )
+                };
+                // Return covariant: `P.ret <: Q.ret`.
+                if !self.infer_gather(p_shape.return_ty, q_shape.return_ty, params, left_schema, round)
+                {
+                    return false;
+                }
+                // Positional formals contravariant: `Q.arg <: P.arg`.
+                for (&qa, &pa) in q_shape
+                    .positional
+                    .iter()
+                    .zip(p_shape.positional.iter())
+                {
+                    if !self.infer_gather(qa, pa, params, !left_schema, round) {
+                        return false;
+                    }
+                }
+                // Named formals by name, contravariant; a missing pair fails.
+                for &(qn, qt) in q_shape.named.iter() {
+                    let Some(&(_, pt)) = p_shape.named.iter().find(|&&(pn, _)| pn == qn) else {
+                        return false;
+                    };
+                    if !self.infer_gather(qt, pt, params, !left_schema, round) {
+                        return false;
+                    }
+                }
+                true
+            }
+            (
+                Ty::Record {
+                    shape: p_shape, ..
+                },
+                Ty::Record {
+                    shape: q_shape, ..
+                },
+            ) => {
+                let (p_shape, q_shape) = {
+                    let pool = self.boundary.pool();
+                    (
+                        pool.record_shape(p_shape).clone(),
+                        pool.record_shape(q_shape).clone(),
+                    )
+                };
+                for (&pa, &qa) in p_shape
+                    .positional
+                    .iter()
+                    .zip(q_shape.positional.iter())
+                {
+                    if !self.infer_gather(pa, qa, params, left_schema, round) {
+                        return false;
+                    }
+                }
+                for &(qn, qt) in q_shape.named.iter() {
+                    let Some(&(_, pt)) = p_shape.named.iter().find(|&&(pn, _)| pn == qn) else {
+                        return false;
+                    };
+                    if !self.infer_gather(pt, qt, params, left_schema, round) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // A non-inference pair decides by the ordinary subtype verdict —
+            // the constraint-generator's trailing `isSubtypeOf` fallback
+            // (a ground `int <: num` match contributes no constraint and
+            // keeps the round's other constraints live; a ground failure
+            // rewinds the whole round upstream — the `_tryMatchSubtypeOf`
+            // `success` gate).
+            _ => self.assignable(p, q, false) == Some(true),
+        }
+    }
+
+    /// Merge one gathered round's raw constraints into the solver's
+    /// per-parameter `(lower, upper)` list — `_squashConstraints`'s per-round
+    /// form: `lower = LUB(lowers)`, `upper = GLB(uppers)`, one origin stamp
+    /// per round.
+    fn infer_lub(&self, a: Ty, b: Ty) -> Ty {
+        if a == Ty::Unknown {
+            return b;
+        }
+        if b == Ty::Unknown || a == b {
+            return a;
+        }
+        if a == Ty::Never {
+            return b;
+        }
+        if b == Ty::Never {
+            return a;
+        }
+        // `dynamic`/`void` tops absorb; `Null` joins toward the nullable
+        // partner (the nullability face `LUB(Null, T) = T?`).
+        match (a, b) {
+            (Ty::Dynamic, _) | (Ty::Void, _) => return a,
+            (_, Ty::Dynamic) | (_, Ty::Void) => return b,
+            (Ty::Null, other) | (other, Ty::Null) => {
+                return match other {
+                    Ty::Named {
+                        name, args, ..
+                    } => Ty::Named {
+                        name,
+                        nullable: true,
+                        args,
+                    },
+                    _ => other,
+                };
+            }
+            _ => {}
+        }
+        // Subtype-related pairs collapse to the wider side.
+        if self.assignable(a, b, false) == Some(true) {
+            return b;
+        }
+        if self.assignable(b, a, false) == Some(true) {
+            return a;
+        }
+        // The numeric-builtin face (`LUB(int, double) = num`): `int` and
+        // `double` both declare `extends num`, so the climb below answers
+        // the same face — this arm stands when the clause capture has not
+        // (or cannot) instantiate the pair, keeping the builtin numeric
+        // triangle decidable on its own terms.
+        {
+            let num = self.intern("num");
+            let int = self.intern("int");
+            let double = self.intern("double");
+            let numeric = |ty: Ty| {
+                matches!(ty, Ty::Named { name, nullable: false, args, .. }
+                    if args == ArgListId::EMPTY && (name == int || name == double || name == num))
+            };
+            if numeric(a) && numeric(b) {
+                return Ty::named(num);
+            }
+        }
+        // The declared-supertype climb: `LUB(int, double) = num` — walk
+        // `a`'s declared clause chain for a head both instantiate into.
+        match (a, b) {
+            (
+                Ty::Named {
+                    name: a_head,
+                    args: a_args,
+                    ..
+                },
+                Ty::Named {
+                    name: b_head,
+                    args: b_args,
+                    ..
+                },
+            ) => {
+                let candidates: [StringId; 3] =
+                    [self.intern("num"), self.intern("Object"), self.intern("Comparable")];
+                for target in candidates {
+                    let a_inst = if a_head == target {
+                        Some(
+                            self.boundary
+                                .args
+                                .borrow()
+                                .get(a_args)
+                                .to_vec(),
+                        )
+                    } else {
+                        self.super_instantiation(a_head, target)
+                    };
+                    let b_inst = if b_head == target {
+                        Some(
+                            self.boundary
+                                .args
+                                .borrow()
+                                .get(b_args)
+                                .to_vec(),
+                        )
+                    } else {
+                        self.super_instantiation(b_head, target)
+                    };
+                    let (Some(a_inst), Some(b_inst)) = (a_inst, b_inst) else {
+                        continue;
+                    };
+                    if a_inst.len() != b_inst.len() {
+                        continue;
+                    }
+                    let merged: Vec<Ty> = a_inst
+                        .iter()
+                        .zip(b_inst.iter())
+                        .map(|(&x, &y)| self.infer_lub(x, y))
+                        .collect();
+                    return Ty::Named {
+                        name: target,
+                        nullable: false,
+                        args: self.boundary.intern_list(&merged),
+                    };
+                }
+            }
+            _ => {}
+        }
+        // The function pair joins pointwise (return LUB, formals GLB —
+        // the upstream `FunctionType` LUB's structural arms), shapes of
+        // equal arity only.
+        if let (
+            Ty::Function {
+                shape: a_shape, ..
+            },
+            Ty::Function {
+                shape: b_shape, ..
+            },
+        ) = (a, b)
+        {
+            let (a_shape, b_shape) = {
+                let pool = self.boundary.pool();
+                (
+                    pool.function_shape(a_shape).clone(),
+                    pool.function_shape(b_shape).clone(),
+                )
+            };
+            if a_shape.positional.len() == b_shape.positional.len()
+                && a_shape.named.len() == b_shape.named.len()
+            {
+                let return_ty = self.infer_lub(a_shape.return_ty, b_shape.return_ty);
+                let positional: Vec<Ty> = a_shape
+                    .positional
+                    .iter()
+                    .zip(b_shape.positional.iter())
+                    .map(|(&x, &y)| self.infer_glb(x, y))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = a_shape
+                    .named
+                    .iter()
+                    .filter_map(|&(n, x)| {
+                        b_shape
+                            .named
+                            .iter()
+                            .find(|&&(bn, _)| bn == n)
+                            .map(|&(_, y)| (n, self.infer_glb(x, y)))
+                    })
+                    .collect();
+                if named.len() == a_shape.named.len() {
+                    return self.boundary.args.borrow_mut().function_generic(
+                        &[],
+                        return_ty,
+                        &positional,
+                        &named,
+                        false,
+                    );
+                }
+            }
+        }
+        // Unrelated non-nullable grounds join at `Object` (Dart's LUB of
+        // unrelated classes is the shared supertype — `int`/`String` →
+        // `Object`; `Object` itself when either side is already there).
+        Ty::Named {
+            name: self.intern("Object"),
+            nullable: false,
+            args: ArgListId::EMPTY,
+        }
+    }
+
+    /// The meet half of the merge (`upper = GLB(uppers)`): `_` absorbs,
+    /// the subtype-related pair keeps the narrower side, equal types
+    /// collapse, an unrelated pair reads `Never` (`GLB(String, num)` —
+    //  the `extends`-refine arm's `Never` the oracle prints).
+    fn infer_glb(&self, a: Ty, b: Ty) -> Ty {
+        if a == Ty::Unknown {
+            return b;
+        }
+        if b == Ty::Unknown || a == b {
+            return a;
+        }
+        if a == Ty::Never || b == Ty::Never {
+            return Ty::Never;
+        }
+        if self.assignable(a, b, false) == Some(true) {
+            return a;
+        }
+        if self.assignable(b, a, false) == Some(true) {
+            return b;
+        }
+        Ty::Never
+    }
+
+    /// The instantiate-to-bounds fill (`type_system.dart`'s
+    /// `instantiateTypeFormalsToBounds`): every parameter without a known
+    /// solution falls to its bound, recursively — a bound naming another
+    /// parameter resolves through that parameter's own seed, a cycle
+    /// (`X extends Y`, `Y extends A<X>`) grounds the in-flight leaf to
+    /// `Object?`, and an absent bound reads `dynamic` (the analyzer's
+    /// default for `<T>`). Returns the solved vector in declaration
+    /// order.
+    fn infer_i2b(&self, params: &[(StringId, Option<Ty>)]) -> Vec<Ty> {
+        fn seed(
+            engine: &Engine<'_>,
+            params: &[(StringId, Option<Ty>)],
+            index: usize,
+            out: &mut Vec<Option<Ty>>,
+            visiting: &mut Vec<usize>,
+        ) -> Ty {
+            if let Some(ty) = out[index] {
+                return ty;
+            }
+            if visiting.contains(&index) {
+                // The cycle leaf (`X` inside `A<X>` while `X` resolves):
+                // grounds to `Object?` exactly as the oracle's i2b
+                // recursion break prints it.
+                return Ty::Named {
+                    name: engine.intern("Object"),
+                    nullable: true,
+                    args: ArgListId::EMPTY,
+                };
+            }
+            visiting.push(index);
+            let seed = match params[index].1 {
+                None => Ty::Dynamic,
+                Some(bound) => {
+                    let map: Vec<(StringId, Ty)> = params
+                        .iter()
+                        .enumerate()
+                        .map(|(other, (param, _))| {
+                            let ty = if other == index {
+                                Ty::Unknown
+                            } else {
+                                seed(engine, params, other, out, visiting)
+                            };
+                            (*param, ty)
+                        })
+                        .collect();
+                    engine.subst_params(bound, &map).unwrap_or(bound)
+                }
+            };
+            visiting.pop();
+            out[index] = Some(seed);
+            seed
+        }
+        let mut out: Vec<Option<Ty>> = vec![None; params.len()];
+        let mut visiting: Vec<usize> = Vec::new();
+        for index in 0..params.len() {
+            seed(self, params, index, &mut out, &mut visiting);
+        }
+        out.into_iter().map(|slot| slot.unwrap_or(Ty::Dynamic)).collect()
+    }
+
+    /// One inference round's merged per-parameter constraint — upstream's
+    /// `MergedTypeConstraint` (`lower <: T <: upper`, `_` = `Ty::Unknown`)
+    /// stamped with the round's origin.
+    fn infer_merge_round(
+        &self,
+        params: &[(StringId, Option<Ty>)],
+        raw: &[(usize, Ty, Ty)],
+        origin: usize,
+        constraints: &mut Vec<Vec<InferConstraint>>,
+        fixed: &[bool],
+    ) {
+        let mut lower: Vec<Ty> = vec![Ty::Unknown; params.len()];
+        let mut upper: Vec<Ty> = vec![Ty::Unknown; params.len()];
+        let mut touched: Vec<bool> = vec![false; params.len()];
+        for &(index, l, u) in raw {
+            lower[index] = self.infer_lub(lower[index], l);
+            upper[index] = self.infer_glb(upper[index], u);
+            touched[index] = true;
+        }
+        for index in 0..params.len() {
+            if !touched[index] || fixed[index] {
+                continue;
+            }
+            constraints[index].push(InferConstraint {
+                lower: lower[index],
+                upper: upper[index],
+                origin,
+            });
+        }
+    }
+
+    /// The closure of a SCHEMA — `TypeSchemaEliminationVisitor` (upstream
+    /// `type_system.dart`'s `greatestClosureOfSchema`): every covariant
+    /// `_` becomes the top (`Object?`), every contravariant `_` the bottom
+    /// (`Never`); the least closure swaps them. Unlike `infer_closure`
+    /// (which eliminates the inference's own parameters), this eliminates
+    /// the `_` holes a substituted bound carries.
+    fn infer_schema_closure(&self, ty: Ty, greatest: bool) -> Ty {
+        let object_q = || Ty::Named {
+            name: self.intern("Object"),
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        match ty {
+            Ty::Unknown => {
+                // covariant position: greatest→top, least→bottom.
+                if greatest { object_q() } else { Ty::Never }
+            }
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } if args != ArgListId::EMPTY => {
+                // Same reentrancy guard as `infer_closure`: materialize the
+                // list before the recursive fold re-interns through the pool.
+                let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                let list: Vec<Ty> = list
+                    .iter()
+                    .map(|&arg| self.infer_schema_closure(arg, greatest))
+                    .collect();
+                Ty::Named {
+                    name,
+                    nullable,
+                    args: self.boundary.intern_list(&list),
+                }
+            }
+            Ty::Function { shape, nullable } => {
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                let return_ty = self.infer_schema_closure(pool_shape.return_ty, greatest);
+                let positional: Vec<Ty> = pool_shape
+                    .positional
+                    .iter()
+                    .map(|&t| self.infer_schema_closure(t, !greatest))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = pool_shape
+                    .named
+                    .iter()
+                    .map(|&(n, t)| (n, self.infer_schema_closure(t, !greatest)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .function_generic(
+                        &pool_shape.type_params_named,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+            }
+            Ty::Record { shape, nullable } => {
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.record_shape(shape).clone()
+                };
+                let positional: Vec<Ty> = pool_shape
+                    .positional
+                    .iter()
+                    .map(|&t| self.infer_schema_closure(t, greatest))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = pool_shape
+                    .named
+                    .iter()
+                    .map(|&(n, t)| (n, self.infer_schema_closure(t, greatest)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, nullable)
+            }
+            _ => ty,
+        }
+    }
+
+    /// `_squashConstraints` for one parameter: `lower = LUB(lowers)`,
+    /// `upper = GLB(uppers)` across its recorded rounds.
+    fn infer_squash(&self, cs: &[InferConstraint]) -> (Ty, Ty) {
+        let mut lower = Ty::Unknown;
+        let mut upper = Ty::Unknown;
+        for c in cs {
+            upper = self.infer_glb(upper, c.upper);
+            lower = self.infer_lub(lower, c.lower);
+        }
+        (lower, upper)
+    }
+
+    /// `chooseTypeFromConstraint` (upstream
+    /// `type_analyzer_operations.dart:1015-1074`): prefer the known side —
+    /// lower first for the covariant parameter, upper under a
+    /// contravariant parameter — then the partially-known side closed
+    /// under `grounded` (least closure of a lower schema, greatest of an
+    /// upper), else `_`.
+    fn infer_choose_from(
+        &self,
+        lower: Ty,
+        upper: Ty,
+        params: &[(StringId, Option<Ty>)],
+        grounded: bool,
+    ) -> Ty {
+        let _ = params;
+        if self.infer_known(lower) {
+            return lower;
+        }
+        if self.infer_known(upper) {
+            return upper;
+        }
+        if lower != Ty::Unknown {
+            return if grounded {
+                self.infer_schema_closure(lower, false)
+            } else {
+                lower
+            };
+        }
+        if upper != Ty::Unknown {
+            return if grounded {
+                self.infer_schema_closure(upper, true)
+            } else {
+                upper
+            };
+        }
+        Ty::Unknown
+    }
+
+    /// The invocation's downward-context type: a declaration's written
+    /// annotation or an assignment target's LHS type — the
+    /// `contextReturnType` `setupGenericTypeInference` carries. `_`
+    /// (`Ty::Unknown`) when the send infers context-free.
+    fn infer_send_context(&mut self, callee: usize) -> Ty {
+        if let Some(ctx) = self.pending_decl_ty
+            && ctx != Ty::Unknown
+        {
+            return ctx;
+        }
+        self.assignment_write_ctx(callee)
+            .filter(|ctx| *ctx != Ty::Unknown)
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// The constraint solver's verdict for one invocation — the real
+    /// `GenericInferrer` pipeline (upstream `generic_inferrer.dart`'s
+    /// `tryChooseFinalTypes` + `_checkArgumentsNotMatchingBounds`, and
+    /// `invocation_inferrer.dart`'s setup → args → final sequence):
+    ///
+    /// 1. `constrainReturnType` — the declared return against the
+    ///    send's downward context (declaration annotation or assignment
+    ///    target), `leftSchema` covariant.
+    /// 2. `choosePreliminaryTypes` — per-parameter context-only choice;
+    ///    a known result fixes the parameter (`_typesInferredSoFar`),
+    ///    and later argument constraints on it drop silently — the
+    ///    oracle's `String v = id2(3)` face (the fixed `String` never
+    ///    reports `couldNotInfer`, only `argument_type_not_assignable`).
+    /// 3. `constrainArgument` per argument (with the bound-gate on every
+    ///    `P <: T` lower) — plus `constrainGenericFunctionInContext`
+    ///    for a generic tear-off argument (`inferTearOff`).
+    /// 4. `tryChooseFinalTypes` — squash, choose (bound-merge +
+    ///    extends-merge inside `inferTypeParameterFromAll`), then
+    ///    per-parameter `isSatisfiedBy` over its recorded rounds and the
+    ///    substituted extends clause; the first failing parameter emits
+    ///    `couldNotInfer`'s Tried-to-infer form at the callee name.
+    /// 5. No failures → `_checkArgumentsNotMatchingBounds` — each
+    ///    i2b-completed argument against its substituted bound emits
+    ///    the instantiated-form `couldNotInfer` instead.
+    ///
+    /// `unnamed_creation` suppresses the bare-creation extends-only
+    /// failure — `check_creation_inference`'s i2b face already reported
+    /// that exact row upstream (one `couldNotInfer` per parameter, never
+    /// two). `recv`/`below` carry the qualified callee's receiver identity
+    /// for the downward closure-formal re-bind (`DeferredClosureFormal`
+    /// entries match on `callee_name` + receiver span + argument slot).
+    ///
+    /// Returns the solved argument vector; known entries also fill
+    /// `solutions`'s still-open slots (the substituted-formals and return
+    /// writes below read them — `_` never fills).
+    #[allow(clippy::too_many_arguments)]
+    fn infer_invocation(
+        &mut self,
+        callee: usize,
+        callee_range: SourceRange,
+        callee_spelling: StringId,
+        recv: Option<Receiver>,
+        below: Option<SourceRange>,
+        params: &[(StringId, Option<Ty>)],
+        formals: &Formals,
+        level: &ArgLevel,
+        return_face: Option<Ty>,
+        unnamed_creation: bool,
+        solutions: &mut [Option<Ty>],
+    ) -> Vec<Ty> {
+        let mut constraints: Vec<Vec<InferConstraint>> = vec![Vec::new(); params.len()];
+        let mut origins: Vec<InferOrigin> = Vec::new();
+        let mut fixed: Vec<bool> = vec![false; params.len()];
+        let mut inferred_so_far: Vec<Ty> = vec![Ty::Unknown; params.len()];
+
+        // Round 0 — the downward context (`constrainReturnType`, origin
+        // ReturnType). The declared face folds its aliases first — the
+        // oracle's printed `declared as` is the EXPANDED type (`F<T,T>`
+        // spells `T Function(T)`).
+        if let Some(declared) = return_face {
+            let context = self.infer_send_context(callee);
+            if context != Ty::Unknown {
+                let declared = self.fold_alias_ty(declared);
+                let context = self.fold_alias_ty(context);
+                let origin = origins.len();
+                origins.push(InferOrigin::ReturnType { declared, context });
+                let mut raw = Vec::new();
+                self.infer_gather(declared, context, params, true, &mut raw);
+                self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
+            }
+        }
+
+        // Preliminary choose (`choosePreliminaryTypes`): context-only,
+        // `grounded: false`; known results fix the parameter.
+        for index in 0..params.len() {
+            if inferred_so_far[index] != Ty::Unknown {
+                continue;
+            }
+            let (lower, upper) = self.infer_squash(&constraints[index]);
+            let chosen = self.infer_choose_param(
+                params,
+                index,
+                lower,
+                upper,
+                &inferred_so_far,
+                &mut constraints,
+                &mut origins,
+                false,
+            );
+            inferred_so_far[index] = chosen;
+            if self.infer_known(chosen) {
+                fixed[index] = true;
+            }
+        }
+
+        // The argument rounds: each `constrainArgument` carries its own
+        // Argument origin (`parameterType` = the written formal, the
+        // oracle's `declared as` column). A generic tear-off argument
+        // (the signature's own `<T>` group is non-empty) against a
+        // function-typed formal runs `inferTearOff` instead — its own
+        // inferrer on the tear-off's parameters, anchored at the
+        // argument's node.
+        let mut positional_index = 0usize;
+        for (name, ty, _literal, range) in &level.args {
+            let formal = if let Some(n) = name {
+                self.named_formal_for(&formals, *n)
+            } else {
+                let formal = formals.positional.get(positional_index);
+                positional_index += 1;
+                formal
+            };
+            let Some(formal) = formal else {
+                continue;
+            };
+            // The tear-off/closure signature recovery the upward face
+            // already runs (`arg_sigs` keyed by offset, `level.closures`
+            // by containment) — reused here for both the argument's type
+            // and the `inferTearOff` detection.
+            let arg_sig: Option<Box<FnVarSig>> =
+                self.arg_sigs.get(&range.offset).cloned().or_else(|| {
+                    level
+                        .closures
+                        .iter()
+                        .find(|(start, end, _)| {
+                            range.offset >= *start && range.offset <= *end
+                        })
+                        .map(|(.., sig)| sig.clone())
+                });
+            let arg_ty = if *ty != Ty::Unknown {
+                *ty
+            } else {
+                match &arg_sig {
+                    Some(sig) => {
+                        let mut fty = self.fn_sig_ty(sig);
+                        // The literal closure's `void` STUB return is
+                        // never a real inference — upstream's
+                        // `staticType` reads the body's inferred return
+                        // (`(double x) => 0` is `int Function(double)`,
+                        // and the oracle's origin column prints THAT).
+                        // The tear-off arm keeps its written signature.
+                        if sig.return_ty == Ty::Void
+                            && let Some((lit_start, lit_end)) = level
+                                .closures
+                                .iter()
+                                .find(|(start, end, _)| {
+                                    range.offset >= *start && range.offset <= *end
+                                })
+                                .map(|(start, end, _)| (*start, *end))
+                            && let Some(ret) = self.literal_inferred_return(lit_start, lit_end)
+                            && let Ty::Function {
+                                shape: fn_shape,
+                                nullable: fn_nullable,
+                            } = fty
+                        {
+                            let shape = {
+                                let pool = self.boundary.pool();
+                                pool.function_shape(fn_shape).clone()
+                            };
+                            let positional: Vec<Ty> = shape.positional.to_vec();
+                            let named: Vec<(StringId, Ty)> =
+                                shape.named.iter().map(|(n, t)| (*n, *t)).collect();
+                            fty = self.boundary.args.borrow_mut().function_generic(
+                                &shape.type_params_named,
+                                ret,
+                                &positional,
+                                &named,
+                                fn_nullable,
+                            );
+                        }
+                        fty
+                    }
+                    // #2516: the solve-only member-read answer — an
+                    // element-bearing accessor/getter argument constrains
+                    // the call's parameters through its resolved return,
+                    // while `level.args` keeps `Unknown` for the verdict.
+                    None => match self.solve_arg_member_ty(range.offset) {
+                        Some(ty) => ty,
+                        None => continue,
+                    },
+                }
+            };
+            if arg_ty == Ty::Unknown {
+                continue;
+            }
+            // `inferFunctionTypeInstantiation`: a GENERIC argument's
+            // signature infers against the formal's function context —
+            // its own solve (origin FunctionContext), reported at the
+            // argument's own range. The instantiated signature then feeds
+            // the outer `constrainArgument` round exactly as upstream's
+            // `inferTearOff` return value does — the generic argument's
+            // chosen types constrain the call's own parameters.
+            let tear_params = self.tear_off_arg_params(range.offset);
+            if let Some(sig) = &arg_sig
+                && !tear_params.as_ref().is_none_or(|p| p.is_empty())
+                && let Ty::Function { .. } = self.fold_alias_ty(formal.ty)
+            {
+                let mut sig = (**sig).clone();
+                if let Some(p) = tear_params {
+                    sig.params = p;
+                }
+                let origin = origins.len();
+                origins.push(InferOrigin::Argument {
+                    parameter: formal.name,
+                    declared: self.fold_alias_ty(formal.ty),
+                    argument: arg_ty,
+                });
+                if let Some(instantiated) = self.infer_tear_off(&sig, formal.ty, *range) {
+                    let mut raw = Vec::new();
+                    self.infer_gather(instantiated, formal.ty, params, false, &mut raw);
+                    self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
+                }
+                continue;
+            }
+            let origin = origins.len();
+            origins.push(InferOrigin::Argument {
+                parameter: formal.name,
+                declared: self.fold_alias_ty(formal.ty),
+                argument: arg_ty,
+            });
+            let mut raw = Vec::new();
+            self.infer_gather(arg_ty, formal.ty, params, false, &mut raw);
+            self.infer_merge_round(params, &raw, origin, &mut constraints, &fixed);
+        }
+
+        // Final choose (`tryChooseFinalTypes`): the same per-parameter
+        // solve, `grounded: true`, then the per-parameter satisfaction
+        // check — a failing parameter emits the Tried-to-infer form.
+        let mut inferred: Vec<Ty> = Vec::with_capacity(params.len());
+        for index in 0..params.len() {
+            let chosen = if fixed[index] && self.infer_known(inferred_so_far[index]) {
+                inferred_so_far[index]
+            } else {
+                let (lower, upper) = self.infer_squash(&constraints[index]);
+                self.infer_choose_param(
+                    params,
+                    index,
+                    lower,
+                    upper,
+                    &inferred,
+                    &mut constraints,
+                    &mut origins,
+                    true,
+                )
+            };
+            inferred.push(chosen);
+        }
+
+        let mut reported = false;
+        for index in 0..params.len() {
+            let inferred_ty = inferred[index];
+            let mut success = constraints[index]
+                .iter()
+                .all(|c| self.infer_satisfied(c, inferred_ty));
+            if success && let Some(raw_bound) = params[index].1 {
+                let map: Vec<(StringId, Ty)> = params
+                    .iter()
+                    .zip(inferred.iter())
+                    .map(|((param, _), ty)| (*param, *ty))
+                    .collect();
+                let bound = self.subst_params(raw_bound, &map).unwrap_or(raw_bound);
+                let origin = origins.len();
+                origins.push(InferOrigin::ExtendsClause {
+                    parameter: params[index].0,
+                    raw_bound,
+                    bound,
+                });
+                let extends = InferConstraint {
+                    lower: Ty::Unknown,
+                    upper: bound,
+                    origin,
+                };
+                constraints[index].push(extends.clone());
+                success = self.infer_satisfied(&extends, inferred_ty);
+            }
+            // Creation dedup: `check_creation_inference` already reported
+            // the bare-creation bound-seed failure (the i2b face walks the
+            // same extends arm). When this solve's ONLY unsatisfied
+            // origins are ExtendsClauses, the seam's row is byte-identical
+            // — emit nothing a second time (`B()` where `B<X extends B<X>>`
+            // would otherwise double-report).
+            if !success
+                && unnamed_creation
+                && constraints[index].iter().all(|c| {
+                    self.infer_satisfied(c, inferred_ty)
+                        || matches!(origins[c.origin], InferOrigin::ExtendsClause { .. })
+                })
+            {
+                continue;
+            }
+            
+            if !success {
+                let detail = self.infer_format_error(params[index].0, inferred_ty, &constraints[index], &origins);
+                let parameter = self.strings.resolve(params[index].0).to_string();
+                let message = SemanticCode::CouldNotInfer.message(&parameter, &detail);
+                self.emit_message_with_correction(SemanticCode::CouldNotInfer, callee_range, message);
+                reported = true;
+            }
+        }
+
+        if !reported {
+            // `_checkArgumentsNotMatchingBounds`: the i2b-completed
+            // arguments against each parameter's substituted bound —
+            // the instantiated-form report, anchored identically.
+            let result = self.infer_i2b_full(params, &inferred);
+            for index in 0..params.len() {
+                let Some(raw_bound) = params[index].1 else {
+                    continue;
+                };
+                let argument = result[index];
+                let map: Vec<(StringId, Ty)> = params
+                    .iter()
+                    .zip(result.iter())
+                    .map(|((param, _), ty)| (*param, *ty))
+                    .collect();
+                let bound = self.subst_params(raw_bound, &map).unwrap_or(raw_bound);
+                if self.assignable(argument, bound, false) == Some(true) {
+                    continue;
+                }
+                let argument_text = self.ty_display(argument);
+                let bound_text = self.ty_display(bound);
+                let raw_text = self.ty_display(raw_bound);
+                let list: Vec<String> = result.iter().map(|&ty| self.ty_display(ty)).collect();
+                let detail = format!(
+                    "\n'{argument_text}' doesn't conform to the bound '{bound_text}', \
+                     instantiated from '{raw_text}' using type arguments [{}].",
+                    list.join(", ")
+                );
+                let parameter = self.strings.resolve(params[index].0).to_string();
+                let message = SemanticCode::CouldNotInfer.message(&parameter, &detail);
+                self.emit_message_with_correction(
+                    SemanticCode::CouldNotInfer,
+                    callee_range,
+                    message,
+                );
+            }
+        }
+
+        // Solved parameters fill the still-open solution slots — the
+        // substituted-formals and return writes below read them
+        // (`_typesInferredSoFar`'s winners alone; `_` never fills).
+        for (index, slot) in solutions.iter_mut().enumerate() {
+            if slot.is_none()
+                && index < inferred.len()
+                && self.infer_known(inferred[index])
+            {
+                *slot = Some(inferred[index]);
+            }
+        }
+        inferred
+    }
+
+    /// `inferTypeParameterFromContext`/`inferTypeParameterFromAll`'s
+    /// shared body: `chooseTypeFromConstraint` over the squashed
+    /// `(lower, upper)`, then — when the raw choice is known — the
+    /// bound-merge (`lower <: bound` gathers constraints into the OTHER
+    /// parameters' sets) and the extends-clause merge (the substituted
+    /// bound joins the parameter's upper). `preliminary` selects the
+    /// non-grounded choose arm.
+    #[allow(clippy::too_many_arguments)]
+    fn infer_choose_param(
+        &mut self,
+        params: &[(StringId, Option<Ty>)],
+        index: usize,
+        lower: Ty,
+        upper: Ty,
+        inferred_prior: &[Ty],
+        constraints: &mut Vec<Vec<InferConstraint>>,
+        origins: &mut Vec<InferOrigin>,
+        preliminary: bool,
+    ) -> Ty {
+        let grounded = !preliminary;
+        let chosen = self.infer_choose_from(lower, upper, params, grounded);
+        if preliminary && !self.infer_known(chosen) {
+            return chosen;
+        }
+        let mut lower = lower;
+        let mut upper = upper;
+        // `mergeInConstraintsFromBound`: only when a real lower and a
+        // declared bound both stand — `lower <: bound` gathers fresh
+        // constraints (into `constraints`, origin ExtendsClause over
+        // THIS parameter's bound), and its own returned constraint
+        // merges back into this parameter's.
+        if lower != Ty::Unknown
+            && let Some(raw_bound) = params[index].1
+        {
+            let origin = origins.len();
+            origins.push(InferOrigin::ExtendsClause {
+                parameter: params[index].0,
+                raw_bound,
+                bound: raw_bound,
+            });
+            let mut raw = Vec::new();
+            // The bound's OWN spelling matches against the lower — the
+            // raw declared face (`T1 Function(T1)`), not the closure.
+            self.infer_gather(lower, raw_bound, params, true, &mut raw);
+            let mut lower_new = Ty::Unknown;
+            let mut upper_new = Ty::Unknown;
+            for &(target, l, u) in &raw {
+                lower_new = self.infer_lub(lower_new, l);
+                upper_new = self.infer_glb(upper_new, u);
+                if target == index {
+                    continue;
+                }
+                // Cross-parameter propagation: the bound's constraint on
+                // ANOTHER parameter merges into that parameter's set
+                // (`f(C())` → `B` through `X extends A<X>`).
+                constraints[target].push(InferConstraint {
+                    lower: l,
+                    upper: u,
+                    origin,
+                });
+            }
+            // The bound's self-constraint merges back (an ExtendsClause-
+            // stamped bound face on the parameter itself).
+            lower = self.infer_lub(lower, lower_new);
+            upper = self.infer_glb(upper, upper_new);
+        }
+        // The extends-clause merge: the bound substituted with the
+        // already-chosen parameters joins the upper (`Func1<_,_>` under
+        // an unchosen sibling).
+        if let Some(raw_bound) = params[index].1 {
+            let map: Vec<(StringId, Ty)> = params
+                .iter()
+                .enumerate()
+                .map(|(other, (param, _))| {
+                    let ty = inferred_prior
+                        .get(other)
+                        .copied()
+                        .unwrap_or(Ty::Unknown);
+                    (*param, ty)
+                })
+                .collect();
+            let bound = self.subst_params(raw_bound, &map).unwrap_or(raw_bound);
+            upper = self.infer_glb(upper, bound);
+        }
+        self.infer_choose_from(lower, upper, params, grounded)
+    }
+
+    /// `MergedTypeConstraint::isSatisfiedBy`: `inferred <: upper` AND
+    /// `lower <: inferred` — a `_` side accepts everything. The ordinary
+    /// subtype verdict answers both; an undecidable pair reads satisfied
+    /// (the under-report posture — a wrongly-decided `false` invents a
+    /// `couldNotInfer` the oracle never printed).
+    fn infer_satisfied(&self, c: &InferConstraint, inferred: Ty) -> bool {
+        let upper_ok = c.upper == Ty::Unknown
+            || self.assignable(inferred, c.upper, false) != Some(false);
+        let lower_ok = c.lower == Ty::Unknown
+            || self.assignable(c.lower, inferred, false) != Some(false);
+        // The `Object` fallback's own face: the merged answer `Object`
+        // satisfies only `Object`/`Object?`/`dynamic`-headed uppers — a
+        // concrete head's ask is decidable-false even when the head's
+        // supertype chain cannot complete in this model's scope (the
+        // names-only `Object` stub has no `double` climb).
+        if upper_ok
+            && let (
+                Ty::Named { name: i_head, nullable: false, .. },
+                Ty::Named {
+                    name: u_head,
+                    nullable: u_nullable,
+                    ..
+                },
+            ) = (inferred, c.upper)
+            && i_head == self.intern("Object")
+            && u_head != i_head
+            && !u_nullable
+        {
+            return false;
+        }
+        upper_ok && lower_ok
+    }
+
+    /// `_formatError` (upstream `generic_inferrer.dart:538-585`): the
+    /// Tried-to-infer intro, the unsatisfied origins block, then "The
+    /// type 'I' was inferred from:" + the satisfied block — each block
+    /// the `_formatConstraints` column layout (prefix padded to the
+    /// widest, the `end` part on a second indented line), duplicate
+    /// lines deduped.
+    fn infer_format_error(
+        &self,
+        parameter: StringId,
+        inferred: Ty,
+        constraints: &[InferConstraint],
+        origins: &[InferOrigin],
+    ) -> String {
+        let inferred_text = self.ty_display(inferred);
+        let parameter_name = self.strings.resolve(parameter).to_string();
+        // Group constraints by origin; an origin is unsatisfied when ANY
+        // of its constraints fails the inferred type.
+        let mut order: Vec<usize> = Vec::new();
+        let mut satisfied: Vec<bool> = Vec::new();
+        for c in constraints {
+            match order.iter().position(|&o| o == c.origin) {
+                Some(slot) => {
+                    satisfied[slot] =
+                        satisfied[slot] && self.infer_satisfied(c, inferred);
+                }
+                None => {
+                    order.push(c.origin);
+                    satisfied.push(self.infer_satisfied(c, inferred));
+                }
+            }
+        }
+        let format_lines = |want: bool| -> String {
+            let parts: Vec<Vec<String>> = order
+                .iter()
+                .zip(satisfied.iter())
+                .filter(|&(_, s)| *s == want)
+                .map(|(&o, _)| origins[o].format_error(self))
+                .collect();
+            let prefix_max = parts
+                .iter()
+                .map(|p| p.first().map(|s| s.len()).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            let mut seen: Vec<String> = Vec::new();
+            for p in parts {
+                let prefix = p.first().cloned().unwrap_or_default();
+                let middle = p.get(1).cloned().unwrap_or_default();
+                let mut line = format!(
+                    "  {prefix}{} {middle}",
+                    " ".repeat(prefix_max.saturating_sub(prefix.len()))
+                );
+                if let Some(end) = p.get(2) {
+                    line.push_str(&format!("\n  {} {end}", " ".repeat(prefix_max)));
+                }
+                if !seen.contains(&line) {
+                    seen.push(line);
+                }
+            }
+            seen.join("\n")
+        };
+        let unsatisfied = format_lines(false);
+        let satisfied_text = format_lines(true);
+        let mut detail = format!(
+            "\n\nTried to infer '{inferred_text}' for '{parameter_name}' which doesn't work:\n{unsatisfied}"
+        );
+        if !satisfied_text.is_empty() {
+            detail.push_str(&format!(
+                "\n\nThe type '{inferred_text}' was inferred from:\n{satisfied_text}"
+            ));
+        }
+        detail.push_str("\n\nConsider passing explicit type argument(s) to the generic.\n\n");
+        detail
+    }
+
+    /// The generic tear-off argument's own solve
+    /// (`inferFunctionTypeInstantiation` → `constrainGenericFunctionInContext`
+    /// — `invocation_inference_helper.dart:122`): the argument's signature
+    /// minus its type-parameter group infers against the formal's context
+    /// type; a failure reports `couldNotInfer` at the argument with the
+    /// FunctionContext origin. Returns the signature's chosen instantiation
+    /// — upstream feeds it into the outer `constrainArgument` round as the
+    /// argument's type (`inferTearOff`'s return), `None` only when the
+    /// signature never was a function type.
+    fn infer_tear_off(&mut self, sig: &FnVarSig, context_ty: Ty, range: SourceRange) -> Option<Ty> {
+        let context = self.fold_alias_ty(context_ty);
+        let fn_ty = self.fn_sig_ty(sig);
+        let params: Vec<(StringId, Option<Ty>)> = sig.params.to_vec();
+        // The context strips its own `<T>` group upstream only when the
+        // CONTEXT is generic — ours never is here (the formal's written
+        // type). `constrainGenericFunctionInContext` rebuilds the fn type
+        // WITHOUT its type formals (`inferFnType`): the written
+        // parameters/formals still spell `T`, and the gather's Q-side
+        // parameter arm matches them through `params` — so the
+        // context-side leaf binds lowers, the fn-side leaf binds uppers.
+        let mut constraints: Vec<Vec<InferConstraint>> = vec![Vec::new(); params.len()];
+        let mut origins = vec![InferOrigin::FunctionContext {
+            function: fn_ty,
+            context,
+        }];
+        let mut raw = Vec::new();
+        let infer_fn = {
+            let pool_shape = {
+                let pool = self.boundary.pool();
+                match fn_ty {
+                    Ty::Function { shape, .. } => pool.function_shape(shape).clone(),
+                    _ => return None,
+                }
+            };
+            // Re-intern the shape without its own param group —
+            // `inferFnType`'s `typeParameters: const []` fold: the
+            // parts keep their `T` spellings (they ARE the schema
+            // holes the gather matches).
+            self.boundary
+                .args
+                .borrow_mut()
+                .function_generic(
+                    &[],
+                    pool_shape.return_ty,
+                    &pool_shape.positional,
+                    &pool_shape.named,
+                    matches!(fn_ty, Ty::Function { nullable: true, .. }),
+                )
+        };
+        // `fnType <: contextType` covariant — the fn type's pieces are
+        // the schema (`leftSchema: true` keeps `P`-side upper arms live
+        // for the signature's own parameters).
+        self.infer_gather(infer_fn, context, &params, true, &mut raw);
+        let fixed = vec![false; params.len()];
+        self.infer_merge_round(&params, &raw, 0, &mut constraints, &fixed);
+        let mut inferred: Vec<Ty> = Vec::with_capacity(params.len());
+        for index in 0..params.len() {
+            let (lower, upper) = self.infer_squash(&constraints[index]);
+            inferred.push(self.infer_choose_param(
+                &params,
+                index,
+                lower,
+                upper,
+                &inferred,
+                &mut constraints,
+                &mut origins,
+                false,
+            ));
+        }
+        let mut reported = false;
+        for index in 0..params.len() {
+            let ok = constraints[index]
+                .iter()
+                .all(|c| self.infer_satisfied(c, inferred[index]));
+            if !ok {
+                let detail = self.infer_format_error(
+                    params[index].0,
+                    inferred[index],
+                    &constraints[index],
+                    &origins,
+                );
+                let parameter = self.strings.resolve(params[index].0).to_string();
+                let message = SemanticCode::CouldNotInfer.message(&parameter, &detail);
+                self.emit_message_with_correction(SemanticCode::CouldNotInfer, range, message);
+                reported = true;
+            }
+        }
+        let _ = reported;
+        // The instantiated signature the outer `constrainArgument` consumes:
+        // the parameter-free shape with the solve's choices substituted —
+        // upstream's `inferTearOff` return value. `_` leftovers substitute
+        // nothing (a failed or partial solve keeps the schema leaf, which
+        // the outer gather matches no constraint against).
+        let map: Vec<(StringId, Ty)> = params
+            .iter()
+            .zip(inferred.iter())
+            .map(|((param, _), ty)| (*param, *ty))
+            .collect();
+        self.subst_params(infer_fn, &map)
+    }
+
+    /// The downward closure-formal re-bind's scan half (#2500): every
+    /// literal-closure argument whose signature carries untyped formals
+    /// re-derives the callee formal's substituted function-shape entry —
+    /// the solver's downward answer the pass-1 `closure_param_context_ty`
+    /// could not count — and writes `rebound_locals` for the matching
+    /// `DeferredClosureFormal`. Runs for any send with a receiver (a
+    /// generic or an inherited-non-generic member): `NodeList<Annotation>
+    /// .where((annotation) => …)` needs only the receiver env (no callee
+    /// parameters), which `closure_callee_params` supplies through the
+    /// `member_recv_env` climb. `solutions` carries the callee's own
+    /// inference merge when the send had parameters.
+    fn infer_rebind_closure_formals(
+        &mut self,
+        callee_spelling: StringId,
+        recv: Option<Receiver>,
+        below: Option<SourceRange>,
+        params: &[(StringId, Option<Ty>)],
+        solutions: &[Option<Ty>],
+        level: &ArgLevel,
+        formals: &Formals,
+    ) {
+        let Some(recv) = recv else {
+            return;
+        };
+        if self.deferred_closure_formals.is_empty() {
+            return;
+        }
+        let mut map: Vec<(StringId, Ty)> = params
+            .iter()
+            .zip(solutions.iter())
+            .filter_map(|((param, _), solution)| solution.map(|ty| (*param, ty)))
+            .collect();
+        if let Some((_, seeds, _)) = self.closure_callee_params(&recv, callee_spelling) {
+            for (name, ty) in seeds {
+                if !map.iter().any(|(param, _)| *param == name) {
+                    map.push((name, ty));
+                }
+            }
+        }
+        let mut positional_index = 0usize;
+        for (name, _, _literal, range) in &level.args {
+            let formal = if let Some(n) = name {
+                self.named_formal_for(formals, *n)
+            } else {
+                let formal = formals.positional.get(positional_index);
+                positional_index += 1;
+                formal
+            };
+            let slot = match name {
+                Some(n) => SchemaSlot::Named(*n),
+                None => SchemaSlot::Positional(positional_index.saturating_sub(1)),
+            };
+            let Some(formal) = formal else {
+                continue;
+            };
+            // Only literal closures with untyped formals need the re-bind —
+            // `arg_sigs`/`level.closures` recover the literal's written
+            // signature; `Unknown` slots are the capture's open spots the
+            // downward answer fills.
+            let arg_sig: Option<Box<FnVarSig>> =
+                self.arg_sigs.get(&range.offset).cloned().or_else(|| {
+                    level
+                        .closures
+                        .iter()
+                        .find(|(start, end, _)| {
+                            range.offset >= *start && range.offset <= *end
+                        })
+                        .map(|(.., sig)| sig.clone())
+                });
+            let Some(sig) = arg_sig else {
+                continue;
+            };
+            if !sig.params.is_empty() {
+                continue;
+            }
+            let needs = sig.positional.iter().any(|&t| t == Ty::Unknown)
+                || sig.named.iter().any(|&(_, t, _)| t == Ty::Unknown);
+            if !needs {
+                continue;
+            }
+            let formal_ty = self.fold_alias_ty(formal.ty);
+            let substituted = self.subst_params(formal_ty, &map).unwrap_or(formal_ty);
+            let Ty::Function { shape, .. } = substituted else {
+                continue;
+            };
+            let shape = {
+                let pool = self.boundary.pool();
+                pool.function_shape(shape).clone()
+            };
+            for (index, &written) in sig.positional.iter().enumerate() {
+                if written != Ty::Unknown {
+                    continue;
+                }
+                let Some(&entry) = shape.positional.get(index) else {
+                    continue;
+                };
+                if !self.infer_known(entry) {
+                    continue;
+                }
+                self.infer_bind_closure_formal(
+                    callee_spelling,
+                    below,
+                    slot,
+                    SchemaSlot::Positional(index),
+                    entry,
+                );
+            }
+            for &(label, written, _) in sig.named.iter() {
+                if written != Ty::Unknown {
+                    continue;
+                }
+                let Some(&(_, entry)) = shape.named.iter().find(|&&(n, _)| n == label) else {
+                    continue;
+                };
+                if !self.infer_known(entry) {
+                    continue;
+                }
+                self.infer_bind_closure_formal(
+                    callee_spelling,
+                    below,
+                    slot,
+                    SchemaSlot::Named(label),
+                    entry,
+                );
+            }
+        }
+    }
+
+    /// The literal closure's inferred return for the constraint gather
+    /// (#2516): `FnVarSig.return_ty` is a `void` STUB
+    /// (`closure_capture_end` hardcodes it — the capture never runs
+    /// return-type inference), while upstream's `staticType` reads the
+    /// body's inferred return (`(double x) => 0` is `int
+    /// Function(double)`, and the oracle's origin line prints THAT). The
+    /// body rows inside the literal's own span carry the expression
+    /// types — the last expression row answers for an `=>` literal and
+    /// approximates a block literal's tail. `None` keeps the stub.
+    fn literal_inferred_return(&self, start: u32, end: u32) -> Option<Ty> {
+        // The body's expression row, when it survived the fold (`=> expr`
+        // literals leave the expression's own row inside the literal
+        // span); a primitive literal token is typed by its lexeme.
+        if let Some(row) = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.offset >= start && row.range.end() <= end
+                && matches!(row.intent, Intent::Read | Intent::Invoke | Intent::Operator(..)))
+        {
+            let ty = self.expression_row_ty(row);
+            if ty != Ty::UNKNOWN {
+                return Some(ty);
+            }
+        }
+        // The folded literal: the `=>`-tail lexeme answers the primitive
+        // face (`=> 0` infers `int`, `=> 'x'` `String`, `=> true` `bool`)
+        // — upstream's `staticType` for the trivial expression bodies
+        // the constraint origin column prints verbatim.
+        // The `level.closures` (start, end) pair ends at the literal's
+        // `=>`/head boundary — the body sits AFTER it. Scan forward from
+        // the `=>` to the argument-list separator (`)`/`,`/`;` at paren
+        // depth 0) and classify the primitive lexeme.
+        let start = self.byte_of(start);
+        let text = self.source.get(start..)?;
+        
+        let tail = text.split("=>").nth(1)?.trim_start();
+        let ty = if tail.starts_with('\'') || tail.starts_with('"')
+            || tail.starts_with("r'") || tail.starts_with("r\"")
+        {
+            self.intern("String")
+        } else {
+            let head = tail
+                .split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '_'))
+                .next()?;
+            if head.parse::<i64>().is_ok() {
+                self.intern("int")
+            } else if head.parse::<f64>().is_ok() {
+                self.intern("double")
+            } else if head == "true" || head == "false" {
+                self.intern("bool")
+            } else {
+                return None;
+            }
+        };
+        Some(Ty::named(ty))
+    }
+
+    /// The generic tear-off argument's own `<T>` group, recovered from
+    /// the argument row's spelled callee — `tear_off_sig` keeps
+    /// `params` empty on purpose (every other consumer reads the
+    /// signature's identity, and a non-empty group would re-route them
+    /// as inference subjects), so the `inferTearOff` solve looks the
+    /// declaration up by name: `type_param_names` for the spellings, the
+    /// `exec_bounds` window for any paired declared bound the oracle's
+    /// FunctionContext origin spells.
+    fn tear_off_arg_params(&self, offset: u32) -> Option<Box<[(StringId, Option<Ty>)]>> {
+        let row = self.rows.iter().find(|row| row.range.offset == offset)?;
+        let decl = self.top_level_decl(row.name)?;
+        if decl.type_param_names.is_empty() {
+            return None;
+        }
+        let bounds = self.exec_bounds.get(&row.name);
+        Some(
+            decl.type_param_names
+                .iter()
+                .map(|name| {
+                    let bound = bounds
+                        .and_then(|window| window.iter().find(|(param, _)| param == name))
+                        .and_then(|(_, bound)| *bound);
+                    (*name, bound)
+                })
+                .collect(),
+        )
+    }
+
+    /// #2516 — the solve-only argument type: a member-read argument whose
+    /// merged Value row kept `Unknown` at capture (`flush_argument` types
+    /// the multi-row window `Unknown` by design — the assignability
+    /// verdict must keep that posture) still owes the constraint gather
+    /// its accessor answer. Reads `member_reads` (offset-sorted), rebuilds
+    /// the read's row like `apply_deferred_rebinds` does, and re-derives
+    /// its static type — consumed ONLY by `infer_invocation`'s
+    /// `constrainArgument` rounds and the `unify_upward` pass in
+    /// `check_arguments`, never by `level.args`, so the verdict face sees
+    /// exactly the same `Unknown` it saw before (the prior
+    /// `typed_argument_row` attempt regressed by lending the typed answer
+    /// to the verdict). `None` keeps the under-report for any argument
+    /// that is not a member read/send.
+    fn solve_arg_member_ty(&mut self, offset: u32) -> Option<Ty> {
+        let index = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&offset))
+            .ok()?;
+        let read = self.member_reads[index];
+        let name = self.strings.resolve(read.name);
+        let units: u32 = if name.is_ascii() {
+            name.len() as u32
+        } else {
+            name.chars().map(char::len_utf16).sum::<usize>() as u32
+        };
+        let invoked = self.byte_at(read.offset + units) == Some(b'(');
+        let row = Row {
+            name: read.name,
+            range: SourceRange {
+                offset: read.offset,
+                length: 0,
+            },
+            qualified: true,
+            shape: RowShape::Member { recv: read.recv },
+            intent: if invoked {
+                Intent::Invoke
+            } else {
+                Intent::Read
+            },
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        };
+        let ty = if invoked {
+            self.expression_row_ty(&row)
+        } else {
+            self.initializer_read_ty(&row)
+        };
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
+    /// One closure formal's downward re-bind (#2500): the deferred entry
+    /// the pass-1 schema face staged (`closure_param_context_ty` pushes a
+    /// `DeferredClosureFormal` for every unsolved literal formal whose
+    /// callee qualified) matches on the callee identity + receiver span +
+    /// argument-list slot + the formal's own schema slot; the solved entry
+    /// joins `rebound_locals` so the pass-2 read-type re-derive and the
+    /// `unused_element` tally both see the real type.
+    fn infer_bind_closure_formal(
+        &mut self,
+        callee_spelling: StringId,
+        below: Option<SourceRange>,
+        slot: SchemaSlot,
+        formal: SchemaSlot,
+        entry: Ty,
+    ) {
+        let Some(below) = below else {
+            return;
+        };
+        let Some(index) = self
+            .deferred_closure_formals
+            .iter()
+            .position(|d| {
+                d.callee_name == callee_spelling
+                    && d.below == below
+                    && match (d.slot, slot) {
+                        (SchemaSlot::Positional(a), SchemaSlot::Positional(b)) => a == b,
+                        (SchemaSlot::Named(a), SchemaSlot::Named(b)) => a == b,
+                        _ => false,
+                    }
+                    && match (d.formal, formal) {
+                        (SchemaSlot::Positional(a), SchemaSlot::Positional(b)) => a == b,
+                        (SchemaSlot::Named(a), SchemaSlot::Named(b)) => a == b,
+                        _ => false,
+                    }
+            })
+        else {
+            return;
+        };
+        let d = &self.deferred_closure_formals[index];
+        let (decl_offset, parse_ty) = (d.decl_offset, d.parse_ty);
+        if parse_ty != Ty::Unknown && parse_ty == entry {
+            return;
+        }
+        // The pass-2 re-bind keeps its own entry: when its schema re-derive
+        // answers, its `narrows` gate may replace this write with the
+        // deferred lane's own verdict (equal or narrower) — last writer
+        // wins and both solve the member.
+        self.rebound_locals.insert(decl_offset, (parse_ty, entry));
+    }
+
+    /// `instantiateTypeFormalsToBounds` over the inference result —
+    /// `tryChooseFinalTypes`'s `result`: known inferred types stay, the
+    /// `_` leftovers fill from the i2b seeds (the
+    /// `_checkArgumentsNotMatchingBounds` argument vector).
+    fn infer_i2b_full(
+        &self,
+        params: &[(StringId, Option<Ty>)],
+        inferred: &[Ty],
+    ) -> Vec<Ty> {
+        let mut result: Vec<Ty> = inferred.to_vec();
+        // i2b seeds only where inference left `_`.
+        let need_seed: Vec<bool> = inferred
+            .iter()
+            .map(|&ty| !self.infer_known(ty))
+            .collect();
+        if !need_seed.iter().any(|&n| n) {
+            return result;
+        }
+        // Reuse the raw i2b fixpoint for the open slots.
+        let seeds = self.infer_i2b(params);
+        for index in 0..params.len() {
+            if need_seed[index] {
+                result[index] = seeds[index];
+            }
+        }
+        result
     }
 
     /// A member send's inference parameters and receiver-side seeds —
@@ -8058,6 +9942,32 @@ impl<'a> Engine<'a> {
         {
             decl_bounds = Some(bounds);
         }
+        // #2516 robustness: a same-file top-level generic callee whose
+        // `exec_bounds` window never paired (the bounds capture can miss
+        // when a header's `<T>` group closes through a path the pairing
+        // latch does not see — the element model's declaration is
+        // complete regardless) falls back to the projected declaration's
+        // own parameter spellings — the same source
+        // `closure_callee_params`'s foreign arm reads. Receiver/member
+        // sends and member-owned bare callees never reach here: their
+        // parameters already answered above or belong to the method's
+        // own table.
+        if exec_params.is_none()
+            && matches!(&row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+            && !row.qualified
+            && !member_owns_callee
+            && let Some(decl) = self.top_level_decl(callee_spelling)
+            && decl.type_param_names.len() == usize::from(decl.type_params)
+            && !decl.type_param_names.is_empty()
+        {
+            let params: Vec<(StringId, Option<Ty>)> = decl
+                .type_param_names
+                .iter()
+                .map(|name| (*name, None))
+                .collect();
+            decl_bounds = Some(params.iter().copied().collect());
+            exec_params = Some(params.into());
+        }
         // The count decisions. The parser's total is exact where the row
         // recovery is not, so the positional supply is the total less the
         // named entries (the same given-count the usage index records); a
@@ -8255,6 +10165,7 @@ impl<'a> Engine<'a> {
                 .collect();
             self.check_call_type_arg_bounds(&params, args);
         }
+        
         if let Some(params) = &exec_params {
             let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
             // The explicit fix precedes every inference face.
@@ -8441,7 +10352,14 @@ impl<'a> Engine<'a> {
                         });
                     match sig {
                         Some(sig) => self.fn_sig_ty(&sig),
-                        None => continue,
+                        // #2516: solve-only — a member-read/getter
+                        // argument's resolved return constrains the
+                        // parameters; `level.args` keeps `Unknown` for the
+                        // assignability verdict.
+                        None => match self.solve_arg_member_ty(range.offset) {
+                            Some(ty) => ty,
+                            None => continue,
+                        },
                     }
                 };
                 if arg_ty != Ty::Unknown {
@@ -8472,6 +10390,119 @@ impl<'a> Engine<'a> {
                 }
             }
             disagreed = poisoned;
+            // The real constraint solve (#2938): `GenericInferrer`'s
+            // gather → choose → check pipeline. Written type arguments
+            // bypass it entirely (upstream's `typeArgumentList != null`
+            // arm never builds an inferrer); the narrow creation seam
+            // above keeps its own pinned outer-call shape — every other
+            // send with inference parameters runs here. The solved types
+            // fill the still-open slots (the substituted formals the
+            // argument walk checks and the instantiated return write
+            // consume them).
+            if explicit_args.is_none() {
+                
+                let infer_below = self
+                    .rows
+                    .get(callee)
+                    .filter(|row| row.qualified)
+                    .and_then(|_| callee.checked_sub(1))
+                    .and_then(|index| self.rows.get(index))
+                    .map(|row| row.range);
+                self.infer_invocation(
+                    callee,
+                    callee_range,
+                    callee_spelling,
+                    send_recv,
+                    infer_below,
+                    params,
+                    &formals,
+                    &level,
+                    return_face,
+                    unnamed_creation,
+                    &mut solutions,
+                );
+            }
+        }
+        // The downward closure-formal re-bind (#2500): literal closure
+        // arguments with untyped formals were staged as
+        // `DeferredClosureFormal` when the pass-1 schema face could not
+        // solve the callee's substituted signature. Now that the send
+        // closed, the callee's formals + the merged solutions answer the
+        // open formal slots — bind them into `rebound_locals` so the
+        // `unused_element` tally sees the member read through the typed
+        // formal. Runs regardless of `exec_params`: a non-generic member
+        // (e.g. `NodeList<Annotation>.where` inherited from `Iterable`)
+        // yields no inference parameters yet still owes the formal its
+        // receiver-instantiated `E`.
+        {
+            let rebind_below = self
+                .rows
+                .get(callee)
+                .filter(|row| row.qualified)
+                .and_then(|_| callee.checked_sub(1))
+                .and_then(|index| self.rows.get(index))
+                .map(|row| row.range);
+            let (rebind_params, rebind_solutions) = match &exec_params {
+                Some(params) => (&params[..], &solutions[..]),
+                None => (&[][..], &[][..]),
+            };
+            self.infer_rebind_closure_formals(
+                callee_spelling,
+                send_recv,
+                rebind_below,
+                rebind_params,
+                rebind_solutions,
+                &level,
+                &formals,
+            );
+            // The generic tear-off argument's own inference stands alone
+            // from the callee's: `h(f)` where `h` is NON-generic still
+            // runs `inferFunctionTypeInstantiation` on `f` against the
+            // formal's function context (`resolver.dart`'s typedLiteral
+            // walk — `constrainGenericFunctionInContext` is per-argument).
+            // The `exec_params` send routes the same call inside
+            // `infer_invocation`'s argument round, so this arm stays
+            // gated to the callee without inference parameters.
+            if exec_params.is_none() && explicit_args.is_none() {
+                let mut positional_index = 0usize;
+                for (name, _, _, range) in &level.args {
+                    let formal = if let Some(n) = name {
+                        self.named_formal_for(&formals, *n)
+                    } else {
+                        let formal = formals.positional.get(positional_index);
+                        positional_index += 1;
+                        formal
+                    };
+                    let Some(formal) = formal else {
+                        continue;
+                    };
+                    let arg_sig: Option<Box<FnVarSig>> =
+                        self.arg_sigs.get(&range.offset).cloned().or_else(|| {
+                            level
+                                .closures
+                                .iter()
+                                .find(|(start, end, _)| {
+                                    range.offset >= *start && range.offset <= *end
+                                })
+                                .map(|(.., sig)| sig.clone())
+                        });
+                    let Some(sig) = arg_sig else {
+                        continue;
+                    };
+                    let Some(tear_params) = self.tear_off_arg_params(range.offset) else {
+                        continue;
+                    };
+                    if tear_params.is_empty() {
+                        continue;
+                    }
+                    if !matches!(self.fold_alias_ty(formal.ty), Ty::Function { .. }) {
+                        continue;
+                    }
+                    let mut sig = (*sig).clone();
+                    sig.params = tear_params;
+                    let _ = self.infer_tear_off(&sig, formal.ty, *range);
+                }
+            }
         }
         // The effective parameter type: the solution, clamped to the
         // declared bound when it violates it (the constraint solver's
