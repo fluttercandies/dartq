@@ -111,17 +111,6 @@ const DUP_SETTER: u8 = 2;
 const DUP_OTHER: u8 = 4;
 const DUP_PAIR: u8 = DUP_GETTER | DUP_SETTER;
 
-/// The finished member-duplicate scopes of one container name (upstream's
-/// `_InstanceElementContext` pair: one instance scope, one static scope).
-/// A container family's augment fragments share the declaration name, so
-/// these accumulate across same-name container declarations exactly like
-/// the oracle's per-element scopes do.
-#[derive(Default)]
-struct DupScope {
-    instance: NameMap<u8>,
-    static_: NameMap<u8>,
-}
-
 /// An open container on the capture stack.
 #[expect(
     clippy::struct_excessive_bools,
@@ -417,11 +406,6 @@ struct Builder<'src, 'tab> {
     /// containers live on [`Builder::containers`]).
     named_containers: NameMapBuilder<Container>,
     containers: Vec<OpenContainer>,
-    /// The member-duplicate scopes of closed containers, merged by
-    /// container name — a same-named augment fragment's members claim
-    /// into the shared scope, matching the oracle's per-element
-    /// `instanceScope`/`staticScope` accumulation.
-    finished_dup_scopes: NameMapBuilder<DupScope>,
     /// The top-level setter claims (`definedSetters`, upstream
     /// duplicate_definition_verifier.dart checkUnit): a non-final
     /// top-level variable claims its induced `name=` setter alongside
@@ -732,7 +716,6 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             top_const_group: false,
             named_containers: NameMapBuilder::default(),
             containers: Vec::new(),
-            finished_dup_scopes: NameMapBuilder::default(),
             top_setters: NameMapBuilder::default(),
             container_order: Vec::new(),
             extension_faces: Vec::new(),
@@ -844,7 +827,25 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// Records a duplicate (second) declaration; the name maps keep the
     /// first entry, this log is the `duplicate_definition` surface.
+    ///
+    /// A declaration whose two induced-accessor claims both collide
+    /// produces two IDENTICAL rows (a non-final field's getter claim and
+    /// setter claim each call upstream `_checkDuplicateIdentifier`, each
+    /// reports at the same name token — `int x; int x;` is two upstream
+    /// diagnostics at one offset). The oracle's diagnostic pipeline
+    /// dedupes same-code/same-span rows into one
+    /// (member_duplicate_definition_verifier.dart:118-149 calls the
+    /// check twice per variable; the emitted set carries one row), so
+    /// only a back-to-back identical (name, range) repeat is absorbed —
+    /// every other repeat is a real second row.
     fn record_duplicate(&mut self, name: StringId, range: SourceRange) {
+        if self
+            .duplicates
+            .last()
+            .is_some_and(|prev| prev.name == name && prev.range == range)
+        {
+            return;
+        }
         self.duplicates.push(DuplicateDecl { name, range });
     }
 
@@ -876,34 +877,27 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// `DUP_GETTER`/`DUP_SETTER`/`DUP_OTHER`; augment members never reach
     /// here (their fragments neither check nor claim, upstream :307-309).
     ///
-    /// An unnamed container (an unnamed extension) claims only in its own
-    /// scope — the finished-scope merge keys on the container name.
+    /// The scope lives on the ELEMENT, not the name
+    /// (`_getElementContext(firstFragment)` — the oracle keys its
+    /// `_InstanceElementContext` on the declaration's own fragment): a
+    /// second non-augment container of the same name is a fresh element
+    /// with a fresh scope (`class C {int x;} class C {int x;}` reports
+    /// only the class-name duplicate, never a member collision), so the
+    /// maps never share across container declarations — augment members
+    /// skip the claim outright, leaving no cross-declaration sharer.
     fn member_dup_claim(&mut self, bare: StringId, is_static: bool, claim: u8, range: SourceRange) {
         let Some(open) = self.containers.last_mut() else {
             return;
         };
-        // The open scope first, then the finished scope this container's
-        // name already accumulated (same-name fragments share the
-        // element's scopes).
         let scope = if is_static {
             &mut open.dup_static
         } else {
             &mut open.dup_instance
         };
-        let prior_open = match scope.entry(bare) {
+        let prior = match scope.entry(bare) {
             Entry::Vacant(_) => None,
             Entry::Occupied(bits) => Some(*bits),
         };
-        let prior = prior_open.or_else(|| {
-            let (name, _) = open.name?;
-            let finished = self.finished_dup_scopes.get(&name)?;
-            let bits = if is_static {
-                finished.static_.get(&bare)
-            } else {
-                finished.instance.get(&bare)
-            };
-            bits.copied()
-        });
         match prior {
             None => {
                 scope.insert(bare, claim);
@@ -941,7 +935,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// `augment` declaration never logs one: augmenting an existing name is
     /// the augmentation face's business (the oracle reports
     /// `duplicate_definition` for same-name introductions only).
-    fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) {
+    ///
+    /// Returns whether the name's token reported a duplicate — the
+    /// `_reportedTokens` face of `checkUnit`'s
+    /// `_checkDuplicateFragmentIdentifier`
+    /// (duplicate_definition_verifier.dart:308-352): a top-level
+    /// variable whose GETTER claim collided reports at its name token
+    /// and is then absorbed for its SETTER check (the same token already
+    /// reported — `int x; int x;` is one upstream row, and the second
+    /// variable's induced `x=` never joins `definedSetters`). The
+    /// setter-side caller reads the flag to skip that second claim.
+    fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) -> bool {
         let augmenting = self.declaring_augment;
         let setter_spelling = self.is_setter_spelling(name);
         match self.decls.entry(name) {
@@ -950,15 +954,20 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // declaration takes the slot.
             Entry::Occupied(existing) if existing.kind == MicroKind::TypeParam => {
                 self.decls.insert(name, decl);
+                false
             }
-            Entry::Occupied(_) if augmenting => {}
+            Entry::Occupied(_) if augmenting => false,
             // A `name=` spelling is a top-level setter: its collision
             // surface is `top_setters` (`definedSetters`), which already
             // reported — `decls` stays the model face only.
-            Entry::Occupied(_) if setter_spelling => {}
-            Entry::Occupied(_) => self.record_duplicate(name, range),
+            Entry::Occupied(_) if setter_spelling => false,
+            Entry::Occupied(_) => {
+                self.record_duplicate(name, range);
+                true
+            }
             Entry::Vacant(slot) => {
                 slot.insert(decl);
+                false
             }
         }
     }
@@ -1783,7 +1792,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         tag: MicroKind,
     ) {
         if let Some((name, range)) = name {
-            self.declare_top(name, range, TopDecl::bare(tag));
+            let _ = self.declare_top(name, range, TopDecl::bare(tag));
         }
         // The declaration's metadata star closed before this open (the
         // parser fires it first); it belongs to this container.
@@ -2028,34 +2037,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 annotations: open.annotations.into_boxed_slice(),
             });
         }
-        // The closed container's member-claim bitmasks merge into the
-        // per-name finished scope: a same-named declaration later in the
-        // unit (an `augment` fragment re-opening the element's scopes, or
-        // a part-mate sharing the name) claims into the same scope — the
-        // oracle's scopes live on the element, not the fragment
-        // (member_duplicate_definition_verifier.dart `_InstanceElementContext`
-        // :657-677). Unnamed containers claim nothing anywhere.
-        if let Some((name, _)) = open.name {
-            let instance = open.dup_instance.finish();
-            let static_ = open.dup_static.finish();
-            if !instance.is_empty() || !static_.is_empty() {
-                let scope = self
-                    .finished_dup_scopes
-                    .or_insert_with(name, DupScope::default);
-                let merge = |dst: &mut NameMap<u8>, src: &NameMap<u8>| {
-                    let mut rows: Vec<(StringId, u8)> = dst.iter().map(|&(k, v)| (k, v)).collect();
-                    for &(member, bits) in src.iter() {
-                        match rows.binary_search_by_key(&member, |&(k, _)| k) {
-                            Ok(i) => rows[i].1 |= bits,
-                            Err(i) => rows.insert(i, (member, bits)),
-                        }
-                    }
-                    *dst = rows.into_iter().collect();
-                };
-                merge(&mut scope.instance, &instance);
-                merge(&mut scope.static_, &static_);
-            }
-        }
+        // The member-claim bitmasks die with the declaration: the oracle's
+        // scopes live on the element (its first fragment), a same-named
+        // later declaration is a fresh element with a fresh scope
+        // (`member_dup_claim`'s note), and an `augment` member never
+        // claims — no cross-declaration merge exists.
         // Extension headers capture no residue (their window's types latch
         // through `note_header_reference`, not the clause buffer), so
         // nothing else to commit here.
@@ -3643,7 +3629,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 is_complete: builder.field_external || !builder.field_abstract,
                             });
                         }
-                        builder.declare_top(
+                        let getter_reported = builder.declare_top(
                             name,
                             range,
                             TopDecl {
@@ -3670,8 +3656,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         // the declarator carries no initializer. `const`
                         // groups set `top_const_group`, not `field_final`
                         // — fold it into the finality here.
+                        // The `_reportedTokens` gate (upstream
+                        // _checkDuplicateFragmentIdentifier — the name
+                        // token already reported by the getter claim
+                        // absorbs the setter check): a collided getter
+                        // skips the setter claim ENTIRELY — no check and
+                        // no `definedSetters` insert, so `int x; int x;`
+                        // emits `x` only and a following `set x` still
+                        // collides against the FIRST variable's claim.
                         let effectively_final = is_final || builder.top_const_group;
-                        if !effectively_final || (field_late && is_final && !has_init) {
+                        if !getter_reported
+                            && (!effectively_final || (field_late && is_final && !has_init))
+                        {
                             let setter = builder.setter_spelling(name);
                             builder.declare_top_setter(setter, range);
                         }
@@ -3983,9 +3979,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_static = Some(static_kw.is_some());
         builder.field_abstract = abstract_kw.is_some();
         builder.field_external = external_kw.is_some();
+        // `const` is finality for the induced-accessor face too: a `const`
+        // field's element is `isFinal` upstream (no `name=` setter ever
+        // declares), so only `final`'s `late`-no-initializer exception reads
+        // the narrower keyword below — `defines_setter` treats both as the
+        // getter-only claim.
         builder.field_final = _var_final_or_const
             .and_then(|t| builder.tokens.get(t.id as usize))
-            .is_some_and(|tok| &builder.source[tok.byte_range()] == "final");
+            .is_some_and(|tok| {
+                let text = &builder.source[tok.byte_range()];
+                text == "final" || text == "const"
+            });
         builder.field_late = _late_kw.is_some();
         // A top-level `const` group opens the const-creation face's
         // capture window (member and local groups never latch it).
@@ -4502,7 +4506,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_complete: augment.is_external || augment.has_body,
                 });
             }
-            builder.declare_top(
+            let _ = builder.declare_top(
                 spelling,
                 range,
                 TopDecl {
@@ -5161,7 +5165,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_factory: false,
                 is_complete: false,
             });
-            builder.declare_top(
+            let _ = builder.declare_top(
                 name,
                 range,
                 TopDecl {

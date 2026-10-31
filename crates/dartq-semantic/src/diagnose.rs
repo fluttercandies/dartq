@@ -5820,6 +5820,19 @@ mod ticket_3112_tests;
 /// report the `'num'` clamp row the oracle emits.
 #[cfg(test)]
 mod ticket_3118_tests;
+
+/// The #3117 pins: the member-level `duplicate_definition` combination
+/// matrix — `_checkDuplicateIdentifier`'s bare-lexeme scope keyed on the
+/// element (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart:297-346),
+/// the induced-accessor claim set (`const` is finality for the face too),
+/// the identical-row absorption of a non-final field's getter+setter
+/// claims, and the `checkUnit` `_reportedTokens` gate that skips a
+/// top-level variable's setter claim once its getter check reported
+/// (pkg/analyzer/lib/src/error/duplicate_definition_verifier.dart:308-352).
+#[cfg(test)]
+mod ticket_3117_tests;
+
 /// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
 /// type-check verdict under-emits on (function-type test spellings, type
 /// literals, typedef-folded checked types, dynamic operands).
