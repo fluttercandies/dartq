@@ -17536,3 +17536,13 @@ mod ticket_3218_tests;
 #[cfg(test)]
 #[path = "ticket_3219_tests.rs"]
 mod ticket_3219_tests;
+
+// The #3224 pins (`consume_send`'s void-operand face tested the invocation's
+// RESULT type instead of the invoked expression's own type — the spurious
+// alias-typed formal discard and the lost `v() + 1` operand). Registered
+// here because `diagnose.rs` is a live-lane file out of this ticket's write
+// scope; `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3224_tests.rs"]
+mod ticket_3224_tests;

@@ -12205,6 +12205,14 @@ impl<'a> Engine<'a> {
         } else {
             return None;
         }
+        // Whether the invoked expression is itself a completed send
+        // (`v()()`): only then is its own static type the inner send's
+        // result rather than a callee reference's declared face. Captured
+        // before the intent flip below erases the distinction.
+        let callee_is_invocation = self
+            .rows
+            .get(callee)
+            .is_some_and(|row| row.intent == Intent::Invoke);
         if let Some(row) = self.rows.get_mut(callee)
             && row.intent == Intent::Read
         {
@@ -12294,17 +12302,36 @@ impl<'a> Engine<'a> {
             let ret = self.boundary.pool().function_shape(shape).return_ty;
             self.rows[callee].ty = ret;
         }
-        // The void-operand use on the invoked expression (upstream
-        // `function_expression_invocation_resolver.dart:56` —
-        // `_checkForUseOfVoidResult(function, receiverType)`): `v()()` —
-        // invoking a `void`-returning call's result — reports
-        // `use_of_void_result` at the callee's span.
-        if let Some(row) = self.rows.get(callee)
+        // The void-operand use on the INVOKED EXPRESSION (upstream
+        // `function_expression_invocation_resolver.dart:55-56` —
+        // `_checkForUseOfVoidResult(function, function.typeOrThrow)`): the
+        // checked type is the invoked expression's own static type, never
+        // the invocation's result. Only an expression that is itself a
+        // completed send carries a `void` face here (`v()()` — invoking the
+        // result of a `void` call); a plain callee reference is a function
+        // value or a `call`-bearing receiver whatever its own return is, so
+        // the alias-typed formal's legal discard (`typedef F<X> = void
+        // Function<Y extends X>(); void f(F<int> a) { a(); }`) stays silent.
+        // The row's `ty` holds that inner send's result at this point — the
+        // residue of its own write-back below. No live shape reaches this
+        // today: the send link arms only on a callee row abutting the group
+        // (`Engine::open_arguments`'s `abuts`), and a nested invocation's
+        // callee row never does — the gate keeps the face upstream-correct
+        // for the nested model instead of firing on a callee's own return.
+        if callee_is_invocation
+            && let Some(row) = self.rows.get(callee)
             && row.ty == Ty::Void
         {
             let range = row.range;
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
+        // The completed send's static type (upstream `node.recordStaticType
+        // (returnType)`): read once, ahead of both the dead-flow exit below
+        // and the write-back onto the row.
+        let send_result = self
+            .rows
+            .get(callee)
+            .map_or(Ty::UNKNOWN, |row| self.callee_return_ty(row));
         // The function-position face (`function_expression_invocation_
         // resolver.dart:131`): the invoked expression's own static type —
         // pre-invocation, so no callee-result enrichment here.
@@ -12319,19 +12346,15 @@ impl<'a> Engine<'a> {
             // The expression-level face: the completed send's static type is
             // the callee's declared return type, so a `Never` return makes
             // the flow state die at the send's end.
-            let ret = self
-                .rows
-                .get(callee)
-                .map_or(Ty::UNKNOWN, |row| self.callee_return_ty(row));
             // The same resolved return stages for the flow send fold
             // (#2567 R18): the listener picks the slot up at this event
             // and stages it into the recorder, so the name-level fold —
             // whose own callee read is an unknown face — adopts the real
             // return (the send-close inference's parameter solution
             // included, `readEnum(Tag.values)` answering the enum).
-            if ret != Ty::UNKNOWN {
+            if send_result != Ty::UNKNOWN {
                 if let Some(row) = self.rows.get(callee) {
-                    self.send_return_staging = Some((row.range.offset, ret));
+                    self.send_return_staging = Some((row.range.offset, send_result));
                 }
             } else if let Some(row) = self.rows.get(callee)
                 && self.unresolved_call_head(row)
@@ -12343,7 +12366,7 @@ impl<'a> Engine<'a> {
                 // chain instead of the undecidable unknown.
                 self.send_invalid_staging = Some((row.range.offset, row.name));
             }
-            (self.is_never_ty(ret)).then_some(SendExit::Result)
+            (self.is_never_ty(send_result)).then_some(SendExit::Result)
         };
         // The needs-getter face (`function_expression_invocation_resolver
         // .dart:137-144`): the invoked expression's static type is known
@@ -12360,6 +12383,22 @@ impl<'a> Engine<'a> {
         {
             let (_, count, range) = self.deferred_args.remove(pos);
             self.check_invocation_arity(callee, count, range);
+        }
+        // The completed send's static type lands on the callee row (upstream
+        // `node.recordStaticType(returnType)`): the invocation NODE is this
+        // row for every enclosing consumer, and `receiver_static_ty` reads
+        // `row.ty` before any shape-derived face. Without the write the row
+        // kept its callee reference face standing (`Unknown` for a bare
+        // top-level `void v()`, the alias spelling for a `F<int>` formal)
+        // where consumers expect the invocation's own type; the callee
+        // reference's face must not outlive the invocation it fed. A
+        // creation head keeps its own fold (the row is replaced below with
+        // the instantiated/solved face).
+        if send_result != Ty::UNKNOWN
+            && let Some(row) = self.rows.get_mut(callee)
+            && !matches!(row.shape, RowShape::Bare(BareInfo::Container { .. }))
+        {
+            row.ty = send_result;
         }
         if matches!(
             self.rows.get(callee).map(|r| r.shape.clone()),
