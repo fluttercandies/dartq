@@ -25,8 +25,17 @@
 //! `values.byName(...)` and on `List<T>` receivers whose type parameter is
 //! bound by `extends Enum`.
 //!
-//! Only libraries whose corpus-visible surface includes implicit-application
-//! members join — the table is empty of libraries whose face is name-only
+//! A library joins for either of two reasons, and both ride the same
+//! scan-collect-index shape: its face carries implicit-application members
+//! (the `dart:core` enum pair), or its face needs element models at all —
+//! a `dart:` library whose sources the SDK root does not carry keeps the
+//! generated names-only face, and a names-only face answers no container,
+//! so a receiver of one of its types breaks every member walk. The
+//! `dart:html` entry is the second kind: a member-bearing container surface
+//! (no extension declarations) for the classes resolving one leaves the
+//! on-type of `extension … on MessagePort` without an element model.
+//!
+//! Otherwise the table is empty of libraries whose face is name-only
 //! complete, and it is hand-curated (a small, fidelity-reviewed surface),
 //! unlike the generated bulk tables.
 
@@ -299,6 +308,137 @@ base class UnmodifiableListView<E> implements List<E> {
 }
 "#,
     ),
+    (
+        // `dart:html` — the event-surface classes and their public member
+        // models (upstream Dart SDK source,
+        // sdk/lib/html/dart2js/html_dart2js.dart: `MessagePort` :22219,
+        // `MessageEvent` :22092, `EventTarget` :16255, `Event` :15934,
+        // `Events` :16203, `EventStreamProvider` :37867,
+        // `ElementStream` :37955, `EventListener` :37859).
+        //
+        // Why the library joins: its sources load only when the SDK root
+        // carries the web segment; a VM/embedder-backed snapshot keeps the
+        // generated names-only face, which carries no element model. A
+        // names-only face answers no container, so an extension whose
+        // on-type names one of these classes loses the type (`extension
+        // … on MessagePort` in drift's web channel bridge): the bare
+        // invocation miss inside such a body — `StreamChannelController
+        // <Object?>()` read as an implicit-`this` call — stayed silent
+        // where the oracle reports `undefined_method` naming the on-type.
+        // These heads give the face the element models that resolve it.
+        //
+        // Fidelity: the public member surfaces are spelled as upstream
+        // declares them; concrete bodies are `external` (the name-level
+        // model is identical and no body is captured either way) and
+        // private members stay out (library-private upstream, invisible to
+        // every user-visible resolution). Inheritance is mirrored only
+        // where it holds upstream (`MessagePort extends EventTarget`,
+        // `MessageEvent extends Event`, `ElementStream implements Stream`);
+        // the other heads extend `JavaScriptObject` upstream, which lives in
+        // `dart:_js_helper` and contributes no corpus-visible member here —
+        // left supertype-free, they climb the implicit `Object` edge every
+        // class without a written supertype climbs. `Event.matchingTarget`
+        // keeps its `Element` return spelling while `Element` itself stays a
+        // names-only face name: modelling it would arm member walks over
+        // every DOM receiver, far beyond the surface this entry owns.
+        "html",
+        r#"typedef EventListener = void Function(Event event);
+
+class Events {
+  Events(EventTarget target);
+  external Stream<Event> operator [](String type);
+}
+
+abstract class ElementStream<T extends Event> implements Stream<T> {
+  external Stream<T> matches(String selector);
+  external StreamSubscription<T> capture(void onData(T event));
+}
+
+class EventStreamProvider<T extends Event> {
+  const EventStreamProvider(String eventType);
+  external Stream<T> forTarget(EventTarget? e, {bool useCapture = false});
+  external ElementStream<T> forElement(Element e, {bool useCapture = false});
+  external String getEventType(EventTarget target);
+}
+
+class Event {
+  external factory Event(
+    String type, {
+    bool canBubble = true,
+    bool cancelable = true,
+  });
+  external factory Event.eventType(
+    String type,
+    String name, {
+    bool canBubble = true,
+    bool cancelable = true,
+  });
+  static const int AT_TARGET = 2;
+  static const int BUBBLING_PHASE = 3;
+  static const int CAPTURING_PHASE = 1;
+  external Element get matchingTarget;
+  external List<EventTarget> get path;
+  external bool? get bubbles;
+  external bool? get cancelable;
+  external bool? get composed;
+  external EventTarget? get currentTarget;
+  external bool get defaultPrevented;
+  external int get eventPhase;
+  external bool? get isTrusted;
+  external EventTarget? get target;
+  external num? get timeStamp;
+  external String get type;
+  external List<EventTarget> composedPath();
+  external void preventDefault();
+  external void stopImmediatePropagation();
+  external void stopPropagation();
+}
+
+class EventTarget {
+  external factory EventTarget._();
+  external Events get on;
+  external void addEventListener(
+    String type,
+    EventListener? listener, [
+    bool? useCapture,
+  ]);
+  external void removeEventListener(
+    String type,
+    EventListener? listener, [
+    bool? useCapture,
+  ]);
+  external bool dispatchEvent(Event event);
+}
+
+class MessageEvent extends Event {
+  external factory MessageEvent(
+    String type, {
+    bool canBubble = false,
+    bool cancelable = false,
+    Object? data,
+    String? origin,
+    String? lastEventId,
+    EventTarget? source,
+    List<MessagePort> messagePorts = const [],
+  });
+  external dynamic get data;
+  external String get lastEventId;
+  external String get origin;
+  external List<MessagePort> get ports;
+  external EventTarget? get source;
+  external String? get suborigin;
+}
+
+class MessagePort extends EventTarget {
+  external factory MessagePort._();
+  static const EventStreamProvider<MessageEvent> messageEvent =
+      EventStreamProvider<MessageEvent>('message');
+  external void close();
+  external void postMessage(dynamic message, [List<Object>? transfer]);
+  external Stream<MessageEvent> get onMessage;
+}
+"#,
+    ),
 ];
 
 #[cfg(test)]
@@ -373,6 +513,61 @@ mod tests {
         assert!(
             core.contains("external Map<String, T> asNameMap();"),
             "EnumByName.asNameMap surface drifted"
+        );
+    }
+
+    /// The `html` excerpt is the container surface an `on MessagePort`
+    /// extension resolves its on-type through (upstream Dart SDK source,
+    /// sdk/lib/html/dart2js/html_dart2js.dart:22219): `MessagePort` must
+    /// stay a member-bearing class extending `EventTarget`, with the
+    /// `onMessage`/`postMessage`/`close` surface the web channel code reads,
+    /// and the event heads it leans on must stay declared. Dropping the
+    /// entry puts the face back to names-only — the on-type then answers no
+    /// container and the bare-invocation fallback inside such an extension
+    /// body goes silent.
+    #[test]
+    fn html_excerpt_carries_the_message_port_surface() {
+        let html = EXTENSION_FACE_SOURCES
+            .iter()
+            .find(|(library, _)| *library == "html")
+            .expect("html extension face present")
+            .1;
+        // Exact declaration heads: the class and its upstream supertype.
+        assert!(
+            html.contains("class MessagePort extends EventTarget {"),
+            "MessagePort head or supertype drifted"
+        );
+        // Member surfaces: the inherited event registration plus the port
+        // members the on-type resolution reads.
+        assert!(
+            html.contains("external void addEventListener("),
+            "EventTarget.addEventListener surface drifted"
+        );
+        assert!(
+            html.contains("external void postMessage(dynamic message, [List<Object>? transfer]);"),
+            "MessagePort.postMessage surface drifted"
+        );
+        assert!(
+            html.contains("external Stream<MessageEvent> get onMessage;"),
+            "MessagePort.onMessage surface drifted"
+        );
+        // The event heads the port surface names stay declared.
+        assert!(html.contains("class Event {"), "Event head drifted");
+        assert!(
+            html.contains("class MessageEvent extends Event {"),
+            "MessageEvent head drifted"
+        );
+        assert!(
+            html.contains("typedef EventListener = void Function(Event event);"),
+            "EventListener alias drifted"
+        );
+        // The heads `dart:html` extends from `dart:_js_helper` stay
+        // supertype-free: `JavaScriptObject` is not a name this face
+        // carries, and an edge naming it would break the climb instead of
+        // landing on the implicit `Object` root.
+        assert!(
+            !html.contains("JavaScriptObject"),
+            "js_helper supertype leaked into the html face"
         );
     }
 }

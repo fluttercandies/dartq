@@ -18,9 +18,14 @@ use dartq_parser::ParserFeatures;
 use dartq_resolution::{
     ClassModifiers, Combinators, DEFERRED_IMPORT_OF_EXTENSION, DUPLICATE_EXPORT,
     DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT, DUPLICATE_SHOWN_NAME, EXPORT_INTERNAL_LIBRARY,
-    ExportEdge, FileRole, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
-    Namespaces, PartOfRow, ResolutionCode, ResolvedTarget, UNDEFINED_HIDDEN_NAME,
-    UNDEFINED_SHOWN_NAME, canonical_dart_uri, compose_canonical_uri, part_of_row,
+    ExportEdge, FileRole, INVALID_EXPORT_OF_INTERNAL_ELEMENT,
+    INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY, ImportEdge, InternalExportFinding,
+    LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces, PartOfRow,
+    RECURSIVE_INTERFACE_INHERITANCE, RECURSIVE_INTERFACE_INHERITANCE_EXTENDS,
+    RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS, RECURSIVE_INTERFACE_INHERITANCE_ON,
+    RECURSIVE_INTERFACE_INHERITANCE_WITH, ResolutionCode, ResolutionCodeInfo, ResolvedTarget,
+    UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
+    canonical_dart_uri, compose_canonical_uri, part_of_row,
 };
 use dartq_semantic::{ElementIndex, MicroKind};
 use dartq_source::{FileId, FileTable, SourceRange, StringId, StringTable, saturate_slot_u32};
@@ -1061,6 +1066,7 @@ fn diagnose_library(
     part_family_diagnostics(state, library, &members, &mut out);
     non_library_import_diagnostics(state, &members, &mut out);
     export_graph_diagnostics(state, resolved, library, &members, &mut out);
+    interface_cycle_diagnostics(state, resolved, library, &members, &mut out);
     // The analyze head builds the three fold contexts beside the fold (a
     // configured diagnoser over a non-empty order with a standing graph —
     // `fold_graph` above); a `None` here is that pairing's miss — the
@@ -1686,6 +1692,20 @@ fn sdk_uri_parts<'a>(
     })
 }
 
+/// The element model for `file` wherever it lives — residency members
+/// first, then the lazily indexed dep/SDK units (the export graph's
+/// declaring-file answers span both worlds).
+fn file_elements(state: &EngineState, file: FileId) -> Option<&dartq_semantic::FileElements> {
+    if let Some(facts) = state.residency.get(&file) {
+        return Some(&*facts.elements);
+    }
+    state
+        .deps
+        .units
+        .get(&file)
+        .map(|unit| &*unit.facts.elements)
+}
+
 /// The export-graph faces over one library's directives (the landed
 /// dartq-resolution `export_graph` walks), per library — the oracle's
 /// verifier rows (`error_verifier.dart` `_checkForAmbiguousExport` /
@@ -1761,6 +1781,193 @@ fn export_graph_diagnostics(
             file,
         )));
     }
+    // `invalid_export_of_internal_element`(_indirectly)
+    // (best_practices_verifier.dart:1004-1050 `_checkForInternalExport`):
+    // gated on the exporting library's defining file sitting in its
+    // package's public API (`sourceIsInPublicApi`, workspace/pub.dart
+    // :585-607 — under <root>/lib/, not under lib/src/). The metadata facts
+    // the face wants are the captured annotation stars read name-level
+    // (`element.isInternal` ⇔ an `@internal` meta getter on the
+    // declaration's own star; the oracle's `hasInternal` is the same
+    // `_isPackageMetaGetter` test `is_meta_getter` mirrors); the signature
+    // arm resolves each written `Ty::Named` leaf through the member's own
+    // file's import scope to the alias declaration, matching the oracle's
+    // `type?.alias?.element` ask at name level.
+    let in_public_api = state
+        .files
+        .path(state.libraries.info(library).expect("live library").defining)
+        .and_then(|path| {
+            let identity = state.packages.containing(path)?;
+            let rel = path.strip_prefix(&identity.lib_dir).ok()?;
+            Some(rel.components().next().is_none_or(|c| c.as_os_str() != "src"))
+        })
+        .unwrap_or(false);
+    if in_public_api {
+        let edges = resolved.graph.export_edges(graph_lib);
+        for (edge_index, &(file, directive)) in exports.iter().enumerate() {
+            let Some(target) = edges.get(edge_index).and_then(|e| e.target) else {
+                continue;
+            };
+            // The exported library's own `@internal` (the oracle reads
+            // `exportedLibrary.metadata.hasInternal` — the `library`
+            // directive's star on the target's defining unit).
+            let target_internal = resolved
+                .graph
+                .unit_files(target)
+                .first()
+                .is_some_and(|&unit| {
+                    file_elements(state, unit).is_some_and(|elements| {
+                        let lib = resolved.graph.library_of_file(unit);
+                        elements.library_annotations().iter().any(|ann| {
+                            lib.is_some_and(|l| {
+                                dartq_semantic::annotation::is_meta_getter(
+                                    ann,
+                                    "internal",
+                                    &state.strings,
+                                    &resolved.graph,
+                                    l,
+                                )
+                            })
+                        })
+                    })
+                });
+            // A namespace member's `element.isInternal`: its declaring
+            // file's own `decl`/`container` star carries the `@internal`
+            // getter (resolved in the declaring library's import faces —
+            // the annotation's own scope, the oracle's element-level test).
+            let element_internal = |name: StringId| -> bool {
+                let Some(entry) = resolved.graph.exported(target, name) else {
+                    return false;
+                };
+                let Some(elements) = file_elements(state, entry.file) else {
+                    return false;
+                };
+                let Some(lib) = resolved.graph.library_of_file(entry.file) else {
+                    return false;
+                };
+                let marked = |star: &[dartq_semantic::model::Annotation]| {
+                    star.iter().any(|ann| {
+                        dartq_semantic::annotation::is_meta_getter(
+                            ann,
+                            "internal",
+                            &state.strings,
+                            &resolved.graph,
+                            lib,
+                        )
+                    })
+                };
+                elements
+                    .decl(name)
+                    .is_some_and(|decl| marked(&decl.annotations))
+                    || elements
+                        .container(name)
+                        .is_some_and(|container| marked(&container.annotations))
+            };
+            // One exported executable's `@internal` signature aliases: the
+            // member's `return_ty` + formal types + type-parameter bounds
+            // (best_practices_verifier.dart:1149-1168's signatureTypes
+            // walk), each `Ty::Named` leaf resolved through the member's
+            // file's import scope to its declaration — an `@internal`
+            // `typedef` reports once per written use, like the oracle's
+            // `type?.alias?.element` probe.
+            let signature_alias_internal = |name: StringId| -> Vec<StringId> {
+                let mut found = Vec::new();
+                let Some(entry) = resolved.graph.exported(target, name) else {
+                    return found;
+                };
+                let Some(elements) = file_elements(state, entry.file) else {
+                    return found;
+                };
+                let Some(decl) = elements.decl(name) else {
+                    return found;
+                };
+                let Some(member_lib) = resolved.graph.library_of_file(entry.file) else {
+                    return found;
+                };
+                // Upstream's signatureTypes order: parameter types, then
+                // the return type, then type-parameter bounds (a top-level
+                // executable's own bounds aren't captured — the under-
+                // report arm; container members' bounds ride MemberEntry).
+                let mut leaves = Vec::new();
+                if let Some(formals) = &decl.formals {
+                    leaves.extend(formals.positional.iter().map(|f| f.ty));
+                    leaves.extend(formals.named.iter().map(|f| f.ty));
+                }
+                leaves.push(decl.return_ty);
+                for leaf in leaves {
+                    let dartq_semantic::model::Ty::Named { name: leaf, .. } = leaf else {
+                        continue;
+                    };
+                    let dartq_resolution::Lookup::Found(
+                        dartq_resolution::NamespaceEntry::Decl(alias_file),
+                    ) = resolved.namespaces().lookup(&resolved.graph, member_lib, leaf)
+                    else {
+                        continue;
+                    };
+                    let Some(alias_lib) = resolved.graph.library_of_file(alias_file) else {
+                        continue;
+                    };
+                    let internal_alias = file_elements(state, alias_file)
+                        .and_then(|elements| elements.decl(leaf))
+                        .is_some_and(|decl| {
+                            decl.kind == MicroKind::TypeAlias
+                                && decl.annotations.iter().any(|ann| {
+                                    dartq_semantic::annotation::is_meta_getter(
+                                        ann,
+                                        "internal",
+                                        &state.strings,
+                                        &resolved.graph,
+                                        alias_lib,
+                                    )
+                                })
+                        });
+                    if internal_alias {
+                        found.push(leaf);
+                    }
+                }
+                found
+            };
+            for finding in resolved.graph.invalid_internal_export_findings(
+                graph_lib,
+                edge_index,
+                in_public_api,
+                target_internal,
+                element_internal,
+                signature_alias_internal,
+            ) {
+                let (info, args) = match finding {
+                    InternalExportFinding::Library => {
+                        // `libraryElement.displayName`: the declared name,
+                        // the canonical URI when the library is unnamed.
+                        let name = resolved.graph.name(target);
+                        let display = if name.is_empty() {
+                            graph_uri_spelling(resolved.graph.uri(target))
+                        } else {
+                            name.to_owned()
+                        };
+                        (INVALID_EXPORT_OF_INTERNAL_ELEMENT, vec![display])
+                    }
+                    InternalExportFinding::Member(name) => (
+                        INVALID_EXPORT_OF_INTERNAL_ELEMENT,
+                        vec![state.strings.resolve(name).to_owned()],
+                    ),
+                    InternalExportFinding::Signature { exported, internal } => (
+                        INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY,
+                        vec![
+                            state.strings.resolve(internal).to_owned(),
+                            state.strings.resolve(exported).to_owned(),
+                        ],
+                    ),
+                };
+                out.push(Arc::new(coded_diagnostic(
+                    info,
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    directive.uri_span,
+                    file,
+                )));
+            }
+        }
+    }
     // `deferred_import_of_extension` (error_verifier.dart:1339-1356 +
     // :4393-4405): each deferred-prefixed import whose namespace reaches an
     // extension reports once at its URI. The edge the face consumes is the
@@ -1806,6 +2013,130 @@ fn export_graph_diagnostics(
 /// bare canonical URI.
 fn graph_uri_spelling(key: &str) -> String {
     key.rsplit('\u{1f}').next().unwrap_or(key).to_owned()
+}
+
+/// The element-graph cycle face for one library: `recursive_interface_
+/// inheritance` and its clause twins (`inheritance_override.dart:705-790`
+/// `_checkForRecursiveInterfaceInheritance`), run per element over the
+/// container supertype graph — the oracle's `element.interfaceCycle` is the
+/// Tarjan SCC of the interface edges (superclass + `with` + `implements` +
+/// a mixin's `on` constraints, `interface_cycles.dart:52-60 +
+/// dependency_walker.dart`), which [`strongly_connected`] reproduces in pop
+/// order. The clause-specific variants share the base row's code name and
+/// machine form (diagnostic.g.dart:14465/14489/14513/14529/14553), so the
+/// (severity, code, file) tuple is identical across the family; the variant
+/// messages pick up the direct self-edge when one clause names the element
+/// itself.
+///
+/// Nodes are `(file, name)` declaration identities — a same-spelling
+/// container in two files is two elements, matching the oracle's element
+/// keying. Edges resolve the written clause name in the *declaring file's*
+/// library scope (`Namespaces::lookup` — locals first, then the import
+/// faces); an unresolvable or ambiguous hop is a dead edge, the
+/// `supertype_hop_dead` posture. Node sweep = member files' container
+/// declarations in member order, upstream's declaration sweep
+/// (`interface_cycles.dart:23-36`).
+fn interface_cycle_diagnostics(
+    state: &EngineState,
+    resolved: &ResolvedGraph,
+    library: LibraryId,
+    members: &[FileId],
+    out: &mut Vec<Arc<Diagnostic>>,
+) {
+    let graph_lib = resolved.graph_ids[&library];
+    type Node = (FileId, StringId);
+    let mut nodes: Vec<Node> = Vec::new();
+    for &file in members {
+        let Some(elements) = file_elements(state, file) else {
+            continue;
+        };
+        for &name in elements.container_order() {
+            nodes.push((file, name));
+        }
+    }
+    if nodes.is_empty() {
+        return;
+    }
+    // The successor closure: a node's out-edges are its container's written
+    // clause names resolved in the file's library scope — superclass +
+    // `with` + `implements` + `on` (the oracle's `_getDirectSupertypes`
+    // set), each hit keyed on the declaration identity it lands on.
+    let successors = |node: Node| -> Vec<Node> {
+        let (file, name) = node;
+        let Some(container) = file_elements(state, file).and_then(|e| e.container(name)) else {
+            return Vec::new();
+        };
+        let lib = resolved.graph.library_of_file(file).unwrap_or(graph_lib);
+        container
+            .superclass
+            .iter()
+            .chain(container.with_clause.iter())
+            .chain(container.implements_clause.iter())
+            .chain(container.on_clause.iter())
+            .filter_map(|&edge| {
+                match resolved.namespaces().lookup(&resolved.graph, lib, edge) {
+                    dartq_resolution::Lookup::Found(
+                        dartq_resolution::NamespaceEntry::Decl(target),
+                    ) => Some((target, edge)),
+                    // An ambiguous or missing hop contributes nothing — the
+                    // dead-edge posture (`supertype_hop_dead`).
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    let sccs = dartq_resolution::strongly_connected(&nodes, successors);
+    for &(file, name) in &nodes {
+        let Some(component) = sccs.cyclic_component((file, name)) else {
+            continue;
+        };
+        let container = file_elements(state, file).and_then(|e| e.container(name));
+        // The direct self-edge variants: a clause that resolves back to
+        // this very declaration reports the clause-specific message (the
+        // code name/machine are shared — only the message differs).
+        let self_named = |edge: Option<&StringId>| -> bool {
+            edge.is_some_and(|&edge| {
+                edge == name
+                    && matches!(
+                        resolved.namespaces().lookup(&resolved.graph, graph_lib, edge),
+                        dartq_resolution::Lookup::Found(
+                            dartq_resolution::NamespaceEntry::Decl(target),
+                        ) if target == file
+                    )
+            })
+        };
+        let display = state.strings.resolve(name).to_owned();
+        let (info, args): (ResolutionCodeInfo, Vec<String>) = if self_named(container.and_then(|c| c.superclass.as_ref())) {
+            (RECURSIVE_INTERFACE_INHERITANCE_EXTENDS, vec![display])
+        } else if container.is_some_and(|c| c.on_clause.iter().any(|e| self_named(Some(e)))) {
+            (RECURSIVE_INTERFACE_INHERITANCE_ON, vec![display])
+        } else if container.is_some_and(|c| c.with_clause.iter().any(|e| self_named(Some(e)))) {
+            (RECURSIVE_INTERFACE_INHERITANCE_WITH, vec![display])
+        } else if container.is_some_and(|c| c.implements_clause.iter().any(|e| self_named(Some(e)))) {
+            (RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS, vec![display])
+        } else {
+            // The generic row: `{1}` is the cycle's member display names
+            // joined ', ' in the oracle's `evaluateScc` (Tarjan pop) order.
+            let loop_names = component
+                .iter()
+                .map(|&(_, member)| state.strings.resolve(member).to_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            (RECURSIVE_INTERFACE_INHERITANCE, vec![display, loop_names])
+        };
+        // The anchor: the declaration's name token — `DeclRow.range` from
+        // the maintained capture (residency) or a dep unit's own capture;
+        // absent rows degrade to the file head (the (severity, code, file)
+        // tuple is unaffected).
+        let decl_rows = state
+            .capture(file)
+            .map(|capture| &capture.index)
+            .or_else(|| state.deps.units.get(&file).map(|unit| &unit.capture.index));
+        let range = decl_rows
+            .and_then(|index| index.by_name(name).and_then(|rows| rows.first()))
+            .map_or(SourceRange { offset: 0, length: 0 }, |row| row.range);
+        out.push(Arc::new(coded_diagnostic(info, &args.iter().map(String::as_str).collect::<Vec<_>>(), range, file)));
+    }
 }
 
 /// One descriptor-keyed row: the code's [`ResolutionCodeInfo`] with its
@@ -5411,8 +5742,183 @@ mod tests {
         let mut baseline = store_engine(&root, memory_store());
         seed_part_library(&mut baseline, &root, PARTS);
         let baseline_rows = baseline
-            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .analyze(&[], &mut |_| {}, &CancellationToken::new())
             .expect("baseline analyze");
         assert_eq!(quiet_rows, baseline_rows);
+    }
+
+    /// A `clause_workspace` variant carrying a path-dep `package:meta` —
+    /// the `invalid_export_of_internal_element` face's `@internal`
+    /// recognition resolves through the import faces, which need a real
+    /// `package:meta` target whose `library meta;` name matches
+    /// (`annotation.rs`'s `meta_face` — the oracle's `_metaLibName` key).
+    fn meta_workspace() -> PathBuf {
+        let root = clause_workspace("meta-export");
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        write(
+            "pubspec.yaml",
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  meta:\n    path: pkgs/meta\n",
+        );
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}, {"name": "meta", "rootUri": "../pkgs/meta", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        write(
+            "pkgs/meta/pubspec.yaml",
+            "name: meta\nversion: 1.0.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            "pkgs/meta/lib/meta.dart",
+            "library meta;\n\nconst Object internal = Object();\n",
+        );
+        root
+    }
+
+    /// `clause_engine` with `meta` declared — the parsed pubspec carries
+    /// the path dep so `build_graph` links it (the fixture's config and
+    /// pubspec file already do).
+    fn meta_engine(root: &Path) -> Engine {
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(
+            PackageConfig::parse(
+                &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+            )
+            .expect("valid config"),
+        );
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let root_pubspec = Pubspec::parse(
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  meta:\n    path: pkgs/meta\n",
+        )
+        .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
+            pub_config: Arc::clone(&config),
+            config_dir,
+            context_roots: Vec::new(),
+            semdiag: Some(diagnoser()),
+            target: crate::DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine")
+    }
+
+    /// `invalid_export_of_internal_element`'s engine path: a public-API
+    /// file (`lib/api.dart`, inside the package `lib/` and outside
+    /// `lib/src/`) exporting a library whose member carries `@internal` —
+    /// the face answers through the captured annotation star on the
+    /// declaring file's model, resolved against `package:meta`'s import
+    /// face. The lib/src twin stays silent (the `_inPackagePublicApi`
+    /// gate), and an unmarked member never reports.
+    #[test]
+    fn internal_member_export_reports_from_the_annotation_star() {
+        let root = meta_workspace();
+        let mut engine = meta_engine(&root);
+        engine.set_content(
+            &root.join("lib/hidden.dart"),
+            b"import 'package:meta/meta.dart';\n\n@internal\nclass Secret {}\nclass Plain {}\n",
+        );
+        let api = engine.set_content(
+            &root.join("lib/api.dart"),
+            b"export 'hidden.dart';\n",
+        );
+        let src_api = engine.set_content(
+            &root.join("lib/src/api.dart"),
+            b"export '../hidden.dart';\n",
+        );
+        engine.apply_pending(&mut |_| {});
+        let rows = engine
+            .analyze(&[api, src_api], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let hits: Vec<_> = rows
+            .iter()
+            .filter(|row| row.code.name == "invalid_export_of_internal_element")
+            .collect();
+        // Exactly one row, on the public-API exporter's own file — the
+        // `Secret` member; `Plain` never joins and the lib/src exporter is
+        // gated out.
+        assert_eq!(hits.len(), 1, "rows: {rows:?}");
+        assert!(hits[0].message.contains("Secret"));
+        assert_eq!(hits[0].file, api);
+    }
+
+    /// `recursive_interface_inheritance`'s engine path: `class A extends
+    /// B; class B extends A;` gives each container a cyclic SCC of two —
+    /// the generic row reports on each with `{1}` the pop-order member
+    /// join; a direct `extends Self` picks the extends-variant's message
+    /// (shared code name, distinct message).
+    #[test]
+    fn interface_cycle_reports_each_member_and_the_self_extends_variant() {
+        let root = clause_workspace("iface-cycle");
+        let mut engine = clause_engine(&root);
+        let ab = engine.set_content(
+            &root.join("lib/ab.dart"),
+            b"class A extends B {}\nclass B extends A {}\nclass Self extends Self {}\n",
+        );
+        engine.apply_pending(&mut |_| {});
+        let rows = engine
+            .analyze(&[ab], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let hits: Vec<_> = rows
+            .iter()
+            .filter(|row| row.code.name == "recursive_interface_inheritance")
+            .collect();
+        // A and B each carry the two-member cycle; Self carries the
+        // extends-self variant — three rows, all on ab.dart.
+        assert_eq!(hits.len(), 3, "rows: {rows:?}");
+        let generic: Vec<_> = hits
+            .iter()
+            .filter(|row| row.message.contains("superinterface of itself"))
+            .collect();
+        assert_eq!(generic.len(), 2);
+        for hit in &generic {
+            assert!(hit.message.contains("B, A") || hit.message.contains("A, B"));
+        }
+        assert!(hits
+            .iter()
+            .any(|row| row.message.contains("can't extend itself")));
+    }
+
+    /// A mixin's `on` self-constraint picks the on-variant; a class's
+    /// `implements` self-edge picks the implements-variant — same code
+    /// name across the family, the upstream uniqueName split carried only
+    /// in the message.
+    #[test]
+    fn interface_cycle_clause_variants_share_the_code_name() {
+        let root = clause_workspace("iface-cycle-clauses");
+        let mut engine = clause_engine(&root);
+        let file = engine.set_content(
+            &root.join("lib/clauses.dart"),
+            b"mixin M on M {}\nclass I implements I {}\nclass W = Object with W;\n",
+        );
+        engine.apply_pending(&mut |_| {});
+        let rows = engine
+            .analyze(&[file], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let messages: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.code.name == "recursive_interface_inheritance")
+            .map(|row| row.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 3, "rows: {rows:?}");
+        assert!(messages.iter().any(|m| m.contains("superclass constraint")));
+        assert!(messages.iter().any(|m| m.contains("implement itself")));
+        assert!(messages.iter().any(|m| m.contains("as a mixin")));
     }
 }
