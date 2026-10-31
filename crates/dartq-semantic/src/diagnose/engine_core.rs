@@ -9561,6 +9561,15 @@ mod ticket_3164_tests;
 #[path = "ticket_3104_tests.rs"]
 mod ticket_3104_tests;
 
+/// The #2999 `unused_local_variable` write-vs-read credit pins: the
+/// statement-position discard law (`_isReadIdentifier`,
+/// unused_local_elements_verifier.dart:429-453) — `++`/`--`/non-`??=`
+/// compound/plain assignments never spare the declaration, `??=` and
+/// every nested-position read do.
+#[cfg(test)]
+#[path = "ticket_2999_tests.rs"]
+mod ticket_2999_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
