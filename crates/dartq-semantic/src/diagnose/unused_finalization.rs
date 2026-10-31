@@ -2202,8 +2202,11 @@ impl<'a> Engine<'a> {
     /// form never reached the table (the archive census rows, #2189-c).
     /// Scoped to the cluster's verified population (`unused_local_variable`,
     /// `unused_field`); every other code keeps its documented under-report.
-    /// A `//` head counts only after whitespace (or at line start), so a
-    /// `//` inside a string literal never reads as a comment.
+    /// The entry must name the ROW's own code — `// ignore: unused_field`
+    /// on a local variable suppresses nothing (the ignore-list's per-name
+    /// match, ignore_info.dart:150-163). A `//` head counts only after
+    /// whitespace (or at line start), so a `//` inside a string literal
+    /// never reads as a comment.
     fn suppress_same_line_ignored_usage(&mut self) {
         if !self.source.contains("ignore:") {
             return;
@@ -2212,15 +2215,19 @@ impl<'a> Engine<'a> {
         let field = SemanticCode::UnusedField.code_info();
         let mut drop: Vec<usize> = Vec::new();
         for (index, row) in self.report.usage.iter().enumerate() {
-            if row.code != local && row.code != field {
+            let code = if row.code == local {
+                "unused_local_variable"
+            } else if row.code == field {
+                "unused_field"
+            } else {
                 continue;
-            }
+            };
             let byte = self.byte_of(row.range.offset).min(self.source.len());
             let start = self.source[..byte].rfind('\n').map_or(0, |at| at + 1);
             let end = self.source[start..]
                 .find('\n')
                 .map_or(self.source.len(), |at| start + at);
-            if self.line_has_trailing_ignore(&self.source[start..end]) {
+            if self.line_has_trailing_ignore(&self.source[start..end], code) {
                 drop.push(index);
             }
         }
@@ -2239,14 +2246,14 @@ impl<'a> Engine<'a> {
         });
     }
 
-    /// Whether the line carries a `// ignore:` entry naming one of the
-    /// suppressed codes with code before the comment (the trailing
-    /// form — a standalone comment's entry is the next line's, the root
-    /// face's). A head only counts after whitespace (or at line start) —
-    /// a `//` inside a string literal is not a comment — and the name
-    /// grammar mirrors the root parser's: comma-list, alphanumeric/
-    /// underscore heads, case-insensitive.
-    fn line_has_trailing_ignore(&self, line: &str) -> bool {
+    /// Whether the line carries a `// ignore:` entry naming `code` with
+    /// code before the comment (the trailing form — a standalone
+    /// comment's entry is the next line's, the root face's). A head only
+    /// counts after whitespace (or at line start) — a `//` inside a
+    /// string literal is not a comment — and the name grammar mirrors
+    /// the root parser's: comma-list, alphanumeric/underscore heads,
+    /// case-insensitive.
+    fn line_has_trailing_ignore(&self, line: &str, code: &str) -> bool {
         let bytes = line.as_bytes();
         let mut from = 0usize;
         while let Some(at) = line[from..].find("//") {
@@ -2275,9 +2282,7 @@ impl<'a> Engine<'a> {
                 let end = name
                     .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .unwrap_or(name.len());
-                let head = &name[..end];
-                head.eq_ignore_ascii_case("unused_local_variable")
-                    || head.eq_ignore_ascii_case("unused_field")
+                name[..end].eq_ignore_ascii_case(code)
             }) {
                 return true;
             }
@@ -4279,6 +4284,30 @@ impl<'a> Engine<'a> {
         // wide char upstream cannot desync (or cut mid-character, #2594).
         let start = self.byte_of(begin.range.offset);
         let stop = self.byte_of(end.range.end());
+        // The annotation head's use credit (the official `_visitNameExpression`
+        // read — `unused_local_elements_verifier.dart`'s `visitNode` routes
+        // every `NameExpression`, the annotation's identifier included, so
+        // `@a` and `@a.b()` both mark the resolved `a` element used): the
+        // head segment resolves lexically, exactly as a bare read does —
+        // a local `a` in scope at the annotation takes the hit and spares
+        // the `unused_local_variable` row. The pending entry's name may
+        // already carry the joined selector (`@A.named`), so only the head
+        // segment consults the frame stack — a qualified head resolves
+        // nothing locally and misses (the same `resolve_local` answer the
+        // `check_annotation` miss gate's `f.locals` membership made).
+        if let Some(head) = self
+            .pending_annotations
+            .last()
+            .map(|open| open.name)
+            .and_then(|name| {
+                let text = self.strings.resolve(name);
+                let end = text.find('.').unwrap_or(text.len());
+                (end > 0).then(|| self.strings.intern(&text[..end]))
+            })
+            && let Some(hit) = self.resolve_local(head)
+        {
+            self.locals[hit as usize].uses += 1;
+        }
         let Some(open) = self.pending_annotations.last_mut() else {
             return;
         };
@@ -4760,7 +4789,7 @@ mod pins {
 
     /// Diagnoses `source` as the sole file of a library with no imports —
     /// the shared single-file rig, at the modern feature posture.
-    fn report(source: &str) -> FileReport {
+    pub(crate) fn report(source: &str) -> FileReport {
         report_posture(source, None)
     }
 
@@ -4769,7 +4798,7 @@ mod pins {
     /// per-library feature channel): `Some(false)` models a pre-3.7
     /// library (`// @dart = 3.4`), where the exact-`_` wildcard face is
     /// off and the all-underscores fallback governs.
-    fn report_posture(source: &str, wildcard_variables: Option<bool>) -> FileReport {
+    pub(crate) fn report_posture(source: &str, wildcard_variables: Option<bool>) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -4834,7 +4863,7 @@ mod pins {
 
     /// The `unused_local_variable` rows of `report`, as (offset, name-token
     /// length) pairs in source order.
-    fn unused_local_rows(source: &str) -> Vec<(u32, u32)> {
+    pub(crate) fn unused_local_rows(source: &str) -> Vec<(u32, u32)> {
         report(source)
             .diagnostics
             .iter()
@@ -6712,3 +6741,12 @@ mod pins {
         );
     }
 }
+
+/// The #3152 `unused_local_variable` family pins (the annotation-mention
+/// read credit, the same-scope-duplicate binding order, the
+/// pattern-assignment declaration, the same-line ignore's code match, and
+/// the switch-expression arm binder window), kept as a standalone module
+/// so the shared `pins` rig stays untouched while its lane is in flight.
+#[cfg(test)]
+#[path = "ticket_3152_tests.rs"]
+mod ticket_3152_tests;

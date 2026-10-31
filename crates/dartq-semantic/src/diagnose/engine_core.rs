@@ -2125,6 +2125,25 @@ impl<'a> Engine<'a> {
         // The pop can remove the open window's members: a group never spans
         // frames, so the window dies with its frame.
         self.pattern_group_open = None;
+        // A destructuring `PatternVariableDeclaration` registers each binder
+        // into the enclosing statement-list duplicate scope twice: once when
+        // `add_tracked_local` claims the name (the declaration's own
+        // `checkStatements` arm) and again when the statement boundary's
+        // `handle_pattern_variable_declaration_statement` re-adds every group
+        // member. The second insert finds the FIRST registration's identical
+        // span, so `stage_local_duplicate` reports the token against itself
+        // (range == context first range). Upstream inserts each declared
+        // element once, so a self-coincident row is always the double-add —
+        // a genuine redeclaration carries a distinct second span. Retract it.
+        // This is the destructuring `var (a, b) = …` face; plain `var x;` and
+        // `note_local`/`note_local_function` each register once and never
+        // produce a self-coincident row.
+        self.report.usage.retain(|d| {
+            !(d.code.name == "duplicate_definition"
+                && d.context.as_ref().map_or(false, |ctx| {
+                    ctx.first().map_or(false, |c| c.range == d.range)
+                }))
+        });
         let mark = self.frame_local_marks.pop().unwrap_or(self.locals.len());
         if mark >= self.locals.len() {
             self.drop_stale_local_hits(mark);
