@@ -251,8 +251,20 @@ fn walk(c: &Check<'_>, rows: &[u32]) -> bool {
 }
 
 /// The static-type read's access-chain posture (:97-107): the
-/// outermost selector names the expression's type.
+/// outermost selector names the expression's type. A parenthesized
+/// operand is a shape the official read answers no arm for
+/// (`_processExpression`'s final `_ => null` — a
+/// `ParenthesizedExpression` never reaches the type switch), and the
+/// adopted-begin tiling leaks its pieces (an interpolation segment's
+/// `Identifier`, the literal row) ahead of the adopted wrapper row, so
+/// the leaf reads must not answer through them.
 fn access_chain_face(c: &Check<'_>, rows: &[u32]) -> bool {
+    if rows
+        .iter()
+        .any(|&row| c.kind(row) == NodeKind::ParenthesizedExpression)
+    {
+        return false;
+    }
     if let Some(&tail) = rows
         .iter()
         .rev()
@@ -807,11 +819,13 @@ mod tests {
 
     /// `test_nestedSwitch` — the nested switch expression IS the
     /// scrutinee expression the official `reportAtNode` pins
-    /// (`[!switch (o) {_ => t}!]` — 18 UTF-16 units from the inner
-    /// `switch` keyword).
+    /// (upstream `switch ([!switch(o) {_ => t}!]) {` — the marked span
+    /// is 18 UTF-16 units at the upstream spelling `switch(o)`, no
+    /// space; this source copies that spelling so the pin stays
+    /// verbatim).
     #[test]
     fn nested_switch_report_pins_the_expression() {
-        let source = "void f(Type t, Object o) {\n  switch (switch (o) {_ => t}) {\n    case const (int):\n      break;\n    default:\n      break;\n  }\n}\n";
+        let source = "void f(Type t, Object o) {\n  switch (switch(o) {_ => t}) {\n    case const (int):\n      break;\n    default:\n      break;\n  }\n}\n";
         let f = Fixture::parse(source);
         let lints = f.run(&one_rule("switch_on_type"));
         assert_eq!(lints.len(), 1, "{lints:?}");
@@ -819,7 +833,7 @@ mod tests {
             lints[0].range.start,
             utf16_at(&f, tok(source, &f.tokens, "switch", 1))
         );
-        // `switch (o) {_ => t}` — 18 UTF-16 units.
+        // `switch(o) {_ => t}` — 18 UTF-16 units.
         assert_eq!(lints[0].range.end - lints[0].range.start, 18);
     }
 

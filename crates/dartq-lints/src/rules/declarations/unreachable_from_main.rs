@@ -3,8 +3,8 @@ use rustc_hash::FxHashSet;
 use super::{Check, PayloadField, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
 use crate::rules::{
-    MemberQuery, SupertypeClause, initialized_identifier_name, member_matches, member_name,
-    rows_with_parent, same_file_ancestors, supertypes, utf16_token_span,
+    MemberQuery, SupertypeClause, get_set_token, initialized_identifier_name, member_matches,
+    member_name, rows_with_parent, same_file_ancestors, supertypes, utf16_token_span,
 };
 use dartq_ast::NodeKind;
 
@@ -255,10 +255,14 @@ fn judge_container(
     }
     let container = c.lexeme(name.expect("public implies a name")).to_owned();
     let is_enum = c.kind(row) == NodeKind::EnumDeclaration;
-    // The ancestor chain resolves once per container — every member's
-    // `isOverride` read consults the same table (the official gathers
-    // `members` per container element; the same-file approximation).
-    let ancestors = same_file_ancestors(c, row, false);
+    // The ancestor chain resolves once per container, flattened to its
+    // member rows — every member's `isOverride` read consults the same
+    // table (the official gathers `members` per container element; the
+    // same-file approximation).
+    let ancestor_members: Vec<u32> = same_file_ancestors(c, row, false)
+        .iter()
+        .flat_map(|&ancestor| member_rows(c, ancestor))
+        .collect();
     for member in member_rows(c, row) {
         match c.kind(member) {
             NodeKind::Constructor | NodeKind::Factory => {
@@ -287,7 +291,12 @@ fn judge_container(
                         // reads the field's own name — upstream keys on
                         // `element.getter`, the accessor the variable
                         // carries.
-                        if is_override_member(c, &ancestors, c.lexeme(name), MemberQuery::Getter) {
+                        if is_override_member(
+                            c,
+                            &ancestor_members,
+                            c.lexeme(name),
+                            MemberQuery::Getter,
+                        ) {
                             continue;
                         }
                         judge(
@@ -332,9 +341,17 @@ fn judge_container(
                 if !is_static && lexeme == "toJson" {
                     continue;
                 }
-                // The `isOverride` arm (:147): a method resolving
-                // against an ancestor's member table never gathers.
-                if is_override_member(c, &ancestors, lexeme, MemberQuery::Method) {
+                // The `isOverride` arm (:147): the member's own accessor
+                // shape queries the table — a getter's element IS the
+                // accessor (upstream `getOverridden(Name.forElement)`),
+                // so an overriding getter resolves against a base
+                // getter, an overriding setter against a base setter.
+                let override_query = match get_set_token(c, member) {
+                    Some("get") => MemberQuery::Getter,
+                    Some(_) => MemberQuery::Setter,
+                    None => MemberQuery::Method,
+                };
+                if is_override_member(c, &ancestor_members, lexeme, override_query) {
                     continue;
                 }
                 judge(
@@ -357,14 +374,16 @@ fn judge_container(
     }
 }
 
-/// Whether `name` resolves against any ancestor's member table — the
+/// Whether `name` resolves against any ancestor member row — the
 /// `isOverride` approximation (`getOverridden` across the same-file
 /// interface chain). `concrete=false` joins `implements` links, the
-/// official `InterfaceElement.getOverridden` semantics.
-fn is_override_member(c: &Check<'_>, ancestors: &[u32], name: &str, query: MemberQuery) -> bool {
-    ancestors
+/// official `InterfaceElement.getOverridden` semantics. `members` is
+/// the flattened member-row table of the ancestor chain (a class row
+/// itself answers no `member_matches` kind).
+fn is_override_member(c: &Check<'_>, members: &[u32], name: &str, query: MemberQuery) -> bool {
+    members
         .iter()
-        .any(|&ancestor| !member_matches(c, ancestor, query, name).is_empty())
+        .any(|&member| !member_matches(c, member, query, name).is_empty())
 }
 
 /// Judges one constructor: the display name is `Type.written`, the

@@ -434,9 +434,26 @@ pub(crate) mod unnecessary_string_interpolations {
                     return;
                 };
                 let ty = analysis.type_of(query_site(c, ident));
-                if is_string(analysis, ty)
-                    || (matches!(ty, Some(Ty::Unknown)) && inferred_string_local(c, ident))
-                {
+                // The written face decides before the read row: the
+                // same-file declaration's written type is the name-level
+                // static type the official read keys on (`String?` stays
+                // nullable) — the flow read can over-non-null a
+                // written-nullable local (the staged inferred seam types
+                // the slot from the initializer). A var-inferred read
+                // (the fold's `Unknown`) falls to the declaration
+                // initializer face.
+                let reports = match crate::rules::written_type_face(
+                    c,
+                    ident,
+                    c.lexeme(c.head_token(ident)),
+                ) {
+                    Some(face) => face.name == Some("String") && !face.nullable,
+                    None => {
+                        is_string(analysis, ty)
+                            || (matches!(ty, Some(Ty::Unknown)) && inferred_string_local(c, ident))
+                    }
+                };
+                if reports {
                     report_literal(c, head, head + 3);
                 }
             }
@@ -496,12 +513,27 @@ pub(crate) mod unnecessary_string_interpolations {
                 // multi-row run (a member access like `d.length`, an
                 // invocation) reads the full expression's static type, and
                 // an unanswered face stays silent — the receiver's own
-                // type never stands in for the expression's.
-                if is_string(analysis, ty)
-                    || (matches!(ty, Some(Ty::Unknown) | None)
-                        && matches!(run.as_slice(), [ident] if c.kind(*ident) == NodeKind::Identifier)
-                        && inferred_string_local(c, run[0]))
-                {
+                // type never stands in for the expression's. The written
+                // face decides before the read row (the same over-non-null
+                // read seam the `$id` arm guards).
+                let sole = matches!(run.as_slice(), [ident] if c.kind(*ident) == NodeKind::Identifier);
+                let reports = if sole {
+                    match crate::rules::written_type_face(
+                        c,
+                        run[0],
+                        c.lexeme(c.head_token(run[0])),
+                    ) {
+                        Some(face) => face.name == Some("String") && !face.nullable,
+                        None => {
+                            is_string(analysis, ty)
+                                || (matches!(ty, Some(Ty::Unknown) | None)
+                                    && inferred_string_local(c, run[0]))
+                        }
+                    }
+                } else {
+                    is_string(analysis, ty)
+                };
+                if reports {
                     report_literal(c, head, close + 1);
                 }
             }
@@ -571,6 +603,15 @@ pub(crate) mod unnecessary_string_interpolations {
                         .is_some_and(|tok| c.lexeme(tok) == name)
                         && c.byte_span(var).start < use_start;
                     if binds {
+                        // A written type answers at the read row (:49-53):
+                        // the initializer read below is the var-inferred
+                        // face — `String?` stays nullable and any other
+                        // written type keeps its interpolation. The
+                        // written face resolves at the USE row (a
+                        // declaration never binds itself).
+                        if let Some(face) = crate::rules::written_type_face(c, row, name) {
+                            return face.name == Some("String") && !face.nullable;
+                        }
                         let Some(range) =
                             crate::rules::flow::exhaustive_cases::initializer_range(c, var)
                         else {
