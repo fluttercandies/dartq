@@ -4713,6 +4713,24 @@ impl<'a> Engine<'a> {
             return;
         }
         if defined {
+            // The compound-write read face: a write satisfied through the
+            // SETTER spelling alone still reports the getter half's miss —
+            // the oracle resolves the read first (`C.foo += 1` over a
+            // `static set foo` is `undefined_getter` naming the container,
+            // UndefinedGetterTest test_compoundAssignment_hasSetter_static;
+            // the miss arm below shares this per-face split).
+            if row.intent == Intent::ReadWrite && !resolved.members.contains_key(&row.name) {
+                let name_text = self.strings.resolve(row.name);
+                let type_text = self.strings.resolve(container).to_string();
+                let read_code = if resolved_kind == ContainerKind::Extension {
+                    SemanticCode::UndefinedExtensionGetter
+                } else if resolved_kind == ContainerKind::Enum {
+                    SemanticCode::UndefinedEnumConstant
+                } else {
+                    SemanticCode::UndefinedGetter
+                };
+                self.emit(read_code, row.range, name_text, &type_text);
+            }
             // The static/extension face resolved (#2618): the edge targets
             // the container's own declaration — statics resolve on the
             // declaring container only, and the write's satisfying arm
@@ -5320,6 +5338,42 @@ impl<'a> Engine<'a> {
             return;
         }
         if self.member_defined(container, receiver_ty, row, false, receiver_nullable) {
+            // The compound-write read face (the oracle resolves the getter
+            // before the setter): a compound write satisfied through the
+            // SETTER spelling (`name=`) still reports the getter half's own
+            // miss — `c.foo += 1` over a setter-only `C` is
+            // `undefined_getter` naming `C` (the class setter's claim also
+            // blocks the extension-getter application,
+            // UndefinedGetterTest test_compoundAssignment_hasSetter_instance
+            // and test_extension_instance_extendedHasSetter_extensionHasGetter).
+            // A satisfied READ half (a getter or field under the plain
+            // spelling) stays silent.
+            if row.intent == Intent::ReadWrite
+                && !receiver_nullable
+                && matches!(self.walk_members(container, row.name), Walk::Missing)
+                && matches!(
+                    self.frozen_member_verdict(container, row.name),
+                    FrozenFace::Absent
+                )
+                && !self.members.object_members.contains(&row.name)
+                && matches!(
+                    self.extension_application(
+                        container,
+                        receiver_ty,
+                        row.name,
+                        false,
+                        receiver_nullable,
+                    ),
+                    ExtensionApp::None
+                )
+            {
+                let name_text = self.strings.resolve(row.name);
+                let type_text =
+                    self.getter_display(&recv, container, receiver_ty, row.range.offset);
+                self.emit(SemanticCode::UndefinedGetter, row.range, name_text, &type_text);
+                self.record_miss(row.name, row.range, true, NameUse::Read);
+                return;
+            }
             // No implicit-this face here: every caller hands a QUALIFIED
             // member (`x.m`, `C().m`, `this.m`), and the oracle runs
             // `_checkForInvalidInstanceMemberAccess2` from the unqualified
@@ -5394,11 +5448,13 @@ impl<'a> Engine<'a> {
                         _ => self.strings.resolve(container).to_string(),
                     };
                     if getter_absent {
+                        let getter_text =
+                            self.getter_display(&recv, container, receiver_ty, row.range.offset);
                         self.emit(
                             SemanticCode::UndefinedGetter,
                             row.range,
                             name_text,
-                            &type_text,
+                            &getter_text,
                         );
                         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                         return;
@@ -5471,22 +5527,26 @@ impl<'a> Engine<'a> {
                     );
                 }
                 Intent::Read => {
+                    let getter_text =
+                        self.getter_display(&recv, container, receiver_ty, row.range.offset);
                     self.emit(
                         SemanticCode::UndefinedGetter,
                         row.range,
                         name_text,
-                        &type_text,
+                        &getter_text,
                     );
                 }
                 Intent::Write | Intent::ReadWrite => {
                     // The oracle resolves the getter before the setter — a
                     // compound write reports its absent read face first.
                     if row.intent == Intent::ReadWrite && getter_absent {
+                        let getter_text =
+                            self.getter_display(&recv, container, receiver_ty, row.range.offset);
                         self.emit(
                             SemanticCode::UndefinedGetter,
                             row.range,
                             name_text,
-                            &type_text,
+                            &getter_text,
                         );
                     }
                     if setter_absent {
@@ -5663,6 +5723,12 @@ impl<'a> Engine<'a> {
         // display name while the getter/setter faces keep the full
         // `getDisplayString` render).
         let method_text = self.strings.resolve(report_on).to_string();
+        // The getter face keeps the full display but strips the nullability
+        // on a null-aware access (the shorted non-null face — the
+        // `getter_display` doc's p6 probe); the setter face keeps the
+        // plain render (its own family owns that text).
+        let getter_text =
+            self.getter_display(&recv, report_on, receiver_ty, row.range.offset);
         match row.intent {
             Intent::Invoke => self.emit(
                 SemanticCode::UndefinedMethod,
@@ -5680,7 +5746,7 @@ impl<'a> Engine<'a> {
                         SemanticCode::UndefinedGetter,
                         row.range,
                         name_text,
-                        &type_text,
+                        &getter_text,
                     );
                 }
                 self.emit(
@@ -5695,7 +5761,7 @@ impl<'a> Engine<'a> {
                     SemanticCode::UndefinedGetter,
                     row.range,
                     name_text,
-                    &type_text,
+                    &getter_text,
                 );
             }
             Intent::Operator(..) => unreachable!("operator intents returned above"),
@@ -7734,6 +7800,35 @@ impl<'a> Engine<'a> {
         });
         let target = target.map(|(file, spelling, face, _)| (file, spelling, face));
         self.note_member_ref(row, kind, target);
+    }
+
+    /// The read-face display: the receiver's full `getDisplayString` render
+    /// (type arguments kept — `C<int>` stays `C<int>`), with the NULLABILITY
+    /// stripped when the access is null-aware (`b?.gone` over `B<int>? b`
+    /// names `B<int>` — the oracle resolves the member on the shorted
+    /// non-null face and renders it without the `?`, probe 3.13.7:
+    /// "The getter 'gone' isn't defined for the type 'B<int>'.").
+    fn getter_display(
+        &self,
+        recv: &Receiver,
+        container: StringId,
+        receiver_ty: Ty,
+        row_offset: u32,
+    ) -> String {
+        let base = match recv {
+            Receiver::Typed {
+                ty: ty @ Ty::Named { .. },
+                ..
+            } => self.ty_display(*ty),
+            _ => self.strings.resolve(container).to_string(),
+        };
+        if self.null_aware_members.contains(&row_offset)
+            && matches!(receiver_ty, Ty::Named { nullable: true, .. })
+        {
+            base.trim_end_matches('?').to_string()
+        } else {
+            base
+        }
     }
 
     pub(crate) fn member_defined(

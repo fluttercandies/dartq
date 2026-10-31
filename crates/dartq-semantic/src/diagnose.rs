@@ -6001,6 +6001,13 @@ mod ticket_3140_tests;
 #[cfg(test)]
 mod ticket_3143_tests;
 
+/// The #3158 pins — the `undefined_getter` display's null-aware
+/// nullability strip (arguments stay, `?` goes) and the compound write's
+/// read face (a setter-satisfied write still reports the getter half's
+/// miss, on the instance and static-container faces).
+#[cfg(test)]
+mod ticket_3158_tests;
+
 /// The #3142 pins — `unnecessary_type_check`'s residual faces after
 /// #3129: the `core.`/`p.` head canonicalization, the generic
 /// member-tear-off operand, the raw generic alias's bounds fold, and the
@@ -6016,3 +6023,12 @@ mod ticket_3142_tests;
 /// staged return verdict across the sync/async/arrow-body shapes.
 #[cfg(test)]
 mod ticket_3144_tests;
+
+/// The #3161 pins: `invalid_use_of_type_outside_library` — the
+/// cross-library class-modifier contract on the written supertype clauses
+/// (`overrides.rs`'s `plan_modifier_use_sites`): the clause-kind drive per
+/// declaration family (classes and named mixin applications, mixins, and
+/// the enum class drive), the alias-transparent resolution, and the
+/// written-entry anchors.
+#[cfg(test)]
+mod ticket_3161_tests;
