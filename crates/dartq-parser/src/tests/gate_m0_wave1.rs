@@ -118,7 +118,11 @@ fn keyword_named_top_level_methods_report_once_and_consume() {
 /// keyword recovery, built-in identifiers report
 /// `built_in_identifier_in_declaration`, and both are consumed as the name
 /// (`ClassOrMixinOrExtensionIdentifierContext`,
-/// identifier_context_impl.dart:50-118).
+/// identifier_context_impl.dart:50-118). Reserved words carry the
+/// built-in-name row too: the verifier gate is `isKeyword && isPseudo !=
+/// true` (error_verifier.dart:846-849, :3372 — oracle machine rows on
+/// `class assert {}`: EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD 1|7|6 +
+/// BUILT_IN_IDENTIFIER_IN_DECLARATION 1|7|6).
 #[test]
 fn keyword_named_classes_report_and_consume() {
     assert_codes(
@@ -127,12 +131,17 @@ fn keyword_named_classes_report_and_consume() {
             KW,
             "built_in_identifier_in_declaration",
             "built_in_identifier_in_declaration",
+            "built_in_identifier_in_declaration",
         ],
         "class names",
     );
     assert_codes(
         "class assert = A with B;\nclass abstract = A with B;\n",
-        &[KW, "built_in_identifier_in_declaration"],
+        &[
+            KW,
+            "built_in_identifier_in_declaration",
+            "built_in_identifier_in_declaration",
+        ],
         "named mixin applications",
     );
 }

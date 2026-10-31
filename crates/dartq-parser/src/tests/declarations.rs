@@ -1039,11 +1039,10 @@ fn class_head_paren_off_matches_oracle_face_set() {
     // Merged 7-row multiset: [experiment_not_enabled, unexpected_token,
     // expected_token(';'), missing_identifier,
     // missing_const_final_var_or_type, expected_executable,
-    // expected_token(')')]. Our parser carries the `)`-face count via the
-    // scanner's parked-closer row (the scanner runs eagerly, so its
-    // unbalanced-group row is unconditional) and lets D parse as its own
-    // declaration — observably identical at (code, file): the oracle emits
-    // no rows for D either.
+    // expected_token(')')]. Our parser carries the `)`-face via the walk's
+    // moveSynthetic adoption at the boundary (parser_impl.dart:1985) and
+    // lets D parse as its own declaration — observably identical at
+    // (code, file): the oracle emits no rows for D either.
     let (c2, scanner2) = parse_off_with_scanner("class C( {}\nclass D {}");
     let mut codes2 = c2.error_codes();
     codes2.extend(scanner2);
@@ -1064,14 +1063,16 @@ fn class_head_paren_off_matches_oracle_face_set() {
     // unexpected_token spans the `(` token alone with the analyzer's
     // re-worded text, and the junk-member face spans the boundary keyword
     // alone (parser-channel order: the experiment gate row, then the skip
-    // face, then the three remnant faces, then the boundary face).
+    // face, then the three remnant faces, then the moveSynthetic adoption
+    // row + boundary face).
     assert_eq!(
         c2.errors[0],
         ("experiment_not_enabled".to_string(), 7, 7)
     );
     assert_eq!(c2.errors[1], ("unexpected_token".to_string(), 7, 8));
     assert_eq!(c2.texts[0], "Unexpected text '('.");
-    assert_eq!(c2.errors[5], ("expected_executable".to_string(), 12, 17));
+    assert_eq!(c2.errors[5], ("expected_token".to_string(), 12, 13));
+    assert_eq!(c2.errors[6], ("expected_executable".to_string(), 12, 17));
 }
 
 // —— class-head `(` junk family, paired-empty sub-shape (3.13.7) —————————
@@ -1306,23 +1307,59 @@ fn class_head_bracket_junk_face() {
 /// Unpaired `(` + `{}` remnant with a follower (`class C( {} void f() {}`,
 /// oracle c08): the pending paren's junk-member face lands on the follower
 /// token — `expected_executable` spanning `void` (1|13|4) — and the
+/// moveSynthetic relocation adopts the parked closer at the boundary, so
+/// the unmatched-group row `expected_token ')'` (1|13|1) rides the follower
+/// too (parser_impl.dart:1985 via :5028-5037) instead of the EOF park. The
 /// follower re-parses cleanly at top level.
 #[test]
 fn class_head_paren_follower_exec_face() {
     let (c, _scanner) = parse_latest_with_scanner("class C( {} void f() {}");
     assert_eq!(
-        &c.errors[..5],
+        &c.errors[..6],
         &[
             ("unexpected_token".to_string(), 7, 8),
             ("expected_token".to_string(), 9, 10),
             ("missing_identifier".to_string(), 10, 11),
             ("missing_const_final_var_or_type".to_string(), 10, 11),
+            ("expected_token".to_string(), 12, 13),
             ("expected_executable".to_string(), 12, 16),
         ],
         "{:?}",
         c.texts
     );
-    assert_eq!(c.texts[4], "Expected a method, getter, setter or operator declaration.");
+    assert_eq!(c.texts[4], "Expected to find ')'.");
+    assert_eq!(c.texts[5], "Expected a method, getter, setter or operator declaration.");
+}
+
+/// Reserved keyword in class-name position (`class if {}`, oracle b12): the
+/// parser's keyword-name face (`expected_identifier_but_got_keyword`) and
+/// the verifier's built-in-name face ride the same keyword — the gate is
+/// `isKeyword && isPseudo != true` (error_verifier.dart:846-849, :3372),
+/// which reserved words satisfy like built-in ones.
+#[test]
+fn class_reserved_name_keyword_face() {
+    let (table, text) = scan_ok("class if {}\n");
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    let c = std::mem::take(p.listener);
+    assert_eq!(
+        c.errors,
+        [
+            (
+                "expected_identifier_but_got_keyword".to_string(),
+                6, 8
+            ),
+            ("built_in_identifier_in_declaration".to_string(), 6, 8),
+        ]
+    );
+    assert_eq!(
+        c.texts[0], "'if' can't be used as an identifier because it's a keyword."
+    );
+    assert_eq!(
+        c.texts[1],
+        "The built-in identifier 'if' can't be used as a type name."
+    );
 }
 
 /// Feature-off paired-empty at EOF (`// @dart=2.12 class C({})`, oracle

@@ -1577,7 +1577,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let built_in_name = if self.is_built_in_name_token(0) {
             Some(self.peek_span())
         } else {
-            None
+            // Reserved keywords carry the same verifier face: the gate is
+            // `isKeyword && isPseudo != true` (error_verifier.dart:846-849),
+            // so `class if {}` reports built_in_identifier_in_declaration on
+            // the keyword alongside the parser's
+            // expected_identifier_but_got_keyword (oracle 1:7 len 2).
+            matches!(
+                self.peek_kind(),
+                TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
+            )
+            .then(|| self.peek_span())
         };
         let name =
             self.ensure_declaration_name(IdentifierContext::ClassOrMixinOrExtensionDeclaration);
@@ -2851,6 +2860,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // empties too — `class C({})` at EOF); the pending-paren arm below
         // splits its faces on exactly this fact.
         let paren_unpaired = !self.peek_is_possible_record_type();
+        // The scanner's parked synthetic closer for the unpaired head `(`:
+        // `close_unclosed_groups` parks it at EOF (or `report_unmatched_begin`
+        // before a mismatching closer) and records the pair without a
+        // diagnostic, deferring the row to the parser's post-parse pass.
+        let parked_close = if paren_unpaired {
+            self.cursor.table_matching_end(lparen.id)
+        } else {
+            None
+        };
         // `endPrimaryConstructor` (outline_builder.dart:1810-1818): the
         // Class/Enum arm runs `reportIfNotEnabled(primaryConstructors,
         // beginPrimaryConstructor)` whenever the `(` head parsed — the junk
@@ -2887,25 +2905,24 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         // The pending `(` closes wherever the recovery can bound it, and the
         // two oracle probes split exactly there. EOF path (`class C( {}`):
-        // the scanner reports the unbalanced group itself
-        // (`expected_token(')')` pinned at EOF, lexer/mod.rs:908-917) and
-        // appends a zero-width synthetic `)` before the EOF token
-        // (lexer/mod.rs:140-141); the parser's `expected_executable` rides
-        // that synthetic and keeps the zero-width EOF anchor (2:1 0).
-        // Follower path (`class C( {} void f() {}`): the scanner parks the
-        // synthetic `)` ahead of the boundary token, so the re-anchored row
-        // lands on the boundary itself (oracle: `expected_executable` on
-        // `void`, len 4) and the follower keeps a clean top-level parse.
+        // the walk drains to EOF without hitting the follower arm, the pair
+        // stays unadopted, and the parse-end pass anchors the
+        // `expected_token(')')` row at the EOF-parked synthetic
+        // (`close_unclosed_groups`, lexer/mod.rs:1117-1152); the parser's
+        // `expected_executable` rides that synthetic and keeps the
+        // zero-width EOF anchor (2:1 0).
+        // Follower path (`class C( {} void f() {}`): the walk stops at the
+        // boundary and adopts the parked closer at the relocation point —
+        // the `expected_token(')')` row lands on the boundary (oracle
+        // `expected_executable` + `expected_token ')'` on `void`) and the
+        // follower keeps a clean top-level parse.
         // With a real `)` the closer carries the row on its own span
         // (oracle `class C({})`: `expected_executable` at the `)`), and a
         // trailing stray `}` adds its own row (oracle `class C({}) }` rows
         // at both closers); the unpaired twin `class C( {} }` collapses to
         // one row at the stray `}` — the synthetic closer's re-anchored row
         // and the real brace's row share the anchor, and the shared dedup
-        // (`admit_row`) drops the second. The merged scanner+parser channel
-        // is the established rig for this fixture class
-        // (`unclosed_formal_relocation`, tests/gate_m0_wave3.rs
-        // `assert_codes_with_scanner`).
+        // (`unmatched_seen`) drops the second.
         while !self.cursor.at_eof() {
             if !matches!(
                 self.peek_kind(),
@@ -2921,6 +2938,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // instead, so the arm is gated on the head paren's own
                 // pairing, not the `{`-remnant's closer.
                 if paren_unpaired {
+                    // moveSynthetic relocation (`ensureCloseParen`'s
+                    // `begin.endGroup!.isSynthetic` bailout,
+                    // parser_impl.dart:1985 via :5028-5037): the official
+                    // parse re-offsets the parked closer to the first token
+                    // past the formals junk (`_setOffset(endGroup,
+                    // next.offset)`) and the translation reads
+                    // `begin.endGroup.charOffset` post-parse, so the
+                    // `expected_token ')'` row lands on the follower
+                    // (oracle `class C( {} void f() {}` → 1:13 on `void`,
+                    // not the EOF park). Adopting the pair here latches
+                    // `unmatched_reported`, so the parse-end pass skips it.
+                    if let Some(parked) = parked_close {
+                        self.report_unmatched_row(")", self.peek_span());
+                        self.unmatched_reported.push(lparen.id);
+                        self.cursor.hide(parked);
+                    }
                     self.report(msg::expected_executable(), self.find_non_zero_span());
                 }
                 break;
