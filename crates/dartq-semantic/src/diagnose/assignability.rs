@@ -2164,6 +2164,24 @@ impl<'a> Engine<'a> {
                     RefTarget::Decl { .. } => self.top_level_write_ty(row.name),
                 }
             }
+            RowShape::Bare(BareInfo::Missing { this_type, .. })
+                if row.intent == Intent::Write =>
+            {
+                // A setter-only implicit-`this` write (`set only(T v)` with
+                // no getter): the tentative read missed the getter
+                // namespace, so the row carries no `Plain` face, yet the
+                // write element the oracle resolves is the `name=` setter
+                // and the checked type is its value formal
+                // (`AssignmentExpressionImpl.writeType`,
+                // assignment_expression_resolver.dart:54/:83/:361). The
+                // row-resolution face owns both halves — the same implicit-
+                // `this` `name=` hit [`Self::bare_write_target_exists`]
+                // rescues from `undefined_identifier` decides the face here
+                // ([`Self::bare_write_formal_ty`]), and only a plain `=`
+                // asks (a compound `??=`/`+=` reads the name too, whose
+                // miss keeps its own report).
+                self.bare_write_formal_ty(row.name, *this_type)
+            }
             RowShape::Bare(BareInfo::Container { name, kind }) => {
                 // A container name is never a valid assignment target — the
                 // oracle reports assignment-to-`this`-prefix shapes with

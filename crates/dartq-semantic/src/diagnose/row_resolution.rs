@@ -7073,6 +7073,12 @@ impl<'a> Engine<'a> {
     /// setter defines the write silently. A getter-only name stays
     /// under-reported (the oracle's `undefined_setter` needs a receiver
     /// type this face cannot supply).
+    ///
+    /// The implicit-`this` arm's write FACE — the setter's value formal the
+    /// assignment check compares the source against — is
+    /// [`Self::bare_write_formal_ty`]'s answer; the two read the same
+    /// `name=` hit under the same accessibility gate, so a write this
+    /// predicate leaves reporting never acquires an assignability verdict.
     pub(crate) fn bare_write_target_exists(
         &mut self,
         name: StringId,
@@ -7099,6 +7105,49 @@ impl<'a> Engine<'a> {
                     && self.member_accessible_in(name, owner)
             })
         })
+    }
+
+    /// The write face of a bare write the getter-side lookup MISSED: the
+    /// implicit-`this` `name=` setter's value formal. A setter-only member
+    /// (`set only(T v)` with no getter) is exactly that shape — the
+    /// push-time tentative read consults the getter namespace and finds
+    /// nothing, so the row carries `BareInfo::Missing` and no declared face,
+    /// while the oracle's write resolution resolves the `name=` element and
+    /// checks the source against ITS type (`AssignmentExpressionImpl
+    /// .writeType` — upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+    /// resolver/assignment_expression_resolver.dart:54/:83/:361; the write
+    /// element is the setter, whose type IS the value formal).
+    ///
+    /// The verdict is [`Self::bare_write_target_exists`]'s implicit-`this`
+    /// arm verbatim — the same own-container `name=` hit under the same
+    /// accessibility gate — so a write that rescue leaves reporting
+    /// (`undefined_identifier`) answers no write face here either: the
+    /// assignability check stays silent rather than inventing a type over a
+    /// reference the model deemed unresolved. `Unknown` for a getter-only
+    /// name (the setter element does not exist), a foreign-private setter,
+    /// a broken chain, and every off-instance context.
+    pub(crate) fn bare_write_formal_ty(
+        &mut self,
+        name: StringId,
+        this_type: Option<StringId>,
+    ) -> Ty {
+        let Some(container) = this_type else {
+            return Ty::UNKNOWN;
+        };
+        let setter = self.setter_spelling(name);
+        resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .filter(|(_, owner)| self.member_accessible_in(name, *owner))
+        .and_then(|(decl, _)| decl.members.get(&setter))
+        .and_then(|entry| entry.formals.as_deref())
+        .and_then(|formals| formals.positional.first())
+        .map_or(Ty::UNKNOWN, |formal| self.fold_alias_ty(formal.ty))
     }
 
     /// The implicit-`this` member's accessibility gate (upstream

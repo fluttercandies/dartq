@@ -17694,3 +17694,17 @@ mod ticket_3238_tests;
 #[cfg(test)]
 #[path = "ticket_3253_tests.rs"]
 mod ticket_3253_tests;
+
+// The #3271 pins (the setter-only implicit-`this` write face:
+// `class C { set only(T v) {} }` + `only = e` resolves no getter, so the row
+// carried no write type and the assignability check stayed silent while the
+// oracle checks the source against the `name=` setter's value formal —
+// `AssignmentExpressionImpl.writeType`; `Engine::bare_write_formal_ty`
+// answers that face, and the pins lock the reject, accept, `this.` parity,
+// pair-regression and getter-only-silent arms). Registered here because
+// `diagnose.rs` is a live-lane file out of this ticket's write scope;
+// `#[path]` keeps the module inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3271_tests.rs"]
+mod ticket_3271_tests;
