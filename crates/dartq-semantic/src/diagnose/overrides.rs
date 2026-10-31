@@ -4215,9 +4215,32 @@ impl<'a> Engine<'a> {
                 hit.owner_file == self.file
                     || self.owner_library_of(hit.owner_file, **name) == Some(self.lib)
             })
-            .map(|name| self.member_description(&view.representative[name], *name))
+            .map(|name| self.completeness_description(view, *name))
             .collect();
         self.emit_missing_members(descriptions, name_range);
+    }
+
+    /// The completeness report's named member: the interface map's
+    /// MOST-SPECIFIC hit for the name — the oracle reads
+    /// `interface.map[name]`, the `InheritanceManager3` selection over every
+    /// face's candidates (`inheritance_override.dart:426-451`, then
+    /// `element.enclosingElement.displayName` at `:970-975`). The first-face
+    /// representative is NOT that selection: `class S extends SetBase<int>
+    /// with SetMixin<int>` must name `SetBase.contains` (the superclass's own
+    /// abstract redeclaration) even though the mixin's face carries the
+    /// `Set.contains` interface row first. A name whose candidates do not
+    /// linearize (the conflict shapes) keeps the representative.
+    fn completeness_description(&self, view: &InterfaceView<'a>, name: StringId) -> String {
+        let candidates: Vec<&FaceEntry<'a>> = view
+            .face_hits
+            .iter()
+            .flatten()
+            .filter(|hit| hit.name == name)
+            .collect();
+        let chosen = self
+            .most_specific(&candidates)
+            .unwrap_or_else(|| &view.representative[&name]);
+        self.member_description(chosen, name)
     }
 
     /// The interface view for the completeness check: every resolved face's
@@ -4684,7 +4707,7 @@ impl<'a> Engine<'a> {
 
     /// The description text of one missing member: `Enclosing.member`, the
     /// official `setter ` prefix for setter spellings and none for methods.
-    pub(crate) fn member_description(&self, hit: &FaceEntry<'a>, name: StringId) -> String {
+    pub(crate) fn member_description(&self, hit: &FaceEntry<'_>, name: StringId) -> String {
         let owner = self.strings.resolve(hit.owner_name);
         let text = self.strings.resolve(name);
         if let Some(base) = text.strip_suffix('=') {
@@ -7097,6 +7120,75 @@ impl<'a> Engine<'a> {
         if matches!(from_ty, Ty::Dynamic | Ty::Void) {
             return Some(false);
         }
+        // A MEMBER's own type parameter (`subtype.dart:300-320`'s Variable
+        // arms): `T <: X` holds iff `T`'s bound is a subtype of `X`
+        // (`dynamic` for an unwritten bound, so only a top target passes),
+        // and `X <: T` holds only for `Never` or the same variable. The two
+        // distinct type variables of an override pair are therefore
+        // unrelated unless their bounds relate them (`void m<T extends
+        // num>(T)` over `void m<T>(String)`, and the SDK's `Set.removeWhere`
+        // pair). CONTAINER parameters never reach here — the super-face
+        // substitution rewrote them (`instantiate_inherited`), and an
+        // unsubstituted one means an undecidable edge, which the caller
+        // already suppressed.
+        if let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = from_ty
+            && from_entry.type_param_names.contains(&name)
+        {
+            // The same variable on both sides relates reflexively (an
+            // identical generic signature is no break) — the bound walk must
+            // never see that pair.
+            if matches!(
+                to_ty,
+                Ty::Named {
+                    name: to_name,
+                    nullable: false,
+                    ..
+                } if to_name == name
+            ) {
+                return Some(true);
+            }
+            let bound = from_entry
+                .type_param_names
+                .iter()
+                .position(|param| *param == name)
+                .and_then(|index| from_entry.type_param_bounds.get(index).copied())
+                .unwrap_or(Ty::Dynamic);
+            if bound == from_ty {
+                return Some(false);
+            }
+            return self.override_decide(
+                bound,
+                from_scope,
+                from_entry,
+                to_ty,
+                to_scope,
+                to_entry,
+                world,
+            );
+        }
+        if let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = to_ty
+            && to_entry.type_param_names.contains(&name)
+        {
+            return Some(
+                matches!(from_ty, Ty::Never)
+                    || matches!(
+                        from_ty,
+                        Ty::Named {
+                            name: from_name,
+                            nullable: false,
+                            ..
+                        } if from_name == name
+                    ),
+            );
+        }
         self.assignable(from_ty, to_ty, false).or_else(|| {
             let (
                 Ty::Named {
@@ -7408,8 +7500,35 @@ impl<'a> Engine<'a> {
                     }
                     None => String::new(),
                 };
+                // A generic member renders its own type parameters between
+                // `Function` and the parameter list, bounds included
+                // (`void Function<T extends num>(T)`; the oracle's function
+                // type text keeps the declared bounds, upstream Dart SDK
+                // source `pkg/analyzer/lib/src/dart/element/type.dart`'s
+                // `FunctionTypeImpl` textual face). A bound recorded as
+                // `dynamic` is the absent-bound default and stays unwritten.
+                let type_params = if entry.type_param_names.is_empty() {
+                    String::new()
+                } else {
+                    let rendered = entry
+                        .type_param_names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            let name = self.strings.resolve(*name);
+                            match entry.type_param_bounds.get(index) {
+                                Some(bound) if *bound != Ty::Dynamic && *bound != Ty::UNKNOWN => {
+                                    format!("{name} extends {}", self.declared_ty_text(*bound))
+                                }
+                                _ => name.to_owned(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("<{rendered}>")
+                };
                 format!(
-                    "{} Function({params})",
+                    "{} Function{type_params}({params})",
                     self.declared_ty_text(entry.return_ty)
                 )
             }
@@ -8451,3 +8570,12 @@ mod field_face_and_set_base_tests {
 #[cfg(test)]
 #[path = "ticket_3001_tests.rs"]
 mod ticket_3001_tests;
+
+/// The #2515 pins: the SDK-units exposure wave's override-signature faces —
+/// generic members render their own type parameters (bounds included) in the
+/// message slots, a member's type parameter relates only through its bound,
+/// and the completeness report names the interface map's most-specific
+/// declaring member.
+#[cfg(test)]
+#[path = "ticket_2515_tests.rs"]
+mod ticket_2515_tests;
