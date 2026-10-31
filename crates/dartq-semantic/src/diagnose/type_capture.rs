@@ -527,41 +527,100 @@ impl<'a> Engine<'a> {
         non_finals.sort_by(|a, b| a.0.cmp(&b.0));
         for (site, span) in &ctor_spans {
             // The implicit-super face: a generative constructor with no
-            // explicit super satisfaction (a `super(...)` initializer — or,
-            // conservatively, any `super.x` formal: the entries' granular
-            // counts are consumed by `check_super_formal` before this flush,
-            // so the mark stays the blanket skip; under-supplied formals
-            // under-report, error_verifier.dart:7246-7254) whose
-            // superclass's unnamed constructor declares required parameters
-            // reports at the head. `required` counts BOTH required-positional
-            // and required-named formals (upstream
-            // `requiredPositionalParameterCount != 0 ||
-            // requiredNamedParameters.isNotEmpty`,
-            // error_verifier.dart:7225-7258).
+            // explicit super satisfaction — an entry in `ctor_super_init`,
+            // fed exclusively by an actual `super(...)`/`super.n(...)`
+            // initializer item (upstream early-returns on a
+            // `SuperConstructorInvocation` /
+            // `RedirectingConstructorInvocation` initializer alone,
+            // error_verifier.dart:7182-7189; a redirecting constructor's
+            // own site never reaches this loop, the `ctor_redirects`
+            // filter) — reports at the head when the superclass's unnamed
+            // constructor still misses arguments. Upstream counts the
+            // required positionals and the required named spellings
+            // (:7225-7232), subtracts what the constructor's own super
+            // formals supply (`verifySuperFormalParameters` — each
+            // positional super formal supplies its positional argument,
+            // each named one its spelling, :7244-7250) and reports when
+            // required positionals outnumber the supplied count or a
+            // required named spelling survives (:7252-7258). The supplies
+            // read off the captured formal table's super-formal markers: a
+            // positional super forward's `super.forward` default marker
+            // (positional formals cannot declare defaults, so the slot is
+            // free) and an unannotated named super formal's `Ty::Never`
+            // type sentinel — an annotated named super formal carries its
+            // written type and reads as unsupplied (a known capture gap;
+            // the supply under-reports, the face over-reports there).
             if !self.ctor_super_init.contains(site) {
                 let superclass = self
                     .index
                     .get(self.file)
                     .and_then(|elements| elements.container(container))
                     .and_then(|decl| decl.superclass);
-                if let Some(superclass) = superclass {
-                    let super_ctor_required = self
-                        .index
+                let super_formals = superclass.and_then(|superclass| {
+                    self.index
                         .get(self.file)
                         .and_then(|elements| elements.container(superclass))
                         .and_then(|decl| decl.ctor_formals.get(&superclass))
-                        .is_some_and(|formals| {
-                            formals.positional.iter().any(|formal| formal.required)
-                                || formals.named.iter().any(|formal| formal.required)
-                        });
-                    if super_ctor_required {
-                        let super_text = self.strings.resolve(superclass).to_string();
-                        self.emit(
-                            SemanticCode::ImplicitSuperInitializerMissingArguments,
-                            *span,
-                            &super_text,
-                            "",
-                        );
+                        .map(|formals| &**formals)
+                });
+                if let Some((superclass, super_formals)) = superclass.zip(super_formals) {
+                    let mut required_named: FxHashSet<StringId> = super_formals
+                        .named
+                        .iter()
+                        .filter(|formal| formal.required)
+                        .map(|formal| formal.name)
+                        .collect();
+                    let required_positional = super_formals
+                        .positional
+                        .iter()
+                        .filter(|formal| formal.required)
+                        .count();
+                    if required_positional > 0 || !required_named.is_empty() {
+                        // The subclass constructor's own super-formal
+                        // supplies, keyed under its own lookup spelling (the
+                        // class name for the unnamed/primary face, the
+                        // selector for a named one — the same key
+                        // `check_super_formal` reads the target's table
+                        // under). A table the capture cannot model supplies
+                        // nothing (the same under-capture posture
+                        // `check_super_formal` takes).
+                        let supplies = self
+                            .index
+                            .get(self.file)
+                            .and_then(|elements| elements.container(container))
+                            .and_then(|decl| decl.ctor_formals.get(&self.decl_sites[*site].name))
+                            .map(|formals| &**formals);
+                        let super_forward = self.intern("super.forward");
+                        let supplied_positional = supplies
+                            .map(|formals| {
+                                formals
+                                    .positional
+                                    .iter()
+                                    .filter(|formal| {
+                                        formal.default_value == Some(super_forward)
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        if let Some(formals) = supplies {
+                            for formal in
+                                formals.named.iter().filter(|formal| formal.ty == Ty::Never)
+                            {
+                                required_named.remove(&formal.name);
+                                required_named.remove(&self.formal_public_name(formal.name));
+                            }
+                        }
+                        if required_positional > supplied_positional
+                            || !required_named.is_empty()
+                        {
+                            let super_text = self.strings.resolve(superclass).to_string();
+                            self.emit(
+                                SemanticCode::ImplicitSuperInitializerMissingArguments,
+                                *span,
+                                &super_text,
+                                "",
+                            );
+                        }
                     }
                 }
             }

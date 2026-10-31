@@ -3739,7 +3739,10 @@ impl<'a> Engine<'a> {
             // satisfaction — so the invocation tail is read off the token
             // table: `(` decides immediately; a `.` selector decides on the
             // `(` after its name. Comments and whitespace never intervene —
-            // the scanner drops them.
+            // the scanner drops them. This is the explicit-call set's ONLY
+            // writer: a `this`/`super` formal never joins, its supplies feed
+            // the flush's granular super-formal subtraction instead.
+
             let tokens = self.tokens.as_slice();
             let at = tokens.partition_point(|t| t.utf16_offset < token.range.end());
             let satisfied = match tokens.get(at).map(|t| &t.kind) {

@@ -5018,6 +5018,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {
+        self.flow().handle_unary_prefix_assignment_expression(operator);
+
         let engine = &mut self.engine;
         // The prefix `++`/`--` junction (`increment_or_decrement_resolver.
         // dart:273`, the prefix face): the operand's row is complete — the
@@ -5035,6 +5037,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
+        self.flow().handle_unary_postfix_assignment_expression(operator);
+
         let engine = &mut self.engine;
         engine.const_capture.unary_postfix(operator.range);
         // The postfix `++`/`--` junction (`increment_or_decrement_resolver.
@@ -9567,18 +9571,19 @@ impl ParserListener for DiagnoseListener<'_> {
         // field for ITS OWN constructor (the
         // `ConstructorFieldsVerifier`'s `initInParameter` state,
         // constructor_fields_verifier.dart) — the per-constructor set the
-        // container's flush consults. A `super.x` formal invokes the
-        // superclass's constructor the same way (the explicit-super-call
-        // satisfaction the implicit-super face reads).
+        // container's flush consults. A `this`/`super` formal never joins
+        // the explicit-super set: upstream's implicit-super face
+        // early-returns on a `SuperConstructorInvocation` /
+        // `RedirectingConstructorInvocation` initializer ENTRY alone
+        // (error_verifier.dart:7182-7189) — a formal is not one — and the
+        // formals' supplies ride the granular super-formal counts the flush
+        // reads off the captured formal table instead
+        // (`verifySuperFormalParameters`, error_verifier.dart:7244-7258).
         if let Some(site) = self.engine.open_ctor_site
             && let Some(name_id) = self.engine.name_of(name)
+            && this_keyword.is_some()
         {
-            if this_keyword.is_some() {
-                self.engine.ctor_formals_init.insert((site, name_id));
-            }
-            if this_keyword.is_some() || super_keyword.is_some() {
-                self.engine.ctor_super_init.insert(site);
-            }
+            self.engine.ctor_formals_init.insert((site, name_id));
         }
 
         // An unnamed slot's unconsumed written signature dies here — the
@@ -10368,6 +10373,15 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         self.flow()
             .handle_for_initializer_pattern_variable_assignment(pattern_keyword, equals);
+    }
+
+    fn handle_for_updaters_end(&mut self, updaters_last: Token) {
+        // Record `Ev::ForParts.updaters_end`: the flow side trims a
+        // header-anchored dead row to the updaters' own last token
+        // (upstream Dart SDK source, dead_code_verifier.dart:309-310), and
+        // dead updaters report at their full extent
+        // (dead_code_verifier.dart:357-378 `for_updaterBegin`).
+        self.flow().handle_for_updaters_end(updaters_last);
     }
 
     fn handle_for_loop_parts(

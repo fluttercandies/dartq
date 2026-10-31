@@ -16,6 +16,12 @@
 //! * `FutureOr<T>` recurses its argument: `FutureOr<int>` is potentially
 //!   non-nullable, `FutureOr<int?>` is nullable, a bare `FutureOr` reads
 //!   `FutureOr<dynamic>` (type_system.dart:1227-1230).
+//!
+//! The #3015 pins — the `implicit_super_initializer_missing_arguments`
+//! residual: `this`/`super` FORMALS never join the explicit-super set
+//! (error_verifier.dart:7182-7189 early-returns on an initializer entry
+//! alone); the formals' supplies subtract granularly instead
+//! (`verifySuperFormalParameters`, :7244-7258).
 
 use super::test_rig::{CORE_PRELUDE, report_ops};
 use super::*;
@@ -31,6 +37,24 @@ fn mdv_spans(report: &FileReport, full: &str) -> Vec<String> {
             full[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string()
         })
         .collect()
+}
+
+/// The `implicit_super_initializer_missing_arguments` rows as the exact
+/// anchored source text, source order.
+fn super_init_spans(report: &FileReport, full: &str) -> Vec<String> {
+    report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "implicit_super_initializer_missing_arguments")
+        .map(|d| {
+            full[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string()
+        })
+        .collect()
+}
+
+/// Every diagnostic code name, source order.
+fn code_names(report: &FileReport) -> Vec<&'static str> {
+    report.diagnostics.iter().map(|d| d.code.name).collect()
 }
 
 /// A `;`-bodied generative constructor still expects defaults — the
@@ -193,3 +217,92 @@ fn record_and_function_shapes_decide_on_their_suffix() {
         "the bare record and function shapes report; the `?` faces stay silent"
     );
 }
+
+// —— #3015: super-formal supplies vs explicit-super satisfaction ————
+
+/// A PARTIALLY supplied superclass still reports: `super.a` supplies only
+/// the named `a`, the required `b` goes unsupplied — a super formal is not
+/// an initializer entry, so the early return never fires
+/// (error_verifier.dart:7182-7189, :7252-7258). The positional arm
+/// mirrors it: one super formal against two required positionals.
+#[test]
+fn super_formal_partial_supply_still_reports() {
+    let fixture = concat!(
+        "class C { C({required int a, required int b}); }\n",
+        "class D extends C { D({super.a}); }\n",
+        "class S { S(int x, int y); }\n",
+        "class T extends S { T(int super.x); }\n",
+    );
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        super_init_spans(&report, &full),
+        vec!["D".to_string(), "T".to_string()],
+        "the under-supplied formals report at their constructor heads"
+    );
+}
+
+/// A FULLY supplied superclass stays silent: every required named spelling
+/// is covered by a same-spelling named super formal and the required
+/// positionals are outnumbered by the positional super formals
+/// (error_verifier.dart:7244-7258 — `removeAll(namedArgumentNames)` then
+/// the count comparison).
+#[test]
+fn super_formal_full_supply_stays_silent() {
+    let fixture = concat!(
+        "class C { C({required int a, required int b}); }\n",
+        "class D extends C { D({super.a, super.b}); }\n",
+        "class S { S(int x, int y); }\n",
+        "class T extends S { T(int super.x, int super.y); }\n",
+        "class U { U({required int only}); }\n",
+        "class V extends U { V({required super.only}); }\n",
+    );
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        super_init_spans(&report, &full),
+        Vec::<String>::new(),
+        "fully-supplied forwarding constructors stay silent: {:?}",
+        code_names(&report)
+    );
+}
+
+/// An initializing `this.f` formal supplies nothing to the superclass —
+/// it is neither a super formal nor an initializer entry, so the
+/// implicit-super face fires beside it (error_verifier.dart:7182-7189;
+/// `verifySuperFormalParameters` counts `SuperFormalParameterImpl` only).
+#[test]
+fn this_formal_never_satisfies_implicit_super() {
+    let fixture = concat!(
+        "class S { S(int a); }\n",
+        "class D extends S { int f; D(this.f); }\n",
+    );
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        super_init_spans(&report, &full),
+        vec!["D".to_string()],
+        "the this-formal neither satisfies nor supplies: {:?}",
+        code_names(&report)
+    );
+}
+
+/// An explicit `super(...)` initializer satisfies regardless of the
+/// formals beside it — the early return precedes the counting
+/// (error_verifier.dart:7182-7189).
+#[test]
+fn explicit_super_still_satisfies_beside_super_formals() {
+    let fixture = concat!(
+        "class C { C({required int a, required int b}); }\n",
+        "class D extends C { D({super.a}) : super(a, 2); }\n",
+    );
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        super_init_spans(&report, &full),
+        Vec::<String>::new(),
+        "the explicit super invocation satisfies: {:?}",
+        code_names(&report)
+    );
+}
+
