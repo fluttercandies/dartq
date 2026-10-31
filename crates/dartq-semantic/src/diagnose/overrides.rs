@@ -438,9 +438,25 @@ impl<'a> Engine<'a> {
                     // left a fully-decidable chain answering Missing, which
                     // flagged legal overrides as non-overriding once the
                     // alias fold made the hop resolvable).
+                    //
+                    // A mixin CLASS applied through `with` also contributes
+                    // its own `with` faces: a named application `mixin class
+                    // A<U, V> = Object with M<...>` denotes the application
+                    // type, so `class C ... with A<...>` puts M's members on
+                    // C's interface exactly like a directly-written `with M`
+                    // (the oracle resolves `c.m()` on `class C<T> = S with
+                    // B<List<T>>`, `B = Object with A<...>`, `A = Object
+                    // with M<...>` through that chain — tests/language/
+                    // mixin5_test.dart). The superclass stays out: an
+                    // applied mixin's superclass is always `Object`
+                    // (`MIXIN_CLASS_DECLARATION_EXTENDS_NOT_OBJECT` forbids
+                    // anything else), whose members the object-members gate
+                    // owns. A plain mixin's `with` clause is empty — this
+                    // only fires for mixin classes and named applications.
                     let level: Vec<(StringId, FileId, StringId)> = mixin_container
-                        .on_clause
+                        .with_clause
                         .iter()
+                        .chain(mixin_container.on_clause.iter())
                         .chain(mixin_container.implements_clause.iter())
                         .map(|face| (*face, *mixin_owner, *mixin))
                         .collect();
@@ -1516,6 +1532,23 @@ impl<'a> Engine<'a> {
                     }
                     None if frozen_hit(self.strings.resolve(*mixin)) => {
                         mixin_hit = true;
+                    }
+                    // An applied mixin CLASS contributes its own `with`
+                    // faces to the interface (the named-application rule —
+                    // see the member walk's mixin hop); the pending drain
+                    // resolves them through the mixin's declaring file.
+                    Some((mixin_container, mixin_owner)) => {
+                        let mixin_owner_lib = self
+                            .owner_library_of(mixin_owner, *mixin)
+                            .unwrap_or(owner_lib);
+                        for mixin_face in mixin_container.with_clause.iter() {
+                            pending.push_back((
+                                *mixin_face,
+                                mixin_owner,
+                                mixin_owner_lib,
+                                *mixin,
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -4290,6 +4323,19 @@ impl<'a> Engine<'a> {
                             mixin_owner,
                             chain,
                         ));
+                    }
+                    // An applied mixin CLASS keeps its own `with` faces on
+                    // the interface (`with A<...>` where `mixin class A =
+                    // Object with M<...>` exposes M's members — the same
+                    // named-application rule the member walk's mixin hop
+                    // applies); the superclass stays out because an applied
+                    // mixin's superclass is always `Object`. A plain mixin
+                    // contributes nothing here.
+                    let mixin_owner_lib = self
+                        .owner_library_of(mixin_owner, *mixin)
+                        .unwrap_or(mixin_lib);
+                    for mixin_face in mixin_container.with_clause.iter() {
+                        pending.push_back((*mixin_face, mixin_owner, mixin_owner_lib, *mixin));
                     }
                 }
             }
