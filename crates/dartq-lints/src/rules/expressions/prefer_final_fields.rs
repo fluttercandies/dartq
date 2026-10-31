@@ -12,9 +12,13 @@ use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_f
 /// Approximations (documented — the official runs on resolved elements
 /// across the whole library; this is one unit, name-level):
 /// - Mutations are bare-name writes: assignment targets (any operator),
-///   `++`/`--` operands, and cascade-section write targets (`.._x = 1`
-///   — a section assignment is an `AssignmentExpression` upstream and
-///   its `writeElement` is the field). A write captured by a nearer
+///   an instance-qualified target whose member name is private
+///   (`c._x = 42` — `writeElement` is the field whatever the receiver),
+///   `++`/`--` operands (the bare name completes as a send group), and
+///   cascade-section write targets (`.._x = 1` — a section assignment is
+///   an `AssignmentExpression` upstream and its `writeElement` is the
+///   field). A constructor initializer-list write (`C() : _x = 7`) is
+///   NOT a mutation. A write captured by a nearer
 ///   same-file binding — a local, a parameter, a catch/for/case binder
 ///   (the shadow-check face shared with the declarations.rs write
 ///   scans) — does not count. Remaining element splits fold into the
@@ -211,11 +215,14 @@ fn scan<'a>(
                 if let Some(head) = cascade_section_head(c, marker) {
                     mutated.push(head);
                 }
-            } else {
+            } else if !in_initializer_list(c, path) {
                 // A bare-name write (`_x = 2`): the left operand run is
                 // the owner pieces left of the operator — a
                 // single-identifier chain. The direct-child face
-                // covers the hand-built compact trees.
+                // covers the hand-built compact trees. A constructor
+                // initializer-list write (`C() : _x = 7`) is not a
+                // mutation — the official rule reports a field written
+                // only there.
                 let lhs = match c.collect_direct(node).first() {
                     Some(&row) if c.kind(row) == NodeKind::Identifier => Some(row),
                     _ => slice::binary_operands_at(c, node).and_then(|(left, _)| {
@@ -225,8 +232,27 @@ fn scan<'a>(
                         }
                     }),
                 };
-                if let Some(lhs) = lhs {
-                    push_write(c, path, mutated, lhs);
+                match lhs {
+                    Some(lhs) => push_write(c, path, mutated, lhs),
+                    // An instance-qualified write (`c._x = 42`): the left
+                    // operand's member row names the written field — the
+                    // official `writeElement` is the field whatever the
+                    // receiver — so a private name counts directly (only
+                    // this library's fields carry one).
+                    None => {
+                        if let Some((left, _)) = slice::binary_operands_at(c, node)
+                            && let Some(&member) = slice::access_run(c, &left).last()
+                            && matches!(
+                                c.kind(member),
+                                NodeKind::DotAccess | NodeKind::Qualified | NodeKind::Identifier
+                            )
+                        {
+                            let name = c.lexeme(c.head_token(member));
+                            if name.starts_with('_') {
+                                mutated.push(name);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -240,17 +266,22 @@ fn scan<'a>(
                 let Some(pos) = siblings.iter().position(|&sibling| sibling == node) else {
                     return;
                 };
-                // The prefix operator parses before its operand, the
-                // postfix operator after it.
-                let operand = match c.kind(node) {
-                    NodeKind::UnaryPrefix => siblings.get(pos + 1),
-                    _ => pos.checked_sub(1).and_then(|i| siblings.get(i)),
-                };
-                if let Some(&operand) = operand {
-                    match c.kind(operand) {
-                        NodeKind::Identifier => push_write(c, path, mutated, operand),
-                        _ => {}
-                    }
+                // The bare-name operand sits on either side of the
+                // operator leaf: the bridge stamps the leaf AFTER the
+                // operand completes (`--_x`, `_x++` alike — the leaf's own
+                // head token is the operator), while a hand-built tree
+                // follows the official child order. Both neighbours are
+                // candidates and the name row decides.
+                let operand = [pos.checked_sub(1), Some(pos + 1)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| siblings.get(i).copied())
+                    .find(|&row| matches!(c.kind(row), NodeKind::Identifier | NodeKind::Send));
+                if let Some(operand) = operand {
+                    // A bare name completes as a send group: the `Send`
+                    // row's head token is the name (`_x++` reports the
+                    // write at `_x`, not at the marker).
+                    push_write(c, path, mutated, operand);
                 }
             }
         }
@@ -261,6 +292,20 @@ fn scan<'a>(
         scan(c, kid, class_row, candidates, mutated, path);
         path.pop();
     }
+}
+
+/// Whether the DFS path crosses a constructor initializer list: a write
+/// there (`C() : _x = 7`) is not a mutation for this rule — the official
+/// `writeElement` face never sees it, so a field written only in an
+/// initializer list reports. A constructor *body* write does count and
+/// sits under a `BlockBody`, not under these rows.
+fn in_initializer_list(c: &Check<'_>, path: &[u32]) -> bool {
+    path.iter().any(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::FieldInitializer | NodeKind::Initializer
+        )
+    })
 }
 
 /// Records the bare-name write bound at `row` unless a nearer

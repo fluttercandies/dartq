@@ -288,12 +288,19 @@ fn statement_run(c: &Check<'_>, stmt: u32) -> Vec<u32> {
 fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
     let root = *run.last()?;
     let span = c.byte_span(root);
-    run.iter()
-        .all(|&other| {
-            let other = c.byte_span(other);
-            other.start >= span.start && other.end <= span.end
-        })
-        .then_some(root)
+    let covers = run.iter().all(|&other| {
+        let other = c.byte_span(other);
+        other.start >= span.start && other.end <= span.end
+    });
+    if covers {
+        return Some(root);
+    }
+    // The bridge stamps the prefix leaf over the operator *after* the
+    // operand completes, so its span covers the operator alone and the
+    // containment test fails on `~1;` / `!x.isEven;`. The leaf is the
+    // expression root there: the official `super.visitPrefixExpression`
+    // routes to `visitNode(node)` and reports the whole prefix.
+    (c.kind(root) == NodeKind::UnaryPrefix).then_some(root)
 }
 
 /// Reports at the whole expression `root`: the run's earliest head
@@ -340,8 +347,7 @@ fn token_content_end(c: &Check<'_>, root: u32, start: u32) -> u32 {
     let mut cursor = index;
     while let Some(token) = c.unit.tokens.get(cursor as usize) {
         let lexeme = c.lexeme(cursor);
-        if matches!(lexeme, ";" | "," | ")" | "}") || token.kind == dartq_scanner::TokenKind::Eof
-        {
+        if matches!(lexeme, ";" | "," | ")" | "}") || token.kind == dartq_scanner::TokenKind::Eof {
             break;
         }
         let span = crate::rules::utf16_token_span(c, cursor);
