@@ -198,3 +198,90 @@ fn record_pattern_colon_prefix_splices_synthetic_name() {
         &[("missing_identifier", 32, 33)],
     );
 }
+
+#[test]
+fn metadata_type_arguments_uninstantiated_anchor() {
+    // Official `reportRecoverableError(token, …)` (parser_impl.dart:1430):
+    // the anchor is parseArguments' returned group end. A healthy group
+    // anchors on the real closer (`@A<int> x;` → the `>`); an abandoned
+    // group anchors on the name (`noTypeParamOrArg.parseArguments` returns
+    // `token` unchanged, `@A<int;` → the `A`); a recovered group closed on
+    // a zero-width synthetic walks back to the last real token
+    // (`@A<int,;` → the `;`, type_info_impl.dart:1713-1722 +
+    // util.dart:39-53).
+    assert_rows("@A<int> x;", &[
+        (
+            "annotation_with_type_arguments_uninstantiated",
+            6,
+            7,
+        ),
+        ("missing_const_final_var_or_type", 8, 9),
+    ]);
+    assert_rows("@A<int;", &[
+        (
+            "annotation_with_type_arguments_uninstantiated",
+            1,
+            2,
+        ),
+        ("expected_executable", 2, 3),
+        ("missing_const_final_var_or_type", 3, 6),
+    ]);
+    assert_rows("@A<int,;", &[
+        (
+            "annotation_with_type_arguments_uninstantiated",
+            7,
+            8,
+        ),
+        ("expected_type_name", 7, 8),
+        ("unexpected_token", 7, 8),
+    ]);
+}
+
+#[test]
+fn metadata_invocation_junk_faces() {
+    // The argument-list junk faces of `parseArgumentsRest` ride the
+    // metadata annotation invocation unchanged (`@A();` — the trailing `;`
+    // is the declaration-loop junk row; `@A<int>.x(;` — the argument
+    // position's identifier recovery plus the closer cascade).
+    assert_rows("@A();", &[("unexpected_token", 4, 5)]);
+    assert_rows("@A<int>.x(;", &[
+        ("expected_token", 10, 11),
+        ("missing_identifier", 10, 11),
+        ("unexpected_token", 10, 11),
+    ]);
+}
+
+#[test]
+fn const_expression_missing_faces() {
+    // The const-expression recovery faces: a missing initializer, the
+    // binary RHS on `+`/`??`/`~/`, the prefix `!`/`-`/`~` operand, the
+    // unclosed `(` closer, and the `is`/`as` type faces — all anchored on
+    // the blocker token (the engine-tier `const_initialized_with_non_
+    // constant_value` companion rows live in the resolution window).
+    assert_rows("const x = ;", &[("missing_identifier", 10, 11)]);
+    assert_rows("const x = 1 +;", &[("missing_identifier", 13, 14)]);
+    assert_rows("const x = -;", &[("missing_identifier", 11, 12)]);
+    assert_rows("const x = !;", &[("missing_identifier", 11, 12)]);
+    assert_rows("const x = ~;", &[("missing_identifier", 11, 12)]);
+    assert_rows("const x = a ??;", &[("missing_identifier", 14, 15)]);
+    assert_rows("const x = a ~/;", &[("missing_identifier", 14, 15)]);
+    assert_rows("const x = (a;", &[("expected_token", 12, 13)]);
+    assert_rows("const x = a as;", &[("expected_type_name", 14, 15)]);
+    assert_rows("const x = a is;", &[("expected_type_name", 14, 15)]);
+}
+
+#[test]
+fn type_group_closer_faces() {
+    // The generic-function head `A<int;`: the `<int` run absorbs the
+    // `;`-expectation row, one group-level row (official
+    // `parseUnexpectedEnd`'s `errorReported` gate,
+    // type_info_impl.dart:1609). The EOF-anchored closer faces (`void
+    // f<T`, `class C<T`, `class C<T,S`) ride the declarations lane's
+    // EOF-span convention and are certified on the machine face by the
+    // conformance battery, not pinned here.
+    assert_rows("A<int;", &[
+        ("expected_token", 2, 5),
+        ("missing_function_body", 5, 6),
+        ("missing_function_parameters", 0, 1),
+    ]);
+}
