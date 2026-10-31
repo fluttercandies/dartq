@@ -6597,6 +6597,14 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(frame) = engine.switch.pattern_stack.pop() else {
             return;
         };
+        if engine.switch.pattern_stack.is_empty() {
+            // The variable latch dies with its root pattern: only a field
+            // boundary inside the SAME pattern reads it as a getter, and a
+            // survivor would mis-name a later field's getter (upstream reads
+            // nothing but the field's own sub-pattern,
+            // type_analyzer.dart:1674-1676).
+            engine.last_pattern_variable = None;
+        }
         let merged = SwitchTracker::collapse(&engine.name_world(), frame.leaves, frame.or_ops);
         // The whole-pattern null-check binder stagings (bound inside the
         // engine borrow below, staged into the flow's inferred-local seam
@@ -6691,6 +6699,13 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_binary_pattern(&mut self, operator: Token) {
         self.flow().begin_binary_pattern(operator);
         let engine = &mut self.engine;
+        // The left operand is complete: a variable it latched is no
+        // logical-and/or field's getter name — that pattern shape never
+        // unwraps to a variable pattern (ast.dart:57337 covers the variable
+        // and the transparent wrappers only), and the operator fires before
+        // the right operand, so clearing here keeps the right operand's own
+        // field boundary from reading the left's name.
+        engine.last_pattern_variable = None;
         // The operand pattern parses next; its bracket frame inherits the
         // binary context (the scrutinee stays the matched type).
         let is_or = engine.text_of(operator) == Some("||");
@@ -6832,6 +6847,11 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {
         self.flow().handle_list_pattern(count, left, right);
+        // A variable INSIDE a list pattern is no positional object field's
+        // getter name (only the transparent wrappers unwrap,
+        // ast.dart:6640/:39354/:39708/:40734): the latch dies with the
+        // bracket.
+        self.engine.last_pattern_variable = None;
         // The list face arrives through keysOfInterest/additional properties
         // — not modeled at name level (documented under-report).
         self.engine.pattern_leaf(Restriction::Unknown);
@@ -6840,6 +6860,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {
         self.flow().handle_map_pattern(count, left, right);
+        // Same latch death as the list arm: a map's entry values never name
+        // an enclosing positional field's getter.
+        self.engine.last_pattern_variable = None;
         self.engine.pattern_leaf(Restriction::Unknown);
         self.engine.pattern_bind_dirty = true;
     }
@@ -7261,8 +7284,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // The getter the field reads: the written name, else the
         // shorthand's variable (`:var x` — the colon is the name-less
         // `handle_no_name` shape, so the variable latch answers). The
-        // latch is consumed per field so a positional field never reads a
-        // stale one.
+        // latch is consumed per field so a field never reads a stale one.
         let latched = engine.last_pattern_variable.take();
         let mut binder = None;
         let mut binder_non_null = false;
@@ -7281,7 +7303,23 @@ impl ParserListener for DiagnoseListener<'_> {
                     .is_some_and(|checked| binder.is_some_and(|(name, _)| name == checked));
                 latched
             }
-            (None, _) => None,
+            // A POSITIONAL field (`Circle(var c)`) reads the getter its own
+            // sub-pattern's variable names: upstream falls back to
+            // `field.pattern.variablePattern?.name` when the field writes no
+            // name and reports `undefined_getter` at that token (upstream
+            // Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+            // type_analyzer.dart:1674-1679 — the lookup then runs over the
+            // head's required type, `:1681-1697`). Only the transparent
+            // wrappers resolve through to a variable pattern — cast, null
+            // assert, null check, parentheses (pkg/analyzer/lib/src/dart/ast/
+            // ast.dart:6640, :39354, :39708, :40734); a list/map/record/
+            // constant/logical-and sub-pattern answers none and reads no
+            // getter (the `dynamic` fall-back, type_analyzer.dart:1677-1679)
+            // — those shapes clear the latch before this boundary fires. The
+            // variable itself is the sub-pattern's own binder
+            // (`handle_declared_variable_pattern`), never the field's
+            // shorthand binder, so `binder` stays `None`.
+            (None, _) => latched,
         };
         // A named field (`:a` / `a: p`) is never a positional record slot —
         // the flat destructure bind requires an all-positional window.
@@ -7296,7 +7334,14 @@ impl ParserListener for DiagnoseListener<'_> {
         leaves.retain(|leaf| *leaf != Restriction::NamedContext);
         if let Some(frame) = engine.switch.pattern_stack.last_mut() {
             frame.fields.push(ObjectField {
-                name: getter.map(|(name, _)| name).or(name),
+                // A positional field keeps no member name: its column is
+                // order-keyed, not name-keyed, so only the getter it reads
+                // is recorded (`self.name` stays `None`).
+                name: if colon.is_some() {
+                    getter.map(|(name, _)| name).or(name)
+                } else {
+                    None
+                },
                 leaves,
                 getter,
                 binder,
@@ -11995,3 +12040,11 @@ mod ticket_2937_tests;
 #[cfg(test)]
 #[path = "ticket_2933_tests.rs"]
 mod ticket_2933_tests;
+
+/// The #3089 pins (a positional object-pattern field reads the getter its
+/// sub-pattern's variable names — `resolveObjectPatternPropertyGet`'s
+/// `field.pattern.variablePattern?.name` fallback, type_analyzer.dart:1675-1676
+/// — so `Circle(var c as num)` reports `undefined_getter` at `c`).
+#[cfg(test)]
+#[path = "ticket_3089_tests.rs"]
+mod ticket_3089_tests;
