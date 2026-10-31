@@ -5820,3 +5820,8 @@ mod ticket_3112_tests;
 /// report the `'num'` clamp row the oracle emits.
 #[cfg(test)]
 mod ticket_3118_tests;
+/// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
+/// type-check verdict under-emits on (function-type test spellings, type
+/// literals, typedef-folded checked types, dynamic operands).
+#[cfg(test)]
+mod ticket_3038_tests;

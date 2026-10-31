@@ -864,7 +864,14 @@ impl<'a> Boundary<'a> {
     /// outer interns), memoized per `(owner, slot)`.
     pub(crate) fn ty(&self, owner: FileId, ty: Ty) -> Ty {
         if owner == self.own {
-            return ty;
+            // Same-file faces carry no pool translation, but a spelled
+            // `p.T` head still canonicalizes to the element name — the
+            // diagnosing file's own import prefixes resolve the leaf
+            // against the identical declaration (`core.List` and `List`
+            // are one element; the subtype lattice compares heads by
+            // name, so the qualified spelling must fold the same way a
+            // foreign signature's head already does below).
+            return self.canonical_dotted_ty(ty);
         }
         match ty {
             // Record and function shapes are pool slots too: a foreign
@@ -1026,16 +1033,128 @@ impl<'a> Boundary<'a> {
         // The same-element guard: the diagnosing file must reach the
         // identical declaration file spelling the leaf bare — a local
         // container or an unqualified import binding to `foreign_file`.
-        let same = resolve_container(
+        let resolved = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
             self.own_lib,
             self.own,
             leaf_id,
-        )
-        .is_some_and(|(_, own_file)| own_file == foreign_file);
+        );
+        let same = resolved.is_some_and(|(_, own_file)| own_file == foreign_file);
         if same { leaf_id } else { name }
+    }
+
+    /// `canonical_head` applied through a whole diagnosing-file `Ty`: the
+    /// deferred type-check verdict compares an `is` operand or checked
+    /// type whose spelled `p.T` heads never crossed a pool boundary — the
+    /// same-element rewrite the foreign projection performs on entry,
+    /// applied here for the diagnosing file's own import prefixes
+    /// (`core.List` vs `List` name one element; without the rewrite the
+    /// subtype lattice reads the qualified spelling as a different head
+    /// and the always-true check stays silent). Bare heads and undecidable
+    /// prefixes pass through untouched; argument lists and function/record
+    /// leaves rewrite only where a head actually changed.
+    pub(crate) fn canonical_dotted_ty(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                let name = self.canonical_head(self.own, name);
+                if args == crate::model::ArgListId::EMPTY {
+                    return Ty::Named {
+                        name,
+                        nullable,
+                        args,
+                    };
+                }
+                let list: Vec<Ty> = self.pool().get(args).to_vec();
+                let rewritten: Vec<Ty> = list
+                    .iter()
+                    .map(|&arg| self.canonical_dotted_ty(arg))
+                    .collect();
+                if rewritten == list {
+                    return Ty::Named {
+                        name,
+                        nullable,
+                        args,
+                    };
+                }
+                self.args.borrow_mut().named(name, nullable, &rewritten)
+            }
+            Ty::Record { shape, nullable } => {
+                if shape == crate::model::RecordShapeId::EMPTY {
+                    return ty;
+                }
+                let (positional, named) = {
+                    let pool = self.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                let new_positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|&t| self.canonical_dotted_ty(t))
+                    .collect();
+                let new_named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|&(n, t)| (n, self.canonical_dotted_ty(t)))
+                    .collect();
+                if new_positional == positional
+                    && new_named
+                        .iter()
+                        .zip(named.iter())
+                        .all(|(a, b)| a == b)
+                {
+                    return ty;
+                }
+                self.args
+                    .borrow_mut()
+                    .record(&new_positional, &new_named, nullable)
+            }
+            Ty::Function { shape, nullable } => {
+                if shape == crate::model::FnShapeId::EMPTY {
+                    return ty;
+                }
+                let (type_params, return_ty, positional, named) = {
+                    let pool = self.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let new_return_ty = self.canonical_dotted_ty(return_ty);
+                let new_positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|&t| self.canonical_dotted_ty(t))
+                    .collect();
+                let new_named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|&(n, t)| (n, self.canonical_dotted_ty(t)))
+                    .collect();
+                if new_return_ty == return_ty
+                    && new_positional == positional
+                    && new_named
+                        .iter()
+                        .zip(named.iter())
+                        .all(|(a, b)| a == b)
+                {
+                    return ty;
+                }
+                self.args.borrow_mut().function(
+                    type_params,
+                    new_return_ty,
+                    &new_positional,
+                    &new_named,
+                    nullable,
+                )
+            }
+            _ => ty,
+        }
     }
 
     /// Projects a member entry found in `owner`'s container `container`
@@ -5517,12 +5636,20 @@ impl<'a> Engine<'a> {
                     _ => continue,
                 },
             };
+            // The read row spells `p.T` heads as written (`x: core.List`
+            // stages `core.List`): canonicalize to the element name before
+            // the invalid-face gate and the verdict — the same-element
+            // rewrite `boundary.ty` already performs for foreign faces.
+            let operand_ty = self.boundary.canonical_dotted_ty(operand_ty);
             if operand_ty == Ty::Unknown || self.is_invalid_ty(operand_ty) {
                 continue;
             }
             let Some((checked, type_end)) = self.reconstruct_is_ty(type_idx) else {
                 continue;
             };
+            // The checked side's `p.T` heads canonicalize the same way —
+            // `x is core.List` over `x: List` is always-true upstream.
+            let checked = self.boundary.canonical_dotted_ty(checked);
             // A type-parameter spelling (`b is Box<String>` over
             // `b: Box<T>`) cannot re-decide post-walk: `type_params`/
             // `pending_type_params` are torn down, so the bound arm of
