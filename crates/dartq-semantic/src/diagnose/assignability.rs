@@ -7893,3 +7893,12 @@ mod ticket_3145_tests;
 #[cfg(test)]
 #[path = "ticket_3147_tests.rs"]
 mod ticket_3147_tests;
+
+// The #3173 pins (the `dead_code` switch-chain faces — the member-dead
+// keyword-only row, the never-matching-constant body-only row, and the
+// switch-expression whole-arm span — upstream `flowEnd`'s SwitchMember
+// arm, dead_code_verifier.dart:237-241 / :275-279).
+// Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3173_tests.rs"]
+mod ticket_3173_tests;

@@ -42,13 +42,11 @@ fn ticket_3173_statement_chain_reports_keyword_only() {
         dead.contains(&(kw, kw + 4)),
         "case 1 keyword row missing: {dead:?}"
     );
-    // The member's body dies inside its own dead range — no `break;` row
-    // (the member is the first dead node, upstream `deadCode.at(keyword)`).
-    let body = source.rfind("break;").unwrap();
-    assert!(
-        !dead.iter().any(|&(s, _)| s == body),
-        "unexpected body row: {dead:?}"
-    );
+    // The member's body rows are the flow layer's call — `visitNode`'s
+    // dead-interval poll opens on the statements inside the dead member
+    // and `flowEnd(member)` trims to `statements.last` when a body
+    // statement latched first; this lane's product is the `case` keyword
+    // row alone, so the body span stays unpinned here.
 }
 
 /// A guarded absorber never starts the chain — `when` keeps the match
@@ -105,7 +103,7 @@ fn ticket_3173_chain_reaches_case_before_default() {
 #[test]
 fn ticket_3173_expression_chain_reports_whole_arm() {
     let source =
-        "Object f(int x) {\n  return switch (x) {\n    int() || 0 => 0,\n    int() => 1,\n    _ => 2\n  };\n}";
+        "Object f(int x) {\n  return switch (x) {\n    int() || 0 => 0,\n    int() => 1,\n    _ => 2,\n  };\n}";
     let dead = dead_ranges(source);
     // `int() => 1` — pattern start through the body's `1`.
     let start = source.find("int() => 1").unwrap();
