@@ -2159,10 +2159,11 @@ impl<'a> Engine<'a> {
                 // use_result_verifier.dart): an invocation or bare read of a
                 // UseResult-carrying top-level declaration, not sealed used.
                 // A local, parameter, or member shadowing the name owns the
-                // reference — the top-level face never applies there.
+                // reference — the callee gates that on the row's published
+                // resolution, the one authority for which element the name
+                // bound.
                 if matches!(row.intent, Intent::Invoke | Intent::Read)
                     && !self.self_scope_rows.contains(&row.range.offset)
-                    && !self.shadowed_bare_rows.contains(&row.range.offset)
                 {
                     self.check_top_level_unused_result(row);
                 }

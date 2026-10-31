@@ -4646,6 +4646,42 @@ impl<'a> Engine<'a> {
     /// UseResult-carrying top-level declaration, not sealed used. The
     /// `unless` bypass reads the declaration's own formals.
     pub(crate) fn check_top_level_unused_result(&mut self, row: &Row) {
+        // The face rides the DECLARATION the reference resolved to, never its
+        // spelling: the official verifier reads the resolved element's own
+        // metadata (upstream Dart SDK source, pkg/analyzer/lib/src/error/
+        // use_result_verifier.dart `_getUseResultMetadata`), so a lexical
+        // binding or the enclosing container's own member of the same
+        // spelling owns the reference instead and the same-spelled top-level
+        // site `ur_sites` keys by name is a different element. Both win the
+        // upstream lookup ahead of the library scope (a local/formal/type
+        // parameter lexically, an own member through the implicit `this`
+        // face — probe: `int f = 2; void m() { String s = f; }` beside a
+        // top-level `double f()` binds the field). The row's published
+        // push-time target is the authority; a row with no publication is a
+        // merged selector (the cascade section), which binds no bare name.
+        //
+        // The `Opaque` and `Missing` faces stay with the name lookup: the
+        // object/extension faces behind `Opaque` lose to a same-spelled
+        // library declaration upstream (probe: a top-level `double
+        // hashCode()` beside `String s = hashCode;` inside a class binds the
+        // top-level function), so their rows are real reports. An enum body's
+        // synthesized member (`values`/`index`/`name`) does win that lookup
+        // upstream and is the one over-report face left here — the
+        // resolution publishes it as `Opaque` beside the object/extension
+        // misses, so telling them apart needs a finer target, not a check
+        // here.
+        if let Some(found) = self
+            .refs
+            .iter()
+            .rev()
+            .find(|r| r.range.offset == row.range.offset)
+            && matches!(
+                found.target,
+                RefTarget::Local | RefTarget::TypeParam | RefTarget::Member { .. }
+            )
+        {
+            return;
+        }
         let Some(&site_index) = self.ur_sites.get(&(None, row.name)) else {
             return;
         };
@@ -6810,3 +6846,11 @@ mod ticket_3152_tests;
 #[cfg(test)]
 #[path = "ticket_3159_tests.rs"]
 mod ticket_3159_tests;
+
+/// The #2482 `unused_result` by-resolution pins (the discarded-value face
+/// against a same-spelled formal/field/local, and the inherited-object-member
+/// keep-honest twin), kept as a standalone module so the shared `pins` rig
+/// stays untouched.
+#[cfg(test)]
+#[path = "ticket_2482_tests.rs"]
+mod ticket_2482_tests;
