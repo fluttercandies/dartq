@@ -100,3 +100,10 @@ impl Engine<'_> {
         // type arguments name declarations the parse has not reached yet.
     }
 }
+
+// The #3195 pins — the representation-field verifier faces this module
+// owns (`expected_representation_type`, the trailing-comma row) at the
+// language version that still requires a written representation type.
+#[cfg(test)]
+#[path = "ticket_3195_tests.rs"]
+mod ticket_3195_tests;
