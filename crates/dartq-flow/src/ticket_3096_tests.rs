@@ -34,7 +34,7 @@ use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
 
 /// Dead-code facts of `source` as the exact source text they cover.
-fn dead_of(source: &str) -> Vec<String> {
+pub(crate) fn dead_of(source: &str) -> Vec<String> {
     let result = dartq_scanner::scan(
         source,
         ScanConfig {

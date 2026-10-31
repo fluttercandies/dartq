@@ -3242,8 +3242,19 @@ impl ParserListener for Flow<'_> {
     fn handle_invalid_function_body(&mut self, _token: Token) {}
     fn handle_invalid_statement(&mut self, _begin: Token) {}
     fn begin_rethrow_statement(&mut self, _token: Token) {}
-    fn end_rethrow_statement(&mut self, _rethrow_kw: Token, end: Token) {
+    fn end_rethrow_statement(&mut self, rethrow_kw: Token, end: Token) {
+        // A `rethrow;` IS an expression statement (`RethrowExpression`
+        // inside an `ExpressionStatement`), so it keeps that wrapper's
+        // contract: the statement-level dead poll anchors a dead row at the
+        // statement's first token — the `rethrow` keyword
+        // (`DeadCodeVerifier._visitNode`, upstream
+        // dead_code_verifier.dart:183-205) — and `StmtEnd` then extends the
+        // interval across the trailing `;`. Recorded after `Rethrow`, whose
+        // own exit kills the flow, because every post-order statement
+        // wrapper polls the state the statement ENDED in
+        // (`handle_expression_statement`'s order).
         self.record(Ev::Rethrow);
+        self.record(Ev::ExprStmt { span: rethrow_kw });
         // The statement-completion contract every other statement kind
         // keeps: `StmtEnd` extends an open dead interval across the
         // rethrow and refreshes the began-dead snapshot, so the statement
