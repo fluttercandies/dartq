@@ -24,7 +24,7 @@ use crate::message::msg;
 use crate::parser::{AsyncModifier, MAX_DEPTH, Parser};
 use crate::recovery::is_identifier;
 use crate::token_id::{TokenId, TokenSpan};
-use crate::type_args::TypeParamOrArg;
+use crate::type_args::{ComplexTypeParamOrArg, TypeParamOrArg, closer_units};
 use crate::types::TypeInfo;
 
 /// Hard turn cap for the constructor-initializer recovery loop
@@ -2193,8 +2193,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let type_param = self.compute_type_param_or_arg_on_lt(true);
         let mut closer = lt;
         if !matches!(type_param, TypeParamOrArg::None) {
-            type_param.parse_variables(self, false);
-            closer = self.last_consumed_span();
+            if let TypeParamOrArg::Complex(group) = &type_param
+                && self.type_vars_break_over_lt_args(lt, *group)
+            {
+                // The variable walk reaches `identifier <`: upstream
+                // `looksLikeTypeParamOrArg` (type_info_impl.dart:512-522)
+                // never continues a variable list over a `<`-headed token,
+                // so the official list breaks there and the group tail runs
+                // `parseUnexpectedEnd` on the last variable — mirror that
+                // posture instead of the missing-comma continuation.
+                closer = self.parse_type_vars_broken_at_lt_args(lt, group.in_declaration);
+            } else {
+                type_param.parse_variables(self, false);
+                closer = self.last_consumed_span();
+            }
         }
         if self.peek_kind() == TokenKind::Eq {
             let at = self.peek_span();
@@ -2203,6 +2215,224 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         let _ = name;
         Some(closer)
+    }
+
+    /// Whether the type-variable walk over `group` would reach the `<`-headed
+    /// missing-comma continuation — a variable position followed by
+    /// `identifier <`. Upstream `looksLikeTypeParamOrArg`
+    /// (type_info_impl.dart:512-522) requires the current token to be an
+    /// IDENTIFIER, so the official variable list never continues over `<`,
+    /// while the members-face group parse does — mis-cascading the
+    /// nameless-member face (`Map<String, B<C>>()? x;`). The walk mirrors
+    /// the variable loop conservatively: `@` metadata, identifier, optional
+    /// `extends` bound (depth-counted), then `,` / closer / the divergence.
+    /// Any shape it cannot attribute keeps `parse_variables` in charge.
+    fn type_vars_break_over_lt_args(&self, lt: TokenSpan, group: ComplexTypeParamOrArg) -> bool {
+        let end = self.offset_of(group.end);
+        let mut i = self.offset_of(lt.id) + 1;
+        loop {
+            if i > end {
+                return false;
+            }
+            if self.kind_at(i) == TokenKind::At {
+                let len = self.metadata_skip_len(i);
+                if len == 0 {
+                    return false;
+                }
+                i += len;
+                continue;
+            }
+            if !is_identifier(self.kind_at(i)) {
+                return false;
+            }
+            i += 1;
+            let mut k = self.kind_at(i);
+            if k == TokenKind::Keyword(Keyword::Extends) {
+                i += 1;
+                let mut depth: usize = 0;
+                loop {
+                    if i > end {
+                        return false;
+                    }
+                    let b = self.kind_at(i);
+                    if b == TokenKind::Lt {
+                        depth += 1;
+                    } else if crate::types::is_closer(b) {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth = depth.saturating_sub(closer_units(b));
+                    } else if depth == 0 && b == TokenKind::Comma {
+                        break;
+                    }
+                    i += 1;
+                }
+                k = self.kind_at(i);
+            }
+            match k {
+                TokenKind::Comma => i += 1,
+                k if crate::types::is_closer(k) => return false,
+                TokenKind::Lt if is_identifier(self.kind_at(i + 1)) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// The members-face mirror of the official break posture: the variable
+    /// loop of `parseVariables` (type_info_impl.dart:1475-1546) over the
+    /// variables preceding the `<`, then the group tail as
+    /// `parseUnexpectedEnd(token3 = last variable, isArguments: false)`
+    /// (:1583-1585, :1658-1706) — one `expected_after_but_got('>')` row on
+    /// the last variable head, the nested `<...` group re-parsed under a
+    /// silent listener (its compound closer splits so the remainder stays
+    /// chained), and the remainder (or the next real closer) becomes the
+    /// group's own closer — landing the cursor before the member's formals
+    /// so the nameless-method cascade re-anchors there.
+    fn parse_type_vars_broken_at_lt_args(
+        &mut self,
+        lt: TokenSpan,
+        in_declaration: bool,
+    ) -> TokenSpan {
+        if !self.enter_type_depth() {
+            return lt;
+        }
+        let begin = lt;
+        self.listener.begin_type_variables(begin);
+        self.cursor.advance(); // `<`
+
+        let mut starts: Vec<TokenSpan> = Vec::new();
+        let mut supers: Vec<Option<(TokenSpan, TypeInfo)>> = Vec::new();
+        loop {
+            if self.is_bailed() {
+                break;
+            }
+            self.parse_metadata_star();
+            let name = self.ensure_identifier(IdentifierContext::TypeVariableDeclaration);
+            self.listener.begin_type_variable(name);
+            starts.push(name);
+
+            // Bound walk, mirroring `parse_variables`: the break tests the
+            // bound's last token, not the follower.
+            let mut bound_ends_on_closer = false;
+            if self.peek_kind() == TokenKind::Keyword(Keyword::Extends) {
+                let extends_span = self.peek_span();
+                self.cursor.advance();
+                let info = self.compute_type(true, in_declaration);
+                if !matches!(info, TypeInfo::NoType) {
+                    let last = info.skip_type(self);
+                    bound_ends_on_closer =
+                        crate::types::is_closer(self.kind_at(self.offset_of(last)));
+                    self.skip_to_token(last);
+                    self.cursor.advance();
+                }
+                supers.push(Some((extends_span, info)));
+            } else {
+                supers.push(None);
+            }
+
+            match self.peek_kind() {
+                TokenKind::Comma => {
+                    self.cursor.advance();
+                }
+                _ if bound_ends_on_closer => break,
+                k if crate::types::is_closer(k) => break,
+                // The `<` (or any other junk) ends the list — the official
+                // `!looksLikeTypeParamOrArg` break (:1539-1543). The
+                // identifier-headed continuation never fires here: the
+                // detection walk only routes chains whose first divergence
+                // is the `<` itself.
+                _ => break,
+            }
+        }
+
+        let count = starts.len();
+        self.listener
+            .handle_type_variables_defined(*starts.first().unwrap_or(&begin), count);
+
+        // Type variables complete in reverse declaration order, bounds
+        // re-parsing anchored at their own `extends` token (the official
+        // `ensureTypeNotVoid` pass, type_info_impl.dart:1571-1591).
+        let mut closer_state: Option<crate::cursor::CursorMark> = None;
+        for i in (0..count).rev() {
+            let start = starts[i];
+            let mut extends_or_super = None;
+            match &supers[i] {
+                Some((extends_span, info)) => {
+                    extends_or_super = Some(*extends_span);
+                    let pending = if closer_state.is_some() {
+                        Some(self.cursor.detach_queue())
+                    } else {
+                        None
+                    };
+                    self.cursor.rewind_to(extends_span.id + 1);
+                    info.ensure_type_not_void(self);
+                    if let Some(pending) = pending {
+                        self.cursor.attach_queue(pending);
+                    }
+                }
+                None => self.listener.handle_no_type(start),
+            }
+            if closer_state.is_none() {
+                closer_state = Some(self.cursor.mark());
+            }
+            self.listener
+                .end_type_variable(start, count - 1 - i, extends_or_super, None);
+        }
+        if let Some(mark) = closer_state {
+            self.cursor.reset(mark);
+        }
+
+        // parseUnexpectedEnd tail: the nested type-argument group arm
+        // (official :1658-1690) anchors its row on the last variable head
+        // (the official report reads `token` = token3) and re-parses the
+        // group silently; the split closer machinery keeps the compound
+        // remainder chained, and it (or the next real closer) becomes the
+        // group's own closer.
+        let anchor = *starts.last().unwrap_or(&begin);
+        if self.peek_kind() == TokenKind::Lt {
+            let nested = self.compute_type_param_or_arg_on_lt(in_declaration);
+            if !matches!(nested, TypeParamOrArg::None) {
+                self.report(msg::expected_after_but_got(">"), anchor);
+                let end_id = nested.skip(anchor.id);
+                self.skip_to_token(end_id);
+                if self.cursor.peek_is_closer() {
+                    self.cursor.consume_closer();
+                } else {
+                    self.cursor.advance();
+                }
+            }
+        }
+        let end = if self.cursor.peek_is_closer() {
+            let id = self.cursor.consume_closer();
+            self.span_of(id)
+        } else if let Some(end_id) = self.cursor.table_matching_end(begin.id) {
+            // Fallback walk (official :1712-1717): absorb the junk run up to
+            // the scanner-paired closer, guarded by the charOffset bound.
+            let end_offset = self.cursor.span(end_id).offset;
+            while !self.cursor.at_eof()
+                && self.cursor.peek_id() != end_id
+                && self.peek_span().range.offset <= end_offset
+            {
+                self.cursor.advance();
+            }
+            if self.cursor.peek_is_closer() {
+                let id = self.cursor.consume_closer();
+                self.span_of(id)
+            } else {
+                let offset = self.peek_span().range.offset;
+                let id = self.cursor.insert_synthetic(TokenKind::Gt, offset);
+                self.cursor.advance();
+                self.span_of(id)
+            }
+        } else {
+            let offset = self.peek_span().range.offset;
+            let id = self.cursor.insert_synthetic(TokenKind::Gt, offset);
+            self.cursor.advance();
+            self.span_of(id)
+        };
+        self.listener.end_type_variables(begin, end);
+        self.leave_type_depth();
+        end
     }
 
     /// Official `parseQualifiedRestOpt`: `. identifier` suffix.

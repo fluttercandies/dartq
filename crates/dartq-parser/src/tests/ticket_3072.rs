@@ -114,24 +114,24 @@ fn valid_gft_type_var_chains_stay_silent() {
 /// alter this face — the pin freezes it to guard against the fix
 /// over-breaking the plain `id<...>(` member face.
 ///
-/// RESIDUAL (pre-existing at HEAD, outside #3072 scope): dartq emits 4 rows
-/// (`missing_method_parameters` at `Map`, `expected_token` /
-/// `missing_identifier` at the inner `<`, `missing_function_body` after the
-/// compound) — the anchors suggest the member lane does not treat
-/// `Map<String, B<C>>` as one clean type before the nameless `(`. The task
-/// brief expected this face "silent"; a nameless member must carry at least
-/// a missing-name row in any oracle, so the exact oracle set needs a
-/// main-agent A/B pass. No compute_rest gate change reaches this face.
+/// Aligned by #3077 (was a frozen 4-row residual at #3072 close): the
+/// oracle 3.13.1 row set for `Map<String, B<C>>()? x;` — the type-variable
+/// list breaks at `B<C>` (type_info_impl.dart:512-522), the `>` row anchors
+/// on `B` via `parseUnexpectedEnd` (:1658-1690), and the operator cluster
+/// (parser_impl.dart:11204/:6288) re-enters at the `?`.
 #[test]
 fn paren_after_type_args_is_not_a_function_intro() {
     assert_eq!(
         sorted_rows("class A {\n  Map<String, B<C>>()? x;\n}\n"),
         vec![
-            code("expected_token", 25, 26),
-            code("missing_function_body", 28, 28),
-            code("missing_identifier", 25, 26),
-            code("missing_method_parameters", 12, 15),
+            code("expected_token", 24, 25),
+            code("invalid_operator", 31, 32),
+            code("missing_const_final_var_or_type", 33, 34),
+            code("missing_function_body", 31, 32),
+            code("missing_function_body", 33, 34),
+            code("missing_keyword_operator", 31, 32),
+            code("missing_method_parameters", 31, 32),
         ],
-        "frozen pre-existing face (gate never enters; residual tracked separately)"
+        "oracle 7-row cascade (aligned by #3077; gate never enters this face)"
     );
 }

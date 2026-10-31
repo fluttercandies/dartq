@@ -84,30 +84,30 @@ fn clean_nullable_compound_field_stays_silent() {
     assert!(sorted_rows("class A {\n  Map<String, int>? x;\n}\n").is_empty());
 }
 
-/// RESIDUAL (pre-existing, out of #3074 scope): `Map<String, B<C>>()? x;`
-/// does not share the List-face decision site — its member dispatch has no
-/// overshoot (the return-type re-parse lands on the member name), so the
-/// bound never arms. The oracle 3.13.1 row set is 7 rows
-/// (`expected_token` (24,25) at `B`; `missing_function_body` +
-/// `missing_method_parameters` + `missing_keyword_operator` +
-/// `invalid_operator` at `?` (31,32); `missing_function_body` +
-/// `missing_const_final_var_or_type` at `x` (33,34)), i.e. the oracle treats
-/// `Map<String, B<C>>()` as a method named by the type head and cascades an
-/// operator face at `?`. dartq emits 4 rows with different anchors
-/// (`missing_method_parameters` at the `Map` head (12,15), the group-recovery
-/// pair at the inner `<`'s argument `C` (25,26), `missing_function_body`
-/// after the compound (28,28)) — a separate type-argument recovery face, to
-/// be aligned by its own ticket.
+/// Aligned by #3077 (was a frozen 4-row residual at #3074 close): the
+/// Map-face member cascade. The oracle treats the member head as a
+/// type-variable list that BREAKS at `B<C>` (`looksLikeTypeParamOrArg`,
+/// type_info_impl.dart:512-522, never continues over `<`), reports the `>`
+/// row on the variable head `B` via `parseUnexpectedEnd` (:1658-1690), and
+/// the split compound closer leaves the member before its formals — the
+/// nameless-method body face lands on `?`, the operator cluster
+/// (`missing_keyword_operator` + `invalid_operator` via
+/// `parseInvalidOperatorDeclaration`/`parseOperatorName`,
+/// parser_impl.dart:11204/:6288) re-enters there, and the `x` cascade
+/// closes.
 #[test]
-fn map_face_residual_is_tracked() {
+fn map_face_cascade_matches_oracle() {
     assert_eq!(
         sorted_rows("class A {\n  Map<String, B<C>>()? x;\n}\n"),
         vec![
-            code("expected_token", 25, 26),
-            code("missing_function_body", 28, 28),
-            code("missing_identifier", 25, 26),
-            code("missing_method_parameters", 12, 15),
+            code("expected_token", 24, 25),
+            code("invalid_operator", 31, 32),
+            code("missing_const_final_var_or_type", 33, 34),
+            code("missing_function_body", 31, 32),
+            code("missing_function_body", 33, 34),
+            code("missing_keyword_operator", 31, 32),
+            code("missing_method_parameters", 31, 32),
         ],
-        "frozen residual: Map face does not share the #3074 overshoot site"
+        "oracle 7-row cascade for `Map<String, B<C>>()? x;`"
     );
 }
