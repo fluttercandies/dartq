@@ -4,13 +4,15 @@
 //! type_system.dart:1581-1635 — equal counts, EQUAL bounds via mutual
 //! subtype, parameters unified by position). The rule is an equality,
 //! not a bounds direction: a `num`-bounded signature is a subtype of an
-//! `int`-bounded one in NEITHER direction. Count-only entries (an
-//! interned `Ty::Function` shape records just the `<...>` group's size)
-//! decide the count rule but never a bounds ask — the under-report
-//! posture pinned below. The bounded pairs ride the assignment face's
-//! stashed-signature junction (a formal's written annotation is the
-//! only face carrying parameters WITH bounds); the byte-exact message
-//! pin rides the argument face, whose display renders the parameters.
+//! `int`-bounded one in NEITHER direction. Interned `Ty::Function`
+//! shapes carry their function-level leaf bounds (`function_shape_sig`'s
+//! bounds arm plus `TreeSink::leaf`'s level routing), so a plain local
+//! annotation decides the bounds ask on the same equality the stashed
+//! formal annotation does — count and bounds are two faces of one rule.
+//! The bounded pairs ride the assignment face's stashed-signature
+//! junction (a formal's written annotation is the first face carrying
+//! parameters WITH bounds); the byte-exact message pin rides the
+//! argument face, whose display renders the parameters.
 
 use crate::diagnose::test_rig::{report_ops, rows};
 use crate::diagnose::types::FileReport;
@@ -129,11 +131,11 @@ fn argument_face_renders_the_type_parameters() {
 
 /// The count rule at the plain assignment face: a local's written
 /// generic function-type annotation (an interned `Ty::Function` — the
-/// count rides the shape, the bounds do not) against a plain shape
-/// reports through `invalid_assignment` in both orders. The message
-/// spelling keeps the model's render (an interned shape carries no
-/// parameter names — the display seam #2834 documents), so the pins
-/// assert the verdict count and the plain target spelling.
+/// count rides the shape AND so do its function-level leaf bounds) against
+/// a plain shape reports through `invalid_assignment` in both orders, and
+/// the byte-exact messages spell each annotated side with its own
+/// `<Y extends num>` group — the display renders the bound the shape
+/// records, exactly as the argument face above does.
 #[test]
 fn count_rule_reports_at_plain_assignments() {
     let report = report_ops(
@@ -143,32 +145,38 @@ fn count_rule_reports_at_plain_assignments() {
          \x20   void Function() w = p;\n\
          \x20 }",
     );
-    let messages = assignment_messages(&report);
-    assert_eq!(messages.len(), 2, "rows: {:#?}", rows(&report));
-    assert!(
-        messages
-            .iter()
-            .all(|m| m.contains("can't be assigned to a variable of type 'void Function()'")),
-        "{messages:#?}"
+    assert_eq!(
+        assignment_messages(&report),
+        vec![
+            "A value of type 'void Function<Y extends num>()' can't be assigned to a variable of type 'void Function()'.".to_string(),
+            "A value of type 'void Function()' can't be assigned to a variable of type 'void Function<Y extends num>()'.".to_string(),
+        ],
+        "rows: {:#?}",
+        rows(&report)
     );
 }
 
-/// The count-only posture: two interned shapes of equal count whose
-/// bounds the shape never recorded stay silent — an unknown bound is
-/// not `dynamic`, and no verdict may invent one (the local annotation
-/// joins no written-signature stash). The seam is documented in #2834:
-/// named, bounded entries arrive only through the stash faces.
+/// The bounds ask at the plain assignment face: a local's written
+/// `void Function<Y extends int>()` annotation records its function-level
+/// leaf bound, so the parameter is a real entry and
+/// `relateTypeParameters`' equality decides against the formal's
+/// `Y extends num` — `num` and `int` are not equal under `isEqualTo`, so
+/// the assignment reports with both bounds spelled. A count-only shape
+/// that invented no bound would be the under-report this pin replaced;
+/// the shape now records the bound the source wrote.
 #[test]
-fn count_only_bounds_never_decide() {
+fn local_annotation_bounds_decide_the_equality() {
     let report = report_ops(
         "void f(void Function<Y extends num>() x) {\n\
          \x20   void Function<Y extends int>() y = x;\n\
          \x20 }",
     );
-    assert!(
-        assignment_messages(&report).is_empty(),
-        "expected the under-report posture, got {:#?}\nall rows: {:#?}",
+    assert_eq!(
         assignment_messages(&report),
+        vec![
+            "A value of type 'void Function<Y extends num>()' can't be assigned to a variable of type 'void Function<Y extends int>()'.".to_string(),
+        ],
+        "rows: {:#?}",
         rows(&report)
     );
 }
