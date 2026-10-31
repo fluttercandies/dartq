@@ -26,6 +26,28 @@ use crate::type_args::TypeParamOrArg;
 use crate::types::is_valid_non_record_type_reference;
 use crate::types::TypeInfo;
 
+/// Whether a computed type is a named type — the `handleType` face an
+/// `extends`/`implements`/`with`/`on` clause list entry must be
+/// (`_popNamedTypeList`, ast_builder.dart:6313-6326).
+///
+/// `NoType` and `void` run the synthetic/named recovery (`expected_type_name`
+/// / `invalid_void` carry their own rows) and count as named. `Complex` is
+/// non-named exactly for the two shapes `_popNamedTypeList` rejects: a
+/// top-level record type (`is_record_type`) and a generalized function type
+/// (`gft_has_return_type`); a type-argumented or prefixed named type keeps a
+/// named head and stays silent.
+fn is_named_type(type_info: &TypeInfo) -> bool {
+    match type_info {
+        TypeInfo::NoType
+        | TypeInfo::Void
+        | TypeInfo::Simple
+        | TypeInfo::SimpleNullable
+        | TypeInfo::Prefixed
+        | TypeInfo::SimpleWith1Arg { .. } => true,
+        TypeInfo::Complex(c) => !c.is_record_type && c.gft_has_return_type.is_none(),
+    }
+}
+
 /// `isTopLevelKeyword` (scanner keyword set).
 fn is_top_level_keyword(kind: TokenKind) -> bool {
     matches!(
@@ -1477,10 +1499,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let implements = self.peek_span();
         self.cursor.advance();
         let mut count = 1usize;
-        self.parse_single_type_required();
+        self.parse_single_type_required(msg::NamedTypeClause::Implements);
         while self.peek_kind() == TokenKind::Comma {
             self.cursor.advance();
-            self.parse_single_type_required();
+            self.parse_single_type_required(msg::NamedTypeClause::Implements);
             count += 1;
         }
         self.listener.handle_implements(Some(implements), count);
@@ -1681,18 +1703,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     fn parse_named_mixin_application(&mut self, begin: TokenSpan, class_keyword: TokenSpan) {
         let equals = self.peek_span();
         self.cursor.advance();
+        let type_begin = self.peek_span();
         let type_info = self.compute_type(true, false);
-        type_info.ensure_type_not_void(self);
+        let type_end = type_info.ensure_type_not_void(self);
+        self.check_named_type(
+            &type_info,
+            type_begin,
+            type_end,
+            msg::NamedTypeClause::Extends,
+        );
         self.parse_mixin_application_rest();
         let mut implements = None;
         if self.peek_kind() == TokenKind::Keyword(Keyword::Implements) {
             implements = Some(self.peek_span());
             self.cursor.advance();
             let mut count = 1usize;
-            self.parse_single_type_required();
+            self.parse_single_type_required(msg::NamedTypeClause::Implements);
             while self.peek_kind() == TokenKind::Comma {
                 self.cursor.advance();
-                self.parse_single_type_required();
+                self.parse_single_type_required(msg::NamedTypeClause::Implements);
                 count += 1;
             }
             self.listener.handle_implements(implements, count);
@@ -1717,24 +1746,49 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             .handle_named_mixin_application_with_clause(with);
     }
 
-    /// Official `parseTypeList`: `type (',' type)*`.
+    /// Official `parseTypeList`: `type (',' type)*`. Used only for the
+    /// `with` clause family (class / enum / named-mixin / mixin recovery).
     fn parse_type_list(&mut self) {
         let begin = self.peek_span();
         self.listener.begin_type_list(begin);
         let mut count = 1usize;
-        self.parse_single_type_required();
+        self.parse_single_type_required(msg::NamedTypeClause::With);
         while self.peek_kind() == TokenKind::Comma {
             self.cursor.advance();
-            self.parse_single_type_required();
+            self.parse_single_type_required(msg::NamedTypeClause::With);
             count += 1;
         }
         self.listener.end_type_list(count);
     }
 
-    /// One required type (`computeType(required: true).ensureTypeNotVoid`).
-    fn parse_single_type_required(&mut self) {
+    /// One required clause-list type
+    /// (`computeType(required: true).ensureTypeNotVoid`, plus the
+    /// `_popNamedTypeList` named-type check).
+    fn parse_single_type_required(&mut self, clause: msg::NamedTypeClause) {
+        let begin = self.peek_span();
         let type_info = self.compute_type(true, false);
-        type_info.ensure_type_not_void(self);
+        let end = type_info.ensure_type_not_void(self);
+        self.check_named_type(&type_info, begin, end, clause);
+    }
+
+    /// The `_popNamedTypeList` check (`ast_builder.dart:6313-6326`): a clause
+    /// type that is not a named type reports `expected_named_type` over its
+    /// own span (official `locatableDiagnostic.at(type)`); recovery continues
+    /// with the type already consumed (upstream drops the entry from the
+    /// built list, a parse-tier no-op).
+    fn check_named_type(
+        &mut self,
+        type_info: &TypeInfo,
+        begin: TokenSpan,
+        end: TokenSpan,
+        clause: msg::NamedTypeClause,
+    ) {
+        if !is_named_type(type_info) {
+            self.report(
+                msg::expected_named_type(clause),
+                self.span_through(begin, end),
+            );
+        }
     }
 
     /// Raw single-type skip (no events; the suppressed-parse stand-in).
@@ -1909,10 +1963,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let implements = self.peek_span();
         self.cursor.advance();
         let mut count = 1usize;
-        self.parse_single_type_required();
+        self.parse_single_type_required(msg::NamedTypeClause::Implements);
         while self.peek_kind() == TokenKind::Comma {
             self.cursor.advance();
-            self.parse_single_type_required();
+            self.parse_single_type_required(msg::NamedTypeClause::Implements);
             count += 1;
         }
         self.listener.handle_implements(Some(implements), count);
@@ -1921,8 +1975,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 
     /// Official `parseClassExtendsSeenExtendsClause`.
     fn parse_class_extends_seen(&mut self, extends_kw: TokenSpan, kind: DeclarationHeaderKind) {
+        let type_begin = self.peek_span();
         let type_info = self.compute_type(true, false);
-        type_info.ensure_type_not_void(self);
+        let type_end = type_info.ensure_type_not_void(self);
+        self.check_named_type(
+            &type_info,
+            type_begin,
+            type_end,
+            msg::NamedTypeClause::Extends,
+        );
         let mut count = 1usize;
         if self.peek_kind() == TokenKind::Comma {
             if kind == DeclarationHeaderKind::Class {
@@ -1930,8 +1991,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
             while self.peek_kind() == TokenKind::Comma {
                 self.cursor.advance();
+                let type_begin = self.peek_span();
                 let type_info = self.compute_type(true, false);
-                type_info.ensure_type_not_void(self);
+                let type_end = type_info.ensure_type_not_void(self);
+                self.check_named_type(
+                    &type_info,
+                    type_begin,
+                    type_end,
+                    msg::NamedTypeClause::Extends,
+                );
                 count += 1;
             }
         }
@@ -2022,10 +2090,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 let implements = self.peek_span();
                 self.cursor.advance();
                 let mut count = 1usize;
-                self.parse_single_type_required();
+                self.parse_single_type_required(msg::NamedTypeClause::Implements);
                 while self.peek_kind() == TokenKind::Comma {
                     self.cursor.advance();
-                    self.parse_single_type_required();
+                    self.parse_single_type_required(msg::NamedTypeClause::Implements);
                     count += 1;
                 }
                 self.listener.handle_implements(Some(implements), count);
@@ -2139,10 +2207,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 self.report(msg::mixin_augmentation_has_on_clause(), on);
             }
             let mut count = 1usize;
-            self.parse_single_type_required();
+            self.parse_single_type_required(msg::NamedTypeClause::On);
             while self.peek_kind() == TokenKind::Comma {
                 self.cursor.advance();
-                self.parse_single_type_required();
+                self.parse_single_type_required(msg::NamedTypeClause::On);
                 count += 1;
             }
             self.listener.handle_mixin_on(Some(on), count);
@@ -2216,10 +2284,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
             if let Some(on) = on_keyword {
                 let mut count = 1usize;
-                self.parse_single_type_required();
+                self.parse_single_type_required(msg::NamedTypeClause::On);
                 while self.peek_kind() == TokenKind::Comma {
                     self.cursor.advance();
-                    self.parse_single_type_required();
+                    self.parse_single_type_required(msg::NamedTypeClause::On);
                     count += 1;
                 }
                 self.listener.handle_mixin_on(Some(on), count);
@@ -2237,10 +2305,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 let implements = self.peek_span();
                 self.cursor.advance();
                 let mut count = 1usize;
-                self.parse_single_type_required();
+                self.parse_single_type_required(msg::NamedTypeClause::Implements);
                 while self.peek_kind() == TokenKind::Comma {
                     self.cursor.advance();
-                    self.parse_single_type_required();
+                    self.parse_single_type_required(msg::NamedTypeClause::Implements);
                     count += 1;
                 }
                 self.listener.handle_implements(Some(implements), count);

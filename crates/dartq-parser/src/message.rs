@@ -122,8 +122,8 @@ pub(crate) mod msg {
         CONTINUE_WITHOUT_LABEL_IN_CASE, DEFAULT_IN_SWITCH_EXPRESSION,
         EMPTY_RECORD_TYPE_NAMED_FIELDS_LIST, EMPTY_RECORD_TYPE_WITH_COMMA,
         EQUALITY_CANNOT_BE_EQUALITY_OPERAND, EXPECTED_ELSE_OR_COMMA,
-        EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD, EXPECTED_TOKEN, EXPECTED_TYPE_NAME,
-        EXPERIMENT_NOT_ENABLED, EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT,
+        EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD, EXPECTED_NAMED_TYPE, EXPECTED_TOKEN,
+        EXPECTED_TYPE_NAME, EXPERIMENT_NOT_ENABLED, EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT,
         ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME, ILLEGAL_PATTERN_IDENTIFIER_NAME,
         ILLEGAL_PATTERN_VARIABLE_NAME, INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR,
         INVALID_CONSTANT_CONST_PREFIX, INVALID_CONSTANT_PATTERN_BINARY,
@@ -183,6 +183,38 @@ pub(crate) mod msg {
     /// `expected_type_name`).
     pub(crate) fn expected_type_name() -> Message {
         Message::new(EXPECTED_TYPE_NAME, "Expected a type name.")
+    }
+
+    /// The four `expectedNamedType*` clause variants
+    /// (`messages.yaml:23262-23289`): one shared registry code,
+    /// clause-specific problem text.
+    #[derive(Clone, Copy)]
+    pub(crate) enum NamedTypeClause {
+        /// `expectedNamedTypeExtends` — `extends` and the named-mixin-
+        /// application head.
+        Extends,
+        /// `expectedNamedTypeImplements`.
+        Implements,
+        /// `expectedNamedTypeWith`.
+        With,
+        /// `expectedNamedTypeOn`.
+        On,
+    }
+
+    /// `_popNamedTypeList`'s report (`ast_builder.dart:6313-6326`): a clause
+    /// list entry that did not parse as a named type (a record type or a
+    /// generalized function type) keeps the shared `expected_named_type`
+    /// code with the clause's own text — extends spells "a class name",
+    /// implements/on "the name of a class or mixin", with "a mixin name".
+    pub(crate) fn expected_named_type(clause: NamedTypeClause) -> Message {
+        let text = match clause {
+            NamedTypeClause::Extends => "Expected a class name.",
+            NamedTypeClause::Implements | NamedTypeClause::On => {
+                "Expected the name of a class or mixin."
+            }
+            NamedTypeClause::With => "Expected a mixin name.",
+        };
+        Message::new(EXPECTED_NAMED_TYPE, text)
     }
 
     /// Registry `missing_identifier`. The fasta `expectedIdentifier`
