@@ -20,6 +20,9 @@ use crate::rules::{body_members, get_set_token, same_file_declaration, slice, ty
 /// - a bare name or member chain keeps the getter face (:129-176): a
 ///   getter at its origin declaration stays silent (`GetterElement &&
 ///   isOriginDeclaration`), everything else reports at the whole chain;
+///   a selector whose argument list follows (`List.empty()`, `x.m()`) is
+///   a call, not a value read — an upstream clear-effect visit — and
+///   stays silent before the class-reference faces decide;
 /// - every other form reports at its node (literals, lambdas, type
 ///   tests, index accesses, parens, constructor tear-offs).
 ///
@@ -587,6 +590,20 @@ fn walk_access(
         return;
     };
     let name = c.lexeme(c.head_token(run[name_index]));
+    // The call face: the argument list tiles after the selector —
+    // `List.empty()` is an instance creation, `x.m()` a method send; every
+    // called-selector shape rides an upstream clear-effect visit
+    // (`visitInstanceCreationExpression`, `visitMethodInvocation`,
+    // `visitFunctionExpressionInvocation`), so the faces below — which
+    // decide a *value* read through the class reference — never see it.
+    // The scan opens at the selector: the receiver-side arguments of a
+    // longer chain (`C().g`, the invocation-receiver face below) stay out.
+    if run[name_index..]
+        .iter()
+        .any(|&row| c.kind(row) == NodeKind::Arguments)
+    {
+        return;
+    }
     // The `this.`/`super.` face: the enclosing class-like scope's
     // member (:150-159 — a same-file origin getter passes).
     if run.iter().any(|&row| {

@@ -177,3 +177,603 @@ fn us_instance_getter_read_stays_silent() {
 fn us_top_level_getter_stays_silent() {
     assert_silent("void f() {\n  g;\n}\nint get g => 1;\n");
 }
+
+// —— the upstream oracle corpus ———————————————————————————————————————
+// The whole corpus (`UnnecessaryStatementsTest`, 55 cases, plus the six
+// `messages.yaml` doc examples — 61 total) pinned against the oracle rows
+// of `conformance/expected.tsv`: each entry is the exact case source (the
+// materialized file carries a leading blank line, so the upstream `3:3`
+// rows land as written) and the oracle's `(line, column, length)` for
+// every `unnecessary_statements` row.
+//
+// Six cases sit out, named with their oracle rows (no silent gaps). All
+// six share one root that owns the semantic layer, not this rule's
+// decision order: the diagnose engine types the factory-constructor
+// invocation `List.empty()` as `Type` (the container TypeLiteral face)
+// and SDK containers are unindexed in the library member walk, so the
+// getter-vs-value split upstream's `GetterElement` face makes
+// (`first` silent, `where` a reported tear-off) is unreachable from
+// `Analysis::member_of`:
+//
+// - `test_instanceGetter#0` — oracle: silent (`first` is an instance
+//   getter of `List`); dartq reports the whole statement.
+// - `test_methodTearoff_cascaded#0` — oracle: (3, 15, 7); the cascade
+//   section's `staticType is FunctionType` gate needs `where` as a
+//   method of the unindexed chain. The conformance verdict additionally
+//   carries a semantic `undefined_getter` extra on the same mis-typed
+//   receiver.
+// - `test_methodTearoff_cascaded_followOn#0` — oracle: (5, 5, 7); same
+//   root (+ `undefined_method` extra on the `..forEach` section).
+// - `test_methodTearoff_cascaded_returned_InLocalFunction#0` — oracle:
+//   (4, 22, 7); same root.
+// - `test_methodTearoff_cascaded_returned_InTopLevelFunction#0` —
+//   oracle: (2, 30, 7); same root.
+// - `test_returnStatement_cascadedTearoff#0` — oracle: (3, 22, 7); same
+//   root.
+//
+// One further case-level (not pin-level) residual:
+// `test_inForLoopUpdaters#0` — the pin's lint rows match below; the
+// conformance verdict additionally carries a semantic `non_bool_condition`
+// extra (the for-parts condition span is misread as the updater region —
+// semantic layer).
+#[test]
+fn unnecessary_statements_oracle_corpus_pins() {
+    // (case, source, oracle rows as (line, column, length)).
+    let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+        (
+            "test_asExpression#0",
+            r#"
+void f(Object o) {
+  o as int;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_binaryExpression#0",
+            r#"
+void f() {
+  1 + 1;
+}
+"#,
+            &[(3, 3, 5)],
+        ),
+        (
+            "test_binaryExpression_andAnd#0",
+            r#"
+void f() {
+  true && 1 == 2;
+}
+"#,
+            &[(3, 11, 6)],
+        ),
+        (
+            "test_binaryExpression_or#0",
+            r#"
+void f() {
+  false || 1 == 2;
+}
+"#,
+            &[(3, 12, 6)],
+        ),
+        (
+            "test_binaryExpression_or_rightSideHasEffect#0",
+            r#"
+void f() {
+  false || 7.isEven;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_construcorTearoff_new#0",
+            r#"
+void f() {
+  ArgumentError.new;
+}
+"#,
+            &[(3, 3, 17)],
+        ),
+        (
+            "test_constructorTearoff_named#0",
+            r#"
+void f() {
+  DateTime.now;
+}
+"#,
+            &[(3, 3, 12)],
+        ),
+        (
+            "test_doStatement#0",
+            r#"
+void f() {
+  do {} while (1 == 2);
+}
+"#,
+            &[],
+        ),
+        (
+            "test_forEachStatement#0",
+            r#"
+void f() {
+  for (var i in []) {}
+}
+"#,
+            &[],
+        ),
+        (
+            "test_forLoopUpdaters_subsequent#0",
+            r#"
+void f() {
+  for (; 1 == 2; print(7), []) {}
+}
+"#,
+            &[(3, 28, 2)],
+        ),
+        (
+            "test_forStatement#0",
+            r#"
+void f() {
+  for (; 1 == 2;) {}
+}
+"#,
+            &[],
+        ),
+        (
+            "test_functionTearoff#0",
+            r#"
+void f() {
+  g;
+}
+void g() {}
+"#,
+            &[(3, 3, 1)],
+        ),
+        (
+            "test_ifNull#0",
+            r#"
+void f() {
+  null ?? 7;
+}
+"#,
+            &[(3, 11, 1)],
+        ),
+        (
+            "test_ifNull_rightSideHasEffect#0",
+            r#"
+void f() {
+  null ?? 7.toString();
+}
+"#,
+            &[],
+        ),
+        (
+            "test_ifStatement#0",
+            r#"
+void f() {
+  if (1 == 2) {
+  } else if (1 == 2) {
+  }
+}
+"#,
+            &[],
+        ),
+        (
+            "test_inDoWhile#0",
+            r#"
+void f() {
+  do {
+    [];
+  } while (1 == 2);
+}
+"#,
+            &[(4, 5, 2)],
+        ),
+        (
+            "test_inForLoop#0",
+            r#"
+void f() {
+  for (var i in []) {
+    ~1;
+  }
+}
+"#,
+            &[(4, 5, 2)],
+        ),
+        (
+            "test_inForLoopInitializer#0",
+            r#"
+void f() {
+  for (7; 1 == 2;) {}
+}
+"#,
+            &[(3, 8, 1)],
+        ),
+        (
+            "test_inForLoopUpdaters#0",
+            r#"
+void f() {
+  for (; 1 == 2; []) {}
+}
+"#,
+            &[(3, 18, 2)],
+        ),
+        (
+            "test_inIfBody#0",
+            r#"
+void f() {
+  if (1 == 2) {
+    [];
+  }
+}
+"#,
+            &[(4, 5, 2)],
+        ),
+        (
+            "test_inSwitchStatement_case#0",
+            r#"
+void f() {
+  switch (7) {
+    case 6:
+      [];
+  }
+}
+"#,
+            &[(5, 7, 2)],
+        ),
+        (
+            "test_inSwitchStatement_case_break#0",
+            r#"
+void f() {
+  switch (7) {
+    case 6:
+      break;
+  }
+}
+"#,
+            &[],
+        ),
+        (
+            "test_inSwitchStatement_default#0",
+            r#"
+void f() {
+  switch (7) {
+    default:
+      [];
+  }
+}
+"#,
+            &[(5, 7, 2)],
+        ),
+        (
+            "test_instanceCreationExpression#0",
+            r#"
+void f() {
+  List.empty();
+}
+"#,
+            &[],
+        ),
+        (
+            "test_instanceField#0",
+            r#"
+void f() {
+  C().g;
+}
+
+class C {
+  int g = 1;
+}
+"#,
+            &[(3, 3, 5)],
+        ),
+        (
+            "test_instanceField2#0",
+            r#"
+void f(C c) {
+  c.g;
+}
+class C {
+  int g = 1;
+}
+"#,
+            &[(3, 3, 3)],
+        ),
+        (
+            "test_instanceGetter2#0",
+            r#"
+void f(List<int> list) {
+  list.first;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_intLiteral#0",
+            r#"
+void f() {
+  1;
+}
+"#,
+            &[(3, 3, 1)],
+        ),
+        (
+            "test_listLiteral#0",
+            r#"
+void f() {
+  [];
+}
+"#,
+            &[(3, 3, 2)],
+        ),
+        (
+            "test_localVariable#0",
+            r#"
+void f() {
+  var g = 1;
+  g;
+}
+"#,
+            &[(4, 3, 1)],
+        ),
+        (
+            "test_mapLiteral#0",
+            r#"
+void f() {
+  <dynamic, dynamic>{};
+}
+"#,
+            &[(3, 3, 20)],
+        ),
+        (
+            "test_methodInvocation#0",
+            r#"
+void f() {
+  g();
+}
+void g() {}
+"#,
+            &[],
+        ),
+        (
+            "test_methodInvocation2#0",
+            r#"
+void f(List<int> list) {
+  list.forEach((_) {});
+}
+"#,
+            &[],
+        ),
+        (
+            "test_methodTearoff#0",
+            r#"
+void f() {
+  List.empty().where;
+}
+"#,
+            &[(3, 3, 18)],
+        ),
+        (
+            "test_methodTearoff_returned_InLocalFunction#0",
+            r#"
+void f() {
+  // ignore: unused_element
+  g() => List.empty().where;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_methodTearoff_returned_InTopLevelFunction#0",
+            r#"
+Object f() => List.empty().where;
+"#,
+            &[],
+        ),
+        (
+            "test_methodTearoff_returned_inFunctionLiteral#0",
+            r#"
+void f() {
+  () => List.empty().where;
+}
+"#,
+            &[(3, 3, 24)],
+        ),
+        (
+            "test_patternAssignment_ok#0",
+            r#"
+f() {
+  var (a, b) = (0, 0);
+  var result = (1, 2);
+  (a, b) = (a + result.$1, b + result.$2);
+}
+"#,
+            &[],
+        ),
+        (
+            "test_rethrow#0",
+            r#"
+void f() {
+  try {} catch (_) {
+    rethrow;
+  }
+}
+"#,
+            &[],
+        ),
+        (
+            "test_returnStatement_binaryOperation#0",
+            r#"
+int f() {
+  return 1 + 1;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_stringLiteral#0",
+            r#"
+void f() {
+  "blah";
+}
+"#,
+            &[(3, 3, 6)],
+        ),
+        (
+            "test_switchStatement#0",
+            r#"
+void f() {
+  switch (~1) {}
+}
+"#,
+            &[],
+        ),
+        (
+            "test_throwExpression#0",
+            r#"
+void f() {
+  throw Exception();
+}
+"#,
+            &[],
+        ),
+        (
+            "test_topLevelGetter#0",
+            r#"
+void f() {
+  g;
+}
+int get g => 1;
+"#,
+            &[],
+        ),
+        (
+            "test_topLevelVariable#0",
+            r#"
+void f() {
+  g;
+}
+int g = 1;
+"#,
+            &[(3, 3, 1)],
+        ),
+        (
+            "test_unaryOperation#0",
+            r#"
+void f() {
+  ~1;
+}
+"#,
+            &[(3, 3, 2)],
+        ),
+        (
+            "test_unaryOperation_postfix#0",
+            r#"
+void f(int x) {
+  x++;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_unaryOperation_prefix#0",
+            r#"
+void f(int x) {
+  ++x;
+}
+"#,
+            &[],
+        ),
+        (
+            "test_whileStatement#0",
+            r#"
+void f() {
+  while (1 == 2) {}
+}
+"#,
+            &[],
+        ),
+        (
+            "doc_bad_0",
+            r#"void f(int Function() first, int Function() second) {
+  first() + second();
+}
+"#,
+            &[(2, 3, 18)],
+        ),
+        (
+            "doc_bad_1",
+            r#"myvar;
+list.clear;
+1 + 2;
+methodOne() + methodTwo();
+foo ? bar : baz;
+"#,
+            &[],
+        ),
+        (
+            "doc_good_0",
+            r#"void f(int Function() first, int Function() second) {}
+"#,
+            &[],
+        ),
+        (
+            "doc_good_1",
+            r#"void f(int Function() first, int Function() second) {
+  print(first() + second());
+}
+"#,
+            &[],
+        ),
+        (
+            "doc_good_2",
+            r#"void f(int Function() first, int Function() second) {
+  first();
+  second();
+}
+"#,
+            &[],
+        ),
+        (
+            "doc_good_3",
+            r#"some.method();
+const SomeClass();
+methodOne();
+methodTwo();
+foo ? bar() : baz();
+return myvar;
+"#,
+            &[],
+        ),
+    ];
+    // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+    fn offset(source: &str, line: u32, column: u32) -> u32 {
+        let line_start: usize = source
+            .split_inclusive('\n')
+            .take(line as usize - 1)
+            .map(str::len)
+            .sum();
+        (line_start + column as usize - 1) as u32
+    }
+    let mut mismatches = Vec::new();
+    for (case, source, oracle) in cases {
+        let f = Fixture::parse(source);
+        let mut lints = f.run_semantic(&one_rule("unnecessary_statements"));
+        lints.sort_by_key(|lint| lint.range.start);
+        let got: Vec<(u32, u32)> = lints
+            .iter()
+            .map(|lint| (lint.range.start, lint.range.end))
+            .collect();
+        let want: Vec<(u32, u32)> = oracle
+            .iter()
+            .map(|&(line, column, length)| {
+                let start = offset(source, line, column);
+                (start, start + length)
+            })
+            .collect();
+        if got != want {
+            mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}

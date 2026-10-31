@@ -7498,6 +7498,19 @@ impl<'a> Engine<'a> {
                 // required positional rejects the super's shorter calls;
                 // the model's required positionals lead their list, so the
                 // flag counts decide it.
+                //
+                // Counts are equivalent to the upstream per-index walk
+                // (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/element/subtype.dart:338
+                // `_isFunctionSubtypeOf`, positional arms `:362-383`): a
+                // declared required positional needs a required super
+                // positional AT ITS INDEX, which — the required group
+                // forming one contiguous head — is exactly
+                // `a_required <= b_required`; a declared optional
+                // positional accepts any super positional, so no per-index
+                // rule survives past the counts; and the leftover-super
+                // check (`:429-431` `gIndex < gParameters.length` → false)
+                // is the length comparison. Both directions are pinned.
                 if a.positional.len() < b.positional.len() {
                     return true;
                 }
@@ -7513,7 +7526,13 @@ impl<'a> Engine<'a> {
                 // or strengthened) rejects calls without it. An added
                 // optional named parameter is the valid-override widening
                 // (oracle-verified: `void f(int x, {int? y})` over
-                // `void f(int x)` is clean).
+                // `void f(int x)` is clean). Upstream spells the same three
+                // verdicts as its name-sorted walk (`:392-415`): a super
+                // name absent from the declaration fails (`:409-411`), a
+                // declared name absent from the super is allowed only while
+                // optional (`:403-408`), and an equal-name pair fails
+                // exactly when the declaration is the required side
+                // (`:394-396`).
                 for f in &b.named {
                     match a.named_formal(f.name) {
                         None => return true,

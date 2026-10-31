@@ -17874,3 +17874,7 @@ mod ticket_3270_tests;
 #[cfg(test)]
 #[path = "ticket_3274_tests.rs"]
 mod ticket_3274_tests;
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3257_tests.rs"]
+mod ticket_3257_tests;
