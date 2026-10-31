@@ -215,6 +215,16 @@ impl SwitchTracker {
                 NameTy::Named(name, nullable) | NameTy::NamedArgs(name, nullable, _) => {
                     Restriction::Named(name, nullable)
                 }
+                // A record/function context (a name-level sentinel) has no
+                // head to name: the type-free pattern covers exactly that
+                // context type, which [`collect_singles`] lowers verbatim.
+                // The pre-#3236 `Unknown` made such a case match nothing at
+                // all, so it could neither absorb a later case nor prove
+                // the switch exhaustive. The top and `Never` keep their
+                // old answer — `TopNullable` also carries an UNRESOLVED
+                // scrutinee, where covering everything could report cases
+                // the oracle keeps live.
+                NameTy::Unknown(_) => Restriction::NamedContext,
                 _ => Restriction::Unknown,
             };
         }
@@ -270,7 +280,7 @@ impl SwitchTracker {
         }
         // The per-field constraints the name level can express: a leaf that
         // covers its whole column (or the type-free `var x`/`_`) contributes
-        // nothing, a `null` leaf or a refining type-test leaf rides the
+        // nothing, a `null` leaf or a refining type-test/value leaf rides the
         // single's property sub-space, and anything else (a conjunctive
         // residual, a positional field's constraining leaf — the member
         // table keeps no declaration order) degrades the pattern to the
@@ -324,6 +334,21 @@ impl SwitchTracker {
                         }
                         Restriction::Named(lt, ln) => {
                             if !world.is_subtype_of(&column, &NameTy::Named(*lt, *ln)) {
+                                carried.push((name, leaf.clone()));
+                            }
+                        }
+                        // The value-precise constants the name level does
+                        // express (`A(b: true)`, `A(e: E.a)`) narrow their
+                        // column exactly like a type test, so the row keeps
+                        // its real shape. Anything else (a relational or
+                        // container sub-pattern's unknown leaf, an
+                        // unrepresentable constant) is no column constraint
+                        // this level can name — the whole pattern degrades
+                        // to the unknown space below.
+                        Restriction::BoolValue(_) | Restriction::EnumValue(..) => {
+                            if leaf_ty(leaf)
+                                .is_some_and(|leaf_ty| !world.is_subtype_of(&column, &leaf_ty))
+                            {
                                 carried.push((name, leaf.clone()));
                             }
                         }
@@ -476,7 +501,7 @@ fn always_exhaustive_within(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bo
             // parameter check `is_scope_param` runs first through the
             // shadow gate).
             if world.strings.resolve(fut_name) == "FutureOr"
-                && !always_exhaustive_shadowed(world, fut_name)
+                && !future_or_shadowed(world, fut_name)
                 && let Some(engine) = fold_engine()
             {
                 let base = engine.boundary.pool().get(args).first().copied();
@@ -502,7 +527,7 @@ fn always_exhaustive_within(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bo
 /// window the scope answer is exact; outside one the head is treated
 /// as core's (the sealed/enum checks already filtered the closed
 /// shadows).
-fn always_exhaustive_shadowed(world: &NameWorld<'_>, name: StringId) -> bool {
+fn future_or_shadowed(world: &NameWorld<'_>, name: StringId) -> bool {
     if world.container(name).is_some() {
         return true;
     }
@@ -814,6 +839,23 @@ pub(crate) enum Restriction {
     Unknown,
 }
 
+/// The name-level type a leaf denotes, for the leaves whose coverage IS one
+/// type test (upstream `_BoolValueStaticType`/`EnumElementStaticType`
+/// intersect to themselves against their head type). `None` for the shapes
+/// that carry no type of their own (`Null` stays a leaf: the `p!`
+/// union-merge owns its coverage whole).
+fn leaf_ty(leaf: &Restriction) -> Option<NameTy> {
+    match *leaf {
+        Restriction::Named(name, nullable) => Some(NameTy::Named(name, nullable)),
+        Restriction::NamedArgs(name, nullable, args) => {
+            Some(NameTy::NamedArgs(name, nullable, args))
+        }
+        Restriction::BoolValue(value) => Some(NameTy::BoolValue(value)),
+        Restriction::EnumValue(enum_name, constant) => Some(NameTy::EnumValue(enum_name, constant)),
+        _ => None,
+    }
+}
+
 impl Restriction {
     /// `&&`-conjunction at name level: the single side when both spell the
     /// same test, unknown otherwise (an incomparable conjunction's
@@ -848,21 +890,6 @@ impl Restriction {
     /// — the `||` collapse owns the in-frame union build and postfix
     /// wraps are the only sibling-leaf merges that ever see it.
     pub(crate) fn and_in(self, world: &NameWorld<'_>, other: Restriction) -> Restriction {
-        let as_ty = |r: &Restriction| match *r {
-            Restriction::Named(name, nullable) => Some(NameTy::Named(name, nullable)),
-            Restriction::NamedArgs(name, nullable, args) => {
-                Some(NameTy::NamedArgs(name, nullable, args))
-            }
-            // The value-precise leaves carry their own `NameTy` (upstream
-            // `_BoolValueStaticType`/`EnumElementStaticType` intersect to
-            // themselves against their head type). `Null` stays a leaf:
-            // the `p!` union-merge owns its coverage whole.
-            Restriction::BoolValue(value) => Some(NameTy::BoolValue(value)),
-            Restriction::EnumValue(enum_name, constant) => {
-                Some(NameTy::EnumValue(enum_name, constant))
-            }
-            _ => None,
-        };
         match (&self, &other) {
             (Restriction::NamedContext, _) => other,
             (_, Restriction::NamedContext) => self,
@@ -882,7 +909,7 @@ impl Restriction {
                 kept.push(Restriction::Null);
                 Restriction::Union(kept)
             }
-            _ => match (as_ty(&self), as_ty(&other)) {
+            _ => match (leaf_ty(&self), leaf_ty(&other)) {
                 (Some(a), Some(b)) if world.is_subtype_of(&a, &b) => self,
                 (Some(a), Some(b)) if world.is_subtype_of(&b, &a) => other,
                 _ => self.and(other),
@@ -1358,17 +1385,37 @@ impl<'a> NameWorld<'a> {
     }
 
     /// Whether some runtime value can inhabit both regions:
-    /// `canBeSubtypeOf` (type_system.dart:150-330), the verified
+    /// `canBeSubtypeOf` (type_system.dart:138-323), the verified
     /// `TypeSystem::can_be_subtype_of` port mirrored at name level — the
     /// mutual-exclusion companion of [`ExhaustivenessWorld::is_subtype_of`].
-    /// The Null arms decide before everything (type_system.dart:160-169),
+    /// The Null arms decide before everything (type_system.dart:147-159),
     /// which is the pinned corner where the two relations legitimately
     /// disagree: `Never <: Null` (subtype.dart:299-301) yet no `Never`
     /// value can sit in a `Null` slot. Undecided shapes answer `true` (the
-    /// official's conservative default, `type_system.dart:324`); function,
-    /// `FutureOr`, and record shapes do not exist at name level and fall
-    /// to the same default.
+    /// official's conservative default, type_system.dart:322).
+    ///
+    /// The arm order mirrors the official body: `FutureOr` splits into
+    /// `base`/`Future<base>` before any head comparison
+    /// (type_system.dart:173-189), the same-declaration pair compares its
+    /// type argument lists pairwise (:201-234 — the pre-#3236 same-head
+    /// `true` collapsed `A<int>` against `A<String>`), the closed-set scans
+    /// below read `allSubtypes != null` rather than sealedness alone
+    /// (:236-266, [`Self::has_known_subtypes`]), and a record/function
+    /// shape — a name-level sentinel, never a head — keeps the
+    /// conservative `true` (:269-320's field walk is not modelled).
     pub(crate) fn can_be_subtype_of(&self, left: &NameTy, right: &NameTy) -> bool {
+        self.can_be_subtype_of_within(left, right, 8)
+    }
+
+    /// [`Self::can_be_subtype_of`] with a recursion budget: the pair walks
+    /// once per written type argument and once per `FutureOr` half, so the
+    /// budget bounds the walk on a self-referential pool entry — an
+    /// exhausted chain answers the official's conservative `true`
+    /// (type_system.dart:322).
+    fn can_be_subtype_of_within(&self, left: &NameTy, right: &NameTy, budget: u8) -> bool {
+        if budget == 0 {
+            return true;
+        }
         let left = &self.extension_erasure(left);
         let right = &self.extension_erasure(right);
         let left_nullable = Self::is_potentially_nullable(left);
@@ -1383,6 +1430,19 @@ impl<'a> NameWorld<'a> {
         if left_nullable && right_nullable {
             return true;
         }
+        // `FutureOr<T>` is the union `T | Future<T>`: match both halves
+        // against the other side (type_system.dart:173-189). The split
+        // reads the union's element, so a nullable `FutureOr<T>?` takes it
+        // too and the base is compared bare — the official
+        // `futureOrBase` drops the projection.
+        if let Some(base) = self.future_or_base(left) {
+            return self.can_be_subtype_of_within(&base, right, budget - 1)
+                || self.future_half_can_be(right, &base, true, budget - 1);
+        }
+        if let Some(base) = self.future_or_base(right) {
+            return self.can_be_subtype_of_within(left, &base, budget - 1)
+                || self.future_half_can_be(left, &base, false, budget - 1);
+        }
         let (Some(left_name), Some(right_name)) = (self.head_name(left), self.head_name(right))
         else {
             // `Never` (already a subtype of everything), top, and unknown
@@ -1390,8 +1450,14 @@ impl<'a> NameWorld<'a> {
             return true;
         };
         if left_name == right_name {
-            // Same declaration, and the name level carries no type
-            // arguments to disagree over.
+            return self.same_head_can_be(left, right, budget - 1);
+        }
+        // `int` and `double` cross in the JavaScript compilation model
+        // (type_system.dart:195-199) — before either closed-set scan, which
+        // would otherwise read the missing edge as a mutual exclusion.
+        if (left_name == self.primitive_ids[0] && right_name == self.primitive_ids[1])
+            || (left_name == self.primitive_ids[1] && right_name == self.primitive_ids[0])
+        {
             return true;
         }
         // An opaque right head (a raw type-parameter spelling, an
@@ -1400,13 +1466,13 @@ impl<'a> NameWorld<'a> {
         // closed-set scans below would read the missing edges as a mutual
         // exclusion. The official answers through the parameter's bound
         // (`T extends Enum` admits every enum), falling to the
-        // conservative `true` without one (type_system.dart:324).
+        // conservative `true` without one (type_system.dart:322).
         if !self.is_known_head(right_name) {
             return true;
         }
         let left_non_null = NameTy::Named(left_name, false);
         // The enum's instances are exactly its constants, typed by the
-        // enum (type_system.dart:229-241's this-type scan).
+        // enum (type_system.dart:221-230's this-type scan).
         if self
             .container(left_name)
             .is_some_and(|c| c.kind == ContainerKind::Enum)
@@ -1414,25 +1480,142 @@ impl<'a> NameWorld<'a> {
             return self.is_subtype_of(&left_non_null, right);
         }
         // Closed left: its instance set is the declared subclass closure —
-        // the left instantiation itself, then every transitive subclass
-        // (type_system.dart:243-262, `allSubtypes`, element.dart:167-210).
-        if self.is_sealed_name(left_name) {
-            if self.is_subtype_of(&left_non_null, right) {
-                return true;
-            }
-            return self.any_subclass_reaches(left_name, right);
+        // the left instantiation itself, then every transitive subclass —
+        // and the official loop answers outright, `false` included
+        // (type_system.dart:236-250).
+        if self.has_known_subtypes(left_name) {
+            return self.is_subtype_of(&left_non_null, right)
+                || self.any_subclass_reaches(left_name, right);
         }
-        // Symmetric closed right (type_system.dart:263-278): the right's
+        // Symmetric closed right (type_system.dart:252-266): the right's
         // candidates (itself, then its transitive subclasses) must be able
         // to view the left.
-        if self.is_sealed_name(right_name) {
+        if self.has_known_subtypes(right_name) {
             let right_non_null = NameTy::Named(right_name, false);
-            if self.is_subtype_of(&right_non_null, &left_non_null) {
-                return true;
-            }
-            return self.any_subclass_reaches(right_name, &left_non_null);
+            return self.is_subtype_of(&right_non_null, &left_non_null)
+                || self.any_subclass_reaches(right_name, &left_non_null);
         }
         true
+    }
+
+    /// The same-declaration arm: `canBeSubtypeOfInterfaces`
+    /// (type_system.dart:201-219) compares the two argument lists pairwise
+    /// with the same can-be ask — a covariant fit, and deliberately not the
+    /// declared variance: the relation answers "could one value be both",
+    /// so `A<num>` and `A<int>` still overlap while `A<int>` and
+    /// `A<String>` do not. A bare side stays the wildcard it always was
+    /// (the instantiate-to-bound head fits every instantiation); outside a
+    /// parse-time window the argument slots cannot be resolved and the
+    /// pre-#3236 collapse answer stands.
+    fn same_head_can_be(&self, left: &NameTy, right: &NameTy, budget: u8) -> bool {
+        let (NameTy::NamedArgs(_, _, left_args), NameTy::NamedArgs(_, _, right_args)) = (left, right)
+        else {
+            return true;
+        };
+        let Some(engine) = fold_engine() else {
+            return true;
+        };
+        let pool = engine.boundary.pool();
+        let left_args = pool.get(*left_args);
+        let right_args = pool.get(*right_args);
+        if left_args.len() != right_args.len() {
+            return true;
+        }
+        left_args.iter().zip(right_args).all(|(left, right)| {
+            self.can_be_subtype_of_within(
+                &NameTy::from_semantic(*left),
+                &NameTy::from_semantic(*right),
+                budget,
+            )
+        })
+    }
+
+    /// The `T` of a `FutureOr<T>` spelling (type_system.dart:173-189): the
+    /// union's first argument, `None` for every other shape and for a head
+    /// the unit shadows (`class FutureOr`), where the spelling no longer
+    /// names dart:async's union. The argument list resolves only inside a
+    /// parse-time window — outside one the shape stays unsplit, the
+    /// conservative direction.
+    fn future_or_base(&self, ty: &NameTy) -> Option<NameTy> {
+        let NameTy::NamedArgs(name, _, args) = ty else {
+            return None;
+        };
+        if self.strings.resolve(*name) != "FutureOr" || future_or_shadowed(self, *name) {
+            return None;
+        }
+        let engine = fold_engine()?;
+        Some(NameTy::from_semantic(
+            *engine.boundary.pool().get(*args).first()?,
+        ))
+    }
+
+    /// The `Future<T>` half of a `FutureOr` split: `canBeSubtypeOf(Future<
+    /// base>, other)` when `future_half_is_left` (the union stood on the
+    /// left, type_system.dart:175-180) and `canBeSubtypeOf(other,
+    /// Future<base>)` otherwise (:184-189). dart:async's `Future` has no
+    /// container here, so the head is compared by spelling: a
+    /// `Future`-spelled side compares its single argument against the base,
+    /// any other side can only sit on the family through a declared edge,
+    /// and a side whose instance set is fully known
+    /// ([`Self::has_known_subtypes`]) and reaches no such edge decides the
+    /// official `false`. An open or shadowed side stays undecided.
+    fn future_half_can_be(
+        &self,
+        other: &NameTy,
+        base: &NameTy,
+        future_half_is_left: bool,
+        budget: u8,
+    ) -> bool {
+        let Some(future) = self.future_head() else {
+            return true;
+        };
+        let Some((head, args)) = Self::head_and_args(other) else {
+            return true;
+        };
+        if head == future {
+            let Some(args) = args else {
+                return true;
+            };
+            let Some(engine) = fold_engine() else {
+                return true;
+            };
+            let Some(other_base) = engine.boundary.pool().get(args).first().copied() else {
+                return true;
+            };
+            let other_base = NameTy::from_semantic(other_base);
+            return if future_half_is_left {
+                self.can_be_subtype_of_within(base, &other_base, budget)
+            } else {
+                self.can_be_subtype_of_within(&other_base, base, budget)
+            };
+        }
+        if self.named_sub(head, future) {
+            return true;
+        }
+        !self.has_known_subtypes(head)
+    }
+
+    /// The interned `Future` spelling, `None` when the unit declares its own
+    /// `Future` (the spelling no longer names dart:async's class) or an
+    /// in-scope type parameter shadows it.
+    fn future_head(&self) -> Option<StringId> {
+        let future = self.strings.intern("Future");
+        if self.container(future).is_some()
+            || fold_engine().is_some_and(|engine| engine.is_scope_param(future))
+        {
+            return None;
+        }
+        Some(future)
+    }
+
+    /// The head and the written argument slot of a named or instantiated
+    /// leaf; `None` for every other shape.
+    fn head_and_args(ty: &NameTy) -> Option<(StringId, Option<ArgListId>)> {
+        match ty {
+            NameTy::Named(name, _) => Some((*name, None)),
+            NameTy::NamedArgs(name, _, args) => Some((*name, Some(*args))),
+            _ => None,
+        }
     }
 
     /// Whether any transitive subclass of the closed `root` can
@@ -1448,6 +1631,16 @@ impl<'a> NameWorld<'a> {
         let mut seen = rustc_hash::FxHashSet::default();
         seen.insert(root);
         let mut queue = self.direct_subcontainers(root);
+        // The core chain's subtype edges sit outside the declared-clause
+        // scan (`num` has no container of its own): a closed `num` whose
+        // candidates ARE `int`/`double` must still try them, or
+        // `case num n:` over an `int` scrutinee would read as a mutual
+        // exclusion the oracle never reports.
+        for (base, parent) in self.core_supertypes {
+            if parent == root {
+                queue.push(base);
+            }
+        }
         while let Some(current) = queue.pop() {
             if !seen.insert(current) {
                 continue;
@@ -2060,6 +2253,32 @@ impl<'a> NameWorld<'a> {
         }
         self.container(name)
             .is_some_and(|c| c.sealed || c.kind == ContainerKind::Enum)
+    }
+
+    /// Whether the world knows `name`'s complete subtype set — the
+    /// `ClassElementImpl.allSubtypes` non-null condition (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/element/element.dart:159-217): a
+    /// `final` class (its subtypes are confined to its library), a `sealed`
+    /// class or enum (whose closed set the walk enumerates), and the
+    /// dart:core primitives — `int`/`double`/`num`/`bool`/`String` are
+    /// `final`/`sealed` in dart:core, so `int` against an ordinary
+    /// interface requirement is decided, not undecided (#3236: the dominant
+    /// firing arm of `pattern_never_matches_value_type`).
+    ///
+    /// Deliberately NOT [`Self::is_sealed_name`]: the exhaustiveness gate
+    /// asks `isAlwaysExhaustive`'s question, whose class arm is `isSealed`
+    /// alone (type_system.dart:815-857 — a `final` class's switch is not
+    /// exhaustive), while `canBeSubtypeOf`'s closed-set scan asks
+    /// `allSubtypes != null` (type_system.dart:236-266), which `final` also
+    /// answers. One predicate cannot serve both: folding `final` into the
+    /// sealed gate would call a `final`-class switch exhaustive and report
+    /// its `default` unreachable.
+    pub(crate) fn has_known_subtypes(&self, name: StringId) -> bool {
+        self.is_sealed_name(name)
+            || self.primitive_ids.contains(&name)
+            || self
+                .container(name)
+                .is_some_and(|c| c.kind == ContainerKind::Class && c.is_final)
     }
 
     /// Whether the world decides `name`'s sealedness and subclass set:

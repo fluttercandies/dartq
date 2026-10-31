@@ -17592,3 +17592,15 @@ mod ticket_3229_tests;
 #[cfg(test)]
 #[path = "ticket_3235_tests.rs"]
 mod ticket_3235_tests;
+// The #3236 pins (the name-level can-be relation's model gaps: the
+// same-declaration arm compares its type argument lists pairwise, the
+// `FutureOr<T>` union splits into `T`/`Future<T>` on either side, the
+// closed-set scans read `allSubtypes != null` so a `final` class and every
+// dart:core primitive decide, and an object pattern's constant field keeps
+// its property column instead of degrading to the unknown space).
+// Registered here because `diagnose.rs` is a live-lane file out of this
+// ticket's write scope; `#[path]` keeps the module inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3236_tests.rs"]
+mod ticket_3236_tests;
