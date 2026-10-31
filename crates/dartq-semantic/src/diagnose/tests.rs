@@ -17767,3 +17767,14 @@ mod ticket_3249_tests;
 #[cfg(test)]
 #[path = "ticket_3251_tests.rs"]
 mod ticket_3251_tests;
+
+// The #3276 pins (the record receiver's FIELD-write face: records are
+// immutable, so a write to an existing `$n`/named field resolves no setter
+// and reports `undefined_setter` on the record display, while the compound
+// write's read face keeps its own verdict when an extension setter alone
+// answers the write). Registered here because `diagnose.rs` is a live-lane
+// file out of this ticket's write scope; `#[path]` keeps the module inside
+// the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3276_tests.rs"]
+mod ticket_3276_tests;

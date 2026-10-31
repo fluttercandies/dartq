@@ -6890,6 +6890,15 @@ impl<'a> Engine<'a> {
         receiver_nullable: bool,
     ) {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        let record_field = !receiver_nullable
+            && matches!(shape_ty, Ty::Record { .. })
+            && self
+                .record_field_ty(
+                    shape_ty,
+                    row.name,
+                    self.null_aware_members.contains(&row.range.offset),
+                )
+                .is_some();
         // A record field resolves the READ face only — records are
         // immutable upstream (`property_element_resolver`'s record arm
         // consults the field getters; no setter element exists), so a
@@ -6898,21 +6907,37 @@ impl<'a> Engine<'a> {
         // (`r.bar += 1` — the getter resolved, the setter's face alone
         // reports). `receiver_nullable` stays ahead: the `isNullable`
         // tail's unchecked row precedes the `undefined_*` family.
-        if write
-            && !receiver_nullable
-            && matches!(shape_ty, Ty::Record { .. })
-            && self
-                .record_field_ty(
-                    shape_ty,
-                    row.name,
-                    self.null_aware_members.contains(&row.range.offset),
-                )
-                .is_some()
-        {
+        if write && record_field {
             let name_text = self.strings.resolve(row.name);
             self.emit(SemanticCode::UndefinedSetter, row.range, name_text, display);
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
+        }
+        // A compound write's READ face issues its own verdict: the write's
+        // `name=` consult never answers it, and the record arm's flags are
+        // independent (`ResolutionResult.needsGetterError`/`needsSetterError`,
+        // type_property_resolver.dart:218-225 — a field miss sets both, a
+        // field hit sets the getter flag false and leaves the setter flag
+        // standing). So a record WITHOUT the field still reports
+        // `undefined_getter` on the record display when an extension setter
+        // alone resolves the write (`r.foo += 1` over
+        // `extension E on ({int bar}) { set foo(int v) {} }` — the oracle
+        // reports the getter miss alone). A read answered by the record
+        // field above, an extension getter or an `Object` member stays
+        // silent, and the full-miss tail below reports the pair itself.
+        if matches!(row.intent, Intent::ReadWrite)
+            && !receiver_nullable
+            && matches!(shape_ty, Ty::Record { .. })
+            && !record_field
+            && !self.members.object_members.contains(&row.name)
+            && row.name != self.intern("==")
+            && self.record_extension_face(shape_ty, row.name).is_none()
+        {
+            let setter = self.setter_spelling(row.name);
+            if self.record_extension_face(shape_ty, setter).is_some() {
+                let name_text = self.strings.resolve(row.name);
+                self.emit(SemanticCode::UndefinedGetter, row.range, name_text, display);
+            }
         }
         // `call` resolves a non-nullable function receiver's own signature
         // (`callFunctionType`, type_property_resolver.dart:202-209) — a
