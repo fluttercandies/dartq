@@ -3020,8 +3020,18 @@ impl ParserListener for Flow<'_> {
         });
     }
 
-    fn handle_null_aware_index_operand_begin(&mut self, _question: Token) {
-        self.record(Ev::NullAwareIndexOperandBegin);
+    fn handle_null_aware_index_operand_begin(&mut self, question: Token) {
+        // The operand's first token is the one after the `[` the parser
+        // consumed just before this hook (the `?` and `[` tokens are
+        // adjacent in the dense token stream): the dead row's anchor when
+        // the access path dies at this open.
+        let operand = self
+            .tokens
+            .next(question.id as usize)
+            .and_then(|open| self.tokens.next(open))
+            .and_then(|index| self.span_at(index))
+            .unwrap_or(question);
+        self.record(Ev::NullAwareIndexOperandBegin { operand });
     }
 
     fn handle_null_aware_member_begin(&mut self, _question: Token) {

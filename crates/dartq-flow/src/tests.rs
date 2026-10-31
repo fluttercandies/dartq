@@ -712,10 +712,10 @@ fn dead_cast_tail_owns_the_initializer_row() {
             crate::ev::Ev::InitializerBegin,
             crate::ev::Ev::OtherExpr { span: tspan(22) },
             crate::ev::Ev::Exit { end: tspan(24) },
-            crate::ev::Ev::AsBegin { span: tspan(26) },
+            crate::ev::Ev::AsBegin { span: tspan(25) },
             crate::ev::Ev::AsEnd,
             crate::ev::Ev::AsOperator {
-                type_head: tspan(27),
+                type_head: tspan(26),
             },
             crate::ev::Ev::InitializerEnd,
             crate::ev::Ev::VarDeclEnd,
@@ -793,10 +793,10 @@ fn dead_cast_tail_owns_the_initializer_row() {
         vec![
             crate::ev::Ev::OtherExpr { span: tspan(22) },
             crate::ev::Ev::Exit { end: tspan(24) },
-            crate::ev::Ev::AsBegin { span: tspan(26) },
+            crate::ev::Ev::AsBegin { span: tspan(25) },
             crate::ev::Ev::AsEnd,
             crate::ev::Ev::AsOperator {
-                type_head: tspan(27),
+                type_head: tspan(26),
             },
             crate::ev::Ev::ExprStmt { span: tspan(22) },
             crate::ev::Ev::StmtEnd { end: 33 },

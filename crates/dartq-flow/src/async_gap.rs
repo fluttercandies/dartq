@@ -2002,7 +2002,7 @@ impl GapPass {
             // no marker: this pass tracks await/gap segments, not
             // reachability. The per-argument boundary likewise — the
             // argument's own marker was already pushed at its value's end.
-            Ev::NullAwareIndexOperandBegin | Ev::NullAwareMemberBegin | Ev::ArgumentEnd => {}
+            Ev::NullAwareIndexOperandBegin { .. } | Ev::NullAwareMemberBegin | Ev::ArgumentEnd => {}
         }
     }
 }

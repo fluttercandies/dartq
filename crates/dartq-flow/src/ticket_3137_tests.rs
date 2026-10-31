@@ -232,3 +232,57 @@ fn dead_statement_late_wildcard_rows_both_extents() {
         vec!["late var _ = 0;".to_string(), "0".to_string()]
     );
 }
+
+// —— as-cast type anchor ————————————————————————————————————————————————
+//
+// The official anchors the cast's dead row at the TYPE (`checkUnreachableNode`
+// of the type before it is visited, type_analyzer.dart:2090) and closes it at
+// the covering node (`flowEnd`, dead_code_verifier.dart:253-279), so a
+// Never-operand cast reports `T..statement end` — never `as..T`.
+
+#[test]
+fn as_cast_dead_row_anchors_at_the_type() {
+    let src = "void f() {\n  (throw 0) as int;\n}";
+    assert_eq!(dead_of(src), vec!["int;".to_string()]);
+}
+
+#[test]
+fn as_cast_dead_row_spans_the_whole_type() {
+    let src = "void f() {\n  (throw 0) as List<int>;\n}";
+    assert_eq!(dead_of(src), vec!["List<int>;".to_string()]);
+}
+
+#[test]
+fn as_cast_dead_row_folds_to_the_covering_block_close() {
+    // The interval runs to the covering close's last statement, its `;`
+    // included, and spans the source between the two statements (oracle
+    // `int; int z = 0;` on a one-line source).
+    let src = "void f() {\n  (throw 0) as int;\n  int z = 0;\n}";
+    assert_eq!(dead_of(src), vec!["int;\n  int z = 0;".to_string()]);
+}
+
+// —— `?[` operand anchors ————————————————————————————————————————————————
+//
+// A `?[` whose access path dies at the open leaves the index OPERAND as the
+// official's first dead node (flow_analysis.dart:9214-9216), and its own
+// events poll nothing — the row anchors at the operand's first token and the
+// `]` face bounds it (dead_code_verifier.dart:183-205, :253-279).
+
+#[test]
+fn dead_index_operand_anchors_the_null_aware_row() {
+    let src = "void f(Null n, int i) {\n  n?[i];\n}";
+    assert_eq!(dead_of(src), vec!["i]".to_string()]);
+}
+
+#[test]
+fn dead_index_literal_operand_anchors_the_null_aware_row() {
+    let src = "void f(Null n) {\n  n?[0];\n}";
+    assert_eq!(dead_of(src), vec!["0]".to_string()]);
+}
+
+#[test]
+fn live_null_aware_index_stays_silent() {
+    // A non-null receiver keeps the access path live: no row.
+    let src = "void f(int? n, int i) {\n  n?[i];\n}";
+    assert_eq!(dead_of(src), Vec::<String>::new());
+}

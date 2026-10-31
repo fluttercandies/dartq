@@ -506,7 +506,15 @@ pub enum Ev {
     /// flow_analysis.dart:9199). The skip-path state must be captured here:
     /// by [`Ev::IndexAccess`] the operand's own `throw`/Never events have
     /// already landed on `current`.
-    NullAwareIndexOperandBegin,
+    ///
+    /// `operand` is the operand's first token (the `[`'s follower): when
+    /// the access path dies at the open (a `Null`- or `Never`-typed
+    /// receiver), the operand is the official's first dead node, and no
+    /// event of its own polls outside a `for` header — the row needs this
+    /// token (`n?[i]` reports `i]`, dead_code_verifier.dart:183-205).
+    NullAwareIndexOperandBegin {
+        operand: TokenSpan,
+    },
     /// The `?.` of a null-aware member selector was just consumed — the
     /// receiver is the top of the expression stack and the member's events
     /// (including any invocation arguments) have not run yet. Same

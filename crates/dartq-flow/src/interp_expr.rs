@@ -1342,20 +1342,35 @@ impl Interp<'_> {
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
-            Ev::AsBegin { span } => {
+            Ev::AsBegin { .. } => {
                 self.in_as_cast = true;
                 // The cast operand ended (`x?.y as T`): rejoin the
                 // operand's own null-shorting before the type spelling's
                 // events.
                 self.flush_null_shorts_above(self.consumer_base(1));
-                // The cast-type node poll (official `checkUnreachableNode`
-                // of the type before it is visited, type_analyzer.dart:2090):
-                // a Never-typed operand's exit lands right before the type
-                // spelling, so the cast anchors the statement's dead row —
-                // `var a = f() as int;` reports at the cast. A reachable
-                // state makes the poll a no-op.
+                // The cast-type dead poll runs at `Ev::AsOperator`, which
+                // carries the type's head token: the official anchors the
+                // row at the TYPE (`checkUnreachableNode` of the type
+                // before it is visited, type_analyzer.dart:2090), so
+                // `x as int` reports `int..covering close`, never `as..`
+                // (the `as` token is no node at all). The latch records
+                // whether the operand already killed the flow — see
+                // [`Interp::as_began_dead`].
+                self.as_began_dead = !self.reachable();
+            }
+            Ev::AsOperator { type_head } => {
+                // The cast-type node poll (the `is` twin's face at
+                // [`Ev::IsOperator`]): a Never-typed operand's exit lands
+                // right before the type spelling, so the cast TYPE is the
+                // official's first dead node and the row runs from its
+                // head to the covering close (`doNotReturn() as int;`
+                // reports `int;`). A reachable state makes the poll a
+                // no-op.
+                let began_dead = std::mem::take(&mut self.as_began_dead);
                 let opened = self.dead.is_none();
-                self.dead_code(*span);
+                if began_dead {
+                    self.dead_code(*type_head);
+                }
                 // When the poll opens the interval directly inside a
                 // variable initializer (no nested executable between), the
                 // row belongs to the semantic layer's as-cast tail face —
@@ -1371,8 +1386,6 @@ impl Interp<'_> {
                 {
                     window.suppress();
                 }
-            }
-            Ev::AsOperator { type_head } => {
                 let cast_ty = self.tested_ty.take().unwrap_or(Ty::UNKNOWN);
                 self.as_cast_pending = Some(cast_ty);
                 // The Never-operand cast's type head parks on the enclosing
@@ -2108,25 +2121,30 @@ impl Interp<'_> {
                 };
                 self.exprs.push(Expr::trivial(ty));
             }
-            Ev::NullAwareIndexOperandBegin | Ev::NullAwareMemberBegin => {
-                // The `?[`/`?.` selector's split (official
+            Ev::NullAwareIndexOperandBegin { operand } => {
+                // The `?[` selector's split (official
                 // `_nullAwareAccess_rightBegin`): the receiver sits on top
-                // of the expression stack, the operand's/member's events
-                // have not run yet — capture the skip path now so an
-                // operand-side `throw`/Never cannot kill it.
-                let receiver = self
-                    .exprs
-                    .last()
-                    .map(|e| (e.reference, e.ty, e.args, e.non_null_literal))
-                    .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false));
-                let recv_offset = self
-                    .exprs
-                    .last()
-                    .and_then(|e| e.read_span)
-                    .map(|span| span.range.offset)
-                    .unwrap_or(0);
-                self.null_short_begin(receiver, recv_offset);
+                // of the expression stack, the operand's events have not
+                // run yet — capture the skip path now so an operand-side
+                // `throw`/Never cannot kill it.
+                self.null_aware_access_open();
+                // The operand is the official's first dead node when the
+                // access path died at this open (a `Null`/`Never`-typed
+                // receiver: flow_analysis.dart:9214-9216, the bottom-type
+                // exit :919-925). Nothing else polls it — reads poll
+                // inside `for` headers only and literals never — so the
+                // row opens here, at the operand's first token, and the
+                // `]` face bounds it (`n?[i]` reports `i]`, `n?[0]` `0]`;
+                // dead_code_verifier.dart:183-205, :253-279). A live
+                // access path makes the poll a no-op, and so does a
+                // statement that BEGAN dead — the top-down official walk
+                // latched that statement first, so its own row owns the
+                // whole extent (`return; a?[0];` is one row).
+                if !self.stmt_began_dead {
+                    self.dead_code(*operand);
+                }
             }
+            Ev::NullAwareMemberBegin => self.null_aware_access_open(),
             Ev::IndexAccess {
                 null_aware,
                 close_end,
@@ -3021,7 +3039,7 @@ impl Interp<'_> {
                     events.get(i + 1),
                     Some(
                         Ev::NullAwareMemberBegin
-                            | Ev::NullAwareIndexOperandBegin
+                            | Ev::NullAwareIndexOperandBegin { .. }
                             | Ev::NonNullAssert
                             | Ev::IndexAccess { .. }
                             | Ev::Ident { .. }

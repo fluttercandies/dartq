@@ -1363,6 +1363,13 @@ pub(crate) struct Interp<'o> {
     /// block bodies (their rows trim to the last statement, never past
     /// it) and for non-`;` ends.
     pub(crate) outer_exec_end: u32,
+    /// Whether the flow was already unreachable when the open `as`-cast's
+    /// TYPE began (`Ev::AsBegin`): only then is the cast type the official's
+    /// first dead node (`x as int` with a Never-typed operand reports
+    /// `int..`, type_analyzer.dart:2090). A cast whose OWN evaluation kills
+    /// the flow (the guaranteed-fail nullability/disjointness faces) reaches
+    /// its type live and anchors nothing — the next node reports.
+    pub(crate) as_began_dead: bool,
     /// Open `??=` skip-path snapshots (paired with [`crate::ev::Ev::
     /// IfNullAssignBegin`]): the state at the operator — the live path
     /// that skips the RHS. An RHS that exits (`x ??= throw e`) restores
@@ -1674,6 +1681,7 @@ impl<'o> Interp<'o> {
             death_index: None,
             outer_exec_end: 0,
             if_null_skips: Vec::new(),
+            as_began_dead: false,
             vacuous_object: None,
             vacuous_fields: Vec::new(),
             pattern_binds: Vec::new(),
@@ -2171,6 +2179,24 @@ impl<'o> Interp<'o> {
             dead_at_open: !self.reachable(),
             recv_offset,
         });
+    }
+
+    /// Opens the null-shorting context of a `?.`/`?[` selector whose
+    /// receiver is the top of the expression stack (the shared body of the
+    /// two begin events; the split itself is [`Interp::null_short_begin`]).
+    pub(crate) fn null_aware_access_open(&mut self) {
+        let receiver = self
+            .exprs
+            .last()
+            .map(|e| (e.reference, e.ty, e.args, e.non_null_literal))
+            .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false));
+        let recv_offset = self
+            .exprs
+            .last()
+            .and_then(|e| e.read_span)
+            .map(|span| span.range.offset)
+            .unwrap_or(0);
+        self.null_short_begin(receiver, recv_offset);
     }
 
     /// Closes one open null-shorting context (official
