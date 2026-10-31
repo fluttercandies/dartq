@@ -4005,6 +4005,20 @@ impl Interp<'_> {
             && range.contains(&death)
             && let Some(anchor) = events[death + 1..range.end]
                 .iter()
+                // The header part's statement wrapper is a parsing artifact
+                // (the official parses the condition as a bare `Expression`,
+                // upstream `ForParts.condition`, parser_impl.dart:10311-10321
+                // reusing `parseExpressionStatement` only as a token-level
+                // parse), so its span — the condition's FIRST token — is
+                // never the first dead NODE: a condition that kills the flow
+                // with no later node (`for (; throw 0; 1) []`) anchors
+                // nothing, and the updaters' own row plus the body's stand in
+                // (dead_code_test.dart `test_flowEnd_forParts_condition_exists`:
+                // `for (; throw 0; 1) {}` reports `1` and `{}`). A node
+                // AFTER the kill inside the condition still anchors
+                // (`for (; g(throw 0, 1); 2) {}` reports from `1`,
+                // `test_flowEnd_forParts_condition_throw`).
+                .filter(|event| !matches!(**event, Ev::ExprStmt { .. }))
                 .find_map(|event| event.span())
         {
             self.dead_code(anchor);

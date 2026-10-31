@@ -11,7 +11,7 @@ use dartq_parser::{
 // alias of `TokenSpan`).
 use dartq_parser::TokenSpan as Token;
 use dartq_parser::TokenSpan;
-use dartq_scanner::TokenTable;
+use dartq_scanner::{TokenKind, TokenTable};
 use dartq_source::saturate_slot_u32;
 
 use rustc_hash::FxHashMap;
@@ -41,12 +41,6 @@ pub struct Flow<'t> {
     /// it — the close's own `end` param is the send-tiling follower for a
     /// bare-send operand, never `rightOperand.end`.
     binary_rhs_end: Option<u32>,
-    /// The else arm's true end offset of the conditional closing next:
-    /// `end_conditional_expression_else_arm` sets it,
-    /// `end_conditional_expression` consumes it — the same follower-tiling
-    /// hazard as `binary_rhs_end` (`flowEnd(elseExpression)`,
-    /// type_analyzer.dart:2616).
-    cond_else_end: Option<u32>,
     /// The C-style header updaters' true end offset:
     /// `handle_for_updaters_end` sets it, `handle_for_loop_parts` consumes
     /// it into the `ForParts` event (the header-anchored dead-row trim
@@ -360,7 +354,6 @@ impl<'t> Flow<'t> {
             names: FxHashMap::default(),
             names_by_id: Vec::new(),
             binary_rhs_end: None,
-            cond_else_end: None,
             for_updaters_end: None,
             type_arg_groups: Vec::new(),
             type_args: vec![Vec::new()],
@@ -446,6 +439,45 @@ impl<'t> Flow<'t> {
             .checked_sub(1)
             .and_then(|index| self.span_at(index as usize))
             .map_or(token.range.offset, |span| span.range.end())
+    }
+
+    /// The else arm's own last-token end, for the conditional close
+    /// (`flowEnd(elseExpression)`, type_analyzer.dart:2616).
+    ///
+    /// The parser answers the *follower's* span for an expression whose
+    /// last token is a bare leaf (a read or a member chain): the official
+    /// AST's `node.end` there is the leaf's end, the parser's is one token
+    /// past it. Scanning the arm's token run from its first token (the one
+    /// after `colon`) to `end` and stopping at the first depth-0 `;`/`,`
+    /// or a closer the run never opened backs the row off to the arm's
+    /// true last token; a compound arm (`f(x)`, `(x)`, `a + b`, a function
+    /// literal) already ends on its own last token and keeps `end`.
+    fn else_arm_end(&self, colon: Token, end: Token) -> u32 {
+        let mut depth = 0u32;
+        let mut last = None;
+        let mut index = colon.id as usize + 1;
+        while index <= end.id as usize {
+            let Some(token) = self.tokens.get(index) else {
+                break;
+            };
+            match token.kind {
+                TokenKind::Eof => break,
+                TokenKind::Semicolon | TokenKind::Comma if depth == 0 => break,
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    depth += 1;
+                }
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            last = Some(token_end(self.source, token));
+            index += 1;
+        }
+        last.unwrap_or_else(|| end.range.end())
     }
 
     /// Interns a written-argument list structurally: equal trees share one
@@ -2869,17 +2901,14 @@ impl ParserListener for Flow<'_> {
         });
     }
 
-    fn end_conditional_expression_else_arm(&mut self, else_last: Token) {
-        self.cond_else_end = Some(else_last.range.end());
-    }
-
     fn end_conditional_expression(&mut self, _question: Token, colon: Token, end: Token) {
         // The else arm starts at the token after the colon (official
-        // `flowEnd(elseExpression)` rows span the arm's own range). The
-        // arm's end prefers the pre-close hook's true last token: the
-        // `end` param tiles a bare-send operand through its follower
-        // (mirroring `binary_rhs_end`).
-        let end = self.cond_else_end.take().unwrap_or_else(|| end.range.end());
+        // `flowEnd(elseExpression)` rows span the arm NODE's range,
+        // type_analyzer.dart:2616). The `end` param tiles a bare leaf (a
+        // read, a member chain) through its follower, so the arm's own last
+        // token is recovered from the token run instead — see
+        // [`Flow::else_arm_end`].
+        let end = self.else_arm_end(colon, end);
         let else_begin = self
             .tokens
             .next(colon.id as usize)
@@ -3264,6 +3293,18 @@ impl ParserListener for Flow<'_> {
             end: end.range.end(),
         });
     }
+}
+
+/// A token's own utf16 end, in the parser's `TokenSpan` convention
+/// (`utf16_offset` plus the token text's utf16 length).
+fn token_end(source: &str, token: &dartq_scanner::Token) -> u32 {
+    let bytes = &source[token.byte_range()];
+    let length = if bytes.is_ascii() {
+        bytes.len() as u32
+    } else {
+        bytes.chars().map(|c| c.len_utf16() as u32).sum()
+    };
+    token.utf16_offset + length
 }
 
 #[cfg(test)]
