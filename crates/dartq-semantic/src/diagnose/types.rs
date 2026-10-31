@@ -6385,3 +6385,14 @@ mod ticket_3177_tests;
 #[cfg(test)]
 #[path = "ticket_2496_tests.rs"]
 mod ticket_2496_tests;
+
+// The #2353 pins (the `Ty::Unknown` three-state faces — the closure-
+// inferred `UnknownInferredType` receiver face reports the shared
+// `unchecked_use_of_nullable_value` code, already converged via the
+// `closure_ctx` `Object?` recovery; `dynamic`/`InvalidType`/unresolved-
+// name/`?.` receivers stay silent). Same `#[path]` registration as
+// #3150/#3177/#2496: the module stays inside the `diagnose` subtree so
+// `super::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_2353_tests.rs"]
+mod ticket_2353_tests;
