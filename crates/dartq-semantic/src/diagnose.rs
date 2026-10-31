@@ -2296,6 +2296,11 @@ pub fn fold_unit_with_ops<'t>(
         file,
         lib,
     );
+    // The #3284 callee-face gate runs on the same joined list: a
+    // function-variant unchecked row claims a nullable CALLEE, so one
+    // anchored at a member read whose receiver and member face are both
+    // non-nullable function types is the invoke arm's over-report.
+    gate_non_nullable_callee_rows(&mut report.diagnostics, &engine);
     // The #2340 InvalidType-scrutinee coverage face runs on the same joined
     // list: an invalid-posture scrutinee makes the oracle's
     // `promoteForPattern` absorb the match at the first guard-free
@@ -3613,6 +3618,107 @@ pub(crate) fn access_kind(intent: &Intent) -> UncheckedNullableKind {
         UncheckedNullableKind::Method
     } else {
         UncheckedNullableKind::Property
+    }
+}
+
+/// The function-variant text of the shared unchecked-nullable family
+/// (messages.yaml's `uncheckedInvocationOfNullableValue`). Name-free, so the
+/// row identifies its own variant from the text alone.
+const UNCHECKED_FUNCTION_TEXT: &str =
+    "The function can't be unconditionally invoked because it can be 'null'.";
+
+/// The #3284 callee-face gate — the function-variant row's soundness check.
+///
+/// The function text asserts a nullable CALLEE (`F?` invoked without a null
+/// check). An explicit-receiver member read invoked as a call (`e.f()`,
+/// `this.g()`, `x.getter()` over a field or getter whose type is a function
+/// type) reaches the bare-invocation arm at the selector, and that arm's
+/// callee face can keep a nullable function shape the member table has
+/// already narrowed — the row then reports on a callee that can never be
+/// `null` (the member's settled type is `int Function()`, never
+/// `int Function()?`).
+///
+/// The gate re-decides at the teardown join, where the member tables, the
+/// member-read rows and the diagnostics are all final: a function-variant
+/// row anchored at a member-read selector drops when BOTH the receiver is a
+/// non-nullable face and the member's resolved result is a non-nullable
+/// function type. Every other shape keeps its verdict — a nullable receiver
+/// (`d.f()` over `D?`), a nullable function member (`F? f; e.f()`), a
+/// non-function member result, an unresolved climb, and rows that name no
+/// member read all stand (fail-open, the under-report direction).
+fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine) {
+    let function_head = engine.intern("Function");
+    diagnostics.retain(|row| {
+        if row.code.name != "unchecked_use_of_nullable_value"
+            || row.message.as_str() != UNCHECKED_FUNCTION_TEXT
+        {
+            return true;
+        }
+        let Ok(index) = engine
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+        else {
+            return true;
+        };
+        let read = engine.member_reads[index];
+        if read.offset != row.range.offset {
+            return true;
+        }
+        let Some(container) = non_nullable_callee_container(engine, read.recv) else {
+            return true;
+        };
+        let Walk::Found(entry) = engine.walk_members(container, read.name) else {
+            return true;
+        };
+        // A non-nullable function result means the callee can never be
+        // `null`; the row is the receiver-face over-report.
+        !non_nullable_function_face(engine, Engine::member_result_ty(&entry), function_head)
+    });
+}
+
+/// Whether a settled member result is a function type that can never be
+/// `null` — a written function type without `?`, or the bare `Function`
+/// head without `?` (an alias fold runs first, the same face the member
+/// tables hand the resolution arms).
+fn non_nullable_function_face(engine: &Engine, ty: Ty, function_head: StringId) -> bool {
+    match engine.fold_alias_ty(ty) {
+        Ty::Function { nullable: false, .. } => true,
+        Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } => name == function_head,
+        _ => false,
+    }
+}
+
+/// The container a member read's receiver resolves members through, when the
+/// receiver itself cannot be `null` (`None` — the row stands — for a nullable
+/// or unknown receiver). A container name, `super`, a creation result and an
+/// import-prefixed container are non-nullable by construction; `this` takes
+/// its enclosing container's static face (an `extension on A?` body reads
+/// `A?`), and a declaration-typed receiver answers its declared type.
+fn non_nullable_callee_container(engine: &Engine, recv: Receiver) -> Option<StringId> {
+    match recv {
+        Receiver::This { container, kind } | Receiver::Super { container, kind } => {
+            let face = engine.this_static_ty(container, kind);
+            match face {
+                Ty::Named { nullable: false, .. }
+                | Ty::Function { nullable: false, .. }
+                | Ty::Record { nullable: false, .. } => Some(container),
+                _ => None,
+            }
+        }
+        Receiver::Container { name, .. }
+        | Receiver::PrefixedContainer { name, .. }
+        | Receiver::Created { name, .. } => Some(name),
+        Receiver::Typed { type_name, ty } => match ty {
+            Ty::Named { nullable: false, .. }
+            | Ty::Function { nullable: false, .. }
+            | Ty::Record { nullable: false, .. } => Some(type_name),
+            _ => None,
+        },
+        Receiver::Prefix { .. } | Receiver::Unknown => None,
     }
 }
 

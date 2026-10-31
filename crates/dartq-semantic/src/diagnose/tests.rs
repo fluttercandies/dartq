@@ -17828,3 +17828,24 @@ mod ticket_3254_tests;
 #[cfg(test)]
 #[path = "ticket_3241_tests.rs"]
 mod ticket_3241_tests;
+
+// The #3284 pins (the explicit-receiver member CALLEE face of
+// `unchecked_use_of_nullable_value`: the function variant claims a nullable
+// callee, so a row anchored at a member read whose receiver AND member face
+// are both non-nullable function types drops at the teardown join —
+// `e.f()`/`this.g()` over a function-typed field or getter, while a nullable
+// function member, the nullable raw `Function?` head and the ordinary
+// non-function member keep their verdicts).
+#[cfg(test)]
+#[path = "ticket_3284_tests.rs"]
+mod ticket_3284_tests;
+
+// The #3256 pins (the field / getter / setter face split — a field rides
+// its implicit getter and, non-final only, its implicit setter, each
+// compared against the super face of the same element kind — plus the
+// combined-signature inference a field with an implicit type reads its
+// type from). Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3256_tests.rs"]
+mod ticket_3256_tests;
