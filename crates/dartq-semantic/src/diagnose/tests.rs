@@ -17808,3 +17808,12 @@ mod ticket_3250_tests;
 #[cfg(test)]
 #[path = "ticket_3237_tests.rs"]
 mod ticket_3237_tests;
+
+// The #3254 pins (the generic-method bound arm of `override_broken`:
+// `relateTypeParameters`' count gate, position unification onto ONE
+// spelling space, and bound equality as a mutual subtype question — the
+// renamed signature's own name list must ride the unified spellings or
+// every renamed bound leaf reads as an unresolvable head).
+#[cfg(test)]
+#[path = "ticket_3254_tests.rs"]
+mod ticket_3254_tests;

@@ -7384,15 +7384,33 @@ impl<'a> Engine<'a> {
         let unified;
         let declared = if declared.type_params > 0
             && declared.type_params == inherited.type_params
+            && declared.type_param_names.len() == inherited.type_param_names.len()
+            && !declared.type_param_names.is_empty()
             && declared.type_param_names != inherited.type_param_names
         {
             let env: FxHashMap<StringId, Ty> = declared
                 .type_param_names
                 .iter()
                 .zip(inherited.type_param_names.iter())
+                .filter(|(from, to)| **from != StringId::NONE && **to != StringId::NONE)
                 .map(|(from, to)| (*from, Ty::named(*to)))
                 .collect();
-            unified = self.substitute_entry(declared, &env);
+            let mut renamed = self.substitute_entry(declared, &env);
+            // The renamed view spells the TARGET's parameter names, so its
+            // own name list must say so too: every reader below recognises
+            // a type-parameter spelling through `type_param_names`
+            // ([`Self::override_decide`]'s InvalidType gate, its reflexive
+            // arm and its bound walk), and a renamed signature still
+            // carrying the declared spellings has every renamed leaf read
+            // as an unresolvable head — the InvalidType leniency then
+            // answers "compatible" in BOTH directions, which silently
+            // swallows a genuine bound mismatch (`f<A, B extends A>` over
+            // `f<T, S extends num>`: the bound pair `A`/`num` unifies to
+            // `T`/`num` and must fail, upstream `type_system.dart:1601-1618`
+            // compares the two bounds after substituting each side onto the
+            // shared fresh parameters).
+            renamed.type_param_names = inherited.type_param_names.clone();
+            unified = renamed;
             &unified
         } else {
             declared
@@ -7437,14 +7455,17 @@ impl<'a> Engine<'a> {
             }
         };
         // The bound pairs, equal under the unified spellings
-        // (`type_system.dart:1612-1624`: `isEqualTo` per pair after both
+        // (`type_system.dart:1601-1618`: `isEqualTo` per pair after both
         // sides instantiate onto the fresh parameters — the declared side
         // already rides the inherited spellings through `unified`, so the
         // two bound lists compare pairwise). Equality is the mutual
         // subtype question: `num` over `num?` fails one leg, `int` over
-        // `num` fails the other. An undecidable pair (`None` — a
-        // type-parameter or unresolvable head in a bound, the lattice's
-        // blind spot) suppresses, the under-report direction.
+        // `num` fails the other. Two absent bounds coincide outright (the
+        // upstream `bound1 ??= dynamic` pair, both legs decided by the
+        // same placeholder); a bound written on exactly one side reads
+        // `dynamic` against the other and fails. An undecidable pair
+        // (`None` — an unresolvable head in a bound, the lattice's blind
+        // spot) suppresses, the under-report direction.
         if declared.type_param_bounds.len() == declared.type_param_names.len()
             && inherited.type_param_bounds.len() == inherited.type_param_names.len()
         {
@@ -7453,6 +7474,9 @@ impl<'a> Engine<'a> {
                 .iter()
                 .zip(inherited.type_param_bounds.iter())
             {
+                if *d_bound == Ty::Dynamic && *i_bound == Ty::Dynamic {
+                    continue;
+                }
                 let forward = decide(declared_at(*d_bound), inherited_at(*i_bound));
                 let backward = decide(inherited_at(*i_bound), declared_at(*d_bound));
                 if matches!(forward, Some(false)) || matches!(backward, Some(false)) {
