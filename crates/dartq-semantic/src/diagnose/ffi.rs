@@ -1125,8 +1125,11 @@ impl<'a> Engine<'a> {
             while cursor > 0 && bytes.get(cursor - 1).is_some_and(|b| b.is_ascii_whitespace()) {
                 cursor -= 1;
             }
-            // Skip a trailing `)` of an argument group.
-            if bytes.get(cursor - 1) == Some(&b')') {
+            // Skip a trailing `)` of an argument group. `cursor == 0`
+            // (the name starts the file, or the annotations are consumed
+            // back to byte 0) precedes nothing — the same guard the
+            // whitespace skips above use.
+            if cursor > 0 && bytes.get(cursor - 1) == Some(&b')') {
                 let mut depth = 0i32;
                 let mut at = cursor - 1;
                 loop {
@@ -2276,7 +2279,12 @@ impl<'a> Engine<'a> {
                 } else {
                     match return_ty {
                         Ty::Named { name, .. } => name,
-                        _ => StringId::NONE,
+                        // An omitted return type is `dynamic` upstream
+                        // (`dartSignature.returnType`), and no other
+                        // non-named shape spells a native type either:
+                        // the validity walk's own `Dynamic` verdict
+                        // answers `native_function_missing_type`.
+                        _ => self.intern("Dynamic"),
                     }
                 };
                 let param_heads: Vec<StringId> = formals
@@ -4386,3 +4394,7 @@ impl FfiInvocation {
 #[cfg(test)]
 #[path = "ticket_3155_tests.rs"]
 mod ticket_3155_tests;
+
+#[cfg(test)]
+#[path = "ticket_3205_tests.rs"]
+mod ticket_3205_tests;
