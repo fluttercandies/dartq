@@ -50,6 +50,16 @@ mod ticket_2498_tests;
 #[path = "ticket_2463_tests.rs"]
 mod ticket_2463_tests;
 
+/// The #2272 pins (the `?.`/`?..`/`?[` null-shorting RESULT-TYPE face:
+/// the `?.` member result lifts to `nullable(memberType)`, the `?..`
+/// cascade result keeps the receiver's own type, the `?[` result is the
+/// nullable element type, and a chained continuation inherits the lift —
+/// upstream's `handleNullShortingFinished` /
+/// `recordNullShortedType` arm).
+#[cfg(test)]
+#[path = "ticket_2272_tests.rs"]
+mod ticket_2272_tests;
+
 /// Where one merged constraint came from — upstream's
 /// `TypeConstraintOrigin` (`type_constraint.dart`), the error-message
 /// column identity. Each gather round stamps one origin; equal origins
@@ -470,6 +480,17 @@ impl<'a> Engine<'a> {
         // the null-aware check below decides against it, not the shape's
         // push-time payload.
         let mut merged_receiver_ty = Ty::UNKNOWN;
+        // The `?[` receiver's PRE-LIFT element face: the index fold bakes
+        // the short's `?` into the result row's stored type (`a?[0]` keeps
+        // `E?`), but every null-aware face that follows reads the element's
+        // own written type — the `?.` verdict's receiver check (`a?[0]?.b`
+        // reports `invalid_null_aware_operator` on `E`) and the chain
+        // continuation's lift gate (`a?[0].b` types `B?` only while `E`
+        // reads non-null — a `List<E?>` keeps `.b`'s unchecked verdict).
+        // The cascade `?..` verdict deliberately reads the lifted row face
+        // (the `?..`'s target IS `E?`), so this answer stays scoped to the
+        // access operators' continuation face.
+        let mut shorted_elem_ty = None;
         let recv = match popped_receiver {
             Some(mut popped) => {
                 // The parenthesized group's bool collapse: `(x as dynamic)`'s
@@ -519,6 +540,12 @@ impl<'a> Engine<'a> {
                 // invocation, cascade section) folds through this pop.
                 let receiver_ty = self.receiver_static_ty(&popped);
                 merged_receiver_ty = receiver_ty;
+                // A folded `?[` result row reads `E?` through the same
+                // receiver face; the continuation's pre-lift element face
+                // re-derives through the indexed receiver's own row.
+                if !self.in_cascade {
+                    shorted_elem_ty = self.shorted_index_elem_ty(popped.range.offset);
+                }
                 self.stage_receiver_of_type_never(popped.range, receiver_ty);
                 recv_span = popped.range;
                 was_local = self.local_hits.contains_key(&recv_span.offset);
@@ -1213,7 +1240,12 @@ impl<'a> Engine<'a> {
             // covers the receivers whose static type lives off the row —
             // `this`'s container, a creation's result (`C()?..new()`'s
             // `C`), `super`'s parse-owned ban.
-            let receiver_ty = if merged_receiver_ty != Ty::UNKNOWN {
+            let receiver_ty = if let Some(elem) = shorted_elem_ty {
+                // The `?[` continuation reads the pre-lift element face:
+                // `a?[0]?.b` decides on `E` (the `?[` already shorted the
+                // receiver), never the `E?` the result row stores.
+                elem
+            } else if merged_receiver_ty != Ty::UNKNOWN {
                 merged_receiver_ty
             } else {
                 match recv {
@@ -1228,7 +1260,11 @@ impl<'a> Engine<'a> {
             };
             // The operator is the anchor (`_checkForUnnecessaryNullAware`'s
             // `.at(operator)`), not the member row the merge folded into.
-            let kind = if self.in_cascade {
+            // The section selector `?..` spells the cascade face; a `?.`
+            // INSIDE a cascade (a section's own null-aware access,
+            // `x?..a?.b`) spells the access face — the lexemes follow the
+            // written operator, not the enclosing expression.
+            let kind = if is_section {
                 NullAwareKind::Cascade
             } else {
                 NullAwareKind::Access
@@ -1276,23 +1312,44 @@ impl<'a> Engine<'a> {
                 // handles the `strictly` verdict either way — the variant
                 // swaps the message text and adds the context, never the
                 // anchor or severity.
+                // The causing operator's own spelling drives the context
+                // lexeme and span (`?.`/2 for a member or index root,
+                // `?..`/3 for a cascade-section root, `?`/1 for a `?[`
+                // question token — `previousShortCircuitingOperator`'s
+                // IndexExpression arm answers the question TOKEN,
+                // error_verifier.dart:7314-7318).
                 let prior = self
                     .dead_null_chains
                     .iter()
                     .find(|(op, end, ..)| *op <= op_range.offset && op_range.offset <= *end)
-                    .map(|(op, _, _, kind, _)| (*op, *kind));
-                let (op, replacement) = kind.lexemes();
-                if let Some((prior_offset, prior_kind)) = prior {
-                    // The causing operator's own spelling drives the context
-                    // lexeme (`?.` for a member/index root, `?..` for a
-                    // cascade-section root) and its span (2 columns for
-                    // `?.`, 3 for `?..`).
-                    let (prior_lexeme, prior_len) = match prior_kind {
+                    .map(|(op, _, _, prior_kind, _)| match prior_kind {
                         crate::diagnose::types::DeadChainKind::Member
-                        | crate::diagnose::types::DeadChainKind::Index => ("?.", 2u32),
+                        | crate::diagnose::types::DeadChainKind::Index => (*op, "?.", 2u32),
                         crate::diagnose::types::DeadChainKind::CascadeMember
-                        | crate::diagnose::types::DeadChainKind::CascadeIndex => ("?..", 3u32),
-                    };
+                        | crate::diagnose::types::DeadChainKind::CascadeIndex => {
+                            (*op, "?..", 3u32)
+                        }
+                    })
+                    // A `?[` receiver's own question is the prior
+                    // short-circuiter when no latched chain covers this
+                    // operator — `l?[0]?.length`'s `?.` reads the pre-lift
+                    // element, so the causing operator is the `?[` whose
+                    // dead-chain extent already ended at `]`.
+                    .or_else(|| {
+                        if shorted_elem_ty.is_some() && !self.in_cascade {
+                            receiver_offset.and_then(|offset| {
+                                self.index_result_recvs
+                                    .get(&offset)
+                                    .and_then(|(indexed, null_aware)| {
+                                        null_aware.then_some((indexed.end(), "?", 1u32))
+                                    })
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                let (op, replacement) = kind.lexemes();
+                if let Some((prior_offset, prior_lexeme, prior_len)) = prior {
                     let message = format!(
                         "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '{op}' can't be used."
                     );
@@ -1624,12 +1681,32 @@ impl<'a> Engine<'a> {
                 .record_short_fields
                 .get(&receiver_offset)
                 .is_some_and(|field| !Self::is_nullable_ty(*field));
-            if !self.in_cascade
-                && self.null_aware_members.contains(&receiver_offset)
-                && (!(Self::is_nullable_ty(merged_receiver_ty)
-                    || self.future_or_potentially_nullable(merged_receiver_ty))
-                    || record_short)
+            // A folded `?[` result receiver carries the same shorted-chain
+            // fact (`a?[0].b`'s `.b` inherits the lift — the whole node
+            // types `B?`). The row's stored `E?` is the SHORT's face, so the
+            // gate reads the pre-lift element type instead: `List<E>`
+            // latches `.b`, `List<E?>` keeps the continuation's own
+            // unchecked verdict.
+            let (shorted, receiver_non_null) = if self
+                .index_result_recvs
+                .get(&receiver_offset)
+                .is_some_and(|(_, null_aware)| *null_aware)
             {
+                (
+                    true,
+                    shorted_elem_ty.is_some_and(|elem| {
+                        !Self::is_nullable_ty(elem)
+                            && !self.future_or_potentially_nullable(elem)
+                    }),
+                )
+            } else {
+                (
+                    self.null_aware_members.contains(&receiver_offset),
+                    !(Self::is_nullable_ty(merged_receiver_ty)
+                        || self.future_or_potentially_nullable(merged_receiver_ty)),
+                )
+            };
+            if !self.in_cascade && shorted && (receiver_non_null || record_short) {
                 self.null_aware_members.insert(member.range.offset);
             }
         }
@@ -1688,6 +1765,34 @@ impl<'a> Engine<'a> {
             write_op: member.write_op,
             ty,
         });
+    }
+
+    /// The `?[` result's PRE-LIFT element face at `offset` (the `]` row's
+    /// own span): `handle_indexed_expression` stores the shorted face on
+    /// the result row (`nullable_form(element)`), so every consumer that
+    /// needs the continuation's semantics — the `?.` receiver check and the
+    /// chain-lift gate — re-derives the element through the folded
+    /// receiver row's own static type. `index_result_recvs` carries the
+    /// `?`-flag; a plain `a[i]` answers `None` exactly like a non-index
+    /// receiver, and a receiver row the fold no longer holds keeps the
+    /// under-report posture.
+    fn shorted_index_elem_ty(&self, offset: u32) -> Option<Ty> {
+        let &(indexed, null_aware) = self.index_result_recvs.get(&offset)?;
+        if !null_aware {
+            return None;
+        }
+        let row = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.offset == indexed.offset)?;
+        let ty = Engine::receiver_row_ty(row);
+        let ty = if ty == Ty::UNKNOWN {
+            self.receiver_static_ty(row)
+        } else {
+            ty
+        };
+        Some(self.index_result_ty(ty))
     }
 
     /// F-C: records a redirecting-constructor invocation edge
