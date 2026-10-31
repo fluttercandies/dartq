@@ -930,15 +930,24 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     pub(crate) fn ensure_parenthesized_condition(&mut self, allow_case: bool) {
         let open = self.peek_span();
         if self.peek_kind() != TokenKind::OpenParen {
-            // Recovery: `insertParens(includeIdentifier: false)`.
+            // Recovery: `insertParens(includeIdentifier: false)`
+            // (:8262-8272). The empty synthetic group rides in front of the
+            // junk, but `parseExpressionInParenthesisRest` shares the rest
+            // for the inserted group, so the condition parse still runs: the
+            // zero-width `)` stalls it and the missing-identifier row
+            // anchors past `report_missing_identifier`'s non-zero walk onto
+            // the junk (oracle while_statement/if_statement keyword_*:
+            // `expected_token '('` + `missing_identifier`, both on the
+            // junk, which then statement-parses as the body).
+            // `ensureCloseParen` returns the synthetic `)` directly — a
+            // clean close, no row.
             self.report(msg::expected_but_got("("), open);
             let offset = open.range.offset;
             self.synthetic(TokenKind::OpenParen, offset);
             self.cursor.advance();
             self.synthetic(TokenKind::CloseParen, offset);
-            self.cursor.advance();
-            let close = self.peek_span();
-            let _ = close;
+            let _ = self.parse_expression();
+            self.cursor.advance(); // the synthetic `)` — the clean close
             self.listener
                 .handle_parenthesized_condition(open, None, None);
             return;
@@ -1087,20 +1096,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
             close
         };
-        // Official `parseForLoopPartsRest` :10369-10373: when the parts parse
-        // stalls anywhere but the `(` group's closer, the stalling token is
-        // reported and the cursor jumps to the closer. An unclosed `(` (the
-        // scanner pinned a synthetic closer) can never complete, and the
-        // declaration-rest recovery consumes the enclosing block's `}` on the
-        // way, so the stall point is detected up front: the first `}` inside
-        // the group.
-        // Up-front stall detection (:10369-10373), latched not reported: the
-        // official landing report belongs to the C-style
-        // `parseForLoopPartsRest` alone — the for-in tail reports through
-        // `ensureCloseParen`/`moveSynthetic` instead and the oracle carries
-        // no `unexpectedToken` on those shapes (partial_code/for_each_statement
-        // `await for (A a in break; }`: `)` at the iterable, body parses on).
-        let stall = self.for_parts_stall_span(left_paren);
+        // The landing report belongs to the C-style `parseForLoopPartsRest`
+        // alone ([`Self::parse_for_loop_parts_rest`]'s landed-token gate,
+        // upstream :10329-10331): the parts parse either lands on the `(`
+        // group's closer (the oracle stays silent — no up-front report exists)
+        // or stalls at real junk (the gate reports on the junk and jumps).
+        // The for-in tail reports through `ensureCloseParen`/`moveSynthetic`
+        // instead and the oracle carries no `unexpectedToken` on those shapes
+        // (partial_code/for_each_statement `await for (A a in break; }`: `)`
+        // at the iterable, body parses on).
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             ExprStmtOrDecl::PatternHead { pattern_keyword } => {
@@ -1117,7 +1121,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                             pattern_keyword,
                             equals,
                         );
-                    self.report_stall(stall);
                     self.parse_for_rest(for_kw, left_paren);
                 } else {
                     self.parse_for_in_rest(
@@ -1145,44 +1148,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         Some((identifier, identifier_pos)),
                     );
                 } else {
-                    self.report_stall(stall);
                     self.parse_for_rest(for_kw, left_paren);
                 }
             }
-        }
-    }
-
-    /// The up-front stall detection shared by the statement and collection
-    /// for-heads (the engine translation of `parseForLoopPartsRest`
-    /// :10369-10373): with a scanner-pinned synthetic `(` closer the parts
-    /// parse can never land on the group's closer, and the declaration-rest
-    /// recovery would consume the enclosing block's `}` on the way, so the
-    /// first `}` inside the group is located before it is eaten. Returns the
-    /// stall span without reporting — only the C-style rest arm reports it
-    /// ([`Self::report_stall`]).
-    pub(crate) fn for_parts_stall_span(&mut self, left_paren: TokenSpan) -> Option<TokenSpan> {
-        if let Some(end_id) = self.cursor.table_matching_end(left_paren.id)
-            && self.cursor.resolve(end_id).1
-        {
-            let mut n = 0usize;
-            while n < 256 {
-                let kind = self.cursor.look_kind(n);
-                if kind == TokenKind::Eof {
-                    break;
-                }
-                if kind == TokenKind::CloseCurly {
-                    return Some(self.look_span_at(n));
-                }
-                n += 1;
-            }
-        }
-        None
-    }
-
-    /// Reports a latched [`Self::for_parts_stall_span`] row.
-    pub(crate) fn report_stall(&mut self, stall: Option<TokenSpan>) {
-        if let Some(stall) = stall {
-            self.report(msg::unexpected_token(self.cursor.lexeme(stall.id)), stall);
         }
     }
 
@@ -1700,6 +1668,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // counts as a real name.
         let name = self.ensure_catch_parameter();
         let name_synthetic = self.cursor.resolve(name.id).1;
+        // A recovery that adopted the scanner's synthetic `)` relocated it in
+        // front of the junk (official `moveSynthetic`, :10776/:10802): the
+        // junk stays in the stream for the catch body (`expected_body` on the
+        // junk) and the repaired list is a synthetic shape the cursor cannot
+        // re-serve, so the formal events emit directly below.
+        let mut repaired = false;
+        let mut repaired_close = None;
         if self.peek_kind() != TokenKind::CloseParen {
             let mut current_comma = None;
             if self.peek_kind() == TokenKind::Comma {
@@ -1717,9 +1692,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     self.report(msg::catch_syntax(), at);
                 }
                 if open_group_synthetic && let Some(close) = close_id {
-                    // The scanner placed the synthetic `)` elsewhere: adopt it.
-                    self.skip_to_token(close);
-                    self.cursor.advance();
+                    // The scanner placed the synthetic `)` elsewhere: adopt it
+                    // at the relocation point (official `moveSynthetic`,
+                    // :10776 — the unmatched-group row anchors there and the
+                    // parse resumes on the junk).
+                    repaired_close = Some(self.move_synthetic_close(
+                        open,
+                        close,
+                        TokenKind::CloseParen,
+                        ")",
+                    ));
+                    repaired = true;
                 } else {
                     current_comma = Some(self.synthetic(TokenKind::Comma, at.range.offset));
                     self.cursor.advance();
@@ -1734,12 +1717,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.report(msg::catch_syntax_extra_parameters(), at);
                     }
                     if open_group_synthetic && let Some(close) = close_id {
-                        self.skip_to_token(close);
-                        self.cursor.advance();
+                        repaired_close = Some(self.move_synthetic_close(
+                            open,
+                            close,
+                            TokenKind::CloseParen,
+                            ")",
+                        ));
+                        repaired = true;
                     }
                 }
                 *comma = Some(comma_span);
             }
+        }
+        if repaired {
+            let close = repaired_close.unwrap_or_else(|| self.peek_span());
+            self.listener
+                .begin_formal_parameters(open, crate::listener::MemberKind::Catch);
+            self.listener
+                .end_formal_parameters(0, open, close, crate::listener::MemberKind::Catch);
+            return close;
         }
         // Re-parse the parameter list for the formal-parameter events (the
         // official parseFormalParameters re-enters at `(`).

@@ -404,8 +404,16 @@ impl ComplexType {
             // past the `Function` or its `<...>` group.
             let mut probe = offset + 1;
             if parser.kind_at(probe) == TokenKind::Lt {
-                match parser.cursor.table_matching_end(parser.real_id(probe)) {
-                    Some(end) => probe = parser.offset_of(end) + 1,
+                // The group probe is the VALIDATED skip
+                // (`computeTypeParamOrArg(token, true).skip(token)`,
+                // type_info_impl.dart:1095-1101), not the raw `<>` pairing:
+                // `<T 5 6>` ends on the recovery tail's boundary (the
+                // synthetic `>` in front of the junk `5`), so the successor
+                // `5` is no `(` and the chain breaks (:1102-1103) — the
+                // member face then cascades like the oracle instead of
+                // consuming a bogus nullable GFT field.
+                match parser.group_skip_len(probe, true, 0) {
+                    Some(len) => probe += len,
                     None => break,
                 }
             }

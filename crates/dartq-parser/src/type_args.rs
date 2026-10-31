@@ -589,7 +589,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// count (`gt_group_len`) over-extends across content the validated scan
     /// rejects (`<C()>`: `C` followed by `(`), misplacing every subsequent
     /// decision.
-    fn group_skip_len(&self, lt_offset: usize, in_declaration: bool, depth: u32) -> Option<usize> {
+    pub(crate) fn group_skip_len(
+        &self,
+        lt_offset: usize,
+        in_declaration: bool,
+        depth: u32,
+    ) -> Option<usize> {
         if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
             return None;
         }

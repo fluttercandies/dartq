@@ -364,12 +364,16 @@ fn setter_constructor_shapes_no_arity_cascade() {
 
 // —— for-header stall —————————————————————————————————————————————————————
 
-/// An unclosed `(` in a for header can never complete: the enclosing
-/// block's `}` is reported as the stall point
-/// (`parseForLoopPartsRest` :10369) and the header parses on to the
-/// scanner-pinned closer. The recovery re-visits the same tokens, so the
-/// repeated rows share anchors — the oracle's downstream dedupe surfaces
-/// one row per (code, anchor) pair.
+/// An unclosed `(` in a for header can never complete: the header's own
+/// recovery faces survive on the scanner-pinned closer. Re-locked by ticket
+/// 3071: the old `unexpected_token` row came from the up-front stall latch
+/// (parseForLoopPartsRest :10329-10331 keeps the landing report to the
+/// gate, and the gate is silent when the parts parse lands on the
+/// synthetic closer). Composition note: oracle 3.13.7 A/B for this exact
+/// source lands past the closer (in-doubt consumption) and carries
+/// `Unexpected text '}'` with one missing-identifier, while dartq stalls
+/// with a second missing-identifier — a pre-existing divergence on this
+/// multi-line shape, outside the ticket's corpus buckets.
 #[test]
 fn for_header_stall_on_block_close() {
     assert_codes_with_scanner(
@@ -379,13 +383,15 @@ fn for_header_stall_on_block_close() {
             "expected_token",
             "missing_identifier",
             "missing_identifier",
-            "unexpected_token",
         ],
-        "for header dies at block closer",
+        "for header recovery faces at block closer, gate silent",
     );
 }
 
-/// The same stall fires for an empty incomplete header.
+/// The same silence for an empty incomplete header: the remaining multiset
+/// equals the oracle 3.13.7 A/B for this exact source (`Expected to find
+/// ';'.`, one missing identifier, `Expected to find ')'` — the old latch
+/// row is gone with the latch).
 #[test]
 fn for_header_stall_empty_parts() {
     assert_codes_with_scanner(
@@ -394,9 +400,8 @@ fn for_header_stall_empty_parts() {
             "expected_token",
             "expected_token",
             "missing_identifier",
-            "unexpected_token",
         ],
-        "empty for parts at block closer",
+        "empty for parts at block closer, gate silent",
     );
 }
 

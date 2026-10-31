@@ -195,15 +195,25 @@ fn for_in_block_iterable_semicolon_anchor() {
     );
 }
 
-/// The C-style stall row survives where it belongs: an unclosed `(` in a
-/// C-style for header still reports the enclosing block's `}`
-/// (parseForLoopPartsRest :10369-10373, the wave-2 pin's shape re-locked).
+/// The C-style for header lands ON the scanner's synthetic `)` (inserted at
+/// the block closer), so the landed-token gate stays silent
+/// (parseForLoopPartsRest :10329-10331; the wave-2 pin re-locked by ticket
+/// 3071 — the old `}` row came from the up-front stall latch, which is the
+/// only source the official flow does not have). Oracle A/B note: oracle
+/// 3.13.7 consumes the in-stream synthetic `)` in doubt, lands past the
+/// closer and reports `Unexpected text '}'`; dartq stalls with a second
+/// missing-identifier instead — a pre-existing composition divergence on
+/// this multi-line shape, outside the ticket's single-line corpus buckets.
 #[test]
 fn for_rest_stall_survives() {
     let rows = rows(leaked("main() {\n  for (var\n}\n"));
     assert!(
-        rows.contains(&("unexpected_token".to_owned(), 20, 21)),
-        "stall row on the block closer: {rows:?}"
+        !rows.iter().any(|(code, _, _)| code == "unexpected_token"),
+        "landed-token gate is silent on the synthetic closer: {rows:?}"
+    );
+    assert!(
+        rows.contains(&("missing_identifier".to_owned(), 20, 21)),
+        "missing name borrows the block closer's extent: {rows:?}"
     );
 }
 

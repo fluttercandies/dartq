@@ -2237,11 +2237,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.cursor.advance();
             close
         };
-        // Same up-front stall detection as the statement form
-        // (`for_parts_stall_span`), latched not reported: only the C-style
-        // rest arm carries the official landing row — the for-in tail
-        // reports through `ensureCloseParen`/`moveSynthetic`.
-        let stall = self.for_parts_stall_span(left_paren);
+        // The landing report belongs to the C-style rest arm alone (the
+        // statement form's landed-token gate, upstream :10329-10331) — the
+        // for-in tail reports through `ensureCloseParen`/`moveSynthetic`.
         let outcome = self.parse_expression_statement_or_declaration(true);
         match outcome {
             crate::statements::ExprStmtOrDecl::PatternHead { pattern_keyword } => {
@@ -2255,7 +2253,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             pattern_keyword,
                             equals,
                         );
-                    self.report_stall(stall);
                     self.parse_for_loop_parts_rest(for_kw, left_paren);
                     false
                 } else {
@@ -2287,7 +2284,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     );
                     true
                 } else {
-                    self.report_stall(stall);
                     self.parse_for_loop_parts_rest(for_kw, left_paren);
                     false
                 }
