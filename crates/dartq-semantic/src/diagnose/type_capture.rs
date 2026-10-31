@@ -2136,3 +2136,46 @@ impl<'a> Engine<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod exec_bounds_pairing_tests {
+    use super::super::test_rig::report_ops;
+
+    /// The bound-driven row a generic callee's captured `exec_bounds`
+    /// window produces for a bound-violating argument: `T extends num`
+    /// clamps a `null` solution to `num`, and the argument check names
+    /// `num`. Empty when the window never paired (name-only params carry
+    /// no bound), so the row's presence and its `num` spelling are the
+    /// observable proof that `exec_bounds` carries the declaration's
+    /// bound for that executable.
+    fn bound_driven_rows(source: &str) -> Vec<String> {
+        report_ops(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "argument_type_not_assignable")
+            .map(|d| d.message.to_string())
+            .collect()
+    }
+
+    /// #3099: a function with a WRITTEN return type pairs its
+    /// type-variable bound exactly like a bare (return-less) header. The
+    /// capture keys the closed `<...>` window on the declaring name in
+    /// both shapes (the return type precedes the name, so it never
+    /// disturbs the name-vs-window token-order latch), so the bound rides
+    /// `exec_bounds` and the same clamp row fires.
+    #[test]
+    fn written_return_fn_pairs_its_bound_like_a_bare_fn() {
+        let bare = bound_driven_rows("f<T extends num>(T t) => t;\nvoid g() { f(null); }\n");
+        let written =
+            bound_driven_rows("T f<T extends num>(T t) => t;\nvoid g() { f(null); }\n");
+        assert!(
+            bare.iter().any(|m| m.contains("'num'")),
+            "bare fn's bound must drive the clamp row: {bare:?}"
+        );
+        assert_eq!(
+            bare, written,
+            "a written return type must pair the same bound as a bare header"
+        );
+    }
+
+}
