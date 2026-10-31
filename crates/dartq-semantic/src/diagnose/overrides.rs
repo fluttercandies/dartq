@@ -917,33 +917,13 @@ impl<'a> Engine<'a> {
             } else {
                 spelling
             };
-            // The covariance faces: every transitive superinterface's OWN
-            // member (upstream `correct_override.dart:96-138`
-            // `CovariantParametersVerifier._superParameters` over
-            // `classHierarchy.implementedInterfaces`; `_correspondingMember`
-            // reads each interface element's own declarations). They carry
-            // both the propagated `covariant` marks and the verifier rows.
-            let super_faces = self.covariant_own_faces(container, lookup, *face_kind, &mut facts);
-            // The `_inheritCovariance` propagation
-            // (`inheritance_manager3.dart:1063-1130`): a parameter is
-            // covariant when this member or any overridden member declares it
-            // so. The marks drive `_computeThisTypeForSubtype`'s `Object?`
-            // rewrite (the subtype pass skips every covariant pair) and the
-            // verifier gate.
-            let base = face_entry.as_ref().unwrap_or(entry);
-            let marked = self.inherit_covariance(base, &super_faces);
-            let declared_cmp: &MemberEntry = marked.as_ref().unwrap_or(base);
-            // The inherited members already judged broken within this
-            // declared face, keyed by pointer — one diagnostic per inherited
-            // member.
-            let mut broken_seen: Vec<*const MemberEntry> = Vec::new();
-            // The rows this declared face already emitted, keyed by
-            // `(setter code, declared text, face text, inherited text)`:
-            // identical rows collapse (the oracle's diagnostic dedup), and
-            // the verifier pass below skips a row the subtype pass landed
-            // (`String m(covariant String a)` over `int m(num a)` texts the
-            // same row from both gates).
-            let mut emitted: Vec<(bool, String, String, String)> = Vec::new();
+            // The per-face merged members, in the oracle's
+            // `directSuperInterfaces` order — each written face contributes
+            // its interface-map signature for the name, one hit per face,
+            // kind-matched for the declared face's element kind. The face
+            // each hit answered rides along: the `namedCandidates` build
+            // below needs the super-and-`with` prefix boundary.
+            let mut face_hits: Vec<(StringId, FaceHit<'a>)> = Vec::new();
             for face in faces.iter().copied() {
                 let Some(hit) = self.override_face_member(container, face, lookup, &mut facts)
                 else {
@@ -967,9 +947,92 @@ impl<'a> Engine<'a> {
                     }
                     _ => hit.entry().kind == *face_kind,
                 };
-                if !kind_matches {
+                if kind_matches {
+                    face_hits.push((face, hit));
+                }
+            }
+            // The oracle's `namedCandidates[name]` (`inheritance_manager3.dart`'s
+            // interface build, the `overridden` map `getOverridden` answers):
+            // the superclass-and-`with` run collapses to ONE candidate — a
+            // mixin's own declaration replaces the running candidate, a
+            // member the mixin inherited merges with it — while every
+            // `implements`/`on` face appends its interface-map member to the
+            // list. The covariance-propagation read happens on THIS list —
+            // never the transitive own-declaration walk — so a covariant
+            // mark on an overridden-out ancestor (the superclass member a
+            // mixin replaced) does not leak into the declared member.
+            // `super_with_end` is the hit index boundary: the implicit
+            // supertype slot plus the `with` mixins lead `faces` (the same
+            // order the face list above was built), and dropped faces can
+            // not desync it because `face_hits` records each hit's face.
+            let super_with_end = decl.with_clause.len() + 1;
+            // `running` indexes `face_hits`: the fold's live candidate (or
+            // `None` after a conflicting merge — upstream drops the name).
+            let mut running: Option<usize> = None;
+            let mut tail: Vec<usize> = Vec::new();
+            for (index, (face, hit)) in face_hits.iter().enumerate() {
+                if index >= super_with_end {
+                    tail.push(index);
                     continue;
                 }
+                let Some(current) = running else {
+                    running = Some(index);
+                    continue;
+                };
+                // `candidate.enclosingElement == mixinElement` — the hit's
+                // declaring hop is the written mixin face itself (an
+                // applied name spells its declaring container): the mixin
+                // member replaces the running candidate outright. An
+                // inherited-through member merges with it.
+                if hit.face_name == *face {
+                    running = Some(index);
+                } else {
+                    running = match self.merged_candidate_index(
+                        &[&face_hits[current].1, hit],
+                        container,
+                        &mut facts,
+                    ) {
+                        // A conflicting pair keeps the running candidate —
+                        // upstream writes nothing back into `namedCandidates`
+                        // on a failed merge, so the previous entry stands.
+                        Some(winner) => Some(if winner == 0 { current } else { index }),
+                        None => Some(current),
+                    };
+                }
+            }
+            let mut candidates: Vec<&FaceHit<'a>> = Vec::new();
+            if let Some(winner) = running {
+                candidates.push(&face_hits[winner].1);
+            }
+            candidates.extend(tail.iter().map(|index| &face_hits[*index].1));
+            // The covariance faces: every transitive superinterface's OWN
+            // member (upstream `correct_override.dart:96-138`
+            // `CovariantParametersVerifier._superParameters` over
+            // `classHierarchy.implementedInterfaces`; `_correspondingMember`
+            // reads each interface element's own declarations). They carry
+            // the verifier rows — NOT the propagation marks.
+            let super_faces = self.covariant_own_faces(container, lookup, *face_kind, &mut facts);
+            // The `_inheritCovariance` propagation
+            // (`inheritance_manager3.dart:1063-1130`): a parameter is
+            // covariant when this member or any overridden member declares it
+            // so. The marks drive `_computeThisTypeForSubtype`'s `Object?`
+            // rewrite (the subtype pass skips every covariant pair) and the
+            // verifier gate.
+            let base = face_entry.as_ref().unwrap_or(entry);
+            let marked = self.inherit_covariance(base, lookup, &candidates, &mut facts);
+            let declared_cmp: &MemberEntry = marked.as_ref().unwrap_or(base);
+            // The inherited members already judged broken within this
+            // declared face, keyed by pointer — one diagnostic per inherited
+            // member.
+            let mut broken_seen: Vec<*const MemberEntry> = Vec::new();
+            // The rows this declared face already emitted, keyed by
+            // `(setter code, declared text, face text, inherited text)`:
+            // identical rows collapse (the oracle's diagnostic dedup), and
+            // the verifier pass below skips a row the subtype pass landed
+            // (`String m(covariant String a)` over `int m(num a)` texts the
+            // same row from both gates).
+            let mut emitted: Vec<(bool, String, String, String)> = Vec::new();
+            for (_, hit) in &face_hits {
                 // The stacked climb can surface one inherited member through
                 // several direct faces (the applied `S&M2` superclass face
                 // and the `M2` face both answer M2's member); the oracle's
@@ -5078,10 +5141,35 @@ impl<'a> Engine<'a> {
         spelling: StringId,
         facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
     ) -> Option<FaceHit<'a>> {
+        self.face_member_in(
+            self.file, container, self.lib, container, face, spelling, facts,
+        )
+    }
+
+    /// [`Self::override_face_member`] rooted at an arbitrary container:
+    /// `(root_file, root_writer, root_lib)` is the file / declaring
+    /// container / scope library whose written clause heads the climb —
+    /// `check_override`'s diagnosing container for the public face, a
+    /// foreign declaring hop for the covariance-propagation recursion
+    /// ([`Engine::effective_covariant_marks`]). `merge_container` names the
+    /// container whose same-file header the candidate merge substitutes
+    /// through; a foreign root passes a spelling no header declares, so the
+    /// merge keeps its unsubstituted first-candidate posture rather than
+    /// borrowing an unrelated local header's arguments.
+    fn face_member_in(
+        &self,
+        root_file: FileId,
+        root_writer: StringId,
+        root_lib: LibraryId,
+        merge_container: StringId,
+        face: StringId,
+        spelling: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<FaceHit<'a>> {
         let mut name = face;
-        let mut hop_writer = container;
-        let mut owner = self.file;
-        let mut scope_lib = self.lib;
+        let mut hop_writer = root_writer;
+        let mut owner = root_file;
+        let mut scope_lib = root_lib;
         let mut seen = FxHashSet::default();
         let mut chain: Vec<(StringId, FileId)> = Vec::new();
         let mut pending: VecDeque<(StringId, FileId, LibraryId, StringId)> = VecDeque::new();
@@ -5231,7 +5319,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        self.merge_face_candidates(collected, container, facts)
+        self.merge_face_candidates(collected, merge_container, facts)
     }
 
     /// One hop's own member face: the stored entry under the lookup
@@ -5385,8 +5473,24 @@ impl<'a> Engine<'a> {
         if collected.len() <= 1 {
             return collected.into_iter().next();
         }
+        let refs: Vec<&FaceHit<'a>> = collected.iter().collect();
+        let witness = self.merged_candidate_index(&refs, container, facts)?;
+        collected.into_iter().nth(witness)
+    }
+
+    /// [`Self::merge_face_candidates`]'s decision on a borrowed candidate
+    /// list — the winning candidate's index (`_getValidOverrides`' first
+    /// survivor), or `None` when the candidates conflict and the interface
+    /// map would carry no name. The covariance-candidate fold calls this on
+    /// hits it does not own; the entry point above keeps the owned answer.
+    fn merged_candidate_index(
+        &self,
+        collected: &[&FaceHit<'a>],
+        container: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<usize> {
         let mut substituted: Vec<MemberEntry> = Vec::with_capacity(collected.len());
-        for hit in &collected {
+        for hit in collected {
             match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
                 Instantiated::Unchanged => substituted.push(hit.entry().clone()),
                 Instantiated::Applied(env) => {
@@ -5407,11 +5511,7 @@ impl<'a> Engine<'a> {
                             )
                         })
                         .unwrap_or(false);
-                    return if first {
-                        collected.into_iter().next()
-                    } else {
-                        None
-                    };
+                    return first.then_some(0);
                 }
             }
         }
@@ -5431,8 +5531,7 @@ impl<'a> Engine<'a> {
             }
             valid.push(i);
         }
-        let witness = *valid.first()?;
-        collected.into_iter().nth(witness)
+        valid.first().copied()
     }
 
     /// The declared member's effective signature — the oracle's
@@ -5534,11 +5633,7 @@ impl<'a> Engine<'a> {
                 let mut getters = getter_candidates(facts);
                 let mut setters = setter_candidates(facts);
                 let covariant = setters.iter().any(|hit| {
-                    hit.entry()
-                        .formals
-                        .as_deref()
-                        .and_then(|f| f.positional.first())
-                        .is_some_and(|p| p.covariant)
+                    self.candidate_first_param_covariant(hit, setter_name, facts)
                 });
                 let mut effective = entry.clone();
                 effective.var_ty = match (getters.is_empty(), setters.is_empty(), entry.is_final) {
@@ -5578,11 +5673,7 @@ impl<'a> Engine<'a> {
                 let mut setters = setter_candidates(facts);
                 let mut getters = getter_candidates(facts);
                 let covariant = setters.iter().any(|hit| {
-                    hit.entry()
-                        .formals
-                        .as_deref()
-                        .and_then(|f| f.positional.first())
-                        .is_some_and(|p| p.covariant)
+                    self.candidate_first_param_covariant(hit, setter_name, facts)
                 });
                 let mut effective = entry.clone();
                 if covariant
@@ -7450,37 +7541,45 @@ impl<'a> Engine<'a> {
     }
 
     /// The oracle's covariance propagation (`_inheritCovariance`,
-    /// `inheritance_manager3.dart:1063-1130`): a member's parameter is
-    /// covariant when the member itself or any overridden member declares it
-    /// so — the interface map's chosen signature carries the propagated
-    /// mark, which is what `_computeThisTypeForSubtype`
-    /// (`correct_override.dart:70-93`) rewrites to `Object?` and what gates
-    /// [`Engine::covariant_own_faces`]' verifier. Correspondence is
-    /// `_correspondingParameter`'s: positionals by index, named by name.
+    /// `inheritance_manager3.dart:1063-1130`, and the declared-member face
+    /// of `instance_member_inferrer.dart`'s `_inferParameterCovariance` /
+    /// `_isCovariantSetter`): a member's parameter is covariant when the
+    /// member itself or any overridden member declares it so — upstream
+    /// mutates the flag on the overriding element during inference, so the
+    /// candidate `namedCandidates[name]` carries is the *propagated* mark
+    /// (a mid-chain `B.m(dynamic)` redeclaring `A.m(covariant dynamic)`
+    /// still answers covariant). The overridden members are
+    /// `namedCandidates[name]` — each DIRECT superinterface's interface-map
+    /// signature (the post-merge `interface.map[name]`, one per clause
+    /// face), which [`Engine::override_face_member`]'s collected hits
+    /// answer; the transitive own-declaration walk
+    /// ([`Engine::covariant_own_faces`]) is the verifier's face set, never
+    /// this one's — a covariant mark on an ancestor whose member was
+    /// overridden out upstream stays out of the marks here. Correspondence
+    /// is `_correspondingParameter`'s: positionals by index, named by name.
     /// `None` = no mark was added (the caller keeps its own entry — the
     /// common uncovariant shape pays the scan only).
     fn inherit_covariance(
         &self,
         entry: &MemberEntry,
-        super_faces: &[(MemberEntry, StringId, FileId)],
+        spelling: StringId,
+        candidates: &[&FaceHit<'a>],
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
     ) -> Option<MemberEntry> {
         let formals = entry.formals.as_deref()?;
         let mut covariant_positional: Vec<usize> = Vec::new();
         let mut covariant_named: Vec<StringId> = Vec::new();
-        for (super_entry, _, _) in super_faces {
-            let Some(super_formals) = super_entry.formals.as_deref() else {
-                continue;
-            };
-            for (index, p) in super_formals.positional.iter().enumerate() {
-                if p.covariant && !covariant_positional.contains(&index) {
-                    covariant_positional.push(index);
-                }
-            }
-            for p in &super_formals.named {
-                if p.covariant && !covariant_named.contains(&p.name) {
-                    covariant_named.push(p.name);
-                }
-            }
+        let mut visited: FxHashSet<(FileId, StringId)> = FxHashSet::default();
+        for hit in candidates {
+            self.candidate_covariant_marks(
+                hit,
+                spelling,
+                0,
+                &mut visited,
+                facts,
+                &mut covariant_positional,
+                &mut covariant_named,
+            );
         }
         let needs_marks = formals
             .positional
@@ -7508,6 +7607,142 @@ impl<'a> Engine<'a> {
             }
         }
         Some(marked)
+    }
+
+    /// One candidate's *effective* covariant marks — its declared marks plus
+    /// the marks the propagation itself would have set on it (upstream
+    /// `_inferParameterCovariance` runs on every declared member, so the
+    /// candidate `namedCandidates[name]` supplies already carries the marks
+    /// it overrode). The propagation set is recursive: for the candidate's
+    /// declaring container, each direct clause face's merged member (the
+    /// same [`Engine::face_member_in`] walk, rooted at that container's own
+    /// file and library) contributes its own effective marks — the spine of
+    /// winning candidates, not the whole transitive own-declaration set.
+    /// `visited` keys the recursion per declaring container: a clause cycle
+    /// or a shared ancestor walks once. Out parameters are the unioned
+    /// positional indices and named-parameter names the chain marks.
+    fn candidate_covariant_marks(
+        &self,
+        hit: &FaceHit<'a>,
+        spelling: StringId,
+        depth: usize,
+        visited: &mut FxHashSet<(FileId, StringId)>,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        covariant_positional: &mut Vec<usize>,
+        covariant_named: &mut Vec<StringId>,
+    ) {
+        if let Some(formals) = hit.entry().formals.as_deref() {
+            for (index, p) in formals.positional.iter().enumerate() {
+                if p.covariant && !covariant_positional.contains(&index) {
+                    covariant_positional.push(index);
+                }
+            }
+            for p in &formals.named {
+                if p.covariant && !covariant_named.contains(&p.name) {
+                    covariant_named.push(p.name);
+                }
+            }
+        }
+        // The declaring container's own clause faces — the same list
+        // `check_override` builds (superclass or the implicit Object/Enum
+        // face, the `with` mixins, `implements`, `on`). Synthesized hits
+        // (the frozen top-face members, an induced setter) name no modeled
+        // container; their declared marks already rode the entry. The depth
+        // cap mirrors the clause-walk's 32-hop bound — a degenerate chain
+        // keeps the marks collected so far (the under-report direction).
+        if depth >= 32 || !visited.insert((hit.origin, hit.face_name)) {
+            return;
+        }
+        let Some(decl) = self
+            .index
+            .get(hit.origin)
+            .and_then(|f| f.container(hit.face_name))
+        else {
+            return;
+        };
+        let mut faces: Vec<StringId> = Vec::with_capacity(
+            usize::from(decl.superclass.is_some())
+                + decl.with_clause.len()
+                + decl.implements_clause.len()
+                + decl.on_clause.len(),
+        );
+        match decl.superclass {
+            Some(superclass) => faces.push(superclass),
+            None => match decl.kind {
+                ContainerKind::Class => faces.push(self.intern("Object")),
+                ContainerKind::Enum => faces.push(self.intern("Enum")),
+                ContainerKind::Mixin if decl.on_clause.is_empty() => {
+                    faces.push(self.intern("Object"))
+                }
+                _ => {}
+            },
+        }
+        faces.extend(decl.with_clause.iter().copied());
+        faces.extend(decl.implements_clause.iter().copied());
+        faces.extend(decl.on_clause.iter().copied());
+        let owner_lib = self
+            .owner_library_of(hit.origin, hit.face_name)
+            .unwrap_or(self.lib);
+        // The merge's substitution root: a same-file declaring container's
+        // header facts live in this file's scan; a foreign one passes a
+        // spelling no header declares (the unsubstituted first-candidate
+        // posture — marks never depend on the substituted types, only the
+        // validity pick does).
+        let merge_container = if hit.origin == self.file {
+            hit.face_name
+        } else {
+            self.intern("")
+        };
+        for face in faces {
+            // The candidate's own override spine for the same spelling is
+            // its propagation source — `namedCandidates[spelling]` built
+            // from the declaring container's direct clause faces.
+            if let Some(sub) = self.face_member_in(
+                hit.origin,
+                hit.face_name,
+                owner_lib,
+                merge_container,
+                face,
+                spelling,
+                facts,
+            ) {
+                self.candidate_covariant_marks(
+                    &sub,
+                    spelling,
+                    depth + 1,
+                    visited,
+                    facts,
+                    covariant_positional,
+                    covariant_named,
+                );
+            }
+        }
+    }
+
+    /// One setter-face candidate's effective first-parameter mark — the
+    /// `_isCovariantSetter` probe (`instance_member_inferrer.dart`'s
+    /// overridden-setter any) asked on the propagated flag, not the raw
+    /// declared one: a setter whose own declaration dropped the keyword but
+    /// whose override spine carries it still answers covariant.
+    fn candidate_first_param_covariant(
+        &self,
+        hit: &FaceHit<'a>,
+        spelling: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> bool {
+        let mut positional: Vec<usize> = Vec::new();
+        let mut named: Vec<StringId> = Vec::new();
+        let mut visited: FxHashSet<(FileId, StringId)> = FxHashSet::default();
+        self.candidate_covariant_marks(
+            hit,
+            spelling,
+            0,
+            &mut visited,
+            facts,
+            &mut positional,
+            &mut named,
+        );
+        positional.contains(&0)
     }
 
     /// Whether a `Ty::Named` head is the oracle's `InvalidType` — a

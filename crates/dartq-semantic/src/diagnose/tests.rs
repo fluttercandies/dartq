@@ -17618,3 +17618,13 @@ mod ticket_3236_tests;
 #[cfg(test)]
 #[path = "ticket_3247_tests.rs"]
 mod ticket_3247_tests;
+// The #3252 pins (C1+C7 covariant-parameter chains: `_inheritCovariance`
+// reads the oracle's `namedCandidates[name]` — each direct superinterface's
+// merged interface-map member, with the propagation spine recursive —
+// while `CovariantParametersVerifier` keeps the transitive own-declaration
+// walk). Registered here because `diagnose.rs` is a live-lane file out of
+// this ticket's write scope; `#[path]` keeps the module inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3252_tests.rs"]
+mod ticket_3252_tests;
