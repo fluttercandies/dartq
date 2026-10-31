@@ -248,6 +248,21 @@ impl<'a> FaceHit<'a> {
     }
 }
 
+/// One candidate set's combined answer — upstream
+/// `inheritance_manager3.dart`'s `_getValidOverrides` + `_topMerge` arms.
+enum Merged {
+    /// No candidate is a valid override of every other (an empty
+    /// `_getValidOverrides`): the interface map carries no name for it.
+    Conflict,
+    /// One candidate already spells the combined signature — the identity
+    /// arms (a single valid override, or a merged type equal to an
+    /// existing candidate's).
+    Candidate(usize),
+    /// The combined signature belongs to no candidate: the merge target's
+    /// own synthesized member (`_topMerge`'s build arm).
+    Synthetic(MemberEntry),
+}
+
 /// Whether the declared member carries an implicit type slot — the oracle's
 /// `hasImplicitType` face (`instance_member_inferrer.dart`): the model
 /// records an unwritten column as [`Ty::Unknown`], so the field's type, the
@@ -5180,16 +5195,17 @@ impl<'a> Engine<'a> {
     /// The climb collects every branch's first hit instead of stopping at
     /// the first one: the linear `extends`/`with` spine's hit plus each
     /// pending `implements`/`on` face's hit. The collection then mirrors
-    /// `_getValidOverrides` + `_topMerge`'s decision order — the candidate
-    /// whose substituted signature is a valid override of every other
-    /// candidate's becomes the witness; when several qualify, the first in
-    /// visit order (`topMerge`'s equal-type early return; the multi-type
-    /// `topMerge` fold collapses to the same witness on every shape the
-    /// corpus carries); when none does, the candidates conflict and the
-    /// interface map carries no name — `getMember3` answers null and the
-    /// face reports nothing (test_33's `I: int`/`J: num` setter pair: the
-    /// `num` setter is the subtype, so the diagnostic anchors at `J`, not
-    /// at the first-declared `I`).
+    /// `_getValidOverrides` + `_topMerge`'s decision order
+    /// ([`Engine::merge_candidates`]): the candidates that are a valid
+    /// override of every other survive; one survivor, or survivors whose
+    /// rendered signatures agree, make the first of them the witness; a
+    /// differing set is merged type-by-type, landing on whichever candidate
+    /// spells the merged signature — or on a synthesized one carrying it
+    /// when none does. When no candidate survives, the candidates conflict
+    /// and the interface map carries no name — `getMember3` answers null and
+    /// the face reports nothing (test_33's `I: int`/`J: num` setter pair:
+    /// the `num` setter is the subtype, so the diagnostic anchors at `J`,
+    /// not at the first-declared `I`).
     ///
     /// Two synthesis arms the climb owns beside the model lookup:
     /// - a setter spelling resolves an inherited non-final FIELD through
@@ -5385,7 +5401,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        self.merge_face_candidates(collected, merge_container, facts)
+        self.merge_face_candidates(collected, merge_container, face, facts)
     }
 
     /// One hop's own member face: the stored entry under the lookup
@@ -5523,63 +5539,92 @@ impl<'a> Engine<'a> {
     }
 
     /// The collected candidates' merge
-    /// (`inheritance_manager3.dart`'s `_getValidOverrides` + `_topMerge`
-    /// decision order, run on each candidate's substituted signature).
-    /// Zero candidates or a candidates conflict answer `None` — the
-    /// interface map carries no name and the face reports nothing; the
-    /// single candidate passes through; the walk's first candidate stands
-    /// when any candidate's substitution is undecidable (the under-report
-    /// posture [`Engine::face_member_tracked`]'s single hit kept).
+    /// (`inheritance_manager3.dart`'s `_getValidOverrides` + `_topMerge`,
+    /// run on each candidate's substituted signature). Zero candidates or a
+    /// candidates conflict answer `None` — the interface map carries no name
+    /// and the face reports nothing; the single candidate passes through; a
+    /// merged signature that belongs to no candidate becomes the merge
+    /// target's own synthesized member, named by `merged_name` (the
+    /// container whose interface map carries it — `_topMerge`'s
+    /// `targetClass`).
     fn merge_face_candidates(
         &self,
         collected: Vec<FaceHit<'a>>,
         container: StringId,
+        merged_name: StringId,
         facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
     ) -> Option<FaceHit<'a>> {
         if collected.len() <= 1 {
             return collected.into_iter().next();
         }
-        let refs: Vec<&FaceHit<'a>> = collected.iter().collect();
-        let witness = self.merged_candidate_index(&refs, container, facts)?;
-        collected.into_iter().nth(witness)
+        let merged = {
+            let refs: Vec<&FaceHit<'a>> = collected.iter().collect();
+            self.merge_candidates(&refs, container, facts)
+        };
+        match merged {
+            Merged::Conflict => None,
+            Merged::Candidate(index) => collected.into_iter().nth(index),
+            // A synthesized member carries no declaration of its own, so the
+            // row's context stays empty rather than pointing at a candidate.
+            Merged::Synthetic(entry) => Some(FaceHit {
+                entry: HitEntry::Frozen(entry),
+                origin: self.file,
+                face_name: merged_name,
+                chain: Vec::new(),
+            }),
+        }
     }
 
-    /// [`Self::merge_face_candidates`]'s decision on a borrowed candidate
-    /// list — the winning candidate's index (`_getValidOverrides`' first
-    /// survivor), or `None` when the candidates conflict and the interface
-    /// map would carry no name. The covariance-candidate fold calls this on
-    /// hits it does not own; the entry point above keeps the owned answer.
+    /// [`Self::merge_candidates`]' surviving candidate index, or `None` when
+    /// the candidates conflict — or when the combined signature belongs to
+    /// no candidate, which has no hit to carry. The covariance-candidate
+    /// fold calls this on hits it does not own and keeps its running
+    /// candidate on `None`.
     fn merged_candidate_index(
         &self,
         collected: &[&FaceHit<'a>],
         container: StringId,
         facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
     ) -> Option<usize> {
+        match self.merge_candidates(collected, container, facts) {
+            Merged::Candidate(index) => Some(index),
+            Merged::Conflict | Merged::Synthetic(_) => None,
+        }
+    }
+
+    /// The candidate set's combined signature (`_getValidOverrides`, then
+    /// `_topMerge`), over each candidate's substituted signature.
+    ///
+    /// `_getValidOverrides` keeps the candidates that are a valid override
+    /// of every other candidate. `_topMerge` then answers the first survivor
+    /// when there is only one, when every survivor renders the same
+    /// signature, or when the type-by-type merge lands on one of them — and
+    /// otherwise a signature none of them spells ([`Merged::Synthetic`]).
+    ///
+    /// Signature comparison rides the rendered text
+    /// ([`Self::override_signature_text`], the same renderer the row's slots
+    /// use, so an equal text means the merge cannot change what the oracle
+    /// prints); the merge itself is [`Self::top_merge_ty`]'s modelled subset
+    /// of `TopMergeHelper.topMerge`. A candidate whose substitution is
+    /// undecidable keeps the walk's first candidate (the under-report
+    /// posture [`Engine::face_member_tracked`]'s single hit kept); a first
+    /// candidate that is itself undecidable drops the name.
+    fn merge_candidates(
+        &self,
+        collected: &[&FaceHit<'a>],
+        container: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Merged {
         let mut substituted: Vec<MemberEntry> = Vec::with_capacity(collected.len());
-        for hit in collected {
-            match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
-                Instantiated::Unchanged => substituted.push(hit.entry().clone()),
-                Instantiated::Applied(env) => {
-                    substituted.push(self.substitute_entry(hit.entry(), &env))
-                }
-                Instantiated::Undecidable => {
-                    let first = collected
-                        .first()
-                        .map(|hit| {
-                            matches!(
-                                self.instantiate_inherited(
-                                    &hit.chain,
-                                    hit.entry(),
-                                    container,
-                                    facts
-                                ),
-                                Instantiated::Unchanged | Instantiated::Applied(_)
-                            )
-                        })
-                        .unwrap_or(false);
-                    return first.then_some(0);
-                }
-            }
+        for (index, hit) in collected.iter().enumerate() {
+            let Some(entry) = self.substituted_signature(hit, container, facts) else {
+                return if index == 0 {
+                    Merged::Conflict
+                } else {
+                    Merged::Candidate(0)
+                };
+            };
+            substituted.push(entry);
         }
         let mut valid: Vec<usize> = Vec::new();
         'outer: for i in 0..substituted.len() {
@@ -5597,7 +5642,222 @@ impl<'a> Engine<'a> {
             }
             valid.push(i);
         }
-        valid.first().copied()
+        let Some(&first) = valid.first() else {
+            return Merged::Conflict;
+        };
+        let texts: Vec<String> = valid
+            .iter()
+            .map(|&index| self.override_signature_text(&substituted[index]))
+            .collect();
+        // `_topMerge`'s identity arms: one valid override, or every survivor
+        // spelling the same signature — the merge could not change the text.
+        if texts.iter().all(|text| *text == texts[0]) {
+            return Merged::Candidate(first);
+        }
+        let entries: Vec<&MemberEntry> = valid.iter().map(|&index| &substituted[index]).collect();
+        let Some(merged) = self.top_merge_signatures(&entries) else {
+            // A pair outside the modelled merge keeps the first valid
+            // candidate — the pre-port posture.
+            return Merged::Candidate(first);
+        };
+        let merged_text = self.override_signature_text(&merged);
+        match texts.iter().position(|text| *text == merged_text) {
+            Some(position) => Merged::Candidate(valid[position]),
+            None => Merged::Synthetic(merged),
+        }
+    }
+
+    /// One candidate's signature under the super-face type-argument
+    /// substitution (`Substitution.fromInterfaceType`): the declared types
+    /// instantiated by the written clause arguments along the hit's chain.
+    /// `None` = the environment is undecidable.
+    fn substituted_signature(
+        &self,
+        hit: &FaceHit<'a>,
+        container: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<MemberEntry> {
+        match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
+            Instantiated::Unchanged => Some(hit.entry().clone()),
+            Instantiated::Applied(env) => Some(self.substitute_entry(hit.entry(), &env)),
+            Instantiated::Undecidable => None,
+        }
+    }
+
+    /// `_topMergeSignatureTypes`: the `topMerge` fold over the valid
+    /// candidates' signatures, in candidate order. `None` = a pair the
+    /// modelled lattice cannot merge.
+    fn top_merge_signatures(&self, valid: &[&MemberEntry]) -> Option<MemberEntry> {
+        let (first, rest) = valid.split_first()?;
+        let mut merged = (*first).clone();
+        for entry in rest {
+            merged = self.top_merge_entry(&merged, entry)?;
+        }
+        Some(merged)
+    }
+
+    /// One `topMerge` step over two candidate signatures
+    /// (`TopMergeHelper._functionTypes`): the result column merges outright,
+    /// every parameter column merges with both sides' required-ness and
+    /// named spelling held equal (`_parameterKind` admits only the same
+    /// kind), and a covariant column stays covariant. `None` = the pair is
+    /// not mergeable — a kind, arity, named-set or generic-header mismatch,
+    /// or a column outside [`Self::top_merge_ty`]'s subset.
+    fn top_merge_entry(&self, first: &MemberEntry, other: &MemberEntry) -> Option<MemberEntry> {
+        // The generic header must already agree (`_typeParameters` merges
+        // only the same arity, and a kind split drops the name upstream).
+        if first.kind != other.kind
+            || first.type_param_names != other.type_param_names
+            || first.type_param_bounds != other.type_param_bounds
+        {
+            return None;
+        }
+        let mut merged = first.clone();
+        merged.return_ty = self.top_merge_ty(first.return_ty, other.return_ty)?;
+        if first.kind == MemberKind::Field {
+            merged.var_ty = self.top_merge_ty(first.var_ty, other.var_ty)?;
+        }
+        match (first.formals.as_deref(), other.formals.as_deref()) {
+            (None, None) => {}
+            (Some(a), Some(b))
+                if a.positional.len() == b.positional.len() && a.named.len() == b.named.len() =>
+            {
+                let formals = merged.formals.as_deref_mut()?;
+                for (slot, (x, y)) in formals
+                    .positional
+                    .iter_mut()
+                    .zip(a.positional.iter().zip(b.positional.iter()))
+                {
+                    if x.required != y.required {
+                        return None;
+                    }
+                    slot.ty = self.top_merge_ty(x.ty, y.ty)?;
+                    slot.covariant = x.covariant || y.covariant;
+                }
+                // Named formals pair by name, not by written order (the
+                // function type's named set is a name set).
+                for slot in formals.named.iter_mut() {
+                    let counterpart = b.named_formal(slot.name)?;
+                    if slot.required != counterpart.required {
+                        return None;
+                    }
+                    slot.ty = self.top_merge_ty(slot.ty, counterpart.ty)?;
+                    slot.covariant = slot.covariant || counterpart.covariant;
+                }
+            }
+            _ => return None,
+        }
+        // The synthesized signature has no declaration of its own: the
+        // context row stays empty rather than pointing at a candidate.
+        merged.name_range = MemberEntry::MISSING_NAME_RANGE;
+        Some(merged)
+    }
+
+    /// `TopMergeHelper.topMerge` on one type column: the NNBD lattice's
+    /// cross arms, then the structural descent over one shared head's
+    /// arguments. An unwritten annotation ([`Ty::Unknown`]) is the oracle's
+    /// `dynamic`. `None` = the pair is outside the modelled subset (a
+    /// different head, a function-typed or record column, one-sided
+    /// nullability), and the caller keeps its first valid candidate.
+    fn top_merge_ty(&self, first: Ty, other: Ty) -> Option<Ty> {
+        let written = |ty: Ty| if ty == Ty::UNKNOWN { Ty::Dynamic } else { ty };
+        let a = written(first);
+        let b = written(other);
+        // The identity arms: `dynamic`/`dynamic`, `void`/`void`,
+        // `Never`/`Never`, `Object?`/`Object?`, one head with equal
+        // arguments — every one of them answers its own value.
+        if a == b {
+            return Some(a);
+        }
+        let object_question = Ty::Named {
+            name: self.intern("Object"),
+            nullable: true,
+            args: crate::model::ArgListId::EMPTY,
+        };
+        let question = |ty: Ty| ty == object_question;
+        // The lattice's cross arms all land on `Object?`:
+        // `(Object?, void)`, `(dynamic, void)`, `(Object?, dynamic)`.
+        let crossed = (question(a) && matches!(b, Ty::Dynamic | Ty::Void))
+            || (question(b) && matches!(a, Ty::Dynamic | Ty::Void))
+            || (matches!(a, Ty::Dynamic) && matches!(b, Ty::Void))
+            || (matches!(a, Ty::Void) && matches!(b, Ty::Dynamic));
+        if crossed {
+            return Some(object_question);
+        }
+        // The nullability arm: both sides carry the suffix (merge the cores,
+        // restore it) or neither does. One-sided is not a mergeable pair —
+        // the subtype directions disagree.
+        let (a_nullable, a_core) = Self::top_core(a);
+        let (b_nullable, b_core) = Self::top_core(b);
+        if a_nullable != b_nullable {
+            return None;
+        }
+        let (
+            Ty::Named {
+                name: a_name,
+                args: a_args,
+                ..
+            },
+            Ty::Named {
+                name: b_name,
+                args: b_args,
+                ..
+            },
+        ) = (a_core, b_core)
+        else {
+            return None;
+        };
+        if a_name != b_name {
+            return None;
+        }
+        let (a_slots, b_slots) = {
+            let pool = self.boundary.args.borrow();
+            (pool.get(a_args).to_vec(), pool.get(b_args).to_vec())
+        };
+        if a_slots.len() != b_slots.len() {
+            return None;
+        }
+        let mut slots = Vec::with_capacity(a_slots.len());
+        for (x, y) in a_slots.iter().zip(b_slots.iter()) {
+            slots.push(self.top_merge_ty(*x, *y)?);
+        }
+        let merged = if slots == a_slots {
+            a_core
+        } else {
+            Ty::Named {
+                name: a_name,
+                nullable: false,
+                args: self.boundary.args.borrow_mut().intern(&slots),
+            }
+        };
+        Some(if a_nullable {
+            Self::nullable_form(merged)
+        } else {
+            merged
+        })
+    }
+
+    /// A type's suffix-less core plus its `?` flag — the pair the
+    /// nullability arm merges before restoring the suffix. The suffix-less
+    /// tops (`dynamic`, `void`, ...) answer themselves.
+    fn top_core(ty: Ty) -> (bool, Ty) {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => (
+                nullable,
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                },
+            ),
+            Ty::Record { shape, nullable } => (nullable, Ty::Record { shape, nullable: false }),
+            Ty::Function { shape, nullable } => (nullable, Ty::Function { shape, nullable: false }),
+            other => (false, other),
+        }
     }
 
     /// The declared member's effective signature — the oracle's
@@ -5810,11 +6070,10 @@ impl<'a> Engine<'a> {
 
     /// The combined most-specific signature over the candidate set
     /// (`inheritance_manager3.dart`'s `combineSignatureTypes`): the single
-    /// candidate passes; the candidates are filtered to those whose
-    /// substituted signature is a valid override of every other's
-    /// (`_getValidOverrides`), and the first survivor stands. An empty
-    /// survivor set — the conflict arm — answers `None`, the caller's
-    /// `dynamic`.
+    /// candidate passes; otherwise [`Self::merge_candidates`] answers, so a
+    /// set of mutually valid overrides answers the merged signature rather
+    /// than the first one. An empty survivor set — the conflict arm —
+    /// answers `None`, the caller's `dynamic`.
     fn combined_inherited(
         &self,
         container: StringId,
@@ -5824,35 +6083,17 @@ impl<'a> Engine<'a> {
         if candidates.len() <= 1 {
             return candidates.first().map(|hit| hit.entry().clone());
         }
-        let mut substituted: Vec<MemberEntry> = Vec::with_capacity(candidates.len());
-        for hit in &candidates {
-            match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
-                Instantiated::Unchanged => substituted.push(hit.entry().clone()),
-                Instantiated::Applied(env) => {
-                    substituted.push(self.substitute_entry(hit.entry(), &env))
-                }
-                Instantiated::Undecidable => return None,
+        let merged = {
+            let refs: Vec<&FaceHit<'a>> = candidates.iter().collect();
+            self.merge_candidates(&refs, container, facts)
+        };
+        match merged {
+            Merged::Conflict => None,
+            Merged::Synthetic(entry) => Some(entry),
+            Merged::Candidate(index) => {
+                self.substituted_signature(&candidates[index], container, facts)
             }
         }
-        let mut valid: Vec<usize> = Vec::new();
-        'outer: for i in 0..substituted.len() {
-            for j in 0..substituted.len() {
-                if i != j
-                    && self.override_broken(
-                        &substituted[i],
-                        (candidates[i].origin, candidates[i].face_name),
-                        &substituted[j],
-                        (candidates[j].origin, candidates[j].face_name),
-                    )
-                {
-                    continue 'outer;
-                }
-            }
-            valid.push(i);
-        }
-        let witness = *valid.first()?;
-        // The vec ends here — the swap is invisible.
-        Some(substituted.swap_remove(witness))
     }
 
     /// The super-face type-argument substitution

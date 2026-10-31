@@ -17778,3 +17778,11 @@ mod ticket_3251_tests;
 #[cfg(test)]
 #[path = "ticket_3276_tests.rs"]
 mod ticket_3276_tests;
+
+// The #3255 pins (the multi-superinterface candidate merge — recon C4:
+// `_getValidOverrides` + `_topMerge` over the candidates a face's climb
+// collects, so the interface map carries the merged signature, and the
+// merge target's synthesized member when no candidate spells it).
+#[cfg(test)]
+#[path = "ticket_3255_tests.rs"]
+mod ticket_3255_tests;
