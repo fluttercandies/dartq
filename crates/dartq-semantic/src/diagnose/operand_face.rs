@@ -79,6 +79,66 @@ impl<'a> Engine<'a> {
                     OperandFace::Invalid
                 }
             }
+            // The `Unknown` receiver's InvalidType face: the member merge
+            // folds every unspellable receiver — a `Bare(Missing)` head
+            // (`x.y` / `Missing.x` / `p.x` with `p` undefined), a
+            // non-`Named` `Plain` head (a function- or record-typed local),
+            // or no head row at all — into the same `Receiver::Unknown`.
+            // Upstream only the first is `InvalidType`: an undefined bare
+            // head's own row reports `undefined_identifier`, and a member
+            // read on an `InvalidType` receiver types `InvalidType` (the
+            // resolver never runs the lookup); the other two are the
+            // documented `dynamic`/model gaps. The push-time verdicts ride
+            // `refs` — the folded receiver's read span (`member_reads`
+            // `recv_span`) keys whether its head resolved to nothing, the
+            // same answer the receiver's own row reports.
+            RowShape::Member {
+                recv: Receiver::Unknown,
+            } => {
+                let Ok(index) = self
+                    .member_reads
+                    .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                else {
+                    return OperandFace::Gap;
+                };
+                let span = self.member_reads[index].recv_span;
+                if self
+                    .refs
+                    .binary_search_by(|r| r.range.offset.cmp(&span.offset))
+                    .ok()
+                    .is_some_and(|i| {
+                        self.refs[i].range == span && self.refs[i].target == RefTarget::Missing
+                    })
+                {
+                    OperandFace::Invalid
+                } else {
+                    OperandFace::Gap
+                }
+            }
+            // A prefixed member read on an import prefix (`p.y`): the
+            // oracle resolves the member inside the prefix's own export
+            // scope — no member walk, no extension applicability — so the
+            // verdict is decidable at this face. A miss reports
+            // `undefined_prefixed_name` and the read types `InvalidType`
+            // (type_property_resolver's error-element path); a hit is the
+            // declared element's face, which stays the model's gap.
+            RowShape::Member {
+                recv: Receiver::Prefix { name: prefix },
+            } => {
+                if matches!(
+                    self.namespaces.lookup_prefixed(
+                        self.graph,
+                        self.lib,
+                        *prefix,
+                        row.name
+                    ),
+                    dartq_resolution::Lookup::Found(_)
+                ) {
+                    OperandFace::Gap
+                } else {
+                    OperandFace::Invalid
+                }
+            }
             // A flow-blind local whose initializer typed InvalidType (the
             // pass-2 pre-pass's `invalid_init_locals`): the local's
             // inferred type is the initializer's, so the read is invalid.

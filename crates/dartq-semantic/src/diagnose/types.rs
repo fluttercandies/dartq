@@ -6230,3 +6230,12 @@ mod boundary_projection {
         assert_eq!(ledger.count, 3);
     }
 }
+
+// The #3150 pins (the `undefined_identifier` InvalidType operand face
+// and the bare/prefixed code-split table). Registered here, not in
+// `diagnose.rs` (other lanes' file), via `#[path]`: the module stays
+// inside the `diagnose` subtree so the test rig's `pub(super)` items
+// remain visible.
+#[cfg(test)]
+#[path = "ticket_3150_tests.rs"]
+mod ticket_3150_tests;
