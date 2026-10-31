@@ -464,7 +464,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             matches!(head, TokenKind::Keyword(Keyword::Super | Keyword::This))
                 && self.precedence_of(self.cursor.look_kind(1))
                     == Some(crate::expressions::ASSIGNMENT_PRECEDENCE);
+        // The statement-root marker for the assignment arm's
+        // `illegalAssignmentToNonAssignable` rider: only the frame whose LHS
+        // begins at this token is the statement's ROOT assignment, exactly
+        // what upstream's `handleExpressionStatement` checks
+        // (ast_builder.dart:4206-4223). Saved/restored so an expression
+        // statement nested in a function-literal body keeps its own begin.
+        let saved_expr_begin = self.statement_expr_begin;
+        self.statement_expr_begin = Some(begin.id);
         let _ = self.parse_expression();
+        self.statement_expr_begin = saved_expr_begin;
         // `reportErrorIfSuper(expression)` (ast_builder.dart:4202): the
         // bare-`super` statement (`super;`) carries the selector-missing
         // row; wrappers widen the statement expression and stay silent

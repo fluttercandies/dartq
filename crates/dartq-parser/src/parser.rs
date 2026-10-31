@@ -123,6 +123,24 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// recursion and clears it afterwards, so the field reads the immediate
     /// enclosing arm's value and never goes stale.
     pub(crate) assignment_op_spliced: bool,
+    /// First token id of the expression currently parsed as an expression
+    /// STATEMENT (`parse_expression_statement`), `None` in every other lane
+    /// (initializer values, annotation arguments, conditions, arguments,
+    /// partial-code recovery re-reads).
+    ///
+    /// The assignment arm's fallback reports
+    /// `illegalAssignmentToNonAssignable` only when its frame starts at this
+    /// token — the statement's ROOT assignment, exactly the check
+    /// `handleExpressionStatement` runs (ast_builder.dart:4206-4223: the
+    /// whole statement expression must be the `AssignmentExpression` and
+    /// its LHS not assignable). The same non-assignable LHS inside an
+    /// initializer or recovery expression has no statement, so it keeps the
+    /// arm's selector row alone (`A() : super() = 0;`,
+    /// `var f = const f = 0;` — oracle MAS + recovery rows, no illegal).
+    /// The postfix-unary arm never consults this: its illegal row is
+    /// context-free upstream (`handleUnaryPostfixAssignmentExpression`,
+    /// ast_builder.dart:5627-5642).
+    pub(crate) statement_expr_begin: Option<TokenId>,
     /// `DirectiveContext.state` (`directive_context.dart:20`): where the
     /// unit is in the directive prelude (ordering checks, #300).
     pub(crate) directive_state: crate::directives::DirectiveState,
@@ -274,6 +292,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             pending_augment: None,
             currently_recovering: false,
             assignment_op_spliced: false,
+            statement_expr_begin: None,
             directive_state: crate::directives::DirectiveState::Unknown,
             external_ctor_field_formals: false,
             unmatched_reported: Vec::new(),
@@ -628,6 +647,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             pending_augment: self.pending_augment,
             currently_recovering: self.currently_recovering,
             assignment_op_spliced: self.assignment_op_spliced,
+            statement_expr_begin: self.statement_expr_begin,
             directive_state: self.directive_state,
             external_ctor_field_formals: self.external_ctor_field_formals,
             unmatched_reported: Vec::new(),

@@ -267,9 +267,21 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// `missingAssignableSelector` over the whole LHS run
     /// (`handleRecoverableError(…, lhs.beginToken, lhs.endToken)`,
-    /// ast_builder.dart:3831-3836) plus the statement-level
-    /// `illegalAssignmentToNonAssignable` rider anchored on the same run
-    /// (:4429-4432; `const [r] = g()` anchors both on the `const` head).
+    /// ast_builder.dart:3831-3836) plus, for a statement's ROOT assignment,
+    /// the `illegalAssignmentToNonAssignable` rider anchored on the same run
+    /// (:4216-4221; `const [r] = g()` anchors both on the `const` head).
+    ///
+    /// The rider is statement-only: upstream runs it from
+    /// `handleExpressionStatement` (:4206-4223), which requires the WHOLE
+    /// statement expression to be the `AssignmentExpression`. The arm's
+    /// frame starts at the statement's first token exactly when its
+    /// assignment is that root, and [`Parser::statement_expr_begin`] records
+    /// that token; every other lane (initializer values, annotation
+    /// arguments, conditions, call arguments, partial-code recovery re-reads)
+    /// is not a statement and keeps the selector row alone — measured:
+    /// `A() : super() = 0;` and `var f = const f = 0;` carry MAS plus their
+    /// recovery rows, never the illegal row.
+    ///
     /// Split out so the run's end spans never occupy the recursion frame of
     /// [`Parser::parse_precedence_inner`] (written-out operator chains
     /// recurse once per operator through it).
@@ -277,7 +289,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let lhs_end = self.last_consumed_span();
         let lhs_span = self.span_through(lhs_begin, lhs_end);
         self.report(msg::missing_assignable_selector(), lhs_span);
-        self.report(msg::illegal_assignment_to_non_assignable(), lhs_span);
+        if self.statement_expr_begin == Some(lhs_begin.id) {
+            self.report(msg::illegal_assignment_to_non_assignable(), lhs_span);
+        }
     }
 
     /// The kind of a token id, reading inserted ids through the cursor (the
@@ -561,8 +575,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     Some(TokenKind::Keyword(Keyword::Super)) => {
                         self.report(msg::missing_assignable_selector(), left);
                     }
-                    // Both rows span the whole LHS run, anchored on its first
-                    // token — [`Parser::report_non_assignable_target`].
+                    // The selector row spans the whole LHS run, anchored on
+                    // its first token; the illegal rider joins it only for
+                    // the statement's root assignment
+                    // ([`Parser::report_non_assignable_target`]).
                     _ => self.report_non_assignable_target(lhs_begin),
                 }
                 // Right associative: recurse at the same level (:6671-6691).
