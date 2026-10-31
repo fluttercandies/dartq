@@ -5804,3 +5804,18 @@ mod ticket_3109_tests;
 /// `Iterable<int>`).
 #[cfg(test)]
 mod ticket_3111_tests;
+
+/// The #3112 pins: the `unnecessary_final` field/super-formal gate —
+/// `final this.`/`final super.` fire, every other `final` inside a
+/// formal list stays silent, and the primary-constructor declaration
+/// head suppresses (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/error/best_practices_verifier.dart:1040-1049,
+/// :496-504/:902-910, :818-824).
+#[cfg(test)]
+mod ticket_3112_tests;
+
+/// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
+/// type-check verdict under-emits on (function-type test spellings, type
+/// literals, typedef-folded checked types, dynamic operands).
+#[cfg(test)]
+mod ticket_3038_tests;

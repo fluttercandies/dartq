@@ -276,11 +276,14 @@ fn usl_non_void_and_map_silent() {
 
 // —— unnecessary_final ————————————————————————————————————————————————
 
-/// A formal parameter's `final` reports at the keyword token (upstream
-/// `_checkFinalParameter`, `BestPracticesVerifierTest`).
+/// A field formal's `final` reports at the keyword token (upstream
+/// `_checkFinalParameter`, `BestPracticesVerifierTest`): the verifier
+/// only visits `FieldFormalParameter`/`SuperFormalParameter`, so a
+/// `final this.x` fires while a plain `final int x` parameter is the
+/// parser's `extraneous_modifier` — not this warning.
 #[test]
 fn uf_final_parameter() {
-    let main = "void f(final int x) {}\n";
+    let main = "class C {\n  int x = 0;\n  C(final this.x);\n}\n";
     let report = unit_report(main);
     let rows = code_rows(&report, "unnecessary_final");
     assert_eq!(rows.len(), 1, "{report:?}");

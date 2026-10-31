@@ -5,21 +5,32 @@
 //!
 //! `BestPracticesVerifier._checkFinalParameter`
 //! (upstream Dart SDK source,
-//! pkg/analyzer/lib/src/error/best_practices_verifier.dart:932-940)
-//! reports the `final` keyword token of every formal parameter — the
-//! check runs at each formal-parameter visit (:458/:843), every kind:
-//! function, method, constructor, setter, and closure formals; the
-//! primary-constructor exemption (:776-780/:936) rides a 3.13 experiment
-//! latch that stays closed in the pinned language, and the
-//! initializing-formal shapes (`final this.x`) the corpus pins are
-//! exactly the reported ones.
+//! pkg/analyzer/lib/src/error/best_practices_verifier.dart:1040-1049)
+//! reports the `final` keyword token of a `FieldFormalParameter` or a
+//! `SuperFormalParameter` only — the check runs solely from
+//! `visitFieldFormalParameter`/:496-504 and `visitSuperFormalParameter`
+//! /:902-910, so `final this.x`/`final super.x` are the whole fire
+//! surface; every other `final` inside a formal list (plain, named,
+//! optional, function-typed, closure formals) answers the parser's
+//! `extraneous_modifier` face instead, never this one.
 //!
-//! The name-level mirror: a `final` keyword is a formal parameter's iff
-//! its innermost enclosing bracket group is a parenthesis — declarations
-//! in `for`/`if` heads are the only other legal `final`s inside parens,
-//! and the two exclusion heads read the group opener's preceding token
-//! (`for (…)`) and the pattern-match `case` arm (`if (x case final …)`)
-//! — a walk of the unified token table with a bracket stack, no AST.
+//! The suppress arm rides `_inPrimaryConstructorDeclaration`
+//! (:101, set/reset across `visitPrimaryConstructorDeclaration`
+//! :818-824): a `final this.`/`final super.` inside a class/enum/
+//! mixin/extension/extension-type declaration head's own parameter
+//! list stays silent (upstream still parses the head as a
+//! `PrimaryConstructorDeclaration` even on the mixin/extension error
+//! arms — parser_impl.dart `parsePrimaryConstructorOpt` :3793-3843
+//! calls `beginPrimaryConstructor` for every `X(…)`/`X.n(…)` head).
+//!
+//! The token-level mirror: a `final` is a field/super formal's iff it
+//! sits inside a parenthesis and the next two tokens are `this`/`super`
+//! + `.` (`this.x`/`super.x` can appear nowhere else in a formal list);
+//! the primary-constructor suppress is the enclosing paren group's
+//! head spelling `class`/`enum`/`mixin`/`extension` + name (`[.name]`)
+//! — the walk-back over the `(`-preceding `Identifier`/`.` run lands on
+//! the declaration keyword. The `for`/`if-case` head exclusions ride
+//! the same bracket walk as before (a `for`/`if` head holds no formal).
 //!
 //! # `missing_required_param`, mirrored
 //!
@@ -61,12 +72,21 @@ struct BracketFrame {
     /// A `case` keyword sat at the group's own level before now (the
     /// `if (x case …)` pattern arm).
     case_seen: bool,
+    /// The group sits inside a primary-constructor declaration head —
+    /// the `_inPrimaryConstructorDeclaration` suppress
+    /// (best_practices_verifier.dart:101/:818-824): a `class`/`enum`/
+    /// `mixin`/`extension` declaration head's own `X(…)`/`X.n(…)`
+    /// parameter list and every group nested in it.
+    primary_ctor: bool,
 }
 
 impl Engine<'_> {
     /// The whole-unit `unnecessary_final` pass: every `final` keyword
-    /// token sitting directly inside a parenthesis, minus the two
-    /// declaration-head exclusions.
+    /// token directly inside a parenthesis whose next two tokens spell
+    /// `this.`/`super.` — the `FieldFormalParameter`/`SuperFormalParameter`
+    /// gate (best_practices_verifier.dart:1040-1049, called only from
+    /// :496-504/:902-910) — minus the `for`/`if-case` head exclusions and
+    /// the primary-constructor suppression.
     pub(crate) fn check_unnecessary_final_parameters(&mut self) {
         let tokens = self.tokens.as_slice();
         let mut stack: Vec<BracketFrame> = Vec::new();
@@ -81,12 +101,15 @@ impl Engine<'_> {
                         paren: true,
                         opener_prev,
                         case_seen: false,
+                        primary_ctor: stack.last().is_some_and(|f| f.primary_ctor)
+                            || primary_ctor_head(tokens, index),
                     });
                 }
                 TokenKind::OpenCurly | TokenKind::OpenSquare => stack.push(BracketFrame {
                     paren: false,
                     opener_prev: TokenKind::Eof,
                     case_seen: false,
+                    primary_ctor: stack.last().is_some_and(|f| f.primary_ctor),
                 }),
                 TokenKind::CloseParen | TokenKind::CloseCurly | TokenKind::CloseSquare => {
                     stack.pop();
@@ -102,7 +125,7 @@ impl Engine<'_> {
                     let Some(frame) = stack.last() else {
                         continue;
                     };
-                    if !frame.paren {
+                    if !frame.paren || frame.primary_ctor {
                         continue;
                     }
                     // A `for` head declares loop variables, not formals;
@@ -112,6 +135,17 @@ impl Engine<'_> {
                     if frame.opener_prev == TokenKind::Keyword(Keyword::For)
                         || (frame.opener_prev == TokenKind::Keyword(Keyword::If)
                             && frame.case_seen)
+                    {
+                        continue;
+                    }
+                    // The field/super-formal gate (:1040-1049): the
+                    // `final` must introduce `this.x`/`super.x` — the only
+                    // formal kinds upstream visits (:496-504/:902-910).
+                    if !matches!(
+                        tokens.get(index + 1).map(|t| t.kind),
+                        Some(TokenKind::Keyword(Keyword::This))
+                            | Some(TokenKind::Keyword(Keyword::Super))
+                    ) || tokens.get(index + 2).map(|t| t.kind) != Some(TokenKind::Period)
                     {
                         continue;
                     }
@@ -497,6 +531,85 @@ impl<'a> Engine<'a> {
         );
         Some((formals, cursor, file, owner))
     }
+}
+
+/// Whether the `(` at `open` opens a primary-constructor declaration
+/// head — upstream `parsePrimaryConstructorOpt` (parser_impl.dart
+/// :3789-3792) fires `beginPrimaryConstructor` whenever a declaration
+/// head's `classNamePart` (`typeIdentifier typeParameters?` plus an
+/// optional `.ctorName`) is followed by `(` or `.name(`, for
+/// `class`/`enum`/`mixin`/`extension`/`extension type` alike (the
+/// mixin/extension arms report a recoverable error but still build the
+/// node, so their `final`s stay suppressed too —
+/// best_practices_verifier.dart:818-824).
+///
+/// The token-level shape, walked backward from `open`: an optional
+/// `.ctorName`/`Name` `Identifier`/`Period` run, an optional balanced
+/// `<…>` type-parameter group, the declaration `Name` run, then the
+/// `class`/`enum`/`mixin`/`extension` keyword (`extension type`'s
+/// `type` scans as an Identifier, so the run covers it). A regular
+/// constructor's `(` inside a body lands on `{`/`}`/`;`, a function's
+/// on a return type/`void` — none is a declaration keyword.
+fn primary_ctor_head(tokens: &[dartq_scanner::Token], open: usize) -> bool {
+    // One `Identifier`/`.` run (a name, or `.ctorName`, or `type` in
+    // `extension type`); never crosses the group's own opener.
+    fn name_run(tokens: &[dartq_scanner::Token], cursor: &mut usize) {
+        while *cursor > 0
+            && matches!(
+                tokens[*cursor - 1].kind,
+                TokenKind::Identifier | TokenKind::Period
+            )
+        {
+            *cursor -= 1;
+        }
+    }
+    let mut cursor = open;
+    // The optional `.ctorName` and/or the declaration name.
+    name_run(tokens, &mut cursor);
+    // The optional `<T…>` type-parameter group, skipped backward:
+    // `>`/`>>`/`>>>` open the skip at their width and each `<` closes
+    // one level; a `(`, `{`, or `;` aborts (unbalanced recovery).
+    if cursor > 0 {
+        let width = |kind: TokenKind| -> i32 {
+            match kind {
+                TokenKind::Gt => 1,
+                TokenKind::GtGt => 2,
+                TokenKind::GtGtGt => 3,
+                _ => 0,
+            }
+        };
+        let mut depth = width(tokens[cursor - 1].kind);
+        if depth > 0 {
+            let mut i = cursor - 1;
+            while depth > 0 && i > 0 {
+                i -= 1;
+                match tokens[i].kind {
+                    TokenKind::Lt => depth -= 1,
+                    TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                        depth += width(tokens[i].kind);
+                    }
+                    TokenKind::OpenParen | TokenKind::OpenCurly | TokenKind::Semicolon => {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                return false;
+            }
+            cursor = i;
+        }
+    }
+    // The declaration name ahead of the type parameters.
+    name_run(tokens, &mut cursor);
+    cursor > 0
+        && matches!(
+            tokens[cursor - 1].kind,
+            TokenKind::Keyword(Keyword::Class)
+                | TokenKind::Keyword(Keyword::Enum)
+                | TokenKind::Keyword(Keyword::Mixin)
+                | TokenKind::Keyword(Keyword::Extension)
+        )
 }
 
 /// The cooked first quoted string of an annotation argument group
