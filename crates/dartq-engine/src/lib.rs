@@ -1914,10 +1914,10 @@ impl Engine {
     /// The generation header facts snapshots key on: the
     /// container format version, the engine's `FACTS_SEMANTIC_VERSION`,
     /// the SDK identity, the package-graph fingerprint, and the context
-    /// salt (the remaining fork dimensions — the context root, target,
-    /// declared variables, analysis options). The same header drives
-    /// `SnapshotStore::load` at warm start and `save` at flush; callers
-    /// never derive it by hand.
+    /// salt (the remaining fork dimensions — the analyzer build (#3113),
+    /// the context root, target, declared variables, analysis options).
+    /// The same header drives `SnapshotStore::load` at warm start and
+    /// `save` at flush; callers never derive it by hand.
     #[must_use]
     pub fn snapshot_header(&self) -> GenerationHeader {
         let mut roots: Vec<PathBuf> = self
@@ -1936,6 +1936,7 @@ impl Engine {
                 &self.state.packages,
             ),
             context_salt: state::persist::context_salt(
+                state::persist::analyzer_build(),
                 &self.context_root,
                 &self.state.target,
                 &self.state.declared_variables,

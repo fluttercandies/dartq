@@ -114,35 +114,68 @@ pub fn sdk_identity(sdk: &SdkSnapshot, target: &str) -> String {
     )
 }
 
+/// The running analyzer build's identity: blake3-128 over the current
+/// executable's bytes, read and hashed once per process (the bytes cannot
+/// change under a running process). The persisted facts are baked analyzer
+/// OUTPUT — scan rows, parse-recovery rows, directive targets and codes,
+/// element captures — so the build that produced them is as much a fork
+/// dimension of a facts generation as the SDK or the package graph: a
+/// rebuilt or upgraded binary whose `FACTS_SEMANTIC_VERSION` did not move
+/// (the bump discipline is manual, and the history above records its
+/// misses — v15, v20, v24) must never serve the previous build's rows for
+/// unchanged content (#3113: a warm generation survived the engine
+/// rebuild, and the same root replayed stale rows while a fresh root — a
+/// different context salt — answered fresh). An unreadable executable
+/// (an exotic embedder) folds a constant failure marker instead: the
+/// identity degrades to one shared build, never to a session failure —
+/// the accelerator posture.
+#[must_use]
+pub fn analyzer_build() -> [u8; 16] {
+    static BUILD: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    *BUILD.get_or_init(|| {
+        let bytes = std::env::current_exe().and_then(|exe| std::fs::read(&exe));
+        match bytes {
+            Ok(bytes) => blake3_128(&bytes),
+            Err(_) => blake3_128(b"dartq-analyzer-build-unreadable"),
+        }
+    })
+}
+
 /// The context-fork salt the generation header carries (#482): blake3-128
 /// over the fork dimensions [`sdk_identity`] and
-/// [`package_graph_fingerprint`] do not already pin — the context root
-/// (the `.dart_tool` directory the engine was assembled over), the SDK
-/// target segment, the conditional-import declared-variables map, and the
-/// analysis-options content. The root is what keeps distinct workspaces
-/// apart when the package graph cannot (#2274): a pubspec-less tree's
-/// package table is empty, so without it the fingerprint degenerates to a
-/// constant and two byte-identical bare trees would share one generation
-/// directory. Sorted keys and length-prefixed fields make the digest a
-/// pure function of the dimension values (equal contexts digest equally
-/// across processes); any difference forks the header, so two contexts
-/// that would analyze differently can never collide on one generation
-/// directory. Options fold the *located options file's* path and raw
-/// bytes per root — the same content the merged options derive from, the
-/// `context_key` precedent — so exclude-glob and lint edits both move it,
-/// and an unreadable file contributes exactly what the engine's own
-/// loader analyzed (empty bytes).
+/// [`package_graph_fingerprint`] do not already pin — the analyzer build
+/// ([`analyzer_build`], #3113), the context root (the `.dart_tool`
+/// directory the engine was assembled over), the SDK target segment, the
+/// conditional-import declared-variables map, and the analysis-options
+/// content. The root is what keeps distinct workspaces apart when the
+/// package graph cannot (#2274): a pubspec-less tree's package table is
+/// empty, so without it the fingerprint degenerates to a constant and two
+/// byte-identical bare trees would share one generation directory. The
+/// build keeps analyzer generations apart when nothing else can: same
+/// workspace, same SDK, same content — a different binary may analyze
+/// differently, so its facts are a different generation. Sorted keys and
+/// length-prefixed fields make the digest a pure function of the
+/// dimension values (equal contexts digest equally across processes); any
+/// difference forks the header, so two contexts that would analyze
+/// differently can never collide on one generation directory. Options
+/// fold the *located options file's* path and raw bytes per root — the
+/// same content the merged options derive from, the `context_key`
+/// precedent — so exclude-glob and lint edits both move it, and an
+/// unreadable file contributes exactly what the engine's own loader
+/// analyzed (empty bytes).
 // The engine's declared-variables map is the face (its FxHasher is part
 // of the engine's identity, not a generalization axis).
 #[expect(clippy::implicit_hasher)] // FxHashMap is part of the digest's identity, not a generalization axis
 #[must_use]
 pub fn context_salt(
+    build: [u8; 16],
     context_root: &Path,
     target: &str,
     declared_variables: &FxHashMap<String, String>,
     roots: &[PathBuf],
 ) -> [u8; 16] {
     let mut bytes = Vec::new();
+    field(&mut bytes, &build);
     field(&mut bytes, context_root.as_os_str().as_encoded_bytes());
     field(&mut bytes, target.as_bytes());
     let mut variables: Vec<(&str, &str)> = declared_variables
@@ -1061,7 +1094,7 @@ mod tests {
     /// [`Self::populated_elements_shape_is_pinned`] fails — the same
     /// bump-the-version-and-re-pin contract as the main pin.
     const FACTS_SHAPE_ELEMENTS_JSON_PIN: &str = concat!(
-        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"default_value":null}],"named":[]},"annotations":[]}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]],"annotations":[]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false}],"anon_methods":[],"wildcard_duplicates":[],"formal_annotations":[],"ctor_annotations":[],"library_annotations":[]}"#,
+        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"default_value":null}],"named":[]},"annotations":[]}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]],"annotations":[]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false,"head_range":{"offset":58,"length":3}}],"anon_methods":[],"wildcard_duplicates":[],"formal_annotations":[],"ctor_annotations":[],"library_annotations":[]}"#,
     );
 
     /// The element rows the main probe rides past empty, modeled on the
@@ -1372,6 +1405,14 @@ mod tests {
                 is_const: true,
                 is_factory: false,
                 is_complete: false,
+                // The constructor head's `errorRange` (#3201's column, the
+                // v24 history entry): populated here per the probe's
+                // pattern — a new column rides a real value, so a later
+                // edit of its encoding moves the pinned bytes.
+                head_range: Some(PersistedRange {
+                    offset: 58,
+                    length: 3,
+                }),
             }],
             anon_methods: Vec::new(),
             // The #2914 wildcard-duplicate log and the #2924 annotation
@@ -1698,39 +1739,53 @@ mod tests {
 
     /// The context salt is a pure function of the fork dimensions and
     /// sensitive to every one of them: equal dimensions digest equally;
-    /// the context root, the target, a declared variable, and the located
-    /// options content each move it.
+    /// the analyzer build, the context root, the target, a declared
+    /// variable, and the located options content each move it.
     #[test]
     fn context_salt_is_stable_and_dimension_sensitive() {
         let plain = salt_config_dir("plain", None);
         let roots = |dir: &Path| vec![dir.to_path_buf()];
-        let base = context_salt(&plain, "vm", &FxHashMap::default(), &roots(&plain));
+        let build = analyzer_build();
+        let base = context_salt(build, &plain, "vm", &FxHashMap::default(), &roots(&plain));
         assert_eq!(
             base,
-            context_salt(&plain, "vm", &FxHashMap::default(), &roots(&plain)),
+            context_salt(build, &plain, "vm", &FxHashMap::default(), &roots(&plain)),
             "equal dimensions digest equally"
         );
         assert_ne!(
             base,
-            context_salt(&plain, "js", &FxHashMap::default(), &roots(&plain)),
+            context_salt([7; 16], &plain, "vm", &FxHashMap::default(), &roots(&plain)),
+            "the analyzer build moves the salt (#3113: a rebuilt binary \
+             forks the generation, never serving the old build's facts)"
+        );
+        assert_ne!(
+            base,
+            context_salt(build, &plain, "js", &FxHashMap::default(), &roots(&plain)),
             "the target segment moves the salt"
         );
         let mut defined = FxHashMap::default();
         defined.insert("dart.vm.profile".to_owned(), "true".to_owned());
         assert_ne!(
             base,
-            context_salt(&plain, "vm", &defined, &roots(&plain)),
+            context_salt(build, &plain, "vm", &defined, &roots(&plain)),
             "a declared variable moves the salt"
         );
         let other_root = salt_config_dir("other-root", None);
         assert_ne!(
             base,
-            context_salt(&other_root, "vm", &FxHashMap::default(), &roots(&plain)),
+            context_salt(
+                build,
+                &other_root,
+                "vm",
+                &FxHashMap::default(),
+                &roots(&plain)
+            ),
             "the context root moves the salt"
         );
 
         let options = salt_config_dir("options", Some("linter:\n  rules:\n    - avoid_print\n"));
-        let with_options = context_salt(&options, "vm", &FxHashMap::default(), &roots(&options));
+        let with_options =
+            context_salt(build, &options, "vm", &FxHashMap::default(), &roots(&options));
         assert_ne!(base, with_options, "located options content moves the salt");
         // The *content* (not the root path) is the folded dimension:
         // rewriting the same file in place moves the digest.
@@ -1741,8 +1796,61 @@ mod tests {
         .expect("rewrite options");
         assert_ne!(
             with_options,
-            context_salt(&options, "vm", &FxHashMap::default(), &roots(&options)),
+            context_salt(build, &options, "vm", &FxHashMap::default(), &roots(&options)),
             "an options edit moves the salt"
+        );
+    }
+
+    /// #3113's pin at the cache-key builder: the persisted-facts generation
+    /// never serves across analyzer builds. A generation saved under this
+    /// process's real header loads under its own header and misses under a
+    /// header that differs only in the context salt — the dimension the
+    /// analyzer build folds into, so a rebuilt or upgraded binary (same
+    /// workspace, same SDK, same content, same `FACTS_SEMANTIC_VERSION`)
+    /// takes the whole-generation miss and recomputes instead of replaying
+    /// the previous build's baked rows.
+    #[test]
+    fn a_generation_never_loads_across_analyzer_builds() {
+        let root = bare_workspace("build-fork");
+        let mut engine = bare_engine(&root);
+        engine.set_content(&root.join("lib/main.dart"), b"void main() {}\n");
+        engine.apply_pending(&mut |_| {});
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snapshot_cache_dir()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open store");
+        let own = engine.snapshot_header();
+        assert_eq!(
+            engine.save_facts_snapshot(&store).expect("save"),
+            1,
+            "one entry for the one file"
+        );
+        assert!(
+            store.load::<PersistedFacts>(&own).is_some(),
+            "the saving build's header loads its generation"
+        );
+        let mut other_build = own.clone();
+        other_build.context_salt = other_build.context_salt.map(|byte| byte ^ 0xff);
+        assert_ne!(
+            other_build.context_salt, own.context_salt,
+            "the foreign build's salt differs by construction"
+        );
+        assert!(
+            store.load::<PersistedFacts>(&other_build).is_none(),
+            "another analyzer build never loads this generation — the #3113 \
+             stale replay (a warm generation surviving an engine rebuild)"
+        );
+    }
+
+    /// The analyzer build identity itself: stable within the process (one
+    /// read, memoized) and content-derived — two calls agree byte-for-byte.
+    #[test]
+    fn analyzer_build_is_stable_within_a_process() {
+        assert_eq!(
+            analyzer_build(),
+            analyzer_build(),
+            "the executable's bytes cannot change under the running process"
         );
     }
 

@@ -198,6 +198,15 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// capture-behavior fork lane); the bump invalidates such snapshots and
 /// forces re-capture. The fold moves on the shape lane, so
 /// `SIGNATURE_VERSION` stays 13.
+/// v24: `PersistedAugTarget` carries the constructor head's `errorRange`
+/// (`head_range`, #3201's column). The column entered the tree WITHOUT
+/// its bump (the v15/v20 retroactive posture — the engine-side shape
+/// probe and this history entry are the missing half, landed with #3113):
+/// a pre-column payload decodes head-range-less, so a warm start would
+/// drop the head anchor the `factory_without_body` chain walk reads. The
+/// populated-elements probe now carries a head range, so the next
+/// encoding edit in that subtree moves bytes again. The fold moves on
+/// the shape lane, so `SIGNATURE_VERSION` stays 13.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -216,7 +225,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 23;
+const FACTS_SHAPE_VERSION: u32 = 24;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with
