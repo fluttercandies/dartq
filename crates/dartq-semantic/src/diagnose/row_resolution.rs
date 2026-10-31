@@ -813,27 +813,57 @@ impl<'a> Engine<'a> {
     /// the instantiated SEND result, never the raw schema a bare
     /// `return_ty` read would leak.
     /// An object-pattern shorthand binder's declared type
-    /// (`Head(:var x)`): the getter's declared return on the head, bare
-    /// named faces only — the oracle's `resolveObjectPatternPropertyGet`
-    /// types the bound variable from the property. A parametric return
-    /// (the boundary's argument projection is not engaged here), an
-    /// unresolved getter, and a non-accessor member answer `None` (the
-    /// under-report direction: the binder keeps the raw unknown).
+    /// (`Head(:var x)`): the getter's declared return on the head — the
+    /// oracle's `resolveObjectPatternPropertyGet` types the bound variable
+    /// from the property. The head instantiates to bounds when it spells
+    /// no arguments (`Square` over `Square<T extends MetricUnits>` reads
+    /// `Square<MetricUnits>` — the iterable element's own face), and the
+    /// member's return substitutes through that environment (`Unit<T>`
+    /// answers `Unit<MetricUnits>`). A parametric return whose environment
+    /// cannot substitute (a foreign or unresolvable face), an unresolved
+    /// getter, and a non-accessor member answer `None` — the under-report
+    /// direction: the binder keeps the raw unknown.
     pub(crate) fn object_pattern_binder_ty(&self, head: StringId, getter: StringId) -> Option<Ty> {
-        match self.walk_members(head, getter) {
-            Walk::Found(entry)
-                if matches!(entry.kind, MemberKind::Getter | MemberKind::Field)
-                    && !entry.is_static =>
-            {
-                match Self::member_result_ty(&entry) {
-                    Ty::Named { args, .. } if args == ArgListId::EMPTY => {
-                        Some(Self::member_result_ty(&entry))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
+        let Walk::Found(entry) = self.walk_members(head, getter) else {
+            return None;
+        };
+        if !matches!(entry.kind, MemberKind::Getter | MemberKind::Field) || entry.is_static {
+            return None;
         }
+        let result = Self::member_result_ty(&entry);
+        // The bare head resolves: no free parameters, no substitution.
+        let Ty::Named { args, .. } = &result else {
+            return Some(result);
+        };
+        if *args == ArgListId::EMPTY {
+            return Some(result);
+        }
+        // The receiver's instantiate-to-bounds face (`Square` over
+        // `Square<T extends MetricUnits>`) carries the written arguments —
+        // zip the head's declared parameters against them for the
+        // substitution map.
+        let instantiated = self.instantiated_head_ty(Ty::named(head));
+        let Ty::Named {
+            args: inst_args, ..
+        } = &instantiated
+        else {
+            return None;
+        };
+        if *inst_args == ArgListId::EMPTY {
+            return None;
+        }
+        let params = self.bounds.container_params(head)?;
+        let inst_args = self.boundary.pool().get(*inst_args).to_vec();
+        if params.len() != inst_args.len() {
+            return None;
+        }
+        let env: FxHashMap<StringId, Ty> = params
+            .iter()
+            .zip(inst_args.iter())
+            .map(|((param, ..), ty)| (*param, *ty))
+            .collect();
+        let substituted = self.substitute_ty(result, &env);
+        (substituted != result && substituted != Ty::UNKNOWN).then_some(substituted)
     }
 
     /// The shared re-bind direction gate: only a NARROWING face is a

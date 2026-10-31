@@ -104,20 +104,52 @@ impl DiagnoseListener<'_> {
     /// resolves on `Object`).
     fn relational_pattern_operand(&self, operator: Token) -> Option<(Ty, String)> {
         let engine = &self.engine;
-        if !engine
+        let all_logical = engine
             .switch
             .pattern_stack
             .iter()
             .skip(1)
-            .all(|frame| frame.binary.is_some())
-        {
-            return None;
-        }
+            .all(|frame| frame.binary.is_some());
         let scrutinee = engine
             .switch
             .switches
             .last()
             .map_or(Ty::Unknown, |ctx| ctx.scrutinee);
+        // The rest-element's sub-pattern (`case [...< 0]`) is the one
+        // non-logical nest whose matched type is still computable: it is
+        // the list the rest collects into — `List<E>` of the scrutinee's
+        // element type — never a property column (upstream
+        // `RestPatternElement`'s sub-pattern matched type,
+        // type_analyzer.dart's list-pattern element walk). The `...`
+        // marker is the token directly before the operator in source —
+        // inside a pattern it only ever spells a rest element, so a
+        // `...` immediately ahead of the relational (modulo trivia) names
+        // this shape exactly and admits it through the logical-only gate.
+        let scrutinee = if all_logical {
+            scrutinee
+        } else {
+            let bytes = engine.source.as_bytes();
+            let mut cursor = operator.range.offset as usize;
+            while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                cursor -= 1;
+            }
+            if cursor < 3 || &bytes[cursor - 3..cursor] != b"..." {
+                return None;
+            }
+            // The rest's own list: `List<E>` where `E` is the scrutinee's
+            // element argument (an `Iterable`-face's written first arg), or
+            // `List<dynamic>` when the scrutinee hands no decidable element
+            // (a `dynamic`/unknown matched value — the oracle's
+            // `List<dynamic>` row on `void f(x)`).
+            let element = match engine.fold_alias_ty(scrutinee) {
+                Ty::Named { args, .. } if args != crate::model::ArgListId::EMPTY => {
+                    engine.boundary.pool().get(args).first().copied().unwrap_or(Ty::Dynamic)
+                }
+                _ => Ty::Dynamic,
+            };
+            let list = engine.intern("List");
+            engine.boundary.args.borrow_mut().named(list, false, &[element])
+        };
         let op_text = engine.text_of(operator)?.to_owned();
         if op_text == "==" || op_text == "!=" {
             return None;
@@ -4873,8 +4905,52 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.null_cmp_groups.push((mark, operator.range));
         }
         if USER_OPERATORS.contains(&text) {
-            let op = engine.intern(text);
-            engine.mark_operator(op, operator.range);
+            // `>>>` / `>>>=` re-glue under `no-triple-shift` (`@dart=2.12`):
+            // the scanner splits `>>>` into `>>`+`>` and `>>>=` into
+            // `>>=`+`>`, and the parser does NOT re-glue (upstream Dart SDK
+            // source, pkg/front_end `handleExperimentNotEnabled`). The
+            // oracle's `undefined_operator '>>>'` anchors at the `>>`/`>>=`
+            // position len 0 — the synthetic re-glued token's range. The
+            // `>`'s own `mark_operator` is a no-op on an already-marked
+            // row (the `_ => {}` arm keeps the `>>`/`>>=` consult), so the
+            // re-glue rewrites the operand's intent to the oracle's
+            // spelling. Byte-adjacent only: a spaced `>> >` is two real
+            // operators.
+            let reglue = if text == ">"
+                && let Some(prev) = (operator.id as usize)
+                    .checked_sub(1)
+                    .and_then(|i| engine.tokens.get(i))
+                && matches!(
+                    prev.kind,
+                    dartq_scanner::TokenKind::GtGt | dartq_scanner::TokenKind::GtGtEq
+                )
+                && prev.byte_offset + prev.byte_len
+                    == engine.byte_of(operator.range.offset) as u32
+            {
+                Some(prev.utf16_offset)
+            } else {
+                None
+            };
+            if let Some(offset) = reglue {
+                let op = engine.intern(">>>");
+                let range = SourceRange { offset, length: 0 };
+                // The operand is the last non-TypeUse row — the `>>`
+                // left operand (`Intent::Operator(">>")` from the `>>`'s
+                // own mark) or the `>>=`'s compound face (`ReadWrite`
+                // from `mark_assignment`). Rewrite whichever intent the
+                // re-glued `>>>` supersedes.
+                if let Some(row) = engine
+                    .rows
+                    .iter_mut()
+                    .rev()
+                    .find(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+                {
+                    row.intent = Intent::Operator(op, range);
+                }
+            } else {
+                let op = engine.intern(text);
+                engine.mark_operator(op, operator.range);
+            }
         }
     }
 
