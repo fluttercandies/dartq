@@ -1234,6 +1234,11 @@ pub fn fold_unit_with_ops<'t>(
             // down, exactly like `type_analyzer_options.dart:20` wires
             // `soundFlowAnalysisEnabled` upstream).
             flow.set_sound_flow(features.sound_flow_analysis);
+            // The `wildcard-variables` posture (`_wildCardVariablesEnabled`
+            // — the same library channel `is_wildcard` reads): a pre-3.7
+            // unit's `late var _ = e` keeps `_` an ordinary name and the
+            // initializer stays live.
+            flow.set_wildcard_variables(class_modifiers.wildcards_enabled(lib));
             flow
         },
         pending_exit: None,
@@ -6047,3 +6052,12 @@ mod ticket_3144_tests;
 /// written-entry anchors.
 #[cfg(test)]
 mod ticket_3161_tests;
+
+/// The #3182 pins: `dead_code`'s three misc faces — the `_`-named local
+/// function declaration (feature-gated), the Never-operand `as`-cast tail
+/// inside an initializer (anchored at the cast-type head), and the
+/// `late var _ = e` initializer row (upstream
+/// `dead_code_late_wildcard_variable_initializer`, shared `dead_code`
+/// name, same feature gate).
+#[cfg(test)]
+mod ticket_3182_tests;

@@ -352,6 +352,13 @@ pub struct Flow<'t> {
     /// dead code). Consumed by the next `begin_variable_initializer` and
     /// cleared by a declarator without one.
     wildcard_declarator: bool,
+    /// The unit's `wildcard-variables` posture (official
+    /// `_wildCardVariablesEnabled` — `library.featureSet.isEnabled(
+    /// Feature.wildcard_variables)`, dead_code_verifier.dart:119-124): a
+    /// `// @dart = 3.4` unit treats a lone `_` as an ordinary name and the
+    /// `late var _ = e` initializer stays live. The consumer sets it
+    /// through [`Flow::set_wildcard_variables`] before the parse.
+    wildcard_variables: bool,
     /// Open variable initializers' `late`-wildcard starts, one per
     /// `begin_variable_initializer` (`None` for every declarator that is
     /// not the wildcard, so a nested declaration pops without emitting —
@@ -450,6 +457,7 @@ impl<'t> Flow<'t> {
             initializer_world: 0,
             decl_late: false,
             wildcard_declarator: false,
+            wildcard_variables: true,
             wildcard_inits: Vec::new(),
             init_starts: Vec::new(),
             facts: Vec::new(),
@@ -953,6 +961,17 @@ impl<'t> Flow<'t> {
     /// keeps every sound-only fold armed.
     pub fn set_sound_flow(&mut self, sound_flow: bool) {
         self.sound_flow = sound_flow;
+    }
+
+    /// Sets the unit's `wildcard-variables` posture (the official
+    /// `_wildCardVariablesEnabled` — `library.featureSet.isEnabled(
+    /// Feature.wildcard_variables)`; a `// @dart = 3.4` library keeps a
+    /// lone `_` an ordinary name, so `late var _ = e`'s initializer is
+    /// live code and its `dead_code` row stands down). `true` (the
+    /// construction default, the modern shipped posture) keeps the row
+    /// armed until a pre-3.7 library's posture lands.
+    pub fn set_wildcard_variables(&mut self, wildcard_variables: bool) {
+        self.wildcard_variables = wildcard_variables;
     }
 
     /// Executables of this unit whose replay exhausted the step budget and
@@ -1856,7 +1875,8 @@ impl ParserListener for Flow<'_> {
         // come through this hook (they open through
         // `begin_field_initializer`), which is exactly upstream's
         // `LocalVariableElement` restriction.
-        self.wildcard_declarator = self.decl_late && self.name_lexeme(name) == "_";
+        self.wildcard_declarator =
+            self.decl_late && self.wildcard_variables && self.name_lexeme(name) == "_";
         self.record(Ev::InitializedIdent { name, token });
     }
 
