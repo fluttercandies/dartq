@@ -172,10 +172,7 @@ impl<'a> Engine<'a> {
                 if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
                     return None;
                 }
-                Some(self.literal_arg_leaf(
-                    name,
-                    self.written_nullable_suffix(name_range.end()),
-                ))
+                Some(self.literal_arg_leaf(name, self.written_nullable_suffix(name_range.end())))
             })
             .collect::<Option<Vec<_>>>()?;
         let (set, map) = (self.collection_heads[1], self.collection_heads[2]);
@@ -2488,6 +2485,160 @@ impl<'a> Engine<'a> {
         span
     }
 
+    /// The right-hand side's result row: the last non-`TypeUse`,
+    /// non-interpolation row strictly after `offset`. Every fold pushes
+    /// the outermost expression's result last — a member merge leaves the
+    /// member row, a cascade its target-typed value stand-in, a
+    /// parenthesized group its own row, a literal/operator fold its value
+    /// row — so a multi-row window resolves to its tail exactly like the
+    /// single-row one resolves to its only entry.
+    fn rhs_result_row(&self, offset: u32) -> Option<&Row> {
+        self.rows
+            .iter()
+            .rev()
+            .filter(|row| row.range.offset > offset)
+            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            .find(|row| !self.interpolation_child_rows.contains(&row.range.offset))
+    }
+
+    /// The two operand rows of a `??` or conditional tail ending at `last`:
+    /// rows `[.., left, last]` where the operator tokens sit between the
+    /// left row's end and `last`'s start. Returns `(left, is_if_null)` —
+    /// `??` joins `LUB(nonNull(left), last)`, `?:` joins `LUB(then, last)`.
+    /// `None` for every other neighborhood (a single-operand tail, a
+    /// nested composite whose operands the tail row does not pair with).
+    fn binary_join_operands<'r>(&self, last: &'r Row) -> Option<(&'r Row, bool)> {
+        let index = self.rows.iter().rposition(|row| std::ptr::eq(row, last))?;
+        let left = self.rows[..index]
+            .iter()
+            .rev()
+            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            .find(|row| !self.interpolation_child_rows.contains(&row.range.offset))?;
+        let toks = self.tokens.as_slice();
+        let lo = toks.partition_point(|t| t.utf16_offset < left.range.end());
+        let hi = toks.partition_point(|t| t.utf16_offset < last.range.offset);
+        let mut colon = false;
+        let mut ifnull = false;
+        for token in &toks[lo..hi] {
+            match token.kind {
+                dartq_scanner::TokenKind::Colon => colon = true,
+                dartq_scanner::TokenKind::QuestionQuestion => ifnull = true,
+                _ => {}
+            }
+        }
+        if ifnull {
+            return Some((left, true));
+        }
+        if !colon {
+            return None;
+        }
+        // A `:` between the operands is a conditional's else marker only
+        // when its matching `?` precedes the left row (named-argument
+        // labels, map-literal pairs, and switch-case colons pair no `?`).
+        let before = self.rows[..index]
+            .iter()
+            .rev()
+            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
+            .nth(1)
+            .map_or(0, |row| row.range.end());
+        let lo = toks.partition_point(|t| t.utf16_offset < before);
+        toks[lo..]
+            .iter()
+            .take_while(|t| t.utf16_offset < left.range.offset)
+            .any(|t| t.kind == dartq_scanner::TokenKind::Question)
+            .then_some((left, false))
+    }
+
+    /// The join of two operand types for a `??`/`?:` tail — upstream
+    /// answers `leastUpperBound` (`resolveIfNull` non-nulls the left
+    /// first). The name lattice decides the same-head and declared-edge
+    /// pairs (the join is then the supertype), `Null` legs join the
+    /// nullable form of the other, and everything else keeps the right
+    /// operand's face — the under-report direction (a shared-interface
+    /// LUB this model cannot spell stays the operand's own type, never a
+    /// false `Object` verdict).
+    fn join_operand_ty(&self, left: Ty, right: Ty, non_null_left: bool) -> Ty {
+        let left = if non_null_left {
+            Self::non_null_form(left)
+        } else {
+            left
+        };
+        match (left, right) {
+            (Ty::Null, other) | (other, Ty::Null) => Self::nullable_form(other),
+            (
+                Ty::Named {
+                    name: l,
+                    nullable: ln,
+                    args: la,
+                },
+                Ty::Named {
+                    name: r,
+                    nullable: rn,
+                    args: ra,
+                },
+            ) if ln == rn => {
+                if l == r {
+                    Ty::Named {
+                        name: l,
+                        nullable: ln,
+                        args: if la == ra { la } else { ra },
+                    }
+                } else {
+                    let world = self.name_world();
+                    if world.named_sub(r, l) {
+                        Ty::Named {
+                            name: l,
+                            nullable: ln,
+                            args: la,
+                        }
+                    } else if world.named_sub(l, r) {
+                        Ty::Named {
+                            name: r,
+                            nullable: rn,
+                            args: ra,
+                        }
+                    } else {
+                        right
+                    }
+                }
+            }
+            _ => right,
+        }
+    }
+
+    /// The right-hand expression's static type from its result `row`:
+    /// [`Self::expression_row_ty`] first, then the faces the row model
+    /// leaves uncaptured at parse time — a member read on a creation
+    /// receiver (the merge's declared-type write answers `Typed`
+    /// receivers only), a bare creation head (an unsolved `C()` folds
+    /// `Unknown` where the oracle's `staticType` is the instantiated
+    /// container), and a `??`/`?:` tail (the join of its two operand
+    /// rows). Everything unresolved keeps the under-report `Unknown`.
+    fn rhs_expression_ty(&self, row: &Row) -> Ty {
+        let mut ty = self.expression_row_ty(row);
+        if ty == Ty::UNKNOWN {
+            ty = match &row.shape {
+                RowShape::Member { .. } if row.intent != Intent::Invoke => {
+                    self.accessor_read_ty(row)
+                }
+                RowShape::Receiver(Receiver::Created { name, kind })
+                    if *kind != ContainerKind::Extension =>
+                {
+                    self.instantiated_head_ty(Ty::named(*name))
+                }
+                _ => Ty::UNKNOWN,
+            };
+        }
+        if let Some((left, ifnull)) = self.binary_join_operands(row) {
+            let left_ty = self.rhs_expression_ty(left);
+            if left_ty != Ty::UNKNOWN && ty != Ty::UNKNOWN {
+                return self.join_operand_ty(left_ty, ty, ifnull);
+            }
+        }
+        ty
+    }
+
     /// The assignment check (`invalid_assignment`,
     /// `assignment_expression_resolver.dart:795`): a single-row right-hand
     /// side whose type the M1 facts know (`Null` or a captured declared
@@ -2529,30 +2680,37 @@ impl<'a> Engine<'a> {
         if matches!(self.rows[target].intent, Intent::Operator(..)) {
             return;
         }
-        // The right-hand side: exactly one row strictly after the operator
-        // (rows are pushed in source order, so the first post-operator row
-        // and the absence of a second decide without collecting).
-        // The single-RHS-row window: collect the candidate before any
-        // mutable member-walk call — the iterator borrows `self.rows`, and
-        // `assignment_target_ty` borrows `self` mutably.
-        let rhs_row = {
-            let mut rhs = self.rows[target + 1..]
+        // The right-hand side's result row — the fold discipline keeps the
+        // outermost expression's row last, so a multi-row window resolves
+        // to its tail (`x = B().x`'s member row, `x = a..m`'s
+        // target-typed value, `x = (a)`'s group row) exactly like the
+        // single-row window resolved to its only entry.
+        let Some(rhs_row) = self.rhs_result_row(limit).cloned() else {
+            return;
+        };
+        // The oracle anchors at the whole right-hand expression
+        // (`AssignmentExpression.rightHandSide`): a multi-row window spans
+        // its first operand row through the result row's end — `x = c ?
+        // a : b` marks the ternary, `x = a ?? b` the pair — while a
+        // single-row window is the row's own range exactly as before.
+        let range = {
+            let first = self
+                .rows
                 .iter()
-                .filter(|row| row.range.offset > limit);
-            let Some(row) = rhs.next() else {
-                return;
-            };
-            if rhs.next().is_some() {
-                return;
+                .filter(|row| row.range.offset > limit)
+                .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+                .find(|row| !self.interpolation_child_rows.contains(&row.range.offset))
+                .map_or(rhs_row.range.offset, |row| row.range.offset);
+            SourceRange {
+                offset: first,
+                length: rhs_row.range.end() - first,
             }
-            row.clone()
         };
         // A `?.`-merged right side reads the short-circuit's nullable
         // result (`x = a?.b` asks `B?` against `x`'s slot) —
         // [`Engine::expression_row_ty`] re-arms the `?` the merge could not
         // join onto the row's declared face.
-        let range = rhs_row.range;
-        let mut from = self.expression_row_ty(&rhs_row);
+        let mut from = self.rhs_expression_ty(&rhs_row);
         // The promoted read (upstream feeds the flow-promoted `valueType`
         // into `_checkForInvalidAssignment`, :694-703): an unpromoted
         // dynamic/unknown right side a flow fact promoted (`y is String`
@@ -2710,19 +2868,10 @@ impl<'a> Engine<'a> {
         if matches!(self.rows[target].intent, Intent::Operator(..)) {
             return;
         }
-        // The right-hand side: exactly one row strictly after the operator
-        // (the plain face's single-row window).
-        let rhs_row = {
-            let mut rhs = self.rows[target + 1..]
-                .iter()
-                .filter(|row| row.range.offset > limit);
-            let Some(row) = rhs.next() else {
-                return;
-            };
-            if rhs.next().is_some() {
-                return;
-            }
-            row.clone()
+        // The right-hand side's result row (the plain face's result-row
+        // window — the outermost expression's row is the tail).
+        let Some(rhs_row) = self.rhs_result_row(limit).cloned() else {
+            return;
         };
         let target_row = self.rows[target].clone();
         let read_ty = self.receiver_static_ty(&target_row);
@@ -2780,8 +2929,11 @@ impl<'a> Engine<'a> {
         if !self.written_ty_invalid(arg_ty)
             && self.argument_verdict(arg_ty, param, literal) == Some(false)
         {
-            let message = SemanticCode::ArgumentTypeNotAssignable
-                .message3(&self.ty_display(arg_ty), &self.ty_display(param), "");
+            let message = SemanticCode::ArgumentTypeNotAssignable.message3(
+                &self.ty_display(arg_ty),
+                &self.ty_display(param),
+                "",
+            );
             self.emit_message_with_correction(
                 SemanticCode::ArgumentTypeNotAssignable,
                 rhs_row.range,
@@ -2805,17 +2957,27 @@ impl<'a> Engine<'a> {
         let Some(mark) = self.init_mark else {
             return;
         };
-        if self.rows.len() != mark + 1 {
+        // The initializer's result row (the plain face's result-row
+        // window — the outermost expression's row is the tail; `U f =
+        // C()` / `String y = B().x` keep their callee/member rows ahead
+        // of it).
+        let Some(row) = self
+            .rows
+            .get(mark..)
+            .and_then(|tail| {
+                tail.iter().rev().find(|row| {
+                    !matches!(row.shape, RowShape::TypeUse(..))
+                        && !self.interpolation_child_rows.contains(&row.range.offset)
+                })
+            })
+            .cloned()
+        else {
             return;
-        }
-        // Cloned, not borrowed: the #2870 gate re-enters `&mut self` (the
-        // imprecise-literal emit) while the row's range still feeds the
-        // staging arms below.
-        let row = self.rows[mark].clone();
+        };
         let literal = Self::primitive_literal(&row, &self.members.primitive_ids);
         // A `?.`-merged initializer reads the short-circuit's nullable
         // result (`int x = a?.b` asks `B?` against `int`).
-        let mut from = self.expression_row_ty(&row);
+        let mut from = self.rhs_expression_ty(&row);
         // The promoted read: an unpromoted dynamic/unknown initializer a
         // flow fact promoted (`int x = y` under `y is String`) re-decides —
         // the oracle checks the promoted `valueType`
@@ -2898,6 +3060,75 @@ impl<'a> Engine<'a> {
             self.stage(StagedKind::Assignment, row.range, from, to, literal);
         }
         self.init_mark = None;
+    }
+
+    /// The default-value assignability face (`invalid_assignment`,
+    /// upstream `handleValuedFormalParameter`'s
+    /// `checkForInvalidAssignment(defaultValue, paramType)` —
+    /// error_verifier.dart: a `= e` default inside a formal list asks the
+    /// expression's static type against the formal's written `to`). The
+    /// expression's result row is the window's tail (the same
+    /// [`Self::rhs_result_row`] discipline — `f({int x = C().s})` reads
+    /// the member row); a const default promotes nothing, so a negative
+    /// verdict emits directly rather than staging (the flow face never
+    /// reaches a default's closed world). `None`/undecidable verdicts
+    /// keep the under-report direction.
+    pub(crate) fn check_default_value_assignable(&mut self, to: Ty) {
+        let Some(rhs_row) = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| {
+                !matches!(row.shape, RowShape::TypeUse(..))
+                    && !self.interpolation_child_rows.contains(&row.range.offset)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let range = rhs_row.range;
+        let mut from = self.rhs_expression_ty(&rhs_row);
+        if matches!(from, Ty::Unknown | Ty::Dynamic)
+            && let Some(promoted) = self.read_type_at(range)
+        {
+            from = promoted;
+        }
+        if from == Ty::Unknown
+            && let Some(sig) = self.tear_off_sig(&rhs_row)
+        {
+            from = self.fn_sig_ty(&sig);
+        }
+        if self.written_ty_invalid(from) {
+            return;
+        }
+        let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
+        let stashed = self.stashed_fn_pair(&rhs_row, None, from, to);
+        let verdict = stashed
+            .as_ref()
+            .map(|(verdict, ..)| *verdict)
+            .or_else(|| self.assignment_verdict(from, to, literal));
+        if verdict == Some(true) {
+            self.check_imprecise_int_literal(from, to, literal, range);
+        }
+        if verdict != Some(false) {
+            return;
+        }
+        let (from_text, to_text) = if let Some((_, from_sig, to_sig)) = stashed {
+            (self.fn_sig_display(&from_sig), self.fn_sig_display(&to_sig))
+        } else {
+            (self.ty_display(from), self.ty_display(to))
+        };
+        let range = self
+            .invocation_span(range)
+            .or_else(|| self.property_access_span(range))
+            .unwrap_or(range);
+        self.emit_non_promotion(
+            SemanticCode::InvalidAssignment,
+            range,
+            &from_text,
+            &to_text,
+            rhs_row.range.offset,
+        );
     }
 
     /// The stashed-signature function-subtype verdict for an assignment
@@ -3363,9 +3594,7 @@ impl<'a> Engine<'a> {
                 // formal or a bound-substituted alias slot, which is why
                 // [`Engine::assignable`] restricts its own param detection
                 // to the live sets.
-                Ty::Named { name: to_name, .. }
-                    if self.return_target_is_type_param(to_name) =>
-                {
+                Ty::Named { name: to_name, .. } if self.return_target_is_type_param(to_name) => {
                     self.return_param_source_verdict(from, to)
                 }
                 _ => match from {
@@ -3439,11 +3668,9 @@ impl<'a> Engine<'a> {
     /// take the interface refusal.
     fn return_param_source_verdict(&self, from: Ty, to: Ty) -> Option<bool> {
         match from {
-            Ty::Named { name: from_name, .. }
-                if self.return_target_is_type_param(from_name) =>
-            {
-                None
-            }
+            Ty::Named {
+                name: from_name, ..
+            } if self.return_target_is_type_param(from_name) => None,
             Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
             _ => self.assignable(from, to, false),
         }
@@ -3502,12 +3729,14 @@ impl<'a> Engine<'a> {
         verdict.or_else(|| self.declared_subtype_negative(&from, &t_v))
     }
 
-    /// A single-row expression's type since `mark`, for the body/return
-    /// checks, with the row's primitive-literal flag (the conversion's
-    /// source-side fact); `None` when the expression is compound. A folded
-    /// creation reads the created container (`C()`'s row is the fold's
-    /// sentinel, its container names the static type — the factory return
-    /// face `factory D.new() => C();` asks the nominal question).
+    /// An expression's type since `mark`, for the body/return checks, with
+    /// the result row's primitive-literal flag (the conversion's
+    /// source-side fact); `None` when the window is empty. The window's
+    /// result row is its tail — the fold discipline pushes the outermost
+    /// expression's row last. A folded creation reads the created
+    /// container (`C()`'s row is the fold's sentinel, its container names
+    /// the static type — the factory return face `factory D.new() => C();`
+    /// asks the nominal question).
     pub(crate) fn single_row_since(&self, mark: usize) -> Option<(Ty, bool, SourceRange)> {
         // `TypeUse` rows are type-annotation residue, not value rows of the
         // expression (`operand_row` already skips them from the tail): a
@@ -3519,16 +3748,23 @@ impl<'a> Engine<'a> {
         // literal's completion row, and the oracle's expression is the
         // `StringInterpolation` node — its type is the literal's, so the
         // child reads never answer the enclosing check.
+        // The window's result row is its tail — the fold discipline pushes
+        // the outermost expression's row last (a member merge leaves the
+        // member row, a cascade its target-typed value stand-in, a
+        // parenthesized group its own row), so a multi-row window answers
+        // the expression's static type through the same single-row arms
+        // applied to that tail (`return B().x` asks the member face,
+        // `return a ?? b` the join's right operand — the under-report
+        // direction keeps the composite's own type when the arms cannot
+        // spell it).
         let row = self
             .rows
             .iter()
             .skip(mark)
             .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
             .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
-            .collect::<Vec<_>>();
-        let &[row] = row.as_slice() else {
-            return None;
-        };
+            .next_back()
+            .cloned()?;
         let ty = if row.ty == Ty::Never {
             // The throw retype (`handle_throw_expression`): the
             // expression's static type is `Never` regardless of the
@@ -3566,7 +3802,8 @@ impl<'a> Engine<'a> {
                     // its to-bounds defaults, which reports a written
                     // creation against its own instantiation).
                     self.creation_row_ty(*name, false, row.range.offset)
-                        .unwrap_or(row.ty)
+                        .filter(|ty| *ty != Ty::UNKNOWN)
+                        .unwrap_or_else(|| self.instantiated_head_ty(Ty::named(*name)))
                 }
                 _ => row.ty,
             }
@@ -3903,14 +4140,18 @@ impl<'a> Engine<'a> {
         // decl-table predicate decides param-ness in BOTH passes — the
         // staged row and the teardown re-decision agree, which the live
         // frame sets alone cannot (empty once the frames pop).
-        if let Ty::Named { name: to_name, nullable: to_nullable, .. } = to
+        if let Ty::Named {
+            name: to_name,
+            nullable: to_nullable,
+            ..
+        } = to
             && self.declared_head_is_type_param(to_name)
         {
             return match from {
                 Ty::Null => Some(to_nullable),
-                Ty::Named { name: from_name, .. } if from_name == to_name => {
-                    self.assignable(from, to, false)
-                }
+                Ty::Named {
+                    name: from_name, ..
+                } if from_name == to_name => self.assignable(from, to, false),
                 Ty::Named { .. } | Ty::Record { .. } | Ty::Function { .. } => Some(false),
                 _ => self.assignable(from, to, false),
             };
@@ -4200,8 +4441,8 @@ impl<'a> Engine<'a> {
         // ([`crate::switch_tracker::enum_bound_scrutinee`]); judging the
         // verdict, the row text, and the deferred re-decision over it is the
         // solved face. Any other scrutinee keeps its own type.
-        let scrutinee = crate::switch_tracker::enum_bound_scrutinee(&world, &ctx)
-            .unwrap_or(ctx.scrutinee);
+        let scrutinee =
+            crate::switch_tracker::enum_bound_scrutinee(&world, &ctx).unwrap_or(ctx.scrutinee);
         let value = NameTy::from_semantic(scrutinee);
         for (i, c) in ctx.cases.iter().enumerate() {}
         let cases: Vec<Case<NameTy>> = ctx
@@ -4389,8 +4630,7 @@ impl<'a> Engine<'a> {
                 // teardown keeps the unrefined verdict verbatim when no
                 // refinement stands. Anything else (a clause-less switch,
                 // an unnameable scrutinee) keeps today's immediate face.
-                if (Self::is_nullable_ty(scrutinee)
-                    || matches!(scrutinee, Ty::Named { .. }))
+                if (Self::is_nullable_ty(scrutinee) || matches!(scrutinee, Ty::Named { .. }))
                     && let Some(first) = ctx.cases.first()
                 {
                     self.pending_switch_coverings.push(PendingSwitchCovering {
@@ -4474,8 +4714,11 @@ impl<'a> Engine<'a> {
             Exhaustiveness::Exhaustive => None,
             Exhaustiveness::NonExhaustive(witnesses) => {
                 let first = witnesses.first();
-                let ty_text = self
-                    .ty_display(matched.filter(|_| matched_decides).unwrap_or(pending.scrutinee));
+                let ty_text = self.ty_display(
+                    matched
+                        .filter(|_| matched_decides)
+                        .unwrap_or(pending.scrutinee),
+                );
                 let unmatched = first.map_or(String::new(), |w: &EngineWitness<NameTy>| {
                     w.as_witness(&world)
                 });
@@ -4650,6 +4893,23 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // The shared-parameter instantiation `relateTypeParameters` ran:
+        // the source's own type parameters spell the TARGET's parameters
+        // by position inside its return and formal faces — `T
+        // Function<T>(T)` against `U Function<U>(U)` compares `U` to `U`
+        // (reflexive), never the two unrelated heads the name lattice
+        // would reject. Empty when either side is non-generic (the count
+        // arm already decided the mixed shape).
+        let param_unify: FxHashMap<StringId, Ty> = from
+            .params
+            .iter()
+            .zip(to.params.iter())
+            .filter(|((from_name, _), (to_name, _))| {
+                *from_name != StringId::NONE && *to_name != StringId::NONE
+            })
+            .map(|((from_name, _), (to_name, _))| (*from_name, Ty::named(*to_name)))
+            .collect();
+        let from_return = self.subst_ty(from.return_ty, &param_unify);
         // A target return face naming a type this file cannot spell (a
         // generic callee's own inference parameter — `then<R>`'s
         // `FutureOr<R> Function(T)`) is an inference-site constraint, not
@@ -4659,7 +4919,7 @@ impl<'a> Engine<'a> {
         // name-level model cannot solve it, and the return-covariance
         // check stays undecided — the under-report direction.
         if to.return_ty != Ty::Void && !self.return_face_undecidable(to.return_ty) {
-            match self.slot_subtype(from.return_ty, to.return_ty) {
+            match self.slot_subtype(from_return, to.return_ty) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -4672,7 +4932,7 @@ impl<'a> Engine<'a> {
             return Some(false);
         }
         for (index, to_ty) in to.positional.iter().enumerate() {
-            match self.slot_subtype(*to_ty, from.positional[index]) {
+            match self.slot_subtype(*to_ty, self.subst_ty(from.positional[index], &param_unify)) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -4690,7 +4950,7 @@ impl<'a> Engine<'a> {
             if *from_required && !to_required {
                 return Some(false);
             }
-            match self.slot_subtype(*to_ty, *from_ty) {
+            match self.slot_subtype(*to_ty, self.subst_ty(*from_ty, &param_unify)) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -4880,8 +5140,7 @@ impl<'a> Engine<'a> {
             return None;
         }
         let rhs = self.alias_rhs_any(name)?;
-        let map: FxHashMap<StringId, Ty> =
-            param_names.iter().copied().zip(written).collect();
+        let map: FxHashMap<StringId, Ty> = param_names.iter().copied().zip(written).collect();
         Some(self.subst_ty(rhs, &map))
     }
 
@@ -5282,13 +5541,41 @@ impl<'a> Engine<'a> {
             if self.members.primitive_ids.contains(&from_name) {
                 return Some(false);
             }
-            return self
+            if self
                 .implicit_call_face(Ty::Named {
                     name: from_name,
                     nullable: false,
                     args: from_args,
                 })
-                .map(|_| true);
+                .is_some()
+            {
+                return Some(true);
+            }
+            // A resolvable container with provably no `call` member
+            // rejects: upstream's `callMethodType` is null there, so the
+            // arm falls through to `false` (type_system.dart:910-915 —
+            // `Function f = C()` reports where `C` declares no `call`).
+            // Only the EMPTY-args read proves the face — an instantiated
+            // source (`C<int>()`) substitutes its arguments into the
+            // member lookup [`Engine::implicit_call_face`] cannot spell,
+            // so a miss there is not the no-`call` fact. An UNRESOLVABLE
+            // head (a foreign spelling the index does not carry, or the
+            // derived-ask residue this slot also receives) keeps the
+            // under-report `None` — a bare rejection would report
+            // inference residue the oracle never asks about.
+            if from_args != ArgListId::EMPTY {
+                return None;
+            }
+            return resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                from_name,
+            )
+            .is_some()
+            .then_some(false);
         }
         let (
             Ty::Named {
@@ -5324,8 +5611,8 @@ impl<'a> Engine<'a> {
         // decides. The declared-return teardown carries its own param
         // detection (the staged `Return` re-decision — `filter_staged`),
         // where the target is provably the executable's declared return.
-        let to_is_param = self.type_params.contains(&to_name)
-            || self.pending_type_params.contains(&to_name);
+        let to_is_param =
+            self.type_params.contains(&to_name) || self.pending_type_params.contains(&to_name);
         if to_is_param {
             let from_is_param = self.type_params.contains(&from_name)
                 || self.pending_type_params.contains(&from_name);
@@ -5438,13 +5725,15 @@ impl<'a> Engine<'a> {
         }) else {
             return None;
         };
-        if !params.is_empty() {
-            // A generic `call` needs the inference the declared facts do
-            // not carry — the under-report direction.
-            return None;
-        }
+        // A generic `call`'s type parameters ride the signature —
+        // `acceptsFunctionType`'s `callMethodType` keeps them, and
+        // `isFunctionSubtypeOf`'s `relateTypeParameters` arm (the
+        // parameter-count + bound-equality ask [`Self::fn_sig_subtype`]
+        // runs first) decides the pair exactly like two generic function
+        // types. A target written without parameters rejects a generic
+        // source outright (the count arm).
         let call_sig = FnVarSig {
-            params: Box::default(),
+            params,
             required_positional: u16::try_from(
                 formals.positional.iter().filter(|f| f.required).count(),
             )
@@ -7007,3 +7296,11 @@ mod ticket_2946_tests;
 #[cfg(test)]
 #[path = "ticket_2967_tests.rs"]
 mod ticket_2967_tests;
+
+// The #3145 pins (the multi-row right-hand-side result window — every
+// `=`/initializer/return face reads the fold's tail row — plus the
+// callable-class acceptance and `relateTypeParameters`' unified-position
+// compare). Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3145_tests.rs"]
+mod ticket_3145_tests;
