@@ -795,6 +795,15 @@ pub(crate) struct NullShort {
     /// only when the first dead node sits INSIDE the chain, never for an
     /// interval opened before the receiver).
     pub recv_offset: u32,
+    /// A `?..` cascade head's context (opened at `CascadeBegin`): its end
+    /// is upstream's direct `nullAwareAccess_end()` join after the last
+    /// section (resolver.dart:2330), which never runs
+    /// `handleNullShortingFinished` — so NO `flowEnd` covers the interval
+    /// there and it survives to the enclosing statement's `;` (the
+    /// official `null?..=> 1;` row includes the `;`, expected 3:7|8). A
+    /// `?.`/`?[` selector short ends through `finishNullShorting` instead —
+    /// the chain-close emit stays gated on it.
+    pub cascade_head: bool,
 }
 
 /// The receiver-invalidation sweep over one state's property slots: the
@@ -968,6 +977,24 @@ impl DeadWindow {
     /// inner anchors, dead_code_verifier.dart:253-279).
     pub(crate) fn anchored_at_depth(&self, depth: usize) -> bool {
         self.depth == depth
+    }
+
+    /// The interval's row end so far — a ForParts-frozen `trim_end` wins
+    /// over the running statement end, the same read [`Self::extend`]
+    /// gates on.
+    pub(crate) fn effective_end(&self) -> u32 {
+        self.trim_end.unwrap_or(self.end)
+    }
+
+    /// The interval's anchor span (the first dead node's token).
+    pub(crate) fn anchor_span(&self) -> TokenSpan {
+        self.anchor
+    }
+
+    /// Whether the interval's row is reported by the as-cast tail face
+    /// instead (the emission-skipping poll — see the field's doc).
+    pub(crate) fn is_suppressed(&self) -> bool {
+        self.suppressed
     }
 
     /// Whether the interval's anchor starts at `offset` (the switch
@@ -2186,6 +2213,7 @@ impl<'o> Interp<'o> {
             exprs_depth: self.exprs.len(),
             dead_at_open: !self.reachable(),
             recv_offset,
+            cascade_head: false,
         });
     }
 
@@ -2276,6 +2304,7 @@ impl<'o> Interp<'o> {
     pub(crate) fn null_short_end(&mut self) -> Option<NullShort> {
         let short = self.null_shorts.pop()?;
         let close = short.dead_at_open
+            && !short.cascade_head
             && self.dead.as_ref().is_some_and(|window| {
                 !window.suppressed && window.anchor.range.offset > short.recv_offset
             });
@@ -2342,7 +2371,11 @@ impl<'o> Interp<'o> {
         let Some(short) = self.null_shorts.last_mut() else {
             return;
         };
-        if !short.dead_at_open {
+        // A `?..` cascade head's face has no `flowEnd` consumer upstream
+        // (its `nullAwareAccess_end` bypasses `handleNullShortingFinished`,
+        // resolver.dart:2330): the interval runs to the statement's `;`,
+        // never trimmed to a section end — `x?..m` and `x?..=> e` alike.
+        if !short.dead_at_open || short.cascade_head {
             return;
         }
         short.face_end = short.face_end.max(end);

@@ -12,6 +12,15 @@ use dartq_scanner::{ScanConfig, TokenTable};
 
 /// Dead-code facts of `source` as the exact source text they cover.
 fn dead_of(source: &str) -> Vec<String> {
+    dead_of_features(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ), source)
+}
+
+/// [`dead_of`] over a caller-supplied [`FeatureSet`] — the anonymous-methods
+/// cases opt the experiment in (`with_experiment`), every other pin keeps
+/// the plain 3.15 fold.
+fn dead_of_features(set: FeatureSet, source: &str) -> Vec<String> {
     let result = dartq_scanner::scan(
         source,
         ScanConfig {
@@ -22,9 +31,7 @@ fn dead_of(source: &str) -> Vec<String> {
     );
     assert!(result.diagnostics.is_empty(), "{source:?}");
     let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
-    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-        LanguageVersion::new(3, 15),
-    ));
+    let features = ParserFeatures::from_feature_set(set);
     let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
         tokens, source,
     ))));
@@ -46,6 +53,16 @@ fn dead_of(source: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The anonymous-methods experiment fold (`3.15 + anonymous-methods`) the
+/// experiment's eight oracle cases resolve under.
+fn dead_of_anonymous(source: &str) -> Vec<String> {
+    dead_of_features(
+        FeatureSet::for_language_version(LanguageVersion::new(3, 15))
+            .with_experiment(dartq_language::Feature::AnonymousMethods),
+        source,
+    )
 }
 
 #[test]
@@ -71,15 +88,74 @@ fn probe_dead_block_else() {
 }
 
 #[test]
-#[ignore = "anonymous-methods experiment syntax (`.=>`/`.(`/`?..=>`): 8 \
-            oracle cases gated on the experiment — the `.`-invoke send's \
-            ArgumentsBegin poll does not see the experimental shape; \
-            residual, dead_code_verifier.dart:317-318"]
 fn probe_never_anonymous_invoke() {
-    // `never.=> 1;` — oracle rows `.=> 1` (AnonymousMethodInvocation
-    // re-anchor at the operator, dead_code_verifier.dart:317-318).
-    let src = "void f() {\n  never.=> 1;\n}\nNever get never => throw 0;\n";
-    assert_eq!(dead_of(src), vec![".=> 1".to_string()]);
+    // `never.=> 1;` — oracle rows `.=> 1;` (the body is the first dead
+    // node; the close re-anchors at the operator —
+    // `parent is AnonymousMethodInvocation`,
+    // dead_code_verifier.dart:317-318 — test_plain_deadCode, 3:8|6).
+    // The getter leads: the fold's top-level capture reads backward
+    // declarations only (the same posture the #3170 property probes take).
+    let src = "Never get never => throw 0;\nvoid f() {\n  never.=> 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec![".=> 1;".to_string()]);
+}
+
+#[test]
+fn probe_never_anonymous_invoke_cascade() {
+    // `never..=> 1;` — the cascade-section twin rows `..=> 1;`
+    // (test_cascaded_deadCode, 3:8|7).
+    let src = "Never get never => throw 0;\nvoid f() {\n  never..=> 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec!["..=> 1;".to_string()]);
+}
+
+#[test]
+fn probe_never_anonymous_invoke_parameterized() {
+    // `never.(_) => 1;` — the parameterized face rows `.(_) => 1;`
+    // (test_parameterized_plain_deadCode, 3:8|10).
+    let src = "Never get never => throw 0;\nvoid f() {\n  never.(_) => 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec![".(_) => 1;".to_string()]);
+}
+
+#[test]
+fn probe_null_anonymous_invoke() {
+    // `null?.=> 1;` — the `?.` access path dies at open on the `Null`
+    // receiver (the member's own `_startNullAwareAccess`,
+    // resolver.dart:1977): the row re-anchors at the operator and ends at
+    // the member's own end — `?.=> 1`, `;` excluded
+    // (test_nullaware_deadCode, 3:7|6).
+    let src = "void f() {\n  null?.=> 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec!["?.=> 1".to_string()]);
+}
+
+#[test]
+fn probe_null_anonymous_invoke_parameterized() {
+    // `null?.(_) => 1;` — same `?.` face, `;` excluded
+    // (test_parameterized_nullaware_deadCode, 3:7|10).
+    let src = "void f() {\n  null?.(_) => 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec!["?.(_) => 1".to_string()]);
+}
+
+#[test]
+fn probe_null_anonymous_invoke_cascade() {
+    // `null?..=> 1;` — the `?..` head's short opens at `CascadeBegin`
+    // (test_nullawareCascaded_deadCode, 3:7|8).
+    let src = "void f() {\n  null?..=> 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec!["?..=> 1;".to_string()]);
+}
+
+#[test]
+fn probe_null_anonymous_invoke_parameterized_cascade() {
+    // `null?..(_) => 1;` —
+    // (test_parameterized_nullawareCascaded_deadCode, 3:7|12).
+    let src = "void f() {\n  null?..(_) => 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec!["?..(_) => 1;".to_string()]);
+}
+
+#[test]
+fn probe_never_anonymous_invoke_parameterized_cascade() {
+    // `never..(_) => 1;` —
+    // (test_parameterized_cascaded_deadCode, 3:8|11).
+    let src = "Never get never => throw 0;\nvoid f() {\n  never..(_) => 1;\n}\n";
+    assert_eq!(dead_of_anonymous(src), vec!["..(_) => 1;".to_string()]);
 }
 
 #[test]
@@ -88,7 +164,7 @@ fn probe_never_var_anonymous_invoke() {
     // local (the name-level feed the getter variant lacks — see the
     // record.rs top-level-capture residual).
     let src = "void f(Never never) {\n  never.=> 1;\n}\n";
-    let out = dead_of(src);
+    let out = dead_of_anonymous(src);
     eprintln!("anon-inv: {out:?}");
     assert!(!out.is_empty());
 }
@@ -310,20 +386,30 @@ fn probe_never_getter_via_final_var_stmt_after() {
 }
 
 #[test]
-#[ignore = "needs Lane B: the covering `flowEnd(VariableDeclaration)` — \
-            the top-level `VarDeclEnd` close lands the row end at `]`; \
-            the `4` anchor this lane owns is already emitted"]
 fn probe_list_literal_never_tail() {
     // `var x = [1, 2, f(), 4];` with a `Never f()` — the `4` anchors and
     // the row runs `4]` (the covering `flowEnd` is the top-level
     // VariableDeclaration, which ends at `]` —
     // test_topLevelVariable_initializer_listLiteral, expected 4:21|2).
-    // The `4` anchor itself is the literal-element open this lane owns;
-    // the declaration-level close is the `VarDeclEnd` face — Lane B.
     let src = "Never f() => throw 0;\nvar x = [1, 2, f(), 4];\n";
-    let out = dead_of(src);
-    eprintln!("list-tail: {out:?}");
-    assert_eq!(out, vec!["4]".to_string()]);
+    assert_eq!(dead_of(src), vec!["4]".to_string()]);
+}
+
+#[test]
+fn probe_list_literal_never_tail_named_type() {
+    // The annotated twin: `List<int> x = [...]` — the covering close is
+    // the same `flowEnd(VariableDeclaration)` at the declarator's
+    // `node.end`.
+    let src = "Never f() => throw 0;\nList<int> x = [1, 2, f(), 4];\n";
+    assert_eq!(dead_of(src), vec!["4]".to_string()]);
+}
+
+#[test]
+fn probe_list_literal_never_tail_final() {
+    // `final` keeps the same covering close (the `isTopLevel` gate spans
+    // `TopLevelVariableElement`, `final` included).
+    let src = "Never f() => throw 0;\nfinal x = [1, 2, f(), 4];\n";
+    assert_eq!(dead_of(src), vec!["4]".to_string()]);
 }
 
 #[test]

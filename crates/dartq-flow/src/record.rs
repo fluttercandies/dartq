@@ -261,6 +261,15 @@ pub struct Flow<'t> {
     /// now open (`begin_variables_declaration` .. `end_variables_declaration`);
     /// every declarator of the list reads it.
     top_decl: Option<TopVar>,
+    /// A unit-level variables declaration list is open
+    /// (`begin_variables_declaration` .. `end_variables_declaration`) —
+    /// the `isTopLevel` gate of the declarator's covering `flowEnd`
+    /// (variable_declaration_resolver.dart:45-46, :90-92): every unit-level
+    /// declarator carries it (`var`/`final`/typed alike — including the
+    /// untyped `var` the [`Flow::top_decl`] read face deliberately
+    /// skips). `end_variable_initializer` records [`Ev::DeclFlowEnd`]
+    /// under it.
+    top_decl_list: bool,
     /// The name token of the top-level declaration now open — a
     /// method/getter/setter (`TopLevelFunctionDeclaration` context) or a
     /// typedef (`TypedefDeclaration` context) — latched at
@@ -446,6 +455,7 @@ impl<'t> Flow<'t> {
             as_type_head: None,
             in_local_fn: false,
             top_decl: None,
+            top_decl_list: false,
             top_fn_name: None,
             top_ret_pending: false,
             top_ret: None,
@@ -1829,6 +1839,11 @@ impl ParserListener for Flow<'_> {
         // duplicate-definition error's territory, not the read face's).
         let header = self.top_last_type.take();
         if self.buffer.is_none() && self.container_depth == 0 {
+            // The unit-level list marker (the covering `flowEnd`'s
+            // `isTopLevel` — variable_declaration_resolver.dart:45-46):
+            // every declarator of the list reports through
+            // [`Ev::DeclFlowEnd`], typed or not.
+            self.top_decl_list = true;
             // An untyped `final`/`const` header still registers (with the
             // unknown face — its inferred static type is the type layer's
             // increment): the read otherwise resolves as an implicit-`this`
@@ -1853,6 +1868,7 @@ impl ParserListener for Flow<'_> {
     fn end_variables_declaration(&mut self, _count: usize, end: Option<Token>) {
         self.record(Ev::VarDeclEnd);
         self.top_decl = None;
+        self.top_decl_list = false;
         self.decl_late = false;
         self.wildcard_declarator = false;
         if let Some(end) = end {
@@ -1942,6 +1958,20 @@ impl ParserListener for Flow<'_> {
             });
         }
         self.record(Ev::InitializerEnd);
+        // A unit-level declarator's covering `flowEnd` (official
+        // `visitVariableDeclaration`'s isTopLevel arm,
+        // variable_declaration_resolver.dart:90-92): the declarator's
+        // `node.end` is its initializer's last token, so the row trims to
+        // `]`/`f()`/`1 + 2` — never the declaration's `;` (`var x =
+        // [1, 2, f(), 4]` reports `4]`). The event rides inside the
+        // initializer's own world (the `VarDeclEnd`/`StmtEnd` close is the
+        // enclosing list's, outside this buffer); local and field
+        // declarators fire no `flowEnd` upstream and record nothing here.
+        if self.top_decl_list
+            && let Some(end) = self.scan_expression_end(token.id + 1, None)
+        {
+            self.record(Ev::DeclFlowEnd { end });
+        }
         // Only the bracket that opened the world closes it: a nested
         // bracket's end must not fire `exec_end` mid-body and desync the
         // executable framing (see [`Flow::initializer_world`]).
@@ -3217,6 +3247,51 @@ impl ParserListener for Flow<'_> {
 
     fn handle_null_aware_member_begin(&mut self, _question: Token) {
         self.record(Ev::NullAwareMemberBegin);
+    }
+
+    fn begin_anonymous_method_invocation(&mut self, token: Token) {
+        // The anonymous-methods experiment's member open: `x.=> e`,
+        // `x.{ ... }`, `x.(p) => e`, and their `?.`/cascade-section
+        // twins. Upstream polls `node.body` after the target walks
+        // (`visitAnonymousMethodInvocation`'s `checkUnreachableNode`,
+        // resolver.dart:1963-1980); a dead access path makes the body
+        // the first dead node and the covering close re-anchors the row
+        // at the operator (`parent is AnonymousMethodInvocation`,
+        // dead_code_verifier.dart:317-318) — recording the punctuation
+        // IS the re-anchored anchor (`x.=> 1` rows `.=> 1;`, `x..=> 1`
+        // rows `..=> 1;`). A `?.` member fires no
+        // `handle_null_aware_member_begin` for this shape (the parser's
+        // anonymous-method arm skips the selector events), so the event
+        // carries the bit the replay needs to open the short itself —
+        // `null?.=> 1;` rows `?.=> 1;`. A `?..` head's short is
+        // `begin_cascade`'s own, already recorded.
+        let null_aware =
+            self.kind(token) == Some(dartq_scanner::TokenKind::QuestionPeriod);
+        self.record(Ev::AnonMethodBegin {
+            punct: token,
+            null_aware,
+        });
+    }
+
+    fn end_anonymous_method_invocation(
+        &mut self,
+        _begin: Token,
+        _function_definition: Option<Token>,
+        end: Token,
+        _is_expression: bool,
+    ) {
+        // The member's own end: the `?.` face's chain-end bound (upstream
+        // `flowEnd(expression)` at `finishNullShorting` ends the row at
+        // the member's last token — `null?.=> 1;` reports `?.=> 1`, the
+        // `;` excluded). For the `.`/`..`/`?..` faces no `flowEnd`
+        // covers the member upstream (a plain member never shorted; a
+        // `?..` head ends via the direct `nullAwareAccess_end`, which
+        // never runs `handleNullShortingFinished`) — the interp only
+        // applies the face to an open selector short, so their intervals
+        // keep running to the statement's `;`.
+        self.record(Ev::AnonMethodEnd {
+            end: end.range.end(),
+        });
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, _open: Token, close: Token) {

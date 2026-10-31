@@ -20,13 +20,29 @@ impl Interp<'_> {
     pub(crate) fn stmt_step(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> bool {
         // The wrapper arms fire at the statement's END (post-order): they
         // must observe the state the statement BEGAN in, so only the other
-        // arms refresh the snapshot.
+        // arms refresh the snapshot. The declaration-interior arms are
+        // likewise excluded: a declarator/initializer/formal event sits
+        // INSIDE its statement (`var x = a?.b, y = c`, `x?.(p) => e`), and
+        // refreshing the began-dead latch mid-statement would re-date a
+        // statement's own interior death to its begin — the post-order
+        // wrapper then re-anchors the body's `?.` row to the statement head
+        // (`null?.(p) => e;` must stay `?.(p) => e;`, the
+        // AnonymousMethodInvocation operator, dead_code_verifier.dart:317).
         let wrapper = matches!(
             ev,
             Ev::ExprStmt { .. }
                 | Ev::ReturnBegin { .. }
                 | Ev::YieldBegin { .. }
                 | Ev::PatternVarDeclStmt { .. }
+                | Ev::VarDeclBegin { .. }
+                | Ev::VarDeclEnd
+                | Ev::InitializedIdent { .. }
+                | Ev::NoInitializer
+                | Ev::InitializerBegin
+                | Ev::InitializerEnd
+                | Ev::DeclFlowEnd { .. }
+                | Ev::Formal { .. }
+                | Ev::LocalFnName { .. }
         );
         let handled = self.stmt_step_arm(ev, events, i, match_of);
         if handled && !wrapper && !self.collecting() {
@@ -1592,6 +1608,33 @@ impl Interp<'_> {
                         (const_feed, self.vars.get_mut(var as usize))
                     {
                         meta.const_bool = Some(value);
+                    }
+                }
+            }
+            Ev::DeclFlowEnd { end } => {
+                // The top-level declarator's covering `flowEnd`
+                // (variable_declaration_resolver.dart:90-92): the interval
+                // reports `firstDeadNode.offset .. node.end`, `node.end`
+                // being the initializer's last token — the declaration's
+                // `;` never joins the row (`var x = [1, 2, f(), 4]` reports
+                // `4]`). The event only exists inside a unit-level
+                // initializer world, and every anchor this world opened is
+                // contained by the declarator node — the official
+                // `_containsFirstDeadNode` check always passes. A live or
+                // interval-less world does nothing.
+                if let Some(window) = self.dead.take() {
+                    let anchor = window.anchor_span();
+                    let end = window.effective_end().max(*end);
+                    if end > anchor.range.offset && !window.is_suppressed() {
+                        self.emit(FlowFact::DeadCode {
+                            span: TokenSpan {
+                                id: anchor.id,
+                                range: dartq_source::SourceRange {
+                                    offset: anchor.range.offset,
+                                    length: end - anchor.range.offset,
+                                },
+                            },
+                        });
                     }
                 }
             }

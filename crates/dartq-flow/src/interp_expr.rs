@@ -2164,6 +2164,41 @@ impl Interp<'_> {
                 }
             }
             Ev::NullAwareMemberBegin => self.null_aware_access_open(),
+            Ev::AnonMethodBegin { punct, null_aware } => {
+                // The anonymous-method member's null-aware face: a bare
+                // `?.` member fires no `Ev::NullAwareMemberBegin` for this
+                // shape (the parser's anonymous-method arm skips the
+                // selector events), so the short opens here — official
+                // `_startNullAwareAccess(node.target)` inside
+                // `visitAnonymousMethodInvocation` (resolver.dart:1977). A
+                // `Null`/`Never` receiver kills the body path at open; a
+                // `?..` head's short is `CascadeBegin`'s, already open.
+                if *null_aware {
+                    self.null_aware_access_open();
+                }
+                // The body poll (official `checkUnreachableNode(node.body)`
+                // / `visitNode(parameters ?? node.body)`,
+                // resolver.dart:1963-1980): a dead access path makes the
+                // member body the first dead node, and the covering close
+                // re-anchors the row at the operator (`parent is
+                // AnonymousMethodInvocation`,
+                // dead_code_verifier.dart:317-318) — `punct` IS that
+                // operator, so `x.=> 1` rows `.=> 1;`, `x..=> 1` rows
+                // `..=> 1;`, `null?.=> 1` rows `?.=> 1;`. A live access
+                // path makes the poll a no-op.
+                self.dead_code(*punct);
+            }
+            Ev::AnonMethodEnd { end } => {
+                // The member's own end: the `?.` member's chain-end face
+                // (upstream `flowEnd(expression)` at `finishNullShorting`
+                // ends the row at the member's last token — `null?.=> 1;`
+                // reports `?.=> 1`, expected 3:7|6, the `;` never joins).
+                // A `.`/`..`/`?..` member closes no `flowEnd` upstream —
+                // the face is inert without an open selector short (the
+                // plain `?..` head's interval keeps running to `;`,
+                // 3:7|8).
+                self.chain_face_end(*end);
+            }
             Ev::IndexAccess {
                 null_aware,
                 close_end,
@@ -2971,6 +3006,15 @@ impl Interp<'_> {
                         .map(|span| span.range.offset)
                         .unwrap_or(0);
                     self.null_short_begin(receiver, recv_offset);
+                    // The head's `?..` context ends at the cascade's own
+                    // `CascadeEnd` — upstream's direct
+                    // `nullAwareAccess_end()` join (resolver.dart:2330), a
+                    // non-`flowEnd` close: a dead interval inside a section
+                    // keeps running to the statement's `;`, never trimmed
+                    // to the section face the selector shorts take.
+                    if let Some(short) = self.null_shorts.last_mut() {
+                        short.cascade_head = true;
+                    }
                     // The target's `ReadType` row re-spells the promoted
                     // face: upstream `cascadeReceiver` reads the target's
                     // promoted static type (`type_analyzer.dart`'s

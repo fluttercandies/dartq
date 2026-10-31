@@ -83,6 +83,18 @@ pub enum Ev {
     NoInitializer,
     InitializerBegin,
     InitializerEnd,
+    /// The covering `flowEnd` of a TOP-LEVEL variable declarator (official
+    /// `visitVariableDeclaration`'s `nullSafetyDeadCodeVerifier.flowEnd(node)`
+    /// — variable_declaration_resolver.dart:90-92, gated `isTopLevel`):
+    /// the declarator's `node.end` — the last token of its initializer
+    /// expression. Recorded immediately after [`Ev::InitializerEnd`] inside
+    /// the initializer's own world, only for unit-level declarators
+    /// (`var x = [1, 2, f(), 4]` reports `4]`, never `4];`): local and
+    /// field declarators fire no `flowEnd` upstream.
+    DeclFlowEnd {
+        /// The declarator's `node.end` — its initializer's last token end.
+        end: u32,
+    },
     /// A local function statement's name (fired at the name token, before
     /// the body parses): the interp's local-callable set — a bare-head
     /// invocation of one of these names resolves, so the unresolved-call
@@ -523,6 +535,40 @@ pub enum Ev {
     /// `throw`/Never inside `x?.m(throw _)`'s argument list has already
     /// landed on `current`.
     NullAwareMemberBegin,
+    /// The anonymous-methods experiment's member open
+    /// (`begin_anonymous_method_invocation`): `x.=> e`, `x.{ ... }`,
+    /// `x.(p) => e`, and their `?.`/cascade-section twins. `punct` is the
+    /// `.`/`?.`/`..`/`?..` operator — the row anchor: upstream polls
+    /// `node.body` after the target walks
+    /// (`visitAnonymousMethodInvocation`'s `checkUnreachableNode`,
+    /// resolver.dart:1963-1980), a dead access path makes the body the
+    /// first dead node, and the covering close re-anchors the row at the
+    /// operator (`parent is AnonymousMethodInvocation`,
+    /// dead_code_verifier.dart:317-318) — so the punctuation IS the
+    /// official row begin. `null_aware` marks the bare `?.` member face:
+    /// the parser fires no [`Ev::NullAwareMemberBegin`] for it (the
+    /// anonymous-method arm skips the selector events), so the replay
+    /// opens the null-short here — a `Null`/`Never` receiver kills the
+    /// body path at open (`null?.=> 1;` rows `?.=> 1;`). A `?..` head's
+    /// short is [`Ev::CascadeBegin`]'s, already open when this fires.
+    AnonMethodBegin {
+        punct: TokenSpan,
+        null_aware: bool,
+    },
+    /// The anonymous-method member's own end token
+    /// (`end_anonymous_method_invocation`): the `?.` member's chain-end
+    /// face — upstream's `flowEnd(expression)` at `finishNullShorting`
+    /// ends the dead row at the member's last token (`null?.=> 1;` rows
+    /// `?.=> 1`, expected 3:7|6 — the `;` never joins). `.`/`..`/`?..`
+    /// members close no `flowEnd` upstream (a plain member never shorted,
+    /// and a `?..` head's `nullAwareAccess_end` bypasses
+    /// `handleNullShortingFinished`), so their intervals keep running to
+    /// the statement's `;` — the face only feeds the selector short's
+    /// `face_end` bound, a no-op when none is open.
+    AnonMethodEnd {
+        /// The member's last token end (the body expression's `node.end`).
+        end: u32,
+    },
     IndexAccess {
         null_aware: bool,
         /// The `]` closer's end: the access's own `node.end` — the
@@ -860,6 +906,7 @@ impl Ev {
             | Ev::PatternBegin { span, .. }
             | Ev::This { span }
             | Ev::ParenBegin { span } => Some(*span),
+            Ev::AnonMethodBegin { punct, .. } => Some(*punct),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),
             Ev::Ident { token, .. } | Ev::Wildcard { token } => Some(*token),
             _ => None,
