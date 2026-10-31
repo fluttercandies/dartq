@@ -122,7 +122,7 @@ fn dead_parenthesized_callee_anchors_at_paren() {
     let events = vec![
         Ev::ExecBegin { is_closure: false },
         Ev::BlockBodyBegin { span: tspan(9) },
-        Ev::ParenBegin,
+        Ev::ParenBegin { span: tspan(11) },
         read(11),
         Ev::ParenEnd,
         Ev::Exit { end: tspan(11) },

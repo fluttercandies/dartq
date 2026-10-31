@@ -1725,6 +1725,13 @@ impl Interp<'_> {
                     window.extend(*end);
                 }
             }
+            Ev::CtorInitBegin { span } => {
+                self.ctor_init_begin = Some(*span);
+                self.ctor_init_began_dead = !self.reachable();
+            }
+            Ev::CtorInitEnd { end } => {
+                self.ctor_init_end(*end);
+            }
             _ => return false,
         }
         true

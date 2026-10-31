@@ -2761,7 +2761,8 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::IfNullAssignBegin { op: operator });
     }
 
-    fn begin_initializer(&mut self, _token: Token) {
+    fn begin_initializer(&mut self, token: Token) {
+        self.record(Ev::CtorInitBegin { span: token });
         if let Some(buffer) = &self.buffer {
             self.init_starts.push(buffer.len());
         }
@@ -2779,17 +2780,17 @@ impl ParserListener for Flow<'_> {
         // fires no `end_initializer` — its window never reaches here.
         if let Some(buffer) = &mut self.buffer {
             let end = end.range.end();
-            if let Some(ev) = buffer[start..]
+            if let Some(Ev::Assign { field_init, .. }) = buffer[start..]
                 .iter_mut()
                 .rev()
                 .find(|ev| matches!(ev, Ev::Assign { end: e, .. } if *e == end))
             {
-                let Ev::Assign { field_init, .. } = ev else {
-                    return;
-                };
                 *field_init = true;
             }
         }
+        self.record(Ev::CtorInitEnd {
+            end: end.range.end(),
+        });
     }
 
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {
@@ -2962,8 +2963,8 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::Throw);
     }
 
-    fn begin_parenthesized_expression_or_record_literal(&mut self, _token: Token) {
-        self.record(Ev::ParenBegin);
+    fn begin_parenthesized_expression_or_record_literal(&mut self, token: Token) {
+        self.record(Ev::ParenBegin { span: token });
     }
 
     fn end_parenthesized_expression(&mut self, _token: Token) {

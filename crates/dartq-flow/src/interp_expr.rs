@@ -2685,12 +2685,34 @@ impl Interp<'_> {
                 // `exit_at` boundary the member poll applies. Only a bare
                 // operand's own span is known here (`read_span` for a leaf
                 // read, `callee_span` for a completed send's head); a
-                // compound argument without either stays to its inner
-                // polls — the under-report direction.
+                // compound argument without either falls back to its
+                // first-token anchor — the region's first spanned event
+                // since the enclosing list's opening (a literal argument
+                // `g(throw 0, 1)` carries no read/send span, yet the
+                // official's top-down poll still visits the ARGUMENT node:
+                // dead_code_verifier.dart:183-189) — and a compound one
+                // without either stays to its inner polls.
                 let arg_span = self
                     .exprs
                     .last()
-                    .and_then(|arg| arg.read_span.or(arg.callee_span));
+                    .and_then(|arg| arg.read_span.or(arg.callee_span))
+                    .or_else(|| {
+                        let start = events[..i]
+                            .iter()
+                            .rposition(|ev| {
+                                matches!(ev, Ev::ArgumentEnd | Ev::ArgumentsBegin { .. })
+                            })?;
+                        let region = &events[start + 1..i];
+                        // A `throw` argument is its own death (official
+                        // `parseThrowExpression` — the argument was live
+                        // when the pre-order poll ran, so the NEXT node
+                        // anchors); its interior literal's span must not
+                        // stand in for the argument node.
+                        if region.iter().any(|ev| matches!(ev, Ev::Throw)) {
+                            return None;
+                        }
+                        region.iter().find_map(|ev| ev.span())
+                    });
                 if let Some(arg_span) = arg_span
                     && !self.reachable()
                     && !self
@@ -2711,7 +2733,7 @@ impl Interp<'_> {
                     self.flush_null_shorts_above(base);
                 }
             }
-            Ev::ParenBegin | Ev::AwaitBegin { .. } => {}
+            Ev::ParenBegin { .. } | Ev::AwaitBegin { .. } => {}
             Ev::ParenEnd => {
                 // The parenthesized operand ended: rejoin the null-shorting
                 // it opened (`(x?.y)` — the chain's boundary is the `)`,

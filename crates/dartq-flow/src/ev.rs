@@ -42,6 +42,14 @@ pub enum Ev {
     /// The body's `}`: `begin` repeats the `{` token (the body-anchored-row
     /// check), `end` is the `}` token's end offset.
     BlockBodyEnd { begin: TokenSpan, end: u32 },
+    /// A constructor-initializer entry's head token (`y`, `assert`, `this`,
+    /// `super` — `begin_initializer`): the entry-extent dead row's begin.
+    CtorInitBegin { span: TokenSpan },
+    /// A constructor-initializer entry's last-token end
+    /// (`end_initializer`): the entry-extent dead row's end. A
+    /// redirecting `super(...)`/`this(...)` entry fires no end — its dead
+    /// window falls through to the executable's covering close.
+    CtorInitEnd { end: u32 },
     /// `=>` body: consumes the body's value; the function's own value for
     /// the consumer is netted at `ExecEnd { is_expr: true }`.
     ExprBody,
@@ -568,7 +576,13 @@ pub enum Ev {
         /// The subexpression's end offset.
         end: TokenSpan,
     },
-    ParenBegin,
+    /// A parenthesized subexpression's `(` (`beginParenthesizedExpression`
+    /// — the token rides the listener face): the dead-updater row's begin
+    /// face — `(i).sign`'s official row starts at the `(` (the updaters'
+    /// `beginToken`, dead_code_verifier.dart:361-375) — and a spanned
+    /// region event everywhere else an offset anchor is read
+    /// ([`Ev::span`]).
+    ParenBegin { span: TokenSpan },
     ParenEnd,
     RecordLitEnd {
         count: usize,
@@ -829,7 +843,8 @@ impl Ev {
             | Ev::Double { span }
             | Ev::Bool { span, .. }
             | Ev::PatternBegin { span, .. }
-            | Ev::This { span } => Some(*span),
+            | Ev::This { span }
+            | Ev::ParenBegin { span } => Some(*span),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),
             Ev::Ident { token, .. } | Ev::Wildcard { token } => Some(*token),
             _ => None,

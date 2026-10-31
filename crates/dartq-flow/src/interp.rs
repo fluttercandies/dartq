@@ -1178,6 +1178,20 @@ pub(crate) struct Interp<'o> {
     /// captured write-version check stands in the official's
     /// `ValueVersion` rebasing).
     pub(crate) cond_vars: std::collections::HashMap<u32, CondVarEntry>,
+    /// The open constructor-initializer entry's head token (the
+    /// `CtorInitBegin`/`CtorInitEnd` pair): the entry-extent dead row's
+    /// begin.
+    pub(crate) ctor_init_begin: Option<TokenSpan>,
+    /// Whether the open entry's head was reached with the walk already
+    /// dead (`throw 0` in an EARLIER entry): such an entry is itself the
+    /// official first dead node when it carries no interior poll.
+    pub(crate) ctor_init_began_dead: bool,
+    /// The dead interval the ctor-initializer face reported and sealed
+    /// (the replay-frame depth it fired at): later same-depth dead polls
+    /// continue the official's one-row fold (`_firstDeadNode` stays
+    /// latched to the covering close; dead_code_verifier.dart:284-291),
+    /// while a nested executable's own walk is untouched.
+    pub(crate) ctor_init_reported: Option<usize>,
     /// Local-function names declared in the unit ([`crate::ev::Ev::
     /// LocalFnName`] feed): a bare-head invocation of one resolves in scope,
     /// so the unresolved-call `InvalidType` face must skip it — the
@@ -1594,6 +1608,9 @@ impl<'o> Interp<'o> {
             cond_split_var: None,
             if_branch_folded: false,
             cond_vars: std::collections::HashMap::new(),
+            ctor_init_begin: None,
+            ctor_init_began_dead: false,
+            ctor_init_reported: None,
             local_fns: FxHashSet::default(),
             prop_slots: FxHashMap::default(),
             decl: DeclCtx::default(),
@@ -2475,6 +2492,9 @@ impl<'o> Interp<'o> {
         if self.reachable() || self.arm_dead_depth > 0 {
             return;
         }
+        if self.ctor_init_reported == Some(self.stack.len()) {
+            return;
+        }
         let end = span.range.end();
         if let Some(window) = &mut self.dead {
             if end > window.end {
@@ -2495,8 +2515,64 @@ impl<'o> Interp<'o> {
     /// to own the reporting. An arm-dead context folds the poll exactly
     /// like [`Interp::dead_code`].
     pub(crate) fn dead_do_condition(&mut self) {
+        if self.ctor_init_reported == Some(self.stack.len()) {
+            return;
+        }
         if self.dead.is_none() && !self.reachable() && self.arm_dead_depth == 0 {
             self.dead = Some(DeadWindow::awaiting_do(self.stack.len()));
+        }
+    }
+
+    /// The constructor-initializer entry close (official
+    /// `parent is ConstructorInitializer`,
+    /// dead_code_verifier.dart:284-291): a dead interval anchored inside
+    /// the entry reports the ENTRY's own extent and its covering-close
+    /// tail is suppressed — the first dead node after a throwing
+    /// initializer is the NEXT entry (`A() : x = throw 0, y = 1 { x; }`
+    /// reports `y = 1`, never `y = 1 { ... }`), and the official reports
+    /// the parent initializer's `offset..end` directly. An entry the
+    /// walk ENTERED dead with no interior poll (`y = 1` carries no
+    /// read/send event) is itself the first dead node — the top-down
+    /// verifier polls the entry before its children — and rows the same
+    /// extent; the throw's OWN entry began live and never fires (the
+    /// first dead node is the next one). The latch marks the fold: later
+    /// dead nodes in the executable continue the official's single
+    /// interval (`_firstDeadNode` stays latched — the body poll
+    /// re-anchors nothing), while a nested executable (a closure body
+    /// replays live) keeps its own walk.
+    pub(crate) fn ctor_init_end(&mut self, end: u32) {
+        let Some(begin) = self.ctor_init_begin.take() else {
+            return;
+        };
+        if self.ctor_init_reported.is_some() {
+            return;
+        }
+        let anchored_inside = self
+            .dead
+            .as_ref()
+            .is_some_and(|window| {
+                window.anchor.range.offset >= begin.range.offset
+                    && window.anchor.range.offset < end
+            });
+        if anchored_inside
+            || (self.ctor_init_began_dead
+                && self.dead.is_none()
+                && !self.reachable()
+                && self.arm_dead_depth == 0)
+        {
+            if !self.collecting() {
+                self.dead = None;
+                self.ctor_init_reported = Some(self.stack.len());
+            }
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: begin.id,
+                    range: SourceRange {
+                        offset: begin.range.offset,
+                        length: end - begin.range.offset,
+                    },
+                },
+            });
         }
     }
 
@@ -3414,6 +3490,11 @@ impl Interp<'_> {
             self.stack.push(frame);
             return;
         };
+        // The ctor-initializer face is the executable's own: an open
+        // entry head or a fired latch never outlives its Exec frame.
+        self.ctor_init_begin = None;
+        self.ctor_init_began_dead = false;
+        self.ctor_init_reported = None;
         self.scopes.truncate(scopes_base);
         // The enclosing statement boundaries resume: the body's own
         // boundaries never rewrite them.

@@ -864,6 +864,8 @@ impl GapPass {
             // events.
             Ev::BlockBodyBegin { .. }
             | Ev::BlockBodyEnd { .. }
+            | Ev::CtorInitBegin { .. }
+            | Ev::CtorInitEnd { .. }
             | Ev::AsyncModifier { .. }
             | Ev::EmptyBody
             | Ev::StmtEnd { .. }
@@ -906,7 +908,7 @@ impl GapPass {
             | Ev::NonNullAssert
             | Ev::BinaryBegin { .. }
             | Ev::ArgumentsBegin { .. }
-            | Ev::ParenBegin
+            | Ev::ParenBegin { .. }
             | Ev::ParenEnd => {}
             Ev::ExprStmt { .. }
             | Ev::InitializerEnd
