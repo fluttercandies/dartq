@@ -2171,6 +2171,17 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.pending_decl_ty_unresolved = false;
         engine.armed_ty = None;
         engine.armed_ty_unresolved = false;
+        // The group closed: a declarator no initializer claimed (a `var a;`
+        // ahead of an initialized sibling, or a recovery shape) belongs to
+        // no window and must not pair with the NEXT group's initializers.
+        // The sweep stops at this group's own end, so an initializer-nested
+        // group (`[for (var i = 0; ...) ...]`) never drops the enclosing
+        // group's later declarators — those names sit past its `;`.
+        engine.var_infer_pending = None;
+        let group_end = end.map_or(u32::MAX, |token| token.range.offset);
+        engine
+            .pending_model_declarators
+            .retain(|(_, range, _)| range.end() > group_end);
         engine.disarm_const_group();
         // The variable group closed: an unclaimed signature stash (a
         // function-type cast inside an initializer) dies here.
@@ -2205,8 +2216,14 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.init_mark = Some(engine.rows.len());
         // This initializer's own declarator (latched at its name): parked
         // on the window stack so nested declarations inside the
-        // initializer cannot re-latch it.
-        let declarator = engine.var_infer_pending.take();
+        // initializer cannot re-latch it. A field/top-level variable group
+        // folds its names ahead of the group head, so its declarators wait
+        // in a queue and pair by position instead.
+        let declarator = engine
+            .var_infer_pending
+            .take()
+            .map(|(name, range)| (name, range, VarInferSlot::Local))
+            .or_else(|| engine.take_model_declarator(token.range.offset));
         engine.init_declarators.push(declarator);
         engine.open_const_initializer();
     }
@@ -2234,7 +2251,7 @@ impl ParserListener for DiagnoseListener<'_> {
             // reach an else arm.
             let init_declarator_range = engine.init_declarators.last().copied().flatten();
             let popped = engine.init_declarators.pop().flatten();
-            if let Some((name, decl_range)) = popped
+            if let Some((name, decl_range, infer_slot)) = popped
                 && let Some(mark) = engine.init_mark
                 && let Some((expr, ifnull_ty)) = {
                     // The `??` pair's own face folds here (this slice): the
@@ -2373,7 +2390,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 // An explicit-argument creation's written arguments ride
                 // the head (`creation_args.rs`).
                 let ty = engine.with_explicit_creation_args(expr, ty);
-                engine.bind_var_type(name, ty);
+                engine.bind_inferred_ty(name, ty, infer_slot);
                 // A promotion-latched initializer defers its re-bind
                 // (#2539): the member read's accessor return rides the
                 // UNPROMOTED declared receiver at this bind, and the
@@ -2385,7 +2402,8 @@ impl ParserListener for DiagnoseListener<'_> {
                 // p.first as T`) owes none: the cast decided the type, and
                 // an unresolvable target would let the accessor's face
                 // replace it.
-                if let Some(expr_row) = engine.rows.get(expr)
+                if infer_slot == VarInferSlot::Local
+                    && let Some(expr_row) = engine.rows.get(expr)
                     && !engine.cast_rewrites.iter().any(|(span, _)| {
                         span.offset <= expr_row.range.offset && span.end() >= expr_row.range.end()
                     })
@@ -2406,7 +2424,8 @@ impl ParserListener for DiagnoseListener<'_> {
                 // promotion standing at the read) re-binds the inferred
                 // face in pass 2. A plain bare read only; every other
                 // shape's face decided above.
-                if let Some(expr_row) = engine.rows.get(expr)
+                if infer_slot == VarInferSlot::Local
+                    && let Some(expr_row) = engine.rows.get(expr)
                     && matches!(expr_row.shape, RowShape::Bare(BareInfo::Plain { .. }))
                     && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
                 {
@@ -2419,7 +2438,8 @@ impl ParserListener for DiagnoseListener<'_> {
                 // promoted callee's `call` member return — a pass-2 face
                 // (the callee's flow read re-decides there), so the rebind
                 // defers like the bare read's.
-                if let Some(expr_row) = engine.rows.get(expr)
+                if infer_slot == VarInferSlot::Local
+                    && let Some(expr_row) = engine.rows.get(expr)
                     && expr_row.intent == Intent::Invoke
                     && matches!(expr_row.shape, RowShape::Bare(_))
                     && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
@@ -2437,12 +2457,16 @@ impl ParserListener for DiagnoseListener<'_> {
                 // exactly like annotated ones. Argument-bearing and
                 // non-named shapes stay untyped downstream (the flow
                 // lattice cannot spell them; the unknown-declared
-                // under-report stands).
-                if let Ty::Named {
-                    name: ty_name,
-                    nullable,
-                    args,
-                } = ty
+                // under-report stands). A model-level declaration (a
+                // top-level variable or a field) owns no frame local to
+                // stage against: its inferred face rides the model overlay
+                // ([`Engine::bind_inferred_ty`]) instead.
+                if infer_slot == VarInferSlot::Local
+                    && let Ty::Named {
+                        name: ty_name,
+                        nullable,
+                        args,
+                    } = ty
                 {
                     let lexeme = engine.strings.resolve(ty_name).to_string();
                     // #2506: the written-argument tree rides beside the
@@ -2460,7 +2484,7 @@ impl ParserListener for DiagnoseListener<'_> {
             } else if let Some(mark) = engine.init_mark
                 && engine.rows.len() == mark + 1
                 && engine.rows[mark].ty == Ty::UNKNOWN
-                && let Some((_, decl_range)) = init_declarator_range
+                && let Some((_, decl_range, VarInferSlot::Local)) = init_declarator_range
             {
                 // The flow-blind declarator fallback (the plain
                 // `var x = <member read>`): the initializer row's face
@@ -3567,6 +3591,29 @@ impl ParserListener for DiagnoseListener<'_> {
                     } else {
                         engine.armed_ty_unresolved
                     };
+                    // A group with NO written annotation infers every
+                    // declarator's type from its initializer (#2513): the
+                    // model rows (`TopDecl::var_ty` / `MemberEntry::var_ty`)
+                    // carry `Unknown` there — the collector runs before any
+                    // inference — so the close binds the inferred face into
+                    // the overlay the read surfaces answer through. An
+                    // `augment` group declares no new element and owns no
+                    // row to overlay, and a function-typed annotation is
+                    // the written-signature stash's face
+                    // ([`Engine::fn_var_sigs`]), never an inference input.
+                    if engine.pending_decl_ty.is_none()
+                        && engine.armed_ty.is_none()
+                        && engine.fn_type_stash.is_none()
+                        && !engine.group_augment
+                    {
+                        let slot = engine.container_context().map_or(
+                            VarInferSlot::TopLevel,
+                            |(container, _)| VarInferSlot::Field(container),
+                        );
+                        engine
+                            .pending_model_declarators
+                            .push((name, token.range, slot));
+                    }
                     let final_gate = engine.group_final && !engine.group_late;
                     let non_nullable_gate = !engine.group_const
                         && !engine.group_final
@@ -9360,10 +9407,12 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_field_initializer(&mut self, _token: Token) {
         self.engine.open_const_initializer();
+        self.engine.field_initializer_open = true;
     }
 
     fn end_field_initializer(&mut self, _assignment: Token, _end: Token) {
         self.engine.close_const_field_initializer();
+        self.engine.field_initializer_open = false;
     }
 
     fn begin_const_literal(&mut self, _token: Token) {
@@ -10073,6 +10122,22 @@ impl ParserListener for DiagnoseListener<'_> {
                     Vec::new(),
                 );
             }
+        }
+        // The primary constructor's formals answer only from its own two
+        // upstream scopes (`ConstructorInitializerScope` over the non-late
+        // INSTANCE field initializers and `PrimaryParameterScope` over the
+        // `this : ...` body —
+        // pkg/analyzer/lib/src/dart/resolver/scope_context.dart:406-461);
+        // the member scope never sees them. The container frame still
+        // carries them as locals (the body needs them), so the names are
+        // marked here for [`Engine::resolve_local`] to refuse in the
+        // illegal planes (static and `late` field initializers, member
+        // bodies) where the oracle answers `undefined_identifier`.
+        if member_kind == dartq_parser::MemberKind::PrimaryConstructor
+            && self.engine.formal_list_depth == 1
+            && let Some(primary) = self.engine.name_of(name)
+        {
+            self.engine.primary_formals.insert(primary);
         }
         self.flow().end_formal_parameter(
             var_or_final,

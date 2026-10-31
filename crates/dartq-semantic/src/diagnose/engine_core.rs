@@ -288,6 +288,9 @@ impl<'a> Engine<'a> {
             arg_gates: Vec::new(),
             var_infer_pending: None,
             init_declarators: Vec::new(),
+            top_var_inferred_tys: FxHashMap::default(),
+            field_inferred_tys: FxHashMap::default(),
+            pending_model_declarators: Vec::new(),
             staged_write_tys: FxHashMap::default(),
             stmt_block_depth: 0,
             next_exec_serial: 0,
@@ -346,6 +349,8 @@ impl<'a> Engine<'a> {
             last_case_object_head: None,
             null_check_binder_candidates: Vec::new(),
             pending_pattern_getters: Vec::new(),
+            primary_formals: FxHashSet::default(),
+            field_initializer_open: false,
             open_exec_site: None,
             decl_sites: Vec::new(),
             pending_annotations: Vec::new(),
@@ -1996,6 +2001,14 @@ impl<'a> Engine<'a> {
         } else {
             0
         };
+        // A fresh container frame owns a fresh primary-constructor formal
+        // set: the previous class body's formals never answer inside this
+        // one (the set is cleared again at the pop, so a top-level `late`
+        // group after the class cannot read the stale names either).
+        if matches!(&kind, FrameKind::Container { .. }) {
+            self.primary_formals.clear();
+            self.field_initializer_open = false;
+        }
         self.frames.push(Frame {
             kind,
             serial,
@@ -2014,6 +2027,13 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn pop_frame(&mut self) {
         if let Some(frame) = self.frames.pop() {
+            // The container's primary-constructor formals die with the
+            // frame: a top-level `late` group after the class must not read
+            // them through the stale set.
+            if matches!(&frame.kind, FrameKind::Container { .. }) {
+                self.primary_formals.clear();
+                self.field_initializer_open = false;
+            }
             // A block-bodied executable leaves `body_mark` latched (the
             // arrow-body arm `take`s it at close; the block body's own end
             // never reads it) — the stale `Some` would read as "a body

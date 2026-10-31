@@ -1,6 +1,20 @@
 use super::engine_core::flatten_ty;
 use super::*;
 
+/// The #2487 pin's instruction-count faces for the bounded
+/// assignment-target scan (`assignment_target_index`'s `cfg(test)`
+/// twin): the predicate visits the bounded reverse scan spent across
+/// every call (the new walk's total), and the widest post-operator tail
+/// any call saw (`rows_len - bound` — every row the old `.rev().find`
+/// would have walked past before reaching the prefix).
+#[cfg(test)]
+static ASSIGNMENT_TARGET_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// See [`ASSIGNMENT_TARGET_VISITS`].
+#[cfg(test)]
+static ASSIGNMENT_TARGET_MAX_TAIL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl<'a> Engine<'a> {
     /// A literal `<…>` group's argument leaf as a [`Ty`]: `dynamic`/`Null`
     /// intern their dedicated faces — the same mapping the type
@@ -941,21 +955,30 @@ impl<'a> Engine<'a> {
         };
         match found {
             Walk::Found(entry) if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) => {
-                let answer = match entry.kind {
-                    MemberKind::Field => self.fold_alias_ty(entry.var_ty),
-                    _ => self.fold_alias_ty(entry.return_ty),
-                };
+                let declaring = self.member_faces.last_origin().unwrap_or(container);
+                let answer = self.accessor_declared_ty(declaring, name, &entry);
                 self.instantiate_accessor_static(container, recv, answer)
             }
             _ => Ty::UNKNOWN,
         }
     }
 
-    fn accessor_read_ty(&self, row: &Row) -> Ty {
-        let answer = |entry: &MemberEntry| match entry.kind {
-            MemberKind::Field => self.fold_alias_ty(entry.var_ty),
+    /// The accessor entry's declared static type: a field's model `var_ty`
+    /// (with the inferred overlay — [`Self::field_model_ty`]) or a getter's
+    /// return, folded through a type alias first (the resolved-face
+    /// convention every declared type the frames bind follows). `container`
+    /// is the member walk's starting container; `name` the member spelling
+    /// the overlay keys on.
+    fn accessor_declared_ty(&self, container: StringId, name: StringId, entry: &MemberEntry) -> Ty {
+        match entry.kind {
+            MemberKind::Field => {
+                self.fold_alias_ty(self.field_model_ty(container, name, entry.var_ty))
+            }
             _ => self.fold_alias_ty(entry.return_ty),
-        };
+        }
+    }
+
+    fn accessor_read_ty(&self, row: &Row) -> Ty {
         match &row.shape {
             RowShape::Bare(BareInfo::Plain { .. }) if !row.qualified => {
                 let resolved = self.resolve_bare(row.name);
@@ -965,7 +988,7 @@ impl<'a> Engine<'a> {
                             Walk::Found(entry)
                                 if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                             {
-                                answer(&entry)
+                                self.accessor_declared_ty(container, row.name, &entry)
                             }
                             _ => Ty::UNKNOWN,
                         }
@@ -991,6 +1014,13 @@ impl<'a> Engine<'a> {
                             if decl.kind == MicroKind::TopLevelFn && decl.formals.is_none() =>
                         {
                             self.fold_alias_ty(decl.return_ty)
+                        }
+                        // A top-level VARIABLE's read is its declared type —
+                        // the model's `var_ty`, overlaid by the inferred face
+                        // for a `var`/`final` declaration the collector
+                        // cannot type.
+                        Some(decl) if decl.kind == MicroKind::TopLevelVar => {
+                            self.fold_alias_ty(self.top_var_model_ty(row.name, decl.var_ty))
                         }
                         _ => Ty::UNKNOWN,
                     },
@@ -1083,7 +1113,7 @@ impl<'a> Engine<'a> {
                             Walk::Found(entry)
                                 if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                             {
-                                let declared = answer(&entry);
+                                let declared = self.accessor_declared_ty(declaring, row.name, &entry);
                                 let inherited = match &recv {
                                     Receiver::Typed { ty, .. } if declaring != container => self
                                         .member_recv_env(*ty, declaring, &entry)
@@ -1931,12 +1961,9 @@ impl<'a> Engine<'a> {
             None
         };
         // The candidate target row: the closest row wholly before the
-        // operator, skipping folded value rows (index results, groups).
-        let Some(index) = self
-            .rows
-            .iter()
-            .rposition(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
-        else {
+        // operator, skipping folded value rows (index results, groups) —
+        // the shared `assignment_target_index` scan.
+        let Some(index) = self.assignment_target_index(limit) else {
             return;
         };
         // An unfolded index target keeps its index arguments as plain read
@@ -2520,6 +2547,52 @@ impl<'a> Engine<'a> {
             .find(|row| !self.interpolation_child_rows.contains(&row.range.offset))
     }
 
+    /// The index of the assignment's candidate target row: the closest row
+    /// wholly before `limit` (the operator's offset), skipping folded value
+    /// rows (index results, groups — the same scan `mark_assignment` runs).
+    /// `rows` is offset-sorted (the `invocation.rs` `partition_point`
+    /// invariant), so a binary search bounds the walk to the pre-operator
+    /// prefix — the right-hand-side rows after `limit` are skipped in
+    /// O(log n) instead of walked one-by-one. The bound is `offset <=
+    /// limit`, not `<`: `end() <= limit` implies `offset <= limit` (a row
+    /// never ends before it starts), so every verdict-eligible row sits
+    /// inside the prefix — including a zero-width row parked exactly on
+    /// the operator's offset. Inside that prefix `end()` is NOT monotone
+    /// (a long outer row can out-end a later inner row), so the
+    /// `end() <= limit` verdict still needs a bounded reverse scan — but
+    /// only within the prefix, never across the right-hand tail.
+    ///
+    /// The `cfg(test)` twin counts predicate visits into
+    /// [`ASSIGNMENT_TARGET_VISITS`] — the #2487 pin reads it to assert
+    /// the bounded scan never walks the right-hand tail.
+    #[cfg(not(test))]
+    fn assignment_target_index(&self, limit: u32) -> Option<usize> {
+        let bound = self
+            .rows
+            .partition_point(|row| row.range.offset <= limit);
+        self.rows[..bound]
+            .iter()
+            .rposition(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
+    }
+
+    /// [`Self::assignment_target_index`]'s instrumented twin (see its doc).
+    #[cfg(test)]
+    fn assignment_target_index(&self, limit: u32) -> Option<usize> {
+        let bound = self
+            .rows
+            .partition_point(|row| row.range.offset <= limit);
+        ASSIGNMENT_TARGET_MAX_TAIL.fetch_max(
+            self.rows.len() - bound,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.rows[..bound]
+            .iter()
+            .rposition(|row| {
+                ASSIGNMENT_TARGET_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                row.range.end() <= limit && !matches!(row.shape, RowShape::Value)
+            })
+    }
+
     /// The two operand rows of a `??` or conditional tail ending at `last`:
     /// rows `[.., left, last]` where the operator tokens sit between the
     /// left row's end and `last`'s start. Returns `(left, is_if_null)` —
@@ -2683,15 +2756,9 @@ impl<'a> Engine<'a> {
         }
         let limit = operator.range.offset;
         // The target: the closest row wholly before the operator, skipping
-        // folded value rows (the same scan `mark_assignment` runs).
-        let Some(target) = self
-            .rows
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, row)| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
-            .map(|(index, _)| index)
-        else {
+        // folded value rows (the shared `assignment_target_index` scan —
+        // `mark_assignment` runs the same walk).
+        let Some(target) = self.assignment_target_index(limit) else {
             return;
         };
         // `c[i] = e` writes through the `[]=` operator: the target's own
@@ -2881,15 +2948,9 @@ impl<'a> Engine<'a> {
         }
         let limit = operator.range.offset;
         // The target: the closest row wholly before the operator, skipping
-        // folded value rows (the same scan [`Self::check_assignment`] runs).
-        let Some(target) = self
-            .rows
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, row)| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
-            .map(|(index, _)| index)
-        else {
+        // folded value rows (the shared `assignment_target_index` scan —
+        // [`Self::check_assignment`] reads the same verdict).
+        let Some(target) = self.assignment_target_index(limit) else {
             return;
         };
         // `c[i] op= e` writes through `[]=`: no assignability face here
@@ -7940,3 +8001,13 @@ mod ticket_3147_tests;
 #[cfg(test)]
 #[path = "ticket_3173_tests.rs"]
 mod ticket_3173_tests;
+
+// The #2487 pins: F5 — the assignment-target scan's bounded form
+// (`assignment_target_index`'s `partition_point` prefix + bounded
+// reverse scan, with `ASSIGNMENT_TARGET_VISITS` counting the
+// instruction face); F6 — the is-check undefined head's id-keyed
+// `undefined_ids` set through the mounted `ResolvedTypeOps`.
+// Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_2487_tests.rs"]
+mod ticket_2487_tests;

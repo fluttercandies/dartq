@@ -4579,6 +4579,13 @@ mod ticket_2491_tests;
 #[cfg(test)]
 mod ticket_2471_tests;
 
+/// The #1598 pins (N5): the constant-pattern const-ness rows of the
+/// 70d226a5 case and the `could_not_infer` row of the 5adcb8ee
+/// (issue63883) unsolved-parameter call, pinned at their face boundaries so
+/// a later cross-face flip fails here first.
+#[cfg(test)]
+mod ticket_1598_tests;
+
 /// The #2159 pins: the `unused_field` read-attribution faces of the
 /// census's reads-side family — the `?.` chain's nested private-field
 /// read, the private-field read inside a getter body, the const-list
@@ -5066,6 +5073,15 @@ mod ticket_2473_tests;
 /// name-level reads only pattern-matched heads.
 #[cfg(test)]
 mod ticket_2508_tests;
+
+/// The #2513 pins: a `var`/`final`-inferred top-level variable or field has
+/// no declared type in the element model (the collector runs before any
+/// inference), so the diagnosing pass infers it from the initializer and
+/// overlays the model read faces — member sends and writes through such a
+/// declaration decide instead of under-reporting, and a written annotation
+/// keeps its own face.
+#[cfg(test)]
+mod ticket_2513_tests;
 
 /// The #2564 pins: the nesting-safe creation-head latch — a keyword
 /// creation whose argument list contains its own invocation
@@ -5894,6 +5910,14 @@ mod ticket_3123_tests;
 /// (`param_bound_of`).
 #[cfg(test)]
 mod ticket_3125_tests;
+
+/// The #3083 pins — the `undefined_*` residual clusters D–H: the
+/// object-pattern field getter's head kinds (extension type, mixin, and
+/// function/class aliases — the row keeps the written alias spelling) and
+/// the primary constructor formal's narrow scopes
+/// (pkg/analyzer/lib/src/dart/resolver/scope_context.dart:406-461).
+#[cfg(test)]
+mod ticket_3083_tests;
 
 /// The #3038 pins — `unnecessary_type_check` coverage for the shapes the
 /// type-check verdict under-emits on (function-type test spellings, type

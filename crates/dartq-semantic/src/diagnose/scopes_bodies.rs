@@ -1015,6 +1015,22 @@ impl<'a> Engine<'a> {
             .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$')
     }
 
+    /// Whether the primary constructor's formal `name` must not answer from
+    /// the current position. The formals are scoped by the constructor
+    /// alone upstream — `ConstructorInitializerScope` over the non-late
+    /// INSTANCE field initializers and `PrimaryParameterScope` over the
+    /// `this : ...` body
+    /// (pkg/analyzer/lib/src/dart/resolver/scope_context.dart:406-461) —
+    /// while the container frame carries them as locals for the body's
+    /// sake. A STATIC or `late` field initializer is outside both scopes
+    /// and reads `undefined_identifier` (oracle 3.13.7:
+    /// `class A(int foo) { static var s = foo; }`).
+    pub(crate) fn primary_formal_hidden(&self, name: StringId) -> bool {
+        self.field_initializer_open
+            && (self.open_member_static || self.group_late)
+            && self.primary_formals.contains(&name)
+    }
+
     /// The local declaration `name` resolves to, innermost frame first
     /// (the same walk [`Engine::resolve_bare`]'s locals arm runs).
     ///
@@ -1025,6 +1041,9 @@ impl<'a> Engine<'a> {
     /// arm-scope end (`#2189`-a's leak direction).
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn resolve_local(&self, name: StringId) -> Option<u32> {
+        if self.primary_formal_hidden(name) {
+            return None;
+        }
         for depth in (0..self.frames.len()).rev() {
             if self.frames[depth].locals.contains(&name) {
                 let lo = self.frame_local_marks[depth];
@@ -1147,10 +1166,47 @@ impl<'a> Engine<'a> {
     /// `undefined_operator`/matched-type face with the declaration's own
     /// arguments — never the raw `Circle` head.
     pub(crate) fn bind_var_type(&mut self, name: StringId, ty: Ty) {
+        self.bind_inferred_ty(name, ty, VarInferSlot::Local);
+    }
+
+    /// Binds a `var`/`final`-inferred declarator's resolved initializer
+    /// type into the slot its declaration owns: a local's frame slot, or —
+    /// for a top-level variable or a field — the overlay the model read
+    /// surfaces answer through, since `TopDecl::var_ty` and
+    /// `MemberEntry::var_ty` carry `Unknown` for every unwritten annotation
+    /// (the collector runs before any inference).
+    pub(crate) fn bind_inferred_ty(&mut self, name: StringId, ty: Ty, slot: VarInferSlot) {
         let ty = self.instantiated_head_ty(ty);
-        if let Some(frame) = self.frames.last_mut() {
-            frame.var_types.insert(name, ty);
+        match slot {
+            VarInferSlot::Local => {
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.var_types.insert(name, ty);
+                }
+            }
+            VarInferSlot::TopLevel => {
+                self.top_var_inferred_tys.insert(name, ty);
+            }
+            VarInferSlot::Field(container) => {
+                self.field_inferred_tys.insert((container, name), ty);
+            }
         }
+    }
+
+    /// Pairs the initializer starting at `at` (UTF-16) with its declarator
+    /// in the open field/top-level variable group — the LAST name the group
+    /// folded ahead of it, since a group keeps its names in one block
+    /// (`var a, b = 2;`: `b` owns the initializer) while the initializers
+    /// follow one per initialized declarator. The skipped names are
+    /// initializerless declarators: they carry no inferred type and drop.
+    pub(crate) fn take_model_declarator(
+        &mut self,
+        at: u32,
+    ) -> Option<(StringId, SourceRange, VarInferSlot)> {
+        let index = self
+            .pending_model_declarators
+            .iter()
+            .rposition(|(_, range, _)| range.end() <= at)?;
+        self.pending_model_declarators.drain(..=index).last()
     }
 
     /// The innermost frame's declared slot for a local — the typedness ask
@@ -2461,7 +2517,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .any(|&(start, _)| self.closure_invalid_returns.contains(&start))
             && self.closure_caps.is_empty()
-            && let Some(Some((name, _))) = self.init_declarators.last()
+            && let Some(Some((name, _, VarInferSlot::Local))) = self.init_declarators.last()
         {
             self.invalid_typed_locals.insert(*name);
         }

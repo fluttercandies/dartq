@@ -1940,6 +1940,20 @@ impl PairingLedger {
     }
 }
 
+/// The model slot a `var`/`final`-inferred declarator's resolved
+/// initializer type binds into (the element model's own declared-type slot
+/// carries `Unknown` for every unwritten annotation — the collector runs
+/// before any inference).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarInferSlot {
+    /// A local: the innermost frame's `var_types` slot.
+    Local,
+    /// A top-level variable: [`Engine::top_var_inferred_tys`].
+    TopLevel,
+    /// A field of `container`: [`Engine::field_inferred_tys`].
+    Field(StringId),
+}
+
 /// The engine: one parse, then the resolution pass.
 #[expect(clippy::struct_excessive_bools)] // flag set mirrors the oracle's verifier latches
 pub(crate) struct Engine<'a> {
@@ -2097,6 +2111,27 @@ pub(crate) struct Engine<'a> {
     pub(crate) pending_decl_ty: Option<Ty>,
     /// [`Self::armed_ty_unresolved`] moved with the group's declared type.
     pub(crate) pending_decl_ty_unresolved: bool,
+    /// This unit's `var`/`final`-inferred TOP-LEVEL variable types, keyed
+    /// by declaration name: the element model's `TopDecl::var_ty` carries
+    /// `Unknown` for every unwritten annotation (the collector runs before
+    /// any inference), so the diagnosing pass overlays the type it infers
+    /// from the initializer at [`Self::bind_var_type`] and every read face
+    /// ([`Self::bare_info_of`]-style lookups, `accessor_read_ty`) answers
+    /// through it instead of the `Unknown` slot.
+    pub(crate) top_var_inferred_tys: FxHashMap<StringId, Ty>,
+    /// The field twin of [`Self::top_var_inferred_tys`], keyed by
+    /// `(declaring container, field)`: `MemberEntry::var_ty` carries the
+    /// same `Unknown` for an inferred field.
+    pub(crate) field_inferred_tys: FxHashMap<(StringId, StringId), Ty>,
+    /// The open field/top-level variable group's declarators awaiting their
+    /// initializers' inferred types. The parser folds those names before
+    /// the group head fires (unlike a local group, whose names interleave
+    /// with their initializers), so the single
+    /// [`Self::var_infer_pending`] slot would keep only the last name —
+    /// the group's declarators queue here and
+    /// [`Self::take_model_declarator`] pairs each initializer with the
+    /// nearest preceding name.
+    pub(crate) pending_model_declarators: Vec<(StringId, SourceRange, VarInferSlot)>,
     /// Instance fields a constructor initializer list assigns (`b = e` /
     /// `this.b = e`): the `ConstructorFieldsVerifier`'s `initInInitializer`
     /// state, consulted by the container's flush. Keyed by the container so
@@ -2998,7 +3033,7 @@ pub(crate) struct Engine<'a> {
     /// here so a declaration nested in the initializer (a for-element's
     /// loop variable, a closure's local) cannot re-latch the slot before
     /// the outer initializer closes — the close binds ITS declarator.
-    pub(crate) init_declarators: Vec<Option<(StringId, SourceRange)>>,
+    pub(crate) init_declarators: Vec<Option<(StringId, SourceRange, VarInferSlot)>>,
     /// The staged assignment RHS types by write-target name (#2174's
     /// inference feed): the latest plain `=` write whose resolved RHS the
     /// flow staged, as `(write offset, executable serial, resolved type)`.
@@ -3209,6 +3244,23 @@ pub(crate) struct Engine<'a> {
     /// (`resolveObjectPatternPropertyGet`, type_analyzer.dart:1669-1715):
     /// `(head type, getter, anchor)`.
     pub(crate) pending_pattern_getters: Vec<(StringId, StringId, SourceRange)>,
+    /// The enclosing container's primary constructor formal names. Upstream
+    /// scopes them narrowly — the `ConstructorInitializerScope` of the
+    /// non-late INSTANCE field initializers (`scope_context.dart:432-461`)
+    /// and the `PrimaryParameterScope` of the `this : ...` body
+    /// (`:406-430`) — and never the member scope: a read from a STATIC or
+    /// `late` field initializer, or from a method body, answers
+    /// `undefined_identifier` (oracle 3.13.7). The parser/engine registers
+    /// these formals into the container frame's locals (the body needs
+    /// them), so the set marks the names that must not answer there; it is
+    /// cleared with the container frame.
+    pub(crate) primary_formals: FxHashSet<StringId>,
+    /// A field-group initializer is open (`begin_field_initializer` ..
+    /// `end_field_initializer`) — with a non-static, non-`late` group it is
+    /// the one member plane the primary constructor's formals are visible
+    /// from. A closure inside the initializer stays on the plane (the
+    /// upstream scope covers the whole expression).
+    pub(crate) field_initializer_open: bool,
     /// The parameters of the executable declaration in flight attach to
     /// this declaration site (set at the site-creating begin events,
     /// read by the formal-parameter identifiers).

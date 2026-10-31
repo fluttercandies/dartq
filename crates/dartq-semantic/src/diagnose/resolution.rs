@@ -798,10 +798,41 @@ impl<'a> Engine<'a> {
     pub(crate) fn member_declared_ty(&self, container: StringId, member: StringId) -> Ty {
         match self.walk_members(container, member) {
             Walk::Found(entry) if entry.kind == MemberKind::Field => {
-                self.fold_alias_ty(entry.var_ty)
+                self.fold_alias_ty(self.field_model_ty(container, member, entry.var_ty))
             }
             _ => Ty::UNKNOWN,
         }
+    }
+
+    /// A field's model `var_ty` with the inferred overlay applied: a
+    /// `var`/`final`-inferred declaration carries `Unknown` in the element
+    /// model (the collector runs before any inference), so the diagnosing
+    /// pass's own initializer inference — [`Self::bind_inferred_ty`]'s model
+    /// slots — answers instead. `container` is the walk's start; the overlay
+    /// keys on the DECLARING container, the origin the walk latched, so an
+    /// inherited field answers too. A written annotation or a field no walk
+    /// resolved keeps the model face.
+    pub(crate) fn field_model_ty(&self, container: StringId, field: StringId, model: Ty) -> Ty {
+        if model != Ty::UNKNOWN {
+            return model;
+        }
+        let declaring = self.member_faces.last_origin().unwrap_or(container);
+        self.field_inferred_tys
+            .get(&(declaring, field))
+            .copied()
+            .unwrap_or(model)
+    }
+
+    /// A top-level variable's model `var_ty` with the same overlay: its
+    /// `TopDecl::var_ty` carries `Unknown` for an inferred declaration.
+    pub(crate) fn top_var_model_ty(&self, name: StringId, model: Ty) -> Ty {
+        if model != Ty::UNKNOWN {
+            return model;
+        }
+        self.top_var_inferred_tys
+            .get(&name)
+            .copied()
+            .unwrap_or(model)
     }
 
     /// The write target's `getWriteType` — the assignment resolver's
@@ -813,7 +844,7 @@ impl<'a> Engine<'a> {
     pub(crate) fn member_write_ty(&mut self, container: StringId, member: StringId) -> Ty {
         match self.walk_members(container, member) {
             Walk::Found(entry) if entry.kind == MemberKind::Field => {
-                self.fold_alias_ty(entry.var_ty)
+                self.fold_alias_ty(self.field_model_ty(container, member, entry.var_ty))
             }
             _ => {
                 let setter = self.setter_spelling(member);
@@ -2001,10 +2032,19 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         ) {
-            ScopedHit::Local(decl) => (
-                self.bare_info_of(name, decl),
-                RefTarget::Decl { file: self.file },
-            ),
+            ScopedHit::Local(decl) => {
+                // This unit's own declaration: the model row answers, with
+                // the inferred overlay for a `var`-inferred top-level
+                // variable (`TopDecl::var_ty` is `Unknown` there — the
+                // collector runs before any inference).
+                let shape = match self.bare_info_of(name, decl) {
+                    BareInfo::Plain { ty } => BareInfo::Plain {
+                        ty: self.top_var_model_ty(name, ty),
+                    },
+                    other => other,
+                };
+                (shape, RefTarget::Decl { file: self.file })
+            }
             ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
             ScopedHit::Ambiguous(_) => (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque),
             ScopedHit::NotFound => {
