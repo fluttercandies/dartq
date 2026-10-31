@@ -5888,7 +5888,22 @@ impl<'a> Engine<'a> {
             kind: ContainerKind::Class,
         }) = row.shape
         {
-            return Ty::named(name);
+            // The creation's INSTANCE type, never the bare head (#3063):
+            // the created row's own solved face (`pending_send_ty`) or the
+            // written `<…>` group keyed on the row's offset
+            // ([`Self::creation_row_ty`]) instantiates the container's
+            // parameters, so `Box<int>(1) + make()` resolves the operator's
+            // `Box<int>` formals and return instead of leaving `T` free.
+            // An unwritten group (`C()`) keeps the bare head — the
+            // to-bounds residual is the display face's, not the operand's.
+            if let Ty::Named { args, .. } = row.ty
+                && args != ArgListId::EMPTY
+            {
+                return row.ty;
+            }
+            return self
+                .creation_row_ty(name, false, row.range.offset)
+                .unwrap_or_else(|| Ty::named(name));
         }
         let ty = self.receiver_static_ty(row);
         // A literal operand's row carries no type at push
@@ -6085,7 +6100,28 @@ impl<'a> Engine<'a> {
             if let Some(formals) = entry.formals.as_deref()
                 && let Some(formal) = formals.positional.first()
             {
-                return Some((formal.ty, entry.return_ty));
+                // The declared signature spells the DECLARING container's
+                // parameters (`Box<T> operator +(Box<T>)`); the receiver's
+                // written arguments bind them (#3063) — `Box<int>` answers
+                // `(Box<int>) -> Box<int>`, so the fold's node type and the
+                // operand check both read the instantiated face instead of
+                // the raw `Box<T>` (which matched nothing downstream and
+                // leaked the parameter spelling into every sink). The
+                // environment is the one a member invocation derives
+                // ([`Self::member_recv_env`]: an own member pairs the
+                // container's parameters with the receiver's arguments, an
+                // inherited one composes the clause hops); a receiver with
+                // no environment (raw spelling, unresolvable container)
+                // keeps the declared face.
+                let declaring = self.member_faces.last_origin().unwrap_or(name);
+                let keys: FxHashMap<StringId, Ty> = self
+                    .member_recv_env(left_ty, declaring, &entry)
+                    .map(|env| env.into_iter().collect())
+                    .unwrap_or_default();
+                return Some((
+                    self.substitute_ty(formal.ty, &keys),
+                    self.substitute_ty(entry.return_ty, &keys),
+                ));
             }
         }
         // The core-fiction arm: `int`/`double` inherit `num`'s arithmetic
@@ -6266,6 +6302,14 @@ impl<'a> Engine<'a> {
         // is the most frequent typed expression shape, the probes are
         // run-stable, and the slot match admits exactly the three heads
         // the guard can ever fire on.
+        // The shadow holds on `num`'s ABSENCE alone. With the receiver
+        // spelled `num` the receiver probe and the `num` probe are the
+        // same lookup, so a shadow can never hold there — a library that
+        // resolves `num` has the numeric face, and `num + double` must
+        // refine to `double` as `int + double` does (#3063: a spurious
+        // `name == num` disjunct short-circuited every `num` receiver
+        // into the unrefined arm, folding `num + double` to `num` and
+        // `num + int` to `num` by accident rather than by the int arm).
         if let Ty::Named { name, .. } = left_ty {
             let shadow_slot = match self.strings.resolve(name) {
                 "int" => Some(0),
@@ -6286,16 +6330,15 @@ impl<'a> Engine<'a> {
                             name,
                         )
                         .is_some()
-                            && (name == num
-                                || resolve_container(
-                                    self.graph,
-                                    self.namespaces,
-                                    self.index,
-                                    self.lib,
-                                    self.file,
-                                    num,
-                                )
-                                .is_none());
+                            && resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                num,
+                            )
+                            .is_none();
                         self.numeric_shadow_memo[slot].set(Some(shadowed));
                         shadowed
                     }
