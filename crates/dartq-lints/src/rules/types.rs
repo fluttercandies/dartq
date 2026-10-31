@@ -6977,6 +6977,241 @@ mod wave1_types_tests {
         assert!(f.run(&one_rule("always_specify_types")).is_empty());
     }
 
+    /// The `required`-prefixed named formal faces (`test_topLevelParameter_
+    /// named_omitted`): a bare `required p2` reports at the whole parameter
+    /// span (the node carries the modifier), a bare `p1` at its name, a
+    /// `required final p2` at the keyword alone. The wildcard formal stays
+    /// silent (`test_functionExpression_parameterType_omitted_wildcard`).
+    #[test]
+    fn specify_required_prefix_parameter_faces() {
+        let f = Fixture::parse("m({p1, required p2}) {}\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        let p1 = tok(&f.source, &f.tokens, "p1", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, p1)..utf16_at(&f, p1) + 2);
+        let required = tok(&f.source, &f.tokens, "required", 0);
+        assert_eq!(
+            lints[1].range,
+            utf16_at(&f, required)..utf16_at(&f, required) + 11,
+            "{lints:?}"
+        );
+
+        let f = Fixture::parse("m(p1, [p2]) {}\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+
+        let mut f = Fixture::parse("// @dart = 3.10\nm({p1, required final p2}) {}\n");
+        f.version = Some(dartq_language::LanguageVersion::new(3, 10));
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        let final_kw = tok(&f.source, &f.tokens, "final", 0);
+        assert_eq!(lints[1].range.start, utf16_at(&f, final_kw));
+        assert_eq!(lints[1].range.end - lints[1].range.start, 5);
+
+        let f = Fixture::parse("void f(List<String> p) {\n  p.forEach((_) {});\n}\n");
+        assert!(f.run(&one_rule("always_specify_types")).is_empty());
+    }
+
+    /// The closure-parameter faces (`test_closureParameter_*`, all pinned
+    /// at 3.10 — the declaring-parameters gate makes keyword-bearing named
+    /// formals an error at the latest version): named and positional
+    /// groups report at the keyword, the keyword-less pair at the name and
+    /// the whole `required p2` span.
+    #[test]
+    fn specify_closure_parameter_faces() {
+        let source = "// @dart = 3.10\nf() {\n  ({final p1, required final p2}) {};\n}\n";
+        let mut f = Fixture::parse(source);
+        f.version = Some(dartq_language::LanguageVersion::new(3, 10));
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        let final_kw = tok(&f.source, &f.tokens, "final", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, final_kw));
+        let final_kw2 = tok(&f.source, &f.tokens, "final", 1);
+        assert_eq!(lints[1].range.start, utf16_at(&f, final_kw2));
+
+        let source = "// @dart = 3.10\nf() {\n  ({var p1, required var p2}) {};\n}\n";
+        let mut f = Fixture::parse(source);
+        f.version = Some(dartq_language::LanguageVersion::new(3, 10));
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].range.end - lints[0].range.start, 3);
+        assert_eq!(lints[1].range.end - lints[1].range.start, 3);
+
+        let source = "// @dart = 3.10\nf() {\n  (final p1, [final p2]) {};\n}\n";
+        let mut f = Fixture::parse(source);
+        f.version = Some(dartq_language::LanguageVersion::new(3, 10));
+        assert_eq!(
+            f.run(&one_rule("always_specify_types")).len(),
+            2,
+            "{source:?}"
+        );
+
+        let source = "f() {\n  ({p1, required p2}) {};\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        let required = tok(&f.source, &f.tokens, "required", 0);
+        assert_eq!(lints[1].range.start, utf16_at(&f, required));
+        assert_eq!(lints[1].range.end - lints[1].range.start, 11);
+    }
+
+    /// The primary-constructor declaring formals (`test_primaryConstructor_
+    /// declaringParameter_*`, `test_primaryConstructor_parameter_omitted`,
+    /// `test_primaryConstructor_named_primary`): keyword at the keyword,
+    /// keyword-less at the name; typed, `this` and `super` formals stay
+    /// silent. The extension-type representation formal reports too
+    /// (`test_extensionType_primaryConstructor_omitted`).
+    #[test]
+    fn specify_primary_constructor_parameter_faces() {
+        let f = Fixture::parse("class C(final x);\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let final_kw = tok(&f.source, &f.tokens, "final", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5);
+
+        let f = Fixture::parse("class C(x);\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let x = tok(&f.source, &f.tokens, "x", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, x));
+
+        let f = Fixture::parse("class C.named(x);\n");
+        assert_eq!(f.run(&one_rule("always_specify_types")).len(), 1);
+
+        let f = Fixture::parse("class C(int x, final int y);\n");
+        assert!(f.run(&one_rule("always_specify_types")).is_empty());
+
+        let f = Fixture::parse("class A {\n  A(int p1);\n}\nclass B(super.p1) extends A;\n");
+        assert!(f.run(&one_rule("always_specify_types")).is_empty());
+
+        let f = Fixture::parse("class C(this.x) {\n  int x;\n}\n");
+        assert!(f.run(&one_rule("always_specify_types")).is_empty());
+
+        let f = Fixture::parse("extension type E(i) {}\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let i = tok(&f.source, &f.tokens, "i", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, i));
+    }
+
+    /// The static-field keyword faces (`test_staticField_const/final/var`):
+    /// the report lands on the `var`/`final`/`const` after `static`.
+    #[test]
+    fn specify_static_field_faces() {
+        for (source, keyword) in [
+            ("class C {\n  static const f = 0;\n}\n", "const"),
+            ("class C {\n  static final f = 0;\n}\n", "final"),
+            ("class C {\n  static var f = 0;\n}\n", "var"),
+        ] {
+            let f = Fixture::parse(source);
+            let lints = f.run(&one_rule("always_specify_types"));
+            assert_eq!(lints.len(), 1, "{source:?} -> {lints:?}");
+            let kw = tok(&f.source, &f.tokens, keyword, 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, kw), "{source:?}");
+        }
+    }
+
+    /// The nested raw type-argument faces: a raw generic nested inside a
+    /// written argument list reports at the inner name
+    /// (`test_topLevelVariableDeclaration_typeArgument_implicitTypeArgument`,
+    /// `test_constructorTearoff_typeArgument`), a raw alias body type
+    /// reports inside the typedef (`test_typedef_withImplicitTypeArgument`,
+    /// `test_typedef_aliased_typeArgument_withImplicitTypeArgument`), and
+    /// the generic-alias annotation with a trailing `?` covers the whole
+    /// node span (`test_declaredVariable_genericTypeAlias`).
+    #[test]
+    fn specify_nested_raw_type_argument_faces() {
+        let f = Fixture::parse("List<List>? x;\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let inner = tok(&f.source, &f.tokens, "List", 1);
+        assert_eq!(lints[0].range, utf16_at(&f, inner)..utf16_at(&f, inner) + 4);
+
+        let f = Fixture::parse("void f() {\n  List<List>.filled;\n}\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let inner = tok(&f.source, &f.tokens, "List", 1);
+        assert_eq!(lints[0].range, utf16_at(&f, inner)..utf16_at(&f, inner) + 4);
+
+        let f = Fixture::parse("typedef RawList = List;\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let list = tok(&f.source, &f.tokens, "List", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, list)..utf16_at(&f, list) + 4);
+
+        let f = Fixture::parse(
+            "typedef StringMap<V> = Map<String, V>;\ntypedef MapList = List<StringMap>;\n",
+        );
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let alias = tok(&f.source, &f.tokens, "StringMap", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, alias));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 9);
+
+        let f = Fixture::parse("typedef StringMap<V> = Map<String, V>;\nStringMap? x;\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let alias = tok(&f.source, &f.tokens, "StringMap", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, alias));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 10);
+    }
+
+    /// The generic-alias invocation callee (`test_instanceCreation_
+    /// genericTypeAlias_implicitTypeArgument`) reports at the callee; a
+    /// non-generic alias callee stays silent (`test_0`).
+    #[test]
+    fn specify_alias_creation_faces() {
+        let f = Fixture::parse(
+            "typedef StringMap<V> = Map<String, V>;\nStringMap<String> x = StringMap();\n",
+        );
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let callee = tok(&f.source, &f.tokens, "StringMap", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, callee));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 9);
+
+        let f = Fixture::parse("typedef Foo1 = Map<String, Object>;\nfinal Foo1 foo = Foo1();\n");
+        assert!(f.run(&one_rule("always_specify_types")).is_empty());
+    }
+
+    /// The pattern group faces: a record pattern reports at each keyword
+    /// (`test_recordPattern_switch`), an object pattern at its keyword
+    /// (`test_objectPattern_switch_final/var`), and a bare destructured
+    /// variable at its name (`test_listPattern_destructured`,
+    /// `test_mapPattern_destructured`).
+    #[test]
+    fn specify_pattern_group_faces() {
+        let f = Fixture::parse(
+            "f() {\n  switch ((1, 2)) {\n    case (final a, var b):\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        let final_kw = tok(&f.source, &f.tokens, "final", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5);
+        let var_kw = tok(&f.source, &f.tokens, "var", 0);
+        assert_eq!(lints[1].range, utf16_at(&f, var_kw)..utf16_at(&f, var_kw) + 3);
+
+        let f = Fixture::parse(
+            "class A {\n  int a;\n  A(this.a);\n}\n\nf() {\n  switch (A(1)) {\n    case A(a: >0 && final b):\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let final_kw = tok(&f.source, &f.tokens, "final", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5);
+
+        let f = Fixture::parse("f() {\n  var [a] = <int>[1];\n}\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let a = tok(&f.source, &f.tokens, "a", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, a)..utf16_at(&f, a) + 1);
+
+        let f = Fixture::parse("f() {\n  var {'a': a} = <String, int>{'a': 1};\n}\n");
+        let lints = f.run(&one_rule("always_specify_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let a = tok(&f.source, &f.tokens, "a", 0);
+        assert_eq!(lints[0].range, utf16_at(&f, a)..utf16_at(&f, a) + 1);
+    }
+
     // —— avoid_futureor_void ——————————————————————————————————————————————
 
     /// A `FutureOr<void>` return type and a top-level variable report at
