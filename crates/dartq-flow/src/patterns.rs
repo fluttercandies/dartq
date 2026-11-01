@@ -1472,7 +1472,13 @@ impl Interp<'_> {
     /// downward from the matched type
     /// (`downwardInferObjectPatternRequiredType`), and the written
     /// spelling stays the honest name-level stand-in the undecided
-    /// cross-base question promotes through.
+    /// cross-base question promotes through. The official pattern face
+    /// reaches the same gate the is-test face does
+    /// (`promoteForPattern` → `tryPromoteForTypeCheck`,
+    /// flow_analysis.dart:7748), so its type-parameter arm chains here
+    /// too: a pattern test against a type-variable scrutinee
+    /// (`case int _` over `T extends num`) promotes the variable to the
+    /// intersection `T & int` ([`Interp::type_parameter_promotion`]).
     fn pattern_promotion_candidate(&self, var: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
@@ -1490,6 +1496,7 @@ impl Interp<'_> {
                     self.args,
                     self.names,
                 )
+                .or_else(|| self.type_parameter_promotion(matched, tested, tested_args))
             }
         }
     }

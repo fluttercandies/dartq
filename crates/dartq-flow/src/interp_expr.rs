@@ -3727,8 +3727,9 @@ impl Interp<'_> {
     /// intersection stands as its `S` head — the same spelling the chain
     /// applies to every promoted read. Once the head is a spelled class the
     /// variable is no longer recognisable as a parameter (no boundary row),
-    /// and the plain gate owns the question.
-    fn type_parameter_promotion(
+    /// and the plain gate owns the question. Shared with the pattern face's
+    /// promotion candidate ([`crate::patterns`]).
+    pub(crate) fn type_parameter_promotion(
         &self,
         from: Ty,
         tested: Ty,
