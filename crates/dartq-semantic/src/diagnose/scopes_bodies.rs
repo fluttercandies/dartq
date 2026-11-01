@@ -2790,7 +2790,7 @@ impl<'a> Engine<'a> {
         };
         let mut candidates: Vec<(StringId, Ty)> = Vec::new();
         let mut positional_index = 0usize;
-        for (name, ty, _, _) in args {
+        for (name, ty, _, range) in args {
             let formal = match name {
                 Some(label) => formals.named_formal(*label),
                 None => {
@@ -2799,8 +2799,17 @@ impl<'a> Engine<'a> {
                     formal
                 }
             };
-            if let (Some(formal), true) = (formal, *ty != Ty::Unknown) {
-                self.closure_unify_upward(formal.ty, *ty, &params, &mut candidates);
+            // The solve-only argument type: an implicit creation argument
+            // closes untyped ([`Self::creation_arg_ty`]); `level.args`
+            // keeps its `Unknown`, so the argument verdict reads the same
+            // posture as before.
+            let ty = if *ty == Ty::Unknown {
+                self.creation_arg_ty(*range).unwrap_or(Ty::Unknown)
+            } else {
+                *ty
+            };
+            if let (Some(formal), true) = (formal, ty != Ty::Unknown) {
+                self.closure_unify_upward(formal.ty, ty, &params, &mut candidates);
             }
         }
         let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
@@ -2859,6 +2868,56 @@ impl<'a> Engine<'a> {
         if !map.is_empty() {
             self.solved_call_params.insert(row.range.offset, map);
         }
+    }
+
+    /// The static type of an implicit unnamed creation argument (`f(A())`)
+    /// for the send-close solve: the parser reports the creation as a send
+    /// of the class name, so its value row reaches the enclosing send's
+    /// close untyped, while upstream's argument is the
+    /// `InstanceCreationExpression` — statically the created class
+    /// (`identity(A())` binds `T := A`). Only an exact `Name(...)` argument
+    /// (the creation's `)` ends the argument) over a non-generic class
+    /// answers: a generic class's instantiation is the creation's own
+    /// inference, so it keeps the free-parameter under-report, as does a
+    /// name a local, a type parameter, or an alias owns.
+    fn creation_arg_ty(&self, range: SourceRange) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|t| t.utf16_offset < range.offset);
+        tokens
+            .get(at)
+            .filter(|t| t.utf16_offset == range.offset && t.kind == TokenKind::Identifier)?;
+        tokens
+            .get(at + 1)
+            .filter(|t| t.kind == TokenKind::OpenParen)?;
+        let close = self.tokens.matching_end(at + 1)?;
+        if !matches!(
+            tokens.get(close + 1).map(|t| t.kind),
+            Some(TokenKind::Comma | TokenKind::CloseParen)
+        ) {
+            return None;
+        }
+        let name = self.intern(self.tokens.lexeme(self.source, at));
+        if self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+            || self.type_resolution(name).0 != TypeResolution::Type
+        {
+            return None;
+        }
+        let (container, _) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )?;
+        (container.kind == ContainerKind::Class && container.type_params == 0).then_some(
+            Ty::Named {
+                name,
+                nullable: false,
+                args: ArgListId::EMPTY,
+            },
+        )
     }
 
     /// Whether an already-passed argument of the open send carries no
@@ -5234,22 +5293,53 @@ impl<'a> Engine<'a> {
         if in_return_position {
             self.open_return_span = Some(span);
         }
-        // An operator head latches `ret` at `begin_method` with the armed
-        // slot still empty — the return annotation's `endType` lands AFTER
-        // the head event for `int operator >` (the parser commits to the
-        // method at the `operator` keyword). The first completion still in
-        // the header window — outside any formal list, before the body
-        // opens — is that annotation: it backfills the latched UNKNOWN
-        // face. An untyped operator's first formal (`operator >(C o)`)
-        // completes under `(` and a local variable's annotation completes
-        // after `body_mark` — neither reaches this window, so the honest
-        // `dynamic` target survives.
-        if self.formal_list_depth == 0
-            && self.body_mark.is_none()
-            && let Some(ty) = self.armed_ty
-            && let Some(frame) = self.frames.last_mut()
+        // An operator head latches `ret` at `begin_method`, BEFORE its
+        // return annotation parses (the parser commits to the method at the
+        // `operator` keyword; the latch drops the armed slot, an earlier
+        // construct's type): every completion that starts before the
+        // declaring name is that annotation's, and the outermost head
+        // completes last (`List<int> operator +` completes `int`, then the
+        // re-fired `List`), so each one overwrites. Every other executable
+        // latches at its name event, after its annotation completed — no
+        // later completion (a type-parameter bound, a formal, a body local
+        // past a nested closure's frame) starts before the name, so an
+        // unannotated `f<T extends num>(T a) {}` keeps its `dynamic` face.
+        // A record field's or a function type's inner completion is no
+        // annotation head: their closes arm the slot without reaching this
+        // event, so such an operator return keeps the `dynamic` face.
+        let Some(ty) = self.armed_ty else {
+            return;
+        };
+        if !self.record_ty_stack.is_empty() || !self.fn_type_capture.is_empty() {
+            return;
+        }
+        let name_offset = match self.frames.last().map(|frame| &frame.kind) {
+            Some(FrameKind::Executable { ret: Some(ret), .. }) => ret.name_span.offset,
+            _ => return,
+        };
+        if span.offset >= name_offset {
+            return;
+        }
+        // A re-fired parameterized head's written arguments join the armed
+        // slot only after this event (`handle_type`'s #611 join): the
+        // group latch keyed at this head's offset carries them.
+        let ty = match (ty, &self.completed_group) {
+            (
+                Ty::Named {
+                    name,
+                    nullable,
+                    args: ArgListId::EMPTY,
+                },
+                Some((_, offset, args)),
+            ) if *offset == span.offset => Ty::Named {
+                name,
+                nullable,
+                args: self.boundary.intern_list(args),
+            },
+            (ty, _) => ty,
+        };
+        if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable { ret: Some(ret), .. } = &mut frame.kind
-            && ret.ty == Ty::UNKNOWN
         {
             ret.ty = ty;
         }

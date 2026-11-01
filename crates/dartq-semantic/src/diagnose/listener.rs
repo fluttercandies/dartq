@@ -1522,12 +1522,19 @@ impl ParserListener for DiagnoseListener<'_> {
         if !name_is_identifier {
             // The punctuation operator head (`>`, `==`, `[]=`) is the
             // declaration's name token — no `MethodDeclaration` identifier
-            // event follows it, so the armed return annotation latches
-            // HERE (an operator is a `MethodElement` upstream, host word
-            // `method`: `int operator >(C o) => "s";` reports `... from
-            // the method '>'`). The `C::OperatorName` arm stays as the
-            // identifier-shaped operator twin (`ret.is_none()` keeps the
-            // latch single-fire).
+            // event follows it, so the return face latches HERE (an
+            // operator is a `MethodElement` upstream, host word `method`:
+            // `int operator >(C o) => "s";` reports `... from the method
+            // '>'`). The return annotation parses AFTER this event, so the
+            // armed slot still holds an earlier construct's type — the
+            // container header's `on`/`extends` clause (`extension E on C
+            // { void operator +(int i) {} }` armed `C`) — and must not
+            // latch: the face starts `unknown`, the written annotation
+            // backfills it as it completes ([`Engine::arm_return_span`]),
+            // and an untyped operator keeps the `dynamic` face. The
+            // `C::OperatorName` arm stays as the identifier-shaped operator
+            // twin (`ret.is_none()` keeps the latch single-fire).
+            engine.armed_ty = None;
             engine.latch_return_type(ExecKind::Method, spelling, name_range);
             let is_static = engine.open_member_static;
             let container = engine.container_context().map_or(spelling, |(c, _)| c);
@@ -2513,6 +2520,27 @@ impl ParserListener for DiagnoseListener<'_> {
                                     ) =>
                             {
                                 Some((mark + 1, None))
+                            }
+                            // The expression-plus-type-arguments window
+                            // (`var c = C<int>`, `var t = C<int>.new`, `var
+                            // f = id<int>`): the head's own row at `mark` is
+                            // the initializer's expression — the `<...>`
+                            // group's `TypeUse` rows above it are the written
+                            // type-argument list, never a second expression —
+                            // and its row-shape alone answers the static
+                            // type (a `C<int>` TypeLiteral reads `Type`, a
+                            // `p.C<T>` prefixed literal the same, a bare
+                            // `id<int>` the instantiated tear-off signature
+                            // the tear-off faces resolve). A `Member`/`Value`
+                            // tail or any non-TypeUse above `mark` leaves the
+                            // window unpaired exactly like before.
+                            count
+                                if count > mark + 1
+                                    && engine.rows[mark + 1..]
+                                        .iter()
+                                        .all(|row| matches!(row.shape, RowShape::TypeUse(..))) =>
+                            {
+                                Some((mark, None))
                             }
                             _ => None,
                         }
@@ -3783,14 +3811,28 @@ impl ParserListener for DiagnoseListener<'_> {
                         && !engine.group_late
                         && !ty_unresolved
                         && engine.written_potentially_non_nullable(ty);
-                    // An `augment` field/variable group declares no new
-                    // variable — it merges into the element's fragment
-                    // chain and owns no initializer obligation, so the
-                    // `final_not_initialized` /
-                    // `not_initialized_non_nullable_variable` latches stay
-                    // off (upstream `checkElement` walks the element the
-                    // augment joins).
-                    if (final_gate || non_nullable_gate) && !engine.group_augment {
+                    // An `augment` group owns the same initializer obligation
+                    // as any declaration: upstream walks every declaration
+                    // node, the augmenting one included
+                    // (`_checkForNotInitializedFieldDeclaration`,
+                    // `visitTopLevelVariableDeclaration` — `class C { final
+                    // int x = 0; } augment class C { augment final int x; }`
+                    // reports at the augment's `x`). Its exemptions are the
+                    // node's OWN: an `abstract`/`external` head (the flushes'
+                    // member-model exemption reads the introductory entry,
+                    // never this fragment's keywords — `augment abstract
+                    // final String? foo;` stays silent), and an extension
+                    // type's instance augment — the representation field's
+                    // fragment, which the representation constructor
+                    // initializes (upstream `hasGenerativeConstructor`).
+                    let augment_exempt = engine.group_augment
+                        && (group_head_exempts_init(engine, token.range.offset)
+                            || (!engine.open_member_static
+                                && matches!(
+                                    engine.container_context(),
+                                    Some((_, ContainerKind::ExtensionType))
+                                )));
+                    if (final_gate || non_nullable_gate) && !augment_exempt {
                         if context == C::FieldDeclaration {
                             let is_static = engine.open_member_static;
                             if let Some((container, _)) = engine.container_context() {
@@ -6412,6 +6454,7 @@ impl ParserListener for DiagnoseListener<'_> {
                                     RowShape::Receiver(Receiver::Created {
                                         name,
                                         kind: ContainerKind::Class,
+                                        ..
                                     })
                                     | RowShape::Bare(BareInfo::Container {
                                         name,
@@ -9278,12 +9321,23 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.push_typed_value_row(range, ty);
             return;
         }
+        // The literal's side (`_computeSetOrMapResolution`): the parser's
+        // `hasSetEntry` is touched only by a top-level simple entry, so a
+        // literal of spreads and control-flow elements leaves it unset —
+        // the context decides first (`_fromContextType`), then the leaves
+        // (`_fromElement`; [`Engine::leaves_decide_set`]). A literal
+        // neither decides keeps the parser's map default.
         let kind = if count == 0 {
             UntypedLiteral::EmptyBraces
         } else if has_set_entry {
             UntypedLiteral::SetElements
         } else {
-            UntypedLiteral::MapEntries
+            match engine.literal_context_side(left) {
+                Some(true) => UntypedLiteral::MapEntries,
+                Some(false) => UntypedLiteral::SetElements,
+                None if engine.leaves_decide_set(left, right) => UntypedLiteral::SetElements,
+                None => UntypedLiteral::MapEntries,
+            }
         };
         engine.untyped_literals.insert(right.range.offset, kind);
         // The untyped literal's map-context entry face: a written
@@ -9719,10 +9773,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.group_const = var_final_or_const
             .and_then(|t| engine.text_of(t))
             .is_some_and(|text| text == "const");
-        // An `augment` field group declares no new field — the
-        // uninitialized latches stay off (the augment merges into the
-        // field element's existing fragment chain; it owns no initializer
-        // obligation of its own).
+        // An `augment` field group declares no new field: it owns no model
+        // row for the inferred-type overlay, while its initializer
+        // obligation stays its own — the declarator gate exempts only the
+        // node's own `abstract`/`external` head and an extension type's
+        // representation augment.
         engine.group_augment = _augment_kw.is_some();
         if var_final_or_const.and_then(|t| engine.text_of(t)) == Some("const") {
             engine.arm_const_group();
@@ -11999,6 +12054,26 @@ fn top_level_question(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
     None
 }
 
+/// The entry colon of the collection leaf `[start, end)` (`start` past
+/// trivia) — `Some` exactly when the leaf is a map entry (upstream
+/// `MapLiteralEntry`, the null-aware `?k: v` and `k: ?v` forms included).
+/// A leading `?` is the null-aware marker of `?e` / `?k: v`, never a
+/// conditional's; a conditional `?` ahead of the first top-level colon
+/// makes the leaf an expression (`c ? a : b`), while the `?` of `??`,
+/// `?.`, and `?..` is an operator of its own (`a ?? b: v`, `a?.b: v`).
+fn entry_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let start = start + usize::from(bytes.get(start) == Some(&b'?'));
+    let colon = top_level_colon(bytes, start, end)?;
+    let mut from = start;
+    while let Some(at) = top_level_question(bytes, from, colon) {
+        if !matches!(bytes.get(at + 1), Some(b'?' | b'.')) {
+            return None;
+        }
+        from = at + 2;
+    }
+    Some(colon)
+}
+
 /// The `}` closing the brace group opening at `open` (nested `{`/`}` and
 /// quoted strings skipped — an interpolation's braces pair inside the
 /// string skip).
@@ -12154,6 +12229,37 @@ fn typed_group_head(engine: &Engine<'_>, left: Token) -> Option<usize> {
             _ => {}
         }
     }
+}
+
+/// Whether the variable group head declaring the name at `name_offset`
+/// spells its own `abstract` or `external` keyword — the declaration node's
+/// exemption from both uninitialized faces (the `abstractKeyword` /
+/// `externalKeyword` gate of `_checkForNotInitializedFieldDeclaration` and
+/// `visitTopLevelVariableDeclaration`). The head runs from the previous
+/// member boundary to the group's first `=`: a later declarator's
+/// initializer can hold a bare `external` identifier, a head cannot.
+fn group_head_exempts_init(engine: &Engine<'_>, name_offset: u32) -> bool {
+    use dartq_scanner::{Keyword, TokenKind};
+    let tokens = engine.tokens.as_slice();
+    let at = tokens.partition_point(|token| token.utf16_offset < name_offset);
+    let start = tokens[..at]
+        .iter()
+        .rposition(|token| {
+            matches!(
+                token.kind,
+                TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::CloseCurly
+            )
+        })
+        .map_or(0, |boundary| boundary + 1);
+    tokens[start..at]
+        .iter()
+        .take_while(|token| token.kind != TokenKind::Eq)
+        .any(|token| {
+            matches!(
+                token.kind,
+                TokenKind::Keyword(Keyword::Abstract | Keyword::External)
+            )
+        })
 }
 
 /// The written-argument tree a staged assignment RHS type carries (#2364):
@@ -12501,6 +12607,23 @@ impl Engine<'_> {
         self.emit_message_with_correction(code, range, message);
     }
 
+    /// Whether the brace literal's leaves decide a set
+    /// (`typed_literal_resolver.dart` `_fromElement`'s combination): some
+    /// leaf is a set side and none a map side. A spread whose side the rows
+    /// cannot see decides nothing — were it a `Map`, the literal is the
+    /// `_both` error either way.
+    fn leaves_decide_set(&self, left: Token, right: Token) -> bool {
+        let mut set = false;
+        for (start, end) in self.literal_leaves(left, right) {
+            match self.leaf_side(start, end) {
+                LeafSide::Map => return false,
+                LeafSide::Set => set = true,
+                LeafSide::Either | LeafSide::Blind => {}
+            }
+        }
+        set
+    }
+
     /// One leaf's must-be side (`_inferCollectionElementType`'s
     /// `mustBeMap`/`mustBeSet` bits).
     fn leaf_side(&self, start: usize, end: usize) -> LeafSide {
@@ -12536,9 +12659,7 @@ impl Engine<'_> {
                                 let s = trim_trivia(bytes, s, e);
                                 s < e
                                     && !bytes[s..].starts_with(b"...")
-                                    && top_level_colon(bytes, s, e).is_some_and(|colon| {
-                                        top_level_question(bytes, s, colon).is_none()
-                                    })
+                                    && entry_colon(bytes, s, e).is_some()
                             })
                     });
                     return if has_entry {
@@ -12577,17 +12698,13 @@ impl Engine<'_> {
             }
             return LeafSide::Blind;
         }
-        match top_level_colon(bytes, s, end) {
-            Some(colon) => {
-                // A conditional's mid-leaf `?` ahead of the colon makes
-                // the leaf an expression; the plain colon is an entry.
-                if top_level_question(bytes, s, colon).is_some() {
-                    LeafSide::Set
-                } else {
-                    LeafSide::Map
-                }
-            }
-            None => LeafSide::Set,
+        // `_fromElement`: a map entry (its null-aware `?k: v` / `k: ?v`
+        // forms included) is a map side; an expression — the null-aware
+        // `?e` element and a conditional included — a set side.
+        if entry_colon(bytes, s, end).is_some() {
+            LeafSide::Map
+        } else {
+            LeafSide::Set
         }
     }
 
@@ -12943,11 +13060,17 @@ impl Engine<'_> {
             return;
         }
         let anchor = if self.call_opens_at(selector.end()) {
-            // The send's own node is the receiver expression: a bare read
-            // keeps its span (`a` of `a.m()`), a member chain widens to the
-            // whole access (`b.g` of `b.g.m()`).
-            self.property_access_span(self.rows[receiver].range)
-                .unwrap_or(self.rows[receiver].range)
+            // The send's receiver is a whole expression node (upstream
+            // `method_invocation_resolver.dart` `_reportUseOfVoidType` —
+            // `useOfVoidResult.at(receiver)`): an invoked receiver spans
+            // the completed send through its `)` (`v()` of `v().m()`, `c.m()`
+            // of `c.m().n()` — the callee row itself keeps its name-only
+            // range), a member chain widens to the whole access (`b.g` of
+            // `b.g.m()`), and a bare read keeps its span (`a` of `a.m()`).
+            let range = self.rows[receiver].range;
+            self.invocation_span(range)
+                .or_else(|| self.property_access_span(range))
+                .unwrap_or(range)
         } else {
             selector
         };

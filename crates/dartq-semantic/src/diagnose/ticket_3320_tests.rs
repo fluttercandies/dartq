@@ -255,11 +255,10 @@ fn conditional_condition_context_types_the_cascade_target() {
 }
 
 /// A creation-expression argument carries its static type into the solve
-/// (`identity(A())` binds `T := A`); today the argument row is untyped at the
-/// send close, the parameter stays free, and the fallback names `Function`.
+/// (`identity(A())` binds `T := A`): the argument row closes untyped (the
+/// creation parses as a send of the class name), and the send-close solve
+/// reads the created class through `creation_arg_ty` (#3359).
 #[test]
-#[ignore = "target: a creation argument does not constrain the callee's inference \
-            (scopes_bodies.rs send-close argument round) — #3318"]
 fn creation_argument_solves_the_generic_parameter() {
     let report = report_ops(
         "class A {}\

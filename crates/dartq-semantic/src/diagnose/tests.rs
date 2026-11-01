@@ -19742,3 +19742,50 @@ mod ticket_3392_tests;
 #[cfg(test)]
 #[path = "ticket_3412_tests.rs"]
 mod ticket_3412_tests;
+
+// The #3359 pins (the executable return latch and the augment field
+// group): an unannotated executable — an operator with no name event, a
+// host whose body completes a type after a nested closure — returns
+// `dynamic`, a written annotation still backfills, and an `augment` field
+// group owes its own initializer unless its head is `abstract`/`external`.
+// The listener riders ride along: the `void` member-send receiver anchor
+// and the brace literal's side (#3393 — the null-aware key is a map entry;
+// a spread/control-flow literal takes the context's side, then its
+// leaves'). Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3359 pins (the executable return latch and the augment field
+// group): an unannotated executable — an operator with no name event, a
+// host whose body completes a type after a nested closure — returns
+// `dynamic`, a written annotation still backfills, and an `augment` field
+// group owes its own initializer unless its head is `abstract`/`external`.
+// The listener riders ride along: the `void` member-send receiver anchor
+// and the brace literal's side (#3393 — the null-aware key is a map entry;
+// a spread/control-flow literal takes the context's side, then its
+// leaves'). Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3359_tests.rs"]
+mod ticket_3359_tests;
+
+// The #3411 pins (the `@nonVirtual` override face and the setter
+// function-type arity): a member overriding an inherited CONCRETE member
+// that carries `@nonVirtual` reports at its own name and names the
+// declaring container — the superclass-and-mixins map only, `implements`
+// faces never; and a setter compares its function type's single parameter
+// rather than a malformed declaration's written list. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3415 pins (the send close's staging source and the named-selector
+// creation's published instantiation): the flow send fold now reads the
+// same operand-static-type fact every verdict over the row reads, so a
+// function-typed formal's call result deads the arm the oracle deads, and a
+// genuinely undecidable result still stages nothing; a named constructor's
+// argument-solved instantiation publishes where the created row's type
+// readers resolve it, while an unsolved one stays `Unknown`. Registered
+// here via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
