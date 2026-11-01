@@ -269,6 +269,12 @@ pub struct PersistedFormals {
 #[expect(clippy::struct_excessive_bools)] // flags mirror the official member modifier set
 pub struct PersistedMemberEntry {
     pub kind: PersistedMemberKind,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode as introductions (the #539
+    /// additive-field discipline; the member's augmentation-fragment bit —
+    /// its own `augment` modifier).
+    #[serde(default)]
+    pub is_augment: bool,
     pub is_static: bool,
     pub is_abstract: bool,
     pub is_external: bool,
@@ -827,6 +833,7 @@ impl<'a> Slice<'a> {
                 MemberKind::Setter => PersistedMemberKind::Setter,
                 MemberKind::Field => PersistedMemberKind::Field,
             },
+            is_augment: entry.is_augment,
             is_static: entry.is_static,
             is_abstract: entry.is_abstract,
             is_external: entry.is_external,
@@ -1598,6 +1605,7 @@ impl PersistedMemberEntry {
                 PersistedMemberKind::Setter => MemberKind::Setter,
                 PersistedMemberKind::Field => MemberKind::Field,
             },
+            is_augment: self.is_augment,
             is_static: self.is_static,
             is_abstract: self.is_abstract,
             is_external: self.is_external,
@@ -1761,6 +1769,7 @@ mod tests {
         let string_fn = pool.function(0, string, std::slice::from_ref(&int), &[], true);
         let member = move |text: &str| MemberEntry {
             kind: MemberKind::Method,
+            is_augment: false,
             is_static: false,
             is_abstract: false,
             is_external: false,
@@ -1990,6 +1999,7 @@ mod tests {
         let name = |text: &str| strings.intern(text);
         let member = || MemberEntry {
             kind: MemberKind::Method,
+            is_augment: false,
             is_static: false,
             is_abstract: false,
             is_external: false,

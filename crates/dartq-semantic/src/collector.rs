@@ -2362,6 +2362,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// already has keeps ITS row — the repeat is `duplicate_definition`'s
     /// business (`member_dup_claim`), and the library-wide fragment merge
     /// applies the same keep-first rule (`library::ElementFragments`).
+    ///
+    /// A member carrying its OWN `augment` modifier folds nowhere: it is an
+    /// augmentation fragment of the member element, not an introduction in
+    /// this container, so the merged member map (the introduction face every
+    /// member-shaped consumer reads) must not absorb it — upstream keeps the
+    /// fragment identity on the member's own chain
+    /// (`fragment.isAugmentation`, element_builder.dart:
+    /// `fragment.isAugmentation = node.augmentKeyword != null`), and the
+    /// augmentation verifier walks that chain, never the merged map. A
+    /// member WITHOUT the modifier folds as before — it is an introduction
+    /// the fragment makes into the element.
     fn fold_fragment(&mut self, name: StringId, fragment: &Container, fragment_ctors: CtorFacts) {
         let Some(mut sitting) = self.named_containers.get(&name).cloned() else {
             return;
@@ -2369,7 +2380,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         sitting.members = sitting
             .members
             .iter()
-            .chain(fragment.members.iter())
+            .chain(fragment.members.iter().filter(|(_, entry)| !entry.is_augment))
             .cloned()
             .collect();
         // Declaration order: the element's constants first, then every
@@ -3339,12 +3350,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // The constant's member row was inserted at `EnumValueDeclaration`
         // (the element's last registered constant is this one — the
         // constants parse in declaration order, members after).
+        let constant_is_augment = builder.declaring_augment;
         if let Some(ty) = declared
             && let Some(open) = builder.containers.last_mut()
             && let Some(&constant) = open.enum_constants.last()
         {
             let entry = open.members.or_insert_with(constant, || MemberEntry {
                 kind: MemberKind::Field,
+                is_augment: constant_is_augment,
                 is_static: true,
                 is_abstract: false,
                 is_external: false,
@@ -4106,6 +4119,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             Entry::Vacant(slot) => {
                                 slot.insert(MemberEntry {
                                     kind: MemberKind::Field,
+                                    // The group's own `augment` keyword — the
+                                    // fragment identity the fold and the
+                                    // merged duplicate replay read.
+                                    is_augment: augmenting.is_some(),
                                     is_static,
                                     is_abstract,
                                     is_external,
@@ -4185,6 +4202,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         Entry::Vacant(slot) => {
                             slot.insert(MemberEntry {
                                 kind: MemberKind::Field,
+                                // The constant's augment fact rides the
+                                // container's flag (the enum-constants grammar
+                                // carries no separate per-constant latch
+                                // here) — the same fact the claim gate below
+                                // reads.
+                                is_augment: builder.declaring_augment,
                                 is_static: true,
                                 is_abstract: false,
                                 is_external: false,
@@ -4689,6 +4712,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             if let Some(open) = builder.containers.last_mut() {
                 let entry = MemberEntry {
                     kind,
+                    // The member's own `augment` keyword (`begin_method`
+                    // latched it; the flag is this member's until the reset
+                    // below) — the fragment identity the fold and the merged
+                    // duplicate replay read.
+                    is_augment: builder.declaring_augment,
                     is_static: pending.is_static,
                     // A body-less non-external method/getter/setter is the
                     // abstract shape (`void m();`); the `abstract` fields'
@@ -5520,6 +5548,46 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // registers no named selector, and the formal table keeps the
         // class-name key its `C(...)` creations look up under.
         let named_selector = selector.filter(|s| builder.strings.resolve(*s) != "new");
+        // The primary constructor's target-kind row: upstream seals every
+        // primary constructor fragment as a complete origin declaration
+        // (`isPrimary`/`isComplete`, upstream Dart SDK source,
+        // pkg/analyzer/lib/src/summary2/element_builder.dart
+        // `visitPrimaryConstructorDeclaration`) — the row an `augment C()`
+        // head resolves its chain against. The one primary that is itself
+        // an augmentation — an `augment extension type` head's
+        // representation constructor (`parent is ExtensionTypeDeclaration &&
+        // parent.augmentKeyword != null`) — chains through the augment face
+        // instead and pushes no target, the same intro-only rule the
+        // body-constructor arms follow.
+        let primary_is_augmentation = builder.containers.last().is_some_and(|open| {
+            open.kind == ContainerKind::ExtensionType && open.augment_kw.is_some()
+        });
+        if !primary_is_augmentation
+            && let Some((container, _)) = builder.containers.last().and_then(|open| open.name)
+        {
+            builder.decl_kinds.push(AugTarget {
+                container: Some(container),
+                // The unnamed face — and a `.new` head, which
+                // `named_selector` already folded away — keys under the
+                // container's own name, the lookup spelling the augment
+                // face (`Space::StaticMember`) and the formal table share.
+                name: named_selector.unwrap_or(container),
+                kind: AugKind::Constructor,
+                is_final: false,
+                is_mixin_application: false,
+                // `constKeyword != null || parent is EnumDeclaration` — an
+                // enum's primary constructor is implicitly const.
+                is_const: const_keyword.is_some()
+                    || builder
+                        .containers
+                        .last()
+                        .is_some_and(|open| open.kind == ContainerKind::Enum),
+                is_factory: false,
+                // A primary is always complete.
+                is_complete: true,
+                head_range: None,
+            });
+        }
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
             open.ctor_const |= const_keyword.is_some();
@@ -6165,6 +6233,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let open = builder.containers.last_mut().expect("checked above");
             open.members.or_insert_with(name, || MemberEntry {
                 kind: MemberKind::Field,
+                // A declaring formal's fragment is an augmentation only when
+                // its PRIMARY is (an augmenting extension type's head — the
+                // class/mixin/extension parents leave it an introduction).
+                is_augment: false,
                 is_static: false,
                 is_abstract: false,
                 is_external: false,
@@ -6347,6 +6419,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 .last()
                 .is_some_and(|open| open.kind == ContainerKind::ExtensionType)
         {
+            // The representation field's fragment shares its primary's
+            // augment rule: an `augment extension type` head marks the
+            // primary (and every formal-derived field) an augmentation.
+            let rep_is_augment = builder
+                .containers
+                .last()
+                .is_some_and(|open| open.augment_kw.is_some());
             let open = builder.containers.last_mut().expect("checked above");
             open.primary_formals.push(RepFormal {
                 formal,
@@ -6365,6 +6444,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let rep_ty = formal.ty;
             open.members.or_insert_with(name, || MemberEntry {
                 kind: MemberKind::Field,
+                is_augment: rep_is_augment,
                 is_static: false,
                 is_abstract: false,
                 is_external: false,
@@ -6383,8 +6463,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             });
             // The representation field's induced getter claims the
             // instance scope (the representation formal is `final` — no
-            // setter face).
-            builder.member_dup_claim(name, false, DUP_GETTER, range);
+            // setter face). An augmenting extension type's representation
+            // getter is an augmentation fragment: it neither checks nor
+            // claims (member_duplicate_definition_verifier.dart:307-309).
+            if !rep_is_augment {
+                builder.member_dup_claim(name, false, DUP_GETTER, range);
+            }
         }
     }
 }

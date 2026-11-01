@@ -1051,6 +1051,7 @@ fn core_entry(kind: MemberKind) -> &'static MemberEntry {
     fn bare(kind: MemberKind) -> MemberEntry {
         MemberEntry {
             kind,
+            is_augment: false,
             is_static: false,
             is_abstract: false,
             is_external: false,

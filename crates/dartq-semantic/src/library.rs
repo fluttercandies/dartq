@@ -485,6 +485,16 @@ fn build_fragments(
             members.sort_by_key(|(_, entry)| entry.name_range.offset);
             let mut unit_dups: Vec<DuplicateDecl> = Vec::new();
             for (name, entry) in members {
+                // An augmentation member neither checks nor claims
+                // (`fragment.isAugmentation` returns before the scope claim,
+                // member_duplicate_definition_verifier.dart:307-309), so it
+                // joins no merged replay: a fragment member carrying its own
+                // `augment` modifier reports nothing here however many
+                // fragments repeat the name. A member WITHOUT the modifier
+                // is an introduction the fragment makes and claims as usual.
+                if entry.is_augment {
+                    continue;
+                }
                 let claims: &[u8] = match entry.kind {
                     MemberKind::Field => {
                         // An enum constant claims only the getter face
