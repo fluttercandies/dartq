@@ -15,7 +15,9 @@ use dartq_resolution::{
     PackageTable as UriPackageTable, ResolvedTarget, SelectedUri, UriResolution, UriResolver,
     doc_imports, resolve_conditional,
 };
-use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
+use dartq_scanner::{
+    Keyword, KeywordStyle, ScanConfig, ScanResult, Token, TokenKind, TokenTable, scan,
+};
 use dartq_sdk::AllowedExperiments;
 use dartq_snapshot::EntryKey;
 use dartq_source::{
@@ -2322,8 +2324,6 @@ fn walk_import_export(
                         // per-token combinator-warning anchor
                         // (dead_code_verifier.dart:148-158).
                         let token = tokens.get(i).expect("kind_at checked");
-                        let end = token.utf16_offset + utf16_len_of(lexeme);
-                        last_combinator_end = last_combinator_end.max(end);
                         name_spans.push(SourceRange {
                             offset: token.utf16_offset,
                             length: utf16_len_of(lexeme),
@@ -2334,6 +2334,24 @@ fn walk_import_export(
                         break;
                     }
                 }
+                // The clause's end token — `Combinator.endToken` is the last
+                // name's end, or the synthetic identifier the official
+                // `ensureIdentifier` splices when the list read no name
+                // (`ast.dart` `HideCombinatorImpl:17348` /
+                // `ShowCombinatorImpl:29973`; `identifier_context_impl.dart
+                // :948-1000`). The synthetic sits at the offending follower, so
+                // a name-less (or trailing-comma) list ends THERE, at the
+                // follower's offset — `export 'a.dart' hide A show class A {}`
+                // spans `hide A show ` (through the `class`), not just the
+                // first clause's names.
+                let clause_end = if expect_name {
+                    tokens
+                        .get(i)
+                        .map_or(tokens.last().utf16_offset, |token| token.utf16_offset)
+                } else {
+                    name_spans.last().map_or(0, |span| span.offset + span.length)
+                };
+                last_combinator_end = last_combinator_end.max(clause_end);
                 let clause = if hide {
                     CombinatorClause::Hide(names.into())
                 } else {
@@ -2491,7 +2509,22 @@ fn walk_conditional_uri(
             // Garbage between the condition and the real closer: the clause
             // shape is broken (the official reports and jumps to the group end).
             clean &= j == interior_end;
-            i = close.map_or(interior_end, |end| end + 1);
+            i = match close {
+                // A real closer: the official reports the interior token and
+                // resumes past the group end (`next = endGroup`, :1145-1150).
+                Some(end) if !tokens.get(end).is_some_and(Token::is_synthetic) => end + 1,
+                // An UNTERMINATED group: the scanner pairs the unmatched `(`
+                // with an APPENDED synthetic closer past the file's real
+                // tokens, and the official RELOCATES that `)` to right after
+                // the last consumed clause token (`rewriter.moveSynthetic`,
+                // :1130-1140). The group therefore ends at the first
+                // unconsumed token: `import 'a.dart' if (b import 'b.dart';`
+                // ends the clause at the second `import`, whose own face —
+                // its `uri_does_not_exist` row included — survives.
+                // `close + 1` here would swallow every directive behind the
+                // clause.
+                _ => j,
+            };
         }
     } else {
         // Missing `(`: the official's insertParens (:1102-1109) stands in an

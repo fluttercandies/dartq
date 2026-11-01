@@ -1446,10 +1446,21 @@ fn obvious_spelling<'a>(c: &'a Check<'a>, value: u32) -> Option<Vec<&'a str>> {
         NodeKind::LiteralNull => Some(vec!["Null"]),
         NodeKind::SymbolLiteral => Some(vec!["Symbol"]),
         // `-1` / `-1.0` — the MINUS-only prefix face (`!true` is not
-        // obvious upstream: the PrefixExpression case is MINUS-only).
+        // obvious upstream: the PrefixExpression case is MINUS-only). A
+        // scanner-folded signed literal (`-1` as one token) answers on the
+        // token's own spelling.
         NodeKind::UnaryPrefix => {
+            let head = c.lexeme(c.head_token(value));
+            if let Some(rest) = head.strip_prefix('-') {
+                if rest.parse::<i64>().is_ok() {
+                    return Some(vec!["int"]);
+                }
+                if rest.contains('.') && rest.parse::<f64>().is_ok() {
+                    return Some(vec!["double"]);
+                }
+            }
             let operand = crate::rules::last_child(c, value)?;
-            match c.lexeme(c.head_token(value)) {
+            match head {
                 "-" => match c.kind(operand) {
                     NodeKind::LiteralInt => Some(vec!["int"]),
                     NodeKind::LiteralDouble => Some(vec!["double"]),

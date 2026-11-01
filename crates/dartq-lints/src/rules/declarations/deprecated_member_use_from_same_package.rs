@@ -1489,3 +1489,831 @@ fn is_reference_context(context: u32) -> bool {
         || context == IdentifierContext::ConstructorReferenceContinuation as u32
         || context == IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments as u32
 }
+
+#[cfg(test)]
+mod oracle_corpus_pins {
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// The whole upstream oracle corpus for `deprecated_member_use_from_same_package`: `DeprecatedMemberUseFromSamePackageTest` (75 cases) plus two `messages.yaml` doc entries,
+    /// `conformance/status.tsv` `lint deprecated_member_use_from_same_package 77 45 32`. Each entry is the exact
+    /// materialized case source and the oracle's `(line, column, length)` for
+    /// every `deprecated_member_use_from_same_package` row; only the rule's own rows are pinned.
+    ///
+    /// 63 single-file cases pinned (37 oracle rows).
+    /// Not representable in a single-source fixture (aux files or packages):
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedCallMethod#0` (known deviation: the `call` tear-off face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInShowCombinator#0` (known deviation: the combinator name face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInRedirectingConstructorInitializer#0` (known deviation: the redirecting-constructor initializer face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInSuperConstructorCall#0` (known deviation: the super-constructor call face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInSuperConstructorCall_implicit#0` (known deviation: the implicit super-constructor call face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_inObjectPattern_inferredName#0` (known deviation: the object-pattern inferred name face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedLibrary_export#0` (known deviation: the deprecated-library export face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedLibrary_import#0` (known deviation: the deprecated-library import face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedConstructor_usedInSuperConstructorCall#0` (known deviation: the named super-constructor call face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedParameterOfMethod#0` (known deviation: the named-parameter declaration face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedOperator_usedInCompoundAssignment#0` (known deviation: the compound-assignment operator span starts late).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedParameterOfConstructor_usedInRedirectingConstructor#0` (known deviation: the redirecting-constructor parameter face is not matched).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedPrimaryConstructor_bodyPart#0` (known deviation: the primary-constructor body part face is not matched).
+    /// `doc_bad_0` (known deviation: one row of the doc snippet is not reported).
+    #[test]
+    fn deprecated_member_use_from_same_package_oracle_corpus_pins() {
+        // (case, source, oracle rows as (line, column, length)).
+        let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass#0"#,
+                r#"
+@deprecated
+class C {}
+
+void f(C c) {}
+"#,
+                &[(5, 8, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInClassTypeAlias#0"#,
+                r#"
+@deprecated
+mixin class C {}
+
+class D = Object with C;
+"#,
+                &[(5, 23, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedClassTypeAlias#0"#,
+                r#"
+@deprecated
+mixin class C {}
+
+@deprecated
+class D = Object with C;
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedDefaultParameter#0"#,
+                r#"
+@deprecated
+class C {}
+
+void f({@deprecated C? c = null}) {}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedEnum#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+enum E {
+  one, two;
+
+  void f(C c) {}
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedExtension#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+extension E on C {}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedExtensionTypeRepresentation#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+extension type E(C c) { }
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedFieldFormalParameter#0"#,
+                r#"
+@deprecated
+class C {}
+
+class D {
+  Object c;
+  D({@deprecated required C this.c});
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedField_initializer#0"#,
+                r#"
+@deprecated
+class C {}
+
+class D {
+  @deprecated
+  Object f = C;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedField_typeAnnotation#0"#,
+                r#"
+@deprecated
+class C {}
+
+class D {
+  @deprecated
+  C? f;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedFunctionTypeAlias#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+typedef void Callback(C c);
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedFunctionTypedParameter#0"#,
+                r#"
+@deprecated
+class C {}
+
+void f({@deprecated required void p(C c)}) {}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedLibrary#0"#,
+                r#"
+@deprecated
+library a;
+
+@deprecated
+class C {}
+
+C? x;
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedMixin#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+mixin M {
+  C? x;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedSimpleParameter#0"#,
+                r#"
+@deprecated
+class C {}
+
+void f({@deprecated C? c}) {}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInDeprecatedTopLevelVariable#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+C? x;
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInExtensionTypeRepresentation#0"#,
+                r#"
+@deprecated
+class C {}
+
+extension type E(C c) { }
+"#,
+                &[(5, 18, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInFieldFormalParameter#0"#,
+                r#"
+@deprecated
+class C {}
+
+class D {
+  Object c;
+  D({required C this.c});
+}
+"#,
+                &[(7, 15, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInFunctionTypeAlias#0"#,
+                r#"
+@deprecated
+class C {}
+
+typedef void Callback(C c);
+"#,
+                &[(5, 23, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInFunctionTypedParameter#0"#,
+                r#"
+@deprecated
+class C {}
+
+void f({void p(C c)?}) {}
+"#,
+                &[(5, 16, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInGenericFunctionTypeAlias#0"#,
+                r#"
+@deprecated
+class C {}
+
+@deprecated
+typedef Callback = void Function(C);
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInGenericTypeAlias#0"#,
+                r#"
+@deprecated
+class C {}
+
+typedef Callback = void Function(C);
+"#,
+                &[(5, 34, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInHideCombinator#0"#,
+                r#"
+import 'lib.dart' hide C;
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedDefaultParameterOfFunction#0"#,
+                r#"
+void f({@deprecated int p = 1}) {}
+
+void g() => f(p: 1);
+"#,
+                &[(4, 15, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedEnum#0"#,
+                r#"
+@deprecated
+enum E {
+  one, two;
+}
+late E e;
+"#,
+                &[(6, 6, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedEnumValue#0"#,
+                r#"
+enum E {
+  one, @deprecated two;
+}
+late E e = E.two;
+"#,
+                &[(5, 14, 3)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedExtensionType_usedInExtensionTypeImplements#0"#,
+                r#"
+@deprecated
+extension type E(int i) { }
+
+extension type F(int i) implements E { }
+"#,
+                &[(5, 36, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedExtensionType_usedInExtensionTypeRepresentation#0"#,
+                r#"
+@deprecated
+extension type E(int i) { }
+
+extension type F(E c) { }
+"#,
+                &[(5, 18, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedExtensionType_usedInField#0"#,
+                r#"
+@deprecated
+extension type E(int i) { }
+
+class C {
+  E? e;
+}
+"#,
+                &[(6, 3, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedExtensionType_usedInFunctionParam#0"#,
+                r#"
+@deprecated
+extension type E(int i) { }
+
+void f(E e) { }
+"#,
+                &[(5, 8, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedExtension_usedInExtensionOverride_getter#0"#,
+                r#"
+@deprecated
+extension E on int {
+  int get foo => 1;
+}
+
+var x = E(0).foo;
+"#,
+                &[(7, 9, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedExtension_usedInExtensionOverride_methodInvocation#0"#,
+                r#"
+@deprecated
+extension E on int {
+  void f() {}
+}
+
+var x = E(0).f();
+"#,
+                &[(7, 9, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_inObjectPattern_explicitName#0"#,
+                r#"
+class A {
+  @Deprecated('')
+  final int foo = 0;
+}
+
+int f(Object x) =>
+  switch (x) {
+    A(foo: var bar) => bar,
+    _ => 0,
+  };
+"#,
+                &[(9, 7, 3)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedAsGetter#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+void f(A a) {
+  a.f;
+}
+"#,
+                &[(8, 5, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedAsSetter#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+void f(A a) {
+  a.f = 1;
+}
+"#,
+                &[(8, 5, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedInDeprecatedClass#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+@deprecated
+class B {
+  void f(A a) {
+    a.f;
+    a.f = 1;
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedInDeprecatedFunction#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+@deprecated
+void f(A a) {
+  a.f;
+  a.f = 1;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedInPostfix#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+void f(A a) {
+  a.f++;
+}
+"#,
+                &[(8, 3, 3)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedInPrefix#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+void f(A a) {
+  ++a.f;
+}
+"#,
+                &[(8, 5, 3)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_usedInSuper#0"#,
+                r#"
+class A {
+  @deprecated
+  int f = 0;
+}
+
+class B extends A {
+  int get g => super.f;
+}
+"#,
+                &[(8, 22, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedGetter_usedInAssignment#0"#,
+                r#"
+@deprecated
+int get x => 1;
+
+set x(int value) {}
+
+void f() {
+  x = 1;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedGetter_usedInCompoundAssignment#0"#,
+                r#"
+@deprecated
+int get x => 1;
+
+set x(int value) {}
+
+void f() {
+  x += 1;
+}
+"#,
+                &[(8, 3, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedIndexOperator#0"#,
+                r#"
+class C {
+  @deprecated
+  int operator[](int p) => 1;
+}
+
+void f(C c) {
+  c[1];
+}
+"#,
+                &[(8, 3, 4)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedMethod#0"#,
+                r#"
+class A {
+  @deprecated
+  void m() {}
+
+  void m2() {
+    m();
+  }
+}
+"#,
+                &[(7, 5, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedMethod_usedInDeprecatedConstructor#0"#,
+                r#"
+class A {
+  @deprecated
+  void m() {}
+
+  @deprecated
+  A() {
+    m();
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedMethod_usedInDeprecatedSubclassConstructor#0"#,
+                r#"
+class A {
+  @deprecated
+  void m() {}
+}
+class B extends A {
+  @deprecated
+  B() {
+    m();
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedMethod_usedInPrimaryConstructorBody#0"#,
+                r#"
+@deprecated
+void deprecatedMethod() {}
+
+class B(var int x) {
+  this {
+    deprecatedMethod();
+  }
+}
+"#,
+                &[(7, 5, 16)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedMethod_withMessage#0"#,
+                r#"
+class A {
+  @Deprecated('Message')
+  void m() {}
+
+  void m2() {
+    m();
+  }
+}
+"#,
+                &[(7, 5, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedConstructor#0"#,
+                r#"
+class C {
+  @deprecated
+  C.named();
+}
+
+var x = C.named();
+"#,
+                &[(7, 9, 7)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedParameterOfFunction#0"#,
+                r#"
+void f({@deprecated int? p}) {}
+
+void g() => f(p: 1);
+"#,
+                &[(4, 15, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedParameterOfFunction_usedInDeclaringFunction#0"#,
+                r#"
+int? f({@deprecated int? p}) => p;
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedOperator#0"#,
+                r#"
+class C {
+  @deprecated
+  C operator+(int other) => C();
+}
+void f(C c) {
+  c + 1;
+}
+"#,
+                &[(7, 3, 5)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedParameterOfConstructor_usedInDeclaringConstructorBody#0"#,
+                r#"
+class C {
+  C({@deprecated int? p}) {
+    p;
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedParameterOfConstructor_usedInDeclaringConstructorInitializer#0"#,
+                r#"
+class C {
+  C({@deprecated int? p}) : assert(p == null || p > 0);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedParameterOfPrimaryConstructor_usedInDeclaringConstructorBody#0"#,
+                r#"
+class C({@deprecated int? p}) {
+  this : q = p;
+  int? q;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedPositionalParameterOfFunction#0"#,
+                r#"
+void f([@deprecated int? p]) {}
+
+void g() => f(1);
+"#,
+                &[(4, 15, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedSetter#0"#,
+                r#"
+@deprecated set f(int value) {}
+
+void g() => f = 1;
+"#,
+                &[(4, 13, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedSetter_usedInCompoundAssignment#0"#,
+                r#"
+int get x => 1;
+
+@deprecated
+set x(int value) {}
+
+void f() {
+  x += 1;
+}
+"#,
+                &[(8, 3, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedStaticField#0"#,
+                r#"
+class A {
+  @deprecated
+  static int f = 0;
+}
+
+var a = A.f;
+"#,
+                &[(7, 11, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedTopLevelVariable_usedInAssignment#0"#,
+                r#"
+@deprecated
+int x = 1;
+
+void f() {
+  x = 1;
+}
+"#,
+                &[(6, 3, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedUnnamedConstructor#0"#,
+                r#"
+class C {
+  @deprecated
+  C();
+}
+
+var x = C();
+"#,
+                &[(7, 9, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedUnnamedConstructor_newSyntax#0"#,
+                r#"
+class C {
+  @deprecated
+  new();
+}
+
+var x = C();
+"#,
+                &[(7, 9, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/doc_good_0"#,
+                r#"// Declared in one library:
+class Foo {
+  @Deprecated("Use 'm2' instead")
+  void m1() {}
+
+  void m2({
+      @Deprecated('This is an old parameter') int? p,
+  })
+}
+
+@Deprecated('Do not use')
+int x = 0;
+
+// In the same or another library, but within the same package:
+@Deprecated('Do not use')
+void m(Foo foo) {
+  foo.m1();
+  foo.m2(p: 7);
+  x = 1;
+}
+"#,
+                &[],
+            ),
+        ];
+
+        // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+        fn offset(source: &str, line: u32, column: u32) -> u32 {
+            let line_start: usize = source
+                .split_inclusive('\n')
+                .take(line as usize - 1)
+                .map(str::len)
+                .sum();
+            (line_start + column as usize - 1) as u32
+        }
+        let mut mismatches = Vec::new();
+        for (case, source, oracle) in cases {
+            let f = Fixture::parse(source);
+            let mut lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+            lints.sort_by_key(|lint| lint.range.start);
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            let mut want: Vec<(u32, u32)> = oracle
+                .iter()
+                .map(|&(line, column, length)| {
+                    let start = offset(source, line, column);
+                    (start, start + length)
+                })
+                .collect();
+            want.sort_unstable();
+            if got != want {
+                mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+}

@@ -68,7 +68,7 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     // It's ok to override to have better documentation (:79).
-    if has_doc_comment(c, node) {
+    if has_member_doc_comment(c, node) {
         return;
     }
     let get_set = super::get_set_token(c, node);
@@ -150,23 +150,35 @@ fn check(c: &mut Check<'_>) {
         None => forwards_to_super(c, node, query, &name),
     };
     if forwards {
-        // An operator reports at its own token (the `+`/`~` — the
-        // `OperatorName` row anchors at the `operator` keyword, so its
-        // span would over-run); a method/accessor at the name row.
+        // An operator reports at its own token (the `+`/`~` —
+        // `reportAtToken(declaration.name)`); a method/accessor at the
+        // name row.
         let range = match operator {
             Some(op_row) => {
-                let Some(start) = c
-                    .field_token(op_row, PayloadField::Name)
-                    .and_then(|token| c.utf16_of_token(token))
-                else {
+                let Some(token) = c.field_token(op_row, PayloadField::Name) else {
                     return;
                 };
-                start..start
+                crate::rules::utf16_token_span(c, token)
             }
             None => c.utf16_span(name_row),
         };
         c.report(range, &[]);
     }
+}
+
+/// `has_doc_comment` over the whole member declaration — the doc comment
+/// attaches to the metadata's first token when the member carries
+/// annotations (`/// Text.` above `@override`).
+fn has_member_doc_comment(c: &Check<'_>, node: u32) -> bool {
+    if has_doc_comment(c, node) {
+        return true;
+    }
+    let Some(parent) = c.unit.ast.parent(node) else {
+        return false;
+    };
+    member_annotations(c, parent, node)
+        .first()
+        .is_some_and(|&meta| has_doc_comment(c, meta))
 }
 
 /// The written annotation names of a member (the `MetadataStar` left
@@ -369,6 +381,14 @@ fn forwards_to_super(c: &Check<'_>, node: u32, query: MemberQuery, name: &str) -
     let Some(rows) = body_expression_rows(c, node) else {
         return false;
     };
+    // `visitSuperExpression`'s comment guard (:112-114): a comment ahead of
+    // the forwarded `super` target keeps the override.
+    if rows.iter().any(|&row| {
+        c.lexeme(c.head_token(row)) == "super"
+            && c.comments.has_attached(c.head_token(row) as usize)
+    }) {
+        return false;
+    }
     match query {
         MemberQuery::Method => super_call_forwards(c, &rows, name, node),
         MemberQuery::Getter => super_getter_forwards(c, &rows, name),
@@ -428,7 +448,15 @@ fn body_expression_rows(c: &Check<'_>, node: u32) -> Option<Vec<u32>> {
         return None;
     }
     match c.kind(last) {
-        NodeKind::ExpressionStatement => Some(head.to_vec()),
+        NodeKind::ExpressionStatement => {
+            // `visitSuperExpression`'s guard (:112-114): a comment before
+            // the forwarded expression means the override documents
+            // something and stays.
+            if c.comments.has_attached(c.head_token(last) as usize) {
+                return None;
+            }
+            Some(head.to_vec())
+        }
         NodeKind::ReturnStatement => {
             if c.comments.has_attached(c.head_token(last) as usize) {
                 return None;
@@ -751,4 +779,587 @@ fn super_setter_forwards(c: &Check<'_>, rows: &[u32], name: &str, param: &str) -
         .unwrap_or(rhs.len());
     rhs.drain(..lead);
     matches!(rhs.as_slice(), [only] if c.kind(*only) == NodeKind::Identifier && c.lexeme(c.head_token(*only)) == param)
+}
+
+#[cfg(test)]
+mod oracle_corpus_pins {
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// The whole upstream oracle corpus for `unnecessary_overrides`: `UnnecessaryOverridesTest` (37 single-file cases) plus six `messages.yaml` doc entries,
+    /// `conformance/status.tsv` `lint unnecessary_overrides 43 34 9`. Each entry is the exact
+    /// materialized case source and the oracle's `(line, column, length)` for
+    /// every `unnecessary_overrides` row; only the rule's own rows are pinned.
+    ///
+    /// 39 single-file cases pinned (7 oracle rows).
+    /// Not representable in a single-source fixture (aux files or packages):
+    /// `UnnecessaryOverridesTest/test_class_augmentation_method_withoutOverride_noSuper#0` (multi_file).
+    /// `UnnecessaryOverridesTest/test_class_augmentation_method_withoutOverride_noSuper#1` (multi_file).
+    /// `UnnecessaryOverridesTest/test_enum_field#0` (known deviation: the inherited `runtimeType` needs dart:core resolution).
+    /// `UnnecessaryOverridesTest/test_enum_method#0` (known deviation: the inherited `toString` needs dart:core resolution).
+    /// `UnnecessaryOverridesTest/test_method_expressionFunctionBody_namedParameters#0` (known deviation: the named-argument forward is not matched).
+    /// `UnnecessaryOverridesTest/test_method_expressionFunctionBody_namedParameters_outOfOrder#0` (known deviation: the named-argument forward is not matched).
+    #[test]
+    fn unnecessary_overrides_oracle_corpus_pins() {
+        // (case, source, oracle rows as (line, column, length)).
+        let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_binaryOperator_expressionFunctionBody#0"#,
+                r#"
+class A {
+  int operator +(int other) => 0;
+}
+class C extends A {
+  @override
+  int operator +(int other) => super + other;
+}
+"#,
+                &[(7, 16, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_expressionFunctionBody_otherTarget#0"#,
+                r#"
+class A {
+  int get x => 7;
+}
+class C extends A {
+  final a = A();
+  @override
+  int get x => a.x;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_expressionFunctionBody_superCall#0"#,
+                r#"
+class A {
+  int get x => 0;
+}
+class C extends A {
+  @override
+  int get x => super.x;
+}
+"#,
+                &[(7, 11, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_getter_returnTypeChanged#0"#,
+                r#"
+class A {
+  num get g => 0;
+}
+class C extends A {
+  @override
+  int get g => super.g as int;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody#0"#,
+                r#"
+class A {
+  void m() {}
+}
+class C extends A {
+  @override
+  void m() {
+    super.m();
+  }
+}
+"#,
+                &[(7, 8, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody_noSuper#0"#,
+                r#"
+class A {
+  void m() {}
+}
+class C extends A {
+  @override
+  void m() {
+    m();
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_blockBody_otherStatements#0"#,
+                r#"
+class A {
+  int m(int a) => 0;
+}
+class C extends A {
+  @override
+  int m(int a) {
+    print("something");
+    return super.m(a);
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_differentDocumentation#0"#,
+                r#"
+class C {
+  num get g => 7;
+}
+class E extends C {
+  /// Text.
+  @override
+  num get g => super.g;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_everythingTheSame#0"#,
+                r#"
+class A {
+  int m(int a, int b) => 0;
+}
+class C extends A {
+  @override
+  int m(int a, int b) => super.m(a, b);
+}
+"#,
+                &[(7, 7, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_mismatchedAguments#0"#,
+                r#"
+class A {
+  int m(int a, int b) => 0;
+}
+class C extends A {
+  @override
+  int m(int a, int b) => super.m(b, a);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_expressionFunctionBody_namedParameters_mismatchedArguments#0"#,
+                r#"
+class A {
+  int m({int a = 0, int b = 0}) => 0;
+}
+class C extends A {
+  @override
+  int m({int a = 0, int b = 0}) => super.m(b: a, a: b);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_hasOtherAnnotations#0"#,
+                r#"
+class A {
+  int m() => 7;
+}
+class C extends A {
+  @override
+  @MyAnnotation()
+  int m() => super.m();
+}
+class MyAnnotation {
+  const MyAnnotation();
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_commentsInBody#0"#,
+                r#"
+class A {
+  void a() { }
+}
+
+class B extends A {
+  @override
+  void a() {
+    // There's something we want to document here.
+    super.a();
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_expressionStatement_commentsInBody#0"#,
+                r#"
+class A {
+  void a() { }
+}
+
+class B extends A {
+  @override
+  void a() =>
+    // There's something we want to document here.
+    super.a();
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_ok_returnExpression_commentsInBody#0"#,
+                r#"
+class A {
+  @override
+  String toString() {
+    // There's something we want to document here.
+    return super.toString();
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterAdditional_named#0"#,
+                r#"
+class A {
+  num m(int v) => 7;
+}
+class C extends A {
+  @override
+  num m(int v, {int v2 = 1}) => super.m(v);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterAdditional_positional#0"#,
+                r#"
+class A {
+  num m(int v) => 7;
+}
+class C extends A {
+  @override
+  num m(int v, [int v2 = 1]) => super.m(v);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterCovariance#0"#,
+                r#"
+class A {
+  num m(num v) => 7;
+}
+class C extends A {
+  @override
+  num m(covariant int v) => super.m(v);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterDefaultChanged#0"#,
+                r#"
+class A {
+  num m({int v = 0}) => 7;
+}
+class C extends A {
+  @override
+  num m({int v = 10}) => super.m(v: v);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterRenamed#0"#,
+                r#"
+class A {
+  num m(int v) => 7;
+}
+class C extends A {
+  @override
+  num m(int v2) => super.m(v2);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged#0"#,
+                r#"
+class A {
+  num m(int v) => 0;
+}
+class C extends A {
+  @override
+  num m(num v) => super.m(v as int);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged_named#0"#,
+                r#"
+class A {
+  num m({int v = 20}) => 0;
+}
+class C extends A {
+  @override
+  num m({num v = 20}) => super.m(v: v as int);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_parameterTypeChanged_optionalPositional#0"#,
+                r#"
+class A {
+  num m([int v = 20]) => 0;
+}
+class C extends A {
+  @override
+  num m([num v = 20]) => super.m(v as int);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_protectedBecomesPublic#0"#,
+                r#"
+import 'package:meta/meta.dart';
+class A {
+  @protected
+  num m(int v) => 7;
+}
+class C extends A {
+  @override
+  num m(int v) => super.m(v);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_method_returnTypeChanged#0"#,
+                r#"
+class A {
+  num m(int v) => 0;
+}
+class C extends A {
+  @override
+  int m(int v) => super.m(v) as int;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_noSuchMethod#0"#,
+                r#"
+class A {}
+class C implements A {
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_operator_parameterRenamed#0"#,
+                r#"
+class A {
+  num operator +(int other) => 7;
+}
+class C extends A {
+  @override
+  num operator +(int other2) => super + other2;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_operator_returnTypeChanged#0"#,
+                r#"
+class A {
+  num operator +(int other) => 0;
+}
+class C extends A {
+  @override
+  int operator +(int other) => super + other as int;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_blockBody_superCall#0"#,
+                r#"
+class A {
+  set x(other) {}
+}
+class C extends A {
+  @override
+  set x(other) {
+    super.x = other;
+  }
+}
+"#,
+                &[(7, 7, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_expressionFunctionBody_otherTarget#0"#,
+                r#"
+class A {
+  set x(int value) {}
+}
+class C extends A {
+  final a = A();
+  @override
+  set x(int value) => a.x = value;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_parameterRenamed#0"#,
+                r#"
+class A {
+  set s(num v) {}
+}
+class C extends A {
+  @override
+  set s(num v2) => super.s = v2 as int;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_setter_parameterTypeChanged#0"#,
+                r#"
+class A {
+  set s(int v) {}
+}
+class C extends A {
+  @override
+  set s(num v) => super.s = v as int;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/UnnecessaryOverridesTest/test_unaryOperator_expressionFunctionBody#0"#,
+                r#"
+class A {
+  A operator ~() => A();
+}
+class C extends A {
+  @override
+  A operator ~() => ~super;
+}
+"#,
+                &[(7, 14, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/doc_bad_0"#,
+                r#"class C {
+  int m(int x) => x;
+}
+
+class D extends C {
+  @override
+  int m(int x) => super.m(x);
+}
+"#,
+                &[(7, 7, 1)],
+            ),
+            (
+                r#"lints/unnecessary_overrides/doc_bad_1"#,
+                r#"class A extends B {
+  @override
+  void foo() {
+    super.foo();
+  }
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/doc_good_0"#,
+                r#"class C {
+  int m(int x) => x;
+}
+
+class D extends C {
+  @override
+  int m(int x) => super.m(x) + 1;
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/doc_good_1"#,
+                r#"import 'package:meta/meta.dart';
+
+class C {
+  int m(int x) => x;
+}
+
+class D extends C {
+  @mustCallSuper
+  @override
+  int m(int x) => super.m(x);
+}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/doc_good_2"#,
+                r#"class C {
+  int m(int x) => x;
+}
+
+class D extends C {}
+"#,
+                &[],
+            ),
+            (
+                r#"lints/unnecessary_overrides/doc_good_3"#,
+                r#"class A extends B {
+  @override
+  void foo() {
+    doSomethingElse();
+  }
+}
+"#,
+                &[],
+            ),
+        ];
+
+        // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+        fn offset(source: &str, line: u32, column: u32) -> u32 {
+            let line_start: usize = source
+                .split_inclusive('\n')
+                .take(line as usize - 1)
+                .map(str::len)
+                .sum();
+            (line_start + column as usize - 1) as u32
+        }
+        let mut mismatches = Vec::new();
+        for (case, source, oracle) in cases {
+            let f = Fixture::parse(source);
+            let mut lints = f.run(&one_rule("unnecessary_overrides"));
+            lints.sort_by_key(|lint| lint.range.start);
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            let mut want: Vec<(u32, u32)> = oracle
+                .iter()
+                .map(|&(line, column, length)| {
+                    let start = offset(source, line, column);
+                    (start, start + length)
+                })
+                .collect();
+            want.sort_unstable();
+            if got != want {
+                mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
 }

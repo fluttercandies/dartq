@@ -2243,6 +2243,26 @@ impl ParserListener for DiagnoseListener<'_> {
                 .insert(name_tok.offset, (row_range.offset, true));
         }
 
+        // The element-value `void` face (`_checkForEachParts`'s
+        // `sequenceElementType is VoidType && variableType is! VoidType`
+        // arm, error_verifier.dart:4478-4484): a `void` element's value is
+        // consumed by the implicit assignment to the loop variable, which
+        // can only discard it into a `void` head — the oracle reports at
+        // the ITERABLE expression. The loop variable's declared face gates
+        // it (a `var`/`final` head infers the element itself, so a `void`
+        // element lands in a `void` head and stays silent upstream).
+        let void_element = match (self.engine.for_in_marks.last(), loop_var.as_ref()) {
+            (Some(&mark), Some((name, _))) => self.engine.for_in_void_element(
+                mark,
+                await_kw.is_some(),
+                self.engine.local_declared_ty(*name),
+            ),
+            _ => None,
+        };
+        if let Some(range) = void_element {
+            self.engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+        }
+
         // The `_checkForEachParts` iterable face: the iterable's operand
         // rows closed at `end_for_in_expression` and the `await` keyword
         // arrives only now, so the assignability ask runs here.
@@ -8995,9 +9015,16 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // The void-operand use (upstream `literal_element_verifier.dart`
         // :95 — `checkElement` → `checkForUseOfVoidResult(element)`): a
-        // `void`-typed element expression reports at its own span. Runs on
-        // the live element rows before the fold drains them below.
-        engine.check_collection_void_elements(left, right);
+        // `void`-typed element expression reports at its own span, but only
+        // when the literal's element type expects a non-`void` value
+        // (`elementType is! VoidType`). Runs on the live element rows
+        // before the fold drains them below.
+        let typed = engine.typed_list_literal_ty(left);
+        let element = typed.and_then(|ty| match ty {
+            Ty::Named { args, .. } => engine.boundary.args.borrow().get(args).first().copied(),
+            _ => None,
+        });
+        engine.check_collection_void_elements(left, right, element, None, None);
         engine.check_list_literal_elements(left, right);
         // The literal folds to one expression node upstream: its element
         // rows belong to the node, not the stack — drain them into the
@@ -9023,7 +9050,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // exactly like a typed expression. The row spans the whole literal
         // — `const`/`>`-start through the `]` — matching the oracle's
         // listLiteral anchor.
-        if engine.typed_list_literal_ty(left).is_some() {
+        if typed.is_some() {
             let span_start = const_keyword.map_or_else(
                 || {
                     // Locate the `<` group's head byte for the anchor's
@@ -9073,7 +9100,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         _ => None,
                     })
             } else {
-                engine.typed_list_literal_ty(left)
+                typed
             };
             if let Some(ty) = ty {
                 engine.push_typed_value_row(range, ty);
@@ -9179,12 +9206,29 @@ impl ParserListener for DiagnoseListener<'_> {
         // The void-operand use over the literal's elements and entry
         // key/value pairs (upstream `literal_element_verifier.dart` :95/
         // :151/:166 — `checkElement`/`_verifyMapLiteralEntry*` →
-        // `checkForUseOfVoidResult`): runs for every literal — typed and
-        // untyped alike — before the typed arm below takes its early
-        // return, so `check_map_literal_entries` stays assignability-only.
-        engine.check_collection_void_elements(left, right);
+        // `checkForUseOfVoidResult`, each gated on the enclosing element /
+        // `mapKeyType` / `mapValueType` not being `void`): before the typed
+        // arm below takes its early return, so `check_map_literal_entries`
+        // stays assignability-only. The written group supplies the gate
+        // (an untyped literal's inferred element face is not modeled here,
+        // so its leaves stay silent).
         let nested = engine.group_has_nested_args(left);
         let helper_typed = engine.typed_set_or_map_literal_ty(left);
+        let (mut element, mut key, mut value) = (None, None, None);
+        if !nested
+            && let Some((_, Ty::Named { args, .. })) = helper_typed.as_ref()
+        {
+            let args = engine.boundary.args.borrow().get(*args).to_vec();
+            match args.as_slice() {
+                [only] => element = Some(*only),
+                [k, v] => {
+                    key = Some(*k);
+                    value = Some(*v);
+                }
+                _ => {}
+            }
+        }
+        engine.check_collection_void_elements(left, right, element, key, value);
         let typed_args = if nested {
             engine.literal_group_args(left)
         } else if let Some((_, Ty::Named { args, .. })) = &helper_typed {
@@ -9507,19 +9551,37 @@ impl ParserListener for DiagnoseListener<'_> {
                 // value is consumed by the literal, so the oracle reports
                 // `use_of_void_result` at each `void` field (upstream Dart
                 // SDK source, pkg/analyzer/lib/src/dart/resolver/
-                // record_literal_resolver.dart:160 `.at(field)`). The field
+                // record_literal_resolver.dart:159 `.at(field)`). The field
                 // window drains below, so the reports happen while its rows
-                // still stand — one per `void` field, in source order.
+                // still stand — one per `void` field, in source order. A
+                // NAMED field anchors on the `RecordLiteralNamedField` node
+                // (`name: value`): the named fields are the trailing
+                // `named.len()` field rows (positional fields precede
+                // them), the others anchor on the expression itself.
                 let void_fields = positional.iter().filter(|ty| **ty == Ty::Void).count()
                     + named.iter().filter(|entry| entry.1 == Ty::Void).count();
                 if void_fields > 0 {
-                    let anchors: Vec<SourceRange> = engine.rows[mark..]
-                        .iter()
-                        .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
-                        .filter(|row| engine.operand_static_ty(row) == Ty::Void)
-                        .map(|row| row.range)
-                        .take(void_fields)
-                        .collect();
+                    let mut anchors: Vec<SourceRange> = Vec::new();
+                    {
+                        let field_rows: Vec<&Row> = engine.rows[mark..]
+                            .iter()
+                            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+                            .collect();
+                        let first_named = field_rows.len().saturating_sub(named.len());
+                        for (index, row) in field_rows.iter().enumerate() {
+                            if anchors.len() == void_fields {
+                                break;
+                            }
+                            if engine.operand_static_ty(row) != Ty::Void {
+                                continue;
+                            }
+                            anchors.push(if index >= first_named {
+                                engine.named_field_span(row.range).unwrap_or(row.range)
+                            } else {
+                                row.range
+                            });
+                        }
+                    }
                     for anchor in anchors {
                         if !engine.void_result_reported_at(anchor) {
                             engine.emit(SemanticCode::UseOfVoidResult, anchor, "", "");
@@ -12293,9 +12355,23 @@ impl Engine<'_> {
     /// at its top-level colon and checks the key and value independently;
     /// a `...`/`...?`-led spread operand answers its own face
     /// (`_verifySpreadForListOrSet` runs no void check) and is left to it.
-    /// Runs for every literal — typed and untyped alike — so the entry
+    ///
+    /// The enclosing element / `mapKeyType` / `mapValueType` supplies the
+    /// gate: the oracle only consumes the value into a non-`void` slot
+    /// (`elementType is! VoidType`, :95; `mapKeyType`/`mapValueType`, :127/
+    /// :152/:166/:171), so `<void>[v()]` and an untyped `[v()]` — whose
+    /// inferred element is the `void` leaf itself — stay silent while
+    /// `<int>[v()]` reports. An unspellable gate (`None`/`Unknown`) keeps
+    /// the under-report direction. Runs for every literal, so the entry
     /// arms in [`Self::check_map_literal_entries`] stay assignability-only.
-    pub(crate) fn check_collection_void_elements(&mut self, left: Token, right: Token) {
+    pub(crate) fn check_collection_void_elements(
+        &mut self,
+        left: Token,
+        right: Token,
+        element: Option<Ty>,
+        key: Option<Ty>,
+        value: Option<Ty>,
+    ) {
         let bytes = self.source.as_bytes();
         for (s, e) in self.literal_leaves(left, right) {
             let s = trim_ws(bytes, s, e);
@@ -12307,22 +12383,24 @@ impl Engine<'_> {
             // A map entry checks its key and value independently (the
             // `?`-key/value promote non-null upstream, which a `void` leaf
             // never reaches — the void use fires on the operand first).
-            let leaves: &[(usize, usize)] = &[(s, e)];
-            let mut sides: Vec<(usize, usize)> = Vec::new();
-            if let Some(colon) = top_level_colon(bytes, s, e) {
+            let mut sides: Vec<(usize, usize, Option<Ty>)> = Vec::new();
+            match top_level_colon(bytes, s, e) {
                 // A conditional element's `? :` splits inside the
                 // condition — the whole leaf stays one expression; only a
                 // `?`-free entry is a key/value pair.
-                if top_level_question(bytes, s, colon).is_none() {
-                    sides.push((s, colon));
-                    sides.push((colon + 1, e));
-                } else {
-                    sides.extend_from_slice(leaves);
+                Some(colon) if top_level_question(bytes, s, colon).is_none() => {
+                    sides.push((s, colon, key));
+                    sides.push((colon + 1, e, value));
                 }
-            } else {
-                sides.extend_from_slice(leaves);
+                _ => sides.push((s, e, element)),
             }
-            for (ls, le) in sides {
+            for (ls, le, slot) in sides {
+                // The slot's value is consumed only by a non-`void`
+                // element type; a `void` slot (or none the name layer can
+                // spell) discards it.
+                if !matches!(slot, Some(ty) if ty != Ty::UNKNOWN && !self.is_void_spelling(ty)) {
+                    continue;
+                }
                 let (ls, le) = (self.utf16_of(ls), self.utf16_of(le));
                 let Some((ty, range)) = self.leaf_completion_row(ls, le) else {
                     continue;
@@ -12822,6 +12900,26 @@ impl Engine<'_> {
             .diagnostics
             .iter()
             .any(|d| d.range == range && d.code.name == "use_of_void_result")
+    }
+
+    /// The `name: value` span of a record literal's named field — the
+    /// `RecordLiteralNamedField` node the oracle anchors
+    /// `use_of_void_result` on (upstream Dart SDK source, record_literal_
+    /// resolver.dart:159 `.at(field)`), never the value alone. `None` for a
+    /// positional field (no label adjoins its value).
+    fn named_field_span(&self, value: SourceRange) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let colon = tokens
+            .partition_point(|t| t.utf16_offset < value.offset)
+            .checked_sub(1)?;
+        if !matches!(tokens.get(colon)?.kind, dartq_scanner::TokenKind::Colon) {
+            return None;
+        }
+        let name = tokens.get(colon.checked_sub(1)?)?;
+        Some(SourceRange {
+            offset: name.utf16_offset,
+            length: value.end() - name.utf16_offset,
+        })
     }
 
     /// The `void`-receiver face of a member access (#3249): a `void`

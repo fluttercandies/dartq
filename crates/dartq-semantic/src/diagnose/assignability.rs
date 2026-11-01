@@ -15,6 +15,49 @@ static ASSIGNMENT_TARGET_VISITS: std::sync::atomic::AtomicUsize =
 static ASSIGNMENT_TARGET_MAX_TAIL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// The structural-descent budget of the shared assignability verdict
+/// (#3333): the nesting depth of [`Engine::assignable`] frames one ask may
+/// hold. The alias-name chain is bounded elsewhere ([`Engine::fold_alias_ty`]'s
+/// hop set), but the STRUCTURAL descent — `assignable` →
+/// [`Engine::slot_subtype`] → [`Engine::covariant_args`] →
+/// [`Engine::fn_sig_subtype`] → `assignable` — is not: a self-referential
+/// alias pair re-derives the same `(from, to)` pair at every covariance
+/// level, and one ask crossing the pair overflowed the stack of the
+/// engine's worker thread. Every cycle edge re-enters `assignable`, so the
+/// frame depth is the cycle's budget.
+const ASSIGNABLE_DEPTH_CAP: u32 = 256;
+
+thread_local! {
+    /// The live [`Engine::assignable`] frame depth on this thread (each
+    /// analyzer run owns its thread, so one counter per thread is one
+    /// counter per ask chain).
+    static ASSIGNABLE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// One [`Engine::assignable`] frame's depth ticket: `enter` refuses past
+/// [`ASSIGNABLE_DEPTH_CAP`], and `Drop` unwinds the count on every return
+/// path (early returns and panics alike), so the counter never leaks.
+struct AssignDepth;
+
+impl AssignDepth {
+    fn enter() -> Option<Self> {
+        ASSIGNABLE_DEPTH.with(|depth| {
+            let live = depth.get();
+            if live >= ASSIGNABLE_DEPTH_CAP {
+                return None;
+            }
+            depth.set(live + 1);
+            Some(Self)
+        })
+    }
+}
+
+impl Drop for AssignDepth {
+    fn drop(&mut self) {
+        ASSIGNABLE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 impl<'a> Engine<'a> {
     /// A literal `<…>` group's argument leaf as a [`Ty`]: `dynamic`/`Null`
     /// intern their dedicated faces — the same mapping the type
@@ -6123,6 +6166,24 @@ impl<'a> Engine<'a> {
     /// through the boundary pool ([`Engine::covariant_args`]). `None`
     /// suppresses (under-report).
     pub(crate) fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        // The structural-descent budget (#3333): a self-referential alias
+        // pair — `typedef F = void Function(List<G>); typedef G = void
+        // Function(List<F>);` — bounds the alias NAME chain
+        // ([`Self::fold_alias_ty`]'s hop set) but not the structural
+        // descent: `assignable` → [`Self::slot_subtype`] →
+        // [`Self::covariant_args`] → [`Self::fn_sig_subtype`] →
+        // `assignable` re-derives the same `(from, to)` pair at every
+        // covariance level, unbounded, and a single ask crossing the pair
+        // overflows the stack. Every edge of that cycle re-enters this
+        // function, so bounding the verdict's own frame depth bounds the
+        // cycle: the guard below refuses the 257th nested frame and the
+        // verdict answers `None` (unknown — the under-report direction),
+        // never a fabricated rejection. 256 frames is far above any
+        // written type's nesting, so a legitimate ask never reaches it.
+        let Some(_depth) = AssignDepth::enter() else {
+            return None;
+        };
+
         // The function-shape read runs on the WRITTEN pair first
         // (`subtype.dart` unfolds the alias before `_isFunctionSubtypeOf`,
         // but the alias faces keep the parameterized alias's signature
@@ -6350,15 +6411,20 @@ impl<'a> Engine<'a> {
         // business ([`Self::assignment_verdict`] and the `to_is_param` block
         // below decide it), so this arm defers on one.
         //
-        // The bound read is the WRITTEN capture ([`Engine::param_bound`]): an
-        // unwritten bound keeps the matrix's answer rather than assuming the
-        // implicit `Object?` (the capture cannot tell an unwritten bound from
-        // a missed one, and guessing it would overturn every unbounded
-        // parameter's clean pair). A bound that mentions the parameter itself
-        // (`X extends FutureOr<X>`) declines — recursing into it would cycle
-        // — and a promoted read's narrowing is not modeled here (the rows
-        // carry the declared parameter type; the flow layers re-derive at the
-        // read).
+        // The bound read is the WRITTEN capture ([`Engine::param_bound`]); an
+        // UNWRITTEN bound is the implicit `Object?` (upstream's type
+        // variable's nullability-independent upper bound,
+        // subtype.dart:336-350), so an unbounded in-scope `T` decides the
+        // pair exactly like an `Object?` source — `T` fits `Object?`/
+        // `dynamic`/`void` and rejects `Object` and every concrete
+        // non-nullable head. Abstaining there was the #3339 divergence:
+        // upstream's `isAssignableTo` answers false for `int x = t`, so
+        // silence was an under-report on the corpus's largest live
+        // `argument_type_not_assignable` mass. A bound that mentions the
+        // parameter itself (`X extends FutureOr<X>`) still declines —
+        // recursing into it would cycle — and a promoted read's narrowing is
+        // not modeled here (the rows carry the declared parameter type; the
+        // flow layers re-derive at the read).
         if let Ty::Named {
             name: from_name,
             nullable: false,
@@ -6366,11 +6432,20 @@ impl<'a> Engine<'a> {
         } = from
             && self.is_scope_param(from_name)
             && !matches!(to, Ty::Named { name: to_name, .. } if self.is_scope_param(to_name))
-            && let Some(bound) = self.param_bound(from_name)
-            && bound != Ty::Unknown
-            && !self.bound_mentions_param(bound, from_name, 0)
         {
-            return self.assignable(bound, to, from_literal);
+            let bound = match self.param_bound(from_name) {
+                Some(bound) if bound != Ty::Unknown => bound,
+                // No written bound (or a capture miss on a parameter this
+                // scope provably declares): the implicit `Object?`.
+                _ => Ty::Named {
+                    name: self.intern("Object"),
+                    nullable: true,
+                    args: ArgListId::EMPTY,
+                },
+            };
+            if !self.bound_mentions_param(bound, from_name, 0) {
+                return self.assignable(bound, to, from_literal);
+            }
         }
         // The cross-family arms below read `from_fn`/`to_fn` computed at
         // entry (the written pair — the alias faces' signature capture).

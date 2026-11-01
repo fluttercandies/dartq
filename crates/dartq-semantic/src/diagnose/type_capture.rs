@@ -298,6 +298,42 @@ impl<'a> Engine<'a> {
             .rev()
             .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
             .map(|site| site.range);
+        // The declaration currently closing: its container site is the last
+        // one of the name (an `augment` declaration is a separate site). The
+        // flush runs once per declaration, so a constructor or field belongs
+        // to THIS declaration only when it sits at or after this start — a
+        // merged element's earlier declaration was already decided by its
+        // own flush.
+        let decl_start = container_name.map(|range| range.offset);
+        // Upstream keys `_forInterface` per ELEMENT: an `augment` constructor
+        // merges into the introductory element, whose `_Constructor` state
+        // (and `errorRange`) is created by the FIRST declaration and reused
+        // by every later fragment. Reporting the merged element again at an
+        // augment head would double the row, so a key already decided by an
+        // earlier declaration stays out of this pass.
+        let ctor_key = |site: &DeclSite| {
+            if site.name == container || self.strings.resolve(site.name) == "new" {
+                container
+            } else {
+                site.name
+            }
+        };
+        let mut decided_ctors: FxHashSet<StringId> = FxHashSet::default();
+        if let Some(start) = decl_start {
+            for (index, site) in self.decl_sites.iter().enumerate() {
+                if site.is_factory
+                    || !matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
+                {
+                    continue;
+                }
+                let Some(head) = self.ctor_head_anchors.get(&index) else {
+                    continue;
+                };
+                if head.offset < start {
+                    decided_ctors.insert(ctor_key(site));
+                }
+            }
+        }
         let ctor_spans: Vec<(usize, SourceRange)> = self
             .decl_sites
             .iter()
@@ -307,6 +343,13 @@ impl<'a> Engine<'a> {
             })
             .filter_map(|(index, site)| {
                 let head = *self.ctor_head_anchors.get(&index)?;
+                // Only this declaration's constructors (see `decl_start`).
+                if decl_start.is_some_and(|start| head.offset < start) {
+                    return None;
+                }
+                if decided_ctors.contains(&ctor_key(site)) {
+                    return None;
+                }
                 // Upstream `_addConstructor` skips `externalKeyword` heads
                 // outright (constructor_fields_verifier.dart:56-59): an
                 // external generative constructor still counts for
@@ -327,7 +370,13 @@ impl<'a> Engine<'a> {
                             .map_or(head.end(), |token| token.end());
                         SourceRange {
                             offset: start,
-                            length: end - start,
+                            // `end` is the head's next-token end; `start` is the
+                            // `.Name` container prefix when one is written, which
+                            // can sit AFTER that token on a recovery head
+                            // (`.name(` with the selector past the `(`). Clamp so
+                            // the inverted span reports a zero-length row instead
+                            // of underflowing.
+                            length: end.saturating_sub(start),
                         }
                     }
                     // A named secondary's site range was rewritten to its
@@ -336,7 +385,10 @@ impl<'a> Engine<'a> {
                     // IS the head.
                     _ if site.range.offset > head.offset => SourceRange {
                         offset: head.offset,
-                        length: site.range.end() - head.offset,
+                        // A head anchor past its site range end (recovery ctor)
+                        // inverts the length; clamp to zero rather than
+                        // underflow.
+                        length: site.range.end().saturating_sub(head.offset),
                     },
                     _ => site.range,
                 };
@@ -458,6 +510,17 @@ impl<'a> Engine<'a> {
         // per-constructor spare sets (`initInParameter` /
         // `updateWithInitializers`) release a field for their own
         // constructor only.
+        // Upstream `_forInterface` keeps the enum's own `index` out of the
+        // required-initialization set (`element is EnumElement && field.name
+        // == 'index'`, constructor_fields_verifier.dart:120-121): the
+        // implicit enum index owns no initialization obligation, and a
+        // same-named declaration collides with it (its own row is the
+        // override/duplicate face).
+        let enum_index = self
+            .index
+            .get(self.file)
+            .and_then(|elements| elements.container(container))
+            .is_some_and(|decl| decl.kind == ContainerKind::Enum);
         let mut finals: Vec<(String, SourceRange)> = Vec::new();
         let mut non_finals: Vec<(String, SourceRange)> = Vec::new();
         let mut index = 0usize;
@@ -468,6 +531,9 @@ impl<'a> Engine<'a> {
             }
             let check = self.pending_init_variables.remove(index);
             if check.initialized || duplicates.contains(&check.name) {
+                continue;
+            }
+            if enum_index && self.strings.resolve(check.name) == "index" {
                 continue;
             }
             let exempt = self

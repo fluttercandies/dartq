@@ -389,6 +389,108 @@ fn has_dart_core(graph: &LibraryGraph) -> bool {
     graph.libraries().any(|lib| graph.uri(lib) == "dart:core")
 }
 
+// —— the deprecation KIND face (#3353) ————————————————————————————————————
+//
+// The `@Deprecated.<kind>` constructor family (upstream Dart SDK source,
+// sdk/lib/core/annotations.dart: `Deprecated.extend`/`.implement`/
+// `.instantiate`/`.mixin`/`.optional`/`.subclass`, each fixing
+// `_kind = _DeprecationKind.<name>`, plus the unnamed constructor and the
+// `deprecated` constant, which fix `use`). The oracle reads the kind off the
+// annotation's computed constant — `ElementAnnotationImpl.deprecationKind`
+// (element.dart:1785-1793: `computeConstantValue()?.getField('_kind')
+// ?.getField('_name')?.toStringValue() ?? 'use'`) — and
+// `isDeprecatedWithKind` (:2300-2302) intersects it with the element's
+// deprecation tag (`isDeprecated`, :1818-1828: a `ConstructorElement` of
+// dart:core's `Deprecated` class, or the `deprecated` top-level getter).
+//
+// At name level the SELECTOR the annotation spells IS that constant: the
+// head must pass the tag gate above, and the selector names the constructor.
+// No other spelling reaches a kind.
+
+/// One [`_DeprecationKind`] of dart:core's `Deprecated` annotation.
+///
+/// [`_DeprecationKind`]: https://api.dart.dev/stable/dart-core/Deprecated-class.html
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeprecationKind {
+    /// The unnamed `Deprecated(…)` constructor and the `deprecated`
+    /// constant — the kind of every plain tag.
+    Use,
+    /// `@Deprecated.extend(…)` — extending the annotated class.
+    Extend,
+    /// `@Deprecated.implement(…)` — implementing it.
+    Implement,
+    /// `@Deprecated.instantiate(…)` — instantiating it.
+    Instantiate,
+    /// `@Deprecated.mixin(…)` — mixing it in.
+    Mixin,
+    /// `@Deprecated.optional(…)` — omitting an optional parameter.
+    Optional,
+    /// `@Deprecated.subclass(…)` — extending or implementing it.
+    Subclass,
+}
+
+impl DeprecationKind {
+    /// The kind a named constructor spells; `None` for every other selector
+    /// (`use` is the unnamed face and has no named constructor).
+    fn from_selector(selector: &str) -> Option<Self> {
+        Some(match selector {
+            "extend" => Self::Extend,
+            "implement" => Self::Implement,
+            "instantiate" => Self::Instantiate,
+            "mixin" => Self::Mixin,
+            "optional" => Self::Optional,
+            "subclass" => Self::Subclass,
+            _ => return None,
+        })
+    }
+}
+
+/// The deprecation kind `annotation` names for `lib` — the name-level
+/// `ElementAnnotationImpl.deprecationKind`: the tag gate plus the written
+/// constructor selector. `None` when the annotation is no dart:core
+/// deprecation tag at all.
+pub fn deprecation_kind(
+    annotation: &Annotation,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    lib: LibraryId,
+) -> Option<DeprecationKind> {
+    deprecation_kind_spelling(
+        strings.resolve(annotation.name),
+        strings,
+        graph,
+        namespaces,
+        lib,
+    )
+}
+
+/// [`deprecation_kind`] over an already-resolved spelling — the form the
+/// declaration-site stars need (their names carry no [`Annotation`] face).
+pub fn deprecation_kind_spelling(
+    spelling: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    lib: LibraryId,
+) -> Option<DeprecationKind> {
+    match spelling.rsplit_once('.') {
+        // Bare (`@deprecated`, `@Deprecated`): the unnamed face.
+        None => is_core_deprecated_spelling(spelling, strings, graph, namespaces, lib)
+            .then_some(DeprecationKind::Use),
+        Some((head, selector)) => match DeprecationKind::from_selector(selector) {
+            // `@Deprecated.extend` / `@core.Deprecated.extend`: the head
+            // (with its written prefix) must be the dart:core tag.
+            Some(kind) => is_core_deprecated_spelling(head, strings, graph, namespaces, lib)
+                .then_some(kind),
+            // The dot is a PREFIX (`@core.deprecated`): the tag gate reads
+            // the whole spelling and answers the unnamed face.
+            None => is_core_deprecated_spelling(spelling, strings, graph, namespaces, lib)
+                .then_some(DeprecationKind::Use),
+        },
+    }
+}
+
 /// The message face of a `@Deprecated` annotation: the cooked string of the
 /// first positional / `message:`-labeled (then `expires:`-labeled) string
 /// argument, normalized the way the oracle presents it

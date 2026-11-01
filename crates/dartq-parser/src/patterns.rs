@@ -675,6 +675,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             } else {
                 // entry: expression `:` pattern
                 let key_before = self.cursor.progress();
+                // A modifier keyword cannot head the key expression, so the
+                // official `parseExpression` stops on it without consuming
+                // and `ensureToken(':')` anchors on the modifier itself.
+                // Frozen oracle face: `{var a: 2}` → `:` at `var` (len 3),
+                // `{final int c: 2}` → `:` at `final` (len 5), while an
+                // identifier head (`{int d: 2}`) consumes and anchors on the
+                // follower `d`.
+                let modifier_head = matches!(
+                    self.peek_kind(),
+                    TokenKind::Keyword(Keyword::Var | Keyword::Final | Keyword::Const)
+                )
+                .then(|| self.peek_span());
                 self.listener.begin_map_pattern_key();
                 self.parse_constant_expression(ConstantPatternContext::None);
                 // #2024 separator anchor: when the key IS the unrelocated
@@ -683,7 +695,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // behind — the blocker's follower — not on the blocker
                 // (frozen oracle 0c9fda4b: the separator recovery row rides
                 // the token following the recovery point).
-                let colon_anchor = if self.no_progress(key_before) {
+                let colon_anchor = if let Some(head) = modifier_head {
+                    head
+                } else if self.no_progress(key_before) {
                     self.look_span_at(1)
                 } else {
                     self.peek_span()

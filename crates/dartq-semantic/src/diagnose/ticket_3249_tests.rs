@@ -89,14 +89,15 @@ fn ticket_3249_index_write_void_receiver() {
     assert_single_void(&report, fixture, fixture.find("[0] =").unwrap(), 3);
 }
 
-/// A record literal's field value reports at the field's own expression
-/// (record_literal_resolver.dart:160 `.at(field)`); the named and the
-/// positional shape share the face.
+/// A record literal's field value reports on the field node
+/// (record_literal_resolver.dart:159 `.at(field)`) — the whole
+/// `RecordLiteralNamedField` for a named field (`a: v`: the value's row
+/// stops at the callee name), the expression itself for a positional one.
 #[test]
 fn ticket_3249_record_literal_field_void_value() {
     let named = "void v() {}\nvoid main() {\n  var r = (a: v());\n  print(r);\n}";
     let report = report_ops(named);
-    assert_single_void(&report, named, named.find("v())").unwrap(), 1);
+    assert_single_void(&report, named, named.find("a: v").unwrap(), 4);
 
     let positional = "void v() {}\nvoid main() {\n  var r = (v(), 1);\n  print(r);\n}";
     let report = report_ops(positional);

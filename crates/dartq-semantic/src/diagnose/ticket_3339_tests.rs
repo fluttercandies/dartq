@@ -28,9 +28,12 @@
 //! 2. an unbounded type-parameter source abstains at every position
 //!    (`int x = t;` is silent too) where upstream's `isAssignableTo` answers
 //!    false (`assignability.rs`, `engine_core.rs`; live lanes #3312/#3316);
-//! 3. the declared-bound rule (`T extends num` ⇒ `T <: num`) is disarmed on
-//!    this file's `TypeSystem` because `LibraryTypes::facts` carries only the
-//!    `dynamic` default (bound trees live in `bounds.rs`'s capture).
+//! 3. the declared-bound rule (`T extends num` ⇒ `T <: num`) was disarmed
+//!    on this file's `TypeSystem` because `LibraryTypes::facts` carried
+//!    only the `dynamic` default — fixed by #3358 on the container face
+//!    (the capture's bound trees now reach `facts`, and the adapter arms
+//!    `with_param_facts`); a function-scope `<T extends num>` stays
+//!    dormant (the element model discards those bound trees).
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block (`diagnose.rs`
 //! is a live-lane file out of this ticket's write scope).
@@ -66,6 +69,18 @@ fn rows<'a>(report: &'a FileReport, code: &str) -> Vec<&'a str> {
 /// `try_promote_to` / `classify` ask below answers through the same
 /// snapshot the engine mounts.
 fn ops_for(source: &str, names: &[&str]) -> ResolvedTypeOps<'static> {
+    ops_for_impl(source, names, false)
+}
+
+/// [`ops_for`] over the production-shaped clause capture
+/// (`capture_clause_trees`, exactly what the engine's fold feeds
+/// [`LibraryTypes::build_with_clauses`]): the written supertype and
+/// parameter-bound trees the element model strips to names.
+fn ops_for_captured(source: &str, names: &[&str]) -> ResolvedTypeOps<'static> {
+    ops_for_impl(source, names, true)
+}
+
+fn ops_for_impl(source: &str, names: &[&str], captured: bool) -> ResolvedTypeOps<'static> {
     // The adapter borrows the string table and the type snapshot for a
     // lifetime the pin owns for its whole body.
     let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
@@ -97,12 +112,17 @@ fn ops_for(source: &str, names: &[&str]) -> ResolvedTypeOps<'static> {
     }
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
-    let types: &'static LibraryTypes = Box::leak(Box::new(LibraryTypes::build(
+    let mut clauses = crate::resolved_ops::ClauseTrees::empty();
+    if captured {
+        crate::capture_clause_trees(file, source, &scanned.tokens, features, strings, &mut clauses);
+    }
+    let types: &'static LibraryTypes = Box::leak(Box::new(LibraryTypes::build_with_clauses(
         &graph,
         &namespaces,
         &index,
         strings,
         lib,
+        &clauses,
     )));
     let ops = ResolvedTypeOps::new(types, strings, file);
     let table: Vec<Box<str>> = names.iter().map(|n| (*n).into()).collect();
@@ -243,20 +263,23 @@ fn resolved_verdict_lattice_matches_upstream_subtype() {
     );
 }
 
-/// The one in-file verdict divergence the audit found (routed, not fixed
-/// here): `is_subtype` asks `TypeSystem` for the left-type-variable bound
-/// rule (`subtype.dart:490-500`), but [`ResolvedTypeOps::new`] builds its
-/// system without `with_param_facts`, so the rule is disarmed — `T <: num`
-/// answers `false` even for `T extends num`, where upstream answers `true`.
+/// The one in-file verdict divergence the audit found (routed, fixed by
+/// #3358 on the container face, still dormant on this fixture): the
+/// adapter's [`dartq_types::TypeSystem`] now arms the left-type-variable
+/// rule (`subtype.dart:490-500`) with the declared bounds the snapshot's
+/// facts carry — see
+/// [`container_declared_bound_answers_through_the_spelling_face`].
 ///
-/// Ignored pending the bound wiring: `LibraryTypes::facts` registers the
-/// always-satisfied `dynamic` default for every parameter (the element model
-/// carries parameter counts, not bound trees — the parse-time capture in
-/// `bounds.rs` owns the real trees), so arming the facts today would buy
-/// `T <: {dynamic, void, Object?}` and nothing more, while arming the
-/// right-type-variable leg with the same `dynamic` would over-admit. That is
-/// a half fix, so the pin stays dormant rather than the call site wrong.
-#[ignore = "dormant: LibraryTypes::facts carries only the dynamic default; the bound rule needs the captured bound trees"]
+/// This fixture stays dormant because its parameter is a **function-scope**
+/// group (`num id<T extends num>(T t)`), and the element model keeps no
+/// bound column for one: the collector discards a top-level function's
+/// bound buffer at the group's close, so `TopDecl` carries the spellings
+/// only. The parse-time window capture in `crate::bounds` is the only
+/// surviving source of those trees and has no transport into
+/// [`LibraryTypes`] — building one is a model/capture change outside this
+/// ticket's scope, so the pin records the gap instead of the wiring
+/// borrowing a bound the function never declared.
+#[ignore = "dormant: a function-scope `<T extends num>` has no bound tree in the element model (TopDecl keeps spellings only); the container face is armed"]
 #[test]
 fn type_parameter_left_answers_through_its_declared_bound() {
     let names = &["num", "T"];
@@ -268,6 +291,41 @@ fn type_parameter_left_answers_through_its_declared_bound() {
         "`T extends num` makes `T <: num` (subtype.dart:490-500)"
     );
     assert!(!ops.is_subtype(num_ty, t_ty), "`num` is not a `T`");
+}
+
+/// The #3358 pin: a *container's* declared bound reaches the name-keyed
+/// parameter id the adapter answers a body's `T` with (the face
+/// `TypeOps::is_subtype`, `try_promote_to` and every flow join read), so
+/// the left-type-variable rule is live over the production-shaped clause
+/// capture. The bound narrows without widening: `T extends num` gives
+/// `T <: num`, never `T <: String`, and `num <: T` holds for no `T`.
+#[test]
+fn container_declared_bound_answers_through_the_spelling_face() {
+    let names = &["num", "String", "T", "Box"];
+    let ops = ops_for_captured(
+        "class Box<T extends num> {\n  T widen(T other) => other;\n}\n",
+        names,
+    );
+    let t_ty = named(names, "T", false);
+    let num_ty = named(names, "num", false);
+    let string_ty = named(names, "String", false);
+    assert!(
+        ops.is_subtype(t_ty, num_ty),
+        "`class Box<T extends num>` makes `T <: num` (subtype.dart:490-500)"
+    );
+    assert!(
+        !ops.is_subtype(t_ty, string_ty),
+        "the declared bound narrows: `num <: String` fails"
+    );
+    assert!(!ops.is_subtype(num_ty, t_ty), "`num` is not a `T`");
+
+    // The unbounded twin keeps the legacy face: an undecided bound never
+    // arms the rule (`T` reads as the unbounded `Object?`).
+    let unbound = ops_for_captured("class Holder<T> {\n  T id(T t) => t;\n}\n", names);
+    assert!(
+        !unbound.is_subtype(t_ty, num_ty),
+        "an unbounded `T` carries no `num` bound"
+    );
 }
 
 /// The routing evidence for the two argument-position divergences below:

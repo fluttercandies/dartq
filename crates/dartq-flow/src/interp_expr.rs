@@ -1173,9 +1173,7 @@ impl Interp<'_> {
                 };
                 let operand = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
-                if let Some(var) = operand.reference
-                    && !self.current.model(var).captured()
-                {
+                if let Some(var) = operand.reference {
                     // The official fail arm decides before the reference
                     // branch and covers promotable references too — a
                     // reference operand never short-circuits it (upstream
@@ -1199,14 +1197,15 @@ impl Interp<'_> {
                     // here: upstream reaches it only when
                     // `_getExpressionReference` returned null
                     // (:7190-7205), so a reference test never folds to
-                    // `true` as a boolean literal on a mere subtype fact
-                    // (`int x; x is num` keeps the else live). The
-                    // reference else-deadness comes from the promotion
-                    // split itself — a bottom `factor(previous, tested)`
+                    // `true` as a boolean literal on a mere subtype fact.
+                    // The reference else-deadness comes from the promotion
+                    // split instead — a bottom `factor(previous, tested)`
                     // marks the unmatched arm unreachable
                     // (`tryPromoteForTypeCheck`'s `ifFalseIsUnreachable`,
                     // :4156-4160), already
-                    // [`Interp::branch_type_test`]'s face.
+                    // [`Interp::branch_type_test`]'s face; `int x; x is num`
+                    // therefore deads its else through the FACTOR, not the
+                    // fold (oracle-probed on Dart 3.13.1).
                     let declared = self
                         .vars
                         .get(var as usize)
@@ -1235,6 +1234,26 @@ impl Interp<'_> {
                         let cur = self.current.clone();
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
+                    } else if self.current.model(var).captured() {
+                        // The write-capture bail of `tryPromoteForTypeCheck`
+                        // (upstream Dart SDK source, pkg/_fe_analyzer_shared/
+                        // lib/src/flow_analysis/flow_analysis.dart:4136-4138):
+                        // a write-captured variable is never promoted, and
+                        // the returned `ExpressionInfo` is TRIVIAL — both
+                        // arms carry the untouched model. `isExpression_end`
+                        // reaches this through the reference branch
+                        // (:7190-7200) and never through the
+                        // `_isTypeCheckGuaranteedToSucceed` fold
+                        // (:7201-7205), so a test the declared type would
+                        // satisfy outright (`int x` write-captured:
+                        // `x is! int`, `x is num`) deads NEITHER arm —
+                        // oracle-probed on Dart 3.13.1: no `dead_code` row,
+                        // only the static `unnecessary_type_check`. The fail
+                        // arm above still applies (it decides before the
+                        // reference branch): a write-captured `int x` keeps
+                        // its `x is Null` dead then-arm.
+                        let cur = self.current.clone();
+                        expr.branches = Some((cur.clone(), cur));
                     } else {
                         // The invalid-tested split: the official reference
                         // path still takes `tryPromoteForTypeCheck`, where

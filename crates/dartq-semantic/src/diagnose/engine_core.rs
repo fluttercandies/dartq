@@ -634,6 +634,23 @@ impl<'a> Engine<'a> {
             .any(|w| range.offset >= w.offset && range.offset < w.end())
     }
 
+    /// Whether `ty` spells the `void` type. The name-level model carries
+    /// two faces for it: a written annotation folds onto [`Ty::Void`],
+    /// while a LITERAL's written type argument keeps the `void` name
+    /// (`literal_arg_leaf` special-cases only `dynamic`/`Null`, so
+    /// `<void>[]` types as `List` over a `Named{void}` element).
+    pub(crate) fn is_void_spelling(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Void => true,
+            Ty::Named {
+                name,
+                nullable: false,
+                ..
+            } => self.strings.resolve(name) == "void",
+            _ => false,
+        }
+    }
+
     /// `use_of_void_result` on one operand row (upstream
     /// `checkForUseOfVoidResult`, error_detection_helpers.dart:245-258):
     /// the operand's `staticType` is `VoidTypeImpl` and its value is
@@ -644,9 +661,28 @@ impl<'a> Engine<'a> {
     /// token (the `.at(methodName)` anchor), every other operand row spans
     /// its own expression. A non-`void` operand is a no-op.
     pub(crate) fn emit_use_of_void_result(&mut self, ty: Ty, operand: &Row) {
-        if ty == Ty::Void {
-            self.emit(SemanticCode::UseOfVoidResult, operand.range, "", "");
+        if ty != Ty::Void {
+            return;
         }
+        // One row per consumed node. The same operand is folded from more
+        // than one seam — the `&&`/`||` condition faces beside
+        // `fold_binary`'s own operand check, and `??`'s `end_if_null`
+        // beside that same fold (scopes_bodies.rs) — and the oracle answers
+        // ONE `use_of_void_result` per operand: the resolver's
+        // `_checkNonBoolOperand` (binary_expression_resolver.dart:294-295 →
+        // bool_expression_verifier.dart:57) and the verifier's
+        // `visitBinaryExpression` (error_verifier.dart:470/:482) both land
+        // on the operand span without doubling the row. Identity is the
+        // span: the row the consuming seam reads IS the operand node.
+        if self
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == operand.range && d.code.name == "use_of_void_result")
+        {
+            return;
+        }
+        self.emit(SemanticCode::UseOfVoidResult, operand.range, "", "");
     }
 
     /// The correction-carrying emit: the correction renders from the table
@@ -8268,6 +8304,61 @@ impl<'a> Engine<'a> {
                 _ => return None,
             }
         }
+    }
+
+    /// The for-in element's `void` use (upstream `_checkForEachParts`'s
+    /// `sequenceElementType is VoidType && variableType is! VoidType` arm —
+    /// error_verifier.dart:4478-4484): the iterated value is implicitly
+    /// assigned to the loop variable, so a `void` element's value can only
+    /// be discarded into a `void` loop variable. The report anchors at the
+    /// ITERABLE expression (`.at(node.iterable)`), the same face the
+    /// iterable-type check uses.
+    ///
+    /// `loop_var_ty` is the loop variable's DECLARED face: a `var`/`final`
+    /// head answers `Unknown` here because its type IS the element (a
+    /// `void` head — upstream's `variableType is VoidType`, silent), and a
+    /// typed head must spell a known non-`void` type. The element itself is
+    /// read off the iterable's written instantiation: the name-level model
+    /// carries no substitution through a user subtype, so a `void` element
+    /// is only ever spelled by a core sequence head, and any unspellable
+    /// shape keeps the under-report direction.
+    pub(crate) fn for_in_void_element(
+        &self,
+        mark: usize,
+        await_: bool,
+        loop_var_ty: Option<Ty>,
+    ) -> Option<SourceRange> {
+        match loop_var_ty {
+            Some(ty) if ty != Ty::UNKNOWN && ty != Ty::Void => {}
+            _ => return None,
+        }
+        let (ty, _, range) = self.single_row_since(mark)?;
+        let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = ty
+        else {
+            return None;
+        };
+        if args == ArgListId::EMPTY {
+            return None;
+        }
+        // The sequence heads the element staging accepts, restricted to the
+        // spellings that can carry a written `void` argument
+        // (`List`/`Set`/`Iterable`, or `Stream` under `await`).
+        let sequence = if await_ {
+            name == self.intern("Stream")
+        } else {
+            name == self.collection_heads[0]
+                || name == self.collection_heads[1]
+                || name == self.collection_heads[3]
+        };
+        if !sequence {
+            return None;
+        }
+        let element = self.boundary.args.borrow().get(args).first().copied();
+        (element.is_some_and(|element| self.is_void_spelling(element))).then_some(range)
     }
 
     /// The non-`bool` face the staged non-`bool` re-decision emits: a

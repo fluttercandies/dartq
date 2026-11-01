@@ -53,6 +53,7 @@
 //! the flow replays on the fold's thread.
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
 
 use dartq_flow::ty::{ArgTy, Base, Classification, EMPTY_ARGS, NameTypeOps, Ty as FlowTy, TypeOps};
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
@@ -136,12 +137,26 @@ pub struct LibraryTypes {
     /// ride under their `dart:core` names and lose to a same-named
     /// registered declaration (the scope chain resolves the local first).
     registry: FxHashMap<StringId, TypeDeclId>,
-    /// The parameter bounds face (`instantiateToBounds` reads it). The
-    /// element model carries parameter *counts* only — the bound trees
-    /// are the parse-time capture's (`crate::bounds`), which this
-    /// library-scoped build does not see — so every parameter's bound
-    /// registers `dynamic` (the always-satisfied default). Phase C's
-    /// `TypedModel` wiring tightens the same field.
+    /// The parameter facts face (`instantiateToBounds` reads it, and the
+    /// adapter's [`dartq_types::TypeSystem`] arms its left-type-variable
+    /// rule over it, subtype.dart:490-500). Three feeders fill it:
+    ///
+    /// * the builtins and every declaration seed `bound: None` — the
+    ///   official `bound ?? dynamic` reading, where `None` keeps the rule
+    ///   inert exactly as the unbounded default does;
+    /// * Pass 1 maps every captured container's written bound tree onto
+    ///   its own parameter ids (`crate::bounds`' trees via
+    ///   [`ClauseTrees`]);
+    /// * the spelling pass mirrors an agreed spelling's mapped bound onto
+    ///   the shared name-keyed id [`Self::type_params`] registers, which
+    ///   is the id [`ResolvedTypeOps::map_name`] answers a body's `T`
+    ///   with.
+    ///
+    /// Only real declared bounds are ever written, so a parameter whose
+    /// bound this build cannot decide never fires the rule at all.
+    /// Function-scope groups (`num id<T extends num>(T t)`) are the one
+    /// hole: the element model discards their bound trees (a `TopDecl`
+    /// keeps the spellings only), so their spellings stay inert.
     facts: ParamFactsTable,
     /// Declaration → its type-parameter ids, in declaration order — the
     /// instantiate-to-bounds input (a raw `List` reads `List<dynamic>`).
@@ -577,6 +592,8 @@ impl LibraryTypes {
             type_params,
             type_param_scope: FxHashSet::default(),
             type_param_bounds: FxHashMap::default(),
+            spelling_bound_tys: FxHashMap::default(),
+            spelling_bound_unknown: FxHashSet::default(),
             param_names,
             invokable_members: FxHashSet::default(),
             property_ty_heads: Vec::new(),
@@ -856,6 +873,8 @@ impl LibraryTypes {
             type_params,
             type_param_scope,
             type_param_bounds,
+            mut spelling_bound_tys,
+            spelling_bound_unknown,
             param_names,
             invokable_members,
             property_ty_heads,
@@ -944,24 +963,104 @@ impl LibraryTypes {
             };
             let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
             let scope = scope_of(capture, decl);
-            for (&param_id, bound_tree) in params.iter().zip(capture.param_bounds.iter()) {
-                let Some(tree) = bound_tree else {
+            for (at, &spelling) in capture.params.iter().enumerate() {
+                let bound = capture
+                    .param_bounds
+                    .get(at)
+                    .and_then(|tree| tree.as_ref())
+                    .and_then(|tree| {
+                        clause_arg_ty(
+                            strings,
+                            &table,
+                            &registry,
+                            &decl_params,
+                            &facts,
+                            &scope,
+                            tree,
+                        )
+                    });
+                // The spelling face's verdict for this declaration — the
+                // same mapped bound the declaration's own parameter id
+                // carries, so the two faces cannot disagree. A spelling two
+                // declarations of the build read differently keeps `None`
+                // (the under-report arm the merge in the spelling pass
+                // applies).
+                match spelling_bound_tys.entry((file, spelling)) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(bound);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        if *slot.get() != bound {
+                            slot.insert(None);
+                        }
+                    }
+                }
+                let Some(&param_id) = params.get(at) else {
                     continue;
                 };
-                let bound = clause_arg_ty(
-                    strings,
-                    &table,
-                    &registry,
-                    &decl_params,
-                    &facts,
-                    &scope,
-                    tree,
-                );
+                let Some(bound) = bound else {
+                    continue;
+                };
                 facts.set(
                     param_id,
                     ParamFacts {
                         variance: Variance::Covariant,
-                        bound,
+                        bound: Some(bound),
+                    },
+                );
+            }
+        }
+        // —— the shared spelling face ————————————————————————————————
+        // `ResolvedTypeOps::map_name` answers a body's `T` with the
+        // name-keyed id (`type_params`), not with the declaring container's
+        // own parameter id, so the declared bound must ride that shared id
+        // too — it is the face the flow layer's promotions, `is`-tests and
+        // joins ask. The id is name-keyed across the whole build (two
+        // files' `T`s share it), so only a bound EVERY declaration of the
+        // spelling agrees on arms it: a pair with no captured verdict (a
+        // function-scope group, a member's own `<T>`, an unfaithful
+        // header) or a disagreeing one keeps the legacy face — an unknown
+        // bound must never read as a sibling's. Seeding real declared
+        // bounds only is what keeps the arming sound: the rule
+        // (subtype.dart:490-500) fires on `bound: Some(_)` alone, so a
+        // parameter this build cannot decide never answers through it.
+        {
+            let mut agreed: FxHashMap<StringId, Option<TypeId>> = FxHashMap::default();
+            let mut unknown = spelling_bound_unknown;
+            for &(file, spelling) in &type_param_scope {
+                if unknown.contains(&spelling) {
+                    continue;
+                }
+                let Some(&bound) = spelling_bound_tys.get(&(file, spelling)) else {
+                    unknown.insert(spelling);
+                    agreed.remove(&spelling);
+                    continue;
+                };
+                match agreed.get(&spelling).copied() {
+                    Some(existing) if existing != bound => {
+                        unknown.insert(spelling);
+                        agreed.remove(&spelling);
+                    }
+                    Some(_) => {}
+                    None => {
+                        agreed.insert(spelling, bound);
+                    }
+                }
+            }
+            for (spelling, bound) in agreed {
+                let Some(bound) = bound else {
+                    // Every declaration agrees the parameter is unbounded:
+                    // the seeded `bound: None` already says so.
+                    continue;
+                };
+                let Some(&parameter) = type_params.get(&spelling) else {
+                    continue;
+                };
+                facts.set(
+                    parameter,
+                    ParamFacts {
+                        variance: Variance::Covariant,
+                        bound: Some(bound),
                     },
                 );
             }
@@ -1249,6 +1348,19 @@ struct Registry {
     /// names a bound this face cannot read — the poison the finished
     /// snapshot drops.
     type_param_bounds: FxHashMap<(FileId, StringId), Option<StringId>>,
+    /// The mapped bound of every captured declaration parameter, keyed on
+    /// the pairs [`Self::type_param_scope`] registers (`None` = unbounded,
+    /// or a written bound this build cannot map). Filled by Pass 1 from the
+    /// capture's bound trees, then mirrored onto the shared name-keyed ids
+    /// ([`LibraryTypes::facts`]).
+    spelling_bound_tys: FxHashMap<(FileId, StringId), Option<TypeId>>,
+    /// Spellings a top-level declaration declares with no bound column at
+    /// all (a generic function's or a typedef's `<T>` — the element
+    /// model's `TopDecl` keeps the spellings only). The name-keyed
+    /// parameter id is shared across files, so one undecidable declaration
+    /// keeps the spelling on the legacy face rather than borrow a
+    /// sibling's bound.
+    spelling_bound_unknown: FxHashSet<StringId>,
     /// See [`LibraryTypes::param_names`].
     param_names: FxHashMap<TypeParamId, StringId>,
     /// See [`LibraryTypes::invokable_members`].
@@ -1426,6 +1538,18 @@ impl Registry {
             // this ledger: it poisons the spelling rather than letting a
             // sibling declaration's bound speak for it.
             self.poison_param_bounds(file, &decl.type_param_names);
+            // The same declaration poisons the spelling face: the
+            // name-keyed parameter id is shared across files, so a bound
+            // a sibling container declared must never answer for a
+            // function's or alias's own group. Container kinds keep the
+            // capture's verdict instead.
+            if !matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin | MicroKind::Extension
+            ) {
+                self.spelling_bound_unknown
+                    .extend(decl.type_param_names.iter().copied());
+            }
             if self.registry.contains_key(&name) {
                 continue;
             }
@@ -1508,7 +1632,6 @@ impl Registry {
     /// declarations establishes it, and any disagreement poisons the
     /// spelling for the rest of the build.
     fn merge_param_bound(&mut self, file: FileId, name: StringId, head: Option<StringId>) {
-        use std::collections::hash_map::Entry;
         match self.type_param_bounds.entry((file, name)) {
             Entry::Vacant(slot) => {
                 slot.insert(head);
@@ -2384,7 +2507,12 @@ impl<'a> ResolvedTypeOps<'a> {
             snapshot,
             strings,
             file,
-            system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy),
+            // Armed: the snapshot's facts carry the declared bounds the
+            // left-type-variable rule answers through (subtype.dart:490-500)
+            // — an unset bound keeps the rule inert, so arming can only add
+            // answers the official relation already gives.
+            system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy)
+                .with_param_facts(&snapshot.facts),
             name_ty: RefCell::new(Vec::new()),
             local_fn_shapes: RefCell::new(FxHashMap::default()),
             overload_ids: RefCell::new(FxHashSet::default()),
