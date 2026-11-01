@@ -23,6 +23,15 @@
 //!   the generic-function bound-invariance rule :131-140), mirrored by
 //!   `TypeParameterElementImpl.computeVarianceInType`
 //!   (element.dart:11576-11623).
+//! * `pkg/analyzer/lib/src/summary2/variance_builder.dart:153-242` — the
+//!   alias entries (`_functionTypeAlias`/`_genericTypeAlias`): a typedef's
+//!   parameter variance is *computed* from the aliased body and stored on
+//!   the element (`_setVariance`, :258-261), not read from a keyword. That
+//!   stored value is what the instantiate-to-bound visitor seeds
+//!   (`_computeDefaultType`, default_types_builder.dart:153-161/171-179):
+//!   a typedef parameter contravariant in its own body grounds to `Never`,
+//!   while a class parameter — declared only, legacy covariant — still
+//!   grounds to `dynamic`.
 //!
 //! # Enforcement-point status
 //!
@@ -39,8 +48,9 @@
 //! so [`Variance::Unrelated`] is a *computation* result (it says "the
 //! parameter does not occur free in the type"), never a declared variance.
 
-use crate::ids::{TypeId, TypeParamId};
+use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::system::{DEPTH_LIMIT, TypeSystem};
+use crate::table::TypeTable;
 use crate::ty::TypeKind;
 
 /// The variance of a type parameter in a type
@@ -128,15 +138,18 @@ impl Variance {
     }
 }
 
-/// The declared facts of one type parameter: its variance keyword (the
-/// legacy-covariant default when none was written,
-/// element.dart:11560-11562) and its declared bound (`None` = unbounded;
-/// the ITB face substitutes `dynamic` exactly where the official reads
-/// `typeParameter.bound ?? DynamicTypeImpl.instance`,
-/// `type_system.dart:786`).
+/// The declared facts of one type parameter: its variance (the `in`/`out`/
+/// `inout` keyword or the legacy-covariant default, element.dart:
+/// 11560-11562; for a *typedef* parameter the value the `VarianceBuilder`
+/// computed from the aliased body, variance_builder.dart:258-261) and its
+/// declared bound (`None` = unbounded; the ITB face substitutes `dynamic`
+/// exactly where the official reads `typeParameter.bound ??
+/// DynamicTypeImpl.instance`, `type_system.dart:786`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ParamFacts {
-    /// The declared variance (`in`/`out`/`inout`, or the legacy default).
+    /// The element's stored variance: the declared keyword (or legacy
+    /// default) for a class/mixin/enum parameter, the body-computed value
+    /// for a typedef parameter (variance_builder.dart:173-181/218-221).
     pub variance: Variance,
     /// The declared bound, if any.
     pub bound: Option<TypeId>,
@@ -235,100 +248,184 @@ pub fn variance_in_type(
     parameter: TypeParamId,
     ty: TypeId,
 ) -> Variance {
-    variance_in_type_bounded(sys, facts, parameter, ty, DEPTH_LIMIT)
+    variance_in_type_bounded(
+        sys.table(),
+        facts,
+        parameter,
+        ty,
+        &|decl, i| {
+            sys.hierarchy()
+                .decl(decl)
+                .expect("declared owner")
+                .type_parameters
+                .get(i)
+                .map(|&p| facts.get(p).variance)
+        },
+        DEPTH_LIMIT,
+    )
+}
+
+/// The typedef-parameter variance entry — `VarianceBuilder._genericTypeAlias`
+/// (variance_builder.dart:188-225) and `_functionTypeAlias` (:153-186): each
+/// declared parameter's variance is computed from the aliased body itself
+/// (`_compute`/`_computeFunctionType`), not read from a keyword. A
+/// `FunctionTypeAlias` and a `GenericTypeAlias` flatten to the same
+/// right-hand-side shape in this model — the function-type alias's
+/// `_computeFunctionType` over its return type and formal parameters is
+/// exactly the [`TypeKind::Function`] arm of the shared walk — so one
+/// entry serves both spellings.
+///
+/// `argument_variance` answers the *stored* variance of an interface
+/// declaration's `i`-th type parameter — the `parameter.variance` the
+/// oracle reads inside `_compute` (variance_builder.dart:76-78/95-98). A
+/// declaration the caller cannot model returns `None` and its argument
+/// positions contribute `covariant` — the under-report direction: a
+/// genuinely contravariant interface parameter read as covariant can only
+/// soften the computed variance, never invent an occurrence. Callers with
+/// a built hierarchy adapt `hierarchy.decl(decl).type_parameters` plus
+/// `facts`; a mid-build caller (the semantic layer's own alias pass)
+/// answers from its declaration-parameter map the same way.
+///
+/// Recursion into a co-alias (`_typeAliasElement`, :227-242) has no
+/// counterpart: alias uses flatten to their right-hand sides at intern
+/// time, so the walk already sees the expanded shape — including the
+/// recursion-recovery covariance the official `_visit` set falls back to
+/// (an unresolvable alias never reaches the walk at all).
+#[allow(
+    dead_code,
+    reason = "the semantic layer's alias-defaults pass (#3469) is the first \
+              caller; the crate root re-exports it when that wiring lands"
+)]
+#[must_use]
+pub fn typedef_parameter_variances(
+    table: &TypeTable,
+    facts: &ParamFactsTable,
+    parameters: &[TypeParamId],
+    body: TypeId,
+    argument_variance: impl Fn(TypeDeclId, usize) -> Option<Variance>,
+) -> Vec<Variance> {
+    parameters
+        .iter()
+        .map(|&parameter| {
+            variance_in_type_bounded(
+                table,
+                facts,
+                parameter,
+                body,
+                &argument_variance,
+                DEPTH_LIMIT,
+            )
+        })
+        .collect()
 }
 
 fn variance_in_type_bounded(
-    sys: &TypeSystem<'_>,
+    table: &TypeTable,
     facts: &ParamFactsTable,
     parameter: TypeParamId,
     ty: TypeId,
+    argument_variance: &dyn Fn(TypeDeclId, usize) -> Option<Variance>,
     depth: u32,
 ) -> Variance {
     if depth == 0 {
         return Variance::Unrelated;
     }
-    let kind = sys.table().get(ty).kind();
+    let kind = table.get(ty).kind();
     match kind {
         TypeKind::TypeParameter { parameter: p } if p == parameter => Variance::Covariant,
         TypeKind::Interface { decl, args } => {
             let mut result = Variance::Unrelated;
-            let params = &sys
-                .hierarchy()
-                .decl(decl)
-                .expect("declared owner")
-                .type_parameters;
-            for (i, &arg) in sys.table().args(args).iter().enumerate() {
-                let parameter_variance = facts.get(params[i]).variance;
+            // An unanswerable position reads covariant — the under-report
+            // direction: `covariant.combine(x) == x`, so the argument's own
+            // occurrences still count instead of fabricating a variance.
+            for (i, &arg) in table.args(args).iter().enumerate() {
+                let parameter_variance = argument_variance(decl, i).unwrap_or(Variance::Covariant);
                 result = result.meet(parameter_variance.combine(variance_in_type_bounded(
-                    sys,
+                    table,
                     facts,
                     parameter,
                     arg,
+                    argument_variance,
                     depth - 1,
                 )));
             }
             result
         }
         TypeKind::FutureOr { base } => {
-            variance_in_type_bounded(sys, facts, parameter, base, depth - 1)
+            variance_in_type_bounded(table, facts, parameter, base, argument_variance, depth - 1)
         }
         TypeKind::Function { signature } => {
-            let sig = sys.table().signature(signature);
-            let mut result =
-                variance_in_type_bounded(sys, facts, parameter, sig.return_type, depth - 1);
+            let sig = table.signature(signature);
+            let mut result = variance_in_type_bounded(
+                table,
+                facts,
+                parameter,
+                sig.return_type,
+                argument_variance,
+                depth - 1,
+            );
             // The bound-invariance rule (variance_builder.dart:131-140):
             // occurrence in any bound of the signature's own parameters
             // forces `invariant`.
-            for p in sys.table().function_type_parameters(sig.type_parameters) {
+            for p in table.function_type_parameters(sig.type_parameters) {
                 let bound = facts.get(p).bound;
                 if let Some(bound) = bound
-                    && variance_in_type_bounded(sys, facts, parameter, bound, depth - 1)
-                        != Variance::Unrelated
+                    && variance_in_type_bounded(
+                        table,
+                        facts,
+                        parameter,
+                        bound,
+                        argument_variance,
+                        depth - 1,
+                    ) != Variance::Unrelated
                 {
                     result = Variance::Invariant;
                 }
             }
-            for member in sys.table().named_members(sig.named) {
+            for member in table.named_members(sig.named) {
                 result = result.meet(Variance::Contravariant.combine(variance_in_type_bounded(
-                    sys,
+                    table,
                     facts,
                     parameter,
                     member.ty,
+                    argument_variance,
                     depth - 1,
                 )));
             }
             for i in 0..sig.positional.len() {
-                let p = sys.table().arg(sig.positional.offset() + i);
+                let p = table.arg(sig.positional.offset() + i);
                 result = result.meet(Variance::Contravariant.combine(variance_in_type_bounded(
-                    sys,
+                    table,
                     facts,
                     parameter,
                     p,
+                    argument_variance,
                     depth - 1,
                 )));
             }
             result
         }
         TypeKind::Record { shape } => {
-            let shape = sys.table().record_shape(shape);
+            let shape = table.record_shape(shape);
             let mut result = Variance::Unrelated;
             for i in 0..shape.positional.len() {
-                let p = sys.table().arg(shape.positional.offset() + i);
+                let p = table.arg(shape.positional.offset() + i);
                 result = result.meet(variance_in_type_bounded(
-                    sys,
+                    table,
                     facts,
                     parameter,
                     p,
+                    argument_variance,
                     depth - 1,
                 ));
             }
-            for member in sys.table().named_members(shape.named) {
+            for member in table.named_members(shape.named) {
                 result = result.meet(variance_in_type_bounded(
-                    sys,
+                    table,
                     facts,
                     parameter,
                     member.ty,
+                    argument_variance,
                     depth - 1,
                 ));
             }

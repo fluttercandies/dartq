@@ -140,3 +140,6 @@ pub use ty::{
     UninternedRecord, UninternedType,
 };
 pub use variance::{ParamFacts, ParamFactsTable, Variance, arguments_related, variance_in_type};
+
+#[cfg(test)]
+mod ticket_3468_tests;

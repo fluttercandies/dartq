@@ -22,8 +22,9 @@
 //! * `C<X extends F<Y>, Y extends F<X>>` — a cycle running through two alias
 //!   applications rewrites every member;
 //! * `typedef F<T> = void Function(T)` used as the bound — the substitution
-//!   reaches inside the signature (`void Function(dynamic)`), never stopping
-//!   at the head.
+//!   reaches inside the signature (`void Function(Never)`, the lower map
+//!   under the formal column's contravariant flip), never stopping at the
+//!   head.
 
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::instantiate_to_bound::instantiate_type_formals_to_bounds_with;
@@ -189,9 +190,14 @@ fn alias_cycle_rewrites_every_member_through_the_expanded_head() {
 /// `class C<X extends F<X>> {}` over `typedef F<T> = void Function(T);` — a
 /// function-RHS alias. The expanded function type mentions `X` in its formal
 /// column, so the fixpoint sees the self-cycle and substitutes *inside* the
-/// signature: the default is `void Function(dynamic)` with the alias's own
+/// signature: the default is `void Function(Never)` with the alias's own
 /// quantifier already gone, never the unrewritten `void Function(X)` a walk
-/// that stopped at the head would leave behind.
+/// that stopped at the head would leave behind. The formal column reads the
+/// *lower* map: `_UpperLowerReplacementVisitor` flips the variance around
+/// the formal list (default_types_builder.dart:242-258/444-451), so even a
+/// covariant-seeded parameter grounds to `NeverTypeImpl.instance` there —
+/// the oracle's answer, where the pre-#3468 `dynamic`-only map read
+/// `dynamic`.
 #[test]
 fn alias_function_rhs_bound_substitutes_inside_the_signature() {
     let table = TypeTable::new();
@@ -226,8 +232,8 @@ fn alias_function_rhs_bound_substitutes_inside_the_signature() {
     assert!(
         matches!(
             table.get(table.arg(sig.positional.offset())).kind(),
-            TypeKind::Dynamic
+            TypeKind::Never
         ),
-        "the formal column reads the Phi substitution `dynamic`"
+        "the formal column reads the directed substitution's lower map `Never`"
     );
 }

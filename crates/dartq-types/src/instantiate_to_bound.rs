@@ -10,20 +10,46 @@
 //! (unbounded reads `dynamic`, default_types_builder.dart:136-140), build
 //! the reference graph among the parameters, rewrite every strongly
 //! connected component's own bounds through the substitution that maps the
-//! component's members to `dynamic` (default_types_builder.dart:144-162),
-//! then substitute each parameter's resolved bound through every bound in
-//! declaration order so no parameter leaf survives
+//! component's members to `dynamic` or `Never` (default_types_builder.dart:
+//! 144-162), then substitute each parameter's resolved bound through every
+//! bound in declaration order so no parameter leaf survives
 //! (default_types_builder.dart:164-180).
+//!
+//! Both substitution passes are *variance-directed*: the official drives
+//! `_UpperLowerReplacementVisitor` (default_types_builder.dart:431-479)
+//! with an `upper` map (the component's `dynamic` rewrite, or the peer's
+//! already-grounded default) and a `lower` map (`NeverTypeImpl.instance`
+//! — the bottom is `Never`, never `Null`). A parameter leaf reads `upper`
+//! unless the walk's current variance is `contravariant`, in which case it
+//! reads `lower`. The walk's current variance *seeds* from the
+//! parameter's own stored `element.variance` (`variable.variance`,
+//! default_types_builder.dart:157-158/175-176), `combine`s against each
+//! interface argument position's declared variance (`visitTypeArgument`,
+//! :458-469), and flips co↔contra around a function type's formal
+//! parameter list (`changeVariance`, :444-451 — `invariant`/`unrelated`
+//! never flip). The leaf substitution is verbatim: a mapped `X?` returns
+//! the map value as stored, without unioning the leaf's `?`
+//! (:472-478).
+//!
+//! The seed is why the class and typedef halves answer differently. A
+//! class parameter's stored variance is the declared keyword or the
+//! legacy-covariant default — covariant seeds read `upper` everywhere, the
+//! `dynamic` answer class defaults give. A typedef parameter's stored
+//! variance is *computed from the aliased body* (`VarianceBuilder.
+//! _genericTypeAlias`/`_functionTypeAlias`, variance_builder.dart:153-225;
+//! `typedef G<X extends A<X>, Y extends X> = Y Function(X)` stores X
+//! contravariant), so the same `X extends A<X>` bound grounds to
+//! `A<Never>` — the oracle's `G<A<Never>, A<Never>>`.
 //!
 //! The component rewrite is *scoped to the component*: a parameter outside
 //! a cycle whose bound mentions a cycle member keeps its parameter leaf
 //! through the SCC pass and completes in the grounding sweep with the
 //! member's substituted default — `X extends A<X>, Y extends X` yields
-//! `Y = A<dynamic>`, not `dynamic`. That is the difference from the
-//! fixpoint-plus-Phi reading of `instantiateTypeFormalsToBounds`
-//! (`type_system.dart:735-811`), whose fallback maps *every* uncompleted
-//! parameter to `dynamic` (type_system.dart:793-804) and so loses the
-//! dependent's bound entirely.
+//! `Y = A<dynamic>` under a covariant seed, not `dynamic`. That is the
+//! difference from the fixpoint-plus-Phi reading of
+//! `instantiateTypeFormalsToBounds` (`type_system.dart:735-811`), whose
+//! fallback maps *every* uncompleted parameter to `dynamic`
+//! (type_system.dart:793-804) and so loses the dependent's bound entirely.
 //!
 //! The free-parameter test behind the `-->m` edges is `getFreeParameters`
 //! (type_system.dart:567-610): a structure walk that respects function
@@ -41,7 +67,10 @@
 //! model spells them name-keyed in shared snapshots, so a consumer holding
 //! the declaration's own bound list (a type alias's shape, for one) must ask
 //! the algorithm directly instead of seeding a shared table with a value
-//! another same-spelled parameter would then read.
+//! another same-spelled parameter would then read. The same name-keying
+//! makes a typedef's *variances* per-declaration data, not shared-facts
+//! data — [`instantiate_type_formals_to_bounds_directed`] takes the seed
+//! and the interface-argument variance as closures for the same reason.
 //!
 //! Alias contract: the algorithm never sees an alias. It is handed the
 //! bound as the element model stores it — already expanded, `X extends F<X>`
@@ -51,15 +80,19 @@
 //! so a bound provider that cannot expand a typedef head must report the
 //! parameter unbounded (`None`) and accept the `dynamic` default; feeding the
 //! alias's own parameter leaves through instead would ground a foreign
-//! parameter the algorithm has no candidates for.
+//! parameter the algorithm has no candidates for. The same contract holds
+//! for variance: an `argument_variance` lookup that cannot answer a
+//! declaration's stored parameter variance reads `None` → covariant, the
+//! under-report direction — the answer degrades toward `dynamic`, never
+//! toward a fabricated `Never`.
 
 use rustc_hash::FxHashSet;
 
 use crate::ids::{TypeDeclId, TypeId, TypeParamId};
-use crate::system::TypeSystem;
+use crate::system::{DEPTH_LIMIT, TypeSystem};
 use crate::table::TypeTable;
-use crate::ty::{TypeKind, UninternedType};
-use crate::variance::ParamFactsTable;
+use crate::ty::{NamedMember, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
+use crate::variance::{ParamFactsTable, Variance};
 
 /// The result of [`instantiate_type_formals_to_bounds`]: the defaults in
 /// the input parameter order, and whether the fixed point left any
@@ -79,17 +112,26 @@ pub struct BoundsInstantiation {
 
 /// `instantiateTypeFormalsToBounds` over the facts snapshot — the bound of
 /// each parameter is its declared bound, or the unbounded `dynamic` face
-/// (default_types_builder.dart:136-140). See the module docs for the
-/// algorithm.
+/// (default_types_builder.dart:136-140), and the seed variance is the
+/// element's stored `element.variance` (`variable.variance`,
+/// default_types_builder.dart:157-158/175-176) read from the same snapshot.
+/// The snapshot has no declaration→parameter map for the interface-argument
+/// combine, so argument positions inside bounds read covariant — the
+/// under-report direction a covariant-only facts table already implies (see
+/// the module docs). See the module docs for the algorithm.
 #[must_use]
 pub fn instantiate_type_formals_to_bounds(
     table: &TypeTable,
     facts: &ParamFactsTable,
     parameters: &[TypeParamId],
 ) -> BoundsInstantiation {
-    instantiate_type_formals_to_bounds_with(table, parameters, |parameter| {
-        facts.get(parameter).bound
-    })
+    instantiate_type_formals_to_bounds_directed(
+        table,
+        parameters,
+        |parameter| facts.get(parameter).bound,
+        |parameter| facts.get(parameter).variance,
+        |_, _| None,
+    )
 }
 
 /// The same instantiation with the bound lookup supplied by the caller —
@@ -100,14 +142,20 @@ pub fn instantiate_type_formals_to_bounds(
 /// (`_computeDefaultType`, default_types_builder.dart:128-187; the kernel
 /// twin is `calculateBounds`, bounds_checks.dart:213-295): materialize the
 /// `-->m` relation, rewrite each strongly connected component's own bounds
-/// through the component's dynamic substitution, then ground every bound by
-/// substituting each parameter's resolved default in declaration order. A
-/// parameter *outside* a cycle whose bound mentions a cycle member therefore
-/// completes with the member's substituted default (`X extends A<X>`,
-/// `Y extends X` yields `Y = A<dynamic>`) — not with `dynamic`, the
+/// through the variance-directed upper/lower substitution, then ground
+/// every bound by substituting each parameter's resolved default in
+/// declaration order. A parameter *outside* a cycle whose bound mentions a
+/// cycle member therefore completes with the member's substituted default
+/// (`X extends A<X>`, `Y extends X` yields `Y = A<dynamic>` under the
+/// covariant seeds this entry implies) — not with `dynamic`, the
 /// all-or-nothing Phi answer the fixpoint port used to give
 /// (type_system.dart:793-804 maps every uncompleted parameter to
 /// `dynamic`); see the module docs.
+///
+/// This entry seeds every parameter `Covariant` — the legacy class-side
+/// answer. [`instantiate_type_formals_to_bounds_directed`] is the same
+/// algorithm with the seed and interface-argument lookups the caller owns
+/// (the typedef path).
 ///
 /// # Panics
 ///
@@ -120,6 +168,53 @@ pub fn instantiate_type_formals_to_bounds_with(
     parameters: &[TypeParamId],
     bound_of: impl Fn(TypeParamId) -> Option<TypeId>,
 ) -> BoundsInstantiation {
+    instantiate_type_formals_to_bounds_directed(
+        table,
+        parameters,
+        bound_of,
+        |_| Variance::Covariant,
+        |_, _| None,
+    )
+}
+
+/// The variance-directed entry — `_computeDefaultType` with the oracle's
+/// `_UpperLowerReplacementVisitor` (default_types_builder.dart:431-479)
+/// instead of a `dynamic`-only map. Same algorithm as
+/// [`instantiate_type_formals_to_bounds`], with the two lookups a
+/// per-declaration caller owns:
+///
+/// * `variance_of` — each input parameter's *stored* variance, the
+///   `variable.variance` seed of `default_types_builder.dart:157-158` (the
+///   SCC rewrite) and :175-176 (the grounding sweep). A class parameter
+///   reads the declared keyword or the legacy-covariant default; a typedef
+///   parameter reads the value `VarianceBuilder` computed from the aliased
+///   body — [`crate::variance::typedef_parameter_variances`] computes it
+///   for a flattened body shape.
+/// * `argument_variance` — the stored variance of an interface
+///   declaration's `i`-th type parameter, the `parameter.variance` the
+///   visitor combines into each argument position (`visitTypeArgument`,
+///   default_types_builder.dart:458-469). `None` answers covariant — the
+///   under-report direction (covariant is the combine identity: the
+///   argument's own occurrences still substitute, just never toward
+///   `Never` on a missing fact).
+///
+/// A caller that cannot model either lookup answers `Covariant`/`None` and
+/// gets the `dynamic` defaults back — an under-report is acceptable, a
+/// fabricated `Never` is not (the alias contract, module docs).
+///
+/// # Panics
+///
+/// Panics on the one ordering invariant of the `-->m` build — a free
+/// parameter of a declared bound always came from the input list (the
+/// candidate set is exactly the input), pinned by an `expect`.
+#[must_use]
+pub fn instantiate_type_formals_to_bounds_directed(
+    table: &TypeTable,
+    parameters: &[TypeParamId],
+    bound_of: impl Fn(TypeParamId) -> Option<TypeId>,
+    variance_of: impl Fn(TypeParamId) -> Variance,
+    argument_variance: impl Fn(TypeDeclId, usize) -> Option<Variance>,
+) -> BoundsInstantiation {
     let count = parameters.len();
     if count == 0 {
         return BoundsInstantiation {
@@ -129,6 +224,10 @@ pub fn instantiate_type_formals_to_bounds_with(
     }
 
     let dynamic = table.intern(UninternedType::Dynamic, false);
+    // `NeverTypeImpl.instance` — the bottom of the lower map
+    // (default_types_builder.dart:130/150/169); non-nullable, matching the
+    // official instance's `NullabilitySuffix.none`.
+    let never = table.intern(UninternedType::Never, false);
     let all: FxHashSet<TypeParamId> = parameters.iter().copied().collect();
     let mut index_of: rustc_hash::FxHashMap<TypeParamId, usize> =
         rustc_hash::FxHashMap::default();
@@ -169,8 +268,9 @@ pub fn instantiate_type_formals_to_bounds_with(
 
     // The component pass (default_types_builder.dart:142-162): each
     // strongly connected component's own bounds are rewritten through the
-    // substitution mapping the component's members to `dynamic`. The
-    // rewrite is scoped to the component — a peer bound that merely
+    // upper/lower substitution — `dynamic` above, `Never` below
+    // (:147-151), driven by each member's own stored variance (:157-158).
+    // The rewrite is scoped to the component — a peer bound that merely
     // mentions a member keeps its parameter leaf for the grounding sweep.
     let components = strong_components(&dependents);
     let mut cyclic = vec![false; count];
@@ -184,12 +284,24 @@ pub fn instantiate_type_formals_to_bounds_with(
                 cyclic[i] = true;
             }
         }
-        let map: Vec<(TypeParamId, TypeId)> = component
+        let upper: Vec<(TypeParamId, TypeId)> = component
             .iter()
             .map(|&i| (parameters[i], dynamic))
             .collect();
+        let lower: Vec<(TypeParamId, TypeId)> = component
+            .iter()
+            .map(|&i| (parameters[i], never))
+            .collect();
         for &i in component {
-            bounds[i] = table.substitute(bounds[i], &map);
+            bounds[i] = replace_upper_lower(
+                table,
+                bounds[i],
+                &upper,
+                &lower,
+                variance_of(parameters[i]),
+                &argument_variance,
+                0,
+            );
         }
     }
 
@@ -201,20 +313,260 @@ pub fn instantiate_type_formals_to_bounds_with(
 
     // The grounding sweep (default_types_builder.dart:164-180): in
     // declaration order, substitute each parameter's resolved bound through
-    // every bound. Every parameter leaf is eliminated exactly once, so
-    // dependents of a cycle complete with the member's substituted default
-    // transitively (`X extends A<X>`, `Y extends X`, `Z extends Y` grounds
-    // all three to `A<dynamic>`).
+    // every bound — the peer's default above, `Never` below (:164-170),
+    // seeded by each *bound owner's* stored variance (:175-176), so a
+    // contravariant dependent grounds to `Never`, not to the peer's
+    // default. Every parameter leaf is eliminated exactly once, so
+    // dependents of a cycle complete transitively (`X extends A<X>`,
+    // `Y extends X`, `Z extends Y` grounds all three to `A<dynamic>` under
+    // covariant seeds).
     for i in 0..count {
-        let map = [(parameters[i], bounds[i])];
-        for bound in bounds.iter_mut() {
-            *bound = table.substitute(*bound, &map);
+        let upper = [(parameters[i], bounds[i])];
+        let lower = [(parameters[i], never)];
+        for j in 0..count {
+            bounds[j] = replace_upper_lower(
+                table,
+                bounds[j],
+                &upper,
+                &lower,
+                variance_of(parameters[j]),
+                &argument_variance,
+                0,
+            );
         }
     }
 
     BoundsInstantiation {
         defaults: bounds,
         malbounded,
+    }
+}
+
+/// `_UpperLowerReplacementVisitor` (default_types_builder.dart:431-479) —
+/// the upper/lower substitution walk both passes drive:
+///
+/// * a [`TypeKind::TypeParameter`] leaf reads `lower` when the walk's
+///   current variance is `contravariant`, `upper` otherwise — verbatim
+///   (`:472-478`): the mapped type returns as stored, without unioning the
+///   leaf's `?`, and an unmapped leaf keeps its own type;
+/// * an [`TypeKind::Interface`] argument position `combine`s the current
+///   variance with the declaration parameter's stored variance
+///   (`visitTypeArgument`, :458-469) — `argument_variance` answers it,
+///   `None` degrading to covariant;
+/// * a [`TypeKind::Function`] visits its return type under the current
+///   variance, `changeVariance`s (co↔contra only, :444-451) around its
+///   formal parameter types, and flips back — nested signatures compose
+///   the same rule per level. The official also visits each signature
+///   type parameter's bound under the current variance *before* the flip
+///   (`visitTypeParameterBound`, :279-281); dartq signatures carry no
+///   bounds — they live in [`ParamFactsTable`] — so that section has no
+///   counterpart here (the under-report direction: a bound leaf the
+///   oracle would rewrite stays a leaf rather than taking a wrong value);
+/// * `FutureOr` and [`TypeKind::Record`] members recurse under the current
+///   variance — the official models `FutureOr`'s sole parameter as legacy
+///   covariant, and record fields carry no variance flip.
+///
+/// Recursion is bounded by `DEPTH_LIMIT` like the other type-operation
+/// walks; a tripped budget leaves the subtree unsubstituted — under-report,
+/// not a fabricated `Never`.
+fn replace_upper_lower(
+    table: &TypeTable,
+    ty: TypeId,
+    upper: &[(TypeParamId, TypeId)],
+    lower: &[(TypeParamId, TypeId)],
+    variance: Variance,
+    argument_variance: &dyn Fn(TypeDeclId, usize) -> Option<Variance>,
+    depth: u32,
+) -> TypeId {
+    if depth > DEPTH_LIMIT {
+        return ty;
+    }
+    let node = table.get(ty);
+    match node.kind() {
+        TypeKind::TypeParameter { parameter } => {
+            // `visitTypeParameterType` (:472-478): contravariant reads
+            // `lower`, every other variance — including `invariant` and
+            // `unrelated` — reads `upper`. The mapped type is verbatim:
+            // the official returns `_upper[type.element]` /
+            // `_lower[type.element]` unwrapped, so a `?` leaf takes the
+            // stored nullability of the replacement, not the union.
+            let map = if matches!(variance, Variance::Contravariant) {
+                lower
+            } else {
+                upper
+            };
+            map.iter()
+                .find(|(p, _)| *p == parameter)
+                .map(|&(_, mapped)| mapped)
+                .unwrap_or(ty)
+        }
+        TypeKind::Interface { decl, args } => {
+            let mut rewritten: Option<Vec<TypeId>> = None;
+            for i in 0..args.len() {
+                let arg = table.arg(args.offset() + i);
+                // `visitTypeArgument` (:458-469): the argument's subtree
+                // sees `current.combine(parameter.variance)`; the saved
+                // variance restores after — the combine is per position.
+                let combined = variance
+                    .combine(argument_variance(decl, i).unwrap_or(Variance::Covariant));
+                let new_arg = replace_upper_lower(
+                    table,
+                    arg,
+                    upper,
+                    lower,
+                    combined,
+                    argument_variance,
+                    depth + 1,
+                );
+                if new_arg != arg {
+                    rewritten.get_or_insert_with(|| table.args(args))[i] = new_arg;
+                }
+            }
+            match rewritten {
+                Some(args) => table.intern(
+                    UninternedType::Interface { decl, args },
+                    node.is_nullable(),
+                ),
+                None => ty,
+            }
+        }
+        TypeKind::FutureOr { base } => {
+            let new_base = replace_upper_lower(
+                table,
+                base,
+                upper,
+                lower,
+                variance,
+                argument_variance,
+                depth + 1,
+            );
+            if new_base == base {
+                return ty;
+            }
+            table.intern(UninternedType::FutureOr { base: new_base }, node.is_nullable())
+        }
+        TypeKind::Function { signature } => {
+            let sig = table.signature(signature);
+            // The return type stays under the current variance
+            // (`visitType` of `node.returnType` before `changeVariance`,
+            // :325-327).
+            let return_type = replace_upper_lower(
+                table,
+                sig.return_type,
+                upper,
+                lower,
+                variance,
+                argument_variance,
+                depth + 1,
+            );
+            // `changeVariance` (:444-451): the formal parameter column
+            // flips co↔contra; `invariant`/`unrelated` hold.
+            let flipped = match variance {
+                Variance::Covariant => Variance::Contravariant,
+                Variance::Contravariant => Variance::Covariant,
+                other => other,
+            };
+            let mut positional: Option<Vec<TypeId>> = None;
+            for i in 0..sig.positional.len() {
+                let arg = table.arg(sig.positional.offset() + i);
+                let new_arg = replace_upper_lower(
+                    table,
+                    arg,
+                    upper,
+                    lower,
+                    flipped,
+                    argument_variance,
+                    depth + 1,
+                );
+                if new_arg != arg {
+                    positional.get_or_insert_with(|| table.args(sig.positional))[i] = new_arg;
+                }
+            }
+            let mut named: Option<Vec<NamedMember>> = None;
+            for (i, member) in table.named_members(sig.named).into_iter().enumerate() {
+                let new_ty = replace_upper_lower(
+                    table,
+                    member.ty,
+                    upper,
+                    lower,
+                    flipped,
+                    argument_variance,
+                    depth + 1,
+                );
+                if new_ty != member.ty {
+                    named.get_or_insert_with(|| table.named_members(sig.named))[i].ty = new_ty;
+                }
+            }
+            if return_type == sig.return_type && positional.is_none() && named.is_none() {
+                return ty;
+            }
+            table
+                .intern_function(
+                    UninternedFunction {
+                        return_type,
+                        // The signature's own binders keep their ids —
+                        // their bounds ride `ParamFactsTable`, not the type
+                        // (see the function doc).
+                        type_parameters: table.function_type_parameters(sig.type_parameters),
+                        positional: positional
+                            .unwrap_or_else(|| table.args(sig.positional)),
+                        named: named.unwrap_or_else(|| table.named_members(sig.named)),
+                        required_positional: sig.required_positional,
+                    },
+                    node.is_nullable(),
+                )
+                .expect("upper/lower substitution preserves signature well-formedness")
+        }
+        TypeKind::Record { shape } => {
+            let shape = table.record_shape(shape);
+            let mut positional: Option<Vec<TypeId>> = None;
+            for i in 0..shape.positional.len() {
+                let field = table.arg(shape.positional.offset() + i);
+                let new_field = replace_upper_lower(
+                    table,
+                    field,
+                    upper,
+                    lower,
+                    variance,
+                    argument_variance,
+                    depth + 1,
+                );
+                if new_field != field {
+                    positional.get_or_insert_with(|| table.args(shape.positional))[i] = new_field;
+                }
+            }
+            let mut named: Option<Vec<NamedMember>> = None;
+            for (i, member) in table.named_members(shape.named).into_iter().enumerate() {
+                let new_ty = replace_upper_lower(
+                    table,
+                    member.ty,
+                    upper,
+                    lower,
+                    variance,
+                    argument_variance,
+                    depth + 1,
+                );
+                if new_ty != member.ty {
+                    named.get_or_insert_with(|| table.named_members(shape.named))[i].ty = new_ty;
+                }
+            }
+            if positional.is_none() && named.is_none() {
+                return ty;
+            }
+            table
+                .intern_record(
+                    UninternedRecord {
+                        positional: positional
+                            .unwrap_or_else(|| table.args(shape.positional)),
+                        named: named.unwrap_or_else(|| table.named_members(shape.named)),
+                    },
+                    node.is_nullable(),
+                )
+                .expect("upper/lower substitution preserves record well-formedness")
+        }
+        TypeKind::Never | TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => {
+            ty
+        }
     }
 }
 
