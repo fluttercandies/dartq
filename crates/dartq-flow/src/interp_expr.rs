@@ -2831,6 +2831,17 @@ impl Interp<'_> {
                         callee.reference = None;
                         callee.prop = None;
                         callee.non_null_literal = false;
+                        // The chain flag dies with the slots (#3452): the
+                        // member callee arrived carrying the
+                        // reference-rooted `ref_chain` its own DotAccess set
+                        // (`x.f`), and a surviving flag re-roots every member
+                        // read over the result (`x.f().g`) at the callee's
+                        // variable — an invalid face on such a read then took
+                        // the reference chain's lenient arm where the oracle
+                        // deads the else (`f().bar`'s group, oracle-probed).
+                        // The plain-read chains keep it: no argument list, no
+                        // clear (`x.f`, `x.f.g` stay open).
+                        callee.ref_chain = false;
                     }
                     self.exprs.push(callee);
                     // The bottom-typed result's exit (official
