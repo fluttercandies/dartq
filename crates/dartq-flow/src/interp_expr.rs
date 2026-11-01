@@ -1558,6 +1558,25 @@ impl Interp<'_> {
             }
             Ev::AsEnd => {
                 self.in_as_cast = false;
+                // A cast PATTERN whose sub-pattern is a GUARANTEED-EQUAL
+                // constant (`case null as int`): the constant left the
+                // cannot-fail posture standing (a total pattern), but the
+                // cast wrapper can THROW — official `analyzeCastPattern`
+                // runs the sub-pattern first and applies the cast to its
+                // result — so the clause may fail and the close's chain
+                // kill must not fire (the bare harness's
+                // `switch (null) { case null as int: …; default: … }`
+                // rowed the `default` dead). A resolved cast pattern adds
+                // no may-fail ARM — "a cast pattern cannot fail to match"
+                // (`cast_pattern_error_test` pins the dead else of
+                // `if (expr<Object?>() case _ as int)`) — hence a posture
+                // stand-down without a chain join.
+                if self.guard_depth == 0
+                    && let Some(pattern) = self.pattern.as_mut()
+                    && std::mem::take(&mut pattern.guaranteed_equal)
+                {
+                    pattern.cannot_fail = false;
+                }
                 let Some(cast_ty) = self.as_cast_pending.take() else {
                     return true;
                 };

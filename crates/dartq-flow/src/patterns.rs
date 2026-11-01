@@ -123,6 +123,7 @@ impl Interp<'_> {
                             guard: None,
                             pending_decls: Vec::new(),
                             shadowed: Vec::new(),
+                            guaranteed_equal: false,
                             cannot_fail: true,
                             saw_node: false,
                         });
@@ -185,7 +186,20 @@ impl Interp<'_> {
                         .or_else(|| self.frame_scrutinee_ty());
                     let guaranteed_equal = matched_ty.is_some_and(|(ty, _)| ty.base == Base::Null)
                         && constant.ty.base == Base::Null;
-                    if !guaranteed_equal {
+                    if guaranteed_equal {
+                        // `_GuaranteedEqual` performs no update: the
+                        // pattern always matches, so it neither joins the
+                        // chain nor stands the cannot-fail posture down —
+                        // the close's kill stands, and an if-case's
+                        // unreachable chain seed keeps its `else` dead
+                        // (`if (expr<Null>() case null) … else …`). The
+                        // latch lets a CAST wrapper (`case null as int`)
+                        // stand the posture down later: the cast throws
+                        // instead of not matching.
+                        if let Some(pattern) = self.pattern.as_mut() {
+                            pattern.guaranteed_equal = true;
+                        }
+                    } else {
                         self.stand_down_may_fail();
                     }
                     return;
@@ -1550,6 +1564,7 @@ impl Interp<'_> {
             guard: None,
             pending_decls: Vec::new(),
             shadowed: Vec::new(),
+            guaranteed_equal: false,
             cannot_fail: true,
             saw_node: false,
         });

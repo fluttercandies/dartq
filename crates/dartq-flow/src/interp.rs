@@ -231,6 +231,15 @@ pub(crate) struct PatternState {
     /// is an unmatched path). The clause close kills the switch frame's
     /// chain when it still stands.
     pub cannot_fail: bool,
+    /// The clause's top-level pattern is a constant that is GUARANTEED
+    /// EQUAL to the matched value (`null case null` over a `Null` typed
+    /// matched value): official `_GuaranteedEqual` performs no update, so
+    /// the pattern always matches and the close's chain kill may stand —
+    /// UNLESS a cast wrapper follows (`case null as int`), whose throw
+    /// path makes the clause refutable; the `as` handler consumes this
+    /// latch and stands the posture down (upstream: a cast pattern never
+    /// adds a may-fail arm, but it does throw).
+    pub guaranteed_equal: bool,
     /// Whether the clause's head actually parsed a pattern node: a
     /// recovered clause can close its context with zero pattern events,
     /// and the cannot-fail kill stands down for it (an unknown head may
