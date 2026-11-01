@@ -1056,6 +1056,7 @@ fn core_entry(kind: MemberKind) -> &'static MemberEntry {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            is_const: false,
             covariant: false,
             type_params: 0,
             type_param_names: Box::new([]),

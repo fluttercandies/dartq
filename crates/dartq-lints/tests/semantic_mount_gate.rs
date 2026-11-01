@@ -28,13 +28,17 @@
 //!
 //! The separate mount seams (`Unit::async_context_uses`,
 //! `Unit::reachability`, `Unit::library_type_uses`) are keyed by rule
-//! name inside the driver, not by `SEMANTIC_RULES`; guarding them is a
-//! different gate over a different crate.
+//! name inside the driver (`crates/dartq-commands/src/lints.rs`), not
+//! by `SEMANTIC_RULES`; [`every_driver_seam_gate_matches_the_registry_and_the_face_readers`]
+//! below runs the same source-walk against that driver — every
+//! `rule_by_name("...")` gate it names must be a live registered rule,
+//! and every rule a scan proves reads one of the mounted faces must be
+//! one of the names it gates.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use dartq_lints::{SEMANTIC_RULES, rules};
+use dartq_lints::{Group, SEMANTIC_RULES, rules};
 
 /// Rules that read `Check::semantics()` yet legitimately stay out of
 /// `SEMANTIC_RULES`, each with the reason the absence is correct. The
@@ -956,6 +960,269 @@ fn every_fold_consumer_is_registered() {
     assert!(
         violations.is_empty(),
         "semantic-fold consumers missing from SEMANTIC_RULES:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The three driver-mounted `Unit` faces: the byte token a rule's check
+/// body reads (comments and literals are stripped before matching, so a
+/// doc mention never registers), and whether the driver fills the face
+/// from the semantic fold's `Analysis` facts. A fold-fed face's readers
+/// must additionally sit in `SEMANTIC_RULES` — `mounts_semantics` is what
+/// builds the `Analysis` the driver reads the rows from, so a gate name
+/// left out of that table passes its own gate yet mounts an empty face
+/// (the same silent death behind one extra table away).
+const DRIVER_FACES: &[(&str, &[u8], bool)] = &[
+    ("Unit::async_context_uses", b".unit.async_context_uses", true),
+    ("Unit::reachability", b".unit.reachability", false),
+    ("Unit::library_type_uses", b".library_type_uses", false),
+];
+
+/// The lint driver's production gate names: every `rule_by_name("...")`
+/// literal outside a test module, in file order. The same noise-strip and
+/// test-mod-skip discipline as [`parse_file`] — a doc mention or a
+/// test's registry lookup must never register as a production seam gate.
+fn driver_gate_names(path: &Path) -> Vec<String> {
+    let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let text = strip_noise(&src);
+
+    // The test-module byte ranges: a `mod tests`/`mod test` body (or a
+    // `#[cfg(test)]`-gated one) is fixture code, not production seams.
+    let mut test_mods: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if keyword_at(&text, i, "mod") {
+            let mut j = i + 3;
+            while j < text.len() && text[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let name_end = ident_after(&text, j);
+            if name_end > j {
+                let name = &src[j..name_end];
+                let mut k = name_end;
+                while k < text.len() && text[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < text.len() && text[k] == b'{' {
+                    let end = balanced(&text, k, b'{', b'}');
+                    let cfg_test = text[i.saturating_sub(64)..i]
+                        .windows(b"cfg(test)".len())
+                        .any(|w| w == b"cfg(test)");
+                    let is_test = cfg_test || name == "tests" || name == "test";
+                    if is_test {
+                        test_mods.push((i, end));
+                        i = end;
+                    } else {
+                        // A production inner mod's body keeps scanning —
+                        // its items may gate seams too.
+                        i = k + 1;
+                    }
+                    continue;
+                }
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+
+    // The gate sites: `rule_by_name(` — the name is the first string
+    // literal of the arg list, read from the raw source.
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if keyword_at(&text, i, "rule_by_name") {
+            let mut j = i + "rule_by_name".len();
+            while j < text.len() && text[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < text.len() && text[j] == b'(' {
+                let end = balanced(&text, j, b'(', b')');
+                let stop = end.saturating_sub(1).max(j + 1);
+                let in_test = test_mods.iter().any(|&(s, e)| i >= s && i < e);
+                if !in_test
+                    && let Some(name) = first_string_literal(&src[j + 1..stop])
+                {
+                    names.push(name);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
+/// The first string literal's content in a raw arg slice (a rule name
+/// carries no escapes).
+fn first_string_literal(inner: &str) -> Option<String> {
+    let start = inner.find('"')?;
+    let stop = inner[start + 1..].find('"')? + start + 1;
+    Some(inner[start + 1..stop].to_owned())
+}
+
+/// Every fn whose call graph reaches a direct read of `token` — the same
+/// fixed point [`analyze`] runs for `.semantics()`, seeded with a
+/// different mount face.
+fn reads_face(scan: &Scan, texts: &[Vec<u8>], token: &[u8]) -> Vec<Vec<bool>> {
+    let mut reads: Vec<Vec<bool>> = scan
+        .files
+        .iter()
+        .enumerate()
+        .map(|(fi, f)| {
+            f.fns
+                .iter()
+                .map(|f| {
+                    texts[fi][f.body.0..f.body.1]
+                        .windows(token.len())
+                        .any(|w| w == token)
+                })
+                .collect()
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (fi, file) in scan.files.iter().enumerate() {
+            for ni in 0..file.fns.len() {
+                if !reads[fi][ni] && scan.edges[fi][ni].iter().any(|&(ef, en)| reads[ef][en]) {
+                    reads[fi][ni] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reads
+}
+
+/// The driver-seam gate: the lint driver mounts the three `Unit` faces
+/// under per-rule-name gates (`rule_by_name("...")` in
+/// `crates/dartq-commands/src/lints.rs`), and the rule side reads the
+/// faces off the mounted unit — so the two ends agree or the rows die
+/// silently. Two directions, both derived from source, no per-rule
+/// boilerplate:
+///
+/// - every name the driver gates must be a live registered rule. A
+///   drifted literal resolves `rule_by_name` to `None`, the gate stays
+///   permanently false, the face never mounts, and every row the gated
+///   rule would emit is silently dropped; a gate on a removed rule is
+///   the same dead seam with extra mount work.
+/// - every rule the scan proves reads a mounted face must be one of the
+///   names the driver gates (and, for a fold-fed face, a `SEMANTIC_RULES`
+///   member — the fold is what fills the face's rows). A new reader whose
+///   gate was never added fails here, naming the file and rule.
+#[test]
+fn every_driver_seam_gate_matches_the_registry_and_the_face_readers() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let driver = manifest
+        .parent()
+        .expect("crates dir")
+        .join("dartq-commands/src/lints.rs");
+    let gates: BTreeSet<String> = driver_gate_names(&driver).into_iter().collect();
+    assert!(
+        !gates.is_empty(),
+        "no rule_by_name gates found in {driver:?} — the scan lost the driver"
+    );
+
+    let mut violations = Vec::new();
+    for name in &gates {
+        match rules().iter().find(|spec| spec.name == name.as_str()) {
+            None => violations.push(format!(
+                "the lint driver ({driver:?}) gates a seam on {name:?} but no \
+                 such rule is registered — `rule_by_name` resolves to `None`, \
+                 the gate stays permanently false and the face is never \
+                 mounted: every row the gated rule would emit is silently \
+                 dropped. Fix the name in dartq-commands/src/lints.rs or \
+                 register the rule."
+            )),
+            // `Group::Removed` is the registry's own removal marker (the
+            // `removed_rule!` family: `check: not_dispatched`). `kinds`
+            // emptiness is NOT a removal signal — the seam-driven rules
+            // (pubspec pass, run epilogue, breaking-version gate) carry
+            // `kinds: &[]` by design: the driver runs them through their
+            // seam, not through AST-node dispatch.
+            Some(spec) if spec.group == Group::Removed => {
+                violations.push(format!(
+                    "the lint driver ({driver:?}) gates a seam on {name:?} but \
+                     the rule is removed (`Group::Removed`, the registered \
+                     no-op family) — the gate mounts a face nothing will ever \
+                     read. Retire the seam with the rule in \
+                     dartq-commands/src/lints.rs."
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
+    // The reader side: the same rules-tree scan the fold gate runs, with
+    // each driver-mounted face's token as the read being traced.
+    let root = manifest.join("src/rules");
+    let mut paths = Vec::new();
+    rule_files(&root, &mut paths);
+    paths.sort();
+    assert!(!paths.is_empty(), "no rule sources under {root:?}");
+    let mut files = Vec::new();
+    let mut texts = Vec::new();
+    for path in &paths {
+        let rel = path
+            .strip_prefix(manifest)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        let src = std::fs::read_to_string(path).expect("readable rule source");
+        texts.push(strip_noise(&src));
+        files.push(parse_file(path, &rel));
+    }
+    let scan = analyze(files, &texts);
+
+    for &(face, token, fold_fed) in DRIVER_FACES {
+        let reads = reads_face(&scan, &texts, token);
+        let mut readers: Vec<&str> = Vec::new();
+        for (fi, file) in scan.files.iter().enumerate() {
+            for spec in &file.specs {
+                if let Some(check) = resolve_check(&scan, fi, spec)
+                    && reads[check.0][check.1]
+                {
+                    readers.push(spec.name.as_str());
+                }
+            }
+        }
+        readers.sort_unstable();
+        readers.dedup();
+        for reader in readers {
+            if !gates.contains(reader) {
+                violations.push(format!(
+                    "{reader:?} reads the driver-mounted {face} face but the \
+                     lint driver ({driver:?}) never gates it by name — the \
+                     face stays unmounted (`None`), the check bails on its \
+                     `let Some(..) = .. else {{ return }}`, and every row the \
+                     rule would emit is silently dropped (the #3530 silent-\
+                     death class at the driver seam). Add the rule's name to \
+                     the seam's `rule_by_name` gate in \
+                     dartq-commands/src/lints.rs."
+                ));
+            }
+            if fold_fed && !SEMANTIC_RULES.iter().any(|&name| name == reader) {
+                violations.push(format!(
+                    "{reader:?} reads the fold-fed {face} face but is absent \
+                     from SEMANTIC_RULES — the driver fills that face from \
+                     the `Analysis` facts, and `mounts_semantics` (the fold \
+                     mount) never fires for a run enabling only this rule, \
+                     so the rows are empty and the rule is silently dead \
+                     even though the driver's own gate agrees. Register the \
+                     name in src/registry.rs's SEMANTIC_RULES."
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "driver-seam mount drift between dartq-commands/src/lints.rs and \
+         the rule registry:\n  {}",
         violations.join("\n  ")
     );
 }

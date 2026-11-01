@@ -1635,6 +1635,17 @@ pub struct MemberEntry {
     /// abstract field's missing halves with it (a final field has no
     /// setter).
     pub is_final: bool,
+    /// The field group's `const` keyword (`const int x = 0;`); false for
+    /// every non-`Field` member shape — upstream
+    /// `fieldFragment.isConst = node.fields.isConst`
+    /// (element_builder.dart:1685). Kept apart from `is_final` on purpose:
+    /// the oracle's bits are independent (`isConst`/`isFinal` both read the
+    /// group's keyword), and folding `const` into `is_final` would make the
+    /// augmentation face's `augments_constant_variable` over-report on a
+    /// plain `final` target. Enum constants carry it unconditionally —
+    /// upstream marks every constant fragment `isConst = true`
+    /// (element_builder.dart:1469).
+    pub is_const: bool,
     /// The field group's `covariant` keyword (`covariant num x;`; false for
     /// every other member shape — parameter covariance rides
     /// [`Formal::covariant`], never this flag). Upstream
@@ -2075,6 +2086,24 @@ pub struct AugTarget {
     /// (`factory A()` reads `A`, `factory ()` reads `factory`). `None` for
     /// every non-constructor target.
     pub head_range: Option<SourceRange>,
+    /// The declaration's name-token span — the intro-side completeness
+    /// walks' anchor (upstream `error_verifier.dart`
+    /// `_checkForFunctionBodyCompleteness` /
+    /// `_checkForIncompleteInducedAccessors` report at `nameToken`).
+    /// Constructor rows anchor at [`Self::head_range`] instead and a row
+    /// whose name token never latched carries
+    /// [`AugTarget::MISSING_NAME_RANGE`].
+    pub name_range: SourceRange,
+}
+
+impl AugTarget {
+    /// The missing name-span sentinel: the offset is never a valid
+    /// position, so consumers must test before anchoring — never anchor at
+    /// it.
+    pub const MISSING_NAME_RANGE: SourceRange = SourceRange {
+        offset: u32::MAX,
+        length: 0,
+    };
 }
 
 /// One formal parameter of an `augment` declaration: the written facts the
@@ -2104,6 +2133,13 @@ pub struct AugmentFormal {
     pub covariant_kw: Option<SourceRange>,
     /// The `required` keyword's span.
     pub required_kw: Option<SourceRange>,
+    /// The default clause's `=`/`:` separator span — present exactly when
+    /// the parameter wrote a default value (upstream
+    /// `formalParameter.defaultClause.separator`, the
+    /// `default_value_already_specified_in_augmentation_chain` anchor).
+    /// Its presence doubles as the fragment's `constantInitializer != null`
+    /// marker the chain walk reads on preceding fragments.
+    pub default_separator: Option<SourceRange>,
 }
 
 impl AugmentFormal {
@@ -3018,6 +3054,7 @@ mod tests {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            is_const: false,
             covariant: false,
             type_params: 0,
             type_param_names: Box::new([]),

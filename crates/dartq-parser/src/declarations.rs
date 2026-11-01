@@ -1568,7 +1568,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     fn parse_enum_element(&mut self) {
         let begin = self.peek_span();
         self.parse_metadata_star();
-        let augment = self.pending_augment.take();
+        // Official `parser_impl.dart` `parseEnumElement`: an `augment`
+        // keyword directly before the constant's identifier is the
+        // constant's own augmentation mark — consumed inline (not through
+        // `pending_augment`, which only top-level declaration dispatch
+        // sets).
+        let augment = if self.peek_kind() == TokenKind::Keyword(Keyword::Augment) {
+            let at = self.peek_span();
+            self.cursor.advance();
+            Some(at)
+        } else {
+            self.pending_augment.take()
+        };
 
         self.ensure_identifier(IdentifierContext::EnumValueDeclaration);
         let constructor_start = self.peek_span();

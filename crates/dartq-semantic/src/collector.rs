@@ -613,6 +613,13 @@ struct Builder<'src, 'tab> {
     field_external: bool,
     /// The field group's `final` modifier (the abstract-field setter split).
     field_final: bool,
+    /// The field group's `const` keyword span (`begin_fields` latches,
+    /// `end_fields`/`end_top_level_fields` clears) — the real const bit
+    /// upstream `fieldFragment.isConst` / `topLevelVariableFragment.isConst`
+    /// carries, kept apart from `field_final` (which folds `const` in for
+    /// the induced-setter face) so the augmentation const checks never read
+    /// a `final` proxy.
+    field_const: Option<SourceRange>,
     /// The field group's `covariant` keyword (`begin_fields` latches,
     /// `end_fields`/`end_top_level_fields` clears) — upstream
     /// `fieldFragment.isExplicitlyCovariant`; it lands on
@@ -649,6 +656,11 @@ struct Builder<'src, 'tab> {
     /// its start span and the `covariant`/`required` keyword spans, latched
     /// at `begin_formal_parameter`, drained at `end_formal_parameter`.
     aug_formal_start: Option<(SourceRange, Option<SourceRange>, Option<SourceRange>)>,
+    /// The current augment formal's `=`/`:` separator span — latched at
+    /// `handle_valued_formal_parameter` while an `augment` declaration's
+    /// depth-1 formal is open, drained into
+    /// [`AugmentFormal::default_separator`] at `end_formal_parameter`.
+    aug_default_separator: Option<SourceRange>,
     /// A factory declaration is open (`begin_factory`..`end_factory`): its
     /// name event is a constructor shape, not a method one.
     factory_ctor_open: bool,
@@ -871,6 +883,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             field_abstract: false,
             field_external: false,
             field_final: false,
+            field_const: None,
             field_covariant: false,
             field_late: false,
             field_augment: None,
@@ -882,6 +895,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_ctor_const: None,
             pending_ctor_external: false,
             aug_formal_start: None,
+            aug_default_separator: None,
             factory_ctor_open: false,
             factory_kw_range: None,
             factory_ctor_head: None,
@@ -3103,7 +3117,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // every `augment` of the name reports
         // `augmentation_of_mixin_application_class` (the oracle's merge rule
         // refuses the fragment chain, element_builder.dart:244-250).
-        if let Some((container, _)) = name {
+        if let Some((container, name_range)) = name {
             // Introductory mixin applications only: an augment-spelled
             // `augment class B = A with M;` must not register a target row
             // (the merge rule reads the intro's mixin-application bit).
@@ -3118,6 +3132,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_factory: false,
                     is_complete: false,
                     head_range: None,
+                    name_range,
                 });
             }
         }
@@ -3350,18 +3365,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // The constant's member row was inserted at `EnumValueDeclaration`
         // (the element's last registered constant is this one — the
         // constants parse in declaration order, members after).
-        let constant_is_augment = builder.declaring_augment;
         if let Some(ty) = declared
             && let Some(open) = builder.containers.last_mut()
             && let Some(&constant) = open.enum_constants.last()
         {
             let entry = open.members.or_insert_with(constant, || MemberEntry {
                 kind: MemberKind::Field,
-                is_augment: constant_is_augment,
+                // The per-constant `augment` fact lands at
+                // `handle_enum_element`, which fires after this event.
+                is_augment: false,
                 is_static: true,
                 is_abstract: false,
                 is_external: false,
                 is_final: false,
+                // Every enum constant is const (element_builder.dart:1469).
+                is_const: true,
                 covariant: false,
                 type_params: 0,
                 type_param_names: Box::default(),
@@ -3380,6 +3398,54 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.armed_ty = None;
         builder.armed_ty_range = None;
         builder.armed_tree = None;
+    }
+
+    /// Enum-element exit: the constant's own `augment` keyword lands on its
+    /// member row — upstream `fieldFragment.isAugmentation =
+    /// constant.augmentKeyword != null` (element_builder.dart:1468), a
+    /// PER-CONSTANT fact the insert at `EnumValueDeclaration` could not see
+    /// (the constant's `augment` token parses ahead of its name, while this
+    /// event fires after its constructor invocation). A constant of an
+    /// `augment enum` that carries no keyword of its own is an introductory
+    /// fragment of the merged element upstream — it claims its induced
+    /// getter like any introduction, so the suppressed claim replays here.
+    fn handle_enum_element(&mut self, _begin: Token, augment: Option<Token>) {
+        let builder = &mut self.builder;
+        let per_constant_augment = augment.is_some();
+        let mut claim: Option<(StringId, SourceRange)> = None;
+        if let Some(open) = builder.containers.last_mut()
+            && open.kind == ContainerKind::Enum
+            && let Some(&constant) = open.enum_constants.last()
+        {
+            // The member row was inserted at `EnumValueDeclaration` —
+            // `or_insert_with` lands on that existing slot (no insert
+            // fires; the fallback just mirrors the constant's shape).
+            let entry = open.members.or_insert_with(constant, || MemberEntry {
+                kind: MemberKind::Field,
+                is_augment: false,
+                is_static: true,
+                is_abstract: false,
+                is_external: false,
+                is_final: false,
+                is_const: true,
+                covariant: false,
+                type_params: 0,
+                type_param_names: Box::default(),
+                type_param_bounds: Box::default(),
+                var_ty: Ty::UNKNOWN,
+                return_ty: Ty::UNKNOWN,
+                formals: None,
+                annotations: Box::default(),
+                name_range: MemberEntry::MISSING_NAME_RANGE,
+            });
+            entry.is_augment = per_constant_augment;
+            if !per_constant_augment && builder.declaring_augment {
+                claim = Some((constant, entry.name_range));
+            }
+        }
+        if let Some((constant, range)) = claim {
+            builder.member_dup_claim(constant, true, DUP_GETTER, range);
+        }
     }
 
     fn handle_mixin_header(&mut self, _mixin: Token) {
@@ -4019,13 +4085,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 kind: AugKind::TopLevelVar,
                                 is_final,
                                 is_mixin_application: false,
-                                is_const: false,
+                                // The group's real `const` bit — the
+                                // `augments_constant_variable` target fact.
+                                is_const: builder.field_const.is_some(),
                                 is_factory: false,
-                                // A top-level variable's induced accessors
-                                // are `external || !abstract` — top-level
-                                // spellings carry neither, so complete.
-                                is_complete: true,
+                                // The induced accessors' completeness:
+                                // `external || !abstract` — under the
+                                // augmentations experiment an `abstract`
+                                // top-level variable parses and its induced
+                                // accessors stay incomplete.
+                                is_complete: builder.field_external || !builder.field_abstract,
                                 head_range: None,
+                                name_range: range,
                             });
                         }
                         if let Some(augment_kw) = builder.field_augment {
@@ -4048,7 +4119,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 formals: Box::new([]),
                                 parens: None,
                                 group_open: None,
-                                const_kw: None,
+                                // `const` on the augmenting variable — the
+                                // `constant_variable_augmentation` fact.
+                                const_kw: builder.field_const,
                                 factory_kw: None,
                                 // The induced accessor's completeness:
                                 // `external || !abstract` (upstream
@@ -4109,6 +4182,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         // (`@meta int a, b;` annotates both).
                         let annotations = builder.field_annotations.clone().into_boxed_slice();
                         let augmenting = builder.field_augment;
+                        // The group's real `const` keyword — read before the
+                        // container borrow below (`open` holds it across the
+                        // member insert).
+                        let group_const = builder.field_const;
                         // The induced-setter fact before the borrow below
                         // (`field.definesSetter` — upstream
                         // member_duplicate_definition_verifier.dart:128-149):
@@ -4127,6 +4204,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     is_abstract,
                                     is_external,
                                     is_final,
+                                    // The group's real `const` bit
+                                    // (`fieldFragment.isConst`), kept apart
+                                    // from `is_final` — the augmentation
+                                    // const checks read exactly it.
+                                    is_const: group_const.is_some(),
                                     covariant: field_covariant,
                                     type_params: 0,
                                     type_param_names: Box::default(),
@@ -4176,7 +4258,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 formals: Box::new([]),
                                 parens: None,
                                 group_open: None,
-                                const_kw: None,
+                                // `const` on the augmenting field group —
+                                // the `constant_variable_augmentation`
+                                // fact.
+                                const_kw: group_const,
                                 factory_kw: None,
                                 // `external || !abstract` (the field's
                                 // induced getter/setter `isComplete`).
@@ -4202,16 +4287,20 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         Entry::Vacant(slot) => {
                             slot.insert(MemberEntry {
                                 kind: MemberKind::Field,
-                                // The constant's augment fact rides the
-                                // container's flag (the enum-constants grammar
-                                // carries no separate per-constant latch
-                                // here) — the same fact the claim gate below
-                                // reads.
-                                is_augment: builder.declaring_augment,
+                                // The constant's own `augment` keyword —
+                                // upstream `constant.augmentKeyword != null`
+                                // (element_builder.dart:1468). The latch is
+                                // populated per constant at
+                                // `handle_enum_element`, which fires AFTER
+                                // this insert — the row is patched there.
+                                is_augment: false,
                                 is_static: true,
                                 is_abstract: false,
                                 is_external: false,
                                 is_final: false,
+                                // Every enum constant is const (upstream
+                                // `isConst = true`, element_builder.dart:1469).
+                                is_const: true,
                                 covariant: false,
                                 type_params: 0,
                                 type_param_names: Box::default(),
@@ -4438,12 +4527,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 text == "final" || text == "const"
             });
         builder.field_late = _late_kw.is_some();
+        // The `const` keyword's own bit and span — upstream
+        // `fieldFragment.isConst = node.fields.isConst` /
+        // `topLevelVariableFragment.isConst = node.variables.isConst`
+        // (element_builder.dart:1685/:2233): a real bit distinct from
+        // `final` (the augmentation face's const checks read exactly it —
+        // a `final` proxy would over-report `augments_constant_variable`).
+        builder.field_const = _var_final_or_const
+            .filter(|t| {
+                builder
+                    .tokens
+                    .get(t.id as usize)
+                    .is_some_and(|tok| &builder.source[tok.byte_range()] == "const")
+            })
+            .map(|t| builder.span_of(t));
         // A top-level `const` group opens the const-creation face's
         // capture window (member and local groups never latch it).
-        builder.top_const_group = builder.containers.is_empty()
-            && _var_final_or_const
-                .and_then(|t| builder.tokens.get(t.id as usize))
-                .is_some_and(|tok| &builder.source[tok.byte_range()] == "const");
+        builder.top_const_group =
+            builder.containers.is_empty() && builder.field_const.is_some();
         builder.field_augment = augment_kw.map(|t| builder.span_of(t));
         builder.declaring_augment = augment_kw.is_some();
     }
@@ -4471,6 +4572,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_const = None;
         builder.field_covariant = false;
         builder.field_late = false;
         builder.field_augment = None;
@@ -4505,6 +4607,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_const = None;
         builder.field_covariant = false;
         builder.field_late = false;
         builder.field_augment = None;
@@ -4724,6 +4827,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_abstract: !pending.has_body && !pending.is_external,
                     is_external: pending.is_external,
                     is_final: false,
+                    is_const: false,
                     // Executables carry no `covariant` member flag — their
                     // parameter marks ride `Formal::covariant`.
                     covariant: false,
@@ -4917,6 +5021,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // body and `declaration_already_complete` must not fire.
                     is_complete: pending.is_external || pending.has_body,
                     head_range: None,
+                    name_range: range,
                 });
             }
             if let Some(mut augment) = builder.pending_aug.take() {
@@ -5173,6 +5278,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_factory: true,
                     is_complete: factory_complete,
                     head_range: head,
+                    // Constructor rows anchor at `head_range`; the
+                    // completeness walks never read this slot.
+                    name_range: AugTarget::MISSING_NAME_RANGE,
                 });
             };
             if capture_named.is_empty() {
@@ -5429,6 +5537,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_factory: false,
                     is_complete: ctor_complete,
                     head_range: None,
+                    // Constructor rows anchor at `head_range`; the
+                    // completeness walks never read this slot.
+                    name_range: AugTarget::MISSING_NAME_RANGE,
                 });
             };
             if ctor_selectors.is_empty() && ctor_unnamed {
@@ -5586,6 +5697,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // A primary is always complete.
                 is_complete: true,
                 head_range: None,
+                name_range: AugTarget::MISSING_NAME_RANGE,
             });
         }
         if let Some(open) = builder.containers.last_mut() {
@@ -5700,6 +5812,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_factory: false,
                 is_complete: false,
                 head_range: None,
+                name_range: range,
             });
             let _ = builder.declare_top(
                 name,
@@ -5997,6 +6110,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.executable_header_done = true;
     }
 
+    /// The `=`/`:` separator of an optional formal's default clause — the
+    /// augment capture's `constantInitializer` marker and the
+    /// `default_value_already_specified_in_augmentation_chain` anchor
+    /// (upstream `defaultClause.separator`). Latched only inside an
+    /// `augment` declaration's own parameter list, drained by
+    /// `end_formal_parameter` into [`AugmentFormal::default_separator`].
+    fn handle_valued_formal_parameter(
+        &mut self,
+        equals: Token,
+        _end: Token,
+        _kind: FormalParameterKind,
+    ) {
+        let builder = &mut self.builder;
+        if builder.formal_depth == 1 && builder.pending_aug.is_some() {
+            builder.aug_default_separator = Some(builder.span_of(equals));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn begin_formal_parameter(
         &mut self,
@@ -6178,6 +6309,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 named,
                 covariant_kw,
                 required_kw,
+                // The default clause's `=`/`:` separator — latched at
+                // `handle_valued_formal_parameter` (upstream
+                // `defaultClause.separator`, the
+                // `default_value_already_specified_in_augmentation_chain`
+                // anchor and the `constantInitializer` marker).
+                default_separator: std::mem::take(&mut builder.aug_default_separator),
             });
         }
         // An initializing `this.x`/`super.x` formal on any open constructor
@@ -6241,6 +6378,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_abstract: false,
                 is_external: false,
                 is_final: declaring_final,
+                // A declaring formal's field is never `const`.
+                is_const: false,
                 // A `covariant` declaring formal marks its induced field's
                 // setter parameter covariant — the same mark
                 // `fieldFragment.isExplicitlyCovariant` carries (upstream
@@ -6449,6 +6588,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_abstract: false,
                 is_external: false,
                 is_final: true,
+                is_const: false,
                 // The representation formal is always `final` — no induced
                 // setter exists for the flag to mark.
                 covariant: false,

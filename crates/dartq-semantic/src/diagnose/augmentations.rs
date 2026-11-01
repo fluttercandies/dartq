@@ -45,8 +45,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::codes::{AlreadyCompleteShape, ReturnShape, SemanticCode, WithoutDeclarationShape};
 use crate::library::ElementIndex;
 use crate::model::{
-    AugKind, AugmentDecl, AugmentFormal, Container, ContainerKind, FileElements, Formal, Formals,
-    MemberKind, MicroKind, Ty,
+    AugKind, AugmentDecl, AugmentFormal, AugTarget, Container, ContainerKind, FileElements, Formal,
+    Formals, MemberEntry, MemberKind, MicroKind, Ty,
 };
 
 /// The variable family — a `Field`/`TopLevelVar` declaration and the
@@ -313,8 +313,17 @@ pub(super) fn augmentation_diagnostics(
     // `_checkForFactoryBodyCompleteness` (error_verifier.dart:5078-5107)
     // runs for every factory constructor of the unit, augmentation chains or
     // none — and only with the `augmentations` experiment on (`:5079-5081`).
+    // `_checkForFunctionBodyCompleteness` (`:5256-5321`) and
+    // `_checkForIncompleteInducedAccessors` (`:5415-5456`) run for every
+    // introductory executable and abstract static field under the same gate
+    // (`:5259-5261`/`:5419-5421`) — both are intro-side walks, so they share
+    // this placement ahead of the augmentation-table early return.
     let mut out = if augmentations_enabled {
-        factory_body_diagnostics(file, own, index, graph, lib, strings)
+        let mut out = factory_body_diagnostics(file, own, index, graph, lib, strings);
+        out.extend(executable_body_diagnostics(
+            file, own, index, graph, lib, strings,
+        ));
+        out
     } else {
         Vec::new()
     };
@@ -358,6 +367,31 @@ pub(super) fn augmentation_diagnostics(
         index,
         strings,
     };
+    // `visitEnumConstantDeclaration` runs `_checkForConstVariableAugmentation`
+    // for every constant of an enum unit (upstream Dart SDK source,
+    // `pkg/analyzer/lib/src/generated/error_verifier.dart:808-818`): an enum
+    // constant fragment is `isConst = true` unconditionally
+    // (`element_builder.dart:1469`), so a constant carrying the `augment`
+    // keyword always reports `constant_variable_augmentation` at its name —
+    // the check's own fragment arm, never reached for the firstFragment arm.
+    // The member row's `is_augment` is the constant's own keyword (patched
+    // per-constant by the collector); the gate needs no chain walk.
+    for &container_name in own.container_order() {
+        let Some(container) = own.container(container_name) else {
+            continue;
+        };
+        if container.kind != ContainerKind::Enum {
+            continue;
+        }
+        for constant in container.enum_constants.iter() {
+            if let Some(member) = container.members.get(constant)
+                && member.is_augment
+            {
+                let code = SemanticCode::ConstantVariableAugmentation;
+                out.push(row(file, member.name_range, code, code.message("", "")));
+            }
+        }
+    }
     for (aug_index, aug) in own.augmentations().iter().enumerate() {
         // A type alias augmentation never merges: the parser reports the
         // shape outright (upstream `parser_impl.dart` reports
@@ -527,6 +561,40 @@ fn process_variable(
         .rposition(|entry| !accessor_family(entry.kind))
         .map_or(0, |i| i + 1);
     let generation = &chain[gen_start..];
+    // `_checkForConstVariableAugmentation` /
+    // `_checkForConstVariableAugmentationByAccessor` (upstream Dart SDK
+    // source, `pkg/analyzer/lib/src/generated/error_verifier.dart:4241-4280`
+    // — call order `visitFieldDeclaration:1047`,
+    // `visitTopLevelVariableDeclaration:2066`,
+    // `visitFunctionDeclaration:1200`,
+    // `visitMethodDeclaration:1473`): the const gate runs BEFORE every
+    // other augmentation check on the declaration — including the
+    // without-declaration row (an accessor augment over a `const` variable
+    // reports `augments_constant_variable`, never
+    // `augmentation_of_different_declaration_kind`, because the accessor's
+    // element exists on the variable even when the accessor's own chain is
+    // empty). A fired row suppresses the rest
+    // (`hasConstVariableAugmentation` guards the whole block).
+    // A variable fragment's own `const` reports `constant_variable_augmentation`;
+    // otherwise the variable element's first fragment being `const` reports
+    // `augments_constant_variable` — `element.variable.firstFragment` is the
+    // generation's first variable-chain entry (the backing field of an
+    // accessor-only generation is synthetic and never const). The name
+    // token anchors both rows.
+    if matches!(aug.kind, AugKind::Field | AugKind::TopLevelVar) && aug.const_kw.is_some() {
+        let code = SemanticCode::ConstantVariableAugmentation;
+        out.push(row(file, aug.name_range, code, code.message("", "")));
+        return;
+    }
+    if generation
+        .iter()
+        .find(|entry| entry.in_accessor(Accessor::Variable))
+        .is_some_and(|entry| entry.is_const)
+    {
+        let code = SemanticCode::AugmentsConstantVariable;
+        out.push(row(file, aug.name_range, code, code.message("", "")));
+        return;
+    }
     // The sub-chains the augment merges into and (for a variable augment)
     // induces.
     let target = match aug.kind {
@@ -983,7 +1051,7 @@ fn populate(
                 false,
                 false,
                 member.is_final,
-                false,
+                member.is_const,
                 false,
                 // The accessor/variable completeness bit: `external ||
                 // !abstract` — a method/getter/setter's `has_body ||
@@ -1320,6 +1388,21 @@ fn check_formals(
         named: Box::default(),
     };
     let first = intro_formals.unwrap_or(&empty);
+    // `_checkForDefaultValueAlreadySpecifiedInAugmentationChain`
+    // (upstream Dart SDK source,
+    // `pkg/analyzer/lib/src/generated/error_verifier.dart:4346-4375`, run
+    // from `_checkUseOfDefaultValuesInParameters` for every parameter of a
+    // visited list `:7999`): an optional formal of THIS augmentation that
+    // writes a default reports at `defaultClause.separator` when ANY
+    // preceding fragment of its own parameter element carried a
+    // `constantInitializer`. The parameter element's chain is positional —
+    // each fragment's i-th optional positional / same-named named formal —
+    // and `run` is exactly the executable chain's preceding fragments in
+    // order (the intro at `run[0]`, then earlier augments); `isOptional`
+    // upstream is `isOptionalPositional || isOptionalNamed` (a `required`
+    // named formal is not optional — `parameter.isOptional` in
+    // `FormalParameterImpl` excludes required named).
+    check_default_chain(out, file, aug, first, index, run);
     let cur_positional: Vec<&AugmentFormal> = aug
         .formals
         .iter()
@@ -1488,6 +1571,101 @@ fn check_formals(
             let code = SemanticCode::AugmentationNamedFormalParameterMissing;
             let message = code.message(strings.resolve(*name), "");
             out.push(row(file, right_paren, code, message));
+        }
+    }
+}
+
+/// One augmentation parameter list's
+/// `default_value_already_specified_in_augmentation_chain` pass — see the
+/// call-site note in [`check_formals`]. Each optional formal that writes a
+/// default walks its own parameter element's preceding fragments: the
+/// same-index optional positional / same-named named formal of the intro
+/// (`first`) and of every earlier augmentation in `run`, reporting at its
+/// own `=`/`:` separator on the first carried default (upstream
+/// `precedingFragments.any(constantInitializer != null)` — one row per
+/// parameter, anchored at `defaultClause.separator`).
+fn check_default_chain(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    aug: &AugmentDecl,
+    first: &Formals,
+    index: &ElementIndex,
+    run: &[&Entry],
+) {
+    // One preceding fragment's same-slot formal carried a default:
+    // `constantInitializer != null` — `Formal::default_value` on the intro,
+    // `AugmentFormal::default_separator` on an augment fragment.
+    let preceding_had_default = |entry: &Entry, positional: Option<usize>, named: Option<StringId>| {
+        if entry.is_augment {
+            let Some(elements) = index.get(entry.unit) else {
+                return false;
+            };
+            let Some(decl) = elements.augmentations().get(entry.aug_index) else {
+                return false;
+            };
+            match (positional, named) {
+                (Some(at), None) => decl
+                    .formals
+                    .iter()
+                    .filter(|f| f.required_positional || f.optional_positional)
+                    .nth(at)
+                    .is_some_and(|f| f.default_separator.is_some()),
+                (None, Some(name)) => decl
+                    .formals
+                    .iter()
+                    .find(|f| f.named && f.name == Some(name))
+                    .is_some_and(|f| f.default_separator.is_some()),
+                _ => false,
+            }
+        } else {
+            match (positional, named) {
+                (Some(at), None) => first
+                    .positional
+                    .get(at)
+                    .is_some_and(|f| f.default_value.is_some()),
+                (None, Some(name)) => first
+                    .named
+                    .iter()
+                    .find(|f| f.name == name)
+                    .is_some_and(|f| f.default_value.is_some()),
+                _ => false,
+            }
+        }
+    };
+    let mut positional_at = 0usize;
+    for formal in aug.formals.iter() {
+        // The parameter element's slot: a positional index for the
+        // positional kinds (required and optional share one indexing —
+        // `formalParameterList.parameters` order upstream), a name for the
+        // named kind.
+        let slot = if formal.required_positional || formal.optional_positional {
+            let at = positional_at;
+            positional_at += 1;
+            Some((Some(at), None))
+        } else if formal.named {
+            formal.name.map(|name| (None, Some(name)))
+        } else {
+            None
+        };
+        // `parameter.isOptional` — an optional positional or a non-required
+        // named formal (a required named formal is not optional upstream
+        // and its default reports `default_value_on_required_parameter`
+        // instead).
+        let optional =
+            formal.optional_positional || (formal.named && formal.required_kw.is_none());
+        let (Some(separator), Some((positional, named))) = (formal.default_separator, slot)
+        else {
+            continue;
+        };
+        if !optional {
+            continue;
+        }
+        if run
+            .iter()
+            .any(|entry| preceding_had_default(entry, positional, named))
+        {
+            let code = SemanticCode::DefaultValueAlreadySpecifiedInAugmentationChain;
+            out.push(row(file, separator, code, code.message("", "")));
         }
     }
 }
@@ -2363,6 +2541,484 @@ fn factory_body_diagnostics(
     out
 }
 
+/// Whether an `augment` declaration joins the named accessor sub-chain of a
+/// variable-family element — the [`Entry::in_accessor`] membership rule
+/// read straight off the capture (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/summary2/element_builder.dart`: a variable
+/// fragment appends an induced getter (always) and an induced setter
+/// (non-final) alongside its own slot; an explicit accessor fragment
+/// appends only to its own chain).
+fn aug_in_accessor(aug: &AugmentDecl, accessor: Accessor) -> bool {
+    match accessor {
+        Accessor::Variable => matches!(
+            aug.kind,
+            AugKind::Field | AugKind::TopLevelVar | AugKind::Getter | AugKind::Setter
+        ),
+        Accessor::Getter => matches!(
+            aug.kind,
+            AugKind::Getter | AugKind::Field | AugKind::TopLevelVar
+        ),
+        Accessor::Setter => {
+            aug.kind == AugKind::Setter
+                || (matches!(aug.kind, AugKind::Field | AugKind::TopLevelVar) && !aug.is_final)
+        }
+    }
+}
+
+/// The fragments of `key`'s chain that follow the introductory declaration
+/// at `intro_offset` in `file`: every same-key `augment` of a later unit in
+/// `allUnits` walk order, plus this unit's own augments written after the
+/// intro (upstream `firstFragment.augmentations` — the `ElementBuilder`
+/// appends in source order within a unit, so an earlier same-unit augment
+/// never reaches this intro's element).
+fn later_augments<'a>(
+    own: &'a FileElements,
+    index: &'a ElementIndex,
+    after: &'a [FileId],
+    intro_offset: u32,
+    key: (Option<StringId>, StringId, Space),
+    strings: &StringTable,
+) -> Vec<&'a AugmentDecl> {
+    let mut out: Vec<&AugmentDecl> = Vec::new();
+    for aug in own.augmentations() {
+        if augment_key(aug, strings) == key && aug.augment_kw.offset > intro_offset {
+            out.push(aug);
+        }
+    }
+    for &unit in after {
+        let Some(elements) = index.get(unit) else {
+            continue;
+        };
+        for aug in elements.augmentations() {
+            if augment_key(aug, strings) == key {
+                out.push(aug);
+            }
+        }
+    }
+    out
+}
+
+/// `_checkForFunctionBodyCompleteness` and
+/// `_checkForIncompleteInducedAccessors` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/generated/error_verifier.dart:5256-5321` and
+/// `:5415-5456`): the intro-side completeness walks of the augmentations
+/// experiment.
+///
+/// The executable arm runs for every method/getter/setter intro except the
+/// instance members of a class, enum, or mixin (`:5273-5280` — those are
+/// validated for the whole interface by other faces) and except a fragment
+/// that is itself an augmentation (`:5267-5270` — `MemberEntry::is_augment`
+/// is the declaration's own keyword). A chain that stays incomplete with
+/// more than one fragment reports `function_not_complete_after_augmentations`
+/// at the name token (`:5313-5319`); a singleton stays silent here —
+/// `missing_function_body` / `extension_declares_abstract_member` /
+/// `extension_type_with_abstract_member` own that arm (`:5286-5311`, other
+/// faces' codes). A complete fragment anywhere in the chain silences the
+/// row (`:5282-5284`).
+///
+/// The field arm runs for a `static` field group written `abstract`
+/// (`:1073-1081`): the variable's induced getter and (non-`final`) setter
+/// elements each report their `*_not_complete_after_augmentations` shape
+/// when no chain fragment is complete and either accessor chain grew
+/// (`:5430-5455` — the `without_body` sibling of a singleton chain is again
+/// another face's code). The enum constants never qualify — the `abstract`
+/// bit is never set on their rows.
+///
+/// The top-level arms are the same checks read off the declaration table:
+/// a top-level function/getter/setter intro (`AugTarget` rows carry no
+/// container) follows the executable rule verbatim, and a `TopLevelVar`
+/// row written `abstract` (its `is_complete` bit is the variable's
+/// induced-accessor completeness — `external || !abstract`) feeds the
+/// induced getter/setter arms.
+fn executable_body_diagnostics(
+    file: FileId,
+    own: &FileElements,
+    index: &ElementIndex,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+    strings: &StringTable,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let units = graph.unit_files(lib);
+    let after: &[FileId] = match units.iter().position(|&unit| unit == file) {
+        Some(pos) => &units[pos + 1..],
+        None => &[],
+    };
+    // The top-level walk: `AugTarget` rows are introductions only (the
+    // collector logs them under `!declaring_augment`), so the
+    // `firstFragment.isAugmentation` filter is structural here.
+    for target in own.decl_kinds() {
+        if target.container.is_some()
+            || target.name_range.offset == AugTarget::MISSING_NAME_RANGE.offset
+        {
+            continue;
+        }
+        match target.kind {
+            AugKind::Function | AugKind::Getter | AugKind::Setter => {
+                executable_top_level_row(&mut out, file, own, index, after, target, strings);
+            }
+            AugKind::TopLevelVar => {
+                induced_top_level_rows(&mut out, file, own, index, after, target, strings);
+            }
+            _ => {}
+        }
+    }
+    for &container_name in own.container_order() {
+        // An `augment` container head's member rows are fragment members,
+        // not introductions — the same filter the chain table applies.
+        if index.container_row_is_fragment(graph, lib, file, container_name) {
+            continue;
+        }
+        let Some(container) = own.container(container_name) else {
+            continue;
+        };
+        let interface_like = matches!(
+            container.kind,
+            ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
+        );
+        for (member_name, member) in container.members.iter() {
+            // `firstFragment.isAugmentation` — the declaration's own
+            // `augment` keyword makes it a fragment, never an intro.
+            if member.is_augment
+                || member.name_range.offset == MemberEntry::MISSING_NAME_RANGE.offset
+            {
+                continue;
+            }
+            match member.kind {
+                MemberKind::Method | MemberKind::Getter | MemberKind::Setter => {
+                    executable_member_row(
+                        &mut out,
+                        file,
+                        own,
+                        index,
+                        after,
+                        container_name,
+                        *member_name,
+                        member,
+                        interface_like,
+                        strings,
+                    );
+                }
+                MemberKind::Field => {
+                    induced_accessor_rows(
+                        &mut out,
+                        file,
+                        own,
+                        index,
+                        after,
+                        container_name,
+                        *member_name,
+                        member,
+                        strings,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One incomplete-executable chain's report decision: `fragments` counts
+/// the chain's augment fragments, `complete` whether any finished the
+/// body. Reports `function_not_complete_after_augmentations` at `anchor`
+/// when the chain grew and never completed (upstream
+/// `error_verifier.dart:5282-5319` — a singleton stays silent; other
+/// faces own that arm).
+fn report_incomplete_executable(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    anchor: SourceRange,
+    display: &str,
+    fragments: usize,
+    complete: bool,
+) {
+    if fragments == 0 || complete {
+        return;
+    }
+    let code = SemanticCode::FunctionNotCompleteAfterAugmentations;
+    out.push(row(file, anchor, code, code.message(display, "")));
+}
+
+/// The executable arm of [`executable_body_diagnostics`]: one member
+/// intro's chain, anchored at its name token.
+#[expect(clippy::too_many_arguments)] // the walk's shared context columns
+fn executable_member_row(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    own: &FileElements,
+    index: &ElementIndex,
+    after: &[FileId],
+    container_name: StringId,
+    member_name: StringId,
+    member: &MemberEntry,
+    interface_like: bool,
+    strings: &StringTable,
+) {
+    // Instance members of a class-family container are validated for the
+    // whole interface (upstream `:5273-5280`); extension and extension-type
+    // members of either staticness stay in the face.
+    if !member.is_static && interface_like {
+        return;
+    }
+    // A complete intro (a body, or `external`) satisfies the chain by
+    // itself — `fragments.any(isComplete)` (`:5282-5284`).
+    if member.is_external || !member.is_abstract {
+        return;
+    }
+    let aug_kind = match member.kind {
+        MemberKind::Method => AugKind::Method,
+        MemberKind::Getter => AugKind::Getter,
+        MemberKind::Setter => AugKind::Setter,
+        MemberKind::Field => unreachable!(),
+    };
+    let space = if member.is_static {
+        Space::StaticMember
+    } else {
+        Space::Member
+    };
+    let key = (
+        Some(container_name),
+        property_name(member_name, aug_kind, strings),
+        space,
+    );
+    // The element's own fragment chain: a method element collects only
+    // method fragments; a getter/setter element also collects the induced
+    // accessor fragments of merging variable declarations (upstream
+    // `_handleInstanceFieldFragment` appends the induced fragment to the
+    // accessor element it finds).
+    let accessor = match member.kind {
+        MemberKind::Method => None,
+        MemberKind::Getter => Some(Accessor::Getter),
+        MemberKind::Setter => Some(Accessor::Setter),
+        MemberKind::Field => unreachable!(),
+    };
+    let mut fragments = 0usize;
+    let mut complete = false;
+    for aug in later_augments(
+        own,
+        index,
+        after,
+        member.name_range.offset,
+        key,
+        strings,
+    ) {
+        match accessor {
+            Some(chain) if !aug_in_accessor(aug, chain) => continue,
+            None if aug.kind != aug_kind => continue,
+            _ => {}
+        }
+        fragments += 1;
+        complete |= aug.is_complete;
+    }
+    report_incomplete_executable(
+        out,
+        file,
+        member.name_range,
+        strings.resolve(key.1),
+        fragments,
+        complete,
+    );
+}
+
+/// The top-level executable arm of [`executable_body_diagnostics`]: a
+/// function/getter/setter intro row from the declaration table. The member
+/// face's container/interface gates do not apply — a top-level intro is
+/// always in the face, and `Space::Top` is its only space.
+fn executable_top_level_row(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    own: &FileElements,
+    index: &ElementIndex,
+    after: &[FileId],
+    target: &AugTarget,
+    strings: &StringTable,
+) {
+    // `fragments.any(isComplete)` — the intro's own bit is the row's
+    // `is_complete` (an executable's `external || nonEmptyBody`).
+    if target.is_complete {
+        return;
+    }
+    let key = (
+        None,
+        property_name(target.name, target.kind, strings),
+        Space::Top,
+    );
+    let accessor = match target.kind {
+        AugKind::Function => None,
+        AugKind::Getter => Some(Accessor::Getter),
+        AugKind::Setter => Some(Accessor::Setter),
+        _ => unreachable!(),
+    };
+    let mut fragments = 0usize;
+    let mut complete = false;
+    for aug in later_augments(own, index, after, target.name_range.offset, key, strings) {
+        match accessor {
+            Some(chain) if !aug_in_accessor(aug, chain) => continue,
+            None if aug.kind != AugKind::Function => continue,
+            _ => {}
+        }
+        fragments += 1;
+        complete |= aug.is_complete;
+    }
+    report_incomplete_executable(
+        out,
+        file,
+        target.name_range,
+        strings.resolve(key.1),
+        fragments,
+        complete,
+    );
+}
+
+/// One induced-accessor pair's report decision shared by the member and
+/// top-level field arms: the getter chain always exists (the intro
+/// induces one), the setter chain only for a non-`final` variable
+/// (upstream `fieldFragment.hasSetter`, read off the group's `final` —
+/// a `const` variable folds into it). `getter`/`setter` are
+/// `(chain_length, complete)`; `has_augmentations` is either chain
+/// growing past its intro (`error_verifier.dart:5428-5432`).
+#[expect(clippy::too_many_arguments)] // the walk's shared context columns
+fn report_incomplete_induced(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    anchor: SourceRange,
+    display: &str,
+    is_final: bool,
+    getter: (usize, bool),
+    setter: (usize, bool),
+) {
+    if getter.0 <= 1 && setter.0 <= 1 {
+        return;
+    }
+    if !getter.1 {
+        let code = SemanticCode::InducedGetterNotCompleteAfterAugmentations;
+        out.push(row(file, anchor, code, code.message(display, "")));
+    }
+    if !is_final && !setter.1 {
+        let code = SemanticCode::InducedSetterNotCompleteAfterAugmentations;
+        out.push(row(file, anchor, code, code.message(display, "")));
+    }
+}
+
+/// The induced-accessor arm of [`executable_body_diagnostics`]: a
+/// `static abstract` field's getter and setter chains.
+#[expect(clippy::too_many_arguments)] // the walk's shared context columns
+fn induced_accessor_rows(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    own: &FileElements,
+    index: &ElementIndex,
+    after: &[FileId],
+    container_name: StringId,
+    member_name: StringId,
+    member: &MemberEntry,
+    strings: &StringTable,
+) {
+    // Upstream gates the face on `node.isStatic && abstractKeyword != null`
+    // (`:1073-1081`): the member row's `is_abstract` is the field group's
+    // `abstract` keyword (and an abstract field is never `external`).
+    if !member.is_static || !member.is_abstract {
+        return;
+    }
+    let key = (
+        Some(container_name),
+        property_name(member_name, AugKind::Field, strings),
+        Space::StaticMember,
+    );
+    let augments = later_augments(
+        own,
+        index,
+        after,
+        member.name_range.offset,
+        key,
+        strings,
+    );
+    // Each accessor element's chain: the intro's induced fragment plus
+    // every merging fragment that lands in that accessor's element. A
+    // `final` field has no setter at all (upstream `fieldFragment.hasSetter`
+    // — the chain count is then zero, `?? 0`).
+    let chain = |accessor: Accessor| -> (usize, bool) {
+        let mut len = 1usize; // the intro's induced fragment
+        let mut complete = member.is_external || !member.is_abstract;
+        for aug in &augments {
+            if !aug_in_accessor(aug, accessor) {
+                continue;
+            }
+            len += 1;
+            complete |= aug.is_complete;
+        }
+        (len, complete)
+    };
+    let getter = chain(Accessor::Getter);
+    let setter = if member.is_final {
+        (0, true)
+    } else {
+        chain(Accessor::Setter)
+    };
+    report_incomplete_induced(
+        out,
+        file,
+        member.name_range,
+        strings.resolve(key.1),
+        member.is_final,
+        getter,
+        setter,
+    );
+}
+
+/// The top-level induced-accessor arm of
+/// [`executable_body_diagnostics`]: an `abstract` top-level variable's
+/// getter and setter chains. The row's `is_complete` is the induced
+/// accessors' completeness bit (`external || !abstract`), so `!is_complete`
+/// is the `abstractKeyword != null` gate; the variable's own chain feeds
+/// neither accessor element.
+fn induced_top_level_rows(
+    out: &mut Vec<Diagnostic>,
+    file: FileId,
+    own: &FileElements,
+    index: &ElementIndex,
+    after: &[FileId],
+    target: &AugTarget,
+    strings: &StringTable,
+) {
+    if target.is_complete {
+        return;
+    }
+    let key = (
+        None,
+        property_name(target.name, AugKind::TopLevelVar, strings),
+        Space::Top,
+    );
+    let augments = later_augments(own, index, after, target.name_range.offset, key, strings);
+    let chain = |accessor: Accessor| -> (usize, bool) {
+        let mut len = 1usize; // the intro's induced fragment
+        let mut complete = target.is_complete;
+        for aug in &augments {
+            if !aug_in_accessor(aug, accessor) {
+                continue;
+            }
+            len += 1;
+            complete |= aug.is_complete;
+        }
+        (len, complete)
+    };
+    let getter = chain(Accessor::Getter);
+    let setter = if target.is_final {
+        (0, true)
+    } else {
+        chain(Accessor::Setter)
+    };
+    report_incomplete_induced(
+        out,
+        file,
+        target.name_range,
+        strings.resolve(key.1),
+        target.is_final,
+        getter,
+        setter,
+    );
+}
+
 // The #3201 pins — the factory-body completeness face
 // (`factory_without_body`) with the augmentations experiment on.
 #[cfg(test)]
@@ -2374,3 +3030,10 @@ mod ticket_3201_tests;
 #[cfg(test)]
 #[path = "ticket_3556_tests.rs"]
 mod ticket_3556_tests;
+
+// The #3569 pins — the intro-side completeness walks
+// (`function_not_complete_after_augmentations` member arm and the induced
+// getter/setter `static abstract` field arm).
+#[cfg(test)]
+#[path = "ticket_3569_tests.rs"]
+mod ticket_3569_tests;

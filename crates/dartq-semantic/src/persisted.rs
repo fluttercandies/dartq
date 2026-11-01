@@ -280,6 +280,12 @@ pub struct PersistedMemberEntry {
     pub is_external: bool,
     pub is_final: bool,
     /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode non-const (the #539 additive-field
+    /// discipline; the field group's real `const` bit — kept apart from
+    /// `is_final`, which conflates `final` and `const`).
+    #[serde(default)]
+    pub is_const: bool,
+    /// Additive after the format shipped: `default` so payloads persisted
     /// before the field existed decode unmarked (the #539 additive-field
     /// discipline; the field's explicit `covariant` keyword — its induced
     /// setter parameter's covariance).
@@ -608,6 +614,13 @@ pub struct PersistedAugmentFormal {
     pub named: bool,
     pub covariant_kw: Option<PersistedRange>,
     pub required_kw: Option<PersistedRange>,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode default-less (the #539
+    /// additive-field discipline; the `=`/`:` separator's span — the
+    /// `default_value_already_specified_in_augmentation_chain` anchor and
+    /// the preceding-fragment `constantInitializer` marker).
+    #[serde(default)]
+    pub default_separator: Option<PersistedRange>,
 }
 
 /// One type parameter of an `augment` declaration.
@@ -661,6 +674,14 @@ pub struct PersistedAugTarget {
     pub is_complete: bool,
     /// The constructor head's `errorRange` ([`AugTarget::head_range`]).
     pub head_range: Option<PersistedRange>,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode span-less — the intro-side
+    /// completeness walks skip a span-less row rather than anchor at a
+    /// sentinel (the #539 additive-field discipline;
+    /// [`AugTarget::name_range`], `None` decodes to
+    /// [`AugTarget::MISSING_NAME_RANGE`]).
+    #[serde(default)]
+    pub name_range: Option<(u32, u32)>,
 }
 
 /// The per-entry string slice under construction: every referenced
@@ -838,6 +859,7 @@ impl<'a> Slice<'a> {
             is_abstract: entry.is_abstract,
             is_external: entry.is_external,
             is_final: entry.is_final,
+            is_const: entry.is_const,
             covariant: entry.covariant,
             type_params: entry.type_params,
             type_param_names: self.ids(&entry.type_param_names),
@@ -987,6 +1009,7 @@ impl PersistedElements {
                         named: f.named,
                         covariant_kw: f.covariant_kw.map(PersistedRange::of),
                         required_kw: f.required_kw.map(PersistedRange::of),
+                        default_separator: f.default_separator.map(PersistedRange::of),
                     })
                     .collect(),
                 parens: aug
@@ -1011,6 +1034,8 @@ impl PersistedElements {
                 is_factory: target.is_factory,
                 is_complete: target.is_complete,
                 head_range: target.head_range.map(PersistedRange::of),
+                name_range: (target.name_range.offset != u32::MAX)
+                    .then(|| (target.name_range.offset, target.name_range.length)),
             })
             .collect();
         let anon_methods = elements
@@ -1234,6 +1259,9 @@ impl PersistedElements {
                             named: f.named,
                             covariant_kw: f.covariant_kw.map(PersistedRange::source_range),
                             required_kw: f.required_kw.map(PersistedRange::source_range),
+                            default_separator: f
+                                .default_separator
+                                .map(PersistedRange::source_range),
                         })
                         .collect(),
                     parens: aug
@@ -1258,6 +1286,10 @@ impl PersistedElements {
                     is_factory: target.is_factory,
                     is_complete: target.is_complete,
                     head_range: target.head_range.map(PersistedRange::source_range),
+                    name_range: target.name_range.map_or(
+                        crate::model::AugTarget::MISSING_NAME_RANGE,
+                        |(offset, length)| SourceRange { offset, length },
+                    ),
                 })
                 .collect(),
             anon_methods: self
@@ -1610,6 +1642,7 @@ impl PersistedMemberEntry {
             is_abstract: self.is_abstract,
             is_external: self.is_external,
             is_final: self.is_final,
+            is_const: self.is_const,
             covariant: self.covariant,
             type_params: self.type_params,
             type_param_names: self
@@ -1774,6 +1807,7 @@ mod tests {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            is_const: false,
             covariant: false,
             type_params: 1,
             type_param_names: Box::new([name(text)]),
@@ -2004,6 +2038,7 @@ mod tests {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            is_const: false,
             covariant: false,
             type_params: 0,
             type_param_names: Box::new([]),
