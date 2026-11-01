@@ -170,6 +170,16 @@ pub enum SemanticCode {
     /// (diagnostic.g.dart:16939-16956, `uniqueName`
     /// `undefined_setter_on_function_type`).
     UndefinedSetterOnFunctionType,
+    /// `The <kind> '{0}' is always abstract in the supertype.` — a
+    /// `super.name` access whose concrete dispatch lookup missed while the
+    /// super-interface still carries the name (an `implements` signature or
+    /// an abstract member on the chain): the oracle's `getInherited`
+    /// fallback after a `getMember(forSuper)` miss
+    /// (`abstract_super_member_reference`,
+    /// method_invocation_resolver.dart:971-982 /
+    /// property_element_resolver.dart:2030-2045, 2085-2108). The member-kind
+    /// word renders off the access shape.
+    AbstractSuperMemberReference(SuperShape),
     /// `UNDEFINED_SUPER_MEMBER`: one code name with a per-member-shape message
     /// (`uniqueName` `UNDEFINED_SUPER_GETTER`/`_METHOD`/`_OPERATOR`/`_SETTER`).
     UndefinedSuperMember(SuperShape),
@@ -2078,6 +2088,10 @@ impl SemanticCode {
             Self::UndefinedSetterOnFunctionType => ("undefined_setter", "UNDEFINED_SETTER"),
             // The analyzer registry keeps one `analyzerCode` for the whole
             // super-member family; the shape lives in the `uniqueName`.
+            Self::AbstractSuperMemberReference(_) => (
+                "abstract_super_member_reference",
+                "ABSTRACT_SUPER_MEMBER_REFERENCE",
+            ),
             Self::UndefinedSuperMember(_) => ("undefined_super_member", "UNDEFINED_SUPER_MEMBER"),
             Self::WrongNumberOfParametersForOperator
             | Self::WrongNumberOfParametersForOperatorMinus => (
@@ -3209,6 +3223,44 @@ impl SemanticCode {
     #[must_use]
     #[expect(clippy::match_same_arms)] // rows follow the official code listing; bodies coincide by arity
     #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
+    /// The private-enum variant of the switch covering rows
+    /// (`nonExhaustiveSwitchExpressionPrivate`/`...StatementPrivate`,
+    /// upstream `pkg/analyzer/messages.yaml`): the same *shared* code name as
+    /// the plain row (so the identity and the anchors match), a different
+    /// problem text — the scrutinee type only, no witness
+    /// (constant_verifier.dart:1082-1109). Any other row answers through
+    /// [`Self::message`].
+    #[must_use]
+    pub fn message_private(self, a0: &str) -> String {
+        match self {
+            Self::NonExhaustiveSwitchStatement | Self::NonExhaustiveSwitchExpression => format!(
+                "The enum '{a0}' isn't exhaustively matched by the switch cases because some of the enum constants are private."
+            ),
+            _ => self.message(a0, ""),
+        }
+    }
+
+    /// The private-enum variant's verbatim `correctionMessage`
+    /// (messages.yaml, same two rows): a statement suggests the default
+    /// case, an expression the wildcard.
+    #[must_use]
+    pub fn correction_private(self) -> Option<String> {
+        match self {
+            Self::NonExhaustiveSwitchStatement => Some("Try adding a default case.".to_string()),
+            Self::NonExhaustiveSwitchExpression => {
+                Some("Try adding a wildcard pattern.".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// The verbatim oracle `correctionMessage` when the row declares one;
+    /// `a2` is the suggested-pattern placeholder. Carried in the
+    /// diagnostic's correction slot (`DiagnosticWithArguments`, the switch
+    /// exhaustiveness rows, diagnostic.g.dart:13018/:13079). Rows without a
+    /// correction answer `None`.
+    #[must_use]
+
     pub fn message(self, a0: &str, a1: &str) -> String {
         match self {
             Self::DuplicateDefinition => format!("The name '{a0}' is already defined."),
@@ -3416,6 +3468,16 @@ impl SemanticCode {
             }
             Self::UndefinedSetterOnFunctionType => {
                 format!("The setter '{a0}' isn't defined for the '{a1}' function type.")
+            }
+            Self::AbstractSuperMemberReference(shape) => {
+                // Upstream renders `member.kind.displayName` (`method`,
+                // `getter`, `setter`); an operator member's kind is method.
+                let kind = match shape {
+                    SuperShape::Getter => "getter",
+                    SuperShape::Setter => "setter",
+                    SuperShape::Method | SuperShape::Operator => "method",
+                };
+                format!("The {kind} '{a0}' is always abstract in the supertype.")
             }
             Self::UndefinedSuperMember(shape) => match shape {
                 SuperShape::Getter => {
