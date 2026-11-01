@@ -240,10 +240,10 @@ pub struct LibraryTypes {
     /// [`Self::type_param_scope`] is: a parameter is visible only inside
     /// the file that declares it. A spelling two declarations bound
     /// differently never registers, and neither does one a declaration
-    /// merely *names* without a bound the element model carries (a
-    /// top-level function's group has spellings only) — the arm must
-    /// never close a switch over the unbounded twin (the under-report
-    /// direction).
+    /// merely *names* without a bound this face can read the head of (a
+    /// record-shaped bound, a number of spellings the declaration's bound
+    /// list did not reach) — the arm must never close a switch over the
+    /// unbounded twin (the under-report direction).
     type_param_bounds: FxHashMap<(FileId, StringId), StringId>,
     /// Every member name of every registered container — the
     /// bare-head-invocation over-approximation
@@ -974,6 +974,7 @@ impl LibraryTypes {
                             &table,
                             &registry,
                             &decl_params,
+                            &typedef_shapes,
                             &facts,
                             &scope,
                             tree,
@@ -1080,7 +1081,7 @@ impl LibraryTypes {
         // (the under-report direction).
         {
             for &(name, file) in &aliases {
-                let Some(shape) = typedef_shapes.get_mut(&name) else {
+                let Some(shape) = typedef_shapes.get(&name) else {
                     continue;
                 };
                 if shape.params.is_empty() {
@@ -1118,6 +1119,7 @@ impl LibraryTypes {
                             &table,
                             &registry,
                             &decl_params,
+                            &typedef_shapes,
                             &facts,
                             &scope,
                             tree,
@@ -1135,7 +1137,13 @@ impl LibraryTypes {
                         .and_then(|at| bounds[at])
                 })
                 .defaults;
-                debug_assert_eq!(defaults.len(), shape.params.len());
+                // The mapping above reads the table (a bound may spell a
+                // sibling alias's shape), so the write takes its own
+                // borrow.
+                let Some(shape) = typedef_shapes.get_mut(&name) else {
+                    continue;
+                };
+                debug_assert_eq!(defaults.len(), params.len());
                 shape.defaults = defaults.into_boxed_slice();
             }
         }
@@ -1165,6 +1173,7 @@ impl LibraryTypes {
                         &table,
                         &registry,
                         &decl_params,
+                        &typedef_shapes,
                         &facts,
                         &scope,
                         tree,
@@ -1354,12 +1363,12 @@ struct Registry {
     /// capture's bound trees, then mirrored onto the shared name-keyed ids
     /// ([`LibraryTypes::facts`]).
     spelling_bound_tys: FxHashMap<(FileId, StringId), Option<TypeId>>,
-    /// Spellings a top-level declaration declares with no bound column at
-    /// all (a generic function's or a typedef's `<T>` — the element
-    /// model's `TopDecl` keeps the spellings only). The name-keyed
-    /// parameter id is shared across files, so one undecidable declaration
-    /// keeps the spelling on the legacy face rather than borrow a
-    /// sibling's bound.
+    /// Spellings a top-level declaration declares with no entry in this
+    /// build's bound trees (a generic function's or a typedef's `<T>` —
+    /// the tree map fills from the clause capture's registered containers
+    /// only). The name-keyed parameter id is shared across files, so one
+    /// undecidable declaration keeps the spelling on the legacy face
+    /// rather than borrow a sibling's bound.
     spelling_bound_unknown: FxHashSet<StringId>,
     /// See [`LibraryTypes::param_names`].
     param_names: FxHashMap<TypeParamId, StringId>,
@@ -1532,15 +1541,18 @@ impl Registry {
         // `TypeParameter` ids below, one per name (declaration-scoped in
         // the element model, name-keyed here like the flow layer).
         for (name, decl) in elements.declarations() {
-            // A top-level function's or alias's group registers its
-            // spellings only — `TopDecl` carries no bound column — so a
-            // spelling such a declaration names can never be decided from
-            // this ledger: it poisons the spelling rather than letting a
-            // sibling declaration's bound speak for it.
-            self.poison_param_bounds(file, &decl.type_param_names);
-            // The same declaration poisons the spelling face: the
-            // name-keyed parameter id is shared across files, so a bound
-            // a sibling container declared must never answer for a
+            // A top-level function's or alias's own group bounds exactly
+            // like a container header's: the declaration carries its
+            // spellings and their written bounds in parallel, so the ledger
+            // reads the same face (a bound list shorter than the spellings,
+            // or a restored model's empty one, reads `None` per spelling —
+            // the unbounded poison).
+            self.record_param_bounds(file, &decl.type_param_names, &decl.type_param_bounds);
+            // The same declaration poisons the name-keyed spelling face
+            // ([`Self::spelling_bound_tys`]): that face is filled from the
+            // clause capture's trees for the registered containers only,
+            // and its parameter id is shared across the whole build — so a
+            // bound a sibling container declared must never answer for a
             // function's or alias's own group. Container kinds keep the
             // capture's verdict instead.
             if !matches!(
@@ -1608,23 +1620,15 @@ impl Registry {
     /// ledger: each spelling maps to its written bound's head, or to the
     /// unbounded poison when the declaration wrote none worth deciding on
     /// (`dynamic`, a record shape, a function type — every bound whose
-    /// `isAlwaysExhaustive` the head face cannot answer).
+    /// `isAlwaysExhaustive` the head face cannot answer) or when the
+    /// declaration's bound list did not reach this snapshot at all (a
+    /// restored model, a written group the capture dropped) — the
+    /// under-report direction, keeping the arm from closing a switch over
+    /// the unbounded twin.
     fn record_param_bounds(&mut self, file: FileId, names: &[StringId], bounds: &[Ty]) {
         for (position, &name) in names.iter().enumerate() {
             let head = bounds.get(position).and_then(bound_head);
             self.merge_param_bound(file, name, head);
-        }
-    }
-
-    /// Marks every spelling of one declaration as undecidable: the
-    /// element model carries a top-level declaration's parameter
-    /// *spellings* but not their bounds, so a spelling such a declaration
-    /// names keeps `false` even when a sibling declaration bounds it (the
-    /// under-report direction — the arm must never close a switch over
-    /// the unbounded twin).
-    fn poison_param_bounds(&mut self, file: FileId, names: &[StringId]) {
-        for &name in names {
-            self.merge_param_bound(file, name, None);
         }
     }
 
@@ -2203,11 +2207,13 @@ fn clause_builtin_ty(table: &TypeTable, head: &str, nullable: bool) -> Option<Ty
     Some(table.intern(uninterned, false))
 }
 
+#[expect(clippy::too_many_arguments)] // one operand per snapshot face the resolution reads
 fn clause_tree_ty(
     strings: &StringTable,
     table: &TypeTable,
     registry: &FxHashMap<StringId, TypeDeclId>,
     decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    typedef_shapes: &FxHashMap<StringId, TypedefShape>,
     facts: &ParamFactsTable,
     scope: &FxHashMap<StringId, TypeParamId>,
     tree: &TypeTree,
@@ -2252,6 +2258,7 @@ fn clause_tree_ty(
                 table,
                 registry,
                 decl_params,
+                typedef_shapes,
                 facts,
                 scope,
                 arg,
@@ -2265,11 +2272,13 @@ fn clause_tree_ty(
 /// The argument-node face of [`clause_tree_ty`]: identical mapping but
 /// `nullable` honored per node (a `T?` argument is legal where the
 /// supertype root is not).
+#[expect(clippy::too_many_arguments)] // one operand per snapshot face the resolution reads
 fn clause_arg_ty(
     strings: &StringTable,
     table: &TypeTable,
     registry: &FxHashMap<StringId, TypeDeclId>,
     decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    typedef_shapes: &FxHashMap<StringId, TypedefShape>,
     facts: &ParamFactsTable,
     scope: &FxHashMap<StringId, TypeParamId>,
     tree: &TypeTree,
@@ -2301,12 +2310,68 @@ fn clause_arg_ty(
             table,
             registry,
             decl_params,
+            typedef_shapes,
             facts,
             scope,
             base,
         )
     {
         return Some(table.intern(UninternedType::FutureOr { base }, tree.nullable));
+    }
+    // A typedef head lives in `typedef_shapes`, never the container
+    // registry: the official resolver expands the alias wholesale at the
+    // written node — the RHS with the alias's own parameters substituted
+    // by the written arguments (or their to-bounds defaults for a raw
+    // use), the use-site `?` composed on top (`TypeAliasElementImpl`'s
+    // `instantiateImpl(typeArguments, nullabilitySuffix)`, upstream Dart
+    // SDK source, pkg/analyzer/lib/src/dart/resolver/
+    // named_type_resolver.dart:237-248). Dropping the node here instead
+    // hands every caller its `Ty::Dynamic` default, so a typedef-carried
+    // bound reads as `dynamic` and the parameter's declared bound never
+    // reaches `facts` — the type-variable bound rule then has nothing to
+    // decide with (`typedef F<X> = void Function<Y extends X>()` spelling
+    // `T extends F<num>` read as no bound at all).
+    if !registry.contains_key(&tree.head)
+        && let Some(entry) = typedef_shapes.get(&tree.head)
+    {
+        let mapped: Vec<TypeId> = if tree.args.is_empty() {
+            // A raw alias use instantiates every parameter to its
+            // to-bounds default (`instantiateToBounds`,
+            // type_system.dart:719-731), exactly the chase's posture.
+            entry.defaults.to_vec()
+        } else if tree.args.len() == entry.params.len() {
+            let mut args = Vec::with_capacity(tree.args.len());
+            for arg in &tree.args {
+                args.push(clause_arg_ty(
+                    strings,
+                    table,
+                    registry,
+                    decl_params,
+                    typedef_shapes,
+                    facts,
+                    scope,
+                    arg,
+                )?);
+            }
+            args
+        } else {
+            // A wrong written count is the erroneous-type face upstream;
+            // the under-report direction drops the node (`registry`'s own
+            // arity discipline above).
+            return None;
+        };
+        let map: Vec<(TypeParamId, TypeId)> = entry
+            .params
+            .iter()
+            .copied()
+            .zip(mapped.iter().copied())
+            .collect();
+        let shape = table.substitute(entry.shape, &map);
+        return Some(with_question(
+            table,
+            shape,
+            entry.nullable || tree.nullable,
+        ));
     }
     let &decl = registry.get(&tree.head)?;
     let args = if tree.args.is_empty() {
@@ -2328,6 +2393,7 @@ fn clause_arg_ty(
                 table,
                 registry,
                 decl_params,
+                typedef_shapes,
                 facts,
                 scope,
                 arg,
@@ -2336,6 +2402,63 @@ fn clause_arg_ty(
         args
     };
     Some(table.intern(UninternedType::Interface { decl, args }, tree.nullable))
+}
+
+/// [`ResolvedTypeOps::with_question`]'s table-level face: the build-time
+/// clause mapping runs before any `ResolvedTypeOps` exists, and its alias
+/// expansion composes the same `?` projection. `false` returns the type
+/// as-is (the flattened shapes intern non-null); a unit kind normalizes at
+/// the intern (`Never?` reads `Null`).
+fn with_question(table: &TypeTable, ty: TypeId, nullable: bool) -> TypeId {
+    if !nullable {
+        return ty;
+    }
+    // The signature and record payloads rebuild before the kind match —
+    // both intern through their own entries, not `UninternedType`.
+    if let TypeKind::Function { signature } = table.get(ty).kind() {
+        let sig = table.signature(signature);
+        return table
+            .intern_function(
+                UninternedFunction {
+                    return_type: sig.return_type,
+                    type_parameters: table.function_type_parameters(sig.type_parameters),
+                    positional: table.args(sig.positional),
+                    named: table.named_members(sig.named),
+                    required_positional: sig.required_positional,
+                },
+                true,
+            )
+            .expect("a pooled signature re-interns");
+    }
+    if let TypeKind::Record { shape } = table.get(ty).kind() {
+        let shape = table.record_shape(shape);
+        return table
+            .intern_record(
+                UninternedRecord {
+                    positional: table.args(shape.positional),
+                    named: table.named_members(shape.named),
+                },
+                true,
+            )
+            .expect("a pooled record shape re-interns");
+    }
+    let un = match table.get(ty).kind() {
+        TypeKind::Never => UninternedType::Never,
+        TypeKind::Dynamic => UninternedType::Dynamic,
+        TypeKind::Void => UninternedType::Void,
+        TypeKind::Invalid => UninternedType::Invalid,
+        TypeKind::Null => UninternedType::Null,
+        TypeKind::Interface { decl, args } => UninternedType::Interface {
+            decl,
+            args: table.args(args),
+        },
+        TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
+        TypeKind::FutureOr { base } => UninternedType::FutureOr { base },
+        TypeKind::Function { .. } | TypeKind::Record { .. } => {
+            unreachable!("handled above")
+        }
+    };
+    table.intern(un, true)
 }
 
 /// Instantiates a registered declaration to its parameter bounds —
@@ -2916,66 +3039,9 @@ impl<'a> ResolvedTypeOps<'a> {
 
     /// Re-interns a snapshot type with the `?` projection composed on top
     /// (`withNullability`, type.dart:1558) — the alias chase composes the
-    /// RHS's own suffix with the use site's. `false` returns the type
-    /// as-is (the flattened shapes intern non-null); a unit kind
-    /// normalizes at the intern (`Never?` reads `Null`).
+    /// RHS's own suffix with the use site's.
     fn with_question(&self, ty: TypeId, nullable: bool) -> TypeId {
-        if !nullable {
-            return ty;
-        }
-        // The signature and record payloads rebuild before the kind match —
-        // both intern through their own entries, not `UninternedType`.
-        if let TypeKind::Function { signature } = self.snapshot.table.get(ty).kind() {
-            let sig = self.snapshot.table.signature(signature);
-            return self
-                .snapshot
-                .table
-                .intern_function(
-                    UninternedFunction {
-                        return_type: sig.return_type,
-                        type_parameters: self
-                            .snapshot
-                            .table
-                            .function_type_parameters(sig.type_parameters),
-                        positional: self.snapshot.table.args(sig.positional),
-                        named: self.snapshot.table.named_members(sig.named),
-                        required_positional: sig.required_positional,
-                    },
-                    true,
-                )
-                .expect("a pooled signature re-interns");
-        }
-        if let TypeKind::Record { shape } = self.snapshot.table.get(ty).kind() {
-            let shape = self.snapshot.table.record_shape(shape);
-            return self
-                .snapshot
-                .table
-                .intern_record(
-                    UninternedRecord {
-                        positional: self.snapshot.table.args(shape.positional),
-                        named: self.snapshot.table.named_members(shape.named),
-                    },
-                    true,
-                )
-                .expect("a pooled record shape re-interns");
-        }
-        let un = match self.snapshot.table.get(ty).kind() {
-            TypeKind::Never => UninternedType::Never,
-            TypeKind::Dynamic => UninternedType::Dynamic,
-            TypeKind::Void => UninternedType::Void,
-            TypeKind::Invalid => UninternedType::Invalid,
-            TypeKind::Null => UninternedType::Null,
-            TypeKind::Interface { decl, args } => UninternedType::Interface {
-                decl,
-                args: self.snapshot.table.args(args),
-            },
-            TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
-            TypeKind::FutureOr { base } => UninternedType::FutureOr { base },
-            TypeKind::Function { .. } | TypeKind::Record { .. } => {
-                unreachable!("handled above")
-            }
-        };
-        self.snapshot.table.intern(un, true)
+        with_question(&self.snapshot.table, ty, nullable)
     }
 
     /// One written name's resolved mapping — the fueled entry (#2636):
@@ -4464,7 +4530,7 @@ impl<'a> ResolvedTypeOps<'a> {
     /// the same conservative subset the name-level walks keep. The bound
     /// is the file-scoped spelling's ([`LibraryTypes::param_bound`]): an
     /// unbounded parameter, one two declarations bound differently, and
-    /// one whose declaration the element model carries without its bound
+    /// one whose declaration reached this snapshot without its bound list
     /// all answer `false`, keeping the post-switch state live.
     fn always_exhaustive_param(&self, parameter: TypeParamId) -> bool {
         let Some(name) = self.param_name(parameter) else {
