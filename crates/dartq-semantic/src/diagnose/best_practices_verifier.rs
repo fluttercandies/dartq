@@ -419,8 +419,11 @@ impl<'a> Engine<'a> {
     }
 
     /// The innermost container declaration enclosing `offset` (the
-    /// oracle's `_enclosingClass`, set by the class-family visits).
-    fn enclosing_container_at(&self, offset: u32) -> Option<StringId> {
+    /// oracle's `_enclosingClass`, set by the class-family visits). Also
+    /// read by `finalize_usage`'s missing-write setter credit — the
+    /// `this_type` substitute for the drained row's `BareInfo::Missing`
+    /// snapshot.
+    pub(crate) fn enclosing_container_at(&self, offset: u32) -> Option<StringId> {
         let mut best: Option<(u32, StringId)> = None;
         for site in &self.decl_sites {
             if !matches!(site.kind, DeclKind::Container) || site.range.offset > offset {
