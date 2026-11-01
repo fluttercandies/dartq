@@ -6983,6 +6983,59 @@ impl<'a> Engine<'a> {
                 _ => Some(false),
             };
         }
+        // The type-variable SOURCE arm (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/element/subtype.dart's Left Type
+        // Variable Bound — the left-side decomposition runs ahead of the
+        // target's own FutureOr/`?` decompositions): a bare, non-nullable
+        // in-scope parameter `T` subtypes a target `T1` exactly when its
+        // declared bound does. `T <: Object?` is `B <: Object?` (an
+        // unbounded `T` carries the implicit `Object?`, so `Object? <:
+        // Object?` accepts), `T <: Object` is `B <: Object` (fails on the
+        // same implicit bound), and `T extends num` subtypes neither
+        // `String` nor `String?`. A parameter TARGET is the Left Variable
+        // arm's own business (the `to_is_param` block below decides it), so
+        // this arm defers on one. Running ahead of the `?` decomposition
+        // matters: decomposing `T <: S?` into `T <: S` / `T <: Null` loses
+        // the bound's own nullability — `B <: S` rejects where `B <: S?`
+        // accepts (`Object?` bound against `Object?` — #3582's
+        // `T => Object?` extra family).
+        //
+        // The bound read is the WRITTEN capture ([`Engine::param_bound`]); an
+        // UNWRITTEN bound is the implicit `Object?` (upstream's type
+        // variable's nullability-independent upper bound,
+        // subtype.dart:336-350), so an unbounded in-scope `T` decides the
+        // pair exactly like an `Object?` source — `T` fits `Object?`/
+        // `dynamic`/`void` and rejects `Object` and every concrete
+        // non-nullable head. Abstaining there was the #3339 divergence:
+        // upstream's `isAssignableTo` answers false for `int x = t`, so
+        // silence was an under-report on the corpus's largest live
+        // `argument_type_not_assignable` mass. A bound that mentions the
+        // parameter itself (`X extends FutureOr<X>`) still declines —
+        // recursing into it would cycle — and a promoted read's narrowing is
+        // not modeled here (the rows carry the declared parameter type; the
+        // flow layers re-derive at the read).
+        if let Ty::Named {
+            name: from_name,
+            nullable: false,
+            args: ArgListId::EMPTY,
+        } = from
+            && self.is_scope_param(from_name)
+            && !matches!(to, Ty::Named { name: to_name, .. } if self.is_scope_param(to_name))
+        {
+            let bound = match self.param_bound(from_name) {
+                Some(bound) if bound != Ty::Unknown => bound,
+                // No written bound (or a capture miss on a parameter this
+                // scope provably declares): the implicit `Object?`.
+                _ => Ty::Named {
+                    name: self.intern("Object"),
+                    nullable: true,
+                    args: ArgListId::EMPTY,
+                },
+            };
+            if !self.bound_mentions_param(bound, from_name, 0) {
+                return self.assignable(bound, to, from_literal);
+            }
+        }
         // Left FutureOr (`subtype.dart:371-385`, ahead of Right FutureOr):
         // `FutureOr<S0> <: T1` iff `S0 <: T1` and `Future<S0> <: T1`; a
         // `FutureOr<S0>?` source is Left Nullable over it (`Null <: T1` as
@@ -7122,51 +7175,31 @@ impl<'a> Engine<'a> {
                 _ => None,
             };
         }
-        // The type-variable SOURCE arms (upstream Dart SDK source,
-        // pkg/analyzer/lib/src/dart/element/subtype.dart:82-131 — the Right
-        // Object arm's `X0` leg — and :336-350 — Left Type Variable Bound):
-        // a bare, non-nullable in-scope parameter `T` subtypes a target `T1`
-        // exactly when its declared bound does. `T <: Object` is `B <: Object`
-        // (an unbounded `T` carries the implicit `Object?`, so it does NOT
-        // subtype `Object`), and `T extends num` subtypes neither `String`
-        // nor `String?`. A parameter TARGET is the Left Variable arm's own
-        // business ([`Self::assignment_verdict`] and the `to_is_param` block
-        // below decide it), so this arm defers on one.
-        //
-        // The bound read is the WRITTEN capture ([`Engine::param_bound`]); an
-        // UNWRITTEN bound is the implicit `Object?` (upstream's type
-        // variable's nullability-independent upper bound,
-        // subtype.dart:336-350), so an unbounded in-scope `T` decides the
-        // pair exactly like an `Object?` source — `T` fits `Object?`/
-        // `dynamic`/`void` and rejects `Object` and every concrete
-        // non-nullable head. Abstaining there was the #3339 divergence:
-        // upstream's `isAssignableTo` answers false for `int x = t`, so
-        // silence was an under-report on the corpus's largest live
-        // `argument_type_not_assignable` mass. A bound that mentions the
-        // parameter itself (`X extends FutureOr<X>`) still declines —
-        // recursing into it would cycle — and a promoted read's narrowing is
-        // not modeled here (the rows carry the declared parameter type; the
-        // flow layers re-derive at the read).
-        if let Ty::Named {
-            name: from_name,
-            nullable: false,
-            args: ArgListId::EMPTY,
-        } = from
-            && self.is_scope_param(from_name)
-            && !matches!(to, Ty::Named { name: to_name, .. } if self.is_scope_param(to_name))
+        // A `Null` source against an in-scope parameter target (`Null => T`
+        // — #3582's extra family): the pool-less matrix's Left Null arm
+        // rejects every non-top target, but upstream's `Null <: T` holds
+        // whenever `T` is POTENTIALLY NULLABLE — the parameter's declared
+        // bound (`Null <: B`: an unbounded `T` reads `Object?` and accepts;
+        // `T extends num` keeps the rejection). The same Left-Variable
+        // decomposition the source arm runs, mirrored on the target.
+        if from == Ty::Null
+            && let Ty::Named {
+                name: to_name,
+                nullable: false,
+                args: ArgListId::EMPTY,
+            } = to
+            && self.is_scope_param(to_name)
         {
-            let bound = match self.param_bound(from_name) {
+            let bound = match self.param_bound(to_name) {
                 Some(bound) if bound != Ty::Unknown => bound,
-                // No written bound (or a capture miss on a parameter this
-                // scope provably declares): the implicit `Object?`.
                 _ => Ty::Named {
                     name: self.intern("Object"),
                     nullable: true,
                     args: ArgListId::EMPTY,
                 },
             };
-            if !self.bound_mentions_param(bound, from_name, 0) {
-                return self.assignable(bound, to, from_literal);
+            if !self.bound_mentions_param(bound, to_name, 0) {
+                return self.assignable(Ty::Null, bound, false);
             }
         }
         // The cross-family arms below read `from_fn`/`to_fn` computed at
