@@ -7727,27 +7727,7 @@ impl<'a> Engine<'a> {
         // invocation carries no callee row, so the constant's name range is
         // the `enum_const_call` latch's own span.
         if let Some((name_range, _)) = self.enum_const_call {
-            for formal in formals.named.iter().filter(|f| f.required) {
-                let covered = level.args.iter().any(|(name, ..)| {
-                    name.is_some_and(|n| {
-                        self.named_formal_for(&formals, n)
-                            .is_some_and(|m| m.name == formal.name)
-                    })
-                });
-                if covered {
-                    continue;
-                }
-                let text = self
-                    .strings
-                    .resolve(self.formal_public_name(formal.name))
-                    .to_string();
-                self.emit(
-                    SemanticCode::MissingRequiredArgument,
-                    name_range,
-                    &text,
-                    "",
-                );
-            }
+            self.emit_missing_required(&formals, &level.args, &[], name_range);
         }
         // The argument walk pairs positionals by index, named by spelling,
         // reporting each type mismatch's code pair at the argument's span.
@@ -8193,27 +8173,7 @@ impl<'a> Engine<'a> {
             let message = code.message(&capacity.to_string(), &given.to_string());
             self.emit_message_with_correction(code, anchor, message);
         }
-        for formal in formals.named.iter().filter(|f| f.required) {
-            let covered = args.iter().any(|(name, ..)| {
-                name.is_some_and(|n| {
-                    self.named_formal_for(&formals, n)
-                        .is_some_and(|m| m.name == formal.name)
-                })
-            });
-            if covered {
-                continue;
-            }
-            let text = self
-                .strings
-                .resolve(self.formal_public_name(formal.name))
-                .to_string();
-            self.emit(
-                SemanticCode::MissingRequiredArgument,
-                anchor,
-                &text,
-                "",
-            );
-        }
+        self.emit_missing_required(&formals, args, &[], anchor);
     }
 
     /// The public spelling a private named formal resolves to at call sites
@@ -8239,6 +8199,51 @@ impl<'a> Engine<'a> {
                 Some(k) if k.style() == dartq_scanner::KeywordStyle::Reserved
             );
         if valid { self.intern(rest) } else { name }
+    }
+
+    /// The required-named coverage walk
+    /// (`RequiredParametersVerifier._check`,
+    /// required_parameters_verifier.dart:122-156): a `required` named
+    /// formal with no same-named argument reports `missing_required_argument`
+    /// at `anchor` — the callee entity (`errorEntity: node` upstream).
+    /// `extra_cover` is the enclosing-constructor super-formal forwarding
+    /// face (`_containsNamedExpression`'s second walk): a `required`
+    /// `super.x` formal of the enclosing constructor stands in for the
+    /// same-named argument. The emit walks `parameters` in declaration
+    /// order, one row per missing required named — the oracle's exact
+    /// ordering.
+    pub(crate) fn emit_missing_required(
+        &mut self,
+        formals: &Formals,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+        extra_cover: &[(bool, StringId)],
+        anchor: SourceRange,
+    ) {
+        let missing: Vec<StringId> = formals
+            .named
+            .iter()
+            .filter(|f| f.required)
+            .filter(|f| {
+                !args.iter().any(|(name, ..)| {
+                    name.is_some_and(|n| {
+                        self.named_formal_for(formals, n)
+                            .is_some_and(|m| m.name == f.name)
+                    })
+                })
+            })
+            .filter(|f| {
+                !extra_cover
+                    .iter()
+                    .any(|(named, name)| *named && *name == f.name)
+            })
+            // The reported name is the element's public spelling — a
+            // `required this._error` formal reports `'error'` upstream.
+            .map(|f| self.formal_public_name(f.name))
+            .collect();
+        for name in missing {
+            let text = self.strings.resolve(name).to_string();
+            self.emit(SemanticCode::MissingRequiredArgument, anchor, &text, "");
+        }
     }
 
     /// The named formal a written `name:` argument resolves to: exact
@@ -8494,27 +8499,7 @@ impl<'a> Engine<'a> {
             .and_then(|index| self.rows.get(index))
             .map(|row| row.range)
             .unwrap_or(close);
-        for formal in formals.named.iter().filter(|f| f.required) {
-            let covered = level.args.iter().any(|(name, ..)| {
-                name.is_some_and(|n| {
-                    self.named_formal_for(&formals, n)
-                        .is_some_and(|m| m.name == formal.name)
-                })
-            });
-            if covered {
-                continue;
-            }
-            let text = self
-                .strings
-                .resolve(self.formal_public_name(formal.name))
-                .to_string();
-            self.emit(
-                SemanticCode::MissingRequiredArgument,
-                required_anchor,
-                &text,
-                "",
-            );
-        }
+        self.emit_missing_required(&formals, &level.args, &[], required_anchor);
         // The unknown named parameter anchors at its label — the same
         // geometry the super walk applies (the oracle resolves the named
         // table at the same `resolveArgumentsToParameters` pass).
@@ -8652,27 +8637,7 @@ impl<'a> Engine<'a> {
             .map(|(.., range)| *range)
             .next()
             .unwrap_or(close);
-        for formal in formals.named.iter().filter(|f| f.required) {
-            let covered = level.args.iter().any(|(name, ..)| {
-                name.is_some_and(|n| {
-                    self.named_formal_for(&formals, n)
-                        .is_some_and(|m| m.name == formal.name)
-                })
-            });
-            if covered {
-                continue;
-            }
-            let text = self
-                .strings
-                .resolve(self.formal_public_name(formal.name))
-                .to_string();
-            self.emit(
-                SemanticCode::MissingRequiredArgument,
-                required_anchor,
-                &text,
-                "",
-            );
-        }
+        self.emit_missing_required(&formals, &level.args, &[], required_anchor);
         for (name, .., range) in &level.args {
             let Some(n) = name else {
                 continue;
@@ -9007,40 +8972,13 @@ impl<'a> Engine<'a> {
         // argument reports `missing_required_argument`. Coverage mirrors
         // `_containsNamedExpression`'s second walk (:197-218): a named
         // `super.x` formal of the enclosing constructor stands in for the
-        // same-named argument.
-        let missing_named: Vec<StringId> = formals
-            .named
-            .iter()
-            .filter(|f| f.required)
-            .filter(|f| {
-                !level.args.iter().any(|(name, ..)| {
-                    name.is_some_and(|n| {
-                        self.named_formal_for(&formals, n)
-                            .is_some_and(|m| m.name == f.name)
-                    })
-                })
-            })
-            .filter(|f| {
-                !super_formals_here
-                    .iter()
-                    .any(|(named, name)| *named && *name == f.name)
-            })
-            .map(|f| self.formal_public_name(f.name))
-            .collect();
+        // same-named argument — `super_formals_here` is that extra cover.
         let required_anchor = level
             .callee_row
             .and_then(|index| self.rows.get(index))
             .map(|row| row.range)
             .unwrap_or(close);
-        for name in missing_named {
-            let text = self.strings.resolve(name).to_string();
-            self.emit(
-                SemanticCode::MissingRequiredArgument,
-                required_anchor,
-                &text,
-                "",
-            );
-        }
+        self.emit_missing_required(&formals, &level.args, &super_formals_here, required_anchor);
         let mut positional_index = 0usize;
         for (name, ty, literal, range) in &level.args {
             let formal = if let Some(n) = name {
@@ -10017,6 +9955,26 @@ impl<'a> Engine<'a> {
             _ => None,
         };
         if let Some(name) = extension_override {
+            // The void-receiver face is upstream's first arm
+            // (`extension_member_resolver.dart:287-288` — `if (receiverType
+            // is VoidType)` reports `use_of_void_result` at the receiver
+            // expression before the assignability ask). `check_extension_
+            // override_argument` suppresses the not-assignable row on the
+            // same void receiver, so the verdict rides here instead of
+            // inside that callee (the helper's own suppression keeps its
+            // `else if` semantics).
+            if let Some((_, ty, _, arg_range)) = level.args.first()
+                && *ty == Ty::Void
+            {
+                // The receiver EXPRESSION is upstream's anchor
+                // (`useOfVoidResult.at(receiverExpression)` — the whole
+                // invoked expression). The row's `arg_range` spells only
+                // the callee name (`v`), so `invocation_span` widens it to
+                // the full `v()` (call_ends' callee-offset → closing `)`)
+                // — an uninvoked receiver keeps its own span.
+                let range = self.invocation_span(*arg_range).unwrap_or(*arg_range);
+                self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+            }
             self.check_extension_override_argument(name, &level.args);
         }
         // The unnamed constructor's existence face (`_resolveConstructor`'s
@@ -10606,6 +10564,21 @@ impl<'a> Engine<'a> {
         if formals.is_none() {
             self.check_creation_type_arg_bounds(callee);
         }
+        // A function-TYPE callee (`void Function({required int x}) f;
+        // f();`) carries no element formals but the captured signature's
+        // `named` table spells `required` — upstream
+        // `visitFunctionExpressionInvocation`'s `staticInvokeType is
+        // FunctionType` arm checks the required-named coverage against the
+        // signature's formals (required_parameters_verifier.dart:60-67).
+        // Rebind `formals` from the signature so the coverage walk below
+        // sees the same table the member/top-level walks consume.
+        let formals = formals.or_else(|| {
+            self.rows
+                .get(callee)
+                .filter(|row| !row.qualified)
+                .and_then(|row| self.fn_var_sigs.get(&row.name))
+                .map(|sig| sig.formals(self.intern("")))
+        });
         let Some(formals) = formals else {
             return;
         };
@@ -10619,28 +10592,9 @@ impl<'a> Engine<'a> {
         // (the constructor reference / invoked name — the row's span). The
         // enclosing-constructor super-formal forwarding face
         // (`_containsNamedExpression`'s second walk) is the under-report
-        // direction this model documents elsewhere. Collected here, emitted
-        // once the callee-row borrow ends (the count block below is the
-        // row's last reader).
-        let missing_required: Vec<StringId> = formals
-            .named
-            .iter()
-            .filter(|f| f.required)
-            .filter(|f| {
-                // A required `this._x`/`super._x` formal is covered when any
-                // named argument resolves to it — by the public spelling
-                // (the element's name) or the raw one.
-                !level.args.iter().any(|(name, ..)| {
-                    name.is_some_and(|n| {
-                        self.named_formal_for(&formals, n)
-                            .is_some_and(|m| m.name == f.name)
-                    })
-                })
-            })
-            // The reported name is the element's public spelling — a
-            // `required this._error` formal reports `'error'` upstream.
-            .map(|f| self.formal_public_name(f.name))
-            .collect();
+        // direction this model documents elsewhere. Emitted at the count
+        // block below once the callee-row borrow ends (the row's last
+        // reader).
         // #1314 FAM10: the callee's declared type parameters (same-file
         // generic executables) admit the inference substitution — a
         // parameter type that is exactly a type parameter checks and
@@ -11061,15 +11015,7 @@ impl<'a> Engine<'a> {
         // The required-named misses emit in formal-declaration order
         // (upstream walks `parameters` in order, one row per missing
         // required named).
-        for name in missing_required {
-            let text = self.strings.resolve(name).to_string();
-            self.emit(
-                SemanticCode::MissingRequiredArgument,
-                callee_range,
-                &text,
-                "",
-            );
-        }
+        self.emit_missing_required(&formals, &level.args, &[], callee_range);
         // Per-parameter solution slots (`None` = unsolved).
         let mut solutions: Box<[Option<Ty>]> = exec_params
             .as_ref()

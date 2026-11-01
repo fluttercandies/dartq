@@ -4899,11 +4899,44 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn prefixed_hit(&self, prefix: StringId, name: StringId) -> bool {
-        !matches!(
+        if !matches!(
             self.namespaces
                 .lookup_prefixed(self.graph, self.lib, prefix, name),
             dartq_resolution::Lookup::NotFound
-        )
+        ) {
+            return true;
+        }
+        // `p.dynamic`: the spelled name is the `dynamic` keyword, which the
+        // export scope never carries (dart:core's `DynamicElementImpl` is
+        // synthetic — `seed_implicit_core` declares only the named faces),
+        // so the scoped probe always misses. Upstream resolves it through
+        // the prefixed core namespace the same way `myCore.dynamic` does
+        // (`named_type_resolver.dart:85-121`'s prefix path): a prefix whose
+        // own import edge targets `dart:core` and whose combinators admit
+        // the name resolves `dynamic` (a `hide dynamic` clause or a prefix
+        // bound to a non-core library does not).
+        name == self.intern("dynamic") && self.prefix_exports_dynamic(prefix)
+    }
+
+    /// Whether `prefix` owns an import edge whose combinators admit the
+    /// `dynamic` name into the dart:core synthetic face — the
+    /// `p.dynamic`/`myCore.dynamic` prefixed-type resolution the scoped
+    /// probe cannot answer (the name never registers in any export scope).
+    /// A `show dynamic` clause or a `hide` omission both count, exactly the
+    /// oracle's `PrefixScope` filtering over the same name.
+    fn prefix_exports_dynamic(&self, prefix: StringId) -> bool {
+        let dynamic = self.intern("dynamic");
+        self.graph
+            .import_edges(self.lib)
+            .iter()
+            .filter(|edge| edge.prefix == Some(prefix))
+            .filter(|edge| edge.combinators.allows(dynamic))
+            .any(|edge| {
+                edge.target.is_some_and(|target| {
+                    self.graph.uri(target) == "dart:core"
+                        || self.graph.exported(target, dynamic).is_some()
+                })
+            })
     }
 
     /// The whole written qualified name's span (`p.C`): the prefix token's
@@ -8053,7 +8086,7 @@ impl<'a> Engine<'a> {
                 }
                 _ => receiver_ty,
             };
-            if !self.extension_on_applies(on_ty, viewed, &face.type_param_names) {
+            if !self.extension_on_applies(on_ty, viewed, face, face_file) {
                 continue;
             }
             let ty = self.boundary.ty(face_file, declared);
@@ -8101,6 +8134,23 @@ impl<'a> Engine<'a> {
                         })
                         .collect()
                 }
+                // `extension E<T> on T` (the bare own-parameter `on` head):
+                // the parameter binds the receiver whole, so a declared
+                // return spelling `T` instantiates to the receiver's type
+                // — the same `T := receiverType` the viability gate above
+                // answered.
+                (
+                    Ty::Named {
+                        name: on_head,
+                        args: ArgListId::EMPTY,
+                        ..
+                    },
+                    _,
+                ) if face.type_param_names.contains(&on_head) => {
+                    let mut map = FxHashMap::default();
+                    map.insert(on_head, viewed);
+                    map
+                }
                 _ => FxHashMap::default(),
             };
             let ty = self.fold_alias_ty(self.substitute_ty(ty, &map));
@@ -8135,7 +8185,40 @@ impl<'a> Engine<'a> {
     /// viability filter — a face whose concrete arguments differ from the
     /// receiver's can never be the oracle's resolution, whatever the
     /// specificity ordering among the survivors.
-    fn extension_on_applies(&self, on_ty: Ty, receiver: Ty, type_params: &[StringId]) -> bool {
+    ///
+    /// The `on` clause spelling the extension's OWN bare parameter
+    /// (`extension E<T> on T`, `on T?`) takes the `applicableTo` arm
+    /// instead: the parameter binds to the receiver wholesale
+    /// (`constrainArgument` answers `T := receiverType`, upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/dart/resolver/
+    /// applicable_extensions.dart:205-281`), so applicability is the
+    /// parameter's declared bound admitting the receiver — an absent or
+    /// `dynamic` bound is the top. A receiver already rendered
+    /// non-nullable by the member face still satisfies the nullable
+    /// spelling (`on T?` over `T <: bound` core), so the verdict asks the
+    /// bound's non-null core against the receiver's.
+    fn extension_on_applies(
+        &self,
+        on_ty: Ty,
+        receiver: Ty,
+        face: &ExtensionFace,
+        face_file: FileId,
+    ) -> bool {
+        if let Ty::Named {
+            name: on_head,
+            args: ArgListId::EMPTY,
+            ..
+        } = on_ty
+            && let Some(index) = face.type_param_names.iter().position(|&n| n == on_head)
+        {
+            return match face.type_param_bounds.get(index).copied() {
+                None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                Some(bound) => {
+                    let bound = Self::non_null_form(self.boundary.ty(face_file, bound));
+                    self.resolved_subtype(Self::non_null_form(receiver), bound)
+                }
+            };
+        }
         let (
             Ty::Named {
                 name: on_head,
@@ -8170,7 +8253,7 @@ impl<'a> Engine<'a> {
                         name,
                         args: ArgListId::EMPTY,
                         ..
-                    } if type_params.contains(&name))
+                    } if face.type_param_names.contains(&name))
                 })
     }
 
@@ -10331,30 +10414,56 @@ impl<'a> Engine<'a> {
         let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
         let mut hits: Vec<(&'a ExtensionFace, FileId)> = Vec::new();
         for &(face, face_file) in faces {
-            if !face.members.contains_key(&member) || !face.type_param_names.is_empty() {
+            if !face.members.contains_key(&member) {
                 continue;
             }
             let on_ty = self.boundary.ty(face_file, face.on_ty);
-            let applies = match self.fold_alias_ty(on_ty) {
-                Ty::Function {
-                    shape: on_shape,
-                    nullable: on_nullable,
-                } => on_shape == recv_shape && (on_nullable || !recv_nullable),
-                // A named `on` head spells one of the shape's named
-                // supertypes: every function type is a `Function`, and
-                // every one is an `Object` — the subtype ask
-                // (`applicableTo`) reduces to the two heads plus the
-                // nullability pair (`int Function()? <: Object` fails,
-                // `<: Object?` holds — the `on`'s own `?` decides).
-                Ty::Named {
-                    name,
-                    nullable: on_nullable,
-                    ..
-                } => {
-                    (name == function_head || name == object_head)
-                        && (on_nullable || !recv_nullable)
+            // A face whose `on` type spells its own bare parameter
+            // (`extension E<T> on T`) binds `T := receiver` wholesale —
+            // `applicableTo` applies iff the receiver's non-null core
+            // satisfies the parameter's declared bound (an absent or
+            // `dynamic` bound is the top). Every other param-spelling
+            // `on` type is left undecided (no credit, the under-report
+            // direction this face has always kept).
+            let applies = if let Ty::Named {
+                name: on_head,
+                args: ArgListId::EMPTY,
+                ..
+            } = on_ty
+                && let Some(index) = face.type_param_names.iter().position(|&n| n == on_head)
+            {
+                match face.type_param_bounds.get(index).copied() {
+                    None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                    Some(bound) => {
+                        let bound =
+                            Self::non_null_form(self.boundary.ty(face_file, bound));
+                        self.resolved_subtype(Self::non_null_form(receiver), bound)
+                    }
                 }
-                _ => false,
+            } else if !face.type_param_names.is_empty() {
+                continue;
+            } else {
+                match self.fold_alias_ty(on_ty) {
+                    Ty::Function {
+                        shape: on_shape,
+                        nullable: on_nullable,
+                    } => on_shape == recv_shape && (on_nullable || !recv_nullable),
+                    // A named `on` head spells one of the shape's named
+                    // supertypes: every function type is a `Function`, and
+                    // every one is an `Object` — the subtype ask
+                    // (`applicableTo`) reduces to the two heads plus the
+                    // nullability pair (`int Function()? <: Object` fails,
+                    // `<: Object?` holds — the `on`'s own `?` decides).
+                    Ty::Named {
+                        name,
+                        nullable: on_nullable,
+                        ..
+                    } => {
+                        (name == function_head || name == object_head)
+                            && (on_nullable || !recv_nullable)
+                    }
+                    _ => false,
+                }
             };
             if applies {
                 hits.push((face, face_file));
@@ -10402,6 +10511,31 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let on_ty = self.boundary.ty(face_file, face.on_ty);
+            // A bare own-parameter `on` head (`extension E<T> on T`) binds
+            // `T := receiver` — the record receiver applies iff its
+            // non-null core satisfies the parameter's declared bound (an
+            // absent or `dynamic` bound is the top), the same
+            // `applicableTo` ask the function/named arms answer.
+            if let Ty::Named {
+                name: on_head,
+                args: ArgListId::EMPTY,
+                ..
+            } = on_ty
+                && let Some(index) = face.type_param_names.iter().position(|&n| n == on_head)
+            {
+                let applies = match face.type_param_bounds.get(index).copied() {
+                    None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                    Some(bound) => {
+                        let bound =
+                            Self::non_null_form(self.boundary.ty(face_file, bound));
+                        self.resolved_subtype(Self::non_null_form(receiver), bound)
+                    }
+                };
+                if applies {
+                    hits.push((face, face_file));
+                }
+                continue;
+            }
             let Ty::Record {
                 shape: on_shape,
                 nullable: on_nullable,
