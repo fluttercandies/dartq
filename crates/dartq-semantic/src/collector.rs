@@ -3668,8 +3668,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // collection literal's written arguments (`final
                     // _commands = <String, Command<T>>{}` answers
                     // `Map<String, Command<T>>`; every use site's member
-                    // table then carries it).
+                    // table then carries it). An instance field keeps
+                    // `Unknown` instead: the oracle's implicit-type slot
+                    // (`fieldFragment.hasImplicitType`,
+                    // element_builder.dart:2099) is the instance-member
+                    // inferrer's trigger — it infers from the overridden
+                    // combined signature and never reads the initializer
+                    // (instance_member_inferrer.dart:104-135), so baking
+                    // the byte-scan face in here would feed the declared
+                    // side of the override check a type the oracle never
+                    // computed. The diagnosing pass's own initializer
+                    // inference answers the read faces through the
+                    // inferred-type overlay.
                     if ty == Ty::UNKNOWN
+                        && (context == IdentifierContext::TopLevelVariableDeclaration
+                            || builder.field_static.unwrap_or(false))
                         && let Some(inferred) = {
                             // The byte scanners read source bytes; the name
                             // span is UTF-16 (a non-ASCII character earlier
@@ -5800,14 +5813,20 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // element_builder.dart:2090-2092).
         let declaring_final = var_or_final
             .is_some_and(|token| builder.kind_of(token) == Some(TokenKind::Keyword(Keyword::Final)));
-        // A class/enum primary-constructor formal with a `var`/`final`
-        // keyword declares an instance field (`FieldFormalParameterElement
-        // .isDeclaring`): bodies read it bare and instances through the
-        // member walk. No field-declaration event fires for it, so the
-        // capture introduces the member here; it stays out of the
-        // declaration-site log — the official verifier never visits it in
-        // the plain field walk, the primary-constructor face owns its
-        // unused-ness (unused_local_elements_verifier.dart:887-920).
+        // A primary-constructor formal with a `var`/`final` keyword
+        // declares an instance field (`FieldFormalParameterElement
+        // .isDeclaring`, element_builder.dart:2089-2099 — the only gate is
+        // `finalOrVarKeyword != null`, so the field exists for every
+        // container kind the head parses under, mixins and extensions
+        // included): bodies read it bare and instances through the member
+        // walk. No field-declaration event fires for it, so the capture
+        // introduces the member here; it stays out of the declaration-site
+        // log — the official verifier never visits it in the plain field
+        // walk, the primary-constructor face owns its unused-ness
+        // (unused_local_elements_verifier.dart:887-920). An extension
+        // type keeps its own arm below — its representation formal is a
+        // field for every keyword shape (`var` included) and is always
+        // `final`, so the shared arm must not shadow it first.
         if member_kind == ParserMemberKind::PrimaryConstructor
             && var_or_final.is_some()
             && this_keyword.is_none()
@@ -5815,7 +5834,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             && builder
                 .containers
                 .last()
-                .is_some_and(|open| matches!(open.kind, ContainerKind::Class | ContainerKind::Enum))
+                .is_some_and(|open| open.kind != ContainerKind::ExtensionType)
         {
             let open = builder.containers.last_mut().expect("checked above");
             open.members.or_insert_with(name, || MemberEntry {

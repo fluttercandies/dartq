@@ -11966,20 +11966,33 @@ impl<'a> Engine<'a> {
             // over the argument expression, error_detection_helpers.dart:
             // 245-258): `g(v())` consumes the void value unless the formal
             // is itself `void` (`g(void x)` accepts it). The row reports
-            // at the argument's own span. `operand_static_ty` resolves the
-            // callee's `void` return — the level arg's `ty` spells an
-            // invoke `Unknown`.
-            let operand_ty = self
+            // at the argument's use-site span. `operand_static_ty`
+            // resolves the callee's `void` return — the level arg's `ty`
+            // spells an invoke `Unknown`.
+            let operand_row = self
                 .rows
                 .iter()
                 .rev()
                 .find(|row| row.range == *range)
+                .cloned();
+            let operand_ty = operand_row
+                .as_ref()
                 .map(|row| self.operand_static_ty(row))
                 .unwrap_or(*ty);
             if operand_ty == Ty::Void && formal_ty != Ty::Void {
+                let mut span = operand_row
+                    .as_ref()
+                    .map(|row| self.use_site_range(row))
+                    .unwrap_or(*range);
+                // A NAMED argument's operand is the `name: value` entry —
+                // the oracle's `at(expression)` anchors the whole
+                // `NamedExpression`, so the span re-opens at the label.
+                if name.is_some() {
+                    span = self.label_span(span).unwrap_or(span);
+                }
                 self.emit(
                     SemanticCode::UseOfVoidResult,
-                    *range,
+                    span,
                     "",
                     "",
                 );
@@ -13185,7 +13198,11 @@ impl<'a> Engine<'a> {
             && let Some(row) = self.rows.get(callee)
             && row.ty == Ty::Void
         {
-            let range = row.range;
+            // The checked node is the invoked EXPRESSION `v()` — the whole
+            // inner send, callee kind notwithstanding — so the anchor widens
+            // to the completed send's span (callee through the first `)` —
+            // the `function` node, not the outer `v()()`).
+            let range = self.invocation_span(row.range).unwrap_or(row.range);
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
         // The completed send's static type (upstream `node.recordStaticType
@@ -15754,7 +15771,6 @@ mod ticket_3208_tests;
 /// `dynamic`/`void`/`Never` twins, and the under-report posture for
 /// `Function`/`Record`/`Unknown` returns). Registered here, not in
 /// `tests.rs` (other lanes' file), via `#[path]`.
-
 #[cfg(test)]
 #[path = "ticket_3436_tests.rs"]
 mod ticket_3436_tests;

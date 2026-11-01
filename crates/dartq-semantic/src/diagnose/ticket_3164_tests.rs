@@ -45,7 +45,9 @@ fn ticket_3164_binary_left_invocation_anchors_method_name() {
 /// A `void`-typed identifier operand anchors at its own expression span
 /// (error_detection_helpers.dart:254 `.at(expression)`), and the
 /// non-`MethodInvocation` arm covers reads of `void`-typed formals —
-/// `void v` declared by the function type's parameter.
+/// `void v` declared by the function type's parameter. A send through
+/// the `void Function()` formal is a `FunctionExpressionInvocation` —
+/// its anchor is the whole `f()`, not the `f` name token.
 #[test]
 fn ticket_3164_binary_left_identifier_anchors_expression() {
     let fixture =
@@ -61,13 +63,14 @@ fn ticket_3164_binary_left_identifier_anchors_expression() {
     for diagnostic in &report.diagnostics {
         assert_eq!(diagnostic.message, VOID_MSG);
     }
-    // `f()` inside `var v = f()` anchors at the `f` name token (the
-    // invocation's methodName); `v` inside `v + 1` anchors at the `v`
-    // read itself — both length 1.
+    // `f()` inside `var v = f()` anchors at the whole send (a
+    // `FunctionExpressionInvocation`'s `.at(expression)`); `v` inside
+    // `v + 1` anchors at the `v` read itself.
     let prelude = crate::diagnose::test_rig::CORE_PRELUDE.len();
     let f_at = prelude + fixture.find("f()").unwrap();
     let v_at = prelude + fixture.find("v + 1").unwrap();
     assert_eq!(report.diagnostics[0].range.offset as usize, f_at, "{:?}", rows(&report));
+    assert_eq!(report.diagnostics[0].range.length, 3, "{:?}", rows(&report));
     assert_eq!(report.diagnostics[1].range.offset as usize, v_at, "{:?}", rows(&report));
 }
 

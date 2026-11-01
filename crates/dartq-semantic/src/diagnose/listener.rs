@@ -5505,8 +5505,11 @@ impl ParserListener for DiagnoseListener<'_> {
             // consume the void operand's value and report at its span. The
             // operand's static type resolves the invoke's `void` return —
             // `receiver_static_ty` answers the operator method's receiver,
-            // not the consumed value.
+            // not the consumed value. The anchor is the operand's
+            // use-site span: `-f()` on a `void Function()` formal reports
+            // the whole `f()`, a declared-method send its name token.
             if op != UnOp::Not && engine.operand_static_ty(&row) == Ty::Void {
+                let at = engine.use_site_range(&row);
                 engine.emit(SemanticCode::UseOfVoidResult, at, "", "");
             }
             // The `!` operand runs the negation face
@@ -5582,8 +5585,11 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.stage_receiver_of_type_never(at, receiver_ty);
             // The void-operand use (upstream `visitPrefixExpression` —
             // `operatorType != BANG` → `checkForUseOfVoidResult(operand)`):
-            // `++v()`/`--v()` consume the void operand's value.
+            // `++v()`/`--v()` consume the void operand's value. The anchor
+            // is the operand's use-site span (a `void Function()` callee's
+            // send reports the whole `v()`).
             if engine.operand_static_ty(&row) == Ty::Void {
+                let at = engine.use_site_range(&row);
                 engine.emit(SemanticCode::UseOfVoidResult, at, "", "");
             }
         }
@@ -5608,8 +5614,10 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.stage_receiver_of_type_never(at, receiver_ty);
             // The void-operand use (upstream `visitPostfixExpression` —
             // `operatorType != BANG` → `checkForUseOfVoidResult(operand)`):
-            // `v()++`/`v()--` consume the void operand's value.
+            // `v()++`/`v()--` consume the void operand's value. The anchor
+            // is the operand's use-site span.
             if engine.operand_static_ty(&row) == Ty::Void {
+                let at = engine.use_site_range(&row);
                 engine.emit(SemanticCode::UseOfVoidResult, at, "", "");
             }
         }
@@ -6167,16 +6175,17 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.is_type_pos -= 1;
         // The void-operand use (upstream `visitIsExpression` →
         // `checkForUseOfVoidResult(node.expression)`): `x is T` on a
-        // `void`-typed `x` reports at the operand's own span — the operand
-        // is the row just below the type-argument window (`is_type_mark`
-        // latches `rows.len()` after it parses).
+        // `void`-typed `x` reports at the operand's use-site span — the
+        // operand is the row just below the type-argument window
+        // (`is_type_mark` latches `rows.len()` after it parses).
         if let Some(mark) = engine.is_type_mark
             && let Some(operand) = mark
                 .checked_sub(1)
                 .and_then(|index| engine.rows.get(index))
-            && engine.operand_static_ty(operand) == Ty::Void
+                .cloned()
+            && engine.operand_static_ty(&operand) == Ty::Void
         {
-            let range = operand.range;
+            let range = engine.use_site_range(&operand);
             engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
     }
@@ -7481,25 +7490,20 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_cast_pattern(&mut self, operator: Token) {
         let engine = &mut self.engine;
-        // `p as X` covers X's values (official `castPatternToSpace`) — the
-        // written arguments ride along, so `x as List<int>`'s space never
-        // covers a later `x as List<num>` case's.
-        let leaf = match engine.armed_ty {
-            Some(Ty::Named {
-                name,
-                nullable,
-                args,
-            }) if args != ArgListId::EMPTY => Restriction::NamedArgs(name, nullable, args),
-            Some(Ty::Named { name, nullable, .. }) => Restriction::Named(name, nullable),
-            _ => Restriction::Unknown,
-        };
         // The still-armed type is the cast target: the triple at
         // shared_type_analyzer.dart:129-152 (the Cast kind of
         // `checkPatternNeverMatchesValueType`), plus `visitCastPattern`'s
         // matched-`Null` face (best_practices_verifier.dart:227-239).
         let cast_ty = engine.armed_ty;
         engine.check_cast_pattern(operator.range, cast_ty);
-        engine.pattern_leaf(leaf);
+        // The coverage half (`createCastSpace`, shared.dart:704-780): the
+        // cast does NOT cover its own type — the sub-pattern's space (already
+        // in the open frame) is what the case covers, widened to the whole
+        // matched type when the cast type fits inside it and joined with
+        // `null` when the cast type is non-nullable.
+        if let Some(cast_ty) = cast_ty {
+            engine.finish_cast_pattern(cast_ty);
+        }
         // The armed type was the cast pattern's — never a declaration's.
         engine.armed_ty = None;
         engine.armed_ty_span = None;
@@ -8980,11 +8984,11 @@ impl ParserListener for DiagnoseListener<'_> {
             // The void-operand use (upstream `visitInterpolationExpression`
             // → `checkForUseOfVoidResult(node.expression)`): `"$x"`/`"${e}"`
             // consumes the element's value — every `void`-typed operand row
-            // reports at its own span.
+            // reports at its use-site span.
             let void_rows: Vec<SourceRange> = children
                 .iter()
                 .filter(|row| engine.operand_static_ty(row) == Ty::Void)
-                .map(|row| row.range)
+                .map(|row| engine.use_site_range(row))
                 .collect();
             let offsets: Vec<u32> = children.iter().map(|row| row.range.offset).collect();
             for range in void_rows {
@@ -10109,11 +10113,13 @@ impl ParserListener for DiagnoseListener<'_> {
             .rows
             .last()
             .filter(|row| row.range.offset >= begin.range.end())
-            .map(|row| (engine.operand_static_ty(row), row.range));
+            .cloned()
+            .map(|row| (engine.operand_static_ty(&row), row));
         // The void-operand use (upstream `visitAwaitExpression` →
         // `checkForUseOfVoidResult(node.expression)`): `await x` on a
-        // `void`-typed `x` reports at the operand's span.
-        if let Some((Ty::Void, range)) = operand {
+        // `void`-typed `x` reports at the operand's use-site span.
+        if let Some((Ty::Void, row)) = &operand {
+            let range = engine.use_site_range(row);
             engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
         let flat_ty = operand.map(|(ty, _)| engine.flatten(ty));
@@ -10160,7 +10166,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .rows
             .last()
             .filter(|row| engine.operand_static_ty(row) == Ty::Void)
-            .map(|row| row.range);
+            .cloned()
+            .map(|row| engine.use_site_range(&row));
         if let Some(range) = void_operand {
             engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
@@ -10339,6 +10346,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // `handle_then_control_flow` unconditionally, so the depth always
         // tears down at the condition's own end.
         self.engine.if_element_cond += 1;
+        // The element's case scope opens the same way the statement's does
+        // (`visitIfElement` runs the same `_resolveGuardedPattern` arm as
+        // `visitIfStatement` — resolution_visitor.dart:569-583): only
+        // patterns inside this condition belong to the element's case
+        // scope, so a stale shadow list from an enclosing arm or sibling
+        // clears here.
+        self.engine.if_condition_begin();
     }
 
     fn begin_if_statement(&mut self, token: Token) {
@@ -11168,10 +11182,19 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_if_control_flow(&mut self, token: Token) {
         self.flow().end_if_control_flow(token);
+        // The element completes with no else (the parser fires this only
+        // when `else` is absent — literal_entry_info_impl.dart
+        // `IfComplete.parse`): a still-open case scope closes, the
+        // `IfElement` arm of `end_if_statement`.
+        self.engine.if_statement_end();
     }
 
     fn end_if_else_control_flow(&mut self, token: Token) {
         self.flow().end_if_else_control_flow(token);
+        // The else element completes: the case scope already emptied at
+        // `handle_else_control_flow`; this pops the cleared entry — the
+        // `IfElement` arm of `end_if_statement`.
+        self.engine.if_statement_end();
     }
 
     fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {
@@ -11322,6 +11345,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {
         self.flow().handle_else_control_flow(else_kw, else_start);
+        // The else entry opens: the then entry's case scope closes — the
+        // `IfElement` arm of the statement's `begin_else_statement` wiring
+        // (the else resolves a shadowed spelling on the OUTER declaration).
+        self.engine.if_then_end();
     }
 
     fn handle_empty_function_body(&mut self, semicolon: Token) {
@@ -11842,6 +11869,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // The element condition's window arms tear down here: the
         // then-element that follows is not a condition.
         self.engine.if_element_cond = self.engine.if_element_cond.saturating_sub(1);
+        // The then-element opens: the condition's pattern shadows become
+        // the element's case scope — the `IfElement` arm of the statement's
+        // `begin_then_statement` wiring (a case clause scopes its variables
+        // to the guard and the then entry only).
+        self.engine.if_then_begin();
         // The if-element's condition is a condition context too
         // (`handle_ifElement_conditionEnd`, upstream Dart SDK source,
         // `pkg/analyzer/lib/src/dart/resolver/type_analyzer.dart:1153-1166`
@@ -12620,14 +12652,21 @@ impl Engine<'_> {
                 };
                 // The leaf's `v()` invoke spells `Unknown` until
                 // `operand_static_ty` resolves the callee's `void` return.
-                let operand_ty = self
+                let operand_row = self
                     .rows
                     .iter()
                     .rev()
                     .find(|row| row.range == range)
+                    .cloned();
+                let operand_ty = operand_row
+                    .as_ref()
                     .map(|row| self.operand_static_ty(row))
                     .unwrap_or(ty);
                 if operand_ty == Ty::Void {
+                    let range = operand_row
+                        .as_ref()
+                        .map(|row| self.use_site_range(row))
+                        .unwrap_or(range);
                     self.emit(SemanticCode::UseOfVoidResult, range, "", "");
                 }
             }
@@ -13019,14 +13058,21 @@ impl Engine<'_> {
         // reports at the yielded expression. The row's raw `ty` spells an
         // invoke's return `Unknown` — `operand_static_ty` resolves the
         // callee's `void` face.
-        let operand_ty = self
+        let operand_row = self
             .rows
             .iter()
             .rev()
             .find(|row| row.range == range)
+            .cloned();
+        let operand_ty = operand_row
+            .as_ref()
             .map(|row| self.operand_static_ty(row))
             .unwrap_or(expr_ty);
         if operand_ty == Ty::Void {
+            let range = operand_row
+                .as_ref()
+                .map(|row| self.use_site_range(row))
+                .unwrap_or(range);
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
         let iterable = self.collection_heads[3];

@@ -5288,8 +5288,16 @@ impl<'a> Engine<'a> {
         // `use_of_void_result`'s row (upstream `_checkForEachParts` →
         // `checkForUseOfVoidResult(node.iterable)` at error_verifier.dart:
         // 4442 — the void use reports and short-circuits the iterable
-        // assignability ask).
+        // assignability ask). The anchor is the iterable's use-site span
+        // (`for (x in f())` reports the whole send).
         if ty == Ty::Void {
+            let range = self
+                .rows
+                .iter()
+                .rev()
+                .find(|row| row.range == range)
+                .map(|row| self.use_site_range(row))
+                .unwrap_or(range);
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
             return;
         }
@@ -5635,6 +5643,45 @@ impl<'a> Engine<'a> {
         self.switch.pattern_leaf(leaf);
     }
 
+    /// The coverage half of a cast pattern's close (`p as X`, official
+    /// `createCastSpace`, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:704-780).
+    /// The cast adds no coverage of its own: the SUB-pattern's space is
+    /// dispatched over the matched type (already pushed — the last leaf of
+    /// the open frame), then
+    ///   - a cast type wholly inside that space lets the cast match every
+    ///     value (the throw path covers the rest), so the case covers the
+    ///     whole matched type;
+    ///   - a non-nullable cast type joins the `null` space (the cast throws
+    ///     for `null`, so `null` never reaches the sub-pattern).
+    /// `case B() as C:` over a sealed `A` therefore covers `B|Null` — the
+    /// gap witnesses `C()`, not the cast-left `B()`.
+    pub(crate) fn finish_cast_pattern(&mut self, cast_ty: Ty) {
+        let world = self.name_world();
+        let context = NameTy::from_semantic(
+            self.switch
+                .switches
+                .last()
+                .map_or(Ty::Unknown, |c| c.scrutinee),
+        );
+        let cast = NameTy::from_semantic(cast_ty);
+        let Some(frame) = self.switch.pattern_stack.last_mut() else {
+            return;
+        };
+        // No leaf at all is the type-free sub-pattern (`_ as X`, `var x as
+        // X`): its coverage is the matched type whole (`createVariableSpace`
+        // / the wildcard space).
+        let sub = frame.leaves.pop().unwrap_or(Restriction::NamedContext);
+        let space = if world.contained_in(cast, &sub, context) {
+            Restriction::NamedContext
+        } else if NameWorld::is_potentially_nullable(&cast) {
+            sub
+        } else {
+            Restriction::Union(vec![sub, Restriction::Null])
+        };
+        frame.leaves.push(space);
+    }
+
     /// Closes the case-header pattern window and drains its root: the
     /// topmost restriction is the header pattern's coverage (pushed between
     /// the window's open and here), everything below is debris from earlier
@@ -5720,10 +5767,10 @@ impl<'a> Engine<'a> {
         // operand's static type resolves the invoke's return — a `v()`
         // call's row spells `Unknown` until `operand_static_ty` reads the
         // callee's `void` return.
-        if let Some(row) = scrutinee_row {
-            let ty = self.operand_static_ty(row);
+        if let Some(row) = scrutinee_row.cloned() {
+            let ty = self.operand_static_ty(&row);
             if ty == Ty::Void {
-                let range = row.range;
+                let range = self.use_site_range(&row);
                 self.emit(SemanticCode::UseOfVoidResult, range, "", "");
             }
         }
@@ -5734,6 +5781,16 @@ impl<'a> Engine<'a> {
     /// diagnostics (per-case reachability, then the covering gap).
     #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub(crate) fn report_switch(&mut self) {
+        // A pre-patterns library takes the legacy statement face instead
+        // (constant_verifier.dart:487-507: `visitSwitchStatement` runs
+        // `_validateSwitchExhaustiveness` only under `Feature.patterns`, and
+        // a switch expression cannot exist before 3.0), so no reachability,
+        // no covering gap, no dead member bodies — and nothing retained for
+        // the teardown re-decision.
+        if !self.patterns_enabled {
+            self.switch.switches.pop_discard();
+            return;
+        }
         let Some(ctx) = self.switch.switches.pop() else {
             return;
         };
@@ -5906,11 +5963,13 @@ impl<'a> Engine<'a> {
             NameTy::Unknown(u64::MAX) => false,
             _ => true,
         };
-        // The private-enum variant (constant_verifier.dart:1110-1121): an
+        // The private-enum variant (constant_verifier.dart:1082-1109): an
         // enum declared in another library whose name is private, or whose
-        // every witness names a private constant (`._`), reports the
-        // `_private` code family instead — unmodeled here, so the face
-        // suppresses rather than emit the public row.
+        // every witness names a private constant (`._`), reports the SAME
+        // shared code under the private template (`messages.yaml`
+        // `nonExhaustiveSwitchExpressionPrivate` — one diagnostic name, its
+        // own problem/correction text). The row reports either way; only the
+        // message differs.
         let private_foreign_enum = match value {
             NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)
                 if world.is_enum_name(name) && world.is_foreign_library(name) =>
@@ -5925,9 +5984,8 @@ impl<'a> Engine<'a> {
             }
             _ => false,
         };
-        let must_be_exhaustive = !private_foreign_enum
-            && ((ctx.is_expression && expression_face_decides)
-                || is_always_exhaustive(&world, value));
+        let must_be_exhaustive = (ctx.is_expression && expression_face_decides)
+            || is_always_exhaustive(&world, value);
         if let Exhaustiveness::NonExhaustive(_) = report.exhaustiveness {
             if must_be_exhaustive && ctx.default_kw.is_none() {
                 let code = if ctx.is_expression {
@@ -5935,17 +5993,13 @@ impl<'a> Engine<'a> {
                 } else {
                     SemanticCode::NonExhaustiveSwitchStatement
                 };
-                // The oracle row carries a correctionMessage whose `{2}` is
-                // the first witness's correction text (diagnostic.g.dart
-                // :13018/:13079, constant_verifier.dart:1104-1120); the
-                // diagnostic carries it in the correction slot.
-                let row = Diagnostic::new(
-                    code.severity(),
-                    code.code_info(),
-                    code.message3(&ty_text, &unmatched, &suggested),
-                    self.file,
+                let row = self.covering_row(
+                    code,
                     ctx.switch_kw,
-                    code.correction_message(&suggested),
+                    &ty_text,
+                    &unmatched,
+                    &suggested,
+                    private_foreign_enum,
                 );
                 // A nullable scrutinee defers (#2538): the flow layer's
                 // per-clause matched type may promote the scrutinee
@@ -5971,6 +6025,7 @@ impl<'a> Engine<'a> {
                         ty_text,
                         unmatched,
                         suggested,
+                        private: private_foreign_enum,
                         spaces: ctx.cases.iter().map(|c| c.space.clone()).collect(),
                         guarded: ctx.cases.iter().map(|c| c.guarded).collect(),
                     });
@@ -5985,6 +6040,40 @@ impl<'a> Engine<'a> {
             // constant_verifier.dart:1141-1148).
             self.emit(SemanticCode::UnreachableSwitchDefault, default_at, "", "");
         }
+    }
+
+    /// The covering row both faces build — the immediate emit in
+    /// [`Self::report_switch`] and the deferred re-decision in
+    /// [`Self::teardown_covering`]. The plain template carries the witness
+    /// texts (the `{1}` witness and the `{2}` correction, diagnostic.g.dart
+    /// :13018/:13079); the private-enum variant carries the scrutinee type
+    /// alone (upstream `pkg/analyzer/messages.yaml`
+    /// `nonExhaustiveSwitchExpressionPrivate`).
+    pub(crate) fn covering_row(
+        &self,
+        code: SemanticCode,
+        kw: SourceRange,
+        ty_text: &str,
+        unmatched: &str,
+        suggested: &str,
+        private: bool,
+    ) -> Diagnostic {
+        let (message, correction) = if private {
+            (code.message_private(ty_text), code.correction_private())
+        } else {
+            (
+                code.message3(ty_text, unmatched, suggested),
+                code.correction_message(suggested),
+            )
+        };
+        Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            message,
+            self.file,
+            kw,
+            correction,
+        )
     }
 
     /// The deferred covering verdict's teardown half (#2538): the staged
@@ -6005,9 +6094,13 @@ impl<'a> Engine<'a> {
         // matched spelling no declaration backs (#2456's unsolved parameter,
         // re-read by the flow from the same unresolved row) refines nothing —
         // the parse-time verdict stands, rendered against the type it was
-        // decided over.
+        // decided over. An UNRESOLVED row (`Ty::Unknown` — the flow's own
+        // blind spot for a complex scrutinee) refines nothing either: it
+        // folds to the nullable top, which would both re-render the type as
+        // the empty text and answer over a space the program never had.
         let matched_decides = matched.is_some_and(|ty| {
-            ty != pending.scrutinee
+            ty != Ty::Unknown
+                && ty != pending.scrutinee
                 && match NameTy::from_semantic(ty) {
                     NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
                         world.is_known_head(name)
@@ -6019,15 +6112,13 @@ impl<'a> Engine<'a> {
         let refined = match matched.filter(|_| matched_decides) {
             Some(ty) => NameTy::from_semantic(ty),
             None => {
-                return Some(Diagnostic::new(
-                    pending.code.severity(),
-                    pending.code.code_info(),
-                    pending
-                        .code
-                        .message3(&pending.ty_text, &pending.unmatched, &pending.suggested),
-                    self.file,
+                return Some(self.covering_row(
+                    pending.code,
                     pending.kw,
-                    pending.code.correction_message(&pending.suggested),
+                    &pending.ty_text,
+                    &pending.unmatched,
+                    &pending.suggested,
+                    pending.private,
                 ));
             }
         };
@@ -6053,13 +6144,13 @@ impl<'a> Engine<'a> {
                     w.as_witness(&world)
                 });
                 let suggested = first.map_or(String::new(), |w| w.as_correction(&world));
-                Some(Diagnostic::new(
-                    pending.code.severity(),
-                    pending.code.code_info(),
-                    pending.code.message3(&ty_text, &unmatched, &suggested),
-                    self.file,
+                Some(self.covering_row(
+                    pending.code,
                     pending.kw,
-                    pending.code.correction_message(&suggested),
+                    &ty_text,
+                    &unmatched,
+                    &suggested,
+                    pending.private,
                 ))
             }
         }
@@ -7699,7 +7790,11 @@ impl<'a> Engine<'a> {
     /// `dynamic` arm). `None` on an arity residue (the `wrong_number`
     /// family's business), when the written capture failed, or when the
     /// head is no function-RHS alias.
-    fn instantiated_alias_sig(&self, name: StringId, args: ArgListId) -> Option<Box<FnVarSig>> {
+    pub(crate) fn instantiated_alias_sig(
+        &self,
+        name: StringId,
+        args: ArgListId,
+    ) -> Option<Box<FnVarSig>> {
         let (params, rhs_vars): (Box<[StringId]>, Box<[(StringId, Option<TypeTree>, bool)]>) =
             match self.bounds.alias_fn_shape(name) {
                 Some((params, rhs_vars, ..)) => (
@@ -9079,3 +9174,11 @@ mod ticket_bounds_tests;
 #[cfg(test)]
 #[path = "ticket_3424_tests.rs"]
 mod ticket_3424_tests;
+
+// The #3472 pins (the switch covering face: the pre-patterns gate, the
+// unresolved matched type, the private-enum template, the sealed split's
+// instantiations, and the cast pattern's coverage). Same `#[path]`
+// registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3472_tests.rs"]
+mod ticket_3472_tests;

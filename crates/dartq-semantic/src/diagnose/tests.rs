@@ -20050,3 +20050,15 @@ mod ticket_3460_tests;
 #[cfg(test)]
 #[path = "ticket_3428_tests.rs"]
 mod ticket_3428_tests;
+
+// —— #3425 —— the declaring-formal member face for every primary-ctor
+// —— container kind (mixin/extension were missing from the gate) and the
+// —— implicit-type slot on unannotated instance fields: `var foo = "s"`
+// —— under `int get foo` infers `int` from the combined signature, never
+// —— the initializer (instance_member_inferrer.dart:104-135). Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree
+// —— so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3425_tests.rs"]
+mod ticket_3425_tests;

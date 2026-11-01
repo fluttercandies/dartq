@@ -654,12 +654,11 @@ impl<'a> Engine<'a> {
     /// `use_of_void_result` on one operand row (upstream
     /// `checkForUseOfVoidResult`, error_detection_helpers.dart:245-258):
     /// the operand's `staticType` is `VoidTypeImpl` and its value is
-    /// consumed by the enclosing construct — the official helper reports
-    /// `useOfVoidResult.at(methodName)` for a `MethodInvocation` and
-    /// `.at(expression)` for every other shape. The row's own `range`
-    /// answers both: an `Intent::Invoke` row spans the callee's name
-    /// token (the `.at(methodName)` anchor), every other operand row spans
-    /// its own expression. A non-`void` operand is a no-op.
+    /// consumed by the enclosing construct. The anchor is the operand's
+    /// use-site span ([`Self::use_site_range`]), never always the row's
+    /// own token — `at(methodName)` keeps a declared-method send's name,
+    /// while every other shape reports the operand's whole expression.
+    /// A non-`void` operand is a no-op.
     pub(crate) fn emit_use_of_void_result(&mut self, ty: Ty, operand: &Row) {
         if ty != Ty::Void {
             return;
@@ -674,15 +673,129 @@ impl<'a> Engine<'a> {
         // `visitBinaryExpression` (error_verifier.dart:470/:482) both land
         // on the operand span without doubling the row. Identity is the
         // span: the row the consuming seam reads IS the operand node.
-        if self
-            .report
-            .diagnostics
-            .iter()
-            .any(|d| d.range == operand.range && d.code.name == "use_of_void_result")
-        {
+        let range = self.use_site_range(operand);
+        if self.report.diagnostics.iter().any(|d| {
+            (d.range == range || d.range == operand.range)
+                && d.code.name == "use_of_void_result"
+        }) {
             return;
         }
-        self.emit(SemanticCode::UseOfVoidResult, operand.range, "", "");
+        self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+    }
+
+    /// The operand's use-site span for `use_of_void_result` (upstream
+    /// `checkForUseOfVoidResult`'s anchor split,
+    /// error_detection_helpers.dart:245-258): a `MethodInvocation` operand
+    /// anchors `methodName` — a declared-method send's row already spans
+    /// exactly that name token — while every other operand shape anchors
+    /// `.at(expression)`. Two widenings fall out of the expression arm:
+    ///
+    /// - a send through a function-typed VALUE (`FunctionExpressionInvocation`
+    ///   — a `void Function()` formal or local, or a function-typed member,
+    ///   never a declared method head) spans receiver-start through the
+    ///   closing `)` (`invocation_span`);
+    /// - a member-shaped operand (`x.f`, `C.m`, `ET1("42").id`) spans the
+    ///   receiver's start through the selector's end
+    ///   (`property_access_span`).
+    ///
+    /// Declared-method sends, bare reads, and every other operand keep the
+    /// row's own span. A declared-method send must NOT take the
+    /// property-access widening: `x.m()` anchors `m`, never `x.m`.
+    pub(crate) fn use_site_range(&self, operand: &Row) -> SourceRange {
+        if matches!(operand.intent, Intent::Invoke) {
+            self.value_send_span(operand).unwrap_or(operand.range)
+        } else {
+            self.property_access_span(operand.range)
+                .unwrap_or(operand.range)
+        }
+    }
+
+    /// The `name: operand` span when the two tokens directly before
+    /// `range`'s head are a `:` and a label identifier — the
+    /// `NamedExpression`/`RecordLiteralNamedField` wrapper the oracle
+    /// anchors (`at(expression)` on the entry, never the value alone).
+    /// `None` without the label. Only callers that KNOW the operand sits
+    /// in a named-entry position (a named argument's `name`, a record
+    /// literal's field label) may apply it — a bare token probe would
+    /// misread a ternary's `:` or a `case` colon as a label.
+    pub(crate) fn label_span(&self, range: SourceRange) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let colon = tokens
+            .partition_point(|t| t.utf16_offset < range.offset)
+            .checked_sub(1)?;
+        if !matches!(tokens.get(colon)?.kind, dartq_scanner::TokenKind::Colon) {
+            return None;
+        }
+        let name = tokens.get(colon.checked_sub(1)?)?;
+        Some(SourceRange {
+            offset: name.utf16_offset,
+            length: range.end() - name.utf16_offset,
+        })
+    }
+
+    /// The whole-send span of a `FunctionExpressionInvocation` operand —
+    /// `None` for a `MethodInvocation` operand (a send resolving to a
+    /// declared method or function head, which anchors the callee's name
+    /// token instead) and for non-send operands. The value-callee shapes:
+    /// a bare send on a `void Function()`-typed formal or local, a local
+    /// without a declared-function capture (`fn_var_sigs` misses plain
+    /// `void`-typed variables — their send is a function-expression
+    /// invocation all the same), or a member send whose resolved member is
+    /// a field or getter (a function-typed property — `Method` members
+    /// keep the `methodName` anchor).
+    fn value_send_span(&self, operand: &Row) -> Option<SourceRange> {
+        if !matches!(operand.intent, Intent::Invoke) {
+            return None;
+        }
+        let value_callee = match &operand.shape {
+            RowShape::Member { recv } => {
+                let type_name = match recv {
+                    Receiver::Typed { type_name, .. }
+                    | Receiver::This {
+                        container: type_name,
+                        ..
+                    }
+                    | Receiver::Super {
+                        container: type_name,
+                        ..
+                    } => *type_name,
+                    _ => return None,
+                };
+                matches!(
+                    self.walk_members(type_name, operand.name),
+                    Walk::Found(entry)
+                        if matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
+                )
+            }
+            _ => {
+                self.fn_var_sigs.contains_key(&operand.name)
+                    || (self
+                        .frames
+                        .iter()
+                        .any(|f| f.locals.contains(&operand.name))
+                        && self.local_fn_sig(operand.name).is_none())
+            }
+        };
+        if !value_callee {
+            return None;
+        }
+        let range = self.invocation_span(operand.range).unwrap_or(operand.range);
+        // A chained send (`f()()` — the outer `()` invokes the inner
+        // send's result) keeps extending through each directly-adjacent
+        // argument list: `call_ends` records only the first send's close
+        // for a shared callee offset, so the tail groups ride the same
+        // paren walk `row_ifnull_operator_at` runs (all UTF-16 offsets).
+        let mut end = range.end();
+        while self.byte_at(end) == Some(b'(') {
+            let Some(close) = self.matching_paren(end) else {
+                break;
+            };
+            end = close + 1;
+        }
+        Some(SourceRange {
+            offset: range.offset,
+            length: end - range.offset,
+        })
     }
 
     /// The correction-carrying emit: the correction renders from the table
@@ -4736,6 +4849,92 @@ impl<'a> Engine<'a> {
         rewritten
     }
 
+    /// The `is`-verdict's parameterized function-RHS typedef fold: a named
+    /// head whose `index.aliases` capture is a signature (`typedef F2<T> =
+    /// core.List<core.int> Function(int y, {List<Function> x})`) answers
+    /// the use-site-instantiated `Ty::Function` the verdict's function rule
+    /// compares — the same face `assignable`'s `function_shape_sig` reads
+    /// for the declared-type asks, applied to the written `is` target and
+    /// operand. The `var_ty` fold cannot carry this pair: `end_typedef`'s
+    /// `take_armed` snapshots the armed head — the anonymous signature's
+    /// return head, never the `Ty::Function` — so `fold_parameterized_alias`
+    /// lands on `Named{core.List}` and the strict ask answers false. A
+    /// BARE parameterized use (`x is F2` — `instantiateTypeFormalsToBounds`)
+    /// reads the bounds-substituted defaults through `itb_default_args`
+    /// before the same instantiation; a no-capture head keeps `None`.
+    /// `?` at the use site joins the folded face's nullability; the honest
+    /// required-positional count rides `fn_shape_required` exactly like
+    /// `alias_function_ty`'s own record.
+    fn parameterized_alias_fn_ty(&mut self, ty: Ty) -> Option<Ty> {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return None;
+        };
+        // The capture gate mirrors `function_shape_sig`'s: only a
+        // function-RHS alias's own file-side capture can answer — a named
+        // RHS (`AliasRhs::Named`) or a head with no capture keeps the
+        // caller's ordinary path.
+        if std::env::var("DQ_PROBE").is_ok() {
+            let t = self.strings.resolve(name);
+            eprintln!(
+                "DQ_PROBE paf name={t} args={args:?} fn_shape={} named_shape={}",
+                self.bounds.alias_fn_shape(name).is_some(),
+                self.bounds.alias_named_shape(name).is_some()
+            );
+        }
+        let Some((params, ..)) = self.bounds.alias_fn_shape(name) else {
+            return None;
+        };
+        let param_count = params.len();
+        let args = if args == ArgListId::EMPTY {
+            if param_count == 0 {
+                // A non-parameterized function-RHS alias (`typedef F = int
+                // Function()`) spells bare with no defaults to
+                // instantiate — the raw signature face answers it.
+                return self
+                    .alias_fn_sig(name)
+                    .map(|sig| self.fold_sig_ty(*sig, nullable));
+            }
+            // A parameterized head's bare use instantiates to bounds
+            // (`x is F2` — `instantiateTypeFormalsToBounds`).
+            let defaults = self.bounds.itb_default_args(self.strings, name)?;
+            let tys: Vec<Ty> = defaults.iter().map(|tree| self.tree_ty(tree)).collect();
+            self.boundary.intern_list(&tys)
+        } else {
+            args
+        };
+        let sig = self.instantiated_alias_sig(name, args)?;
+        Some(self.fold_sig_ty(*sig, nullable))
+    }
+
+    /// The sig-to-`Ty` tail of [`Self::parameterized_alias_fn_ty`]: interns
+    /// the signature through `fn_sig_ty`, records the honest
+    /// required-positional count on the fresh `FnShapeId`, and joins the
+    /// use-site `?` onto the face's own nullability.
+    fn fold_sig_ty(&mut self, sig: FnVarSig, nullable: bool) -> Ty {
+        let required = sig.required_positional;
+        let ty = self.fn_sig_ty(&sig);
+        match ty {
+            Ty::Function {
+                shape,
+                nullable: rhs_nullable,
+            } => {
+                if shape != crate::model::FnShapeId::EMPTY {
+                    self.fn_shape_required.entry(shape).or_insert(required);
+                }
+                Ty::Function {
+                    shape,
+                    nullable: nullable || rhs_nullable,
+                }
+            }
+            _ => ty,
+        }
+    }
+
     /// already produced. `None` for a non-function or nullable face.
     /// `required` overrides the map answer for a caller that knows the
     /// face's own written site (`check_type_check`'s `last_fn_seal` match)
@@ -5402,6 +5601,19 @@ impl<'a> Engine<'a> {
         // operand's `List` declaration face and the always-true verdict
         // stays silent (the `f2 is F2<int>` family).
         checked = self.canonical_function_ty(checked);
+        // A parameterized function-RHS typedef whose written arguments
+        // survived the folds (`m2 is F2<T>`) folds here through the
+        // file-side `index.aliases` capture: `var_ty` snapshots the armed
+        // return head (`core.List`), never the anonymous signature, so
+        // `fold_parameterized_alias` lands the pair as (Function, Named)
+        // and the strict ask stays silent where the oracle's
+        // `instantiateTypeFormalsToBounds` reads the instantiated
+        // signature (`isSubtypeOf` over `sig<T→arg>`, subtype.dart). The
+        // fold records the written `?` on the use and the honest
+        // required-positional count on the fresh shape.
+        if let Some(folded) = self.parameterized_alias_fn_ty(checked) {
+            checked = self.normalized_never(self.official_fn_face(folded));
+        }
         // A bare generic alias (`x is F0` over `typedef F0<T> = int
         // Function(int, [Function x])`) survives the first fold as the
         // instantiate-to-bounds head `F0<dynamic>` — the bare loop's
@@ -5411,6 +5623,38 @@ impl<'a> Engine<'a> {
         // captured signature the verdict's function rule answers (the
         // oracle's `instantiateTypeFormalsToBounds` face).
         checked = self.normalized_never(self.official_fn_face(self.fold_alias_ty(checked)));
+        // The listener's leaf-substitute keeps only the continuation of a
+        // dot-joined checked head (`is p.T` arms `Named{T}` — the leaf
+        // resolves the element but drops the import prefix the subtype
+        // ask needs). `armed_ty_span` still anchors the prefix token:
+        // `p`'s written range, resolving to `RefTarget::Prefix`, rebuilds
+        // the joined head `p.T` — the same element `lookup_prefixed`
+        // answers, and the spelling the operand's own prefixed declared
+        // face spells. A bare `is T` (`armed_ty_span` over `T`, not a
+        // prefix) and an unresolvable prefix keep `checked` unchanged.
+        if let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = checked
+            && let Some(span) = self.armed_ty_span
+        {
+            let start = self.byte_of(span.offset);
+            let end = self.byte_of(span.end());
+            // The span may trail the written `?` (`is p.T?` arms `p`..`?`)
+            // — the prefix token's own spelling is the head candidate.
+            let span_text = self.source[start..end].trim_end_matches('?');
+            if self.strings.resolve(name) != span_text
+                && matches!(self.resolve_bare(self.intern(span_text)).1, RefTarget::Prefix)
+            {
+                let joined = self.intern(&format!("{}.{}", span_text, self.strings.resolve(name)));
+                checked = Ty::Named {
+                    name: joined,
+                    nullable,
+                    args,
+                };
+            }
+        }
         // A prefixed `is p.T` arms the prefix token's name (the parser's
         // `handle_type` anchors the qualified head at `p`, never `T`):
         // `Named{p}` resolves to the import prefix, not a type. The real
@@ -5436,10 +5680,11 @@ impl<'a> Engine<'a> {
         // `TypeSystem::type_check_verdict`'s first gate — an
         // `InvalidType` operand is informative before every other arm
         // (`subtype.dart`'s 0c vacuity never reaches the verdict), so
-        // `Missing rv is dynamic` reports nothing. The `p.T`-prefixed
-        // operand is the same silence (the prefix answers no subtype
-        // question — the under-report direction every unresolved side
-        // already takes).
+        // `Missing rv is dynamic` reports nothing. A bare prefix token as
+        // operand (`e is p` nonsense) is the same silence — the prefix
+        // answers no subtype question — while a dot-joined `p.T` head IS
+        // a resolvable element the subtype walk reads through
+        // `split_prefixed_spelling`; only the dot-free name vetoes here.
         // The operand's resolved static type (`leftNode.typeOrThrow`,
         // best_practices_verifier.dart:1011) — the alias fold mirrors the
         // target side's: `f0 is F0<int>` over a tear-off typed
@@ -5472,13 +5717,25 @@ impl<'a> Engine<'a> {
         // second fold then reads an `x: F0` declared face's bounds into the
         // signature.
         let operand_ty = self.canonical_function_ty(operand_ty);
+        // The same parameterized function-RHS fold the checked side ran:
+        // an operand whose declared face spells `F2<T>` (`x15 is F15<bool>`
+        // — the tear-off var's alias-written declared type) unfolds to the
+        // instantiated signature so the pair asks the strict function rule
+        // instead of stranding as (Named, Function).
+        let operand_ty = self
+            .parameterized_alias_fn_ty(operand_ty)
+            .map(|ty| self.normalized_never(self.official_fn_face(ty)))
+            .unwrap_or(operand_ty);
         let operand_ty =
             self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
         if operand_ty == Ty::Unknown
-            || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
+            || matches!(operand_ty, Ty::Named { name, .. } if !self.strings.resolve(name).contains('.') && matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)
         {
             return;
+        }
+        if std::env::var("DQ_PROBE").is_ok() {
+            eprintln!("DQ_PROBE walk operand={operand_ty:?} checked={checked:?}");
         }
         let verdict =
             if checked == Ty::Dynamic {
@@ -5752,6 +6009,9 @@ impl<'a> Engine<'a> {
                     Some(true)
                 }
             };
+        if std::env::var("DQ_PROBE").is_ok() {
+            eprintln!("DQ_PROBE verdict={verdict:?} negated={negated}");
+        }
         let Some(constant_true) = verdict else { return };
         let code = match (constant_true, negated) {
             (true, false) | (false, true) => SemanticCode::UnnecessaryTypeCheckTrue,
@@ -6750,10 +7010,16 @@ impl<'a> Engine<'a> {
             // error_detection_helpers.dart:245-258): a `void`-typed
             // operand's value is consumed by the assertion — the oracle
             // reports `use_of_void_result` at the operand-plus-`!` span
-            // before the null-check faces ever ask their question.
+            // before the null-check faces ever ask their question. The
+            // span opens at the operand EXPRESSION's head — a member
+            // operand's `x.m()!` spans from `x`, not the `m` selector.
+            let head = self.rows.last().and_then(|row| {
+                self.property_access_span(row.range)
+                    .map(|span| span.offset)
+            });
             let range = SourceRange {
-                offset: read_span.offset,
-                length: at.end() - read_span.offset,
+                offset: head.unwrap_or(read_span.offset),
+                length: at.end() - head.unwrap_or(read_span.offset),
             };
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
         } else if ty == Ty::Null {
@@ -10297,6 +10563,16 @@ mod ticket_2935_tests;
 #[cfg(test)]
 #[path = "ticket_3164_tests.rs"]
 mod ticket_3164_tests;
+
+/// The #3470 `use_of_void_result` USE-SITE span pins: the report anchors
+/// the operand's whole expression for every non-`MethodInvocation` shape
+/// (`FunctionExpressionInvocation` sends through `void Function()`
+/// formals/locals and function-typed members, `PropertyAccess` chains,
+/// `NamedExpression`/`RecordLiteralNamedField` entries), and keeps the
+/// `methodName` token only for declared-method sends.
+#[cfg(test)]
+#[path = "ticket_3470_tests.rs"]
+mod ticket_3470_tests;
 
 /// The #3104 dead-region suppression pins: the flow layer's `DeadCode`
 /// intervals re-home into [`Engine::dead_windows`] before `resolve_rows`,
