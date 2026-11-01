@@ -19933,3 +19933,18 @@ mod ticket_3417_tests;
 #[cfg(test)]
 #[path = "ticket_3259_tests.rs"]
 mod ticket_3259_tests;
+
+// The #3432 pins (the named mixin application's forwarded constructor
+// face): `class X = S with M;` declares no constructor of its own — the
+// analyzer synthesizes one per generative constructor of `S`, so the
+// ctor faces (`ctor_face_exists`, the unnamed-creation miss, the const
+// selector-miss staging, the `super.` initializer faces, and the
+// formals/arity lanes) read through `effective_ctor_container`'s
+// superclass-chain walk, keyed off `decl_kinds`'s `is_mixin_application`
+// row (the only marker telling the sugar form from `extends ... with`).
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3432_tests.rs"]
+mod ticket_3432_tests;

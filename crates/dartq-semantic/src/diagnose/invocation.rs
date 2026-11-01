@@ -1933,15 +1933,211 @@ impl<'a> Engine<'a> {
     /// of `decl`: a named selector joins through the container's selector
     /// set, the unnamed spellings (the head itself, `new`) through the
     /// implicit/explicit unnamed face.
+    ///
+    /// A named mixin application (`class X = S with M;`) declares no
+    /// constructor of its own — the analyzer SYNTHESIZES one per generative
+    /// constructor of `S` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart:223`'s
+    /// `getMember` superclass climb), so the face reads the application's
+    /// [`Self::effective_ctor_container`] terminal instead. Its own
+    /// `has_unnamed_constructor` flag is the source-declared row — always
+    /// the implicit default — and answers nothing.
+    ///
+    /// The forwarding check re-resolves `container` in the diagnosing
+    /// scope and requires the hit to BE `decl` (`std::ptr::eq`): a
+    /// prefixed or shadowed spelling's container answers its own face
+    /// alone (the pre-existing under-report posture — the effective face
+    /// cannot be re-derived without the declaring unit).
     pub(crate) fn ctor_face_exists(
         &self,
         decl: &Container,
         container: StringId,
         selector: StringId,
     ) -> bool {
-        decl.constructors.contains(&selector)
-            || ((selector == container || selector == self.intern("new"))
-                && decl.has_unnamed_constructor)
+        let unnamed = selector == container || selector == self.intern("new");
+        let own = |face: &Container| {
+            face.constructors.contains(&selector)
+                || (unnamed && face.has_unnamed_constructor)
+        };
+        let effective = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .and_then(|(resolved, owner)| {
+            std::ptr::eq(resolved, decl)
+                .then(|| self.effective_ctor_container(resolved, owner, container))
+                .flatten()
+        });
+        let Some((face, face_owner, face_name)) = effective else {
+            return own(decl);
+        };
+        if std::ptr::eq(face, decl) {
+            return own(decl);
+        }
+        // The application's forwarded set is the superclass's GENERATIVE
+        // constructors — factories never forward (the spec's mixin-
+        // application clause, `mixin_application_constructor_forwarding`),
+        // so a selector the terminal face declares only as a factory is no
+        // constructor of the application.
+        if unnamed && face.has_unnamed_constructor {
+            return !self.ctor_is_factory(face, face_owner, face_name);
+        }
+        face.constructors.contains(&selector)
+            && !self.ctor_is_factory(face, face_owner, selector)
+    }
+
+    /// The container whose constructor tables answer `name`'s constructor
+    /// face — `(decl, owner, name)` itself, unless `decl` is a named mixin
+    /// application, whose constructor set is forwarded from the
+    /// superclass chain (each mixin-application hop climbs to its own
+    /// superclass, so `class Y = X with N;` over the mixin application `X`
+    /// lands on the terminal face `X`'s forwards read). Returns the
+    /// terminal container with its declaring unit and lookup name — the
+    /// `ctor_formals` unnamed face keys on THAT spelling, not `name`'s.
+    ///
+    /// The `is_mixin_application` fact rides the declaring unit's
+    /// `decl_kinds` rows (introductory spellings only — an `augment` head
+    /// never sets it). A container without both a superclass and a `with`
+    /// list cannot be the sugar form, which short-circuits the scan on
+    /// the ordinary path. `None` when a superclass spelling resolves
+    /// nowhere or the chain cycles — the under-report posture every
+    /// creation face shares (the declaration face reports the miss
+    /// elsewhere).
+    pub(crate) fn effective_ctor_container(
+        &self,
+        decl: &'a Container,
+        owner: FileId,
+        name: StringId,
+    ) -> Option<(&'a Container, FileId, StringId)> {
+        let is_mixin_app = |owner: FileId, name: StringId| {
+            self.index.get(owner).is_some_and(|elements| {
+                elements
+                    .decl_kinds()
+                    .iter()
+                    .any(|target| target.is_mixin_application && target.name == name)
+            })
+        };
+        if decl.superclass.is_none()
+            || decl.with_clause.is_empty()
+            || !is_mixin_app(owner, name)
+        {
+            return Some((decl, owner, name));
+        }
+        let mut seen: FxHashSet<StringId> = FxHashSet::from_iter([name]);
+        let (mut cur, mut cur_owner, mut cur_name) = (decl, owner, name);
+        let mut scope_lib = self.lib;
+        loop {
+            // A mixin application always writes a head type (`= S with`),
+            // so `superclass` is present on every hop the flag marks.
+            let super_name = cur.superclass?;
+            let super_lib = owner_library(self.graph, self.lib, cur_owner, cur_name)
+                .unwrap_or(scope_lib);
+            let (super_decl, super_owner) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                super_lib,
+                cur_owner,
+                super_name,
+            )?;
+            if !seen.insert(super_name) {
+                return None; // malformed cyclic chain: unresolved posture
+            }
+            let chained = super_decl.superclass.is_some()
+                && !super_decl.with_clause.is_empty()
+                && is_mixin_app(super_owner, super_name);
+            if !chained {
+                return Some((super_decl, super_owner, super_name));
+            }
+            scope_lib = super_lib;
+            (cur, cur_owner, cur_name) = (super_decl, super_owner, super_name);
+        }
+    }
+
+    /// Whether `key`'s constructor on `face` is a FACTORY — the selector a
+    /// mixin application never forwards. `key` is the `ctor_formals`
+    /// lookup spelling (the selector for a named face, the container's own
+    /// name for the unnamed face). The declaring unit's `decl_kinds` row
+    /// is authoritative; `face`'s `factory_formals` table backstops it for
+    /// a declaration whose target row never sealed.
+    pub(crate) fn ctor_is_factory(
+        &self,
+        face: &Container,
+        owner: FileId,
+        key: StringId,
+    ) -> bool {
+        face.factory_formals.contains_key(&key)
+            || self.index.get(owner).is_some_and(|elements| {
+                elements
+                    .decl_kinds()
+                    .iter()
+                    .any(|target| target.is_factory && target.name == key)
+            })
+    }
+
+    /// The unnamed-constructor existence face on `(decl, owner, name)`
+    /// through [`Self::effective_ctor_container`]: the terminal
+    /// container's `has_unnamed_constructor`, minus the factory-only
+    /// unnamed shape a mixin application never forwards (a plain class's
+    /// own factory unnamed face answers `C()` directly — the exclusion is
+    /// the forwarding hop's alone). A broken forwarding chain answers the
+    /// container's own flag (the under-report posture).
+    fn unnamed_ctor_exists(&self, decl: &'a Container, owner: FileId, name: StringId) -> bool {
+        let Some((face, face_owner, face_name)) =
+            self.effective_ctor_container(decl, owner, name)
+        else {
+            return decl.has_unnamed_constructor;
+        };
+        face.has_unnamed_constructor
+            && (std::ptr::eq(face, decl)
+                || !self.ctor_is_factory(face, face_owner, face_name))
+    }
+
+    /// The formal table `selector`'s GENERATIVE constructor carries on
+    /// `class`'s [`Self::effective_ctor_container`] face — the mixin-
+    /// application forwarding lane [`Self::ctor_schema_formals`]'s plain
+    /// read cannot reach (the application's own table is empty). `None`
+    /// for an ordinary class, a broken forwarding chain, or a selector
+    /// the terminal face does not declare — the caller's own
+    /// `factory_formals` lane or under-report posture continues. The
+    /// `new`/class-name spellings key on the terminal container's own
+    /// name (the collector's `ctor_formals` unnamed-face convention).
+    fn forwarded_ctor_formals(&self, class: StringId, selector: StringId) -> Option<Formals> {
+        let (container, owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            class,
+        )?;
+        let (face, face_owner, face_name) =
+            self.effective_ctor_container(container, owner, class)?;
+        if std::ptr::eq(face, container) {
+            return None; // no forwarding: the plain table owns this read
+        }
+        let key = if selector == class || selector == self.intern("new") {
+            face_name
+        } else {
+            selector
+        };
+        if self.ctor_is_factory(face, face_owner, key) {
+            return None;
+        }
+        let mut formals = (**face.ctor_formals.get(&key)?).clone();
+        self.project_formals(face_owner, &mut formals);
+        // An untyped `this.f` formal reads its field's declared type off
+        // the declaring unit — same-file only, the field-formal patch's
+        // ordinary reach (a same-named local class must never patch a
+        // foreign face's formals).
+        if face_owner == self.file {
+            self.patch_field_formals(face_name, &mut formals);
+        }
+        Some(formals)
     }
 
     /// The offset just past the argument group whose `(` sits at `open`:
@@ -2294,7 +2490,7 @@ impl<'a> Engine<'a> {
                 )
             })
         });
-        let Some((super_container, _)) = resolved else {
+        let Some((super_container, super_owner)) = resolved else {
             // The dead-edge Object fallback (upstream Dart SDK source,
             // `error_verifier.dart`'s unresolved-superclass walk): a truly
             // undefined superclass resolves no element, so the check walks
@@ -2317,7 +2513,15 @@ impl<'a> Engine<'a> {
             }
             return;
         };
-        if super_container.constructors.contains(&name) {
+        // A mixin-application superclass answers through its own forwarded
+        // face: `class S = T with M;` synthesizes `T`'s generative
+        // constructors, so `super.t1` in a subclass reaches them through
+        // the application's terminal container. A broken forwarding chain
+        // keeps the application's own row (the under-report posture).
+        let (face, face_owner, _) = self
+            .effective_ctor_container(super_container, super_owner, superclass)
+            .unwrap_or((super_container, super_owner, superclass));
+        if face.constructors.contains(&name) && !self.ctor_is_factory(face, face_owner, name) {
             // The super-ctor selector counts as the constructor's
             // reference: `super._(...)` spares the named super constructor
             // from `unused_element` (the official reference set includes
@@ -2415,9 +2619,20 @@ impl<'a> Engine<'a> {
                 // (`extends p.J`) binds through its import prefix — the
                 // collector keeps only the bare leaf.
                 match self.resolve_clause_face(container, self.file, self.lib, superclass) {
-                    Some((super_container, _)) => super_container
-                        .ctor_formals
-                        .get(&target.unwrap_or(superclass)),
+                    Some((super_container, super_owner)) => {
+                        // A mixin-application superclass's super formal
+                        // associates against the forwarded table on the
+                        // terminal face — `class S = T with M;` declares
+                        // `T`'s constructors, keyed on `T`'s own spelling.
+                        self.effective_ctor_container(
+                            super_container,
+                            super_owner,
+                            superclass,
+                        )
+                        .and_then(|(face, _, face_name)| {
+                            face.ctor_formals.get(&target.unwrap_or(face_name))
+                        })
+                    }
                     // A dead-edge super face takes no parameters (the
                     // undefined-name shape above); a declaration the index
                     // cannot model (the synthetic SDK face) keeps the
@@ -8156,13 +8371,19 @@ impl<'a> Engine<'a> {
         // prefix head — `prefixed_container` resolved through the prefix,
         // but the table keys on the declaring name itself.
         let leaf = head.rsplit('.').next().unwrap_or(head);
-        let key = selector.map_or_else(|| self.intern(leaf), |sel| self.intern(sel));
-        let Some(formals) = container.ctor_formals.get(&key) else {
+        // A mixin-application head pairs the forwarded table on the
+        // terminal face — the unnamed key is THAT container's own
+        // spelling. A broken forwarding chain keeps the head's own row.
+        let (face, face_owner, face_name) = self
+            .effective_ctor_container(container, owner, self.intern(leaf))
+            .unwrap_or((container, owner, self.intern(leaf)));
+        let key = selector.map_or(face_name, |sel| self.intern(sel));
+        let Some(formals) = face.ctor_formals.get(&key) else {
             return;
         };
         let mut formals = (**formals).clone();
-        self.project_formals(owner, &mut formals);
-        let const_ctor = container.has_const_constructor;
+        self.project_formals(face_owner, &mut formals);
+        let const_ctor = face.has_const_constructor;
         // The per-argument walk pairs positionals by index, named by
         // spelling — the same shape `check_enum_const_arguments` runs (no
         // `undefined_named_parameter` here: the oracle's annotation walk
@@ -8638,15 +8859,22 @@ impl<'a> Engine<'a> {
         ) else {
             return;
         };
-        let Some(formals) = container
-            .ctor_formals
-            .get(&head)
-            .map(|f| (**f).clone())
+        // A mixin-application head reads the forwarded table on the
+        // terminal face — `new A1(...)` over `class A1 = B<int> with M1;`
+        // pairs `B`'s unnamed formals (keyed on `B`, not `A1`). A broken
+        // forwarding chain keeps the under-report posture the empty-table
+        // miss already carried.
+        let Some((face, face_owner, face_name)) =
+            self.effective_ctor_container(container, owner, head)
+        else {
+            return;
+        };
+        let Some(formals) = face.ctor_formals.get(&face_name).map(|f| (**f).clone())
         else {
             return;
         };
         let mut formals = formals;
-        self.project_formals(owner, &mut formals);
+        self.project_formals(face_owner, &mut formals);
         let named = level
             .args
             .iter()
@@ -8835,13 +9063,25 @@ impl<'a> Engine<'a> {
                     superclass,
                 ) {
                     Some((super_container, super_owner)) => {
+                        // A mixin-application superclass forwards its
+                        // terminal class's constructor tables — `super.t1`
+                        // in `class X extends S` over `class S = T with M;`
+                        // pairs `T`'s `t1` formals (keyed on `T`, not `S`).
+                        // A broken forwarding chain keeps the under-report
+                        // posture the selector miss already carried.
+                        let Some((face, face_owner, face_name)) = self
+                            .effective_ctor_container(
+                                super_container,
+                                super_owner,
+                                superclass,
+                            )
+                        else {
+                            return;
+                        };
                         let key = selector
                             .filter(|name| *name != self.intern("new"))
-                            .unwrap_or(superclass);
-                        let Some(formals) = super_container
-                            .ctor_formals
-                            .get(&key)
-                            .map(|f| (**f).clone())
+                            .unwrap_or(face_name);
+                        let Some(formals) = face.ctor_formals.get(&key).map(|f| (**f).clone())
                         else {
                             // A resolved class without the selector: the
                             // `undefined_constructor_in_initializer` face
@@ -8853,13 +9093,13 @@ impl<'a> Engine<'a> {
                         // hop above it (the super constructor's own
                         // `super.name` formal reads the grandparent's
                         // associated parameter). The resolved table lives in
-                        // `super_owner`'s pool, so the clone re-interns into
+                        // `face_owner`'s pool, so the clone re-interns into
                         // the diagnosing pool before the argument walk
                         // derefs a `formal.ty` slot (a same-file owner is a
                         // no-op).
                         let mut formals = formals;
-                        self.project_formals(super_owner, &mut formals);
-                        self.patch_super_formals(superclass, &mut formals);
+                        self.project_formals(face_owner, &mut formals);
+                        self.patch_super_formals(face_name, &mut formals);
                         // An untyped initializing formal reads its field's
                         // declared type BEFORE the clause substitution
                         // (#2873): `Indexable(this._value)` over
@@ -8875,11 +9115,11 @@ impl<'a> Engine<'a> {
                             .chain(formals.named.iter_mut())
                         {
                             if formal.ty == Ty::UNKNOWN
-                                && let Some(entry) = super_container.members.get(&formal.name)
+                                && let Some(entry) = face.members.get(&formal.name)
                                 && entry.kind == MemberKind::Field
                                 && !entry.is_static
                             {
-                                formal.ty = self.boundary.ty(super_owner, entry.var_ty);
+                                formal.ty = self.boundary.ty(face_owner, entry.var_ty);
                             }
                         }
                         // The subclass's written instantiation substitutes
@@ -8888,8 +9128,14 @@ impl<'a> Engine<'a> {
                         // `MapView(Map<K, V>?)`'s `K := String?`) — the
                         // element model's clause face carries names only,
                         // so the written argument group is the only source.
-                        if let Some(args) = self.clause_instantiation(container, superclass)
-                            && !super_container.type_param_names.is_empty()
+                        // A forwarded face's parameters pair against the
+                        // application's own super-edge instantiation, which
+                        // the name-level model does not carry — the
+                        // substitution stays off there (the under-report
+                        // posture).
+                        if std::ptr::eq(face, super_container)
+                            && let Some(args) = self.clause_instantiation(container, superclass)
+                            && !face.type_param_names.is_empty()
                         {
                             // The clause scan records one `Ty` per clause
                             // entry — a single instantiated head carries its
@@ -8903,8 +9149,8 @@ impl<'a> Engine<'a> {
                                 }
                                 many => many.to_vec(),
                             };
-                            if written.len() == super_container.type_param_names.len() {
-                                let map: Vec<(StringId, Ty)> = super_container
+                            if written.len() == face.type_param_names.len() {
+                                let map: Vec<(StringId, Ty)> = face
                                     .type_param_names
                                     .iter()
                                     .copied()
@@ -9463,8 +9709,14 @@ impl<'a> Engine<'a> {
             self.file,
             superclass,
         )?;
-        let formals = super_container.ctor_formals.get(&superclass)?;
-        Some((super_container, super_owner, superclass, formals))
+        // A mixin-application superclass's unnamed table is the terminal
+        // face's — the associated `super.name` forward climbs to the
+        // class that DECLARES the constructor, whose own superclass is
+        // the chained hop's next link.
+        let (face, face_owner, face_name) =
+            self.effective_ctor_container(super_container, super_owner, superclass)?;
+        let formals = face.ctor_formals.get(&face_name)?;
+        Some((face, face_owner, face_name, formals))
     }
 
     /// The instance field's declared type under `name`, the associated
@@ -10144,7 +10396,9 @@ impl<'a> Engine<'a> {
                     self.file,
                     *name,
                 )
-                .filter(|(decl, _)| !decl.has_unnamed_constructor)
+                .filter(|(decl, owner)| {
+                    !self.unnamed_ctor_exists(*decl, *owner, *name)
+                })
                 .map(|_| (*name, head.range))
             });
         if let Some((container, head_range)) = unnamed_creation_miss {
@@ -10166,7 +10420,9 @@ impl<'a> Engine<'a> {
                 self.file,
                 name,
             )
-            .is_some_and(|(decl, _)| !decl.has_unnamed_constructor)
+            .is_some_and(|(decl, owner)| {
+                !self.unnamed_ctor_exists(decl, owner, name)
+            })
         {
             // The row-transport under-report seam: a bare creation whose
             // callee row resolved outside the container shape (the
@@ -10220,7 +10476,18 @@ impl<'a> Engine<'a> {
                     self.file,
                     container,
                 )
-                .is_some_and(|(decl, _)| decl.constructors.contains(&row.name));
+                .is_some_and(|(decl, owner)| {
+                    // The mixin-application face forwards the terminal
+                    // class's generative constructors (`const A1.b1(…)`
+                    // over `class A1 = B<int> with M1;` resolves `B`'s
+                    // `b1`). A broken chain keeps the own-face read.
+                    self.effective_ctor_container(decl, owner, container)
+                        .is_some_and(|(face, face_owner, _)| {
+                            face.constructors.contains(&row.name)
+                                && (std::ptr::eq(face, decl)
+                                    || !self.ctor_is_factory(face, face_owner, row.name))
+                        })
+                });
                 if resolves || !self.const_ctor_target(container) {
                     return None;
                 }
@@ -10589,6 +10856,7 @@ impl<'a> Engine<'a> {
                             // keeps the prior under-report.
                             if level.closures.is_empty() {
                                 self.ctor_schema_formals(name, row.name)
+                                    .or_else(|| self.forwarded_ctor_formals(name, row.name))
                                     .or_else(|| self.factory_ctor_formals(name, row.name))
                             } else {
                                 None
@@ -10616,6 +10884,7 @@ impl<'a> Engine<'a> {
                     .and_then(|f| f.container(*name))
                     .and_then(|c| c.ctor_formals.get(name))
                     .map(|f| (**f).clone())
+                    .or_else(|| self.forwarded_ctor_formals(*name, *name))
                     .or_else(|| {
                         self.declared_extends_unresolved(*name)
                             .then(|| self.ctor_schema_formals(*name, *name))
@@ -13518,8 +13787,22 @@ impl<'a> Engine<'a> {
             ),
             _ => return None,
         };
-        let declares = resolved.0.constructors.contains(&name)
-            || (name == self.intern("new") && resolved.0.has_unnamed_constructor);
+        let (decl, owner) = resolved;
+        // The mixin-application head forwards the terminal class's
+        // generative set (`p.A1.b1` over `class A1 = B<int> with M1;`
+        // resolves `B.b1`'s arity) — the prefixed arm's own walk reaches
+        // it the same way (`prefixed_container` already carries the
+        // declaring unit). A broken forwarding chain keeps the own-face
+        // read.
+        let (face, face_owner, face_name) = self
+            .effective_ctor_container(decl, owner, class)
+            .unwrap_or((decl, owner, class));
+        let forwarded = !std::ptr::eq(face, decl);
+        let declares = (face.constructors.contains(&name)
+            && (!forwarded || !self.ctor_is_factory(face, face_owner, name)))
+            || (name == self.intern("new")
+                && face.has_unnamed_constructor
+                && (!forwarded || !self.ctor_is_factory(face, face_owner, face_name)));
         declares.then_some((class, name))
     }
 
