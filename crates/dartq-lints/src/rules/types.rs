@@ -420,7 +420,10 @@ pub(crate) mod avoid_shadowing_type_parameters {
     /// together). Every matching ancestor reports separately (:89-127 — the
     /// walk never stops at the first match). The `wildcard_variables`
     /// feature gate skips `_` parameters (:143-145) through the step-0
-    /// feature face. Message: `diagnostic.g.dart`
+    /// feature face. An ancestor's group is read through
+    /// [`ancestor_type_variables`]: a class-like parses its type parameters
+    /// before its own begin event, so the row is the declaration's *sibling*
+    /// under the wrapper. Message: `diagnostic.g.dart`
     /// `avoidShadowingTypeParameters`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "avoid_shadowing_type_parameters",
@@ -482,12 +485,25 @@ pub(crate) mod avoid_shadowing_type_parameters {
         }
     }
 
-    /// The node's own `TypeVariables` child, if any.
+    /// The node's own `TypeVariables` child, if any. The dispatched faces
+    /// (local functions, function expressions, methods, function types,
+    /// function-typed parameters) all parse their group after their own
+    /// begin event, so the row is a direct child.
     fn own_type_variables(c: &Check<'_>, node: u32) -> Option<u32> {
         c.direct_children(node)
             .iter()
             .copied()
             .find(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+    }
+
+    /// An *ancestor* declaration's type parameters. Class-likes parse their
+    /// group before the declaration's own begin event (`parse_typedef` /
+    /// `parse_class_or_mixin_declaration`: `type_param.parse_variables` runs
+    /// ahead of `begin_class_declaration`), so the `TypeVariables` row tiles
+    /// as a sibling of the declaration under the enclosing wrapper —
+    /// [`declaration_type_variables`] reads both homes.
+    fn ancestor_type_variables(c: &Check<'_>, node: u32) -> Option<u32> {
+        super::declaration_type_variables(c, node)
     }
 
     /// `(enclosing kind, type parameters)` of an ancestor declaration, or
@@ -511,7 +527,7 @@ pub(crate) mod avoid_shadowing_type_parameters {
         if !has {
             return None;
         }
-        let type_variables = own_type_variables(c, node)?;
+        let type_variables = ancestor_type_variables(c, node)?;
         Some((kind, type_variables))
     }
 
@@ -546,18 +562,22 @@ pub(crate) mod library_private_types_in_public_api {
     /// everything under a private library name (:245-251) or a private
     /// declaration name, and checks the type positions of public members:
     /// top-level variables/functions, class-like members (methods, fields,
-    /// constructors), and typedefs. The header faces read same-file: the
-    /// extension `on` type (:80-88), the mixin `on` constraints (:196-203),
-    /// and every type-parameter bound (:275-277); a prefixed written
-    /// reference (`p._Foo`) reads the continuation identifier (the
-    /// `PrefixedType.parseType` tiling — the `Type` row spans the head
-    /// name only); an unwritten field formal `this.x` reads the
-    /// declaring class's instance-field type (:123-142), an unwritten
-    /// super formal `super.x` the same-file superclass's (:238-258 — the
-    /// element arm; a cross-file superclass, a super constructor parameter
-    /// that is no field, and a superclass chain beyond the direct step
-    /// under-report). Message: `diagnostic.g.dart`
-    /// `libraryPrivateTypesInPublicApi`.
+    /// constructors), typedefs (both forms), and the class-like's own formal
+    /// parameters (a primary constructor, an extension type's
+    /// representation). The header faces read same-file: the extension `on`
+    /// type (:80-88), the mixin `on` constraints (:196-203), and every
+    /// type-parameter bound (:275-277 — the group tiles as the declaration's
+    /// sibling under its wrapper); a prefixed written reference (`p._Foo`)
+    /// reads the continuation identifier (the `PrefixedType.parseType`
+    /// tiling — the `Type` row spans the head name only); an unwritten field
+    /// formal `this.x` reads the declaring class's instance-field type
+    /// (:123-142), an unwritten super formal `super.x` the same-file
+    /// superclass's field or plain constructor parameter (:238-258 — the
+    /// element arm; a cross-file superclass and a superclass chain beyond
+    /// the direct step under-report). A constructor whose class is
+    /// effectively private (sealed, abstract+final, abstract+interface)
+    /// takes no parameter rows (:62/:221/:288-296). Message:
+    /// `diagnostic.g.dart` `libraryPrivateTypesInPublicApi`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "library_private_types_in_public_api",
         &[NodeKind::CompilationUnit],
@@ -668,15 +688,17 @@ pub(crate) mod library_private_types_in_public_api {
         if c.kind(decl) == NodeKind::NamedMixinApplication {
             return; // superclass/mixin-constraint types: element sub-face, skipped
         }
-        let Some(body) = c
-            .direct_children(decl)
-            .iter()
-            .copied()
-            .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
-        else {
+        // An enum's members ride an `EnumBody` row, the other class-likes a
+        // `DeclarationBody` — both are the members window.
+        let body = c.direct_children(decl).iter().copied().find(|&kid| {
+            matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
+        });
+        let body_start = body.map(|body| c.byte_span(body).start);
+        walk_header_types(c, decl, wrapper, body_start);
+        walk_primary_parameters(c, decl, body_start);
+        let Some(body) = body else {
             return;
         };
-        walk_header_types(c, decl, wrapper, body);
         let in_enum = c.kind(decl) == NodeKind::EnumDeclaration;
         let members = c.direct_children(body).iter().copied().collect::<Vec<_>>();
         for member in members {
@@ -696,17 +718,20 @@ pub(crate) mod library_private_types_in_public_api {
     /// before the body — the `TypeVariables` row is a sibling of the
     /// declaration under the wrapper (a bound is the `Type` row under its
     /// [`NodeKind::TypeVariable`]), while an `on` type stays a `Type` row
-    /// whose parent is the declaration itself. A class's
-    /// `extends`/`implements` header types share that parentage and stay
-    /// unchecked (:42-52 walks the type parameters and members only).
-    fn walk_header_types(c: &mut Check<'_>, decl: u32, wrapper: u32, body: u32) {
-        let body_start = c.byte_span(body).start;
+    /// whose parent is the declaration itself. A mixin's `implements` types
+    /// share that parentage but stay unchecked (`visitMixinDeclaration`
+    /// :200-207 walks `onClause.superclassConstraints` only), so the walk
+    /// stops at the `implements` keyword. A class's `extends`/`implements`
+    /// header types stay unchecked too (:42-52 walks the type parameters and
+    /// members only).
+    fn walk_header_types(c: &mut Check<'_>, decl: u32, wrapper: u32, body_start: Option<usize>) {
         let on_clause_kind = matches!(
             c.kind(decl),
             NodeKind::ExtensionDeclaration | NodeKind::MixinDeclaration
         );
+        let implements_before = header_implements_token(c, decl);
         for row in c.children(wrapper) {
-            if c.byte_span(row).start >= body_start {
+            if body_start.is_some_and(|start| c.byte_span(row).start >= start) {
                 break;
             }
             match c.kind(row) {
@@ -720,13 +745,62 @@ pub(crate) mod library_private_types_in_public_api {
                     }
                 }
                 NodeKind::Type => {
-                    if on_clause_kind && c.unit.ast.parent(row) == Some(decl) {
+                    if on_clause_kind
+                        && c.unit.ast.parent(row) == Some(decl)
+                        && implements_before.is_none_or(|token| c.head_token(row) < token)
+                    {
                         check_type(c, row);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// The header's `implements` keyword token, if the declaration carries
+    /// one. A mixin's clause types stay children of the declaration with no
+    /// payload word ([`bridge`](crate::bridge) `handle_implements`), so the
+    /// keyword is found in the declaration's own token run — the header
+    /// precedes the body, and `implements` is a reserved word that cannot
+    /// name anything inside it.
+    fn header_implements_token(c: &Check<'_>, decl: u32) -> Option<u32> {
+        let range = c.unit.ast.token_range(decl);
+        (range.start..range.end).find(|&token| c.lexeme(token) == "implements")
+    }
+
+    /// A class-like's own formal parameters — the primary constructor
+    /// (`class C(_P p);`, `visitPrimaryConstructorDeclaration` :218-224) and
+    /// the extension type's representation (`extension type E(_C c)`,
+    /// :102-111). Both tile their `FormalParameters` row in the header,
+    /// ahead of the body (and ahead of every member), so the first such row
+    /// before the body is the one the official name-part visitor walks.
+    fn walk_primary_parameters(c: &mut Check<'_>, decl: u32, body_start: Option<usize>) {
+        if matches!(c.kind(decl), NodeKind::EnumDeclaration) {
+            return; // enum constructors are effectively private
+        }
+        if effectively_private_class(c, decl) {
+            return; // :62/:221 `isEffectivelyPrivate`
+        }
+        let Some(params) = c.children(decl).find(|&row| {
+            c.kind(row) == NodeKind::FormalParameters
+                && body_start.is_none_or(|start| c.byte_span(row).start < start)
+        }) else {
+            return;
+        };
+        walk_parameter_list(c, params);
+    }
+
+    /// The official `isEffectivelyPrivate` on a class declaration
+    /// (`pkg/linter/lib/src/extensions.dart:82-96`): a `sealed` class, or an
+    /// `abstract` one that is also `final` or `interface`.
+    fn effectively_private_class(c: &Check<'_>, decl: u32) -> bool {
+        const ABSTRACT: u16 = 1 << 2;
+        const SEALED: u16 = 1 << 3;
+        const INTERFACE: u16 = 1 << 5;
+        const FINAL: u16 = 1 << 6;
+        let flags = dartq_ast::mod_flags(c.unit.ast, decl);
+        flags & SEALED != 0
+            || (flags & ABSTRACT != 0 && flags & (FINAL | INTERFACE) != 0)
     }
 
     /// A method face: a private name skips; otherwise return type,
@@ -739,7 +813,7 @@ pub(crate) mod library_private_types_in_public_api {
         if c.kind(name) == NodeKind::Identifier && c.lexeme(c.head_token(name)).starts_with('_') {
             return;
         }
-        if let Some((type_node, kind)) = type_before(c, member, name)
+        if let Some((type_node, kind)) = member_return_type(c, member, name)
             && kind != NodeKind::NoType
         {
             check_type(c, type_node);
@@ -758,13 +832,50 @@ pub(crate) mod library_private_types_in_public_api {
         if c.lexeme(c.head_token(name)).starts_with('_') {
             return;
         }
-        if let Some((type_node, kind)) = type_before(c, function, name)
+        if let Some((type_node, kind)) = member_return_type(c, function, name)
             && kind != NodeKind::NoType
         {
             check_type(c, type_node);
         }
         walk_type_variables(c, function);
         walk_parameters(c, function);
+    }
+
+    /// The member's written return type. A plain member tiles its type as
+    /// its own first child; an operator's `OperatorName` anchors as the
+    /// *left sibling* of the `Method` row under the declaration body, so the
+    /// type then precedes the name in that parent window
+    /// (`_P operator -(...)` — the official `node.returnType`).
+    fn member_return_type(c: &Check<'_>, member: u32, name: u32) -> Option<(u32, NodeKind)> {
+        if let Some((row, kind)) = type_before(c, member, name)
+            && (kind == NodeKind::NoType || type_family(kind))
+        {
+            return Some((row, kind));
+        }
+        type_row_before_name(c, member, name).map(|row| (row, c.kind(row)))
+    }
+
+    /// The written type-family row with the latest start before `name`
+    /// inside `owner`'s window. An operator's `OperatorName` completes
+    /// ahead of its return type, so the "immediately preceding row" read
+    /// lands elsewhere; the same holds for the legacy typedef form. Every
+    /// row before the name inside the declaration's own window is part of
+    /// its head, so the latest one is the written type.
+    fn type_row_before_name(c: &Check<'_>, owner: u32, name: u32) -> Option<u32> {
+        let name_start = c.byte_span(name).start;
+        c.children(owner)
+            .filter(|&row| row != name && type_family(c.kind(row)))
+            .filter(|&row| c.byte_span(row).start < name_start)
+            .max_by_key(|&row| c.byte_span(row).start)
+    }
+
+    /// The written-type family (`Type`/`VoidType`/`FunctionType`/
+    /// `RecordType`).
+    fn type_family(kind: NodeKind) -> bool {
+        matches!(
+            kind,
+            NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType | NodeKind::RecordType
+        )
     }
 
     /// The declaration's own `TypeVariables` bounds face: each
@@ -793,9 +904,13 @@ pub(crate) mod library_private_types_in_public_api {
     }
 
     /// A constructor face (:57-63): a `_`-named constructor is private;
-    /// the unnamed form is public-facing. Enum constructors are skipped by
-    /// the caller (the official `isEffectivelyPrivate`, :225-235).
+    /// the unnamed form is public-facing. Enum constructors and those of an
+    /// effectively private class are skipped (`isEffectivelyPrivate`,
+    /// :288-296).
     fn walk_constructor(c: &mut Check<'_>, decl: u32, constructor: u32) {
+        if effectively_private_class(c, decl) {
+            return;
+        }
         let named = c
             .direct_children(constructor)
             .iter()
@@ -858,8 +973,8 @@ pub(crate) mod library_private_types_in_public_api {
     /// The implicit initializing-formal faces (:133-142/:249-258): a field
     /// formal `this.x` without a written type reads the declaring class's
     /// instance-field type, a super formal `super.x` the same-file
-    /// superclass's (the element arm — a cross-file superclass, a
-    /// non-field super parameter, and a chain beyond the direct step
+    /// superclass's field or plain constructor parameter (the element arm —
+    /// a cross-file superclass and a chain beyond the direct step
     /// under-report). A `_`-private field type reports at the parameter
     /// name (`reportAtToken(node.name)`); a named private formal skips
     /// (:124-126/:239-241).
@@ -885,7 +1000,11 @@ pub(crate) mod library_private_types_in_public_api {
         }
         let field_type = match c.lexeme(receiver) {
             "this" => instance_field_type(c, decl, name),
-            "super" => super_field_type(c, decl, name),
+            // The super formal's element type is the inherited parameter's
+            // — a field (`super_field_type`) or a plain super-constructor
+            // parameter (`_A(_O o)` + `B(super.o)`).
+            "super" => super_field_type(c, decl, name)
+                .or_else(|| super_parameter_type(c, decl, name)),
             _ => None,
         };
         if let Some(field_type) = field_type {
@@ -943,24 +1062,65 @@ pub(crate) mod library_private_types_in_public_api {
         None
     }
 
-    /// The written type of the field `name` in the same-file superclass —
-    /// the direct `extends` name read off the declaration's `ExtendsKeyword`
-    /// word (`class B extends A`: the keyword rides the word, the
-    /// superclass head the next token), then the superclass row found
-    /// among the unit's class-like wrappers.
+    /// The written type of the field `name` in the same-file superclass.
     fn super_field_type(c: &Check<'_>, decl: u32, name: &str) -> Option<u32> {
+        instance_field_type(c, same_file_superclass(c, decl)?, name)
+    }
+
+    /// The written type of the superclass constructor parameter `name` —
+    /// the `super.x` element arm when the inherited parameter is no field
+    /// (`class _A { _A(_O o); }` + `class B extends _A { B(super.o); }`).
+    fn super_parameter_type(c: &Check<'_>, decl: u32, name: &str) -> Option<u32> {
+        let super_decl = same_file_superclass(c, decl)?;
+        let body = c
+            .collect_direct(super_decl)
+            .into_iter()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody))?;
+        let members = c
+            .direct_children(body)
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for member in members {
+            if c.kind(member) != NodeKind::Constructor {
+                continue;
+            }
+            let Some(params) = c
+                .collect_direct(member)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+            else {
+                continue;
+            };
+            let params_list = c
+                .direct_children(params)
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            for param in params_list {
+                if parameter_name(c, param).is_some_and(|token| c.lexeme(token) == name) {
+                    return parameter_written_type(c, param);
+                }
+            }
+        }
+        None
+    }
+
+    /// The superclass row of the same-file `extends` clause — the direct
+    /// name read off the declaration's `ExtendsKeyword` word (`class B
+    /// extends A`: the keyword rides the word, the superclass head the next
+    /// token), then the declaration found among the unit's class-like
+    /// wrappers.
+    fn same_file_superclass(c: &Check<'_>, decl: u32) -> Option<u32> {
         let extends_kw = c.field(decl, PayloadField::ExtendsKeyword)?;
         if extends_kw == crate::rules::NONE_TOKEN || c.lexeme(extends_kw) != "extends" {
             return None;
         }
         let super_name = c.lexeme(extends_kw + 1);
-        let Some(&unit) = c
+        let &unit = c
             .path
             .iter()
-            .find(|&&n| c.kind(n) == NodeKind::CompilationUnit)
-        else {
-            return None;
-        };
+            .find(|&&n| c.kind(n) == NodeKind::CompilationUnit)?;
         for top in c.collect_direct(unit) {
             let kids = c.collect_direct(top);
             let Some(super_decl) = kids
@@ -978,10 +1138,39 @@ pub(crate) mod library_private_types_in_public_api {
                 continue;
             };
             if c.lexeme(c.head_token(wrapper_name)) == super_name {
-                return instance_field_type(c, super_decl, name);
+                return Some(super_decl);
             }
         }
         None
+    }
+
+    /// A formal parameter's name token (the `Name` payload word, else the
+    /// parameter's first `Identifier` child).
+    fn parameter_name(c: &Check<'_>, param: u32) -> Option<u32> {
+        if !matches!(
+            c.kind(param),
+            NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
+        ) {
+            return None;
+        }
+        c.field(param, PayloadField::Name)
+            .filter(|&token| token != crate::rules::NONE_TOKEN)
+            .or_else(|| {
+                c.collect_direct(param)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                    .map(|name| c.head_token(name))
+            })
+    }
+
+    /// A formal parameter's written type row, if any.
+    fn parameter_written_type(c: &Check<'_>, param: u32) -> Option<u32> {
+        c.collect_direct(param).into_iter().find(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType
+            )
+        })
     }
 
     /// A fields face (visitFieldDeclaration :112-120 /
@@ -1024,12 +1213,7 @@ pub(crate) mod library_private_types_in_public_api {
     /// typedef's own type-parameter bounds (`node.typeParameters` —
     /// `visitGenericTypeAlias` :183 / `visitFunctionTypeAlias` :171).
     fn walk_typedef(c: &mut Check<'_>, typedef: u32) {
-        let Some(name) = c
-            .direct_children(typedef)
-            .iter()
-            .copied()
-            .find(|&kid| c.kind(kid) == NodeKind::Identifier)
-        else {
+        let Some(name) = typedef_name(c, typedef) else {
             return;
         };
         if c.lexeme(c.head_token(name)).starts_with('_') {
@@ -1040,6 +1224,8 @@ pub(crate) mod library_private_types_in_public_api {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let mut old_style = false;
+        let mut aliased = false;
         for kid in kids {
             match c.kind(kid) {
                 // `node.functionType` (:182-183) — the new form's aliased
@@ -1047,13 +1233,55 @@ pub(crate) mod library_private_types_in_public_api {
                 // `FunctionType` (`void Function<T extends _Foo>()`), or a
                 // `RecordType` (`typedef R = (_Foo, int)`).
                 NodeKind::Type | NodeKind::FunctionType | NodeKind::RecordType => {
+                    aliased = true;
                     check_type(c, kid);
                 }
                 NodeKind::TypeVariables => walk_type_variables(c, typedef),
-                NodeKind::FormalParameters => walk_parameters(c, typedef),
+                NodeKind::FormalParameters => {
+                    old_style = true;
+                    walk_parameters(c, typedef);
+                }
                 _ => {}
             }
         }
+        // The legacy form (`typedef _P F();`, `visitFunctionTypeAlias`
+        // :164-171) spells its return type between `typedef` and the name,
+        // ahead of the declaration's own row — read as the row the typedef
+        // follows.
+        if old_style && !aliased {
+            if let Some(return_type) = type_row_before_name(c, typedef, name) {
+                check_type(c, return_type);
+            }
+        }
+    }
+
+    /// A typedef's own name: the last `Identifier` before the declaration's
+    /// type-parameter group or parameter list. The legacy form
+    /// (`typedef _P F();`) tiles the *return type's* head `Identifier`
+    /// ahead of the name, so the first-identifier read binds the type
+    /// instead (`_P` would then read as a private declaration name and
+    /// silence the whole face).
+    fn typedef_name(c: &Check<'_>, typedef: u32) -> Option<u32> {
+        let kids = c.collect_direct(typedef);
+        let anchor = kids.iter().position(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::TypeVariables | NodeKind::NoTypeVariables | NodeKind::FormalParameters
+            )
+        });
+        anchor
+            .and_then(|i| {
+                kids[..i]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+            })
+            .or_else(|| {
+                kids.iter()
+                    .copied()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+            })
     }
 
     /// The parameters of a declaration: each parameter's declared type
@@ -1067,6 +1295,12 @@ pub(crate) mod library_private_types_in_public_api {
         else {
             return;
         };
+        walk_parameter_list(c, params);
+    }
+
+    /// One formal-parameter list's declared types (the
+    /// `visitRegularFormalParameter` accept walk, :227-239).
+    fn walk_parameter_list(c: &mut Check<'_>, params: u32) {
         let params_list = c
             .direct_children(params)
             .iter()
@@ -1524,6 +1758,62 @@ mod tests {
         assert_eq!(lints[0].range.start, utf16_at(&f, 9));
     }
 
+    /// The enclosing class-like faces on the production tree: a class,
+    /// enum, mixin, extension, and extension type all parse their group
+    /// *before* the declaration's own begin event, so the `TypeVariables`
+    /// row tiles as the declaration's sibling under the wrapper rather than
+    /// inside it (`test_method_shadowingClass` and friends,
+    /// `test/rules/avoid_shadowing_type_parameters_test.dart`).
+    #[test]
+    fn shadowing_enclosing_class_likes_report() {
+        for (source, kind) in [
+            ("class C<T> {\n  void m<T>() {}\n}\n", "class"),
+            ("enum E<T> { a; void m<T>() {} }\n", "enum"),
+            ("mixin M<T> { void m<T>() {} }\n", "mixin"),
+            ("extension X<T> on List<T> { void m<T>() {} }\n", "extension"),
+            (
+                "extension type Y<T>(int i) { void m<T>() {} }\n",
+                "extension type",
+            ),
+        ] {
+            let f = Fixture::parse(source);
+            let lints = f.run(&one_rule("avoid_shadowing_type_parameters"));
+            assert_eq!(lints.len(), 1, "{source}: {lints:?}");
+            assert_eq!(
+                lints[0].message,
+                format!(
+                    "The type parameter 'T' shadows a type parameter from the enclosing {kind}."
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    /// The same sibling hoist from a local function: the class is the
+    /// nearest enclosing declaration carrying type parameters
+    /// (`test_localFunction_shadowingClass`).
+    #[test]
+    fn shadowing_local_function_in_class_reports() {
+        let f = Fixture::parse("class C<T> {\n  void f() {\n    void g<T>() {}\n  }\n}\n");
+        let lints = f.run(&one_rule("avoid_shadowing_type_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The type parameter 'T' shadows a type parameter from the enclosing class."
+        );
+    }
+
+    /// A class without type parameters leaves the walk silent
+    /// (`test_method_noShadowing`'s enclosing face).
+    #[test]
+    fn shadowing_plain_class_passes() {
+        let f = Fixture::parse("class C {\n  void f<T>() {}\n}\n");
+        assert!(
+            f.run(&one_rule("avoid_shadowing_type_parameters"))
+                .is_empty()
+        );
+    }
+
     // —— library_private_types_in_public_api ——————————————————————————————
 
     /// A private type on a public top-level variable reports at the type
@@ -1938,6 +2228,119 @@ mod tests {
         let p = tok(&f.source, &f.tokens, "p", 1);
         let start = utf16_at(&f, p);
         assert_eq!(lints[0].range, start..start + 6);
+    }
+
+    /// An enum's members ride an `EnumBody` row, not the class-like
+    /// `DeclarationBody`: every public member face still reports (:76-81 —
+    /// `node.body.members.accept(this)`), while the enum's own constructor
+    /// stays effectively private (:288-296).
+    #[test]
+    fn enum_member_types_report() {
+        let f = Fixture::parse(
+            "class _P {}\nenum E {\n  a;\n  _P m() => _P();\n  _P get g => _P();\n}\n",
+        );
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+    }
+
+    /// A constructor whose class is effectively private — `sealed`, or
+    /// `abstract` paired with `final`/`interface` — takes no parameter
+    /// rows (`isEffectivelyPrivate`, :227-235 / extensions.dart:82-96).
+    #[test]
+    fn effectively_private_class_constructor_passes() {
+        for source in [
+            "class _P {}\nsealed class E {\n  E(_P p);\n}\n",
+            "class _P {}\nabstract final class E {\n  E(_P p);\n}\n",
+            "class _P {}\nabstract interface class E {\n  E(_P p);\n}\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("library_private_types_in_public_api"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+        // The member faces of the same class still report (:190-197 walks
+        // the body members unconditionally).
+        let f = Fixture::parse("class _P {}\nsealed class E {\n  _P m() => _P();\n}\n");
+        assert_eq!(
+            f.run(&one_rule("library_private_types_in_public_api"))
+                .len(),
+            1
+        );
+    }
+
+    /// A mixin's `implements` clause stays unchecked (:196-207 walks
+    /// `onClause.superclassConstraints`, the type parameters and the
+    /// members); its `on` constraints still report.
+    #[test]
+    fn mixin_implements_type_passes_on_constraint_reports() {
+        let f = Fixture::parse("class _P {}\nmixin M implements _P {}\n");
+        assert!(
+            f.run(&one_rule("library_private_types_in_public_api"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("class _P {}\nclass _Q {}\nmixin M on _P implements _Q {}\n");
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let on = tok(&f.source, &f.tokens, "_P", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, on));
+    }
+
+    /// An operator's return type reports (`node.returnType`, :190-197): the
+    /// `OperatorName` anchors as the `Method` row's left sibling, so the
+    /// type precedes the name in the body window.
+    #[test]
+    fn operator_return_type_reports() {
+        let f = Fixture::parse("class _P {}\nclass C {\n  _P operator -(int i) => _P();\n}\n");
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let head = tok(&f.source, &f.tokens, "_P", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, head));
+    }
+
+    /// The legacy typedef form's return type reports (:164-171 —
+    /// `node.returnType`), alongside its parameters.
+    #[test]
+    fn legacy_typedef_return_type_reports() {
+        let f = Fixture::parse("typedef _P F();\nclass _P {}\n");
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let head = tok(&f.source, &f.tokens, "_P", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, head));
+
+        let f = Fixture::parse("typedef _P G(_P p);\nclass _P {}\n");
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+    }
+
+    /// The extension type's representation parameters report (:94-114 —
+    /// the name part's primary constructor walks its formal parameters).
+    #[test]
+    fn extension_type_representation_reports() {
+        let f = Fixture::parse("class _C {}\nextension type E(_C c) {}\n");
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let head = tok(&f.source, &f.tokens, "_C", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, head));
+    }
+
+    /// The implicit super-formal face (:241-262): `super.o` without a
+    /// written type reads the inherited super-constructor parameter's type
+    /// — `class A { A(_O o); }` + `class B extends A { B(super.o); }`
+    /// reports at the parameter name.
+    #[test]
+    fn implicit_super_formal_parameter_type_reports() {
+        // The official case's superclass is private, so only `B`'s implicit
+        // super formal reports (`test_implicitTypeSuperFormalParam`).
+        let f = Fixture::parse(
+            "class _O {}\nclass _A {\n  _A(_O o);\n}\nclass B extends _A {\n  B(super.o);\n}\n",
+        );
+        let lints = f.run(&one_rule("library_private_types_in_public_api"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let name = tok(&f.source, &f.tokens, "o", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, name));
     }
 
     /// The implicit field-formal face (:133-142): `this.x` without a
