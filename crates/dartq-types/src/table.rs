@@ -397,6 +397,30 @@ impl TypeTable {
     pub(crate) fn collect_type_parameters(&self, ty: TypeId, out: &mut BTreeSet<TypeParamId>) {
         self.state.borrow().collect(ty, out);
     }
+
+    /// Re-interns `ty` with every nested function signature's declared
+    /// parameters swapped for fresh ids — the typedef-alias *use* face of
+    /// upstream `_FreshTypeParametersSubstitutor.freshTypeParameters`
+    /// (type_algebra.dart:241-271, driven from `visitFunctionType`:416-460):
+    /// each signature's binder group mints a fresh element per use so the
+    /// bound facts keyed on those ids (kept outside the table, in
+    /// [`crate::ParamFactsTable`]) can carry the use's substituted bound
+    /// instead of the declaration template's. Each section renames the
+    /// binder's occurrences onto the fresh ids exactly like the
+    /// function-subtype correlation does. Returns the new id plus the
+    /// `(old, new)` binder pairs in walk order — the caller re-keys the
+    /// facts from them. A type holding no signature comes back unchanged
+    /// with an empty pair list.
+    #[must_use]
+    pub fn rebind_function_params(
+        &self,
+        ty: TypeId,
+        fresh: &mut dyn FnMut() -> TypeParamId,
+    ) -> (TypeId, Vec<(TypeParamId, TypeParamId)>) {
+        let mut pairs = Vec::new();
+        let out = self.state.borrow_mut().rebind(ty, fresh, &mut pairs);
+        (out, pairs)
+    }
 }
 
 impl TableState {
@@ -838,6 +862,183 @@ impl TableState {
                 }
             }
             TypeKind::Never
+            | TypeKind::Dynamic
+            | TypeKind::Void
+            | TypeKind::Invalid
+            | TypeKind::Null => ty,
+        }
+    }
+
+    /// The [`TypeTable::rebind_function_params`] walk: mirrors
+    /// [`TableState::substitute`]'s structure recursion — payload-bearing
+    /// kinds recurse through their sections, unit kinds return unchanged —
+    /// but a `Function` node additionally mints fresh binder ids, renames
+    /// its sections' binder occurrences, and records the `(old, new)`
+    /// pairs. Sections rebind first so a nested signature's own binder
+    /// group refreshes on its own pair; the outer rename then substitutes
+    /// the outer binder's leaves wherever they remain (including inside a
+    /// just-rebound nested signature's columns — an outer binder is shared
+    /// context, exactly like upstream's inner-environment substitution).
+    /// The original id returns whenever nothing changed, so a binder-free
+    /// or signature-free type keeps its canonical sharing.
+    fn rebind(
+        &mut self,
+        ty: TypeId,
+        fresh: &mut dyn FnMut() -> TypeParamId,
+        pairs: &mut Vec<(TypeParamId, TypeParamId)>,
+    ) -> TypeId {
+        let t = self.types[ty.raw() as usize];
+        match t.kind() {
+            TypeKind::Function { signature } => {
+                let sig = self.signatures[signature.raw() as usize];
+                let (lo, hi) = (
+                    sig.type_parameters.offset(),
+                    sig.type_parameters.offset() + sig.type_parameters.len(),
+                );
+                let old_params = self.fn_type_parameters[lo..hi].to_vec();
+                // Sections rebind first: a nested signature refreshes its
+                // own binder group inside the recursion.
+                let mut changed = false;
+                let return_type = self.rebind(sig.return_type, fresh, pairs);
+                changed |= return_type != sig.return_type;
+                let mut positional = Vec::with_capacity(sig.positional.len());
+                for index in sig.positional.offset()..sig.positional.offset() + sig.positional.len()
+                {
+                    let arg = self.args[index];
+                    let rebound = self.rebind(arg, fresh, pairs);
+                    changed |= rebound != arg;
+                    positional.push(rebound);
+                }
+                let mut named = Vec::with_capacity(sig.named.len());
+                for member in self.named_vec(sig.named) {
+                    let rebound = self.rebind(member.ty, fresh, pairs);
+                    changed |= rebound != member.ty;
+                    named.push(NamedMember {
+                        ty: rebound,
+                        ..member
+                    });
+                }
+                if old_params.is_empty() {
+                    // No binder group of its own: only the nested rebinds
+                    // can change the signature.
+                    if !changed {
+                        return ty;
+                    }
+                    return self
+                        .intern_function(
+                            UninternedFunction {
+                                return_type,
+                                type_parameters: Vec::new(),
+                                positional,
+                                named,
+                                required_positional: sig.required_positional,
+                            },
+                            t.is_nullable(),
+                        )
+                        .expect("rebinding preserves signature well-formedness");
+                }
+                // Mint the fresh binder group and record the pairs before
+                // the rename runs — the order matches the walk the caller
+                // re-keys facts over.
+                let new_params: Vec<TypeParamId> =
+                    old_params.iter().map(|_| fresh()).collect();
+                pairs.extend(old_params.iter().copied().zip(new_params.iter().copied()));
+                // Rename the binder occurrences inside each section — the
+                // same positional correlation the function-subtype leg
+                // runs (`Subst::Slice` over `TypeParameter` replacements).
+                let rename: Vec<(TypeParamId, TypeId)> = old_params
+                    .iter()
+                    .copied()
+                    .zip(new_params.iter().copied())
+                    .map(|(old, new)| {
+                        let fresh_ty = self.intern_kind(
+                            UninternedType::TypeParameter { parameter: new },
+                            false,
+                        );
+                        (old, fresh_ty)
+                    })
+                    .collect();
+                let subst = Subst::Slice(rename.as_slice());
+                let return_type = self.substitute(return_type, &subst);
+                let positional = positional
+                    .into_iter()
+                    .map(|arg| self.substitute(arg, &subst))
+                    .collect();
+                let named = named
+                    .into_iter()
+                    .map(|member| NamedMember {
+                        ty: self.substitute(member.ty, &subst),
+                        ..member
+                    })
+                    .collect();
+                self.intern_function(
+                    UninternedFunction {
+                        return_type,
+                        type_parameters: new_params,
+                        positional,
+                        named,
+                        required_positional: sig.required_positional,
+                    },
+                    t.is_nullable(),
+                )
+                .expect("rebinding preserves signature well-formedness")
+            }
+            TypeKind::Interface { decl, args } => {
+                let mut rebound = Vec::with_capacity(args.len());
+                let mut changed = false;
+                for index in args.offset()..args.offset() + args.len() {
+                    let arg = self.args[index];
+                    let arg = self.rebind(arg, fresh, pairs);
+                    changed |= arg != self.args[index];
+                    rebound.push(arg);
+                }
+                if !changed {
+                    return ty;
+                }
+                self.intern_kind(UninternedType::Interface { decl, args: rebound }, t.is_nullable())
+            }
+            TypeKind::FutureOr { base } => {
+                let rebound = self.rebind(base, fresh, pairs);
+                if rebound == base {
+                    return ty;
+                }
+                self.intern_kind(
+                    UninternedType::FutureOr { base: rebound },
+                    t.is_nullable(),
+                )
+            }
+            TypeKind::Record { shape } => {
+                let shape = self.shapes[shape.raw() as usize];
+                let mut changed = false;
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for index in
+                    shape.positional.offset()..shape.positional.offset() + shape.positional.len()
+                {
+                    let arg = self.args[index];
+                    let rebound = self.rebind(arg, fresh, pairs);
+                    changed |= rebound != arg;
+                    positional.push(rebound);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for member in self.named_vec(shape.named) {
+                    let rebound = self.rebind(member.ty, fresh, pairs);
+                    changed |= rebound != member.ty;
+                    named.push(NamedMember {
+                        ty: rebound,
+                        ..member
+                    });
+                }
+                if !changed {
+                    return ty;
+                }
+                self.intern_record(
+                    UninternedRecord { positional, named },
+                    t.is_nullable(),
+                )
+                .expect("rebinding preserves record well-formedness")
+            }
+            TypeKind::TypeParameter { .. }
+            | TypeKind::Never
             | TypeKind::Dynamic
             | TypeKind::Void
             | TypeKind::Invalid

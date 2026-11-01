@@ -429,6 +429,97 @@ impl LibraryTypes {
         self.type_param_bounds.get(&(file, name)).copied()
     }
 
+    /// Test-only face of [`Self::facts`] — the pins read the binder bounds
+    /// the typedef-alias expansion feeds (#3383).
+    #[cfg(test)]
+    pub(crate) fn testing_facts(&self) -> &ParamFactsTable {
+        &self.facts
+    }
+
+    /// Test-only face of [`Self::table`].
+    #[cfg(test)]
+    pub(crate) fn testing_table(&self) -> &TypeTable {
+        &self.table
+    }
+
+    /// Test-only face of [`Self::registry`] — the pins intern a named
+    /// declaration's type to compare a facts bound against (#3383).
+    #[cfg(test)]
+    pub(crate) fn testing_decl_of(&self, name: StringId) -> Option<TypeDeclId> {
+        self.registry.get(&name).copied()
+    }
+
+    /// The declared bound of `file`'s type-parameter `spelling` as the
+    /// clause-bounds pass wrote it into [`Self::facts`] — a pin accessor
+    /// for the typedef-alias bound feed (#3383): given the declaration
+    /// `class A<T extends F<num>>`, it answers `T`'s mapped bound (the
+    /// expanded `Function<Y>` type id) so the pin can walk the signature's
+    /// binder and read `Y`'s own bound back.
+    #[cfg(test)]
+    pub(crate) fn testing_param_bound_of(
+        &self,
+        file: FileId,
+        spelling: StringId,
+    ) -> Option<TypeId> {
+        let param = self
+            .type_params
+            .get(&spelling)
+            .filter(|_| self.type_param_scope.contains(&(file, spelling)))?;
+        self.facts.get(*param).bound
+    }
+
+    /// Every function-signature binder inside `ty` with its facts bound —
+    /// the pin accessor for the typedef-alias per-use freshness (#3383):
+    /// the list pairs each declared `type_parameters` id with
+    /// `facts.get(id).bound`, in the shape's walk order.
+    #[cfg(test)]
+    pub(crate) fn testing_fn_binder_bounds(&self, ty: TypeId) -> Vec<Option<TypeId>> {
+        let mut out = Vec::new();
+        self.collect_fn_binders(ty, &mut out);
+        out
+    }
+
+    /// The [`Self::testing_fn_binder_bounds`] walk.
+    #[cfg(test)]
+    fn collect_fn_binders(&self, ty: TypeId, out: &mut Vec<Option<TypeId>>) {
+        match self.table.get(ty).kind() {
+            TypeKind::Function { signature } => {
+                let sig = self.table.signature(signature);
+                for param in self.table.function_type_parameters(sig.type_parameters) {
+                    out.push(self.facts.get(param).bound);
+                }
+                self.collect_fn_binders(sig.return_type, out);
+                for arg in self.table.args(sig.positional) {
+                    self.collect_fn_binders(arg, out);
+                }
+                for member in self.table.named_members(sig.named) {
+                    self.collect_fn_binders(member.ty, out);
+                }
+            }
+            TypeKind::Interface { args, .. } => {
+                for arg in self.table.args(args) {
+                    self.collect_fn_binders(arg, out);
+                }
+            }
+            TypeKind::FutureOr { base } => self.collect_fn_binders(base, out),
+            TypeKind::Record { shape } => {
+                let shape = self.table.record_shape(shape);
+                for arg in self.table.args(shape.positional) {
+                    self.collect_fn_binders(arg, out);
+                }
+                for member in self.table.named_members(shape.named) {
+                    self.collect_fn_binders(member.ty, out);
+                }
+            }
+            TypeKind::Never
+            | TypeKind::Dynamic
+            | TypeKind::Void
+            | TypeKind::Invalid
+            | TypeKind::Null
+            | TypeKind::TypeParameter { .. } => {}
+        }
+    }
+
     /// [`LibraryTypes::build`] over the name-level clause names only —
     /// the pre-Phase-D face. Equivalent to [`Self::build_with_clauses`]
     /// over an empty [`ClauseTrees`].
@@ -880,6 +971,7 @@ impl LibraryTypes {
             property_ty_heads,
             extension_erasures,
             mut facts,
+            mut next_param,
             ..
         } = registry;
         // The object-pattern property gate's set: a collected member's
@@ -975,7 +1067,10 @@ impl LibraryTypes {
                             &registry,
                             &decl_params,
                             &typedef_shapes,
-                            &facts,
+                            &mut AliasBinder {
+                                facts: &mut facts,
+                                next_param: &mut next_param,
+                            },
                             &scope,
                             tree,
                         )
@@ -1120,7 +1215,10 @@ impl LibraryTypes {
                             &registry,
                             &decl_params,
                             &typedef_shapes,
-                            &facts,
+                            &mut AliasBinder {
+                                facts: &mut facts,
+                                next_param: &mut next_param,
+                            },
                             &scope,
                             tree,
                         )
@@ -1174,7 +1272,10 @@ impl LibraryTypes {
                         &registry,
                         &decl_params,
                         &typedef_shapes,
-                        &facts,
+                        &mut AliasBinder {
+                            facts: &mut facts,
+                            next_param: &mut next_param,
+                        },
                         &scope,
                         tree,
                     ) && matches!(table.get(ty).kind(), TypeKind::Interface { .. })
@@ -1413,6 +1514,24 @@ struct TypedefShape {
     /// list did not reach this snapshot (the under-report face — the
     /// unbounded default).
     defaults: Box<[TypeId]>,
+    /// Every function-type binder the flattened RHS minted, paired with
+    /// its bound *in the alias template's own terms* (a bound naming an
+    /// alias parameter keeps the `TypeParameter` leaf — `Y extends X` in
+    /// `typedef F<X> = void Function<Y extends X>()` stores `X` here).
+    /// Per the official instantiation contract
+    /// (`_FreshTypeParametersSubstitutor.freshTypeParameters` +
+    /// `visitFunctionType`, upstream type_algebra.dart:241-271/:416-460)
+    /// each *use* of the alias rebinds those signature parameters to fresh
+    /// ids and writes each fresh binder's `ParamFacts.bound` as the
+    /// template bound substituted by the use's argument map — `F<num>`
+    /// yields a `Y` bounded by `num`, `F<int>` a different `Y` bounded by
+    /// `int`, so no stale alias-parameter leaf leaks through the shared
+    /// shape. The template's own ids keep their declared bound in `facts`
+    /// for the never-substituted reads (a nested signature inside another
+    /// alias's shape is rebound at THAT alias's uses through the
+    /// propagated entries — [`Registry::flatten_named_head`]'s typedef arm
+    /// feeds them back).
+    binders: Box<[(TypeParamId, Option<TypeId>)]>,
 }
 
 /// The head of one declared type-parameter bound, when the bound is a
@@ -1688,6 +1807,10 @@ impl Registry {
                 if !shape_worthy {
                     continue;
                 }
+                // Every function-type binder the RHS mints collects into
+                // `binders` beside the flattened shape — the alias's uses
+                // rebind them per-use ([`TypedefShape::binders`]).
+                let mut binders = Vec::new();
                 let Some((shape, nullable)) = self.flatten_rhs(
                     table,
                     elements.type_args(),
@@ -1695,6 +1818,7 @@ impl Registry {
                     decl.var_ty,
                     name,
                     &decl.type_param_names,
+                    &mut binders,
                 ) else {
                     continue;
                 };
@@ -1717,6 +1841,7 @@ impl Registry {
                         nullable,
                         params,
                         defaults,
+                        binders: binders.into_boxed_slice(),
                     },
                 );
                 progress = true;
@@ -1775,16 +1900,22 @@ impl Registry {
             return None;
         }
         let pool = elements.type_args();
-        let return_type = self.flatten_leaf(table, pool, strings, sig.return_ty, name, &[])?;
+        // A tear-off is never substituted — its signature's binders keep
+        // the facts the flatten writes directly, so the collected list is
+        // discarded.
+        let mut binders = Vec::new();
+        let return_type =
+            self.flatten_leaf(table, pool, strings, sig.return_ty, name, &[], &mut binders)?;
         let mut positional = Vec::with_capacity(sig.formals.positional.len());
         for formal in &sig.formals.positional {
-            positional.push(self.flatten_leaf(table, pool, strings, formal.ty, name, &[])?);
+            positional
+                .push(self.flatten_leaf(table, pool, strings, formal.ty, name, &[], &mut binders)?);
         }
         let mut named = Vec::with_capacity(sig.formals.named.len());
         for formal in &sig.formals.named {
             named.push(NamedMember {
                 name: strings.resolve(formal.name).to_string(),
-                ty: self.flatten_leaf(table, pool, strings, formal.ty, name, &[])?,
+                ty: self.flatten_leaf(table, pool, strings, formal.ty, name, &[], &mut binders)?,
                 required: false,
             });
         }
@@ -1822,13 +1953,14 @@ impl Registry {
         ty: Ty,
         alias: StringId,
         own_params: &[StringId],
+        binders: &mut Vec<(TypeParamId, Option<TypeId>)>,
     ) -> Option<TypeId> {
         match ty {
             Ty::Unknown | Ty::Dynamic => Some(table.intern(UninternedType::Dynamic, false)),
             Ty::Void => Some(table.intern(UninternedType::Void, false)),
             Ty::Never => Some(table.intern(UninternedType::Never, false)),
             ty => self
-                .flatten_rhs(table, pool, strings, ty, alias, own_params)
+                .flatten_rhs(table, pool, strings, ty, alias, own_params, binders)
                 .map(|(id, _)| id),
         }
     }
@@ -1849,6 +1981,7 @@ impl Registry {
         ty: Ty,
         alias: StringId,
         own_params: &[StringId],
+        binders: &mut Vec<(TypeParamId, Option<TypeId>)>,
     ) -> Option<(TypeId, bool)> {
         match ty {
             // A bare unit face (`void`/`dynamic`/`Never`) is not a shape
@@ -1859,7 +1992,7 @@ impl Registry {
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for &field in &shape.positional {
                     positional.push(
-                        self.flatten_rhs(table, pool, strings, field, alias, own_params)?
+                        self.flatten_rhs(table, pool, strings, field, alias, own_params, binders)?
                             .0,
                     );
                 }
@@ -1868,7 +2001,9 @@ impl Registry {
                     named.push(NamedMember {
                         name: strings.resolve(field_name).to_string(),
                         ty: self
-                            .flatten_rhs(table, pool, strings, field, alias, own_params)?
+                            .flatten_rhs(
+                                table, pool, strings, field, alias, own_params, binders,
+                            )?
                             .0,
                         required: false,
                     });
@@ -1890,36 +2025,62 @@ impl Registry {
                 // face's, not a signature column's. A leaf naming an
                 // unresolvable head still drops the whole shape (the
                 // under-report direction).
-                let return_ty =
-                    self.flatten_leaf(table, pool, strings, shape.return_ty, alias, own_params)?;
+                let return_ty = self.flatten_leaf(
+                    table,
+                    pool,
+                    strings,
+                    shape.return_ty,
+                    alias,
+                    own_params,
+                    binders,
+                )?;
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for &formal in &shape.positional {
-                    positional
-                        .push(self.flatten_leaf(table, pool, strings, formal, alias, own_params)?);
+                    positional.push(self.flatten_leaf(
+                        table, pool, strings, formal, alias, own_params, binders,
+                    )?);
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for &(formal_name, formal) in &shape.named {
                     named.push(NamedMember {
                         name: strings.resolve(formal_name).to_string(),
-                        ty: self.flatten_leaf(table, pool, strings, formal, alias, own_params)?,
+                        ty: self.flatten_leaf(
+                            table, pool, strings, formal, alias, own_params, binders,
+                        )?,
                         required: false,
                     });
                 }
                 // The RHS's own `<T>` group: fresh parameter ids in this
                 // snapshot's space (globally unique per interned signature,
                 // so no binder confusion — the same ids the function-subtype
-                // correlation renames positionally).
+                // correlation renames positionally). Each parameter's written
+                // bound rides `type_params_named` (an alias binder's bound
+                // may name the alias's own parameters — `Y extends X` keeps
+                // the `TypeParameter` leaf, substituted at every *use* by
+                // the rebind [`TypedefShape::binders`] drives); a bound that
+                // flattens to nothing keeps the unbounded read — the
+                // under-report direction, same as a shapeless leaf's.
                 let mut type_parameters = Vec::new();
-                for _ in 0..shape.type_params {
+                for position in 0..shape.type_params {
+                    let bound = shape
+                        .type_params_named
+                        .get(usize::from(position))
+                        .and_then(|&(_, bound)| bound)
+                        .and_then(|bound_ty| {
+                            self.flatten_leaf(
+                                table, pool, strings, bound_ty, alias, own_params, binders,
+                            )
+                        });
                     let id = TypeParamId::from_raw(self.next_param);
                     self.next_param += 1;
                     self.facts.set(
                         id,
                         ParamFacts {
                             variance: Variance::Covariant,
-                            bound: None,
+                            bound,
                         },
                     );
+                    binders.push((id, bound));
                     type_parameters.push(id);
                 }
                 let required_positional = u32::try_from(positional.len()).unwrap_or(u32::MAX);
@@ -1959,11 +2120,13 @@ impl Registry {
                 let mut flattened = Vec::with_capacity(pool.get(args).len());
                 for &arg in pool.get(args) {
                     flattened.push(
-                        self.flatten_rhs(table, pool, strings, arg, alias, own_params)?
+                        self.flatten_rhs(table, pool, strings, arg, alias, own_params, binders)?
                             .0,
                     );
                 }
-                self.flatten_named_head(table, strings, name, nullable, &flattened, alias)
+                self.flatten_named_head(
+                    table, strings, name, nullable, &flattened, alias, binders,
+                )
             }
         }
     }
@@ -1981,6 +2144,7 @@ impl Registry {
         nullable: bool,
         args: &[TypeId],
         alias: StringId,
+        binders: &mut Vec<(TypeParamId, Option<TypeId>)>,
     ) -> Option<(TypeId, bool)> {
         if name == alias {
             // A self-referential RHS never resolves.
@@ -2006,28 +2170,49 @@ impl Registry {
         }
         if self.non_containers.contains(&name) {
             if let Some(entry) = self.typedef_shapes.get(&name) {
-                let (shape, nullable) = (entry.shape, entry.nullable | nullable);
-                if entry.params.is_empty() {
-                    return args.is_empty().then_some((shape, nullable));
+                // The entry's fields come out owned first — the binder
+                // rebind below writes `self.facts`, so the shared borrow
+                // cannot live across it.
+                let (shape, nullable, params, defaults, source_binders) = (
+                    entry.shape,
+                    entry.nullable | nullable,
+                    entry.params.to_vec(),
+                    entry.defaults.to_vec(),
+                    entry.binders.to_vec(),
+                );
+                if params.is_empty() {
+                    // A parameter-free alias still rebinds its signature
+                    // binders fresh — the use gets its own binder ids
+                    // exactly like the official's per-use freshCopy.
+                    let expanded =
+                        self.expand_alias_binders(table, shape, &source_binders, &[], binders);
+                    return args.is_empty().then_some((expanded, nullable));
                 }
                 // A raw alias use (`F<G>`) instantiates every parameter to
                 // its to-bounds default — the same `instantiateToBounds`
                 // posture the registered heads keep (type_system.dart:
                 // 719-731), self-referential bounds included.
                 let mapped: &[TypeId] = if args.is_empty() {
-                    &entry.defaults
-                } else if args.len() == entry.params.len() {
+                    &defaults
+                } else if args.len() == params.len() {
                     args
                 } else {
                     return None;
                 };
-                let map: Vec<(TypeParamId, TypeId)> = entry
-                    .params
+                let map: Vec<(TypeParamId, TypeId)> = params
                     .iter()
                     .copied()
                     .zip(mapped.iter().copied())
                     .collect();
-                return Some((table.substitute(shape, &map), nullable));
+                let substituted = table.substitute(shape, &map);
+                let expanded = self.expand_alias_binders(
+                    table,
+                    substituted,
+                    &source_binders,
+                    &map,
+                    binders,
+                );
+                return Some((expanded, nullable));
             }
             // A bare-Named alias chain (`typedef B = A;` with `A` still
             // bare-Named): chase to its terminal and instantiate that —
@@ -2050,6 +2235,47 @@ impl Registry {
             "Never" => Some((table.intern(UninternedType::Never, nullable), false)),
             _ => self.registered_instantiation(table, name, nullable, args),
         }
+    }
+
+    /// The per-use binder freshness of an alias expansion
+    /// (`_FreshTypeParametersSubstitutor.freshTypeParameters` +
+    /// `visitFunctionType`, upstream type_algebra.dart:241-271/:416-460):
+    /// every function signature inside `shape` mints fresh parameter ids,
+    /// each fresh binder's `ParamFacts.bound` lands as its template bound
+    /// (`source_binders`, keyed on the template ids) substituted by this
+    /// use's argument map — `F<num>`'s `Y` is bounded by `num`, `F<int>`'s
+    /// by `int`, no stale alias-parameter leaf leaking through the shared
+    /// shape. The fresh pairs append to `binders` so an enclosing alias's
+    /// own rebind propagates them at ITS uses.
+    fn expand_alias_binders(
+        &mut self,
+        table: &TypeTable,
+        shape: TypeId,
+        source_binders: &[(TypeParamId, Option<TypeId>)],
+        map: &[(TypeParamId, TypeId)],
+        binders: &mut Vec<(TypeParamId, Option<TypeId>)>,
+    ) -> TypeId {
+        let (expanded, pairs) = table.rebind_function_params(shape, &mut || {
+            let id = TypeParamId::from_raw(self.next_param);
+            self.next_param += 1;
+            id
+        });
+        for (old, fresh) in pairs {
+            let bound = source_binders
+                .iter()
+                .find(|&&(id, _)| id == old)
+                .and_then(|&(_, bound)| bound)
+                .map(|bound| table.substitute(bound, map));
+            self.facts.set(
+                fresh,
+                ParamFacts {
+                    variance: Variance::Covariant,
+                    bound,
+                },
+            );
+            binders.push((fresh, bound));
+        }
+        expanded
     }
 
     /// A registered container's instantiation: the written arguments stand
@@ -2129,6 +2355,53 @@ fn builtin_super(
         }
     };
     Some(table.intern(UninternedType::Interface { decl, args }, false))
+}
+
+/// The two mutable build-phase channels a typedef expansion needs bundled
+/// into one argument: the shared facts table (each fresh binder's
+/// substituted bound lands beside the declared facts) and the snapshot's
+/// parameter-id allocator (the per-use freshness, upstream
+/// type_algebra.dart's freshCopy per signature parameter).
+struct AliasBinder<'a> {
+    /// The snapshot's facts table under construction.
+    facts: &'a mut ParamFactsTable,
+    /// The fresh-parameter allocator's high-water mark.
+    next_param: &'a mut u32,
+}
+
+/// One typedef-shape use's binder refresh for the free-function clause
+/// mappers — [`Registry::expand_alias_binders`]'s sibling over borrowed
+/// (not owned) build state: rebinds every signature binder in `shape` to
+/// fresh ids and writes each fresh binder's substituted bound into
+/// `binder.facts`. A bound whose template id carries no entry keeps the
+/// unbounded read — the under-report direction.
+fn rebind_clause_binders(
+    table: &TypeTable,
+    shape: TypeId,
+    source_binders: &[(TypeParamId, Option<TypeId>)],
+    map: &[(TypeParamId, TypeId)],
+    binder: &mut AliasBinder<'_>,
+) -> TypeId {
+    let (expanded, pairs) = table.rebind_function_params(shape, &mut || {
+        let id = TypeParamId::from_raw(*binder.next_param);
+        *binder.next_param += 1;
+        id
+    });
+    for (old, fresh) in pairs {
+        let bound = source_binders
+            .iter()
+            .find(|&&(id, _)| id == old)
+            .and_then(|&(_, bound)| bound)
+            .map(|bound| table.substitute(bound, map));
+        binder.facts.set(
+            fresh,
+            ParamFacts {
+                variance: Variance::Covariant,
+                bound,
+            },
+        );
+    }
+    expanded
 }
 
 /// The name-level edge of a `superclass`/`with`/`implements`/`on` clause:
@@ -2214,7 +2487,7 @@ fn clause_tree_ty(
     registry: &FxHashMap<StringId, TypeDeclId>,
     decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     typedef_shapes: &FxHashMap<StringId, TypedefShape>,
-    facts: &ParamFactsTable,
+    binder: &mut AliasBinder<'_>,
     scope: &FxHashMap<StringId, TypeParamId>,
     tree: &TypeTree,
 ) -> Option<TypeId> {
@@ -2238,7 +2511,7 @@ fn clause_tree_ty(
     let args = if tree.args.is_empty() {
         instantiate_type_formals_to_bounds(
             table,
-            facts,
+            binder.facts,
             decl_params.get(&decl).map_or(&[][..], Vec::as_slice),
         )
         .defaults
@@ -2259,7 +2532,7 @@ fn clause_tree_ty(
                 registry,
                 decl_params,
                 typedef_shapes,
-                facts,
+                binder,
                 scope,
                 arg,
             )?);
@@ -2279,7 +2552,7 @@ fn clause_arg_ty(
     registry: &FxHashMap<StringId, TypeDeclId>,
     decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     typedef_shapes: &FxHashMap<StringId, TypedefShape>,
-    facts: &ParamFactsTable,
+    binder: &mut AliasBinder<'_>,
     scope: &FxHashMap<StringId, TypeParamId>,
     tree: &TypeTree,
 ) -> Option<TypeId> {
@@ -2311,7 +2584,7 @@ fn clause_arg_ty(
             registry,
             decl_params,
             typedef_shapes,
-            facts,
+            binder,
             scope,
             base,
         )
@@ -2348,7 +2621,7 @@ fn clause_arg_ty(
                     registry,
                     decl_params,
                     typedef_shapes,
-                    facts,
+                    binder,
                     scope,
                     arg,
                 )?);
@@ -2366,7 +2639,17 @@ fn clause_arg_ty(
             .copied()
             .zip(mapped.iter().copied())
             .collect();
-        let shape = table.substitute(entry.shape, &map);
+        // Every signature binder inside the expanded shape rebinds fresh
+        // per use (`_FreshTypeParametersSubstitutor`,
+        // type_algebra.dart:241-271) — `F<num>`'s `Y` reads bound `num`
+        // in `facts`, never the template's stale `X` leaf.
+        let shape = rebind_clause_binders(
+            table,
+            table.substitute(entry.shape, &map),
+            &entry.binders,
+            &map,
+            binder,
+        );
         return Some(with_question(
             table,
             shape,
@@ -2377,7 +2660,7 @@ fn clause_arg_ty(
     let args = if tree.args.is_empty() {
         instantiate_type_formals_to_bounds(
             table,
-            facts,
+            binder.facts,
             decl_params.get(&decl).map_or(&[][..], Vec::as_slice),
         )
         .defaults
@@ -2394,7 +2677,7 @@ fn clause_arg_ty(
                 registry,
                 decl_params,
                 typedef_shapes,
-                facts,
+                binder,
                 scope,
                 arg,
             )?);
@@ -3191,6 +3474,15 @@ impl<'a> ResolvedTypeOps<'a> {
                 let map: Vec<(TypeParamId, TypeId)> =
                     entry.params.iter().copied().zip(mapped).collect();
                 let shape = self.snapshot.table.substitute(entry.shape, &map);
+                // RESIDUAL (#3383): the official use-site expansion also
+                // rebinds every signature's binder group fresh and feeds
+                // each fresh binder the substituted bound (`type_algebra
+                // .dart`'s freshCopy per parameter). The build-time
+                // expansion does that (`clause_arg_ty`'s typedef arm);
+                // here the snapshot's `facts` is immutable, so the query
+                // face keeps the shared template ids — a substituted-use
+                // binder reads its template bound (the declared `X` leaf)
+                // until a facts overlay reaches the TypeSystem arm.
                 return self.with_question(shape, entry.nullable || nullable);
             }
             // A bare `typedef A = B` chases its aliased head before the

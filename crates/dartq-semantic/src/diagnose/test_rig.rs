@@ -71,6 +71,70 @@ pub(super) fn report_ops_imports(source: &str, imports: &[RigImport<'_>]) -> Fil
     report_ops_with(&format!("{CORE_PRELUDE}{source}"), imports, None)
 }
 
+/// The snapshot half of the rig without the fold: `source` is analyzed
+/// exactly as [`report_ops`] does (prelude + clause-tree capture feeding
+/// `build_with_clauses`), and the built [`LibraryTypes`] comes back with
+/// the shared string table and the fixture's file id — the #3383 pins read
+/// the typedef-alias binder bounds out of `facts` after the build.
+pub(super) fn types_for(source: &str) -> (LibraryTypes, StringTable, dartq_source::FileId) {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let source = format!("{CORE_PRELUDE}{source}");
+    let scanned = scan_fixture(&source, file);
+    let features =
+        ParserFeatures::from_feature_set(FeatureSet::for_language_version(LanguageVersion::new(
+            3, 15,
+        )));
+    let elements = collect(&source, &scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let core_lib = builder.intern("dart:core");
+    let core_file = files.intern(Path::new("<dart:core>"));
+    for name in CORE_STUB_NAMES {
+        builder.declare(core_lib, strings.intern(name), core_file);
+    }
+    builder.import(
+        lib,
+        ImportEdge {
+            target: Some(core_lib),
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    builder.unit(lib, file);
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        if matches!(
+            decl.kind,
+            MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+        ) {
+            builder.declare_class(lib, name, file, ClassModifiers::default());
+        } else {
+            builder.declare(lib, name, file);
+        }
+    }
+    let mut clauses = ClauseTrees::empty();
+    crate::capture_clause_trees(
+        file,
+        &source,
+        &scanned.tokens,
+        features,
+        &strings,
+        &mut clauses,
+    );
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let types =
+        LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
+    (types, strings, file)
+}
+
 /// [`report_ops`] with the analyzed library's `wildcard-variables` posture
 /// pinned (the engine's per-library feature channel,
 /// [`LibraryClassModifiers::insert_wildcards`]): `false` models a pre-3.7
