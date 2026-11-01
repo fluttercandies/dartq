@@ -90,24 +90,15 @@ void f({required int Function() intFunction}) {
     );
 }
 
-/// The ticket's literal shape, parked on the flow layer: the same call
-/// result types `int` (asserted above), so `intFunction() is int` is a
-/// trivially satisfied check and the oracle deads the `else` arm
+/// The ticket's literal shape: the same call result types `int` (asserted
+/// above), so `intFunction() is int` is a trivially satisfied check and
+/// the oracle deads the `else` arm
 /// (`trivially_satisfied_type_check_test.dart:37`).
 ///
-/// It does not reproduce here yet, and the gap is NOT the staging source:
-/// a non-reference operand of the same type folds correctly
-/// (`if (1 is int)` deads its else in this harness), and an invocation
-/// whose staged result is `int` folds through the `== null` face above. The
-/// remaining difference is the flow layer's reference face: the `Ev::Send`
-/// handler types the call in place but leaves the callee identifier's
-/// `reference` slot standing, so `Ev::IsEnd` takes its REFERENCE arm and
-/// reads the formal's declared function type instead of the invocation's
-/// static type. Upstream a call carries no reference at all. That file is
-/// owned by the flow lane, so this pin is parked rather than failing;
-/// un-ignore it once the send face clears `reference` (and `prop`) on the
-/// invoked expression.
-#[ignore = "blocked on the flow layer's call-reference face (dartq-flow, #3390 lane): Ev::Send keeps the callee identifier's `reference`, so an `is` over a call reads the callee's declared type"]
+/// The flow side this once parked on has landed (#3435): the `Ev::Send`
+/// close drops the callee identifier's `reference`/`prop` slots, so
+/// `Ev::IsEnd` takes the non-reference arm and the staged `int` folds the
+/// else dead.
 #[test]
 fn function_typed_formal_call_result_deads_the_is_else_arm() {
     let body = "\
