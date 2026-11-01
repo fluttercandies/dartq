@@ -20086,3 +20086,14 @@ mod ticket_3459_tests;
 #[cfg(test)]
 #[path = "ticket_3482_tests.rs"]
 mod ticket_3482_tests;
+
+// The #3464 pins (duplicate_constructor keys follow the element chain and
+// the written head shape): an augment fragment shares the introduction's
+// constructor set, `factory`-adjacent heads (including the bare `factory(`,
+// which fires no identifier event) key by their written name or `new`, and
+// a foreign typeName rejects the claim. Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3464_tests.rs"]
+mod ticket_3464_tests;
