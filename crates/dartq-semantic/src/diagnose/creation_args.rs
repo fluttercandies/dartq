@@ -6,6 +6,28 @@
 //! `SplayTreeSet<E> implements Set<E>` edge instead of the raw head's
 //! to-bounds instantiation. The assignment staging reads the same slot
 //! for `x = C<int>()`.
+//!
+//! Scope against the instance-creation downward inference (recon bucket
+//! C): this file is the created row's TYPE READER — [`Engine::creation_row_ty`]
+//! (written group first, then the send's published solution, both keyed
+//! on the head's offset), [`Engine::with_explicit_creation_args`] (the
+//! `var` bind), and [`Engine::instantiated_head_ty`] (the
+//! instantiate-to-bounds fill of a raw generic head, inert for a
+//! non-generic one). Everything that DECIDES a creation's instantiation
+//! lives in `invocation.rs`: the context discovery
+//! (`creation_context_ty`), the parameter solve (`creation_call_site_ty`
+//! with its `creation_context_seed`), the publish
+//! (`publish_creation_instantiation`), and the argument check's own
+//! declared/write-context seed. The open residual — a context-seeded
+//! parameter must win over a disagreeing argument, so that
+//! `A<int, String> x = new A('s', 1)` reads `A<int, String>` and reports
+//! the argument rows instead of the to-bounds `A<dynamic, dynamic>` —
+//! is `creation_call_site_ty`'s poison arm, whose upstream rule is the
+//! already-inferred (downward) type returned for a covariant parameter
+//! ahead of any constraint (upstream Dart SDK source,
+//! pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer_operations.dart
+//! `inferTypeParameterFromAll`). The pinned reader contract those lanes
+//! must keep is `ticket_3388_tests.rs`.
 
 use super::*;
 
