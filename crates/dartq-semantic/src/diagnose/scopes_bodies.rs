@@ -2372,15 +2372,22 @@ impl<'a> Engine<'a> {
     fn emit_irrefutable(&mut self, at: SourceRange, matched: Ty, required: Ty) {
         // The verdict: `assignable`'s nominal lattice answers first —
         // `Some` is the assignability answer itself, so the report fires
-        // on `false`. When it abstains (an unindexed `Object` source
-        // carries no declared edges at the name level) the declared-edge
-        // lattice decides directly — `Object <: List`/`String`/record is
-        // false at every grade, so the oracle's row still lands.
-        // `dynamic`/invalid matched faces keep the official gate's
-        // silence.
+        // on `false`. When it abstains the declared-edge lattice answers
+        // only a NAMED source — an unindexed `Object` head carries no
+        // declared edges at the `Ty` level, so `assignable` defers while
+        // `Object <: List`/`String`/record is false at every grade and
+        // the oracle's row still lands. A `Record`/`Function` matched
+        // face has no name-level decomposition ([`NameTy::from_semantic`]
+        // maps it to a shape-keyed sentinel), so the fallback cannot
+        // express the pair — abstaining here is the oracle's under-report,
+        // never a fabricated row on a valid destructure.
         let verdict = match self.assignable(matched, required, false) {
             Some(assignable) => !assignable,
-            None => matched != Ty::Dynamic && !self.name_subtype(matched, required),
+            None => {
+                matches!(matched, Ty::Named { .. })
+                    && matched != Ty::Dynamic
+                    && !self.name_subtype(matched, required)
+            }
         };
         if verdict {
             let a0 = self.ty_display(matched);
