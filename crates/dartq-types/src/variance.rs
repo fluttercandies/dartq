@@ -27,11 +27,12 @@
 //!   alias entries (`_functionTypeAlias`/`_genericTypeAlias`): a typedef's
 //!   parameter variance is *computed* from the aliased body and stored on
 //!   the element (`_setVariance`, :258-261), not read from a keyword. That
-//!   stored value is what the instantiate-to-bound visitor seeds
-//!   (`_computeDefaultType`, default_types_builder.dart:153-161/171-179):
-//!   a typedef parameter contravariant in its own body grounds to `Never`,
-//!   while a class parameter — declared only, legacy covariant — still
-//!   grounds to `dynamic`.
+//!   stored value is what the default-type face of instantiate-to-bound
+//!   seeds (`_computeDefaultType`, default_types_builder.dart:153-161/
+//!   171-179; the to-bounds face, `instantiateTypeFormalsToBounds`, reads
+//!   no variance): a typedef parameter contravariant in its own body
+//!   grounds to `Never`, while a class parameter — declared only, legacy
+//!   covariant — still grounds to `dynamic`.
 //!
 //! # Enforcement-point status
 //!
@@ -142,9 +143,9 @@ impl Variance {
 /// `inout` keyword or the legacy-covariant default, element.dart:
 /// 11560-11562; for a *typedef* parameter the value the `VarianceBuilder`
 /// computed from the aliased body, variance_builder.dart:258-261) and its
-/// declared bound (`None` = unbounded; the ITB face substitutes `dynamic`
-/// exactly where the official reads `typeParameter.bound ??
-/// DynamicTypeImpl.instance`, `type_system.dart:786`).
+/// declared bound (`None` = unbounded; both instantiate-to-bound faces read
+/// it as `dynamic` — `default_types_builder.dart:139`,
+/// `type_system.dart:754`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ParamFacts {
     /// The element's stored variance: the declared keyword (or legacy

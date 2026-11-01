@@ -1,7 +1,32 @@
-//! Instantiate-to-bound: the type-parameter defaults computation.
+//! Instantiate-to-bound: the analyzer's two faces. They answer the same
+//! bound list differently, so neither entry stands in for the other:
 //!
-//! Direct port of the NDBD algorithm the oracle uses to compute
-//! `TypeParameterElementImpl.defaultType` — `DefaultTypesBuilder.
+//! * the **default-type face** — `TypeParameterElementImpl.defaultType`,
+//!   the value every raw-type instantiation reads (`_defaultTypeArguments`,
+//!   `type_system.dart:1822-1831`):
+//!   [`instantiate_type_formals_to_bounds`] (facts snapshot),
+//!   [`instantiate_type_formals_to_bounds_with`] (caller-held bounds),
+//!   [`instantiate_type_formals_to_bounds_directed`] (caller-held variance
+//!   seeds), and [`instantiate_interface_to_bounds`] over the first;
+//! * the **to-bounds face** — `TypeSystemImpl.
+//!   instantiateTypeFormalsToBounds` (`type_system.dart:735-811`), the fill
+//!   the extension-specificity rule substitutes into each `on` type
+//!   (`_instantiateToBounds`, `extension_member_resolver.dart:455-462`) and
+//!   generic inference falls back to (`generic_inferrer.dart:426`):
+//!   [`instantiate_type_formals_to_bounds_fixpoint`].
+//!
+//! Over one bound list the faces split three ways (oracle-pinned side by
+//! side in `ticket_3487_tests.rs`): a parameter leaf in a function-type
+//! formal reads `Never` in the default face (the variance-directed lower
+//! map) but the parameter's completed default — `dynamic` inside a cycle —
+//! in the to-bounds face; a parameter that only depends on a cycle grounds
+//! to the member's default in the default face but to `Phi(bound)` (the
+//! member read as `dynamic`) in the to-bounds face; and an `X?` leaf takes
+//! the replacement verbatim in the default face but unites the `?` in the
+//! to-bounds face.
+//!
+//! The default-type face is a direct port of the NDBD algorithm the oracle
+//! uses to compute `defaultType` — `DefaultTypesBuilder.
 //! _computeDefaultType` (`pkg/analyzer/lib/src/summary2/
 //! default_types_builder.dart:128-187`), the same algorithm `calculateBounds`
 //! spells out for the kernel side (`pkg/kernel/lib/src/bounds_checks.dart:
@@ -46,13 +71,14 @@
 //! through the SCC pass and completes in the grounding sweep with the
 //! member's substituted default — `X extends A<X>, Y extends X` yields
 //! `Y = A<dynamic>` under a covariant seed, not `dynamic`. That is the
-//! difference from the fixpoint-plus-Phi reading of
-//! `instantiateTypeFormalsToBounds` (`type_system.dart:735-811`), whose
-//! fallback maps *every* uncompleted parameter to `dynamic`
-//! (type_system.dart:793-804) and so loses the dependent's bound entirely.
+//! difference from the to-bounds face's fixpoint-plus-Phi
+//! (`type_system.dart:735-811`), whose fallback maps *every* uncompleted
+//! parameter to `dynamic` (type_system.dart:793-804) and so loses the
+//! dependent's bound entirely.
 //!
-//! The free-parameter test behind the `-->m` edges is `getFreeParameters`
-//! (type_system.dart:567-610): a structure walk that respects function
+//! The free-parameter test behind the `-->m` edges — and behind the
+//! to-bounds face's progress test — is `getFreeParameters`
+//! (type_system.dart:542-586): a structure walk that respects function
 //! types' binders — a parameter declared by a nested function type is
 //! bound there, not free — and honors the optional candidate set.
 //!
@@ -94,26 +120,28 @@ use crate::table::TypeTable;
 use crate::ty::{NamedMember, TypeKind, UninternedFunction, UninternedRecord, UninternedType};
 use crate::variance::{ParamFactsTable, Variance};
 
-/// The result of [`instantiate_type_formals_to_bounds`]: the defaults in
-/// the input parameter order, and whether the fixed point left any
-/// parameter malbounded (the official `hasError[0] = true`,
-/// type_system.dart:820-822).
+/// The result of either face: one type per input parameter, and whether
+/// some parameter's bound reaches a cycle (the official `hasError[0] =
+/// true`, type_system.dart:785-788).
 #[derive(Clone, Debug)]
 pub struct BoundsInstantiation {
-    /// One default per input parameter, in input order.
+    /// One type per input parameter, in input order.
     pub defaults: Vec<TypeId>,
     /// `true` when some parameter's bound reaches a cycle — the official
     /// `partials.isNotEmpty → hasError[0] = true` (type_system.dart:
     /// 785-788): cycle members and their dependents were completed only by
-    /// the component rewrite and grounding sweep. The caller reports the
-    /// malbounded-ness error; the substituted types are still returned.
+    /// the default face's component rewrite and grounding sweep, or by the
+    /// to-bounds face's `Phi`. The caller reports the malbounded-ness
+    /// error; the substituted types are still returned.
     pub malbounded: bool,
 }
 
-/// `instantiateTypeFormalsToBounds` over the facts snapshot — the bound of
-/// each parameter is its declared bound, or the unbounded `dynamic` face
-/// (default_types_builder.dart:136-140), and the seed variance is the
-/// element's stored `element.variance` (`variable.variance`,
+/// The default-type face over the facts snapshot — `defaultType`, what a
+/// raw type instantiates with; *not* `instantiateTypeFormalsToBounds`,
+/// whose consumers call [`instantiate_type_formals_to_bounds_fixpoint`].
+/// The bound of each parameter is its declared bound, or the unbounded
+/// `dynamic` (default_types_builder.dart:136-140), and the seed variance is
+/// the element's stored `element.variance` (`variable.variance`,
 /// default_types_builder.dart:157-158/175-176) read from the same snapshot.
 /// The snapshot has no declaration→parameter map for the interface-argument
 /// combine, so argument positions inside bounds read covariant — the
@@ -147,9 +175,9 @@ pub fn instantiate_type_formals_to_bounds(
 /// declaration order. A parameter *outside* a cycle whose bound mentions a
 /// cycle member therefore completes with the member's substituted default
 /// (`X extends A<X>`, `Y extends X` yields `Y = A<dynamic>` under the
-/// covariant seeds this entry implies) — not with `dynamic`, the
-/// all-or-nothing Phi answer the fixpoint port used to give
-/// (type_system.dart:793-804 maps every uncompleted parameter to
+/// covariant seeds this entry implies) — not with `dynamic`, the Phi answer
+/// of the to-bounds face ([`instantiate_type_formals_to_bounds_fixpoint`];
+/// type_system.dart:793-804 maps every uncompleted parameter to
 /// `dynamic`); see the module docs.
 ///
 /// This entry seeds every parameter `Covariant` — the legacy class-side
@@ -338,6 +366,94 @@ pub fn instantiate_type_formals_to_bounds_directed(
 
     BoundsInstantiation {
         defaults: bounds,
+        malbounded,
+    }
+}
+
+/// The to-bounds face — `TypeSystemImpl.instantiateTypeFormalsToBounds`
+/// (`type_system.dart:735-811`): the fill the extension-specificity rule
+/// substitutes into each `on` type (`_instantiateToBounds`,
+/// `extension_member_resolver.dart:455-462`) and generic inference falls
+/// back to (`generic_inferrer.dart:426`). Not the default-type face: the
+/// same bounds answer differently here (see the module docs).
+///
+/// Every parameter starts at its bound — `dynamic` when `bound_of` answers
+/// `None` (:751-757) — and completes once every candidate parameter free in
+/// that bound ([`get_free_parameters`]) has completed, as the bound under
+/// the completed defaults (:759-779). The substitution is
+/// `Substitution.fromMap`'s ([`TypeTable::substitute`]), not the default
+/// face's `replace_upper_lower`: position-blind — no flip around a function
+/// type's formals, no `Never` lower map — and nullability-uniting (`X?`
+/// over `int` is `int?`). Parameters still incomplete are malbounded
+/// (`hasError[0]`, :785-788) and complete as `Phi(bound)`, where `Phi` maps
+/// each completed parameter to its default and each incomplete one to
+/// `dynamic` (:789-804) — a single substitution, so a dependent of a cycle
+/// reads the member as `dynamic`, never as the member's own `Phi` default.
+///
+/// The official optional `knownTypes` seed (the inference caller's solved
+/// parameters, :738/747) has no counterpart: no caller of this crate solves
+/// parameters before the fill. As in the default face, a nested generic
+/// function type's binder bounds live in [`ParamFactsTable`], outside the
+/// substitution.
+#[allow(
+    dead_code,
+    reason = "the semantic layer's extension-specificity projection is the \
+              first caller (#3487); the crate root re-exports it when that \
+              routing lands"
+)]
+#[must_use]
+pub fn instantiate_type_formals_to_bounds_fixpoint(
+    table: &TypeTable,
+    parameters: &[TypeParamId],
+    bound_of: impl Fn(TypeParamId) -> Option<TypeId>,
+) -> BoundsInstantiation {
+    let dynamic = table.intern(UninternedType::Dynamic, false);
+    let all: FxHashSet<TypeParamId> = parameters.iter().copied().collect();
+    let bounds: Vec<TypeId> = parameters
+        .iter()
+        .map(|&p| bound_of(p).unwrap_or(dynamic))
+        .collect();
+
+    // The progress loop (:759-779). The official rescans from the start
+    // after every completion; a completed default is its bound under a
+    // ground substitution, so neither the completed set nor any default
+    // depends on the scan order — sweeping until a sweep completes nothing
+    // reaches the same fixpoint, in at most `parameters.len() + 1` sweeps.
+    let mut defaults: Vec<Option<TypeId>> = vec![None; parameters.len()];
+    let mut completed: Vec<(TypeParamId, TypeId)> = Vec::with_capacity(parameters.len());
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for (i, &parameter) in parameters.iter().enumerate() {
+            if defaults[i].is_some() {
+                continue;
+            }
+            let ready = get_free_parameters(table, &all, bounds[i])
+                .is_none_or(|free| free.iter().all(|p| completed.iter().any(|&(q, _)| q == *p)));
+            if ready {
+                let default = table.substitute(bounds[i], &completed);
+                completed.push((parameter, default));
+                defaults[i] = Some(default);
+                progress = true;
+            }
+        }
+    }
+
+    let malbounded = defaults.iter().any(Option::is_none);
+    let mut phi = completed;
+    phi.extend(
+        parameters
+            .iter()
+            .zip(&defaults)
+            .filter(|(_, default)| default.is_none())
+            .map(|(&parameter, _)| (parameter, dynamic)),
+    );
+    BoundsInstantiation {
+        defaults: defaults
+            .iter()
+            .zip(&bounds)
+            .map(|(default, &bound)| default.unwrap_or_else(|| table.substitute(bound, &phi)))
+            .collect(),
         malbounded,
     }
 }
@@ -643,12 +759,13 @@ fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
     result
 }
 
-/// `getFreeParameters` (`type_system.dart:567-610`): the free type
+/// `getFreeParameters` (`type_system.dart:542-586`): the free type
 /// parameters of `root`, restricted to `candidates`, or `None` when there
-/// are none. Function types bind their own declared parameters
-/// (type_system.dart:588-600); the official alias arm
-/// (type_system.dart:596-598) has no counterpart — dartq types carry no
-/// alias kinds.
+/// are none — the `-->m` edges of the default face and the progress test of
+/// the to-bounds face. Function types bind their own declared parameters
+/// (type_system.dart:566-575); the official alias arm
+/// (type_system.dart:574) has no counterpart — dartq types carry no alias
+/// kinds.
 #[expect(
     clippy::implicit_hasher,
     reason = "the workspace pins Fx hashing (rustc-hash); generalizing over \
@@ -675,10 +792,10 @@ pub fn get_free_parameters(
     if found.is_empty() { None } else { Some(found) }
 }
 
-/// The `appendParameters` closure (`type_system.dart:579-609`), iterative
+/// The `appendParameters` closure (`type_system.dart:551-582`), iterative
 /// over the type spine via the depth budget (crate recursion law) —
-/// `depth > DEPTH_LIMIT` answers "no free parameters found past here",
-/// which only deepens the malbounded answer instead of crashing.
+/// `depth > DEPTH_LIMIT` answers "no free parameters found past here", a
+/// bounded under-report instead of a crash.
 fn append_free_parameters(
     table: &TypeTable,
     candidates: &FxHashSet<TypeParamId>,
@@ -711,7 +828,7 @@ fn append_free_parameters(
             let sig = table.signature(signature);
             let params = table.function_type_parameters(sig.type_parameters);
             // The binder: the signature's own parameters are bound inside
-            // (type_system.dart:588-600); the official asserts they are
+            // (type_system.dart:566-575); the official asserts they are
             // fresh, so shadowing cannot hide an outer parameter here.
             let newly_bound: Vec<TypeParamId> = params
                 .iter()
@@ -776,11 +893,11 @@ fn append_free_parameters(
     }
 }
 
-/// `instantiateInterfaceToBounds` (`type_system.dart:719-731`):
-/// instantiates `decl` with its parameters' instantiate-to-bound defaults
-/// — the official reads each `typeParameterImpl.defaultType!`
-/// (`_defaultTypeArguments`, type_system.dart:1811-1820), which is exactly
-/// the ITB default computed here.
+/// `instantiateInterfaceToBounds` (`type_system.dart:687-698`):
+/// instantiates `decl` with its parameters' default types — the official
+/// reads each `typeParameterImpl.defaultType!` (`_defaultTypeArguments`,
+/// type_system.dart:1822-1831), the default-type face computed here, never
+/// the to-bounds face.
 ///
 /// # Panics
 ///
@@ -1138,3 +1255,9 @@ mod tests {
 #[cfg(test)]
 #[path = "ticket_3311_tests.rs"]
 mod ticket_3311_tests;
+
+// The #3487 pins (the to-bounds face against the default-type face over the
+// same bounds, each oracle-verified) live beside the two entries.
+#[cfg(test)]
+#[path = "ticket_3487_tests.rs"]
+mod ticket_3487_tests;
