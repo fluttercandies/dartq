@@ -636,11 +636,15 @@ impl<'a> Engine<'a> {
     }
 
     /// The diagnostic-message face of a verdict type: an invalid head (the
-    /// unresolved/paren-junk face) spells `InvalidType`, everything else
-    /// renders through [`Self::ty_display`].
+    /// unresolved/paren-junk face) spells `InvalidType` — the oracle's
+    /// `DartType.getDisplayString` on the substituted `InvalidType` — while
+    /// everything else renders through [`Self::ty_display`]. `Ty::render`'s
+    /// `Unknown` arm spells `""` for the diagnoser's unknown slots
+    /// (model.rs `render`), so the invalid face carries the literal —
+    /// `render_slot`'s own `InvalidType` splice is the same spelling.
     fn catch_ty_display(&self, ty: Ty) -> String {
         if self.is_invalid_ty(ty) {
-            return self.render_ty(Ty::Unknown);
+            return "InvalidType".to_string();
         }
         self.ty_display(ty)
     }
@@ -961,6 +965,74 @@ impl<'a> Engine<'a> {
             )
     }
 
+    /// The shorthand resolution's context type: the declaration group's
+    /// armed annotation folded through the alias chain and the `FutureOr<S>`
+    /// base (the oracle's `_resolveDotShorthand` unwraps both —
+    /// `typedef E2 = E; E2 e = .a` resolves `.a` against `E`, and the static
+    /// namespace denoted by `S` is the one `FutureOr<S>` denotes). `None`
+    /// when the group carries no decidable context: unwritten (`var x =
+    /// .a`), unresolvable (the annotation is the oracle's `InvalidType` —
+    /// `pending_decl_ty_unresolved`, which swallows the member verdict
+    /// upstream), or a non-interface shape the shorthand's lookup never
+    /// climbs (records and `void`; a function-type context still reports
+    /// through the invocation face, see [`Self::resolve_decl_shorthands`]).
+    fn shorthand_context_ty(&self) -> Option<Ty> {
+        if self.pending_decl_ty_unresolved {
+            return None;
+        }
+        let ty = self.future_or_base(self.fold_alias_ty(self.pending_decl_ty?));
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
+    /// The shorthand's resolved static face for `name` against the resolved
+    /// context head `context` — upstream's `_resolveElement` union: a
+    /// constructor spelling (`.new`, `.named`) answers the context type
+    /// itself; a static member spelling answers the member's declared face
+    /// (field/getter `var_ty`, method `return_ty`); an instance member and
+    /// every miss answer `None` — the `dot_shorthand_undefined_member`
+    /// verdict. The constructor probe unions the in-file decl sites
+    /// ([`Self::ctor_decl_site`]) with the container's model face
+    /// ([`Self::ctor_face_exists`]): a context head declared in a sibling
+    /// unit owns no decl site here, so the local-only probe would
+    /// misreport the shorthand `.named()` that resolves upstream.
+    fn shorthand_member_ty(
+        &self,
+        context: StringId,
+        nullable: bool,
+        args: ArgListId,
+        name: StringId,
+    ) -> Option<Ty> {
+        let ctor_hit = self.ctor_decl_site(context, name).is_some()
+            || resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                context,
+            )
+            .is_some_and(|(decl, _)| self.ctor_face_exists(decl, context, name));
+        if ctor_hit {
+            return Some(Ty::Named {
+                name: context,
+                nullable,
+                args,
+            });
+        }
+        let Walk::Found(entry) = self.walk_members(context, name) else {
+            return None;
+        };
+        if !entry.is_static {
+            return None;
+        }
+        let ty = if entry.var_ty != Ty::UNKNOWN {
+            entry.var_ty
+        } else {
+            entry.return_ty
+        };
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
     /// The leading-dot shorthand's static type. A `DotShorthandNameExpression`
     /// / `DotShorthandPropertyAccess` / `DotShorthandConstructorInvocation`
     /// resolves its name against the CONTEXT type — the declaration group's
@@ -979,29 +1051,120 @@ impl<'a> Engine<'a> {
             name: context,
             nullable,
             args,
-        } = self.pending_decl_ty?
+        } = self.shorthand_context_ty()?
         else {
             return None;
         };
-        if self.ctor_decl_site(context, row.name).is_some() {
-            return Some(Ty::Named {
-                name: context,
-                nullable,
-                args,
+        self.shorthand_member_ty(context, nullable, args, row.name)
+    }
+
+    /// The declaration-initializer shorthand pass (#3433): every leading-dot
+    /// selector row the window folded resolves against the declaration
+    /// group's context type — upstream `DotShorthandPropertyAccess` /
+    /// `DotShorthandInvocation` (`property_element_resolver.dart`'s
+    /// `_resolveTargetInterfaceElement` with `resolvingDotShorthand`,
+    /// `method_invocation_resolver.dart`'s `_resolveReceiverTypeLiteralFor
+    /// DotShorthand`), never the bare scope the selector row's `Bare` shape
+    /// pretended to answer. Runs at the variable-initializer close
+    /// ([`Self::finish_const_initializer`] calls it for every group,
+    /// const or not), while `pending_decl_ty` still carries the group's
+    /// written annotation and `init_mark` still names the window's first
+    /// row.
+    ///
+    /// The gate triple — `qualified` (the selector fold), `Bare(_)` (the
+    /// dot access never merged a receiver), `dot_shorthand_context` (a `.`
+    /// opens the name with an expression-opener ahead) — picks exactly the
+    /// un-merged leading-dot selectors: `x.foo`, `x?.foo`, `x..foo`, and
+    /// `super.new` all fail one arm. `row.ty` is the once-only marker:
+    /// `push_member` writes `Unknown` for a non-record receiver shape, the
+    /// pass upgrades a hit to the member's declared face, so a stale
+    /// `init_mark` resweeping an older window never re-verdicts a resolved
+    /// row (a miss row re-verdicts harmlessly — the emit dedups on the
+    /// range).
+    ///
+    /// The verdict mirrors the oracle's two faces:
+    ///
+    /// - Context head resolves (`Ty::Named`): a member/constructor hit
+    ///   types the row with the member's declared face and stays silent; a
+    ///   miss reports `dot_shorthand_undefined_member` at the selector —
+    ///   read and invocation arms alike (the invocation's
+    ///   `dotShorthandUndefinedInvocation` and the read's
+    ///   `dotShorthandUndefinedGetter` freeze to the same code).
+    /// - No decidable context: the invocation arm still reports
+    ///   `dot_shorthand_undefined_member` (its `contextType` renders `'_'`
+    ///   upstream — `var c = .m()`); the read arm does not (its verdict is
+    ///   `dot_shorthand_missing_context`, an unimplemented sibling).
+    /// - An unresolvable annotation (`pending_decl_ty_unresolved`) or a
+    ///   non-`Named` head: the read arm's verdict is `missing_context`
+    ///   (suppressed); the invocation arm reports with the written
+    ///   context's display (`C Function() c = .m()`).
+    ///
+    /// Selector rows pushed with `Intent::Write`/`ReadWrite`/`Operator`
+    /// (`x == .a`, `.a = v`) keep their silence: their context is the
+    /// operand/assignment face's, not the declaration's — the under-report
+    /// direction every other operand-context shorthand keeps.
+    pub(crate) fn resolve_decl_shorthands(&mut self) {
+        let Some(mark) = self.init_mark else {
+            return;
+        };
+        let context = self.shorthand_context_ty();
+        let context_text = self
+            .pending_decl_ty
+            .map(|ty| self.ty_display(ty))
+            .unwrap_or_default();
+        for index in mark..self.rows.len() {
+            let row = self.rows[index].clone();
+            if !row.qualified
+                || !matches!(row.shape, RowShape::Bare(_))
+                || row.ty != Ty::UNKNOWN
+                || !self.dot_shorthand_context(row.range.offset)
+            {
+                continue;
+            }
+            let invoke = row.intent == Intent::Invoke;
+            if !matches!(row.intent, Intent::Read | Intent::Invoke) {
+                continue;
+            }
+            let resolved = context.and_then(|ctx| {
+                let Ty::Named {
+                    name: head,
+                    nullable,
+                    args,
+                } = ctx
+                else {
+                    return None;
+                };
+                self.shorthand_member_ty(head, nullable, args, row.name)
             });
+            match (resolved, invoke) {
+                (Some(ty), _) => {
+                    self.rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
+                    self.rows[index].ty = ty;
+                }
+                (None, true) => {
+                    // The invocation arm reports unconditionally once its
+                    // context is not an accessible interface type
+                    // (method_invocation_resolver.dart:290-304) — a written
+                    // context displays it, a context-free shorthand `_`.
+                    let text = if context.is_some() || self.pending_decl_ty.is_some() {
+                        context_text.as_str()
+                    } else {
+                        "_"
+                    };
+                    self.emit_shorthand_undefined_member(row.range, text);
+                }
+                (None, false) => {
+                    // The property-access arm reports only on a named
+                    // context head (`dotShorthandUndefinedGetter` at the
+                    // selector); every weaker context — none, invalid, a
+                    // non-interface shape — reads `missing_context`
+                    // upstream (suppressed here).
+                    if matches!(context, Some(Ty::Named { .. })) {
+                        self.emit_shorthand_undefined_member(row.range, &context_text);
+                    }
+                }
+            }
         }
-        let Walk::Found(entry) = self.walk_members(context, row.name) else {
-            return None;
-        };
-        if !entry.is_static {
-            return None;
-        }
-        let ty = if entry.var_ty != Ty::UNKNOWN {
-            entry.var_ty
-        } else {
-            entry.return_ty
-        };
-        (ty != Ty::UNKNOWN).then_some(ty)
     }
 
     /// `end_binary_expression` for `??`: the right operand's row anchors

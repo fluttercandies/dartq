@@ -19963,3 +19963,18 @@ mod ticket_3432_tests;
 #[cfg(test)]
 #[path = "ticket_3423_tests.rs"]
 mod ticket_3423_tests;
+
+// —— #3433 —— the dot-shorthand declaration-initializer pass: a
+// —— leading-dot selector never merges a receiver, so a member miss
+// —— against the declaration group's context went silently unreported
+// —— (510 oracle rows). The pass sweeps the initializer window at
+// —— `finish_const_initializer` — `pending_decl_ty` + `init_mark`
+// —— still armed — types each `Bare(Plain)` + `qualified` selector
+// —— against the folded context face, and emits
+// —— `dot_shorthand_undefined_member` at the selector on a miss.
+// —— Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3433_tests.rs"]
+mod ticket_3433_tests;

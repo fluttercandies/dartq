@@ -416,6 +416,12 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn finish_const_initializer(&mut self, local: bool) {
+        // Every variable-initializer close routes here (const and non-const
+        // alike — the const machinery below early-returns on the non-const
+        // shape): the declaration group's leading-dot shorthands resolve
+        // against the armed annotation while `pending_decl_ty` still
+        // carries it (#3433).
+        self.resolve_decl_shorthands();
         let Some(keyed) = self.pending_init_names.pop() else {
             return;
         };
@@ -1217,13 +1223,7 @@ impl<'a> Engine<'a> {
             return;
         };
         if call {
-            let selector_text = self.source_slice(selector).to_string();
-            self.emit(
-                SemanticCode::DotShorthandUndefinedMember,
-                selector,
-                &selector_text,
-                "dynamic",
-            );
+            self.emit_shorthand_undefined_member(selector, "dynamic");
         } else {
             self.emit(
                 SemanticCode::DotShorthandMissingContext,
@@ -1237,6 +1237,34 @@ impl<'a> Engine<'a> {
             whole,
             "",
             "",
+        );
+    }
+
+    /// The `dot_shorthand_undefined_member` emit surface every shorthand
+    /// face shares (#3433): the const evaluation's root failure
+    /// ([`Self::report_root_shorthand`]) and the declaration-initializer
+    /// pass ([`Engine::resolve_decl_shorthands`]) both land the row at the
+    /// shorthand's selector span — `memberName` upstream — with the context
+    /// type's display as the second slot (`'_'` for a context-free
+    /// invocation, `dynamic` for the const root's known-invalid context).
+    /// Emitting twice at one selector is one verdict — the diagnostic set
+    /// dedups on the `(code, range)` pair so a stale-window resweep stays
+    /// idempotent.
+    pub(crate) fn emit_shorthand_undefined_member(&mut self, selector: SourceRange, context: &str) {
+        if self
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == selector && d.code.name == "dot_shorthand_undefined_member")
+        {
+            return;
+        }
+        let selector_text = self.source_slice(selector).to_string();
+        self.emit(
+            SemanticCode::DotShorthandUndefinedMember,
+            selector,
+            &selector_text,
+            context,
         );
     }
 
