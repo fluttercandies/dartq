@@ -4281,10 +4281,11 @@ impl<'a> Engine<'a> {
                 .unwrap_or_default();
             let face = self.tear_off_fn_ty(&sig, &type_params);
             // The same broken-capture gate as the member face: a
-            // prefix-sentinel or `Unknown` leaf in the captured
+            // prefix-sentinel leaf or an `Unknown` return in the captured
             // declaration re-reads the written signature from the
-            // source, the captured counts gating the candidate.
-            if self.has_prefix_sentinel(face)
+            // source, the captured counts gating the candidate. A
+            // type-less formal's `Unknown` is not a trigger.
+            if self.needs_recovery(face)
                 && let Some(rebuilt) = self.source_top_level_signature(
                     operand.name,
                     sig.positional.len(),
@@ -4327,37 +4328,29 @@ impl<'a> Engine<'a> {
         match entry.kind {
             MemberKind::Method => {
                 let formals = entry.formals.as_deref()?;
-                // A broken annotation capture (a prefix-sentinel or
-                // `Unknown` leaf anywhere in the captured face — the
-                // armed walk's `p.T` degradation) re-reads the member's
+                // A broken annotation capture (a prefix-sentinel leaf
+                // anywhere, or an `Unknown` RETURN — the armed walk's
+                // `p.T` degradation; a type-less formal's `Unknown` is an
+                // honest capture, not a trigger) re-reads the member's
                 // own written signature from the source: the return
                 // annotation before the name, the formals group after
                 // it, both with the honest required/optional/named
                 // split. The captured formal COUNTS gate the rebuild —
                 // a mis-split parse declines back to the captured face.
                 let broken = entry.return_ty == Ty::Unknown
-                    || self.has_prefix_sentinel(entry.return_ty)
+                    || self.needs_recovery(entry.return_ty)
                     || formals
                         .positional
                         .iter()
-                        .any(|formal| self.has_prefix_sentinel(formal.ty))
+                        .any(|formal| self.needs_recovery(formal.ty))
                     || formals
                         .named
                         .iter()
-                        .any(|formal| self.has_prefix_sentinel(formal.ty))
+                        .any(|formal| self.needs_recovery(formal.ty))
                     || entry
                         .type_param_bounds
                         .iter()
-                        .any(|bound| self.has_prefix_sentinel(*bound));
-                if std::env::var_os("DQ3567_TRACE").is_some() {
-                    eprintln!(
-                        "[3567] member broken={} captured-return={} formals-pos={} formals-named={}",
-                        broken,
-                        self.render_ty(entry.return_ty),
-                        formals.positional.len(),
-                        formals.named.len()
-                    );
-                }
+                        .any(|bound| self.needs_recovery(*bound));
                 if broken
                     && entry.name_range != MemberEntry::MISSING_NAME_RANGE
                     && let Some((type_params, return_ty, positional, required, named)) =
@@ -4386,9 +4379,6 @@ impl<'a> Engine<'a> {
                         )
                     };
                     let ty = self.boundary.canonical_dotted_ty(ty);
-                    if std::env::var_os("DQ3567_TRACE").is_some() {
-                        eprintln!("[3567] member rebuild ok: {}", self.render_ty(ty));
-                    }
                     return Some(ty);
                 }
                 let named: Vec<(StringId, Ty)> = formals
@@ -5245,19 +5235,37 @@ impl<'a> Engine<'a> {
     /// declaration-tree capture when the collector's armed walk poisons
     /// the annotation (the same face the `Named` arms above recover from
     /// the written spelling). Walks returns, formals, type-parameter
-    /// bounds, and argument lists at every depth; an `Unknown` return is
-    /// the same broken-capture signal (the whole annotation tree refused,
-    /// not one leaf).
-    fn has_prefix_sentinel(&self, ty: Ty) -> bool {
+    /// bounds, and argument lists at every depth. An `Unknown` is never a
+    /// sentinel here: a type-less formal (`topy([y,])` — implicit
+    /// `dynamic`) and an unannotated return are honest captures, and a
+    /// sig carrying them must keep its honest required-positional count.
+    fn has_prefix_leaf(&self, ty: Ty) -> bool {
+        self.sentinel_walk(ty, false)
+    }
+
+    /// Whether a face is worth re-reading from its written spelling: a
+    /// prefix-sentinel leaf anywhere ([`Self::has_prefix_leaf`]), or an
+    /// `Unknown` in RETURN position at any depth — the collector's armed
+    /// walk refuses the whole annotation tree of a prefixed generic
+    /// return (`core.List<core.int> f(...)`) and leaves `Unknown` there.
+    /// A type-less formal's `Unknown` does not qualify. The re-read of an
+    /// honestly unannotated return declines at the parse (no annotation
+    /// text) and the caller keeps the captured face, so the trigger errs
+    /// wide while the DISCARD in `operand_fn_sig` stays strict.
+    fn needs_recovery(&self, ty: Ty) -> bool {
+        self.sentinel_walk(ty, true)
+    }
+
+    fn sentinel_walk(&self, ty: Ty, unknown_return_counts: bool) -> bool {
         match ty {
-            Ty::Unknown => true,
             Ty::Named { name, args, .. } => {
                 if args == ArgListId::EMPTY {
                     !self.strings.resolve(name).contains('.')
                         && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
                 } else {
                     let list = self.boundary.args.borrow().get(args).to_vec();
-                    list.iter().any(|&arg| self.has_prefix_sentinel(arg))
+                    list.iter()
+                        .any(|&arg| self.sentinel_walk(arg, unknown_return_counts))
                 }
             }
             Ty::Function { shape, .. } => {
@@ -5274,14 +5282,17 @@ impl<'a> Engine<'a> {
                         shape.named.to_vec(),
                     )
                 };
-                self.has_prefix_sentinel(ret)
-                    || pos.iter().any(|&formal| self.has_prefix_sentinel(formal))
+                (unknown_return_counts && ret == Ty::Unknown)
+                    || self.sentinel_walk(ret, unknown_return_counts)
+                    || pos
+                        .iter()
+                        .any(|&formal| self.sentinel_walk(formal, unknown_return_counts))
                     || named
                         .iter()
-                        .any(|(_, formal)| self.has_prefix_sentinel(*formal))
-                    || names
-                        .iter()
-                        .any(|(_, bound)| bound.is_some_and(|b| self.has_prefix_sentinel(b)))
+                        .any(|(_, formal)| self.sentinel_walk(*formal, unknown_return_counts))
+                    || names.iter().any(|(_, bound)| {
+                        bound.is_some_and(|b| self.sentinel_walk(b, unknown_return_counts))
+                    })
             }
             _ => false,
         }
@@ -5536,7 +5547,7 @@ impl<'a> Engine<'a> {
                 return None;
             }
             let (inner, after) = Self::balanced_group(text, open)?;
-            let (positional, required, named) = self.parse_fn_params(inner, subst)?;
+            let (positional, required, named) = self.parse_fn_params(inner, subst, false)?;
             ty = if type_params.is_empty() {
                 self.boundary.args.borrow_mut().function_required(
                     0,
@@ -5594,10 +5605,15 @@ impl<'a> Engine<'a> {
     /// default]`); the name strips from the trailing identifier, the
     /// default from the first depth-0 `=`, and the remaining head parses
     /// as a leaf or a nested function literal (`void Function() f`).
+    /// `decl` marks a DECLARATION's formal list (a method or top-level
+    /// function's own group): there a lone identifier is the formal's
+    /// NAME with the implicit `dynamic` type (`topy([y,])`), where a
+    /// function-type literal's `Function(int)` spells a type-only formal.
     fn parse_fn_params(
         &self,
         inner: &str,
         subst: &FxHashMap<StringId, Ty>,
+        decl: bool,
     ) -> Option<(Vec<Ty>, u16, Vec<(StringId, Ty)>)> {
         let inner = inner.trim();
         if inner.is_empty() {
@@ -5657,7 +5673,7 @@ impl<'a> Engine<'a> {
             if piece.trim().is_empty() {
                 continue;
             }
-            positional.push(self.parse_formal_ty(piece, subst, false)?.1);
+            positional.push(self.parse_formal_ty(piece, subst, false, decl)?.1);
         }
         let required = u16::try_from(positional.len()).ok()?;
         let named: Vec<(StringId, Ty)> = match section {
@@ -5668,7 +5684,9 @@ impl<'a> Engine<'a> {
                         Self::split_top_commas(group, ',')
                             .into_iter()
                             .filter(|piece| !piece.trim().is_empty())
-                            .map(|piece| self.parse_formal_ty(piece, subst, false).map(|(_, ty)| ty))
+                            .map(|piece| {
+                                self.parse_formal_ty(piece, subst, false, decl).map(|(_, ty)| ty)
+                            })
                             .collect::<Option<Vec<_>>>()?,
                     );
                 }
@@ -5678,7 +5696,7 @@ impl<'a> Engine<'a> {
                 .into_iter()
                 .filter(|piece| !piece.trim().is_empty())
                 .map(|piece| {
-                    let (name, ty) = self.parse_formal_ty(piece, subst, true)?;
+                    let (name, ty) = self.parse_formal_ty(piece, subst, true, decl)?;
                     Some((name?, ty))
                 })
                 .collect::<Option<Vec<_>>>()?,
@@ -5692,12 +5710,16 @@ impl<'a> Engine<'a> {
     /// (`int x` → `int`, `List<int> x` → `List<int>`, bare `int` stays
     /// whole). A formal that is itself a function literal (`void
     /// Function() f`) recurses into [`Self::parse_fn_literal_at`]. The
-    /// name returns beside the type — the named column keys by it.
+    /// name returns beside the type — the named column keys by it. In a
+    /// declaration's group (`decl`) a lone identifier is the type-less
+    /// formal's name, its type the implicit `dynamic` (upstream's
+    /// unannotated-formal reading); a literal's lone identifier is a type.
     fn parse_formal_ty(
         &self,
         piece: &str,
         subst: &FxHashMap<StringId, Ty>,
         named: bool,
+        decl: bool,
     ) -> Option<(Option<StringId>, Ty)> {
         let mut head = piece.trim();
         if named && let Some(rest) = head.strip_prefix("required ") {
@@ -5727,6 +5749,10 @@ impl<'a> Engine<'a> {
             if start > 0 {
                 name = Some(self.intern(&head[start..end]));
                 head = head[..start].trim_end();
+            } else if decl {
+                // The whole piece is one identifier: a declaration's
+                // type-less formal, named and implicitly `dynamic`.
+                return Some((Some(self.intern(&head[..end])), Ty::Dynamic));
             }
         }
         if head.is_empty() {
@@ -5882,6 +5908,12 @@ impl<'a> Engine<'a> {
                 b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$' | b'.' | b'?' => {
                     start -= 1;
                 }
+                // Intra-annotation whitespace (`[core.List<core.int> x]`,
+                // `int Function`): the walk skips it and keeps the
+                // token-left scan — any statement-level character still
+                // stops the walk, and a cross-declaration walk's garbage
+                // declines at parse.
+                ch if ch.is_ascii_whitespace() => start -= 1,
                 _ => break,
             }
         }
@@ -5949,7 +5981,8 @@ impl<'a> Engine<'a> {
             return None;
         }
         let (inner, _) = Self::balanced_group(self.source, index)?;
-        let (positional, required, named) = self.parse_fn_params(inner, &FxHashMap::default())?;
+        let (positional, required, named) =
+            self.parse_fn_params(inner, &FxHashMap::default(), true)?;
         let return_text = self.backward_type_text(entry.name_range.offset)?;
         let return_ty = self.parse_annotation_ty(&return_text)?;
         Some((type_params, return_ty, positional, required, named))
@@ -6008,7 +6041,7 @@ impl<'a> Engine<'a> {
                 continue;
             };
             let Some((positional, required, named)) =
-                self.parse_fn_params(inner, &FxHashMap::default())
+                self.parse_fn_params(inner, &FxHashMap::default(), true)
             else {
                 continue;
             };
@@ -6124,22 +6157,7 @@ impl<'a> Engine<'a> {
             while index < bytes.len() && bytes[index].is_ascii_whitespace() {
                 index += 1;
             }
-            let subst: FxHashMap<StringId, Ty> = if args == ArgListId::EMPTY {
-                params
-                    .iter()
-                    .map(|&(name, bound)| bound.map(|bound| (name, bound)))
-                    .collect::<Option<FxHashMap<StringId, Ty>>>()?
-            } else {
-                let list = self.boundary.args.borrow().get(args).to_vec();
-                if list.len() != params.len() {
-                    return None;
-                }
-                params
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .zip(list)
-                    .collect()
-            };
+            let subst = self.alias_subst(&params, args)?;
             let (ty, _) = self.parse_fn_literal_at(&self.source[index..], &subst)?;
             let ty = match ty {
                 Ty::Function {
@@ -6154,6 +6172,29 @@ impl<'a> Engine<'a> {
             return Some(self.boundary.canonical_dotted_ty(ty));
         }
         None
+    }
+
+    /// The alias-parameter substitution a use site spells: the written
+    /// arguments zipped onto the parameters (counts must agree), or —
+    /// for a bare use — each parameter's own written bound
+    /// (`instantiateTypeFormalsToBounds`); a boundless bare parameter
+    /// declines.
+    fn alias_subst(
+        &self,
+        params: &[(StringId, Option<Ty>)],
+        args: ArgListId,
+    ) -> Option<FxHashMap<StringId, Ty>> {
+        if args == ArgListId::EMPTY {
+            return params
+                .iter()
+                .map(|&(name, bound)| bound.map(|bound| (name, bound)))
+                .collect();
+        }
+        let list = self.boundary.args.borrow().get(args).to_vec();
+        if list.len() != params.len() {
+            return None;
+        }
+        Some(params.iter().map(|(name, _)| *name).zip(list).collect())
     }
 
     /// already produced. `None` for a non-function or nullable face.
@@ -6228,14 +6269,22 @@ impl<'a> Engine<'a> {
         }
         // A captured declaration sig carrying a broken-annotation leaf
         // (the `p.T` truncation) declines in favor of the operand FACE's
-        // own sig — the source-recovered face the tear-off path built
-        // spells every leaf the ask compares.
-        if let Some(sig) = self.tear_off_sig(operand)
-            && !self.has_prefix_sentinel(sig.return_ty)
-            && sig.positional.iter().all(|formal| !self.has_prefix_sentinel(*formal))
-            && sig.named.iter().all(|(_, formal, _)| !self.has_prefix_sentinel(*formal))
-        {
-            return Some(sig);
+        // own sig — but only when that face IS the source-recovered one
+        // (a clean `Ty::Function`): the captured sig alone carries the
+        // declaration's honest required-positional count, and a face the
+        // recovery declined would hand the ask the pooled all-required
+        // reading instead (`topy([y,]) is! fy` — the trailing-comma
+        // family's optional formals). An `Unknown` leaf is never a reason
+        // to discard: a type-less formal is an honest capture.
+        if let Some(sig) = self.tear_off_sig(operand) {
+            let captured_broken = self.has_prefix_leaf(sig.return_ty)
+                || sig.positional.iter().any(|formal| self.has_prefix_leaf(*formal))
+                || sig.named.iter().any(|(_, formal, _)| self.has_prefix_leaf(*formal));
+            let face_recovered =
+                matches!(operand_ty, Ty::Function { .. }) && !self.needs_recovery(operand_ty);
+            if !captured_broken || !face_recovered {
+                return Some(sig);
+            }
         }
         self.fn_face_sig(operand_ty, None)
     }
@@ -7116,7 +7165,7 @@ impl<'a> Engine<'a> {
         // the operand's own source recovery spells. The parse bounds
         // itself structurally, so the span's trailing `)` never joins.
         if let Ty::Function { .. } = checked
-            && self.has_prefix_sentinel(checked)
+            && self.needs_recovery(checked)
         {
             let start = self.byte_of(at.offset);
             let end = self.byte_of(at.end());
@@ -7132,18 +7181,7 @@ impl<'a> Engine<'a> {
                 if let Some((recovered, _)) =
                     self.parse_fn_literal_at(&span_text[keyword_end + skip..], &FxHashMap::default())
                 {
-                    if std::env::var_os("DQ3567_TRACE").is_some() {
-                        eprintln!(
-                            "[3567] literal re-parse fired: {}",
-                            self.render_ty(recovered)
-                        );
-                    }
                     checked = self.canonical_function_ty(recovered);
-                } else if std::env::var_os("DQ3567_TRACE").is_some() {
-                    eprintln!(
-                        "[3567] literal re-parse DECLINED span={:?} tail={:?}",
-                        span_text, trimmed
-                    );
                 }
             }
         }
@@ -7231,13 +7269,6 @@ impl<'a> Engine<'a> {
             .unwrap_or(operand_ty);
         let operand_ty =
             self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
-        if std::env::var_os("DQ3567_TRACE").is_some() {
-            eprintln!(
-                "[3567] verdict operand={} checked={}",
-                self.render_ty(operand_ty),
-                self.render_ty(checked)
-            );
-        }
         if operand_ty == Ty::Unknown
             || matches!(operand_ty, Ty::Named { name, .. } if !self.strings.resolve(name).contains('.') && matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)

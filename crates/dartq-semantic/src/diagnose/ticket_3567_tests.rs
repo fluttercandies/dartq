@@ -409,3 +409,68 @@ fn literal_target_generic_inner_arity_stays_silent() {
         all_names(&report)
     );
 }
+
+// —— root 1's guard: unannotated formals are not broken captures ——
+
+/// The `arg_param_trailing_comma_test` family's shape: an old-style
+/// typedef and a top-level function spelling type-less formals (implicit
+/// `dynamic`). The tear-off's declaration sig carries the honest
+/// required-positional count (`[y,]` — none required); the pooled face
+/// cannot, and the type-less formal must not be mistaken for a broken
+/// annotation that discards that sig — `topy is! fy` is always false.
+#[test]
+fn untyped_optional_positional_tearoff_fires() {
+    let report = prefix_report(concat!(
+        "typedef fy([y,]);\n",
+        "void topy([y,]) {}\n",
+        "void t() { if (topy is! fy) throw ''; }\n",
+    ));
+    assert!(
+        !utc_rows(&report).is_empty(),
+        "diags: {:?}",
+        all_names(&report)
+    );
+}
+
+/// The mixed twin: one required and one optional positional
+/// (`fxy(x, [y,])`) on both sides — the split survives the tear-off.
+#[test]
+fn untyped_mixed_positional_tearoff_fires() {
+    let report = prefix_report(concat!(
+        "typedef fxy(x, [y,]);\n",
+        "void topxy(x, [y,]) {}\n",
+        "void t() { if (topxy is! fxy) throw ''; }\n",
+    ));
+    assert!(
+        !utc_rows(&report).is_empty(),
+        "diags: {:?}",
+        all_names(&report)
+    );
+}
+
+/// The arity twin: a tear-off REQUIRING its positional against a target
+/// that makes it optional — `void Function(dynamic)` is no subtype of
+/// `Function([dynamic])` (upstream's `_isFunctionSubtypeOf` positional
+/// leg), informative, no row.
+///
+/// Ignored: an old-style typedef (`typedef fy([y,]);`) has no `Fn`
+/// alias capture, so the target never folds to a signature and the
+/// verdict falls to the pooled-shape reflexivity, which reads
+/// `Function(dynamic)` and `Function([dynamic])` as one id and reports a
+/// row the oracle does not. Fixing it means producing the written target
+/// shape with its optional split (the required count must survive the
+/// canonical re-intern); the operand side is already honest.
+#[test]
+#[ignore = "pre-existing: old-style typedef targets lose their optional split on the pooled-shape path"]
+fn untyped_required_against_optional_stays_silent() {
+    let report = prefix_report(concat!(
+        "typedef fy([y,]);\n",
+        "void topx(x,) {}\n",
+        "void t() { if (topx is! fy) throw ''; }\n",
+    ));
+    assert!(
+        utc_rows(&report).is_empty(),
+        "diags: {:?}",
+        all_names(&report)
+    );
+}
