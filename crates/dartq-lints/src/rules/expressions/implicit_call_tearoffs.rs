@@ -5,6 +5,34 @@ use super::{
 };
 use crate::rules::{TypeFace, slice};
 
+/// Whether the rows carry a tear-off instantiation (`c<int>` /
+/// `C()<int>`): a `TypeArguments` row no `Arguments` follows (a generic
+/// invocation's type arguments precede its argument list).
+fn is_instantiation(c: &Check<'_>, rows: &[u32]) -> bool {
+    rows.iter()
+        .rposition(|&row| c.kind(row) == NodeKind::TypeArguments)
+        .is_some_and(|ta_pos| {
+            !rows[ta_pos + 1..]
+                .iter()
+                .any(|&row| c.kind(row) == NodeKind::Arguments)
+        })
+}
+
+/// The report end of a value-position run: [`value_run_end`], extended
+/// through a trailing tear-off instantiation's type arguments — the
+/// resolver's `ImplicitCallReference` spans `c<int>` / `C()<int>` whole.
+fn instantiation_end(c: &Check<'_>, rows: &[u32], fallback: u32) -> u32 {
+    let end = value_run_end(c, rows, fallback);
+    if !is_instantiation(c, rows) {
+        return end;
+    }
+    let ta_pos = rows
+        .iter()
+        .rposition(|&row| c.kind(row) == NodeKind::TypeArguments)
+        .expect("checked above");
+    end.max(c.utf16_span(rows[ta_pos]).end)
+}
+
 /// Official: `pkg/linter/lib/src/rules/implicit_call_tearoffs.dart` —
 /// the resolution-built `ImplicitCallReference` (an object with a
 /// `call` member used where a function is expected) reports at the
@@ -71,7 +99,10 @@ fn context_face(c: &mut Check<'_>) {
     let context_is_function = match c.kind(node) {
         NodeKind::VariableInitializer => {
             let decl = c.unit.ast.parent(node);
-            decl.is_some_and(|decl| written_row_is_function(c, declaration_type_row(c, decl)))
+            decl.is_some_and(|decl| {
+                written_row_is_function(c, declaration_type_row(c, decl))
+                    || written_row_is_function(c, top_level_declaration_type_row(c, node, decl))
+            })
         }
         NodeKind::Assignment => {
             let Some(op) = c.field(node, PayloadField::Operator) else {
@@ -115,7 +146,7 @@ fn context_face(c: &mut Check<'_>) {
     // span it in source order — the run's last value row bounds the
     // end (the send-group completion wrappers finalize at the `;`).
     let start = c.utf16_span(rows[0]).start;
-    let end = value_run_end(c, &rows, node);
+    let end = instantiation_end(c, &rows, node);
     c.report(start..end, &[]);
 }
 
@@ -158,7 +189,7 @@ fn return_face(c: &mut Check<'_>) {
             )
         })
         .collect();
-    let end = value_run_end(c, &operands, node);
+    let end = instantiation_end(c, &operands, node);
     c.report(start..end, &[]);
 }
 
@@ -269,8 +300,12 @@ fn argument_face(c: &mut Check<'_>) {
     // owns no expression operand). The production tiling wraps the
     // instantiation in a `TypeApplication` row whose `TypeArguments`
     // piece seals after the operand's `Send` — the slice is the owner
-    // window minus the trailing statement/completion rows.
-    if instantiation_face(c, node, &kids) {
+    // window minus the trailing statement/completion rows. When this
+    // dispatch's window carries the shape while the operand verdict here
+    // fails (the head is the outer call, not the callable), the window
+    // still owns the row through another dispatch — the value loop stays
+    // out either way.
+    if instantiation_face(c, node, &kids) || is_instantiation(c, &kids) {
         return;
     }
     let Some(arguments) = arg_row else {
@@ -321,6 +356,13 @@ fn argument_face(c: &mut Check<'_>) {
             positional += 1;
             (*row, &pieces[range.start..range.end])
         };
+        // A tear-off instantiation argument (`g(c<int>)`) is the
+        // instantiation face's row — the owner window reports it whole;
+        // this loop's value verdict would report the bare operand
+        // beside it.
+        if is_instantiation(c, value) {
+            continue;
+        }
         if !formal_is_function_typed(c, formal) {
             continue;
         }
@@ -502,33 +544,25 @@ fn enclosing_collection_element_is_function(c: &Check<'_>, _node: u32) -> bool {
             NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration
         )
     });
-    let type_row = function.and_then(|f| {
-        let name = c
-            .collect_direct(f)
-            .into_iter()
-            .find(|&kid| c.kind(kid) == NodeKind::Identifier)?;
-        crate::rules::type_before(c, f, name).map(|(row, _)| row)
-    });
-    let Some(type_row) = type_row else {
+    let Some(function) = function else {
         return false;
     };
-    // The `List<…>`/`Set<…>`/`Map<…, …>` type's `TypeArguments` subtree:
-    // the element context is the first `FunctionType` argument (the
-    // collection's element face; a map literal's value shares it). The
-    // `TypeArguments` row tiles as the `Type` row's sibling inside the
-    // type's byte span, so the walk scans every row the span covers.
-    let span = c.byte_span(type_row);
-    let Some(owner) = c.unit.ast.parent(type_row) else {
-        return false;
+    // The declaration header carries the written return type whole: the
+    // production order tiles the name first with the generic type's
+    // `TypeArguments` and `Type` pieces after it (and plain types before
+    // it), so the face scans every header row before the formal
+    // parameters and descends the type rows — the return type is
+    // function-typed when a `FunctionType` (or the bare `Function`
+    // spelling) sits anywhere in them.
+    let members = c.collect_direct(function);
+    let formals = members
+        .iter()
+        .position(|&kid| c.kind(kid) == NodeKind::FormalParameters);
+    let header: Vec<u32> = match formals {
+        Some(end) => members[..end].to_vec(),
+        None => members.clone(),
     };
-    let mut pending: Vec<u32> = c
-        .collect_direct(owner)
-        .into_iter()
-        .filter(|&row| {
-            let s = c.byte_span(row);
-            s.start >= span.start && s.end <= span.end
-        })
-        .collect();
+    let mut pending: Vec<u32> = header;
     while let Some(row) = pending.pop() {
         match c.kind(row) {
             NodeKind::FunctionType => return true,
@@ -720,6 +754,21 @@ fn assigned_name<'a>(c: &'a Check<'_>, run: &[u32]) -> Option<&'a str> {
 /// variable row — [`written_type_sibling`]).
 fn declaration_type_row(c: &Check<'_>, decl: u32) -> Option<u32> {
     written_type_sibling(c, decl, &[NodeKind::Type, NodeKind::FunctionType])
+}
+
+/// The top-level tiling's written type row: the initializer's decl
+/// parent is the variable's `InitializedIdentifier`, whose written
+/// type rides the enclosing `TopLevelFields` row outside every wrapper
+/// the sibling walks climb — the same-file binding channel answers
+/// (the name carries the top-level-variable context, and
+/// [`crate::rules::expressions::same_file::binding`] matches the
+/// declaring field itself).
+fn top_level_declaration_type_row(c: &Check<'_>, use_node: u32, decl: u32) -> Option<u32> {
+    if c.kind(decl) != NodeKind::InitializedIdentifier {
+        return None;
+    }
+    let name = crate::rules::initialized_identifier_name(c, decl)?;
+    super::same_file::binding(c, use_node, c.lexeme(name))?.1
 }
 
 /// The assignment target's context verdict, shadow-correct: the

@@ -661,6 +661,22 @@ fn check_typed_target(
     report_run(c, run);
 }
 
+/// The written type row of a for-each loop variable: the declaration
+/// sibling read, else the for-each lane's own tiling — the loop
+/// variable's name row precedes its written type in the owner window
+/// (`[…, Identifier, Type, …]`, the declaration opens at the name), so
+/// the type rides the window's next row.
+fn loop_variable_type_row(c: &Check<'_>, loop_name_row: u32) -> Option<u32> {
+    super::written_type_sibling(c, loop_name_row, &[NodeKind::Type, NodeKind::FunctionType])
+        .or_else(|| {
+            let parent = c.unit.ast.parent(loop_name_row)?;
+            let members = c.collect_direct(parent);
+            let index = members.iter().position(|&m| m == loop_name_row)?;
+            let right = *members.get(index + 1)?;
+            matches!(c.kind(right), NodeKind::Type | NodeKind::FunctionType).then_some(right)
+        })
+}
+
 /// The for-each faces (:198-235): the iterable judges against the
 /// implicit `Iterable`/`Stream` target (`await for` streams), and a
 /// typed loop variable judges when the iterable's written element type
@@ -713,9 +729,7 @@ fn for_each_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     else {
         return;
     };
-    let Some(loop_type_row) =
-        super::written_type_sibling(c, loop_name_row, &[NodeKind::Type, NodeKind::FunctionType])
-    else {
+    let Some(loop_type_row) = loop_variable_type_row(c, loop_name_row) else {
         return;
     };
     let loop_face = type_face(c, loop_type_row);

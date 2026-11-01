@@ -3811,3 +3811,10 @@ fn implicit_call_tearoffs_function_target_and_creation() {
         1
     );
 }
+
+/// The #3322 oracle-corpus pins (`no_dynamic_casts`,
+/// `implicit_call_tearoffs`) — every conformance case of each rule
+/// against its oracle rows.
+#[cfg(test)]
+#[path = "t3322_pins.rs"]
+mod t3322_pins;
