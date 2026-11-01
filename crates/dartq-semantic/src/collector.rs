@@ -134,13 +134,15 @@ struct OpenContainer {
     /// The member name set so far (sorted-insert; sealed into the
     /// finished [`Container::members`] at the close).
     members: NameMapBuilder<MemberEntry>,
-    /// The declaration-scoped member-claim bitmasks (bare lexeme →
-    /// `DUP_*` bits), mirroring the oracle's per-element
-    /// `instanceScope`/`staticScope` — getter/setter pair merges and
-    /// every other same-name claim report here, independently of the
-    /// keep-first `members` map.
-    dup_instance: NameMapBuilder<u8>,
-    dup_static: NameMapBuilder<u8>,
+    /// The index of this container's member-claim scope row in
+    /// [`Builder::member_scopes`] (bare lexeme → `DUP_*` bits), mirroring
+    /// the oracle's per-element `instanceScope`/`staticScope` —
+    /// getter/setter pair merges and every other same-name claim report
+    /// there, independently of the keep-first `members` map. The row lives
+    /// on the ELEMENT, not the declaration: an `augment` container opens
+    /// with its introduction's index, so a merged element's members share
+    /// one scope.
+    scope: usize,
     type_params: u16,
     /// The header's type-parameter spellings in declaration order (the
     /// container-open take of the buffered group; empty when the header
@@ -197,6 +199,26 @@ struct OpenContainer {
     /// The header's `extends` keyword span, latched at
     /// `handle_class_extends` while the container is an augmentation.
     augment_extends: Option<SourceRange>,
+}
+
+/// One declared container's member-claim scope, alive for the whole unit:
+/// the oracle's per-ELEMENT `_InstanceElementContext`. Upstream resolves the
+/// context through `_getElementContext(fragment.element.firstFragment)`
+/// (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/error/member_duplicate_definition_verifier.dart`
+/// `_checkClassMembers`), so every fragment of one merged element — the
+/// introduction and each of its augmentations — shares ONE
+/// `instanceScope`/`staticScope` pair. Each row is one declaration's pair;
+/// an `augment` declaration opens with its introduction's row instead of a
+/// fresh one.
+struct MemberScope {
+    /// The container's own name; [`StringId::NONE`] for an unnamed
+    /// extension, whose scope never matches an augmentation.
+    name: StringId,
+    /// The instance-member claims (the oracle's `instanceScope`).
+    instance: NameMapBuilder<u8>,
+    /// The static-member claims (the oracle's `staticScope`).
+    statics: NameMapBuilder<u8>,
 }
 
 /// The open constructor's capture: the named selectors it declares plus
@@ -306,6 +328,10 @@ struct PendingTop {
     name: Option<(StringId, SourceRange)>,
     type_params: u16,
     type_param_names: Vec<StringId>,
+    /// Their declared bounds, parallel to `type_param_names` and taken with
+    /// them at the depth-1 close (`Dynamic` for an absent bound) — the
+    /// resolved bound ledger's per-spelling face.
+    type_param_bounds: Vec<Ty>,
     return_ty: Ty,
     formals: Option<Box<Formals>>,
     is_external: bool,
@@ -335,6 +361,10 @@ struct PendingTypedef {
     /// group closes) — the use-site substitution face zips the written
     /// arguments against it.
     type_param_names: Vec<StringId>,
+    /// The declaration's own type-parameter bounds, parallel to
+    /// [`PendingTypedef::type_param_names`] (`Dynamic` for an absent
+    /// bound) — taken at the same first depth-1 close.
+    type_param_bounds: Vec<Ty>,
     /// The old-style head's return type, latched at the name identifier
     /// (`typedef int fx(int)` — `int` parses between `typedef` and the
     /// name). The modern `=` arm never reads it (its RHS arms later).
@@ -406,6 +436,14 @@ struct Builder<'src, 'tab> {
     /// containers live on [`Builder::containers`]).
     named_containers: NameMapBuilder<Container>,
     containers: Vec<OpenContainer>,
+    /// Every declared container's member-claim scope, in declaration order
+    /// (the open container indexes it through [`OpenContainer::scope`]).
+    /// The rows outlive their declarations because the oracle's scopes hang
+    /// off the merged ELEMENT, not the fragment: an `augment` claims into
+    /// the introduction's pair (upstream
+    /// `member_duplicate_definition_verifier.dart` `_checkClassMembers`
+    /// resolves `_getElementContext(fragment.element.firstFragment)`).
+    member_scopes: Vec<MemberScope>,
     /// The top-level setter claims (`definedSetters`, upstream
     /// duplicate_definition_verifier.dart checkUnit): a non-final
     /// top-level variable claims its induced `name=` setter alongside
@@ -506,6 +544,11 @@ struct Builder<'src, 'tab> {
     field_external: bool,
     /// The field group's `final` modifier (the abstract-field setter split).
     field_final: bool,
+    /// The field group's `covariant` keyword (`begin_fields` latches,
+    /// `end_fields`/`end_top_level_fields` clears) — upstream
+    /// `fieldFragment.isExplicitlyCovariant`; it lands on
+    /// [`MemberEntry::covariant`], which the induced-setter faces read.
+    field_covariant: bool,
     /// The field group's `late` modifier: `late final` declares a setter
     /// only while the declarator has no initializer (the induced-accessor
     /// fact `field.definesSetter` reads, upstream
@@ -582,6 +625,15 @@ struct Builder<'src, 'tab> {
     formal_default_depth: u32,
     positional_formals: Vec<Formal>,
     named_formals: Vec<Formal>,
+    /// The open parameter list's name scope — ONE
+    /// `_FormalParameterDuplicateIdentifierScope` per list, shared across
+    /// the positional and named sections (upstream
+    /// `duplicate_definition_verifier.dart` `checkParameters`). Each entry
+    /// is `(name, wildcard-shaped)`: a wildcard-shaped `_` never reports
+    /// under the wildcard-variables feature but does without it, so the
+    /// capture parks that row in the wildcard log instead of the hard
+    /// duplicate log (`record_wildcard_duplicate`).
+    formal_scope: Vec<(StringId, bool)>,
     /// The current type-parameter list's nesting depth (the executable's
     /// own list is depth 1).
     type_group_depth: u32,
@@ -722,6 +774,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             top_const_group: false,
             named_containers: NameMapBuilder::default(),
             containers: Vec::new(),
+            member_scopes: Vec::new(),
             top_setters: NameMapBuilder::default(),
             container_order: Vec::new(),
             extension_faces: Vec::new(),
@@ -748,6 +801,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             field_abstract: false,
             field_external: false,
             field_final: false,
+            field_covariant: false,
             field_late: false,
             field_augment: None,
             field_static: None,
@@ -768,6 +822,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             formal_default_depth: 0,
             positional_formals: Vec::new(),
             named_formals: Vec::new(),
+            formal_scope: Vec::new(),
             type_group_depth: 0,
             type_arg_depth: 0,
             type_var_group: Vec::new(),
@@ -885,22 +940,25 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// `DUP_GETTER`/`DUP_SETTER`/`DUP_OTHER`; augment members never reach
     /// here (their fragments neither check nor claim, upstream :307-309).
     ///
-    /// The scope lives on the ELEMENT, not the name
-    /// (`_getElementContext(firstFragment)` — the oracle keys its
-    /// `_InstanceElementContext` on the declaration's own fragment): a
-    /// second non-augment container of the same name is a fresh element
-    /// with a fresh scope (`class C {int x;} class C {int x;}` reports
-    /// only the class-name duplicate, never a member collision), so the
-    /// maps never share across container declarations — augment members
-    /// skip the claim outright, leaving no cross-declaration sharer.
+    /// The scope lives on the ELEMENT, not the declaration
+    /// (`_getElementContext(fragment.element.firstFragment)` — the oracle
+    /// keys its `_InstanceElementContext` on the MERGED element's first
+    /// fragment): a second non-augment container of the same name is a
+    /// fresh element with a fresh scope (`class C {int x;} class C {int
+    /// x;}` reports only the class-name duplicate, never a member
+    /// collision), while every `augment` of one element claims into that
+    /// element's pair — `class A {int foo;} augment class A {int foo;}`
+    /// reports at the augment's member. [`OpenContainer::scope`] carries
+    /// the resolved row.
     fn member_dup_claim(&mut self, bare: StringId, is_static: bool, claim: u8, range: SourceRange) {
-        let Some(open) = self.containers.last_mut() else {
+        let Some(scope_index) = self.containers.last().map(|open| open.scope) else {
             return;
         };
+        let scope = &mut self.member_scopes[scope_index];
         let scope = if is_static {
-            &mut open.dup_static
+            &mut scope.statics
         } else {
-            &mut open.dup_instance
+            &mut scope.instance
         };
         let prior = match scope.entry(bare) {
             Entry::Vacant(_) => None,
@@ -1020,6 +1078,22 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// recovery synthetics carry the parser's chosen fallback span).
     fn span_of(&self, token: Token) -> SourceRange {
         token.range
+    }
+
+    /// The scanner kind behind a span; `None` for a token outside the table
+    /// (the parser's own synthetic boundary spans).
+    fn kind_of(&self, token: Token) -> Option<TokenKind> {
+        self.tokens.get(token.id as usize).map(|t| t.kind)
+    }
+
+    /// Whether the span names an identifier-shaped slot — an identifier or a
+    /// keyword (a keyword still occupies a name slot; the parser's junk
+    /// slots — a `,`, a closer, a literal — do not).
+    fn names_a_slot(&self, token: Token) -> bool {
+        matches!(
+            self.kind_of(token),
+            Some(TokenKind::Identifier | TokenKind::Keyword(_))
+        )
     }
 
     /// Zips the type-variable group's parallel buffers into the augment
@@ -1861,6 +1935,29 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         } else {
             Vec::new()
         };
+        // The member-claim scope: an `augment` declaration joins its
+        // element's introduction (upstream keys the context on the merged
+        // element's first fragment), every other declaration opens a fresh
+        // pair — two same-named introductions are two elements with two
+        // scopes. An unnamed extension never matches (its symbol is
+        // `StringId::NONE`).
+        let scope = if self.declaring_augment {
+            name.and_then(|(name, _)| {
+                self.member_scopes
+                    .iter()
+                    .position(|scope| scope.name == name)
+            })
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            self.member_scopes.push(MemberScope {
+                name: name.map_or(StringId::NONE, |(name, _)| name),
+                instance: NameMapBuilder::default(),
+                statics: NameMapBuilder::default(),
+            });
+            self.member_scopes.len() - 1
+        });
         self.containers.push(OpenContainer {
             name,
             kind,
@@ -1871,8 +1968,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             is_interface: false,
             is_mixin_class: false,
             members: NameMapBuilder::default(),
-            dup_instance: NameMapBuilder::default(),
-            dup_static: NameMapBuilder::default(),
+            scope,
             type_params: header_type_params,
             type_param_names,
             type_param_bounds,
@@ -2045,14 +2141,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 annotations: open.annotations.into_boxed_slice(),
             });
         }
-        // The member-claim bitmasks die with the declaration: the oracle's
-        // scopes live on the element (its first fragment), a same-named
-        // later declaration is a fresh element with a fresh scope
-        // (`member_dup_claim`'s note), and an `augment` member never
-        // claims — no cross-declaration merge exists.
-        // Extension headers capture no residue (their window's types latch
-        // through `note_header_reference`, not the clause buffer), so
-        // nothing else to commit here.
+        // The member-claim scope rows stay in `member_scopes` past this
+        // close: the oracle's scopes live on the merged element (its first
+        // fragment), so a later `augment` of this declaration opens onto
+        // the same pair (`member_dup_claim`'s note). Extension headers
+        // capture no residue (their window's types latch through
+        // `note_header_reference`, not the clause buffer), so nothing else
+        // to commit here.
     }
 
     /// Marks the open container `sealed` (the `sealed` modifier event).
@@ -2422,7 +2517,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 // in declaration order — the cross-file closure-formal solver
                 // pairs explicit type arguments against them positionally.
                 pending.type_param_names = std::mem::take(&mut self.type_var_group);
-                std::mem::take(&mut self.type_var_bounds);
+                // The declared bounds ride beside their spellings: without
+                // them the resolved bound ledger answers the unbounded face
+                // for every use of the parameter (`T extends St` never
+                // closes a switch, #3336).
+                pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
             }
         } else if let Some(pending) = &mut self.pending_typedef {
             // The declaring group closes before the right-hand side parses
@@ -2959,6 +3058,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_abstract: false,
                 is_external: false,
                 is_final: false,
+                covariant: false,
                 type_params: 0,
                 type_param_names: Box::default(),
                 type_param_bounds: Box::default(),
@@ -3567,6 +3667,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     let is_abstract = builder.field_abstract;
                     let is_external = builder.field_external;
                     let is_final = builder.field_final;
+                    let field_covariant = builder.field_covariant;
                     let field_late = builder.field_late;
                     let name_end = if builder.source.is_ascii() {
                         range.end()
@@ -3646,6 +3747,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 kind: MicroKind::TopLevelVar,
                                 type_params: 0,
                                 type_param_names: Box::new([]),
+                                type_param_bounds: Box::new([]),
                                 var_ty: ty,
                                 return_ty: Ty::UNKNOWN,
                                 formals: None,
@@ -3700,6 +3802,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     is_abstract,
                                     is_external,
                                     is_final,
+                                    covariant: field_covariant,
                                     type_params: 0,
                                     type_param_names: Box::default(),
                                     type_param_bounds: Box::default(),
@@ -3778,6 +3881,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 is_abstract: false,
                                 is_external: false,
                                 is_final: false,
+                                covariant: false,
                                 type_params: 0,
                                 type_param_names: Box::default(),
                                 type_param_bounds: Box::default(),
@@ -3960,6 +4064,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             && pending.type_param_names.is_empty()
         {
             pending.type_param_names = std::mem::take(&mut builder.type_var_group);
+            pending.type_param_bounds = std::mem::take(&mut builder.type_var_bounds);
         }
         if let Some(site) = builder.capture.as_mut() {
             site.type_variables_end();
@@ -3994,6 +4099,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // declares), so only `final`'s `late`-no-initializer exception reads
         // the narrower keyword below — `defines_setter` treats both as the
         // getter-only claim.
+        builder.field_covariant = _covariant_kw.is_some();
         builder.field_final = _var_final_or_const
             .and_then(|t| builder.tokens.get(t.id as usize))
             .is_some_and(|tok| {
@@ -4034,6 +4140,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_covariant = false;
         builder.field_late = false;
         builder.field_augment = None;
         builder.declaring_augment = false;
@@ -4067,6 +4174,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_covariant = false;
         builder.field_late = false;
         builder.field_augment = None;
         builder.declaring_augment = false;
@@ -4230,7 +4338,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     builder
                         .pending_top
                         .as_ref()
-                        .map(|t| (t.type_param_names.clone(), Vec::new()))
+                        .map(|t| (t.type_param_names.clone(), t.type_param_bounds.clone()))
                 })
                 .unwrap_or_default();
             pending.type_params = builder.zip_type_var_rows(&names, &bounds);
@@ -4280,6 +4388,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_abstract: !pending.has_body && !pending.is_external,
                     is_external: pending.is_external,
                     is_final: false,
+                    // Executables carry no `covariant` member flag — their
+                    // parameter marks ride `Formal::covariant`.
+                    covariant: false,
                     type_params: pending.type_params,
                     type_param_names: pending.type_param_names.into_boxed_slice(),
                     type_param_bounds: pending.type_param_bounds.into_boxed_slice(),
@@ -4369,6 +4480,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             name: None,
             type_params: 0,
             type_param_names: Vec::new(),
+            type_param_bounds: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
             is_external: external.is_some(),
@@ -4472,12 +4584,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 });
             }
             if let Some(mut augment) = builder.pending_aug.take() {
-                let names = builder
+                let (names, bounds) = builder
                     .pending_top
                     .as_ref()
-                    .map(|t| t.type_param_names.clone())
+                    .map(|t| (t.type_param_names.clone(), t.type_param_bounds.clone()))
                     .unwrap_or_default();
-                augment.type_params = builder.zip_type_var_rows(&names, &[]);
+                augment.type_params = builder.zip_type_var_rows(&names, &bounds);
                 augment.type_params_close = builder.type_group_close;
                 augment.name = spelling;
                 let spelling_text = builder.strings.resolve(spelling);
@@ -4524,6 +4636,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     kind: MicroKind::TopLevelFn,
                     type_params: pending.type_params,
                     type_param_names: pending.type_param_names.into_boxed_slice(),
+                    type_param_bounds: pending.type_param_bounds.into_boxed_slice(),
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,
@@ -4551,6 +4664,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             name: None,
             type_params: 0,
             type_param_names: Vec::new(),
+            type_param_bounds: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
             annotations,
@@ -5194,6 +5308,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     kind: MicroKind::TypeAlias,
                     type_params: pending.type_params,
                     type_param_names: pending.type_param_names.into_boxed_slice(),
+                    type_param_bounds: pending.type_param_bounds.into_boxed_slice(),
                     var_ty,
                     return_ty: Ty::UNKNOWN,
                     formals: None,
@@ -5355,6 +5470,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if builder.formal_depth == 0 {
             builder.positional_formals.clear();
             builder.named_formals.clear();
+            builder.formal_scope.clear();
         }
         // A depth-0 generalized-function-type group is a type shape, never
         // the executable's own formals: `int Function() topFn(int x)` parses
@@ -5566,6 +5682,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             }
         }
         let builder = &mut self.builder;
+        // The name slot's own token: a typed formal with no identifier (a
+        // function type's `Void Function(Int32, VarArgs<(Int32, Int32)>)`
+        // members, a true-junk slot behind a type) arrives as the CURRENT
+        // token — a `,`/`)`/literal — which the oracle never treats as a
+        // name (`parser_impl.dart:2229` consumes a name only
+        // `if (next.isIdentifier)`, and the duplicate scope bails on a
+        // null/synthetic identifier). Such a slot never joins the list's
+        // name scope, so two of them never fake a duplicate.
+        let name_token = name;
         let Some((name, range)) = builder.capture_name(name) else {
             return;
         };
@@ -5630,6 +5755,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             _ => None,
         };
         let covariant = covariant_kw.is_some();
+        // The declaring formal's own field is `final` only behind the
+        // written `final` keyword: `var int a` induces a mutable field
+        // (upstream `fieldFragment.isFinal = formalParameter.isFinal`,
+        // element_builder.dart:2090-2092).
+        let declaring_final = var_or_final
+            .is_some_and(|token| builder.kind_of(token) == Some(TokenKind::Keyword(Keyword::Final)));
         // A class/enum primary-constructor formal with a `var`/`final`
         // keyword declares an instance field (`FieldFormalParameterElement
         // .isDeclaring`): bodies read it bare and instances through the
@@ -5653,7 +5784,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_static: false,
                 is_abstract: false,
                 is_external: false,
-                is_final: false,
+                is_final: declaring_final,
+                // A `covariant` declaring formal marks its induced field's
+                // setter parameter covariant — the same mark
+                // `fieldFragment.isExplicitlyCovariant` carries (upstream
+                // `covariant var A foo`).
+                covariant,
                 type_params: 0,
                 type_param_names: Box::default(),
                 type_param_bounds: Box::default(),
@@ -5663,12 +5799,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 annotations: Box::default(),
                 name_range: range,
             });
-            // The declaring formal's field claims the instance getter face
-            // (upstream `checkPrimaryConstructorFormals` walks the induced
-            // accessor; the field's `is_final` capture hardcodes false
-            // below — a latent under-report on `final` declaring formals'
-            // setter claim, ledger).
+            // The declaring formal's field claims its induced accessors in
+            // the member scope: the getter always, the setter when the
+            // field is not final (upstream `_checkClassMembers`' primary
+            // constructor arm claims `fieldElement.getter` and, `if
+            // (fieldElement.setter case var setter?)`, the setter —
+            // member_duplicate_definition_verifier.dart:64-97). The claim
+            // runs BEFORE the body members, so a body member re-declaring
+            // the name reports at its own token.
             builder.member_dup_claim(name, false, DUP_GETTER, range);
+            if !declaring_final {
+                builder.member_dup_claim(name, false, DUP_SETTER, range);
+            }
         }
         // A positional `super.name` formal carries the marker so the
         // use-site patch can count the forwards preceding it
@@ -5732,27 +5874,46 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // across the whole list — a positional formal's name collides with a
         // named formal's and vice versa (duplicate_definition_verifier.dart
         // :56-82; the `parameters_*` census rows report positional collisions
-        // the named-only scan missed). The wildcard gate: `this._` is a
-        // FieldFormalParameterElement — never a wildcard — while `super._`
-        // and a `var`/`final` primary-constructor declaring formal are
-        // ordinary parameters and DO wildcard (upstream :444-457 reads the
-        // element kind, not the keyword). A second `_` therefore parks in
-        // the wildcard log unless it is a `this.` formal.
+        // the named-only scan missed). Two gates shape the row:
+        //
+        // - the wildcard gate: `this._` is a FieldFormalParameterElement —
+        //   never a wildcard — while `super._` and a `var`/`final`
+        //   primary-constructor declaring formal are ordinary parameters and
+        //   DO wildcard (upstream :444-457 reads the element kind, not the
+        //   keyword). A wildcard never enters the scope, so it neither
+        //   collides nor blocks: `void f(int _, int _)` is silent under the
+        //   feature and reports without it, and `A(int _, this._)` is silent
+        //   in BOTH (the plain formal is skipped, the field formal claims an
+        //   empty scope);
+        // - the name-slot gate: a formal whose name token is not an
+        //   identifier (a function type's unnamed parameters, a true-junk
+        //   slot behind a type) never joins the scope — the oracle's
+        //   `checkParameters` skips the null identifier outright.
         let is_named = matches!(
             kind,
             FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
         );
-        let dup_hit = builder.positional_formals.iter().any(|f| f.name == name)
-            || builder.named_formals.iter().any(|f| f.name == name);
-        if dup_hit {
-            let wildcard = builder.strings.resolve(name) == "_"
-                && this_keyword.is_none()
-                && !(member_kind == ParserMemberKind::PrimaryConstructor && var_or_final.is_some());
-            if wildcard {
-                builder.record_wildcard_duplicate(range);
-            } else {
-                builder.record_duplicate(name, range);
+        let wildcard_shaped = builder.strings.resolve(name) == "_"
+            && this_keyword.is_none()
+            && !(member_kind == ParserMemberKind::PrimaryConstructor && var_or_final.is_some());
+        if builder.names_a_slot(name_token) {
+            // A prior non-wildcard claim is the hard collision (both
+            // readings report it); a wildcard-only prior collides only
+            // while the feature is off, so its row parks in the wildcard
+            // log (dropped on a feature-enabled unit).
+            let prior_hard = builder
+                .formal_scope
+                .iter()
+                .any(|&(prior, wildcard)| prior == name && !wildcard);
+            let prior_any = builder.formal_scope.iter().any(|&(prior, _)| prior == name);
+            if prior_any {
+                if wildcard_shaped || !prior_hard {
+                    builder.record_wildcard_duplicate(range);
+                } else {
+                    builder.record_duplicate(name, range);
+                }
             }
+            builder.formal_scope.push((name, wildcard_shaped));
         }
         // The formal's own star — drained from the latch `begin_formal_
         // parameter` armed — joins the side-map under the resolved owner
@@ -5824,6 +5985,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_abstract: false,
                 is_external: false,
                 is_final: true,
+                // The representation formal is always `final` — no induced
+                // setter exists for the flag to mark.
+                covariant: false,
                 type_params: 0,
                 type_param_names: Box::default(),
                 type_param_bounds: Box::default(),

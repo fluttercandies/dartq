@@ -889,6 +889,23 @@ impl<'a> Engine<'a> {
         let setter_name = self.setter_spelling(spelling);
         let (effective, inferred_setter_covariant) =
             self.effective_declared(container, entry, spelling, setter_name, &faces, &mut facts);
+        // The `no_combined_super_signature` face (upstream Dart SDK source,
+        // `inheritance_override.dart` `_reportNoCombinedSuperSignature`, fed
+        // by `instance_member_inferrer.dart` `_inferExecutable`'s null
+        // `combineSignatureTypes`): a METHOD with an implicit type slot whose
+        // multi-candidate set has no combined signature reports at the
+        // method name — and the declared-face override loop below skips the
+        // member entirely (the oracle's `continue`), the inference's
+        // `dynamic` fallback never being a face worth judging.
+        if entry.kind == MemberKind::Method
+            && has_implicit_slot(entry)
+            && let Some(signatures) =
+                self.no_combined_super_candidates(container, spelling, &faces, &mut facts)
+        {
+            let class_name = self.strings.resolve(container);
+            self.emit(SemanticCode::NoCombinedSuperSignature, range, class_name, &signatures);
+            return;
+        }
         let entry = &effective;
         // The declared faces the oracle checks (upstream Dart SDK source,
         // `pkg/analyzer/lib/src/error/inheritance_override.dart`
@@ -913,7 +930,14 @@ impl<'a> Engine<'a> {
                             name: spelling,
                             ty: entry.var_ty,
                             required: true,
-                            covariant: inferred_setter_covariant,
+                            // The `covariant` field keyword marks the
+                            // induced setter's parameter directly
+                            // (`element_builder.dart:504`
+                            // `valueFragment.isExplicitlyCovariant`);
+                            // `inferred_setter_covariant` is the
+                            // propagation arm (an overridden covariant
+                            // setter marks this one).
+                            covariant: entry.covariant || inferred_setter_covariant,
                             default_value: None,
                         }]),
                         named: Box::new([]),
@@ -1069,6 +1093,25 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                 }
+                // The inherited member's effective signature first
+                // (`instance_member_inferrer.dart` on the DECLARING
+                // container): the model row stores unwritten slots as
+                // `Unknown`, but the element model the oracle compares
+                // already inferred them — `B { method29(a) }` over `A {
+                // method29(int a) }` compares `String` against `int`, never
+                // against an `Unknown` that suppresses the verdict.
+                let inferred;
+                let inherited_entry: &MemberEntry = match self.inferred_inherited(
+                    hit,
+                    lookup,
+                    &mut facts,
+                ) {
+                    Some(entry) => {
+                        inferred = entry;
+                        &inferred
+                    }
+                    None => hit.entry(),
+                };
                 // The super-face type-argument substitution
                 // (`Substitution.fromInterfaceType`): the inherited signature
                 // read through a generic super face carries that face's own
@@ -1082,13 +1125,13 @@ impl<'a> Engine<'a> {
                 let substituted;
                 let inherited_ref: &MemberEntry = match self.instantiate_inherited(
                     &hit.chain,
-                    hit.entry(),
+                    inherited_entry,
                     container,
                     &mut facts,
                 ) {
-                    Instantiated::Unchanged => hit.entry(),
+                    Instantiated::Unchanged => inherited_entry,
                     Instantiated::Applied(env) => {
-                        substituted = self.substitute_entry(hit.entry(), &env);
+                        substituted = self.substitute_entry(inherited_entry, &env);
                         &substituted
                     }
                     Instantiated::Undecidable => continue,
@@ -1428,7 +1471,11 @@ impl<'a> Engine<'a> {
                                         name: *spelling,
                                         ty: projected.var_ty,
                                         required: true,
-                                        covariant: false,
+                                        // The `covariant` field keyword
+                                        // marks the induced setter's
+                                        // parameter
+                                        // (`element_builder.dart:504`).
+                                        covariant: projected.covariant,
                                         default_value: None,
                                     }]),
                                     named: Box::new([]),
@@ -3915,6 +3962,14 @@ impl<'a> Engine<'a> {
         let Some(decl) = elements.container(container) else {
             return;
         };
+        // The clause gate stands every member check down
+        // (`_checkDirectSuperTypes`' early return,
+        // `inheritance_override.dart:312-314`): a disallowed
+        // direct-supertype clause reports its own row and the conflicts /
+        // completeness / implementation faces never run.
+        if self.disallowed_clause_suppresses_members(decl, kind) {
+            return;
+        }
         let Some(conflicted) = self.inheritance_conflicts(decl, name_range) else {
             return;
         };
@@ -4210,6 +4265,7 @@ impl<'a> Engine<'a> {
                     is_abstract: *r#abstract,
                     is_external: false,
                     is_final: false,
+                    covariant: false,
                     type_params: 0,
                     type_param_names: Box::default(),
                     type_param_bounds: Box::default(),
@@ -4246,6 +4302,7 @@ impl<'a> Engine<'a> {
                     is_abstract: *r#abstract,
                     is_external: false,
                     is_final: false,
+                    covariant: false,
                     type_params: 0,
                     type_param_names: Box::default(),
                     type_param_bounds: Box::default(),
@@ -4722,7 +4779,7 @@ impl<'a> Engine<'a> {
                 specific_owned = own;
                 &specific_owned
             } else {
-                let Some(specific) = self.most_specific(&hits) else {
+                let Some(specific) = self.interface_map_member(decl, view, *name, &hits) else {
                     continue;
                 };
                 specific
@@ -4797,14 +4854,96 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The name's `interface.map` member — the oracle's per-name
+    /// `namedCandidates` assembly (`inheritance_manager3.dart:547-695`
+    /// `_getInterfaceClass`): the superclass face seeds the running
+    /// candidate, each `with` mixin's OWN member replaces it
+    /// (`candidate.enclosingElement == mixinElement`), an
+    /// inherited-through mixin member merges against the running candidate
+    /// via the most-specific arm, and the `implements`/`on` faces append —
+    /// the final name's signature is the most specific of the accumulated
+    /// list, `None` when the candidates do not linearize (conflict
+    /// territory). Each face's own contribution is its first hit of the
+    /// name: upstream seats ONE member per name per face (`Interface.map`),
+    /// whose own collapse already ran the same algorithm on the face's
+    /// element — the linearized walk's first same-name hit is that seated
+    /// member (the declaring hop walks before the faces it shadows).
+    fn interface_map_member<'e>(
+        &self,
+        decl: &Container,
+        view: &'e InterfaceView<'a>,
+        name: StringId,
+        hits: &[&'e FaceEntry<'a>],
+    ) -> Option<&'e FaceEntry<'a>> {
+        // Per-face seated member of `name`: the first hit each face
+        // contributes, keyed by its clause spelling (`face_sources` rides
+        // the same order `collect_interface` pushed them — superclass,
+        // `with` in application order, `implements`, `on`).
+        let mut seated: FxHashMap<StringId, &FaceEntry<'a>> = FxHashMap::default();
+        for (face_hits, face) in view.face_hits.iter().zip(view.face_sources.iter()) {
+            if let Some(hit) = face_hits.iter().find(|h| h.name == name) {
+                seated.insert(*face, hit);
+            }
+        }
+        // The running candidate: the superclass face's seated member first
+        // (upstream seeds `namedCandidates` from the supertype interface's
+        // map), then the `with` mixin faces in application order.
+        let mut running: Option<&FaceEntry<'a>> = decl.superclass.and_then(|s| seated.get(&s).copied());
+        for mixin in decl.with_clause.iter() {
+            let Some(&mixin_hit) = seated.get(mixin) else {
+                continue;
+            };
+            if mixin_hit.owner_name == *mixin || running.is_none() {
+                // A mixin's own declared member always replaces the running
+                // candidate (`candidate.enclosingElement == mixinElement`,
+                // `inheritance_manager3.dart:605-613`); with no running
+                // candidate the mixin's seated member starts the list.
+                running = Some(mixin_hit);
+            } else if let Some(current) = running {
+                // An inherited-through mixin member merges against the
+                // running candidate (`candidatesFromSuperAndMixin` — the
+                // more specific wins; an unresolvable pair keeps the
+                // running candidate, upstream's failed merge leaving
+                // `namedCandidates[name]` untouched).
+                running = self.most_specific(&[current, mixin_hit]).or(Some(current));
+            }
+        }
+        // `implements`/`on` faces append their seated members — the final
+        // `_findMostSpecificFromNamedCandidates` answers the name's
+        // signature over the whole accumulated list.
+        let mut candidates: Vec<&FaceEntry<'a>> = Vec::with_capacity(seated.len() + 1);
+        if let Some(hit) = running {
+            candidates.push(hit);
+        }
+        for face in decl.implements_clause.iter().chain(decl.on_clause.iter()) {
+            if let Some(&hit) = seated.get(face) {
+                candidates.push(hit);
+            }
+        }
+        // The `name=` setter query folds bare-spelling field hits in (the
+        // caller's `hits` extension): each field's first hit per face joins
+        // its seated candidates — a face whose `x=` spelling answered
+        // nothing keeps its `x` field's induced setter as the candidate.
+        if self.strings.resolve(name).ends_with('=') {
+            for hit in hits {
+                if hit.entry.kind == MemberKind::Field
+                    && !candidates.iter().any(|c| std::ptr::eq(*c, *hit))
+                {
+                    candidates.push(hit);
+                }
+            }
+        }
+        self.most_specific(&candidates)
+    }
+
     /// The name's most-specific interface member: the unique candidate that
     /// validly overrides every other hit (the oracle's interface-map
     /// selection at name level). `None` when the candidates do not
     /// linearize — conflict territory.
-    pub(crate) fn most_specific<'e>(
+    pub(crate) fn most_specific<'e, 'm>(
         &self,
-        hits: &[&'e FaceEntry<'e>],
-    ) -> Option<&'e FaceEntry<'e>> {
+        hits: &[&'e FaceEntry<'m>],
+    ) -> Option<&'e FaceEntry<'m>> {
         hits.iter().copied().find(|candidate| {
             hits.iter().all(|other| {
                 std::ptr::eq(*candidate, *other)
@@ -4915,20 +5054,18 @@ impl<'a> Engine<'a> {
     }
 
     /// The name's inherited concrete implementation, `_addImplemented`'s
-    /// source order: the `with` mixins first, then the superclass chain
-    /// (never an `implements` face — its hits are interface members only).
-    /// Within a concrete face only `concrete_source` hits count: a member
-    /// reached through the face's own `implements` clause is an interface
-    /// member, not an implementation the face contributes (the oracle's
-    /// `implemented` map carries own members, mixins, and the super chain
-    /// only — `inheritance_manager3.dart:333-351` `_addImplemented` /
-    /// `_addMixinMembers`; `C extends R with M implements I` takes `M`'s
-    /// and `R`'s chain's members, never `I`'s or `M`'s interfaces'). The
-    /// mixin-before-superclass order is load-bearing: the oracle's
-    /// concrete resolution for `C extends A with M implements I` is the
-    /// *mixin's* member, and the superclass's would manufacture a conflict
-    /// the oracle resolves away. The class's own members are deliberately
-    /// absent: the per-member `invalid_override` pass owns their faces.
+    /// last-writer wins: the superclass interface's `implemented` map seats
+    /// first, each `with` mixin's implemented members then overwrite in
+    /// application order — the LAST mixin carrying the name wins the seat
+    /// (`inheritance_manager3.dart:333-374` `_addImplemented` /
+    /// `_addMixinMembers`; never an `implements` face — its hits are
+    /// interface members only). Within a concrete face only
+    /// `concrete_source` hits count: a member reached through the face's own
+    /// `implements` clause is an interface member, not an implementation the
+    /// face contributes (`C extends R with M implements I` takes `M`'s and
+    /// `R`'s chain's members, never `I`'s or `M`'s interfaces'). The class's
+    /// own members are deliberately absent: the per-member
+    /// `invalid_override` pass owns their faces.
     pub(crate) fn inherited_concrete_implementation(
         decl: &Container,
         view: &InterfaceView<'a>,
@@ -4940,7 +5077,20 @@ impl<'a> Engine<'a> {
                 .position(|f| *f == face)
                 .and_then(|i| view.face_hits.get(i))
         };
-        for face in decl.with_clause.iter().copied().chain(decl.superclass) {
+        // `_addImplemented` seats the superclass interface's implemented map
+        // first, then each `with` mixin's implemented members OVERWRITE the
+        // name in application order (`_addMixinMembers`,
+        // `inheritance_manager3.dart:354-374` — the applied `S&M` class
+        // chain means the LAST mixin declaring the name wins the concrete
+        // seat). The read order here is the last-writer: `with` mixins in
+        // reverse application order, then the superclass face.
+        for face in decl
+            .with_clause
+            .iter()
+            .rev()
+            .copied()
+            .chain(decl.superclass)
+        {
             if let Some(hit) = hits_of(face).and_then(|hits| {
                 hits.iter()
                     .find(|h| h.name == name && h.concrete_source && !h.entry.is_abstract)
@@ -5560,7 +5710,9 @@ impl<'a> Engine<'a> {
                     name: plain,
                     ty: field.var_ty,
                     required: true,
-                    covariant: false,
+                    // The `covariant` field keyword marks the induced
+                    // setter's parameter (`element_builder.dart:504`).
+                    covariant: field.covariant,
                     default_value: None,
                 }]),
                 named: Box::new([]),
@@ -5606,6 +5758,7 @@ impl<'a> Engine<'a> {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            covariant: false,
             type_params: 0,
             type_param_names: Box::default(),
             type_param_bounds: Box::default(),
@@ -6234,6 +6387,80 @@ impl<'a> Engine<'a> {
                 self.substituted_signature(&candidates[index], container, facts)
             }
         }
+    }
+
+    /// The `no_combined_super_signature` candidate text
+    /// (`inheritance_override.dart` `_reportNoCombinedSuperSignature` reading
+    /// `TopLevelInferenceErrorNoCombinedSuperSignature.candidateSignatures`,
+    /// recorded by `instance_member_inferrer.dart` `_inferExecutable` when
+    /// `combineSignatureTypes` answers null): the METHOD's multi-candidate
+    /// super-face set substitutes cleanly (`_addCandidates`' edge
+    /// substitution) and no candidate validly overrides the others
+    /// (`_getValidOverrides`' empty survivor set) — the oracle then prints
+    /// every candidate as `Class.member (signature)`, joined `', '`.
+    /// `None` = no verdict: a single candidate combines trivially (the
+    /// `candidates.length == 1` identity arm), an undecidable substitution
+    /// keeps the merge's own suppression posture (under-report), and a
+    /// surviving candidate is a combined signature — silent.
+    fn no_combined_super_candidates(
+        &self,
+        container: StringId,
+        spelling: StringId,
+        faces: &[StringId],
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<String> {
+        let mut candidates: Vec<FaceHit<'a>> = Vec::new();
+        for face in faces {
+            if let Some(hit) = self.override_face_member(container, *face, spelling, facts)
+                && hit.entry().kind == MemberKind::Method
+            {
+                candidates.push(hit);
+            }
+        }
+        if candidates.len() <= 1 {
+            return None;
+        }
+        let mut substituted: Vec<MemberEntry> = Vec::with_capacity(candidates.len());
+        for hit in &candidates {
+            substituted.push(self.substituted_signature(hit, container, facts)?);
+        }
+        // `_getValidOverrides`: a candidate broken against any other drops;
+        // any survivor owns the combined signature.
+        let has_valid = substituted.iter().enumerate().any(|(i, entry)| {
+            substituted.iter().enumerate().all(|(j, other)| {
+                i == j
+                    || !self.override_broken(
+                        entry,
+                        (candidates[i].origin, candidates[i].face_name),
+                        other,
+                        (candidates[j].origin, candidates[j].face_name),
+                    )
+            })
+        });
+        if has_valid {
+            return None;
+        }
+        let display = self.strings.resolve(spelling);
+        // Every candidate as `Class.member (signature)` (the
+        // `CandidatesConflict.candidates` fold, `_inferExecutable`); each
+        // hit's chain names its declaring hop, so an empty chain decides
+        // nothing.
+        candidates
+            .iter()
+            .zip(&substituted)
+            .map(|(hit, entry)| {
+                let Some(&(owner, _)) = hit.chain.last() else {
+                    return None;
+                };
+                Some(format!(
+                    "{}.{} ({})",
+                    self.strings.resolve(owner),
+                    display,
+                    self.override_signature_text(entry)
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|rows| rows.join(", "))
     }
 
     /// The super-face type-argument substitution
@@ -8010,12 +8237,27 @@ impl<'a> Engine<'a> {
                     _ => hit.entry().kind == face_kind,
                 };
                 if kind_matches {
-                    match self.instantiate_inherited(&hop_chain, hit.entry(), container, facts) {
+                    // The own member's effective signature first — the
+                    // element model already inferred its unwritten slots
+                    // (`instance_member_inferrer.dart` on the declaring
+                    // container); the raw `Unknown` columns would suppress
+                    // the verifier's pair comparison.
+                    let inferred;
+                    let hit_entry: &MemberEntry = match self.inferred_inherited(
+                        &hit, spelling, facts,
+                    ) {
+                        Some(entry) => {
+                            inferred = entry;
+                            &inferred
+                        }
+                        None => hit.entry(),
+                    };
+                    match self.instantiate_inherited(&hop_chain, hit_entry, container, facts) {
                         Instantiated::Unchanged => {
-                            out.push((hit.entry().clone(), face, found_owner));
+                            out.push((hit_entry.clone(), face, found_owner));
                         }
                         Instantiated::Applied(env) => {
-                            out.push((self.substitute_entry(hit.entry(), &env), face, found_owner));
+                            out.push((self.substitute_entry(hit_entry, &env), face, found_owner));
                         }
                         Instantiated::Undecidable => {}
                     }
@@ -8214,6 +8456,173 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    /// An inherited hit's effective signature — the oracle's instance-member
+    /// inference runs on EVERY element's own members
+    /// (`instance_member_inferrer.dart` `_inferExecutable` /
+    /// `_inferAccessorOrField`): an unwritten parameter or return slot on
+    /// the declaring container's member infers from THAT container's
+    /// combined superinterface signature at model build, so the model row
+    /// the oracle compares is never `Unknown`. The walk-side read here is
+    /// the raw collected member (the model stores only the written
+    /// columns), so the inference replays against the hit's own declaring
+    /// container — `B { method29(a) }` reads its combined signature from
+    /// `B`'s own clause faces (`A.method29(int)`), not from the diagnosed
+    /// `Class`'s. `None` = no implicit slot or no modeled declaring
+    /// container (a synthesized hit — its `Unknown` columns genuinely mean
+    /// `dynamic`, the frozen faces' own posture); the caller keeps the raw
+    /// entry.
+    fn inferred_inherited(
+        &self,
+        hit: &FaceHit<'a>,
+        spelling: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Option<MemberEntry> {
+        let entry = hit.entry();
+        if !has_implicit_slot(entry) || entry.kind == MemberKind::Field {
+            return None;
+        }
+        let decl = self
+            .index
+            .get(hit.origin)
+            .and_then(|f| f.container(hit.face_name))?;
+        // The declaring container's direct superinterface faces — the same
+        // clause set `candidate_covariant_marks` walks (superclass or the
+        // implicit Object/Enum face, the `with` mixins, `implements`,
+        // `on`).
+        let mut faces: Vec<StringId> = Vec::with_capacity(
+            usize::from(decl.superclass.is_some())
+                + decl.with_clause.len()
+                + decl.implements_clause.len()
+                + decl.on_clause.len(),
+        );
+        match decl.superclass {
+            Some(superclass) => faces.push(superclass),
+            None => match decl.kind {
+                ContainerKind::Class => faces.push(self.intern("Object")),
+                ContainerKind::Enum => faces.push(self.intern("Enum")),
+                ContainerKind::Mixin if decl.on_clause.is_empty() => {
+                    faces.push(self.intern("Object"))
+                }
+                _ => {}
+            },
+        }
+        faces.extend(decl.with_clause.iter().copied());
+        faces.extend(decl.implements_clause.iter().copied());
+        faces.extend(decl.on_clause.iter().copied());
+        let owner_lib = self
+            .owner_library_of(hit.origin, hit.face_name)
+            .unwrap_or(self.lib);
+        let merge_container = if hit.origin == self.file {
+            hit.face_name
+        } else {
+            self.intern("")
+        };
+        // The kind-matched candidate set: a method reads its own kind; a
+        // getter face reads getter-or-field candidates, a setter face
+        // setter-or-non-final-field candidates (the oracle's
+        // `_inferAccessorOrField` pairing — an accessor's combined
+        // signature comes from its counterpart kind too). A setter hit
+        // already resolves under the `name=` spelling the caller's lookup
+        // carried — the candidates' own containers read the same spelling.
+        let mut candidates: Vec<FaceHit<'a>> = Vec::new();
+        for face in faces.iter().copied() {
+            if let Some(sub) = self.face_member_in(
+                hit.origin,
+                hit.face_name,
+                owner_lib,
+                merge_container,
+                face,
+                spelling,
+                facts,
+            ) {
+                let kind_ok = match entry.kind {
+                    MemberKind::Getter => {
+                        matches!(sub.entry().kind, MemberKind::Getter | MemberKind::Field)
+                    }
+                    MemberKind::Setter => {
+                        sub.entry().kind == MemberKind::Setter
+                            || (sub.entry().kind == MemberKind::Field && !sub.entry().is_final)
+                    }
+                    kind => sub.entry().kind == kind,
+                };
+                if kind_ok {
+                    candidates.push(sub);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let combined = self.combined_inherited(merge_container, candidates, facts);
+        let dynamic = Ty::Dynamic;
+        let mut effective = entry.clone();
+        match entry.kind {
+            MemberKind::Method => {
+                if effective.return_ty == Ty::UNKNOWN {
+                    effective.return_ty = combined
+                        .as_ref()
+                        .map(|c| c.return_ty)
+                        .unwrap_or(dynamic);
+                }
+                if let Some(formals) = effective.formals.as_deref_mut() {
+                    let slots = combined.as_ref().and_then(|c| c.formals.as_deref());
+                    for (index, param) in formals.positional.iter_mut().enumerate() {
+                        if param.ty == Ty::UNKNOWN {
+                            param.ty = slots
+                                .and_then(|f| f.positional.get(index))
+                                .map(|p| p.ty)
+                                .unwrap_or(dynamic);
+                        }
+                    }
+                    for param in formals.named.iter_mut() {
+                        if param.ty == Ty::UNKNOWN {
+                            param.ty = slots
+                                .and_then(|f| f.named.iter().find(|p| p.name == param.name))
+                                .map(|p| p.ty)
+                                .unwrap_or(dynamic);
+                        }
+                    }
+                }
+            }
+            MemberKind::Getter => {
+                if effective.return_ty == Ty::UNKNOWN {
+                    effective.return_ty = combined
+                        .as_ref()
+                        .map(|c| {
+                            if c.kind == MemberKind::Field {
+                                c.var_ty
+                            } else {
+                                c.return_ty
+                            }
+                        })
+                        .unwrap_or(dynamic);
+                }
+            }
+            MemberKind::Setter => {
+                if let Some(formals) = effective.formals.as_deref_mut()
+                    && let Some(param) = formals.positional.first_mut()
+                    && param.ty == Ty::UNKNOWN
+                {
+                    param.ty = combined
+                        .as_ref()
+                        .and_then(|c| {
+                            if c.kind == MemberKind::Field {
+                                Some(c.var_ty)
+                            } else {
+                                c.formals
+                                    .as_deref()
+                                    .and_then(|f| f.positional.first())
+                                    .map(|p| p.ty)
+                            }
+                        })
+                        .unwrap_or(dynamic);
+                }
+            }
+            MemberKind::Field => unreachable!("the early return above"),
+        }
+        Some(effective)
     }
 
     /// One setter-face candidate's effective first-parameter mark — the

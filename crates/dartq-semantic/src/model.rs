@@ -1514,6 +1514,16 @@ pub struct MemberEntry {
     /// abstract field's missing halves with it (a final field has no
     /// setter).
     pub is_final: bool,
+    /// The field group's `covariant` keyword (`covariant num x;`; false for
+    /// every other member shape — parameter covariance rides
+    /// [`Formal::covariant`], never this flag). Upstream
+    /// `fieldFragment.isExplicitlyCovariant`: the mark makes the field's
+    /// INDUCED setter parameter covariant (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/summary2/element_builder.dart:504`
+    /// `valueFragment.isExplicitlyCovariant = fieldFragment
+    /// .isExplicitlyCovariant`), so the override faces read it through the
+    /// synthesized setter's parameter list.
+    pub covariant: bool,
     /// The member's own type parameters (`void m<T>()`); 0 when absent.
     pub type_params: u16,
     /// The member's own type-parameter names, in declaration order (the
@@ -1717,6 +1727,21 @@ pub struct TopDecl {
     /// against the declaration's parameter order. Every other kind keeps
     /// the list empty.
     pub type_param_names: Box<[StringId]>,
+    /// The declaration's declared type-parameter bounds, parallel to
+    /// [`TopDecl::type_param_names`] ([`Ty::Dynamic`] = the parameter wrote
+    /// none) — the same column [`MemberEntry::type_param_bounds`] and
+    /// [`Container::type_param_bounds`] carry, so a top-level function's or
+    /// type alias's own `<T extends E>` group bounds exactly like a
+    /// container header's. The resolved per-file bound ledger reads it
+    /// (`resolved_ops`' name-parameter face, behind the
+    /// `isAlwaysExhaustive` type-parameter arm); the collector used to take
+    /// the buffered group and drop the bound half here.
+    ///
+    /// The persisted declaration payload carries the spellings only, so a
+    /// model restored from a payload keeps this empty and the ledger then
+    /// keeps its unbounded face — the under-report direction, never a
+    /// borrowed sibling's bound.
+    pub type_param_bounds: Box<[Ty]>,
     /// Declared type of a top-level variable (executables:
     /// [`Ty::Unknown`]). For a type alias: the right-hand side as written
     /// — a parameterized alias keeps its parameter spellings as bare
@@ -1747,6 +1772,7 @@ impl TopDecl {
             kind,
             type_params: 0,
             type_param_names: Box::new([]),
+            type_param_bounds: Box::new([]),
             var_ty: Ty::UNKNOWN,
             return_ty: Ty::UNKNOWN,
             formals: None,
@@ -2820,6 +2846,7 @@ mod tests {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            covariant: false,
             type_params: 0,
             type_param_names: Box::new([]),
             type_param_bounds: Box::default(),

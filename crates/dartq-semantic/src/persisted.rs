@@ -263,6 +263,12 @@ pub struct PersistedMemberEntry {
     pub is_abstract: bool,
     pub is_external: bool,
     pub is_final: bool,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode unmarked (the #539 additive-field
+    /// discipline; the field's explicit `covariant` keyword — its induced
+    /// setter parameter's covariance).
+    #[serde(default)]
+    pub covariant: bool,
     pub type_params: u16,
     pub type_param_names: Vec<u32>,
     /// The own type parameters' declared bounds, parallel to
@@ -806,6 +812,7 @@ impl<'a> Slice<'a> {
             is_abstract: entry.is_abstract,
             is_external: entry.is_external,
             is_final: entry.is_final,
+            covariant: entry.covariant,
             type_params: entry.type_params,
             type_param_names: self.ids(&entry.type_param_names),
             type_param_bounds: entry
@@ -1353,6 +1360,12 @@ impl PersistedTopDecl {
                 .into_iter()
                 .map(|at| ids[at as usize])
                 .collect(),
+            // The payload carries the spellings only: a restored model keeps
+            // the unbounded face and the resolved bound ledger answers the
+            // under-report direction for a top-level function's or alias's
+            // own parameter (the same posture the payload's absent bound
+            // columns keep for members).
+            type_param_bounds: Box::new([]),
             var_ty: into_ty(self.var_ty, ids, pool),
             return_ty: into_ty(self.return_ty, ids, pool),
             formals: self
@@ -1564,6 +1577,7 @@ impl PersistedMemberEntry {
             is_abstract: self.is_abstract,
             is_external: self.is_external,
             is_final: self.is_final,
+            covariant: self.covariant,
             type_params: self.type_params,
             type_param_names: self
                 .type_param_names
@@ -1707,6 +1721,7 @@ mod tests {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            covariant: false,
             type_params: 1,
             type_param_names: Box::new([name(text)]),
             type_param_bounds: Box::default(),
@@ -1741,6 +1756,7 @@ mod tests {
                 kind: MicroKind::TopLevelFn,
                 type_params: 0,
                 type_param_names: Box::new([]),
+                type_param_bounds: Box::new([]),
                 var_ty: Ty::Unknown,
                 return_ty: Ty::Void,
                 formals: None,
@@ -1928,6 +1944,7 @@ mod tests {
             is_abstract: false,
             is_external: false,
             is_final: false,
+            covariant: false,
             type_params: 0,
             type_param_names: Box::new([]),
             type_param_bounds: Box::default(),
