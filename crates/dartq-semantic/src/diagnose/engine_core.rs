@@ -1283,6 +1283,31 @@ impl<'a> Engine<'a> {
             }
             let verdict = match check.kind {
                 StagedKind::Return { ctor, is_async, .. } => {
+                    // The expression body's `void` exemption (upstream Dart
+                    // SDK source,
+                    // pkg/analyzer/lib/src/error/return_type_verifier.dart
+                    // `verifyExpressionFunctionBody`:57-64): an
+                    // expression-bodied executable checks NOTHING when the
+                    // FLATTENED declared return type is `void` — `void f()
+                    // => e;` and `Future<void> f() async => e;` (likewise
+                    // `FutureOr<void>`, `Future<void>?`) all run the body
+                    // expression for its value, never its type, so the
+                    // block-body matrix (`T_v` void accepts only
+                    // `void`/`dynamic`/`Null`) never runs. The sync arm is
+                    // already skipped where the arrow body closes
+                    // (`handle_expression_function_body` reads the raw
+                    // return type); the async arm needs the flatten, which
+                    // only the teardown can ask — `is_async` rides the
+                    // staged row and `check.to` is the declared face.
+                    let target = self.fold_alias_ty(check.to);
+                    let flattened = if is_async {
+                        self.future_value_type(target)
+                    } else {
+                        target
+                    };
+                    if flattened == Ty::Void && self.arrow_body_expression(check.range) {
+                        continue;
+                    }
                     // The declared return's verdict reads the alias's RHS
                     // face (`typedef WhenComplete = void Function(...)?` —
                     // `return null` is legal because the alias spells a
@@ -1353,8 +1378,19 @@ impl<'a> Engine<'a> {
             // `const`, unary heads, parens, `is`/`as`, postfix `!`, literal
             // brackets) rides the same `.at(expression)` extent. A bare
             // operand's row already is its own span.
+            //
+            // The return face asks the identical anchor (upstream Dart SDK
+            // source, return_type_verifier.dart `reportTypeError`'s
+            // `.at(expression)`), and its row is just as often a head token
+            // — a callee name (`return f();` staged on `f`), an untyped
+            // collection literal's close bracket (`return [1, 2];` staged on
+            // `]`), a conditional's `?` operand. Leaving it unwidened
+            // reported the row one token wide against the oracle's whole
+            // expression, so `Return` rides the same recovery. The closure
+            // literal stays out of it: a returned function literal is its
+            // own expression, and its braces are the row's own span.
             let range = match check.kind {
-                StagedKind::Assignment | StagedKind::Argument
+                StagedKind::Assignment | StagedKind::Argument | StagedKind::Return { .. }
                     if !self.closure_literal_starts.contains(&check.range.offset) =>
                 {
                     self.staged_expression_span(check.range)
@@ -1409,6 +1445,31 @@ impl<'a> Engine<'a> {
         // regardless.
         survivors.sort_by_key(|d| d.range.offset);
         survivors
+    }
+
+    /// Whether a staged return expression is an EXPRESSION body — `f() =>
+    /// e` / `f() async => e` — rather than a `return e;` statement. The two
+    /// forms are the same staged kind (both call
+    /// [`Engine::check_return`]) but the oracle's `void` exemption hangs on
+    /// the distinction (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/return_type_verifier.dart
+    /// `verifyExpressionFunctionBody`:57-64 — only the expression body
+    /// early-returns on a `void` flattened return; `verifyReturnStatement`
+    /// keeps checking).
+    ///
+    /// The byte probe reads the arrow: the expression-body listener hands
+    /// the body expression's own span, which always sits immediately after
+    /// `=>` (an `await`-widened span keeps the arrow ahead of the keyword),
+    /// while a return statement's span follows the `return` keyword, so no
+    /// staged face lands on both. An `await`-rewritten range still starts
+    /// at a token that ends in `=>`.
+    fn arrow_body_expression(&self, range: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(range.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        cursor >= 2 && &bytes[cursor - 2..cursor] == b"=>"
     }
 
     /// The statement-form operand faces of `unchecked_use_of_nullable_value`

@@ -18014,3 +18014,15 @@ mod ticket_3300_tests;
 #[cfg(test)]
 #[path = "ticket_3313_tests.rs"]
 mod ticket_3313_tests;
+
+// The #3306 pins (`return_of_invalid_type` emit side): the expression
+// body's `void` exemption (`verifyExpressionFunctionBody` flattens the
+// declared return before it decides — `Future<void> f() async => e;` is
+// silent while the block body reports) and the return row's
+// `.at(expression)` anchor (a callee head, an untyped literal's `]`, a
+// conditional operand all widen to the whole returned expression).
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3306_tests.rs"]
+mod ticket_3306_tests;
