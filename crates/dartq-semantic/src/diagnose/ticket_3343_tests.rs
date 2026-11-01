@@ -16,15 +16,13 @@
 //!   diag.constEvalForElement)`) plus the site default
 //!   `const_initialized_with_non_constant_value` at the enclosing literal
 //!   (constant_verifier.dart `visitVariableDeclaration` → `_reportError`,
-//!   at the entity the literal's evaluation failed on). dartq has neither
-//!   row: the parser emits no for-element span event into the const
-//!   capture (`begin_ctl_element` carries no span), `SemanticCode` does
-//!   not register `const_eval_for_element`, and the literal's failed value
-//!   push (`push_literal_value`) hands the ELEMENT's span, not the
-//!   literal's, to `push_non_constant`. Routing: codes.rs (register the
-//!   code), diagnose/listener.rs (a span-bearing ctl-element event),
-//!   const_eval.rs (latch + fold) and const_eval_faces.rs (failed-literal
-//!   re-anchor at the literal extent).
+//!   at the entity the literal's evaluation failed on). dartq now reports
+//!   both: the listener latches the `for` element's head (`begin_for_control_flow`
+//!   → `begin_ctl_element`) and extent (`end_for_control_flow` /
+//!   `end_for_in_control_flow` → `close_ctl_element`), and the owning
+//!   literal's close reports `const_eval_for_element` at the element while
+//!   pushing the site default at the whole literal (never the element's own
+//!   body expression).
 //!
 //! - Dot shorthand (7 corpus cases): `.new()` / `.name` under a const
 //!   declaration resolves against the CONTEXT type upstream
@@ -62,16 +60,18 @@
 //! `diagnose/tests.rs`'s `#[path]` block; the module stays inside the
 //! `diagnose` subtree so the parent rig resolves.
 //!
-//! Status: the three dot-shorthand pins and the non-const-creation pin are
-//! green (the shorthand face lives in `const_eval_faces.rs`'s
-//! `report_root_shorthand`, the creation rows in the deferred creation
-//! tail pass); the for-element pair and the wildcard pin stay `#[ignore]`d
-//! and routed to the listener lane — see each attribute's `routed:` note.
+//! Status: the three dot-shorthand pins, the non-const-creation pin and the
+//! two for-element pins are green (the shorthand face lives in
+//! `const_eval_faces.rs`'s `report_root_shorthand`, the creation rows in the
+//! deferred creation tail pass, the for-element spans in `listener.rs` +
+//! `const_eval.rs`'s ctl-element latch); the wildcard pin stays `#[ignore]`d
+//! and routed to the wildcard-formal face.
 //! Expected row vectors are written in [`oracle_rows`]' canonical order
 //! (code name, then offset): the helper sorts, so a semantic ordering
 //! ("primary row first") silently fails the equality.
 
 use super::*;
+use super::test_rig::{CORE_PRELUDE, report_ops_bare};
 
 /// `(code, offset, written text at the row)` — the span-exact projection:
 /// code + offset + text pin a row's code, anchor, and length together.
@@ -97,19 +97,24 @@ fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
 /// SDK source, pkg/analyzer/test/src/diagnostics/const_eval_for_element_test.dart):
 /// a C-style `for` element in an implicitly const list reports at the whole
 /// for element and the site default at the literal.
+///
+/// Runs under the core-preloaded rig ([`report_ops_bare`] over
+/// [`CORE_PRELUDE`]): the update `i++` resolves `int.operator +`, which the
+/// bare `report` rig cannot (it declares no core members) — there the loop
+/// variable's `++` would add a spurious `undefined_operator` row the oracle
+/// never reports. The corpus's `int` annotation drops to `var` (an
+/// annotation would draw `undefined_class int`); the face under pin is
+/// annotation-blind.
 #[test]
-// routed: needs listener.rs span event (residual) — the parser's
-// `begin_ctl_element` carries no span, so the const capture cannot latch a
-// `for` element's extent; the listener must fire a span-bearing
-// ctl-element event into `const_capture` before this pin can turn green.
-#[ignore = "for-element face: needs the ctl-element span event + const_eval_for_element registration + literal-extent failed-value re-anchor"]
 fn for_element_reports_at_the_element_and_the_literal() {
-    let source = "const x = [for (var i = 0; i < 3; i++) i];\n";
+    let fixture = "const x = [for (var i = 0; i < 3; i++) i];\n";
+    let source = format!("{CORE_PRELUDE}{fixture}");
+    // `[for` (not `[`) — the prelude declares `operator []`.
+    let literal = source.find("[for").expect("fixture has the list") as u32;
     let for_element = source.find("for (").expect("fixture has the for element") as u32;
-    let literal = source.find('[').expect("fixture has the list") as u32;
-    let rep = report(source);
+    let rep = report_ops_bare(&source);
     assert_eq!(
-        oracle_rows(&rep, source),
+        oracle_rows(&rep, &source),
         vec![
             ("const_eval_for_element", for_element, "for (var i = 0; i < 3; i++) i"),
             (
@@ -119,7 +124,7 @@ fn for_element_reports_at_the_element_and_the_literal() {
             ),
         ],
         "{:#?}",
-        oracle_rows(&rep, source)
+        oracle_rows(&rep, &source)
     );
 }
 
@@ -127,9 +132,6 @@ fn for_element_reports_at_the_element_and_the_literal() {
 /// for element wrapped in an if element reports at the for element ALONE
 /// (the if wrapper contributes nothing), site default at the literal.
 #[test]
-// routed: needs listener.rs span event (residual) — the same ctl-element
-// span event as the flat shape, plus the nested anchor's ctl-nesting order.
-#[ignore = "for-element face: same machinery gap as the flat shape, plus the ctl-nesting anchor"]
 fn nested_for_element_reports_at_the_for_element_alone() {
     let source = "const x = {if (true) for (final i in const []) i: null};\n";
     let for_element = source.find("for (").expect("fixture has the for element") as u32;

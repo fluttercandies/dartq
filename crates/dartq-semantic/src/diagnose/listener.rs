@@ -9041,20 +9041,43 @@ impl ParserListener for DiagnoseListener<'_> {
         // body expression was the literal, never the bare shape).
         engine.nsm_poison();
         if let Some(elements) = engine.const_capture.literal_list(count, left.range) {
-            // Implicit const literals in a const context check per element
-            // with the element code too (the oracle evaluates the literal
-            // at the enclosing site).
-            let failed =
-                engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
-            let payload = engine
-                .literal_payload(&elements)
-                .map(|values| ConstantValue::List(values.into()));
-            engine.push_literal_value(
-                failed,
-                right.range,
-                crate::const_eval::InstanceKind::List,
-                payload,
-            );
+            let for_elements = engine.const_capture.take_pending_for_elements();
+            if !for_elements.is_empty() {
+                // A constant collection rejects `for` elements outright
+                // (upstream `_buildListConstant`'s `case ForElement()` →
+                // `InvalidConstant.forEntity`): the oracle reports
+                // `const_eval_for_element` at the whole element and the site
+                // default at the enclosing literal, never the element's own
+                // body expression.
+                let literal_span = SourceRange {
+                    offset: left.range.offset,
+                    length: right.range.end() - left.range.offset,
+                };
+                for span in for_elements {
+                    engine.emit(SemanticCode::ConstEvalForElement, span, "", "");
+                }
+                engine.push_literal_value(
+                    Some(literal_span),
+                    right.range,
+                    crate::const_eval::InstanceKind::List,
+                    None,
+                );
+            } else {
+                // Implicit const literals in a const context check per element
+                // with the element code too (the oracle evaluates the literal
+                // at the enclosing site).
+                let failed =
+                    engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
+                let payload = engine
+                    .literal_payload(&elements)
+                    .map(|values| ConstantValue::List(values.into()));
+                engine.push_literal_value(
+                    failed,
+                    right.range,
+                    crate::const_eval::InstanceKind::List,
+                    payload,
+                );
+            }
         }
         // The void-operand use (upstream `literal_element_verifier.dart`
         // :95 — `checkElement` → `checkForUseOfVoidResult(element)`): a
@@ -9202,31 +9225,53 @@ impl ParserListener for DiagnoseListener<'_> {
                 .const_capture
                 .literal_set_or_map(count, left.range, has_set_entry)
         {
-            match shape {
-                SetOrMap::Map(entries) => {
-                    // The oracle names the failing side
-                    // (`_validateMapLiteralEntry`): `non_constant_map_key` /
-                    // `non_constant_map_value` at each entry's key and value.
-                    let mut failed = None;
-                    for (key, value) in &entries {
-                        for (code, part) in [
-                            (SemanticCode::NonConstantMapKey, key),
-                            (SemanticCode::NonConstantMapValue, value),
-                        ] {
-                            let at = engine.check_const_elements(code, std::slice::from_ref(part));
-                            failed = failed.or(at);
-                        }
-                    }
-                    let payload = engine.map_payload(&entries);
-                    engine.push_literal_value(failed, right.range, InstanceKind::Map, payload);
+            let for_elements = engine.const_capture.take_pending_for_elements();
+            if !for_elements.is_empty() {
+                // A constant collection rejects `for` elements outright
+                // (upstream `_buildMapConstant` / `_buildSetConstant`'s
+                // `case ForElement()` → `InvalidConstant.forEntity`): the
+                // oracle reports `const_eval_for_element` at the whole element
+                // and the site default at the enclosing literal.
+                let literal_span = SourceRange {
+                    offset: left.range.offset,
+                    length: right.range.end() - left.range.offset,
+                };
+                let kind = match &shape {
+                    SetOrMap::Map(_) => InstanceKind::Map,
+                    SetOrMap::Set(_) => InstanceKind::Set,
+                };
+                for span in for_elements {
+                    engine.emit(SemanticCode::ConstEvalForElement, span, "", "");
                 }
-                SetOrMap::Set(elements) => {
-                    let failed =
-                        engine.check_const_elements(SemanticCode::NonConstantSetElement, &elements);
-                    let payload = engine
-                        .literal_payload(&elements)
-                        .map(|values| ConstantValue::Set(values.into()));
-                    engine.push_literal_value(failed, right.range, InstanceKind::Set, payload);
+                engine.push_literal_value(Some(literal_span), right.range, kind, None);
+            } else {
+                match shape {
+                    SetOrMap::Map(entries) => {
+                        // The oracle names the failing side
+                        // (`_validateMapLiteralEntry`): `non_constant_map_key` /
+                        // `non_constant_map_value` at each entry's key and value.
+                        let mut failed = None;
+                        for (key, value) in &entries {
+                            for (code, part) in [
+                                (SemanticCode::NonConstantMapKey, key),
+                                (SemanticCode::NonConstantMapValue, value),
+                            ] {
+                                let at =
+                                    engine.check_const_elements(code, std::slice::from_ref(part));
+                                failed = failed.or(at);
+                            }
+                        }
+                        let payload = engine.map_payload(&entries);
+                        engine.push_literal_value(failed, right.range, InstanceKind::Map, payload);
+                    }
+                    SetOrMap::Set(elements) => {
+                        let failed = engine
+                            .check_const_elements(SemanticCode::NonConstantSetElement, &elements);
+                        let payload = engine
+                            .literal_payload(&elements)
+                            .map(|values| ConstantValue::Set(values.into()));
+                        engine.push_literal_value(failed, right.range, InstanceKind::Set, payload);
+                    }
                 }
             }
         }
@@ -10205,6 +10250,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.ur_seal_used();
     }
 
+    /// The collection-element `for` head: opens the loop frame, the
+    /// condition window and the const capture's `for`-element latch (a
+    /// constant collection rejects a `for` element, so the element's extent
+    /// is reported when the owning literal closes).
     fn begin_for_control_flow(&mut self, await_kw: Option<Token>, for_kw: Token) {
         self.flow().begin_for_control_flow(await_kw, for_kw);
         let engine = &mut self.engine;
@@ -10223,7 +10272,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // expression statement like the statement form's; its window closes
         // at the control-flow end.
         engine.in_for_parts.push(2);
-        engine.const_capture.begin_ctl_element();
+        // The element head (the `await`/`for` keyword): a constant collection
+        // rejects a `for` element outright, and this head is what the
+        // element's whole extent anchors at when the literal closes.
+        engine.const_capture.begin_ctl_element(
+            crate::const_eval::CtlElementKind::For,
+            await_kw.unwrap_or(for_kw).range,
+        );
     }
 
     fn begin_for_in_body(&mut self, token: Token) {
@@ -10250,7 +10305,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_if_control_flow(&mut self, token: Token) {
         self.flow().begin_if_control_flow(token);
-        self.engine.const_capture.begin_ctl_element();
+        self.engine.const_capture.begin_ctl_element(
+            crate::const_eval::CtlElementKind::If,
+            token.range,
+        );
         // The collection form's condition arms the same window the
         // statement's does when it carries a case clause (the element face
         // of `begin_pattern`'s gate). The parser pairs this event with
@@ -10418,7 +10476,12 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_for_control_flow(&mut self, token: Token) {
         self.flow().end_for_control_flow(token);
+        let end = element_end_before(&self.engine, token);
         let engine = &mut self.engine;
+        engine.const_capture.close_ctl_element(
+            crate::const_eval::CtlElementKind::For,
+            end,
+        );
         if engine.in_for_parts.last() == Some(&2) {
             engine.in_for_parts.pop();
         }
@@ -10434,7 +10497,12 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_for_in_control_flow(&mut self, token: Token) {
         self.flow().end_for_in_control_flow(token);
+        let end = element_end_before(&self.engine, token);
         let engine = &mut self.engine;
+        engine.const_capture.close_ctl_element(
+            crate::const_eval::CtlElementKind::For,
+            end,
+        );
         if engine.in_for_parts.last() == Some(&2) {
             engine.in_for_parts.pop();
         }
@@ -11668,7 +11736,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_spread_expression(&mut self, operator: Token) {
         self.flow().handle_spread_expression(operator);
-        self.engine.const_capture.begin_ctl_element();
+        self.engine.const_capture.begin_ctl_element(
+            crate::const_eval::CtlElementKind::Spread,
+            operator.range,
+        );
 
         // The `...?e` null-aware spread (upstream `visitSpreadElement`
         // :2176-2184 → `_checkForUnnecessaryNullAware(_, spreadOperator,
@@ -11794,6 +11865,18 @@ fn trim_trivia(bytes: &[u8], mut start: usize, end: usize) -> usize {
             None => return start,
         }
     }
+}
+
+/// The UTF-16 exclusive end of the source just before `token` — the
+/// `]`/`,`/`}` that follows a collection element's body. Trailing trivia is
+/// walked back, so a `for` element's extent stops at its body (the oracle
+/// anchors `const_eval_for_element` at the whole element).
+fn element_end_before(engine: &Engine<'_>, token: Token) -> u32 {
+    let Some(scanned) = engine.tokens.get(token.id as usize) else {
+        return token.range.offset;
+    };
+    preceding_position(engine.source.as_bytes(), scanned.byte_range().start)
+        .map_or(token.range.offset, |byte| engine.utf16_of(byte))
 }
 
 /// The source position one past the last significant byte before `cursor`:

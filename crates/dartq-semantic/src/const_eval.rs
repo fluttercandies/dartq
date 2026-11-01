@@ -1832,6 +1832,17 @@ pub struct ConstCapture {
     /// type, never an inner literal's (`isExp(const Constant(null))`
     /// checks `Constant`, not `null`).
     creation_spans: Vec<SourceRange>,
+    /// The `for` element heads open inside the const window. A collection
+    /// literal cannot hold a constant `for` element, so the head is all the
+    /// capture needs until the close (which only then knows the body's end).
+    ctl_open: Vec<SourceRange>,
+    /// The closed `for` elements' whole extents, waiting for the owning
+    /// literal's close: the literal close is the only point that knows the
+    /// element list ended and can hand the spans to the report.
+    ctl_closed: Vec<SourceRange>,
+    /// The `for` element spans the last closed literal owned — drained by
+    /// the engine to emit `const_eval_for_element` at each.
+    pending_for_elements: Vec<SourceRange>,
 }
 
 /// The closed argument list of a call whose const-ness the engine
@@ -1853,6 +1864,19 @@ pub struct ClosedArgs {
 pub enum SetOrMap {
     Set(Vec<Node>),
     Map(Vec<(Node, Node)>),
+}
+
+/// Which control-flow collection element opened. Only a `for` element
+/// carries a diagnostic face (`const_eval_for_element`: a constant
+/// collection rejects it outright — upstream `_buildListConstant` /
+/// `_buildMapConstant`'s `case ForElement()` returns
+/// `InvalidConstant.forEntity`), so only those latch a head span the
+/// owning literal's close turns into a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CtlElementKind {
+    For,
+    If,
+    Spread,
 }
 
 /// Splits the popped operands into entries vs bare elements; the
@@ -1898,6 +1922,9 @@ impl ConstCapture {
             selector_callee: false,
             pending_ctor_callee: None,
             creation_spans: Vec::new(),
+            ctl_open: Vec::new(),
+            ctl_closed: Vec::new(),
+            pending_for_elements: Vec::new(),
         }
     }
 
@@ -2149,8 +2176,10 @@ impl ConstCapture {
     /// flag (a control-flow element's operands stay several stack nodes,
     /// so folding the literal would drop the condition operand and could
     /// value a collection the oracle's `canBeConst` probe calls
-    /// non-constant — `Other` keeps the under-report direction).
-    pub fn begin_ctl_element(&mut self) {
+    /// non-constant — `Other` keeps the under-report direction). A `for`
+    /// element also latches its head: a constant collection rejects it
+    /// outright, and the owning literal's close reports the whole extent.
+    pub fn begin_ctl_element(&mut self, kind: CtlElementKind, head: SourceRange) {
         if let Some(window) = self.windows.last_mut()
             && matches!(
                 window.kind,
@@ -2159,6 +2188,55 @@ impl ConstCapture {
         {
             window.ctl_elements += 1;
         }
+        if kind == CtlElementKind::For && self.open() {
+            self.ctl_open.push(head);
+        }
+    }
+
+    /// Closes the `for` element opened at [`Self::begin_ctl_element`]: `end`
+    /// is its exclusive UTF-16 end (the body's last significant unit — the
+    /// caller trims the trailing `]`/`,`/`}` trivia). The whole extent waits
+    /// for the owning literal's close, which reports it.
+    pub fn close_ctl_element(&mut self, kind: CtlElementKind, end: u32) {
+        if kind != CtlElementKind::For {
+            return;
+        }
+        let Some(head) = self.ctl_open.pop() else {
+            return;
+        };
+        let span = SourceRange {
+            offset: head.offset,
+            length: end.saturating_sub(head.offset),
+        };
+        self.ctl_closed.push(span);
+    }
+
+    /// Removes the `for` elements the literal opened at `left` owns, in
+    /// source order. A `for` head sits strictly inside its own literal
+    /// (`[for …]`), while an enclosing element's head sits before the
+    /// literal's opening token — so the head offset separates the two without
+    /// any nesting depth bookkeeping. A `for` whose close a recovery skipped
+    /// opened inside this literal too: it is dropped rather than left for a
+    /// later literal to misattribute.
+    fn settle_literal(&mut self, left: u32) -> Vec<SourceRange> {
+        let mut taken = Vec::new();
+        self.ctl_closed.retain(|span| {
+            if span.offset > left {
+                taken.push(*span);
+                false
+            } else {
+                true
+            }
+        });
+        self.ctl_open.retain(|head| head.offset <= left);
+        taken.sort_by_key(|span| span.offset);
+        taken
+    }
+
+    /// The `for` element spans the last closed literal owned (drained): the
+    /// engine reports each as `const_eval_for_element`.
+    pub fn take_pending_for_elements(&mut self) -> Vec<SourceRange> {
+        std::mem::take(&mut self.pending_for_elements)
     }
 
     fn open_window(&mut self, kind: WindowKind) {
@@ -2260,6 +2338,10 @@ impl ConstCapture {
         let shape = split_set_or_map(staged, has_set_entry);
         self.discard_window();
         self.non_const_dup_placeholder(span);
+        // A non-const literal never reports `const_eval_for_element`; drop
+        // its own `for` bookkeeping so a later literal cannot claim it.
+        let _ = self.settle_literal(span.offset);
+        self.pending_for_elements.clear();
         Some((shape, has_ctl))
     }
 
@@ -2731,13 +2813,19 @@ impl ConstCapture {
             self.apply_unaries_at(self.depth);
             self.pop_operands(count);
             self.non_const_dup_placeholder(span);
+            let _ = self.settle_literal(span.offset);
+            self.pending_for_elements.clear();
             return None;
         }
         self.apply_unaries_at(self.depth);
         if self.fold_literal_ctor_element(count, span, Expr::List, self.base()) {
+            let _ = self.settle_literal(span.offset);
+            self.pending_for_elements.clear();
             return None;
         }
-        Some(self.pop_operands(count))
+        let elements = self.pop_operands(count);
+        self.pending_for_elements = self.settle_literal(span.offset);
+        Some(elements)
     }
 
     /// The literal-constructor candidate fold shared by the collection
@@ -2786,7 +2874,12 @@ impl ConstCapture {
         span: SourceRange,
         has_set_entry: bool,
     ) -> Option<SetOrMap> {
-        if !self.open() || self.top_is_non_const_dup() {
+        if !self.open() {
+            return None;
+        }
+        if self.top_is_non_const_dup() {
+            let _ = self.settle_literal(span.offset);
+            self.pending_for_elements.clear();
             return None;
         }
         self.apply_unaries_at(self.depth);
@@ -2799,6 +2892,8 @@ impl ConstCapture {
             },
             self.base(),
         ) {
+            let _ = self.settle_literal(span.offset);
+            self.pending_for_elements.clear();
             return None;
         }
         let staged = self.pop_operands(count);
@@ -2809,6 +2904,7 @@ impl ConstCapture {
         // element faces. Non-const literals never reach here (the
         // `close_non_const_dup` branch owns them upstream).
         self.staged_dups.push((shape.clone(), span));
+        self.pending_for_elements = self.settle_literal(span.offset);
         Some(shape)
     }
 
@@ -4483,7 +4579,7 @@ mod tests {
         let mut capture = ConstCapture::new(world.id("identical"));
         assert!(capture.open_literal_ctor());
         capture.begin_arguments();
-        capture.begin_ctl_element();
+        capture.begin_ctl_element(CtlElementKind::For, span(0));
         capture.identifier(world.id("x"), span(1));
         capture.literal(span(2), ConstantValue::Int(1));
         assert!(
