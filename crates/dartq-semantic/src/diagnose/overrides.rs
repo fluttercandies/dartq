@@ -3714,18 +3714,25 @@ impl<'a> Engine<'a> {
             .map(|decl| decl.constructors.iter().copied().collect())
             .unwrap_or_default();
         // The instance-scope bare names of this container's own members.
+        // An `augment` member merges into the augmented element — it claims
+        // no introductory instance name of its own (upstream's claim side
+        // skips augmentation fragments, member_duplicate_definition_verifier
+        // .dart:307-309), so an augmenting instance member never silences
+        // a same-named static here. The static-probe side keeps every site:
+        // upstream applies no augment filter on probes.
         let instance_names: FxHashSet<StringId> = self
             .decl_sites
             .iter()
             .filter(|site| {
-                matches!(
-                    &site.kind,
-                    DeclKind::Member {
-                        is_static: false,
-                        container: c,
-                        ..
-                    } if *c == container
-                )
+                !site.is_augment
+                    && matches!(
+                        &site.kind,
+                        DeclKind::Member {
+                            is_static: false,
+                            container: c,
+                            ..
+                        } if *c == container
+                    )
             })
             .map(|site| self.bare_name(site.name))
             .filter(|name| !ctor_names.contains(name))

@@ -1937,10 +1937,16 @@ pub(crate) struct DeclSite {
     /// sites set it (the unnamed factory's member-captured head never
     /// joins a `this()` edge, whose selector is what this bit keys).
     pub(crate) is_factory: bool,
-    /// The declaration is an `augment` (constructor sites only — the
+    /// The declaration carries its own `augment` keyword. Constructor
+    /// sites take the head's `ctor_augment_pending` latch (the
     /// `duplicate_constructor` pass and the generative-constructor gate
     /// skip them; the fragment chain, not a second declaration, carries
-    /// the augmentation).
+    /// the augmentation); member sites take their own keyword's latch —
+    /// `open_exec_augment` for the executable kinds, `group_augment` for
+    /// a field declarator — so the `conflicting_static_and_instance`
+    /// own-scope claim side can keep an augmenting fragment out of the
+    /// introductory instance scope (member_duplicate_definition_verifier
+    /// .dart:307-309 skips augmentation fragments on claims).
     pub(crate) is_augment: bool,
 }
 

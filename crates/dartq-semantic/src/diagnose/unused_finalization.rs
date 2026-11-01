@@ -6929,10 +6929,21 @@ impl<'a> Engine<'a> {
             // `begin_factory` set it before any site of theirs exists).
             const_ctor: self.in_const_ctor,
             is_factory: false,
-            // The site-consumed augment latch (constructor heads only):
-            // taken here so a later non-constructor site can never see a
-            // stale bit.
-            is_augment: std::mem::take(&mut self.ctor_augment_pending),
+            // The site-consumed augment latch. A member site carries its
+            // own `augment` keyword — the executable kinds read the method
+            // head's `open_exec_augment`, a field declarator reads the
+            // group head's `group_augment` (both latched before any of the
+            // declaration's name events). Every other site keeps the
+            // constructor latch's `take` so a stale bit never crosses a
+            // site.
+            is_augment: match &kind {
+                DeclKind::Member {
+                    kind: MemberKind::Field,
+                    ..
+                } => self.group_augment,
+                DeclKind::Member { .. } => self.open_exec_augment,
+                _ => std::mem::take(&mut self.ctor_augment_pending),
+            },
         });
         let site = self.decl_sites.len() - 1;
         // The FFI-named annotations latch onto the declaration they

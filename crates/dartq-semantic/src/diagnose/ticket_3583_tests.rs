@@ -53,8 +53,8 @@
 //! the field group head), and `check_conflicting_static_and_instance`
 //! (overrides.rs) builds `instance_names` from those sites with no
 //! `is_augment` filter. The repair is engine-side (set the bit on member
-//! sites, filter the instance set), and the two `#[ignore]`d pins below
-//! state the oracle truth for it. The #3585 positive controls
+//! sites, filter the instance set) and is now landed — the two pins below
+//! state the oracle truth it was checked against. The #3585 positive controls
 //! (`ticket_3585_tests.rs`) hold the other half fixed: a member WITHOUT
 //! the keyword inside an `augment` body is an introduction that still
 //! claims and still reports.
@@ -198,18 +198,13 @@ fn enum_factory_constructor_name_is_not_an_instance_member() {
 /// instance scope, so the introductory static member stays silent
 /// (oracle a1: `augmentation_without_declaration` only).
 ///
-/// Ignored: the own-scope arm builds its instance set from the engine's
-/// flat declaration sites (`check_conflicting_static_and_instance`,
-/// overrides.rs), and a member site never carries the member's own
-/// `augment` keyword — `note_decl_site` (unused_finalization.rs) sets
-/// `DeclSite::is_augment` from the constructor latch only — so the
-/// emitter cannot tell this augmenting fragment from an introduction. The
-/// collector's merged member map already excludes it (`fold_fragment`'s
-/// `is_augment` filter) and is not what this arm reads. The pin states
-/// the oracle truth so the engine-side repair lands against a failing
-/// witness.
+/// Member decl sites now carry their own `augment` keyword —
+/// `note_decl_site` (unused_finalization.rs) sets `DeclSite::is_augment`
+/// from the member latches and the own-scope claim side filters
+/// augmentation fragments out of `instance_names`
+/// (`check_conflicting_static_and_instance`, overrides.rs) — so this
+/// augmenting fragment no longer reads as an introduction.
 #[test]
-#[ignore = "member decl sites never carry the member's own augment keyword (engine note_decl_site + overrides instance_names filter)"]
 fn augment_without_target_does_not_collide() {
     let rows = conflicts_augmented(
         "class A {\n\
@@ -245,14 +240,15 @@ fn augment_static_member_with_target_still_reports() {
 /// never become declarations of the container (oracle
 /// `parser-fe/augmentation/member_declarations`: zero such rows).
 ///
-/// Ignored for the same engine-side reason as
+/// Previously ignored for the same engine-side reason as
 /// [`augment_without_target_does_not_collide`]: the two `augment`-shaped
-/// members reach the declaration-site capture as an ordinary
-/// instance/static pair. This shape is also the direct disproof of a
-/// collector attribution — a plain `class` head takes the claim arm of
-/// `close_container`, so `fold_fragment` never runs here at all.
+/// members reached the declaration-site capture as an ordinary
+/// instance/static pair; with `is_augment` on member sites the claim arm
+/// now drops the instance fragment. This shape is also the direct
+/// disproof of a collector attribution — a plain `class` head takes the
+/// claim arm of `close_container`, so `fold_fragment` never runs here at
+/// all.
 #[test]
-#[ignore = "member decl sites never carry the member's own augment keyword (engine note_decl_site + overrides instance_names filter)"]
 fn augment_members_in_non_augment_container_are_silent() {
     let rows = conflicts_augmented(
         "class C {\n\
