@@ -622,8 +622,23 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
             },
         },
         Expr::Cond { cond, then, els } => match fold(cond, lookup, depth) {
-            Verdict::Value(ConstantValue::Bool(true)) => fold(then, lookup, depth),
-            Verdict::Value(ConstantValue::Bool(false)) => fold(els, lookup, depth),
+            // A known condition skips one branch, but upstream checks the
+            // skipped branch for shapes the const grammar can never value
+            // before evaluating the taken one (evaluation.dart:825-837); the
+            // skipped branch's first such node wins over the taken branch's
+            // own verdict.
+            Verdict::Value(ConstantValue::Bool(true)) => {
+                match not_potentially_constant(els, lookup) {
+                    Some(npc) => Verdict::NotConstant(npc),
+                    None => fold(then, lookup, depth),
+                }
+            }
+            Verdict::Value(ConstantValue::Bool(false)) => {
+                match not_potentially_constant(then, lookup) {
+                    Some(npc) => Verdict::NotConstant(npc),
+                    None => fold(els, lookup, depth),
+                }
+            }
             // A created bool instance of unknown value (`cond ? a : b` over
             // `bool.fromEnvironment`): `applyBooleanConversion` passes and
             // the condition is unknown — both branches must be constant.
@@ -810,6 +825,19 @@ fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth
     })
 }
 
+/// Upstream `_reportNotPotentialConstants` (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/constant/evaluation.dart:2237-2249): a lazy
+/// construct whose left operand settles the value still checks the operand
+/// it skips for shapes the const grammar can never value. The first such
+/// node anchors the site default (the verdict's code is `invalid_constant`,
+/// which `_reportError`'s allow list does not carry, so the variable
+/// declaration reports its own code at that node).
+fn not_potentially_constant(node: &Node, lookup: &dyn ConstLookup) -> Option<SourceRange> {
+    let mut spans = Vec::new();
+    collect_not_potentially_constant(node, lookup, &mut spans);
+    spans.first().copied()
+}
+
 fn eval_binary(
     op: BinOp,
     span: SourceRange,
@@ -826,16 +854,43 @@ fn eval_binary(
             match l {
                 Verdict::Value(ConstantValue::Bool(b)) => {
                     if (b && op == BinOp::Or) || (!b && op == BinOp::And) {
-                        l
+                        // The left operand settles the value, but the skipped
+                        // right operand still has to be potentially constant
+                        // (evaluation.dart:708-723): the first shape the
+                        // const grammar can never value replaces the value.
+                        match not_potentially_constant(right, lookup) {
+                            Some(npc) => Verdict::NotConstant(npc),
+                            None => l,
+                        }
                     } else {
+                        // The right operand decides the value, so upstream
+                        // computes it inside the lazy state and re-anchors a
+                        // failure at the whole binary — `computeRightOperand`
+                        // throws and `DartObjectComputer.lazyAnd`/`lazyOr`
+                        // catch into `InvalidConstant.forEntity(entity: node)`
+                        // (evaluation.dart:697-736, 2293-2298).
                         match fold(right, lookup, depth) {
                             Verdict::Value(ConstantValue::Bool(rb)) => {
                                 Verdict::Value(ConstantValue::Bool(rb))
                             }
-                            r @ (Verdict::Fault(..)
-                            | Verdict::NotConstant(_)
-                            | Verdict::Unresolved(_)) => r,
-                            _ => Verdict::Constant,
+                            // `assertBool(rightOperand)`: an unknown-but-bool
+                            // state passes; any other value throws the
+                            // type-bool fault at the binary.
+                            Verdict::Value(ConstantValue::Created(rc))
+                                if lookup.created_state(rc) == CreatedState::Bool =>
+                            {
+                                Verdict::Constant
+                            }
+                            Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, span),
+                            Verdict::NotConstant(_) | Verdict::Unresolved(_) => {
+                                Verdict::NotConstant(span)
+                            }
+                            // A `constEval*` fault keeps its own grade: it is
+                            // allow-listed, so the site default is overridden
+                            // either way and the inner anchor is the finer of
+                            // the two.
+                            r @ Verdict::Fault(..) => r,
+                            Verdict::Constant => Verdict::Constant,
                         }
                     }
                 }
@@ -866,7 +921,17 @@ fn eval_binary(
         BinOp::IfNull => {
             let l = fold(left, lookup, depth);
             match l {
+                // `null ?? e`: the left decides nothing, and upstream hands
+                // the right's own verdict through untouched
+                // (`lazyQuestionQuestion` returns the computer's result
+                // without re-anchoring, evaluation.dart:2525-2532).
                 Verdict::Value(ConstantValue::Null) => fold(right, lookup, depth),
+                // A non-null left settles the value; the skipped right
+                // operand is still scanned (evaluation.dart:724-730).
+                Verdict::Value(_) => match not_potentially_constant(right, lookup) {
+                    Some(npc) => Verdict::NotConstant(npc),
+                    None => l,
+                },
                 other => other,
             }
         }
@@ -2401,9 +2466,23 @@ impl ConstCapture {
             }
             (None, _) => return,
         };
+        // The node ends at the RIGHT OPERAND's own end, never at the token
+        // the expression context closed on: the oracle builds the node as
+        // `BinaryExpressionImpl(rightOperand: right)` and takes its extent
+        // from `right.endToken` (`endToken` is unused,
+        // pkg/analyzer/lib/src/fasta/ast_builder.dart:1069). The listener's
+        // `end` is the token the caller consumed after the expression (the
+        // `;` of `const c = a && b;`), so it is only a fallback for a
+        // span-less right operand.
+        let right_end = right.span.end();
+        let node_end = if right_end > left.span.offset {
+            right_end
+        } else {
+            end.end()
+        };
         let span = SourceRange {
             offset: left.span.offset,
-            length: end.end().saturating_sub(left.span.offset),
+            length: node_end.saturating_sub(left.span.offset),
         };
         self.push(
             Node {
