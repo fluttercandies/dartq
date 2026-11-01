@@ -720,6 +720,51 @@ impl State {
         )
     }
 
+    /// Records a type test's outcome on a property slot (the property
+    /// mirror of [`State::finish_type_test`] — official `_finishTypeTest`
+    /// reached through `tryPromoteForTypeCheck` on a `_PropertyReference`,
+    /// `flow_analysis.dart:4118-4179`: the same tested/promoted chain
+    /// bookkeeping a variable model carries, keyed on the slot's own
+    /// promotion model). A receiver-captured or slot-captured property
+    /// promotes nothing (the official `info.writeCaptured` bail,
+    /// `flow_analysis.dart:4136-4138` — the value version association is
+    /// permanently gone). `tested` joins the types-of-interest chain,
+    /// `promoted` the promotion chain — each optional side a
+    /// `(type, written-argument tree)` pair.
+    pub(crate) fn finish_prop_type_test(
+        self,
+        ops: &dyn TypeOps,
+        lists: &mut Lists,
+        slot: u32,
+        tested: Option<(Ty, u32)>,
+        promoted: Option<(Ty, u32)>,
+        arena: &[Vec<crate::ty::ArgTy>],
+        names: &[Box<str>],
+    ) -> Self {
+        let model = self.prop(slot);
+        if model.captured() {
+            return self;
+        }
+        let mut new_tested = model.tested;
+        if let Some((tested, args)) = tested
+            && !lists.iter(model.tested).any(|t| t == tested)
+        {
+            new_tested = append_tested(lists, model.tested, tested, args);
+        }
+        let mut new_promoted = model.promoted;
+        if let Some((promoted, args)) = promoted {
+            new_promoted = add_promoted(ops, lists, model.promoted, promoted, args, arena, names);
+        }
+        self.with_prop(
+            slot,
+            VarModel {
+                promoted: new_promoted,
+                tested: new_tested,
+                ..model
+            },
+        )
+    }
+
     /// Records the non-null promotion on a property slot (the property
     /// mirror of the null-check face of [`State::finish_type_test`] —
     /// official `tryMarkNonNullable` through `_finishTypeTest`,
