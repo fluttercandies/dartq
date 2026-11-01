@@ -1611,6 +1611,19 @@ pub struct ExtensionFace {
 pub struct MemberEntry {
     /// The member kind.
     pub kind: MemberKind,
+    /// The declaration is an augmentation fragment — it carried its own
+    /// `augment` modifier (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/summary2/element_builder.dart`:
+    /// `fragment.isAugmentation = node.augmentKeyword != null`). An
+    /// augmentation member neither checks nor claims in any duplicate
+    /// scope (member_duplicate_definition_verifier.dart:307-309 returns
+    /// before the claim) and never enters an augmentation chain as an
+    /// introduction — a member of an `augment` container WITHOUT its own
+    /// keyword is an introduction in that fragment and stays `false`
+    /// (it claims into the merged element's scope). Primary-constructor
+    /// declaring formals follow the primary fragment's own augment rule
+    /// (an augmenting extension type's primary alone marks them).
+    pub is_augment: bool,
     /// `static` member (enum constants are static).
     pub is_static: bool,
     /// The `abstract` modifier was present (abstract fields).
@@ -3000,6 +3013,7 @@ mod tests {
 
         let entry = MemberEntry {
             kind: MemberKind::Method,
+            is_augment: false,
             is_static: false,
             is_abstract: false,
             is_external: false,
