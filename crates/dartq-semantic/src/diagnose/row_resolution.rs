@@ -1899,7 +1899,14 @@ impl<'a> Engine<'a> {
                     );
                 }
             }
-            Receiver::Super { container, .. } => {
+            Receiver::Super { container, kind } => {
+                // `super` inside an extension/extension-type body resolves
+                // against `InvalidType` upstream (`SuperContext.of != valid`
+                // — binary_expression_resolver.dart:391-404) — the operator
+                // lookup never runs and the dedicated context face reports.
+                if matches!(kind, ContainerKind::Extension | ContainerKind::ExtensionType) {
+                    return;
+                }
                 let mut missing: Vec<String> = Vec::new();
                 for spelling in [read, write].into_iter().flatten() {
                     if matches!(self.walk_super(container, spelling), Walk::Missing) {
@@ -1911,9 +1918,14 @@ impl<'a> Engine<'a> {
                 }
                 let type_text = self.strings.resolve(container).to_string();
                 for text in missing {
+                    // The oracle reports `undefinedSuperOperator` at the
+                    // operator token (`binary_expression_resolver.dart`
+                    // `.at(node.operator)`), never the `super` keyword —
+                    // and operators never run the `getInherited` abstract
+                    // leg, so the face here stays the single operator row.
                     self.emit(
                         SemanticCode::UndefinedSuperMember(SuperShape::Operator),
-                        row.range,
+                        op_range,
                         &text,
                         &type_text,
                     );
@@ -2834,6 +2846,56 @@ impl<'a> Engine<'a> {
                         // the `shouldIgnoreUndefinedIdentifier` check rides
                         // the `else if` below it).
                         self.emit(SemanticCode::UndefinedIdentifierAwait, row.range, "", "");
+                        self.record_miss(row.name, row.range, false, NameUse::Read);
+                    }
+                    Intent::Read if self.method_type_arguments_after(row.range) => {
+                        // A generic instantiation head (`foo<int>` — the
+                        // oracle's `ReadSyntax.typeInstantiation`): the
+                        // unqualified lookup fails its `this` face like the
+                        // invocation arm — `undefined_method` naming `this`'s
+                        // type where one exists (an extension body answers
+                        // its `on` type), `undefined_identifier` where none
+                        // does (lookup_failure_reporter.dart's
+                        // `UnqualifiedLookupDomain._readFailure`
+                        // typeInstantiation arm). An extension whose `on`
+                        // head is `InvalidType` reports nothing — the
+                        // `ext_invoke` slot's `None` host, mirroring the
+                        // invocation arm's silent posture.
+                        if let Some(host) = ext_invoke {
+                            if let Some(container) = host {
+                                let type_text = self.strings.resolve(container).to_string();
+                                if !Self::synthetic_reference(row.range)
+                                    && !self.keyword_bare_reference(row.range)
+                                {
+                                    self.emit(
+                                        SemanticCode::UndefinedMethod,
+                                        row.range,
+                                        name_text,
+                                        &type_text,
+                                    );
+                                }
+                            }
+                            self.record_miss(row.name, row.range, false, NameUse::Read);
+                            return;
+                        }
+                        if let Some(container) = this_type {
+                            let type_text = self.strings.resolve(container).to_string();
+                            if !Self::synthetic_reference(row.range)
+                                && !self.keyword_bare_reference(row.range)
+                            {
+                                self.emit(
+                                    SemanticCode::UndefinedMethod,
+                                    row.range,
+                                    name_text,
+                                    &type_text,
+                                );
+                            }
+                        } else if !Self::synthetic_reference(row.range)
+                            && !self.keyword_bare_reference(row.range)
+                            && !self.guard.ignore(None, row.name)
+                        {
+                            self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
+                        }
                         self.record_miss(row.name, row.range, false, NameUse::Read);
                     }
                     Intent::Read | Intent::Write | Intent::ReadWrite => {
@@ -5009,8 +5071,8 @@ impl<'a> Engine<'a> {
             Receiver::This { .. } | Receiver::Typed { .. } => {
                 self.check_instance_member(promotions, row, recv);
             }
-            Receiver::Super { container, .. } => {
-                self.check_super_member(row, container);
+            Receiver::Super { container, kind } => {
+                self.check_super_member(row, container, kind);
             }
         }
     }
@@ -6584,12 +6646,29 @@ impl<'a> Engine<'a> {
 
     /// `super.member` — the oracle's `SuperLookupDomain`: one analyzerCode
     /// (`undefined_super_member`) with a per-access-shape message, reported
-    /// against the enclosing container's name. Operator intents follow the
-    /// member-result shape (the direct `super + b` form lives on the
-    /// receiver rows in [`Engine::resolve_receiver_row`], which reports the
-    /// operator shape). A broken super chain (mixins: `on` constraints are
-    /// not edges) suppresses.
-    pub(crate) fn check_super_member(&mut self, row: &Row, container: StringId) {
+    /// against the enclosing container's name, plus the
+    /// `abstract_super_member_reference` verdict a super-interface
+    /// signature earns when no concrete dispatch target exists. Operator
+    /// intents follow the member-result shape (the direct `super + b` form
+    /// lives on the receiver rows in [`Engine::resolve_receiver_row`],
+    /// which reports the operator shape). A broken super chain (mixins:
+    /// `on` constraints are not edges) suppresses.
+    ///
+    /// Inside an `extension`/`extension type` body `super` is not a valid
+    /// reference at all — upstream resolves it against `InvalidType`
+    /// (`SuperContext.of != valid`, method_invocation_resolver.dart:947-955
+    /// / property_element_resolver.dart:2014-2016), so the member lookup
+    /// never runs and this face stays silent; the dedicated
+    /// `super_in_extension*` context rows own the report.
+    pub(crate) fn check_super_member(
+        &mut self,
+        row: &Row,
+        container: StringId,
+        kind: ContainerKind,
+    ) {
+        if matches!(kind, ContainerKind::Extension | ContainerKind::ExtensionType) {
+            return;
+        }
         if let Intent::Operator(..) = row.intent {
             match self.walk_super(container, row.name) {
                 Walk::Found(entry) => {
@@ -6644,10 +6723,7 @@ impl<'a> Engine<'a> {
             self.check_member_unused_result(
                 row,
                 container,
-                &Receiver::Super {
-                    container,
-                    kind: ContainerKind::Class,
-                },
+                &Receiver::Super { container, kind },
                 false,
             );
             return;
@@ -6705,10 +6781,7 @@ impl<'a> Engine<'a> {
                 self.check_member_unused_result(
                     row,
                     container,
-                    &Receiver::Super {
-                        container,
-                        kind: ContainerKind::Class,
-                    },
+                    &Receiver::Super { container, kind },
                     false,
                 );
                 return;
@@ -6744,32 +6817,61 @@ impl<'a> Engine<'a> {
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
-        let shape = match row.intent {
-            Intent::Invoke => SuperShape::Method,
-            Intent::Write | Intent::ReadWrite => SuperShape::Setter,
-            Intent::Read => SuperShape::Getter,
-            Intent::Operator(..) => unreachable!("operator intents returned above"),
-        };
-        let name_text = self.strings.resolve(row.name);
+        let name_text = self.strings.resolve(row.name).to_string();
         let type_text = self.strings.resolve(container).to_string();
-        // A compound write checks the read face first (the oracle resolves
-        // the getter before the setter).
-        if row.intent == Intent::ReadWrite
-            && matches!(self.walk_super(container, row.name), Walk::Missing)
-        {
-            self.emit(
-                SemanticCode::UndefinedSuperMember(SuperShape::Getter),
-                row.range,
-                name_text,
-                &type_text,
-            );
+        // The dispatch walk missed cleanly — the oracle retries through the
+        // inherited interface (`getInherited`,
+        // property_element_resolver.dart:2035-2058 / 2093-2116): a
+        // super-interface still carrying the name (an `implements`
+        // signature or an abstract member on the chain) reports
+        // `abstract_super_member_reference` with the found member's own
+        // kind word; a clean interface miss reports the
+        // `undefined_super_member` shape of the access. A compound write's
+        // read and write faces judge independently — the read spelling
+        // first, then the `name=` setter (upstream runs the read leg's
+        // `getMember`/`getInherited` pair before the write leg's
+        // `lookUpSetter` pair).
+        let report = |engine: &mut Self, spelling: StringId, miss_shape: SuperShape| {
+            match engine.walk_super_interface(container, spelling) {
+                Walk::Found(entry) => {
+                    let shape = match entry.kind {
+                        MemberKind::Getter | MemberKind::Field => SuperShape::Getter,
+                        MemberKind::Setter => SuperShape::Setter,
+                        MemberKind::Method => SuperShape::Method,
+                    };
+                    engine.emit(
+                        SemanticCode::AbstractSuperMemberReference(shape),
+                        row.range,
+                        &name_text,
+                        "",
+                    );
+                }
+                Walk::Missing | Walk::ChainBroken => {
+                    engine.emit(
+                        SemanticCode::UndefinedSuperMember(miss_shape),
+                        row.range,
+                        &name_text,
+                        &type_text,
+                    );
+                }
+            }
+        };
+        match row.intent {
+            Intent::Invoke => report(self, row.name, SuperShape::Method),
+            Intent::Read => report(self, row.name, SuperShape::Getter),
+            Intent::Write => {
+                let setter = self.setter_spelling(row.name);
+                report(self, setter, SuperShape::Setter);
+            }
+            Intent::ReadWrite => {
+                // The read face reports first (the oracle resolves the
+                // getter before the setter).
+                report(self, row.name, SuperShape::Getter);
+                let setter = self.setter_spelling(row.name);
+                report(self, setter, SuperShape::Setter);
+            }
+            Intent::Operator(..) => unreachable!("operator intents returned above"),
         }
-        self.emit(
-            SemanticCode::UndefinedSuperMember(shape),
-            row.range,
-            name_text,
-            &type_text,
-        );
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
     }
 

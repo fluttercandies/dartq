@@ -6329,6 +6329,10 @@ mod tests {
             | SemanticCode::UndefinedGetterOnFunctionType
             | SemanticCode::UndefinedMethodOnFunctionType
             | SemanticCode::UndefinedSetterOnFunctionType
+            // The super-member miss pair: the dispatch-vs-interface two-stage
+            // lookup's rows — the abstract interface hit reports beside the
+            // dispatch miss's own `undefined_super_member`.
+            | SemanticCode::AbstractSuperMemberReference(_)
             | SemanticCode::PrefixShadowedByLocalDeclaration
             | SemanticCode::UnnecessaryCast
             | SemanticCode::UnnecessaryCastPattern
@@ -6665,6 +6669,7 @@ mod tests {
             SemanticCode::UndefinedReferencedParameter,
             SemanticCode::UndefinedSetter,
             SemanticCode::UndefinedSetterOnFunctionType,
+            SemanticCode::AbstractSuperMemberReference(SuperShape::Getter),
             SemanticCode::UndefinedSuperMember(SuperShape::Getter),
             SemanticCode::UndefinedSuperMember(SuperShape::Method),
             SemanticCode::UndefinedSuperMember(SuperShape::Operator),

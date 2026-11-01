@@ -445,12 +445,82 @@ impl<'a> Engine<'a> {
         self.walk_climb(container, member, skip_own, false)
     }
 
+    /// The `super.member` dispatch walk — the official `getMember(element,
+    /// name, forSuper: true)` (`inheritance_manager3.dart:223-265`): the
+    /// enclosing type's `superImplemented.last` map — the concrete-dispatch
+    /// members on the superclass-and-mixin spine only. Abstract members are
+    /// skipped (they never enter `implemented` — `_addMixinMembers` and
+    /// `_addImplemented` both filter on `isAbstract`), `implements`/`on`
+    /// signature faces never answer (the interface merge contributes no
+    /// dispatch target), and a mixin's `on` heads are not edges here. The
+    /// chain still reports `ChainBroken` on an unresolvable hop — the
+    /// under-report boundary stays identical to the union climb's.
+    ///
+    /// Not memoized through [`FaceMemo::walk`]: the `(container, member,
+    /// super)` key already caches the union answer [`Self::walk_super`]
+    /// rides, and a dispatch probe of the same key would collide with it.
+    pub(crate) fn walk_dispatch(&self, container: StringId, member: StringId) -> Walk<'a> {
+        self.walk_climb_impl(container, member, true, true, true)
+    }
+
+    /// The `super.member` interface walk — the official `getInherited`
+    /// (`inheritance_manager3.dart:152-155`, `inheritedMap` over the union of
+    /// every super-interface's signatures): the answer to "does any
+    /// supertype carry the name at all", abstract members and `implements`
+    /// faces included. The oracle consults it only after the dispatch walk
+    /// misses — a hit there reports `abstract_super_member_reference`, a
+    /// miss the `undefined_super_*` face.
+    ///
+    /// A mixin's interface walk covers its `on` constraints AND its
+    /// `implements` faces (the `overridden` candidate map,
+    /// `_getInterfaceMixin`:1001-1057); every other container climbs the
+    /// union spine (`skip_own`, abstract entries live).
+    pub(crate) fn walk_super_interface(&self, container: StringId, member: StringId) -> Walk<'a> {
+        if let Some((container_decl, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        ) && container_decl.kind == ContainerKind::Mixin
+        && container_decl.superclass.is_none()
+        && container_decl.with_clause.is_empty()
+        {
+            let mut seen: FxHashSet<StringId> = FxHashSet::default();
+            seen.insert(container);
+            return self.walk_face_list(
+                container_decl
+                    .on_clause
+                    .iter()
+                    .chain(container_decl.implements_clause.iter())
+                    .map(|face| (*face, self.file, container)),
+                self.lib,
+                member,
+                &mut seen,
+                true,
+            );
+        }
+        self.walk_climb(container, member, true, false)
+    }
+
     fn walk_climb(
+        &self,
+        container: StringId,
+        member: StringId,
+        skip_own: bool,
+        for_super: bool,
+    ) -> Walk<'a> {
+        self.walk_climb_impl(container, member, skip_own, for_super, false)
+    }
+
+    fn walk_climb_impl(
         &self,
         container: StringId,
         member: StringId,
         mut skip_own: bool,
         for_super: bool,
+        dispatch: bool,
     ) -> Walk<'a> {
         let mut name = container;
         // The container whose supertype clauses wrote the current `name` —
@@ -595,48 +665,81 @@ impl<'a> Engine<'a> {
             let owner_lib = self
                 .owner_library_of(found_owner, name)
                 .unwrap_or(scope_lib);
-            for mixin in found.with_clause.iter().rev() {
-                if !seen.insert(*mixin) {
+            // The dispatch walk keeps a worklist: an applied mixin CLASS's own
+            // `with` chain is part of the application's `implemented` map
+            // upstream (`_addMixinMembers` folds the mixin's implemented in,
+            // which a mixin class builds from its own `with` spine), so a
+            // member miss on `A` of `with A` keeps descending into `A`'s
+            // applications — depth-first, most-applied first. The union walk
+            // instead routes those faces through `pending_faces` (the
+            // interface merge), so its seed stays the written clause.
+            let mut mixin_queue: VecDeque<(StringId, FileId, StringId)> = found
+                .with_clause
+                .iter()
+                .rev()
+                .map(|mixin| (*mixin, found_owner, name))
+                .collect();
+            while let Some((mixin, mixin_writer_owner, mixin_writer)) = mixin_queue.pop_front() {
+                if !seen.insert(mixin) {
                     return Walk::ChainBroken;
                 }
-                let mixin_lib = owner_lib;
-                let mixin_resolved = self.resolve_clause_face(name, found_owner, mixin_lib, *mixin);
+                let mixin_lib = self
+                    .owner_library_of(mixin_writer_owner, mixin_writer)
+                    .unwrap_or(owner_lib);
+                let mixin_resolved =
+                    self.resolve_clause_face(mixin_writer, mixin_writer_owner, mixin_lib, mixin);
                 if let Some((mixin_container, mixin_owner)) = &mixin_resolved
-                    && mixin_container.members.get(&member).is_none()
+                    && mixin_container
+                        .members
+                        .get(&member)
+                        .is_none_or(|entry| dispatch && entry.is_abstract)
                 {
-                    // The application's interface keeps the mixin's own
-                    // faces: a resolved mixin whose members miss the lookup
-                    // still contributes its `on` constraint heads and
-                    // `implements` faces to the chain's interface climb
-                    // (`with ListMixin<E>` — SDK 3.47's ListBase `implements
-                    // List<E>` is where `[]`/`length` live; skipping them
-                    // left a fully-decidable chain answering Missing, which
-                    // flagged legal overrides as non-overriding once the
-                    // alias fold made the hop resolvable).
-                    //
-                    // A mixin CLASS applied through `with` also contributes
-                    // its own `with` faces: a named application `mixin class
-                    // A<U, V> = Object with M<...>` denotes the application
-                    // type, so `class C ... with A<...>` puts M's members on
-                    // C's interface exactly like a directly-written `with M`
-                    // (the oracle resolves `c.m()` on `class C<T> = S with
-                    // B<List<T>>`, `B = Object with A<...>`, `A = Object
-                    // with M<...>` through that chain — tests/language/
-                    // mixin5_test.dart). The superclass stays out: an
-                    // applied mixin's superclass is always `Object`
-                    // (`MIXIN_CLASS_DECLARATION_EXTENDS_NOT_OBJECT` forbids
-                    // anything else), whose members the object-members gate
-                    // owns. A plain mixin's `with` clause is empty — this
-                    // only fires for mixin classes and named applications.
-                    let level: Vec<(StringId, FileId, StringId)> = mixin_container
-                        .with_clause
-                        .iter()
-                        .chain(mixin_container.on_clause.iter())
-                        .chain(mixin_container.implements_clause.iter())
-                        .map(|face| (*face, *mixin_owner, *mixin))
-                        .collect();
-                    if !level.is_empty() {
-                        pending_faces.push(level);
+                    if dispatch {
+                        // The mixin's own `with` chain is part of its
+                        // `implemented` (a mixin class is a class — its
+                        // interface build merges the applied members as
+                        // concrete targets), so it recurses into the
+                        // dispatch queue ahead of the shallower seeds —
+                        // `with A, B` where `B = X with B2` asks B2 before X
+                        // before A (application order, most specific first).
+                        for (index, face) in mixin_container.with_clause.iter().enumerate() {
+                            mixin_queue.insert(index, (*face, *mixin_owner, mixin));
+                        }
+                    } else {
+                        // The application's interface keeps the mixin's own
+                        // faces: a resolved mixin whose members miss the lookup
+                        // still contributes its `on` constraint heads and
+                        // `implements` faces to the chain's interface climb
+                        // (`with ListMixin<E>` — SDK 3.47's ListBase `implements
+                        // List<E>` is where `[]`/`length` live; skipping them
+                        // left a fully-decidable chain answering Missing, which
+                        // flagged legal overrides as non-overriding once the
+                        // alias fold made the hop resolvable).
+                        //
+                        // A mixin CLASS applied through `with` also contributes
+                        // its own `with` faces: a named application `mixin class
+                        // A<U, V> = Object with M<...>` denotes the application
+                        // type, so `class C ... with A<...>` puts M's members on
+                        // C's interface exactly like a directly-written `with M`
+                        // (the oracle resolves `c.m()` on `class C<T> = S with
+                        // B<List<T>>`, `B = Object with A<...>`, `A = Object
+                        // with M<...>` through that chain — tests/language/
+                        // mixin5_test.dart). The superclass stays out: an
+                        // applied mixin's superclass is always `Object`
+                        // (`MIXIN_CLASS_DECLARATION_EXTENDS_NOT_OBJECT` forbids
+                        // anything else), whose members the object-members gate
+                        // owns. A plain mixin's `with` clause is empty — this
+                        // only fires for mixin classes and named applications.
+                        let level: Vec<(StringId, FileId, StringId)> = mixin_container
+                            .with_clause
+                            .iter()
+                            .chain(mixin_container.on_clause.iter())
+                            .chain(mixin_container.implements_clause.iter())
+                            .map(|face| (*face, *mixin_owner, mixin))
+                            .collect();
+                        if !level.is_empty() {
+                            pending_faces.push(level);
+                        }
                     }
                 }
                 if let Some((mixin_container, mixin_owner)) = mixin_resolved
@@ -654,9 +757,9 @@ impl<'a> Engine<'a> {
                     // reads — and stays undecidable when the clause facts
                     // are unknowable (a foreign application class), where
                     // the raw entry keeps the under-report posture.
-                    let projected = self.boundary.member(mixin_owner, *mixin, member, entry);
+                    let projected = self.boundary.member(mixin_owner, mixin, member, entry);
                     let found_entry =
-                        match self.mixin_env(name, *mixin, mixin_owner, &projected, &mut facts) {
+                        match self.mixin_env(mixin_writer, mixin, mixin_owner, &projected, &mut facts) {
                             Instantiated::Applied(env) => Projected::Foreign(std::rc::Rc::new(
                                 self.substitute_entry(&projected, &env),
                             )),
@@ -664,7 +767,7 @@ impl<'a> Engine<'a> {
                         };
                     self.member_faces
                         .found_origin
-                        .set(Some((*mixin, mixin_owner)));
+                        .set(Some((mixin, mixin_owner)));
                     return Walk::Found(found_entry);
                 }
             }
@@ -676,8 +779,12 @@ impl<'a> Engine<'a> {
             // interface build treats `on A, B` as the superclass `A` plus
             // the additional constraint faces `B`). The first head rides
             // the superclass climb; the remaining heads join this level's
-            // faces ahead of the interfaces.
-            let mixin_on_head = (found.kind == ContainerKind::Mixin)
+            // faces ahead of the interfaces. The dispatch walk has no `on`
+            // edges: a mixin's constraints sit on its `superImplemented`
+            // face, never on the application's `implemented` — `super.m`
+            // inside `class C extends S with M` sees S's concrete chain,
+            // never M's constraint members.
+            let mixin_on_head = (!dispatch && found.kind == ContainerKind::Mixin)
                 .then(|| found.on_clause.split_first().map(|(head, _)| *head))
                 .flatten();
             let mut level: Vec<(StringId, FileId, StringId)> = found
@@ -687,10 +794,18 @@ impl<'a> Engine<'a> {
                 .chain(found.implements_clause.iter())
                 .map(|face| (*face, found_owner, name))
                 .collect();
-            if !level.is_empty() {
+            if !level.is_empty() && !dispatch {
                 pending_faces.push(std::mem::take(&mut level));
             }
             let Some(superclass) = found.superclass.or(mixin_on_head) else {
+                // The dispatch chain ends at a class without a superclass:
+                // no `implements`/`on` face ever answers it (the oracle's
+                // `implemented` map carries no interface signatures). An
+                // enum still reports its implicit `Enum` superinterface —
+                // it IS the dispatch superclass.
+                if dispatch && found.kind != ContainerKind::Enum {
+                    return Walk::Missing;
+                }
                 // An enum's implicit superinterface (`Enum`, dart:core —
                 // every enum declaration implements it, so `index` and the
                 // `EnumName` extension's receiver resolve through it): the
@@ -822,17 +937,30 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// `super.member`: the walk starts at the enclosing container but skips
-    /// its own members — the official `S&M2` superclass chain still applies
-    /// (`super.m` in `class C extends S with M1, M2` resolves M2 over M1
-    /// over S). A container without a captured superclass edge and without
-    /// mixins (mixins: `on` constraints are not edges) breaks the chain.
+    /// `super.member`: the DISPATCH walk — the official `getMember(element,
+    /// name, forSuper: true)` (`inheritance_manager3.dart:223-265`), the
+    /// concrete members on the superclass-and-applied-mixin spine only.
+    /// The walk starts at the enclosing container but skips its own
+    /// members — the `S&M2` application sequence still applies (`super.m`
+    /// in `class C extends S with M1, M2` resolves M2 over M1 over S).
+    /// Abstract members never answer here (they are not `implemented`), and
+    /// `implements`/`on` faces contribute signatures only — the interface
+    /// leg lives in [`Self::walk_super_interface`], consulted for the
+    /// `abstract_super_member_reference` verdict.
+    ///
+    /// A container without a captured superclass edge and without mixins
+    /// (mixins: `on` constraints are not edges) answers `Missing` — the
+    /// official walk still reaches `Object`, whose members the caller's
+    /// `member_defined` gate resolves.
     pub(crate) fn walk_super(&self, container: StringId, member: StringId) -> Walk<'a> {
-        let Some(container_decl) = self
-            .index
-            .get(self.file)
-            .and_then(|f| f.container(container))
-        else {
+        let Some((container_decl, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        ) else {
             return Walk::ChainBroken;
         };
         if container_decl.superclass.is_none() && container_decl.with_clause.is_empty() {
@@ -840,9 +968,14 @@ impl<'a> Engine<'a> {
             // `mixin M on A, B` resolves `m` against the superclass
             // constraints' member pools (each constraint's own members, then
             // its supertypes — the oracle's `unpromotedThisType` interface,
-            // type_analyzer.dart `superLookupType`). Constraints are not
-            // supertype edges in the model, so the regular `walk_from` never
-            // sees them; seed the shared face-list climb with the `on` list.
+            // type_analyzer.dart `superLookupType`). The constraints'
+            // members answer abstract or concrete — the official
+            // `superInterface` merge keeps both
+            // (inheritance_manager3.dart:1013-1015), so this arm never runs
+            // the abstract filter the dispatch climb applies. Constraints
+            // are not supertype edges in the model, so the regular
+            // `walk_from` never sees them; seed the shared face-list climb
+            // with the `on` list.
             if container_decl.kind == ContainerKind::Mixin && !container_decl.on_clause.is_empty() {
                 let mut seen: FxHashSet<StringId> = FxHashSet::default();
                 seen.insert(container);
@@ -866,9 +999,18 @@ impl<'a> Engine<'a> {
             // gate.
             return Walk::Missing;
         }
-        self.member_faces.walk(container, member, true, || {
-            self.walk_from(container, member, true)
-        })
+        // An `augment` fragment's container row carries the introduction's
+        // clauses through the merged element face (`resolve_container` →
+        // `fragment_face` — `super.foo` inside `augment class B` climbs the
+        // BASE declaration's `extends`/`with` spine, exactly like the
+        // merged element upstream). A fragment without a resolvable
+        // introduction keeps the bare row's empty clauses and the `Missing`
+        // verdict above — the `undefined_super_member` report the oracle
+        // emits on the augment-without-declaration corpus face.
+        self.member_faces
+            .walk(container, member, true, || {
+                self.walk_dispatch(container, member)
+            })
     }
 
     // —— invalid_override (#453: the inheritance-override family) ——————

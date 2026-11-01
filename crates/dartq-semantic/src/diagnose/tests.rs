@@ -20036,6 +20036,15 @@ mod ticket_3429_tests;
 #[path = "ticket_3460_tests.rs"]
 mod ticket_3460_tests;
 
+// The #3461 pins (the `unnecessary_type_check` verdict legs): the
+// parameterized function-RHS typedef fold and the `p.T` checked-head
+// recovery. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3461_tests.rs"]
+mod ticket_3461_tests;
+
 // The #3428 pins (the live-prefix member miss's context routing): a
 // `p.C` whose prefix resolves but whose member is absent rides
 // `reportNullOrNonTypeElement`'s context chain exactly as a bare `C` does —

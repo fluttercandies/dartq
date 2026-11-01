@@ -4752,6 +4752,18 @@ impl<'a> Engine<'a> {
     /// [`Engine::requalify_creation_head`] with a written span end — the
     /// two-segment qualified reference (`Missing.new`) spans through the
     /// selector's name, its `.new` having ridden the qualified rest.
+    ///
+    /// Only a head whose own element lookup answers `null` takes the
+    /// `undefined_identifier`-over-the-span verdict: the upstream
+    /// `resolveConstructorTypeReference` importPrefix arm resolves the
+    /// head's first segment in the name scope and reports the
+    /// `undefined_identifier` face only when it is missing outright
+    /// (named_type_resolver.dart:566-590). A head that resolves to a
+    /// NON-TYPE element (`const NonType<int>.named()`'s function head) keeps
+    /// its `Missing` verdict — the creation context then reports
+    /// `creation_with_non_type` at the head token, exactly the oracle's
+    /// `reportNullOrNonTypeElement` tail. The `resolve_bare` probe asks the
+    /// same scope question the official element lookup does.
     pub(crate) fn requalify_creation_head_to(&mut self, start: Token, end: u32) {
         let offset = start.range.offset;
         let Some(index) = self.rows.iter().rposition(|row| {
@@ -4759,6 +4771,12 @@ impl<'a> Engine<'a> {
         }) else {
             return;
         };
+        if let Some(head) = self.text_of(start) {
+            let head = self.intern(head);
+            if !matches!(self.resolve_bare(head).0, BareInfo::Missing { .. }) {
+                return;
+            }
+        }
         let row = &mut self.rows[index];
         if let RowShape::TypeUse(TypeVerdict::Missing, suppressed) = row.shape {
             row.range.length = end.saturating_sub(offset);
