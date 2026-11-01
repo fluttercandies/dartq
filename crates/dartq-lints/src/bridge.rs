@@ -115,8 +115,11 @@ pub(crate) fn scan_tokens(source: &str, file: dartq_source::FileId) -> TokenTabl
 /// constructors (3.13), dot shorthands (3.10) shipped, variance and
 /// enhanced parts unshipped; the version-gated faces (records /
 /// class-modifiers / sealed-class 3.0, digit-separators 3.6,
-/// triple-shift 2.14 — the parser half of the scanner's
-/// [`SCAN_CONFIG`] gate) are all shipped at 3.15.
+/// triple-shift 2.14, nonfunction-type-aliases 2.13, generic-metadata
+/// 2.14, constructor-tearoffs 2.15, named-arguments-anywhere /
+/// super-parameters / enhanced-enums 2.17, unnamed-libraries 2.19,
+/// inline-class 3.3, null-aware-elements 3.8 — the parser half of the
+/// scanner's [`SCAN_CONFIG`] gate) are all shipped at 3.15.
 const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     patterns_enabled: true,
     variance_enabled: false,
@@ -131,6 +134,15 @@ const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     sealed_class_enabled: true,
     digit_separators_enabled: true,
     triple_shift_enabled: true,
+    constructor_tearoffs_enabled: true,
+    named_arguments_anywhere_enabled: true,
+    super_parameters_enabled: true,
+    enhanced_enums_enabled: true,
+    generic_metadata_enabled: true,
+    nonfunction_type_aliases_enabled: true,
+    inline_class_enabled: true,
+    unnamed_libraries_enabled: true,
+    null_aware_elements_enabled: true,
 };
 
 /// Parses `source` once (scanner → parser → arena) and yields the transient

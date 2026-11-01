@@ -138,20 +138,12 @@ fn constant_pattern_binary_over_collection() {
 #[test]
 fn patterns_disabled_reports_experiment() {
     let (table, text) = super::collector::scan_ok("1");
+    // Only the patterns bit drives this fixture (the source is a bare `1`);
+    // everything else rides the pre-2.13 all-off fold, so a new gate bit
+    // needs no edit here.
     let features = crate::ParserFeatures {
-        patterns_enabled: false,
-        variance_enabled: false,
         primary_constructors_enabled: true,
-        augmentations_enabled: false,
-        enhanced_parts_enabled: false,
-        dot_shorthands_enabled: false,
-        anonymous_methods_enabled: false,
-        sound_flow_analysis: false,
-        records_enabled: false,
-        class_modifiers_enabled: false,
-        sealed_class_enabled: false,
-        digit_separators_enabled: false,
-        triple_shift_enabled: false,
+        ..super::collector::version_features(2, 12)
     };
     let mut collector = super::collector::Collector::default();
     let mut p = crate::Parser::new(text, table, features, &mut collector);

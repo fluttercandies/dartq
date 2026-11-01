@@ -200,6 +200,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener.begin_library_name(library_keyword);
         self.cursor.advance(); // `library`
         let has_name = self.peek_kind() != TokenKind::Semicolon;
+        // `unnamed-libraries` (`enabledIn: 2.19`): a bare `library;` reports
+        // `experiment_not_enabled` at the `library` keyword below the
+        // boundary (`endLibraryName`, ast_builder.dart:2281).
+        if !has_name && !self.features.unnamed_libraries_enabled {
+            self.report(
+                msg::experiment_not_enabled("unnamed-libraries"),
+                library_keyword,
+            );
+        }
         let semicolon = if has_name {
             self.parse_qualified(
                 IdentifierContext::LibraryName,

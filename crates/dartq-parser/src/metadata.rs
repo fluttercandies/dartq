@@ -56,10 +56,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.cursor.advance();
             self.ensure_identifier(IdentifierContext::MetadataContinuation);
         }
+        let type_arguments_lt = self.peek_span();
         let has_type_arguments = self.peek_kind() == TokenKind::Lt;
         let type_param = self.compute_type_param_or_arg_on_lt(false);
         let group_parsed = !matches!(type_param, crate::type_args::TypeParamOrArg::None);
         let type_args_end = type_param.parse_arguments(self);
+        // `generic-metadata` (`enabledIn: 2.14`): type arguments on an
+        // annotation report `experiment_not_enabled` at the group's `<`
+        // below the boundary (`endMetadata`, ast_builder.dart:2423).
+        if group_parsed && !self.features.generic_metadata_enabled {
+            self.report(
+                msg::experiment_not_enabled("generic-metadata"),
+                type_arguments_lt,
+            );
+        }
         let mut period = None;
         if self.peek_kind() == TokenKind::Period {
             let period_span = self.peek_span();

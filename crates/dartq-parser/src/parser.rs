@@ -594,6 +594,60 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
         }
     }
 
+    /// The `constructor-tearoffs` gate's `new` face (`enabledIn: 2.15`): the
+    /// parser rewrites a `.`-headed `new` to an identifier wherever the
+    /// context allows it, and the analyzer's `handleNewAsIdentifier`
+    /// (ast_builder.dart:4984) reports `experiment_not_enabled` at that
+    /// token when the feature is off. Call it at every rewrite point.
+    pub(crate) fn report_constructor_tearoff_new(&mut self, at: TokenSpan) {
+        if !self.features.constructor_tearoffs_enabled {
+            self.report(
+                crate::message::msg::experiment_not_enabled("constructor-tearoffs"),
+                at,
+            );
+        }
+    }
+
+    /// The `constructor-tearoffs` gate's type-argument face (ast_builder.dart:5602):
+    /// a standalone `<...>` application on a non-invoked receiver reports
+    /// `experiment_not_enabled` over the whole group (`leftBracket` through
+    /// `rightBracket`) when the feature is off.
+    pub(crate) fn report_constructor_tearoff_application(
+        &mut self,
+        open_angle: TokenSpan,
+        closer: TokenSpan,
+    ) {
+        if !self.features.constructor_tearoffs_enabled {
+            self.report_with_end(
+                crate::message::msg::experiment_not_enabled("constructor-tearoffs"),
+                open_angle,
+                closer,
+            );
+        }
+    }
+
+    /// The `null-aware-elements` gate (`enabledIn: 3.8`): a `?` element
+    /// (`handleNullAwareElement`, ast_builder.dart:5119) or a map entry's
+    /// `?key`/`?value` marker (`handleLiteralMapEntry`, :4771) reports
+    /// `experiment_not_enabled` once per entry, at the key marker when both
+    /// are present (`nullAwareKeyToken ?? nullAwareValueToken`) and the
+    /// markers are then dropped.
+    pub(crate) fn report_null_aware_elements_gate(
+        &mut self,
+        key: Option<TokenSpan>,
+        value: Option<TokenSpan>,
+    ) {
+        if self.features.null_aware_elements_enabled {
+            return;
+        }
+        if let Some(at) = key.or(value) {
+            self.report(
+                crate::message::msg::experiment_not_enabled("null-aware-elements"),
+                at,
+            );
+        }
+    }
+
     /// The dot-shorthands gate (`enabledIn: 3.10`). The shared parser has no
     /// flag for the feature; the analyzer's `AstBuilder` reports
     /// `experiment_not_enabled` from its listener handlers — head, context

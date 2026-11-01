@@ -871,6 +871,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             }
         }
 
+        // `super-parameters` (`enabledIn: 2.17`): a `super.x` formal reports
+        // `experiment_not_enabled` at the `super` keyword below the boundary
+        // (`endFormalParameter`, ast_builder.dart:1789-1795).
+        if let Some(kw) = super_keyword
+            && !self.features.super_parameters_enabled
+        {
+            self.report(msg::experiment_not_enabled("super-parameters"), kw);
+        }
+
         // Field formals are only legal in constructor formals; anywhere else
         // the verifier reports `field_initializer_outside_constructor` at the
         // `this` keyword (error_verifier.dart:5595; primary constructors are

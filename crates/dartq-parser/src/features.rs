@@ -115,6 +115,53 @@ pub struct ParserFeatures {
     /// (`parser_impl.dart:5790` operator member, :7262 `>>>=`, :7392
     /// binary `>>>`).
     pub triple_shift_enabled: bool,
+    /// `constructor-tearoffs` (`enabledIn: 2.15.0`): `new` rewritten to an
+    /// identifier (`A.new`) and a standalone explicit type-argument
+    /// application (`f<int>`). When off, `handleNewAsIdentifier`
+    /// (ast_builder.dart:4984) and `handleTypeArgumentApplication`
+    /// (ast_builder.dart:5602) each report `experiment_not_enabled` — the
+    /// first at the `new`, the second over the `<...>` group.
+    pub constructor_tearoffs_enabled: bool,
+    /// `named-arguments-anywhere` (`enabledIn: 2.17.0`): a positional
+    /// argument after a named one. When off, `endArguments`
+    /// (ast_builder.dart:970) reports `positional_after_named_argument`
+    /// over the positional's expression.
+    pub named_arguments_anywhere_enabled: bool,
+    /// `super-parameters` (`enabledIn: 2.17.0`): a `super.x` formal
+    /// parameter. When off, `endFormalParameter` (ast_builder.dart:1789)
+    /// reports `experiment_not_enabled` at the `super` keyword.
+    pub super_parameters_enabled: bool,
+    /// `enhanced-enums` (`enabledIn: 2.17.0`): enum constants with
+    /// arguments or a named/generic constructor selector
+    /// (`handleEnumElement`, ast_builder.dart:4035), a `;` closing the
+    /// constant list (`handleEnumElements`, :4094) and a header with a
+    /// with-clause, implements-clause or type parameters
+    /// (`handleEnumHeader`, :4131) each report `experiment_not_enabled`
+    /// when off — one row, anchored on the first present construct.
+    pub enhanced_enums_enabled: bool,
+    /// `generic-metadata` (`enabledIn: 2.14.0`): type arguments on an
+    /// annotation. When off, `endMetadata` (ast_builder.dart:2423) reports
+    /// `experiment_not_enabled` at the group's `<`.
+    pub generic_metadata_enabled: bool,
+    /// `nonfunction-type-aliases` (`enabledIn: 2.13.0`): a `typedef X = T;`
+    /// whose right-hand type is not a function type. When off,
+    /// `endGenericTypeAlias` (ast_builder.dart:3373) reports
+    /// `experiment_not_enabled` at the `=`.
+    pub nonfunction_type_aliases_enabled: bool,
+    /// `inline-class` (`enabledIn: 3.3.0`): the `extension type`
+    /// declaration. When off, `endExtensionTypeDeclaration`
+    /// (ast_builder.dart:1607) reports `experiment_not_enabled` at the
+    /// `type` keyword.
+    pub inline_class_enabled: bool,
+    /// `unnamed-libraries` (`enabledIn: 2.19.0`): a bare `library;`
+    /// directive. When off, `endLibraryName` (ast_builder.dart:2281)
+    /// reports `experiment_not_enabled` at the `library` keyword.
+    pub unnamed_libraries_enabled: bool,
+    /// `null-aware-elements` (`enabledIn: 3.8.0`): `?e` elements,
+    /// `?k: v`/`k: ?v` map entries. When off, `handleNullAwareElement`
+    /// (ast_builder.dart:5119) and `handleLiteralMapEntry` (:4771) report
+    /// `experiment_not_enabled` at the `?` and drop the marker.
+    pub null_aware_elements_enabled: bool,
 }
 
 impl ParserFeatures {
@@ -133,6 +180,15 @@ impl ParserFeatures {
         sealed_class_enabled: false,
         digit_separators_enabled: false,
         triple_shift_enabled: false,
+        constructor_tearoffs_enabled: false,
+        named_arguments_anywhere_enabled: false,
+        super_parameters_enabled: false,
+        enhanced_enums_enabled: false,
+        generic_metadata_enabled: false,
+        nonfunction_type_aliases_enabled: false,
+        inline_class_enabled: false,
+        unnamed_libraries_enabled: false,
+        null_aware_elements_enabled: false,
     };
 
     /// Folds a [`FeatureSet`] into the parser's plain flags.
@@ -182,6 +238,15 @@ impl ParserFeatures {
             // Lexical gate in the scanner (`>>>` as one token) plus the
             // parser's split-shape faces (the field's doc).
             Feature::TripleShift => self.triple_shift_enabled = true,
+            Feature::ConstructorTearoffs => self.constructor_tearoffs_enabled = true,
+            Feature::NamedArgumentsAnywhere => self.named_arguments_anywhere_enabled = true,
+            Feature::SuperParameters => self.super_parameters_enabled = true,
+            Feature::EnhancedEnums => self.enhanced_enums_enabled = true,
+            Feature::GenericMetadata => self.generic_metadata_enabled = true,
+            Feature::NonfunctionTypeAliases => self.nonfunction_type_aliases_enabled = true,
+            Feature::InlineClass => self.inline_class_enabled = true,
+            Feature::UnnamedLibraries => self.unnamed_libraries_enabled = true,
+            Feature::NullAwareElements => self.null_aware_elements_enabled = true,
             // No parser stance: the grammar surface is version-blind for
             // these entries (the fixed 3.15 surface accepts the shipped
             // shapes; the experimental ones have no production here), and
@@ -198,21 +263,12 @@ impl ParserFeatures {
             | Feature::PrivateNamedParameters
             | Feature::NativeAssets
             | Feature::GetterSetterError
-            | Feature::NullAwareElements
             | Feature::InferenceUsingBounds
             | Feature::WildcardVariables
             | Feature::InferenceUpdate3
-            | Feature::InlineClass
             | Feature::InferenceUpdate2
-            | Feature::UnnamedLibraries
             | Feature::AlternativeInvalidationStrategy
             | Feature::InferenceUpdate1
-            | Feature::EnhancedEnums
-            | Feature::NamedArgumentsAnywhere
-            | Feature::SuperParameters
-            | Feature::ConstructorTearoffs
-            | Feature::GenericMetadata
-            | Feature::NonfunctionTypeAliases
             | Feature::NonNullable
             | Feature::ExtensionMethods
             | Feature::ConstantUpdate2018
@@ -249,12 +305,15 @@ mod tests {
     /// every version that decides differently: each bit is exactly the
     /// `enabledIn <= version` predicate over its yaml entry (clamped at
     /// the data horizon like every version-derived face). The matrix
-    /// brackets every shipped boundary the stances cross — 2.14
-    /// (triple-shift), 3.0 (records / class-modifiers / sealed-class),
-    /// 3.6 (digit-separators), 3.9 (sound-flow-analysis), 3.10
-    /// (dot-shorthands), 3.13 (primary-constructors) — on both sides; a
-    /// new fold bit without its registry truth — or a stance flip — fails
-    /// here.
+    /// brackets every shipped boundary the stances cross — 2.13
+    /// (nonfunction-type-aliases), 2.14 (triple-shift / generic-metadata),
+    /// 2.15 (constructor-tearoffs), 2.17 (named-arguments-anywhere /
+    /// super-parameters / enhanced-enums), 2.19 (unnamed-libraries), 3.0
+    /// (records / class-modifiers / sealed-class), 3.3 (inline-class), 3.6
+    /// (digit-separators), 3.8 (null-aware-elements), 3.9
+    /// (sound-flow-analysis), 3.10 (dot-shorthands), 3.13
+    /// (primary-constructors) — on both sides; a new fold bit without its
+    /// registry truth — or a stance flip — fails here.
     #[test]
     fn fold_matches_the_registry_truth_across_versions() {
         const MATRIX: [dartq_language::LanguageVersion; 14] = [
@@ -301,6 +360,21 @@ mod tests {
                 sealed_class_enabled: shipped(Feature::SealedClass, version),
                 digit_separators_enabled: shipped(Feature::DigitSeparators, version),
                 triple_shift_enabled: shipped(Feature::TripleShift, version),
+                constructor_tearoffs_enabled: shipped(Feature::ConstructorTearoffs, version),
+                named_arguments_anywhere_enabled: shipped(
+                    Feature::NamedArgumentsAnywhere,
+                    version,
+                ),
+                super_parameters_enabled: shipped(Feature::SuperParameters, version),
+                enhanced_enums_enabled: shipped(Feature::EnhancedEnums, version),
+                generic_metadata_enabled: shipped(Feature::GenericMetadata, version),
+                nonfunction_type_aliases_enabled: shipped(
+                    Feature::NonfunctionTypeAliases,
+                    version,
+                ),
+                inline_class_enabled: shipped(Feature::InlineClass, version),
+                unnamed_libraries_enabled: shipped(Feature::UnnamedLibraries, version),
+                null_aware_elements_enabled: shipped(Feature::NullAwareElements, version),
             };
             assert_eq!(folded, expected, "parser fold drifts at {version}");
         }

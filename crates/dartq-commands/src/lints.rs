@@ -248,6 +248,15 @@ pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
     sealed_class_enabled: true,
     digit_separators_enabled: true,
     triple_shift_enabled: true,
+    constructor_tearoffs_enabled: true,
+    named_arguments_anywhere_enabled: true,
+    super_parameters_enabled: true,
+    enhanced_enums_enabled: true,
+    generic_metadata_enabled: true,
+    nonfunction_type_aliases_enabled: true,
+    inline_class_enabled: true,
+    unnamed_libraries_enabled: true,
+    null_aware_elements_enabled: true,
 };
 
 const _: () = assert!(

@@ -453,6 +453,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         {
             let id = self.cursor.advance();
             let span = self.span_of(id);
+            // The analyzer's `handleNewAsIdentifier` carries the
+            // `constructor-tearoffs` gate at this rewrite (ast_builder.dart:4984).
+            self.report_constructor_tearoff_new(span);
             self.listener.handle_identifier(span, context);
             return span;
         }

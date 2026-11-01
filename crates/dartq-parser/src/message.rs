@@ -133,7 +133,8 @@ pub(crate) mod msg {
         MISSING_ASSIGNMENT_IN_INITIALIZER, MISSING_CATCH_OR_FINALLY, MISSING_EXPRESSION_IN_THROW,
         MISSING_IDENTIFIER, MISSING_INITIALIZER, MULTIPLE_VARIANCE_MODIFIERS,
         NAMED_FUNCTION_EXPRESSION, NULL_AWARE_CASCADE_OUT_OF_ORDER,
-        PATTERN_ASSIGNMENT_DECLARES_VARIABLE, RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
+        PATTERN_ASSIGNMENT_DECLARES_VARIABLE, POSITIONAL_AFTER_NAMED_ARGUMENT,
+        RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
         RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT,
         STACK_OVERFLOW, SWITCH_HAS_CASE_AFTER_DEFAULT_CASE, SWITCH_HAS_MULTIPLE_DEFAULT_CASES,
         VAR_AND_TYPE, VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
@@ -406,6 +407,17 @@ pub(crate) mod msg {
         Message::new(
             EXPERIMENT_NOT_ENABLED,
             format!("This requires the '{feature}' language feature to be enabled."),
+        )
+    }
+
+    /// `positionalAfterNamedArgument` (`endArguments`,
+    /// ast_builder.dart:970-981): the shipped `named-arguments-anywhere`
+    /// gate below 2.17. The registry row's correction message is not part of
+    /// the machine face, so the template carries the text only.
+    pub(crate) fn positional_after_named_argument() -> Message {
+        Message::new(
+            POSITIONAL_AFTER_NAMED_ARGUMENT,
+            "Positional arguments must occur before named arguments.",
         )
     }
 

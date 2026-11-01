@@ -192,11 +192,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             let lt = self.peek_span();
             let candidate = self.compute_type_param_or_arg_on_lt(false);
             if !matches!(candidate, crate::types::TypeParamOrArg::None) {
-                let _ = candidate.parse_arguments(self);
+                let closer = candidate.parse_arguments(self);
                 if self.peek_kind() != TokenKind::OpenParen {
                     if context != ConstantPatternContext::None {
                         self.report(invalid_constant_pattern_generic(), lt);
                     }
+                    self.report_constructor_tearoff_application(lt, closer);
                     self.listener.handle_type_argument_application(lt);
                 }
                 // The selector level continues past the group
@@ -594,6 +595,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     let member = if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
                         let span = self.peek_span();
                         self.cursor.advance();
+                        self.report_constructor_tearoff_new(span);
                         self.listener
                             .handle_identifier(span, IdentifierContext::ExpressionContinuation);
                         span
@@ -653,10 +655,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // `_tryRewriteNewToIdentifier` (parser_impl.dart:4105):
                     // in a continuation context `new` after `.` names the
                     // unnamed constructor and is rewritten to an identifier
-                    // with no report.
+                    // with no identifier-recovery report (the
+                    // `constructor-tearoffs` gate rides it).
                     let name = if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
                         let span = self.peek_span();
                         self.cursor.advance();
+                        self.report_constructor_tearoff_new(span);
                         self.listener
                             .handle_identifier(span, IdentifierContext::ExpressionContinuation);
                         span
@@ -689,12 +693,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         let lt = self.peek_span();
                         let type_param = self.compute_type_param_or_arg_on_lt(false);
                         if !matches!(type_param, crate::types::TypeParamOrArg::None) {
-                            type_param.parse_arguments(self);
+                            let closer = type_param.parse_arguments(self);
                             member_type_args = true;
                             if self.peek_kind() != TokenKind::OpenParen {
                                 if context != ConstantPatternContext::None {
                                     self.report(invalid_constant_pattern_generic(), lt);
                                 }
+                                self.report_constructor_tearoff_application(lt, closer);
                                 self.listener.handle_type_argument_application(lt);
                                 end = self.span_of(
                                     self.cursor

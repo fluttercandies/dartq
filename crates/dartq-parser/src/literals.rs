@@ -105,6 +105,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // disambiguation (:7980-8012).
                     let marker = self.peek_span();
                     self.cursor.advance();
+                    // The `null-aware-elements` gate: the key marker is the
+                    // entry's report anchor whether the element stays a
+                    // null-aware element or grows into a `?key: value` map
+                    // entry (the value marker only wins when no key marker
+                    // exists).
+                    self.report_null_aware_elements_gate(Some(marker), None);
                     let _ = self.parse_expression();
                     if set_map && self.peek_kind() == TokenKind::Colon {
                         let (colon, value_marker) = self.parse_map_entry_rest();
@@ -135,6 +141,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                                 has_set_entry.get_or_insert(false);
                             }
                             let (colon, value_marker) = self.parse_map_entry_rest();
+                            self.report_null_aware_elements_gate(None, value_marker);
                             self.listener.handle_literal_map_entry(
                                 colon,
                                 self.peek_span(),

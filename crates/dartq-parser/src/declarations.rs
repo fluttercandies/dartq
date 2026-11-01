@@ -941,6 +941,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     &type_info,
                     crate::types::TypeInfo::Complex(c) if c.gft_has_return_type.is_some()
                 );
+                // `nonfunction-type-aliases` (`enabledIn: 2.13`): a new-style
+                // alias whose right-hand type is not a function type reports
+                // `experiment_not_enabled` at the `=` below the boundary
+                // (`endGenericTypeAlias`, ast_builder.dart:3373).
+                if !type_is_gft
+                    && !self.features.nonfunction_type_aliases_enabled
+                    && let Some(eq) = equals
+                {
+                    self.report(msg::experiment_not_enabled("nonfunction-type-aliases"), eq);
+                }
                 let mut handled = false;
                 if matches!(type_info, crate::types::TypeInfo::NoType)
                     && self.peek_kind() == TokenKind::Lt
@@ -1276,6 +1286,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // Official parseEnum passes inDeclaration: true, allowsVariance: true
         // (parser_impl.dart:2629): the header accepts variance modifiers.
         let type_param = self.compute_type_param_or_arg_on_lt(true);
+        let type_param_lt = if matches!(type_param, crate::types::TypeParamOrArg::None) {
+            None
+        } else {
+            Some(self.peek_span())
+        };
         type_param.parse_variables(self, true);
         if let Some(at) = built_in_name {
             let lexeme = self.cursor.lexeme(at.id).to_owned();
@@ -1287,7 +1302,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         self.listener
             .begin_enum_declaration(begin, augment, enum_keyword, name);
         self.parse_primary_constructor_opt(DeclarationKind::Enum, Some(name), const_keyword, true);
-        self.parse_enum_header_opt(enum_keyword);
+        // The `enhanced-enums` header face (`handleEnumHeader`,
+        // ast_builder.dart:4131): below 2.17 one report, anchored on the
+        // first present construct — the with-clause, else the
+        // implements-clause, else the type parameter list's `<`.
+        let header_anchor = self.parse_enum_header_opt(enum_keyword);
+        if let Some(at) = header_anchor.or(type_param_lt) {
+            self.report_enhanced_enums_gate(at);
+        }
 
         let mut left_brace = self.peek_span();
         let mut member_count = 0usize;
@@ -1355,6 +1377,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.listener
                 .handle_enum_elements(self.peek_span(), element_count);
             if self.peek_kind() == TokenKind::Semicolon {
+                // The `enhanced-enums` elements-end face (`handleEnumElements`,
+                // ast_builder.dart:4094): a `;` closing the constant list is
+                // the enhanced form below 2.17.
+                self.report_enhanced_enums_gate(self.peek_span());
                 self.cursor.advance();
                 while !self.cursor.at_eof()
                     && !self.is_bailed()
@@ -1414,19 +1440,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// with-clause, then optional implements-clause, with the bounded gunk
     /// skip (`recoverySmallLookAheadSkipTokens`) and the duplicate/out-of-
     /// order clause recoveries interleaved exactly as the official loop
-    /// orders them.
-    fn parse_enum_header_opt(&mut self, _enum_keyword: TokenSpan) {
+    /// orders them. Returns the anchor of the first successfully parsed
+    /// clause (the `with` keyword, else the `implements` keyword) — the
+    /// `enhanced-enums` gate's report site.
+    fn parse_enum_header_opt(&mut self, _enum_keyword: TokenSpan) -> Option<TokenSpan> {
         const LOOK: [TokenKind; 3] = [
             TokenKind::OpenCurly,
             TokenKind::Keyword(Keyword::With),
             TokenKind::Keyword(Keyword::Implements),
         ];
+        let mut header_anchor: Option<TokenSpan> = None;
         // Gunk before any clause (:2744-2752).
         if !LOOK.contains(&self.peek_kind()) {
             self.skip_to_clause(&LOOK);
         }
         // With-clause opt (:2754).
         let saw_with = if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
+            header_anchor = Some(self.peek_span());
             self.parse_enum_with_clause();
             true
         } else {
@@ -1453,6 +1483,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         // Implements-clause opt (:2775).
         if self.peek_kind() == TokenKind::Keyword(Keyword::Implements) {
+            header_anchor.get_or_insert(self.peek_span());
             self.parse_implements_opt();
         } else {
             self.listener.handle_implements(None, 0);
@@ -1484,6 +1515,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             } else if !self.skip_to_clause(&LOOK) {
                 break;
             }
+        }
+        header_anchor
+    }
+
+    /// The `enhanced-enums` gate (`enabledIn: 2.17`): the analyzer reports
+    /// `experiment_not_enabled` from the enum element/header handlers
+    /// (ast_builder.dart:4035/:4094/:4131) when the feature is off.
+    fn report_enhanced_enums_gate(&mut self, at: TokenSpan) {
+        if !self.features.enhanced_enums_enabled {
+            self.report(msg::experiment_not_enabled("enhanced-enums"), at);
         }
     }
 
@@ -1530,9 +1571,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let augment = self.pending_augment.take();
 
         self.ensure_identifier(IdentifierContext::EnumValueDeclaration);
+        let constructor_start = self.peek_span();
         let mut has_type_arguments_or_dot = false;
         {
-            let start = self.peek_span();
+            let start = constructor_start;
             self.listener
                 .handle_no_type_name_in_constructor_reference(start);
             self.listener.begin_constructor_reference(start);
@@ -1561,7 +1603,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 ConstructorReferenceContext::Const,
             );
         }
-        if self.peek_kind() == TokenKind::OpenParen || has_type_arguments_or_dot {
+        let has_arguments = self.peek_kind() == TokenKind::OpenParen;
+        if has_arguments || has_type_arguments_or_dot {
+            // The `enhanced-enums` element face (`handleEnumElement`,
+            // ast_builder.dart:4035-4050): a constant with arguments (at the
+            // `(`) or a named/generic constructor selector (at the
+            // constructor reference head) is the enhanced form below 2.17.
+            let anchor = if has_arguments {
+                self.peek_span()
+            } else {
+                constructor_start
+            };
+            self.report_enhanced_enums_gate(anchor);
             // Official `parseConstructorInvocationArguments` (the enum
             // element is a verbatim copy of the constructor-reference tail,
             // parser_impl.dart:2948-2950): the missing-`(` recovery reports
@@ -2393,6 +2446,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         {
             let type_keyword = self.peek_span();
             self.cursor.advance();
+            // `inline-class` (`enabledIn: 3.3`): an `extension type`
+            // declaration reports `experiment_not_enabled` at the `type`
+            // keyword below the boundary (`endExtensionTypeDeclaration`,
+            // ast_builder.dart:1607).
+            if !self.features.inline_class_enabled {
+                self.report(msg::experiment_not_enabled("inline-class"), type_keyword);
+            }
             self.parse_extension_type_declaration(begin, augment, extension_keyword, type_keyword);
         } else {
             self.parse_extension_declaration(begin, augment, extension_keyword);

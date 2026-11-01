@@ -22,8 +22,8 @@
 //!
 //! Decision order is observable (diagnostics and event order), so every arm
 //! keeps the official order. The pinned-oracle riders hold:
-//! `expected_list_or_map_literal`, `positional_after_named_argument`, and
-//! `constructor_with_type_arguments` are never emitted — recovery uses the
+//! `expected_list_or_map_literal` and `constructor_with_type_arguments` are
+//! never emitted — recovery uses the
 //! `expected_token`/`missing_identifier` generic family the pinned 3.13.1
 //! oracle produces (the Group B do-not-emit contract: no oracle corpus row
 //! produces these codes). Codes
@@ -1108,6 +1108,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             if self.ends_bare_super(current) {
                 self.report(msg::missing_assignable_selector(), current);
             }
+            self.report_constructor_tearoff_application(lt, end);
             self.listener.handle_type_argument_application(lt);
             return (end, TypeParamOrArg::None);
         }
@@ -1612,16 +1613,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// `ensureIdentifier` `new`-rewrite folded in: `expressionContinuation`
     /// allows `new` as an identifier (identifier_context_impl.dart:391,
     /// `allowsNewAsIdentifier => isContinuation`), so `..new()` names the
-    /// unnamed constructor and is consumed silently
-    /// (`_tryRewriteNewToIdentifier`, parser_impl.dart:4101-4111 — no
-    /// report). The generic `ensure_identifier` rewrite set covers the
-    /// constructor-reference and method-declaration continuations; cascade
-    /// sections parse their names through `parse_send` directly, so this is
-    /// their expression-side counterpart.
+    /// unnamed constructor and is consumed without an identifier-recovery
+    /// report (`_tryRewriteNewToIdentifier`, parser_impl.dart:4101-4111;
+    /// the analyzer's `handleNewAsIdentifier` gate rides it). The generic
+    /// `ensure_identifier` rewrite set covers the constructor-reference and
+    /// method-declaration continuations; cascade sections parse their names
+    /// through `parse_send` directly, so this is their expression-side
+    /// counterpart.
     fn parse_send_continuation(&mut self) -> TokenSpan {
         if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
             let new_kw = self.peek_span();
             self.cursor.advance();
+            self.report_constructor_tearoff_new(new_kw);
             self.listener
                 .handle_identifier(new_kw, IdentifierContext::ExpressionContinuation);
             return self.parse_send_from_identifier(new_kw);
@@ -1925,9 +1928,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // After `.`, `new` names the unnamed constructor and
                     // reads as an identifier (official
                     // `_tryRewriteNewToIdentifier` :3684 runs at parsePrimary
-                    // entry, so `A.new`/`.new` reach parseSend as one).
+                    // entry, so `A.new`/`.new` reach parseSend as one). The
+                    // analyzer's `handleNewAsIdentifier` carries the
+                    // `constructor-tearoffs` gate at that rewrite.
                     let identifier = self.peek_span();
                     self.cursor.advance();
+                    self.report_constructor_tearoff_new(identifier);
                     self.listener.handle_identifier(identifier, context);
                     self.parse_send_from_identifier(identifier)
                 }
@@ -2451,9 +2457,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// Official `parseArgumentsRest` :9160. Function expressions are
     /// allowed inside arguments; a positional-looking token where `,` is
-    /// expected splits the arguments (missing-comma recovery), and the
-    /// do-not-emit riders hold (`positional_after_named_argument` is
-    /// oracle-dead — the pinned oracle splits or closes generically).
+    /// expected splits the arguments (missing-comma recovery).
     pub(crate) fn parse_arguments_rest(&mut self) -> TokenSpan {
         let begin = self.peek_span();
         self.cursor.advance();
@@ -2461,6 +2465,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let saved = self.may_parse_function_expressions;
         self.may_parse_function_expressions = true;
         let mut count = 0usize;
+        let mut has_seen_named_argument = false;
         let end;
         loop {
             if self.is_bailed() {
@@ -2486,6 +2491,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             }
             let argument_starts_super =
                 self.peek_kind() == TokenKind::Keyword(Keyword::Super);
+            let argument_begin = self.peek_span();
             let argument_end = self.parse_expression();
             // `reportErrorIfSuper` per argument (ast_builder.dart:961): a
             // bare `super` argument carries the selector-missing row
@@ -2494,8 +2500,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.report(msg::missing_assignable_selector(), argument_end);
             }
             if let Some(colon) = colon {
+                has_seen_named_argument = true;
                 self.listener.handle_named_argument(colon);
             } else {
+                // `named-arguments-anywhere` (`enabledIn: 2.17`): below the
+                // feature a positional argument after a named one reports at
+                // its own expression span (`endArguments`,
+                // ast_builder.dart:970-981).
+                if has_seen_named_argument && !self.features.named_arguments_anywhere_enabled {
+                    self.report_with_end(
+                        msg::positional_after_named_argument(),
+                        argument_begin,
+                        argument_end,
+                    );
+                }
                 // `handlePositionalArgument` fires once per positional
                 // argument, after its expression parse (parser_impl.dart
                 // :9608) — the const capture flushes one operand per event.
