@@ -129,16 +129,37 @@ fn non_generic_bare_head_stays_silent() {
     assert_eq!(bounds_rows(&report), Vec::<String>::new(), "{report:#?}");
 }
 
-/// A generic-function-type argument stays out of this face (the `dartq-types`
-/// residual): the verdict suppresses rather than answer an undecidable
-/// conformance.
+/// A generic-function-type argument whose conformance is decidable reports:
+/// the bound `F` expands through `map_tree`'s alias arm (#3510 ended the
+/// pre-alias map that read every alias-headed bound `dynamic`) into
+/// `T Function<T>(T)`, and `int Function(int)` misses it on the signatures'
+/// type-parameter count — one `<T>` binder against zero, `function_subtype`'s
+/// first refusal (subtype.dart:502-510). The earlier premise — that this
+/// conformance was undecidable and the verdict suppressed — was falsified by
+/// the oracle 3.13.7 probe on the fixture below:
+///
+/// ```text
+/// ERROR|COMPILE_TIME_ERROR|TYPE_ARGUMENT_NOT_MATCHING_BOUNDS|main.dart|3|11|17|'int Function(int)' doesn't conform to the bound 'F' of the type parameter 'T'.
+/// ```
+///
+/// The row's span diverges in length only: the oracle anchors the whole
+/// `GenericFunctionType` node (17 columns), the captured tree's range covers
+/// the `int Function` head region (12) — a documented span divergence, the
+/// code identical.
 #[test]
-fn generic_function_type_argument_stays_silent() {
-    let report = report_ops(
+fn generic_function_type_argument_reports_the_arity_mismatch() {
+    let hits = bounds_rows(&report_ops(
         "typedef F = T Function<T>(T);\nclass CB<T extends F> {}\n\
          void f(CB<int Function(int)> a) {}\n",
+    ));
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(row_len(&hits[0]), "12", "{hits:#?}");
+    assert!(
+        row_message(&hits[0]).ends_with(
+            "'int Function(int)' doesn't conform to the bound 'F' of the type parameter 'T'."
+        ),
+        "{hits:#?}"
     );
-    assert_eq!(bounds_rows(&report), Vec::<String>::new(), "{report:#?}");
 }
 
 // —— the residual this face does not reach ——————————————————————————————

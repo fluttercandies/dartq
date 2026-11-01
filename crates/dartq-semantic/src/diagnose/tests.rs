@@ -2384,12 +2384,17 @@ fn resolved_return_host_keeps_the_return_check() {
 /// (the self-referential alias bound, `error_verifier.dart:5061-5079`)
 /// and `TYPE_ARGUMENT_NOT_MATCHING_BOUNDS` at the `Never` argument
 /// (`type_arguments_verifier.dart:176-202`: the local `Never` class is
-/// not a subtype of the substituted bound `A<Never>`). We emit the
-/// first; the second stays silent because the alias-shaped bound
-/// `A<T>` is unmodelable in the bounds snapshot and maps to `dynamic`
-/// (the under-report direction, bounds.rs's pre-alias map). With the
-/// real `dart:core` `Never` — the corpus fixture — the oracle emits
-/// only the enum row and we match.
+/// an ordinary interface, not bottom, so it misses the substituted
+/// bound `A<Never>` = `Never Function(Never)`). Both rows fire since
+/// the alias-shaped bound `A<T>` expands through the snapshot instead
+/// of reading `dynamic` (the pre-alias map this pin used to document).
+/// The oracle 3.13.7 probe on the fixture below emits exactly these:
+/// `ENUM_INSTANTIATED_TO_BOUNDS_IS_NOT_WELL_BOUNDED` at 2|6|1 and
+/// `'Never' doesn't conform to the bound 'A<Never>' of the type
+/// parameter 'T'.` at 2|31|5.
+///
+/// With the real `dart:core` `Never` — the corpus fixture — the oracle
+/// emits only the enum row (bottom satisfies every bound).
 #[test]
 fn header_bounds_scope_their_own_parameters() {
     let enum_case = report(
@@ -2398,7 +2403,10 @@ fn header_bounds_scope_their_own_parameters() {
     );
     assert_eq!(
         code_names(&enum_case),
-        ["enum_instantiated_to_bounds_is_not_well_bounded"],
+        [
+            "enum_instantiated_to_bounds_is_not_well_bounded",
+            "type_argument_not_matching_bounds"
+        ],
         "{:?}",
         code_names(&enum_case)
     );
