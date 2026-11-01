@@ -110,28 +110,47 @@ fn a_static_repeating_an_instance_member_still_reports() {
 }
 
 /// ⑤ Part order independence: whichever fragment the library lists first,
-/// the introduction's claims seed the scope before any fragment's — the
-/// second-in-library-order fragment's repeat is the report.
+/// the introduction's claims seed the scope before any fragment's — each
+/// repeat of an already-claimed member reports exactly once, at its own
+/// declaration, no matter which fragment carries it.
+///
+/// Two `augment` heads of one name in ONE part file produce TWO rows, and
+/// that is the oracle's count, not a bug: upstream's merged
+/// `_InstanceElementContext` claims `x = 1` (getter+setter → pair), then
+/// `x = 2` collides → one report, then `x = 3` collides → one report
+/// (member_duplicate_definition_verifier.dart walks every fragment of the
+/// element). The two rows come from two producers on our side:
+///
+/// - `x = 2` is the keep-first survivor in the aug unit's
+///   `named_containers`, so the MERGED claim eval sees it and reports its
+///   collision with the introduction's pair (cross-unit);
+/// - `x = 3` is dropped from `container.members` by keep-first, so the
+///   merged eval cannot see it — but `member_scopes` is not `members`:
+///   the second `augment` head joins the aug unit's `C` scope
+///   (collector.rs:1960), where `x = 2`'s pair is already claimed, so the
+///   UNIT-LOCAL pass reports `x = 3` in place. Same row upstream emits.
+///
+/// Swapping the heads' order keeps the count at two: the kept member's
+/// row is always emitted by the merged eval, the dropped member's row by
+/// the unit-local pass — the producers trade members, never the count.
 #[test]
 fn the_merge_is_part_order_independent() {
-    // Two `augment` heads of one name in ONE part file: the first head's
-    // `x = 2` survives `named_containers`'s keep-first into the unit's
-    // container row, the second head's `x = 3` does not (the #3378
-    // keep-first residual — a `model.rs` change, out of scope). The merged
-    // claim eval sees one fragment `x` → one `duplicate_definition`.
-    let report = report_ops_augment(
-        "class C { int x = 1; }\n",
-        "augment class C { int x = 2; }\naugment class C { int x = 3; }\n",
-    );
-    let names = code_names(&report);
+    let dup_count = |augment_source: &str| {
+        code_names(&report_ops_augment(
+            "class C { int x = 1; }\n",
+            augment_source,
+        ))
+        .iter()
+        .filter(|name| **name == "duplicate_definition")
+        .count()
+    };
     assert_eq!(
-        names
-            .iter()
-            .filter(|name| **name == "duplicate_definition")
-            .count(),
-        1,
-        "{:#?}",
-        rows(&report)
+        dup_count("augment class C { int x = 2; }\naugment class C { int x = 3; }\n"),
+        2
+    );
+    assert_eq!(
+        dup_count("augment class C { int x = 3; }\naugment class C { int x = 2; }\n"),
+        2
     );
 }
 
