@@ -1873,15 +1873,28 @@ impl<'a> Engine<'a> {
                 container,
             )
         {
-            // A GENERIC class's constructor result needs the inference
-            // this name-level read cannot run (`List.of(ranges)` answers
-            // `List<RangeCharPredicate>` from the arguments) — the raw
-            // `List` would poison every downstream schema, so a generic
-            // head stays `Unknown` and the send-close solver's upward
-            // inference owns the answer.
+            // A GENERIC class's constructor result is the instantiated
+            // head (`List.of(ranges)` answers `List<RangeCharPredicate>`
+            // from the arguments), never the raw one: the raw `List` would
+            // poison every downstream schema. This name-level read cannot
+            // run the call-site inference itself, so the generic arm
+            // answers the face the creation machinery PUBLISHED for this
+            // class segment — a written `<...>` group (`G<int>.value(1)`)
+            // or a solved fold (`creation_row_ty`'s latch, keyed on the
+            // class head's offset). A creation the machinery published
+            // nothing for (the argument-solved spelling `G.value(1)`, whose
+            // solve the send close keeps to itself) stays `Unknown`: a raw
+            // head or a to-bounds fill would stand in for an instantiation
+            // nobody decided and stage rows the oracle never reports, and
+            // the unknown under-report is the only sound stand-in (#3412).
             if found.constructors.contains(&row.name) {
-                return (found.type_params == 0)
-                    .then(|| Ty::named(container))
+                if found.type_params == 0 {
+                    return Ty::named(container);
+                }
+                return self
+                    .creation_class_offset(row.range, container)
+                    .and_then(|head| self.creation_row_ty(container, false, head))
+                    .filter(|ty| *ty != Ty::UNKNOWN)
                     .unwrap_or(Ty::UNKNOWN);
             }
             return match found.members.get(&row.name) {
@@ -1997,6 +2010,71 @@ impl<'a> Engine<'a> {
                     .map_or(Ty::UNKNOWN, |(_, _, head)| Ty::named(self.intern(*head)))
             }
         }
+    }
+
+    /// The class segment a named-constructor send's selector sits behind
+    /// (`G<int>.value(` reads `G`'s offset): the identifier left of the
+    /// selector's `.`, across a balanced `<...>` group when one is spelled.
+    /// `None` when no dot precedes the selector, or when the walked
+    /// spelling names another container — the send is then no creation of
+    /// `container`, and a same-spelled instance member's receiver face
+    /// keeps its own type.
+    ///
+    /// The creation latches key on the class head's own offset (the
+    /// written group's `call_type_args` entry, `publish_creation_
+    /// instantiation`'s solved fold), so this walk is what turns a merged
+    /// member row back into its creation's lookup key. The scan mirrors the
+    /// creation machinery's own class-segment reader; it lives here because
+    /// [`Self::callee_return_ty`]'s generic-constructor arm is its only
+    /// reader outside that module.
+    fn creation_class_offset(&self, selector: SourceRange, container: StringId) -> Option<u32> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(selector.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'.' {
+            return None;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        // A written instantiation between the class and the selector
+        // (`G<int>.value(`): the head sits before the balanced group.
+        if cursor > 0 && bytes[cursor - 1] == b'>' {
+            let mut depth = 0usize;
+            while cursor > 0 {
+                let byte = bytes[cursor - 1];
+                cursor -= 1;
+                if byte == b'>' {
+                    depth += 1;
+                } else if byte == b'<' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                cursor -= 1;
+            }
+        }
+        let end = cursor;
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric()
+                || bytes[cursor - 1] == b'_'
+                || bytes[cursor - 1] == b'$')
+        {
+            cursor -= 1;
+        }
+        if cursor == end || self.source.get(cursor..end)? != self.strings.resolve(container) {
+            return None;
+        }
+        Some(self.utf16_of(cursor))
     }
 
     /// Stages the never-receiver junction (`receiverOfTypeNever`,

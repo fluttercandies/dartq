@@ -19729,3 +19729,16 @@ mod ticket_3392_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
+
+// The #3412 pins (the generic constructor send's static type): a dot-send
+// on a class head is an instance creation upstream, so the invocation
+// node's type is the CREATED instance — the arm reads the instantiation
+// the creation machinery published for the class segment (a written
+// `<...>` group, a solved fold) instead of answering `Unknown`, and a
+// creation it published nothing for keeps the unknown under-report so no
+// fabricated face stages rows the oracle never reports. Registered here
+// via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3412_tests.rs"]
+mod ticket_3412_tests;
