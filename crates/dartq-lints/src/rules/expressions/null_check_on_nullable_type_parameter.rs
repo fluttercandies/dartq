@@ -15,7 +15,7 @@ use crate::rules::utf16_token_span;
 /// Object` stays silent), reports at the operator.
 ///
 /// The context face (`getExpectedType`, `unnecessary_null_checks.dart`)
-/// ports for five syntax/resolution-knowable sites: a `return` or
+/// ports for seven syntax/resolution-knowable sites: a `return` or
 /// arrow body whose nearest function ancestor is a function shape —
 /// the official lookup is `thisOrAncestorOfType<FunctionExpression>`
 /// (:36-41), which class methods never satisfy (their returns carry no
@@ -23,10 +23,13 @@ use crate::rules::utf16_token_span;
 /// the oracle) — a variable initializer with the declaration's written
 /// type, an assignment whose bare/`this.` target carries the written
 /// type (the official `writeType` face; a member-chain target
-/// under-reports), and an argument whose callee's bridge signature
-/// formal declares it (positional by slot, named by label). The
-/// await-wrapper, async `Future<X>`/yield unwrap, and collection
-/// member faces of the official walk stay unported (under-report). The
+/// under-reports), an argument whose callee's bridge signature
+/// formal declares it (positional by slot, named by label), a
+/// collection member whose literal sits under the return, a `yield`
+/// through the generator's first type argument, and the `await`
+/// wrapper (`withAwait` — one `Future`/`FutureOr` flatten at the outer
+/// face). The collection/yield faces are the `unnecessary_null_checks`
+/// helpers verbatim, so the two rules cannot drift apart. The
 /// pattern face (`visitNullAssertPattern`, :52-56 — `matchedValueType`)
 /// rides [`Analysis::matched_value_type`] keyed at the switch scrutinee
 /// read's own span: the matched type must be the nullable type
@@ -392,18 +395,38 @@ fn bound_face<'a>(c: &'a Check<'_>, variable: u32) -> Option<(&'a str, bool)> {
 /// nearest meaningful ancestor decides — a `return` or arrow body with
 /// the enclosing function's written return type, a variable initializer
 /// with the declaration's written type, an assignment whose target's
-/// written type is the face (the official `writeType`), or an argument
+/// written type is the face (the official `writeType`), an argument
 /// whose callee's formal table (the bridge signature face) declares
-/// it. The potentially-nullable question answers at the caller. A
-/// block body boundary first bails.
+/// it, a collection member through the literal's element type, or a
+/// `yield` through the generator's first type argument. The
+/// potentially-nullable question answers at the caller. A block body
+/// boundary first bails.
 fn expected_type_type_parameter<'a>(
     c: &'a Check<'_>,
     operand: (&str, bool),
 ) -> Option<(&'a str, bool)> {
+    // `getExpectedType`'s `withAwait` (:30-37): an `await` on the way
+    // flattens one `Future`/`FutureOr` at the outer face.
+    let mut awaited = false;
     for pair in c.path.windows(2).rev() {
         let ancestor = pair[0];
         let child = pair[1];
         match c.kind(ancestor) {
+            NodeKind::AwaitExpression => {
+                // The awaited expression's own window holds the literal
+                // rows beside the `!` (a literal row completes after its
+                // elements), so the member face answers here (:46-53).
+                awaited = true;
+                if let Some(face) = collection_face(c, ancestor, c.node(), awaited) {
+                    return Some(face);
+                }
+            }
+            // The map entry's element nesting is transparent
+            // (`:129-137`): the for/if wrappers climb to their literal.
+            NodeKind::ForControlFlow
+            | NodeKind::IfControlFlow
+            | NodeKind::ThenControlFlow
+            | NodeKind::ElseControlFlow => {}
             NodeKind::VariableInitializer => {
                 // `T? x = <e>!;` — the declaration's written type.
                 let decl = c.unit.ast.parent(ancestor)?;
@@ -414,7 +437,24 @@ fn expected_type_type_parameter<'a>(
                 // written return type (the official return and
                 // `ExpressionFunctionBody` faces share the lookup).
                 let function = enclosing_function(c, ancestor)?;
-                return written_return_type(c, function);
+                return return_expected(c, function, awaited);
+            }
+            // `Iterable<T> f<T>(T? p) sync* { yield p!; }` (:59-72).
+            NodeKind::YieldStatement => {
+                return super::unnecessary_null_checks::yield_type(c);
+            }
+            // `List<T> f<T>(T? p) => [p!]` (:107-114) — the literal's
+            // element type, read as the written return's head argument.
+            NodeKind::ListLiteral => {
+                return super::unnecessary_null_checks::member_type(c, 0, awaited);
+            }
+            NodeKind::SetOrMapLiteral => {
+                let index = super::unnecessary_null_checks::map_index(c, ancestor, c.node());
+                return super::unnecessary_null_checks::member_type(c, index, awaited);
+            }
+            NodeKind::MapEntry => {
+                let index = super::unnecessary_null_checks::entry_side(c, ancestor, c.node());
+                return super::unnecessary_null_checks::member_type(c, index, awaited);
             }
             NodeKind::TopLevelMethod
             | NodeKind::LocalFunctionDeclaration
@@ -427,11 +467,19 @@ fn expected_type_type_parameter<'a>(
                 // arrow face). Block bodies fall through — their
                 // returns were caught at the `ReturnStatement` arm.
                 let kids = c.collect_direct(ancestor);
-                if kids.len() >= 2
-                    && c.kind(kids[kids.len() - 1]) == NodeKind::ExpressionBody
-                    && kids[kids.len() - 2] == child
-                {
-                    return written_return_type(c, ancestor);
+                if kids.len() < 2 || c.kind(kids[kids.len() - 1]) != NodeKind::ExpressionBody {
+                    continue;
+                }
+                let body = &kids[..kids.len() - 1];
+                let awaited = awaited
+                    || body
+                        .iter()
+                        .any(|&row| c.kind(row) == NodeKind::AwaitExpression);
+                if let Some(face) = collection_face(c, ancestor, c.node(), awaited) {
+                    return Some(face);
+                }
+                if body.last() == Some(&child) {
+                    return return_expected(c, ancestor, awaited);
                 }
             }
             NodeKind::Assignment => {
@@ -460,6 +508,62 @@ fn expected_type_type_parameter<'a>(
         }
     }
     None
+}
+
+/// The collection-member expected type when a literal row sits in
+/// `owner`'s window with `node` inside it (:107-114 lists/sets,
+/// :115-129 map entries; the element nesting is transparent). A literal
+/// row completes AFTER its element rows, so it is located by the `!`'s
+/// own position rather than by row order.
+fn collection_face<'a>(
+    c: &'a Check<'_>,
+    owner: u32,
+    node: u32,
+    awaited: bool,
+) -> Option<(&'a str, bool)> {
+    let kids = c.collect_direct(owner);
+    if let Some(literal) = kids.iter().rev().copied().find(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
+        ) && super::unnecessary_null_checks::belongs_to(c, row, node)
+    }) {
+        let index = if c.kind(literal) == NodeKind::SetOrMapLiteral {
+            super::unnecessary_null_checks::map_index(c, literal, node)
+        } else {
+            0
+        };
+        return super::unnecessary_null_checks::member_type(c, index, awaited);
+    }
+    let entry = kids.iter().rev().copied().find(|&row| {
+        c.kind(row) == NodeKind::MapEntry
+            && super::unnecessary_null_checks::belongs_to(c, row, node)
+    })?;
+    let index = super::unnecessary_null_checks::entry_side(c, entry, node);
+    super::unnecessary_null_checks::member_type(c, index, awaited)
+}
+
+/// The expected type at a whole-body or `return` site: the written
+/// return type, flattened one level when the site awaits or the body is
+/// `async` (:50-53 — only the `Future`/`FutureOr` wrapper decides).
+fn return_expected<'a>(
+    c: &'a Check<'_>,
+    function: u32,
+    awaited: bool,
+) -> Option<(&'a str, bool)> {
+    let face = written_return_face(c, function)?;
+    if awaited
+        || c.unit
+            .ast
+            .token_range(function)
+            .any(|token| c.lexeme(token) == "async")
+    {
+        if !matches!(face.name, Some("Future" | "FutureOr")) {
+            return None;
+        }
+        return face.type_arguments.first().copied();
+    }
+    Some((face.name?, face.nullable))
 }
 
 /// The bare or `this.`-qualified target name of an assignment whose
@@ -578,8 +682,8 @@ fn written_declaration_type<'a>(c: &'a Check<'_>, decl: u32) -> Option<WrittenTy
     Some((c.lexeme(name_token), nullable))
 }
 
-/// The written return type of a method-like row.
-fn written_return_type<'a>(c: &'a Check<'_>, function: u32) -> Option<(&'a str, bool)> {
+/// The written return type face of a method-like row.
+fn written_return_face<'a>(c: &'a Check<'_>, function: u32) -> Option<crate::rules::TypeFace<'a>> {
     // The member-name identifier — a written return type's own name
     // tiles before it in the completion order, so the first
     // `Identifier` is the type, not the member.
@@ -608,7 +712,5 @@ fn written_return_type<'a>(c: &'a Check<'_>, function: u32) -> Option<(&'a str, 
     if kind != NodeKind::Type {
         return None;
     }
-    let name_token = c.head_token(type_row);
-    let nullable = c.byte_span(type_row).end > crate::rules::byte_span_of_token(c, name_token).end;
-    Some((c.lexeme(name_token), nullable))
+    Some(crate::rules::type_face(c, type_row))
 }

@@ -87,6 +87,100 @@ fn ncvp_bound_to_nullable_object_reports() {
     assert_eq!(lints.len(), 1, "{lints:?}");
 }
 
+// —— the collection / yield / await expected-type faces ——————————————
+// Upstream `getExpectedType` (pkg/linter .../unnecessary_null_checks.dart
+// :107-129 list/set/map members, :59-72 yield, :30-37 withAwait). The
+// `null_check_on_nullable_type_parameter` verdict reads the same faces
+// through the shared helpers, so each pin below is the element/argument
+// type the oracle resolves.
+
+/// `test_inListLiteral#0` — `INFO|…|2:25|1` — the list literal's element
+/// type is the written return's first type argument.
+#[test]
+fn ncvp_list_literal_member_reports() {
+    let f = Fixture::parse("\nList<T> f<T>(T? p) => [p!];\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+    assert_eq!(lints[0].range.end - lints[0].range.start, 1);
+}
+
+/// `test_inSetLiteral#0` — `INFO|…|2:24|1` — a `{…}` with no entry reads
+/// the set element slot.
+#[test]
+fn ncvp_set_literal_member_reports() {
+    let f = Fixture::parse("\nSet<T> f<T>(T? p) => {p!};\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_inMapLiteralKey#0` — `INFO|…|2:32|1` — the entry's key side
+/// reads the map's `K`.
+#[test]
+fn ncvp_map_literal_key_reports() {
+    let f = Fixture::parse("\nMap<T, String> f<T>(T? p) => {p!: ''};\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_inMapLiteralValue#0` — `INFO|…|2:36|1` — the entry's value side
+/// reads the map's `V`.
+#[test]
+fn ncvp_map_literal_value_reports() {
+    let f = Fixture::parse("\nMap<String, T> f<T>(T? p) => {'': p!};\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_inYieldSync#0` / `test_inYieldAsync#0` — `INFO|…|2:38|1` and
+/// `INFO|…|2:37|1` — `yield` reads the generator's `Iterable`/`Stream`
+/// argument.
+#[test]
+fn ncvp_yield_faces_report() {
+    let f = Fixture::parse("\nIterable<T> f<T>(T? p) sync* {yield p!;}\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+
+    let f = Fixture::parse("\nStream<T> f<T>(T? p) async* {yield p!;}\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_typeParameterExtendsNullableObject_inAwaited#0` —
+/// `INFO|…|2:54|1` — the `await` wrapper reads the awaited `T`, not the
+/// `Future<T>` return.
+#[test]
+fn ncvp_awaited_return_reports() {
+    let f = Fixture::parse("\nFuture<T> f<T extends Object?>(T? p) async => await p!;\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_typeParameterExtendsNullableObject_inAwaitedInList#0` —
+/// `INFO|…|2:61|1` — the awaited `Future<List<T>>` flattens once, then the
+/// list element slot answers `T`.
+#[test]
+fn ncvp_awaited_list_member_reports() {
+    let f = Fixture::parse("\nFuture<List<T>> f<T extends Object?>(T? p) async => await [p!];\n");
+    let lints = f.run_semantic(&one_rule("null_check_on_nullable_type_parameter"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
 // —— unnecessary_null_checks ——————————————————————————————————————————
 // Upstream Dart SDK source, pkg/linter .../unnecessary_null_checks.dart:26-161
 // (getExpectedType): report when the expected type at the `!` already
@@ -228,6 +322,54 @@ fn unc_top_level_declaration_reports() {
     assert_eq!(lints.len(), 1, "{lints:?}");
 }
 
+/// `test_return_mapValue_forElement_nullable#0` — `INFO|…|2:61|1` — the
+/// `for` element's entry keeps its map-value slot (:129-137, the element
+/// nesting is transparent).
+#[test]
+fn unc_map_value_for_element_reports() {
+    let f = Fixture::parse("\nMap<String, int?> f(int? p) => {for (var a in <int>[]) '': p!};\n");
+    let lints = f.run_semantic(&one_rule("unnecessary_null_checks"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+    assert_eq!(lints[0].range.end - lints[0].range.start, 1);
+}
+
+/// `test_return_mapValue_ifElement_nullable#0` —
+/// `INFO|…|2:50|1` — the `if` element's entry keeps its map-value slot.
+#[test]
+fn unc_map_value_if_element_reports() {
+    let f = Fixture::parse("\nMap<String, int?> f(int? p) => {if (1 != 0) '': p!};\n");
+    let lints = f.run_semantic(&one_rule("unnecessary_null_checks"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_return_mapValue_ifElementNested_nullable#0` —
+/// `INFO|…|2:62|1` — the nesting depth does not change the slot.
+#[test]
+fn unc_map_value_nested_if_element_reports() {
+    let f = Fixture::parse("\nMap<String, int?> f(int? p) => {if (1 != 0) if (1 != 0) '': p!};\n");
+    let lints = f.run_semantic(&one_rule("unnecessary_null_checks"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
+/// `test_functionCall_positionalArgument_parenthesized#0` —
+/// `INFO|…|3:23|1` — the transparent `(...)` is not the argument's own
+/// value: the slot range is the parenthesized one and the formal still
+/// answers.
+#[test]
+fn unc_parenthesized_positional_argument_reports() {
+    let f = Fixture::parse("\nint? i;\nvoid f(int? p) => f((i!));\n");
+    let lints = f.run_semantic(&one_rule("unnecessary_null_checks"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let bang = tok(&f.source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+}
+
 // —— avoid_futureor_void ——————————————————————————————————————————————
 // Upstream Dart SDK source, pkg/linter .../avoid_futureor_void.dart:59-73
 // (checkNamedType): report a `FutureOr` whose single type argument is
@@ -270,3 +412,4 @@ fn afov_unresolved_head_stays_silent() {
     let lints = f.run_semantic(&one_rule("avoid_futureor_void"));
     assert!(lints.is_empty(), "{lints:?}");
 }
+

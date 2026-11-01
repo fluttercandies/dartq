@@ -1888,7 +1888,9 @@ pub(crate) mod collection_methods_unrelated_type {
     /// `String`, `bool`, `null`); unknown arguments stay silent. The
     /// relation (`typesAreUnrelated`) ports as: equal names, `num` against
     /// `int`/`double`, `Object`/`dynamic` against everything,
-    /// nullable-`?` against `Null`, and `Comparable`/`Pattern` (the core
+    /// nullable-`?` against `Null`, a `Null` argument against a type
+    /// parameter whose bound does not pin it non-nullable
+    /// (`<T extends Object?>`), and `Comparable`/`Pattern` (the core
     /// supertypes the scalars implement) are comparable — everything else
     /// reports.
     ///
@@ -2226,7 +2228,9 @@ pub(crate) mod collection_methods_unrelated_type {
         }
         let arg_type = literal_type_name(c, argument)?;
         let (element, element_nullable) = type_arguments[index];
-        if comparable(element, element_nullable, arg_type) {
+        if comparable(element, element_nullable, arg_type)
+            || (arg_type == "Null" && type_parameter_admits_null(c, element) == Some(true))
+        {
             return None;
         }
         let mut expected = element.to_owned();
@@ -2342,6 +2346,66 @@ pub(crate) mod collection_methods_unrelated_type {
             NodeKind::LiteralNull => Some("Null"),
             _ => None,
         }
+    }
+
+    /// `typesAreUnrelated`'s type-parameter arm: a `Null` argument is
+    /// related to a type parameter whose bound does not pin it
+    /// non-nullable (`<T extends Object?>` reports nothing, `<T extends
+    /// Object>` reports). `None` when no in-scope type variable carries
+    /// the name — the caller keeps the plain comparison. The bound read
+    /// is the `null_check_on_nullable_type_parameter` one: no row, no
+    /// bound, a `dynamic` bound, or a written `?` all stay potentially
+    /// nullable.
+    fn type_parameter_admits_null(c: &Check<'_>, name: &str) -> Option<bool> {
+        for &ancestor in c.path.iter() {
+            let mut candidates = c.collect_direct(ancestor);
+            if let Some(owner) = c.unit.ast.parent(ancestor) {
+                candidates.extend(c.collect_direct(owner));
+            }
+            for variables in candidates
+                .into_iter()
+                .filter(|&row| c.kind(row) == NodeKind::TypeVariables)
+            {
+                if let Some(admits) = type_variable_admits_null(c, variables, name) {
+                    return Some(admits);
+                }
+            }
+        }
+        None
+    }
+
+    /// The `name`-matched type variable of one `TypeVariables` run: the
+    /// production tiling spells the name as a context-marked `Identifier`
+    /// directly before its span-only `TypeVariable` row.
+    fn type_variable_admits_null(c: &Check<'_>, variables: u32, name: &str) -> Option<bool> {
+        let context = dartq_parser::IdentifierContext::TypeVariableDeclaration as u32;
+        let kids = c.collect_direct(variables);
+        for (index, &kid) in kids.iter().enumerate() {
+            if c.kind(kid) != NodeKind::Identifier
+                || c.field(kid, PayloadField::Context) != Some(context)
+                || c.lexeme(c.head_token(kid)) != name
+            {
+                continue;
+            }
+            let variable = kids
+                .get(index + 1)
+                .copied()
+                .filter(|&row| c.kind(row) == NodeKind::TypeVariable);
+            let Some(variable) = variable else {
+                return Some(true); // no row at all — the implicit `Object?`
+            };
+            let bound = c
+                .children(variable)
+                .find(|&row| c.kind(row) == NodeKind::Type)
+                .map(|row| {
+                    let head = c.head_token(row);
+                    let nullable =
+                        c.byte_span(row).end > crate::rules::byte_span_of_token(c, head).end;
+                    (c.lexeme(head), nullable)
+                });
+            return Some(bound.is_none_or(|(bound, nullable)| bound == "dynamic" || nullable));
+        }
+        None
     }
 
     /// `typesAreUnrelated` on the ported faces (documented on the SPEC).
@@ -3645,6 +3709,30 @@ mod tests {
                 .is_empty()
         );
     }
+    /// `test_contains_related_null_genericNullable#0` — `<T extends
+    /// Object?>[]` relates `Null` to `T`, so `contains(null)` reports
+    /// nothing; `test_contains_unrelated_null_generic#0` — `<T extends
+    /// Object>[]` pins `T` non-nullable and the same argument reports.
+    #[test]
+    fn collection_methods_null_against_a_type_parameter() {
+        let f = Fixture::parse(
+            "bool f<T extends Object?>() {\n  return <T>[].contains(null);\n}\n",
+        );
+        assert!(
+            f.run(&one_rule("collection_methods_unrelated_type"))
+                .is_empty(),
+            "a nullable-bound type parameter accepts null"
+        );
+
+        let f = Fixture::parse("bool f<T extends Object>() {\n  return <T>[].contains(null);\n}\n");
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'Null' isn't related to 'T'."
+        );
+    }
+
     // ---- #586: collection_methods_unrelated_type (production bridge) ----
 
     /// A scalar-literal argument unrelated to the receiver's written type
@@ -5156,11 +5244,11 @@ pub(crate) mod use_null_aware_elements {
 }
 
 pub(crate) mod prefer_const_literals_to_create_immutables {
-    use super::{Check, NodeKind, RuleSpec, slice};
+    use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
     use crate::rules::declarations::{annotation_names, top_level_annotations};
     use crate::rules::{
-        SupertypeClause, const_ability, const_keyword, in_const_context, same_file_declaration,
-        supertypes,
+        NONE_TOKEN, SupertypeClause, const_ability, const_keyword, in_const_context,
+        same_file_declaration, supertypes,
     };
 
     /// Official: `upstream Dart SDK source,
@@ -5188,11 +5276,14 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
     /// leaves the file under-reports. The analyzer resolves the annotation
     /// only over the declaring-library gate (`_isPackageMetaGetter`/
     /// `_isPackageMetaConstructor`, `element.library.name == 'meta'`), so
-    /// the spelling read answers only over a `library meta;` unit — an
-    /// unnamed vendored meta never recognizes it and the rule stays
-    /// silent (the live oracle's own face over a differential corpus).
-    /// `canBeConst` is the syntactic `const_ability` face. Message:
-    /// `diagnostic.g.dart` `preferConstLiteralsToCreateImmutables`.
+    /// the spelling read answers over a `library meta;` unit *and* over a
+    /// unit importing `package:meta/meta.dart` — that library's own
+    /// directive names it `meta` (the corpus face: the linter tests import
+    /// the package, never redeclaring the directive); a vendored
+    /// directive-less copy stays unrecognized and the rule stays silent
+    /// (the oracle's own resolution). `canBeConst` is the syntactic
+    /// `const_ability` face. Message: `diagnostic.g.dart`
+    /// `preferConstLiteralsToCreateImmutables`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "prefer_const_literals_to_create_immutables",
         &[NodeKind::ListLiteral, NodeKind::SetOrMapLiteral],
@@ -5301,11 +5392,7 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
     /// written `immutable`/`Immutable` annotation; an unresolvable link
     /// ends the chain (the under-report).
     fn spelling_has_immutable(c: &Check<'_>, name: &str) -> bool {
-        // The declaring-library gate first: the annotation resolves only
-        // out of a library named `meta` (the doc block) — the mounted
-        // fold's resolution face, the written-directive scan as the
-        // plain-run fallback.
-        if !const_ability::spells_meta_library(c.unit, c.semantics()) {
+        if !meta_immutable_in_scope(c) {
             return false;
         }
         let Some(first) = same_file_class_like(c, name) else {
@@ -5330,6 +5417,45 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
             }
         }
         false
+    }
+
+    /// The declaring-library gate (`_isPackageMetaGetter`/
+    /// `_isPackageMetaConstructor`, `element.dart:2006-2012`: the
+    /// annotation's element lives in a library named `meta`). The unit's
+    /// own declaration answers when it *is* that library (a `library
+    /// meta;` unit, or the mounted fold's registry name), else the
+    /// annotation resolves through the unit's imports — the `package:meta`
+    /// face, whose `meta.dart` is the `library meta;` unit the analyzer
+    /// names. The plain-run posture (this rule mounts no semantic fold)
+    /// reads the directives.
+    fn meta_immutable_in_scope(c: &Check<'_>) -> bool {
+        const_ability::spells_meta_library(c.unit, c.semantics()) || imports_meta_library(c)
+    }
+
+    /// Whether the unit imports the `package:meta/meta.dart` library — the
+    /// only spelling `@immutable`/`@Immutable` resolves through. A
+    /// prefixed import puts the annotation's spelling out of scope, so
+    /// only unprefixed directives count (the `AsKeyword` payload absent).
+    fn imports_meta_library(c: &Check<'_>) -> bool {
+        let is_meta_import = |c: &Check<'_>, row: u32| {
+            c.kind(row) == NodeKind::Import
+                && c.field(row, PayloadField::AsKeyword).unwrap_or(NONE_TOKEN) == NONE_TOKEN
+                && c.unit
+                    .ast
+                    .token_range(row)
+                    .any(|token| c.lexeme(token).contains("meta/meta.dart"))
+        };
+        let Some(root) = c.unit.ast.root() else {
+            return false;
+        };
+        // Each unit declaration — the import included — wraps in its own
+        // `TopLevelDeclaration` row.
+        c.collect_direct(root).iter().any(|&row| {
+            is_meta_import(c, row)
+                || c.collect_direct(row)
+                    .iter()
+                    .any(|&kid| is_meta_import(c, kid))
+        })
     }
 
     /// The same-file class-like row of a type spelling: the class/mixin/
@@ -5386,10 +5512,34 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
             assert_eq!(lints[0].range.start, utf16_at(&f, open));
         }
 
-        /// The corpus's own face: the unnamed vendored meta (no `library
-        /// meta;` in the importing unit) never resolves the annotation,
-        /// and no row reports — the live oracle emits zero rows for the
-        /// rule over that corpus.
+        /// `test_listLiteral_noConst#0` — the corpus shape: the annotation
+        /// resolves through `import 'package:meta/meta.dart'` (the
+        /// `library meta;` unit the analyzer names), with no directive in
+        /// the importing unit itself. `INFO|…|7:11|2` over
+        /// `var x = C([]);` — the report covers the literal alone.
+        #[test]
+        fn meta_import_resolves_the_annotation() {
+            let source = concat!(
+                "import 'package:meta/meta.dart';\n",
+                "@immutable\n",
+                "class C {\n",
+                "  const C(List<Object> p);\n",
+                "}\n",
+                "var x = C([]);\n",
+            );
+            let f = Fixture::parse(source);
+            let lints = f.run(&one_rule(SPEC.name));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let open = tok(source, &f.tokens, "[]", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, open));
+            assert_eq!(lints[0].range.end - lints[0].range.start, 2);
+        }
+
+        /// `doc_bad_1` — no import and no `library meta;` directive: the
+        /// annotation is undefined and the rule stays silent (the
+        /// declaring-library gate, upstream `_isPackageMetaGetter`). The
+        /// const faces below are the same shape, so a gate that opened on
+        /// any `@immutable` spelling would surface here first.
         #[test]
         fn unnamed_meta_library_stays_silent() {
             let source = "@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C([]);\n";
@@ -5487,6 +5637,43 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
                 let lints = f.run(&one_rule(SPEC.name));
                 assert!(lints.is_empty(), "{source:?} -> {lints:?}");
             }
+        }
+
+        /// The census const/not-constable family over the meta import —
+        /// the gates the meta-open pin now exercises for real (each case is
+        /// its `conformance/expected.tsv` row: six silence rows, one
+        /// report).
+        #[test]
+        fn const_gates_over_the_meta_import_family() {
+            let silent = [
+                // test_listLiteral_const
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C(const []);\n",
+                // test_mapLiteral_const
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C(Map<int, int> p);\n}\nvar x = C(const {1: 2});\n",
+                // test_mapLiteral_inParens_const
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C(Object? p);\n}\nvar x = C(((const {})));\n",
+                // test_listLiteral_nested_const
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C(const [\n  const [],\n]);\n",
+                // test_boolFromEnvironment — the for/if element is no const
+                "\nimport 'package:meta/meta.dart';\n\nconst x = bool.fromEnvironment('dart.library.js_util');\n\n@immutable\nclass A {\n  const A(List<int> p);\n}\n\nvar a = A([\n  if (x) e(),\n]);\n\nint e() => 7;\n",
+                // test_listLiteral_notConstable_noConst
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nclass D {}\nvar x = C([D()]);\n",
+            ];
+            for source in silent {
+                let f = Fixture::parse(source);
+                let lints = f.run(&one_rule(SPEC.name));
+                assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+            }
+
+            // test_mapLiteral_intToInstantiation_const — `{1: const C(null)}`
+            // is itself no const literal: one report over the whole map.
+            let source = "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C(Object? p);\n}\nvar x = C({1: const C(null)});\n";
+            let f = Fixture::parse(source);
+            let lints = f.run(&one_rule(SPEC.name));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let open = tok(source, &f.tokens, "{", 1);
+            assert_eq!(lints[0].range.start, utf16_at(&f, open));
+            assert_eq!(lints[0].range.end - lints[0].range.start, 18);
         }
 
         /// The explicit `new` face and the transparent named-argument and

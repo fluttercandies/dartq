@@ -33,10 +33,14 @@ use crate::rules::utf16_token_span;
 /// prefix/postfix faces read the operand run's static type.
 /// Approximations (documented, under-report): a compound operand's
 /// read-type fallback reports whole only for `++`/`--` (the
-/// census-compound shape), and a cascade-section `.call()` over a
+/// census-compound shape), a cascade-section `.call()` over a
 /// bare-`Function` target reads the section target's type from the run
 /// before the first section dots (the per-section receiver face is the
-/// same `.call` special case). Message: `diagnostic.g.dart`
+/// same `.call` special case), and a receiver bound from an
+/// unconstrained generic call (`var object = wrapper.doSomething();`,
+/// `T` instantiated to its `dynamic` bound — `doc_bad_1`'s third row)
+/// under-reports while the semantic fold's declaration type does not
+/// carry instantiate-to-bound. Message: `diagnostic.g.dart`
 /// `avoidDynamicCalls`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "avoid_dynamic_calls",

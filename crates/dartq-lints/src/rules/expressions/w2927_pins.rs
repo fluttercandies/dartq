@@ -144,6 +144,34 @@ fn adc_implicit_call_reports_at_the_target() {
     assert_eq!(lints[0].range.end - lints[0].range.start, 1);
 }
 
+/// `lints/avoid_dynamic_calls/AvoidDynamicCallsTest/test_prefixedIdentifier_dynamicMethodCall#0`'s
+/// negative twin — `INFO` rows only for a `dynamic` target: a typed
+/// receiver's member read stays silent (`doc_good_0`'s
+/// `void f(String s) { s.length; }`, no row).
+#[test]
+fn adc_typed_receiver_stays_silent() {
+    let f = Fixture::parse("void f(String s) {\n  s.length;\n}\n");
+    assert!(
+        f.run_semantic(&one_rule("avoid_dynamic_calls")).is_empty(),
+        "{:?}",
+        f.run_semantic(&one_rule("avoid_dynamic_calls"))
+    );
+}
+
+/// `lints/avoid_dynamic_calls/AvoidDynamicCallsTest/test_prefixedIdentifier_dynamicMethodCall_asDynamic#0`
+/// — no row — the explicit-cast bail (:115): `(a as dynamic).foo()`
+/// resolves through the cast, so neither the member face nor the
+/// bare-invocation face reports.
+#[test]
+fn adc_explicit_cast_receiver_stays_silent() {
+    let f = Fixture::parse("void f(Object? a) {\n  (a as dynamic).foo();\n}\n");
+    assert!(
+        f.run_semantic(&one_rule("avoid_dynamic_calls")).is_empty(),
+        "{:?}",
+        f.run_semantic(&one_rule("avoid_dynamic_calls"))
+    );
+}
+
 /// `unnecessary_parenthesis` — the repaired faces' oracle rows (the
 /// helper set `inner_has_kind`/`binary_child_operator`/`spread_token_-
 /// before` drives the record-literal, return, and assignment parents).
