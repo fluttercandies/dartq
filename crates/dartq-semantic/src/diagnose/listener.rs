@@ -11787,8 +11787,15 @@ impl ParserListener for DiagnoseListener<'_> {
             // `node.value.staticType` — the composite type (see
             // `handle_spread_expression`'s note): an untyped collection
             // literal (`?[1, 2]`) answers its inferred `List`, a send its
-            // result rather than the callee's own type.
-            let ty = engine.operand_static_ty(&engine.rows[pos]);
+            // result rather than the callee's own type. A still-unfolded
+            // compound element (`?x += 1` leaves `[x, 1]` on the stack —
+            // the assignment event fires after this one) reads the
+            // AssignmentExpression's resolved-operator result
+            // (`compound_element_ty`), not the RHS literal's face the tail
+            // row carries.
+            let ty = engine
+                .compound_element_ty()
+                .unwrap_or_else(|| engine.operand_static_ty(&engine.rows[pos]));
             if engine.strictly_non_nullable(ty) {
                 // The `_element` uniqueName's verbatim pair
                 // (diagnostic.g.dart invalidNullAwareElement :9404-9415):

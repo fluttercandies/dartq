@@ -2647,6 +2647,19 @@ impl<'a> Engine<'a> {
                                     RefTarget::Member { container } => Some(container),
                                     _ => None,
                                 });
+                            // A bare member read promotes by the same type
+                            // test the qualified read does (`_f is String`
+                            // inside the body promotes `_f`, so `_f + "s"`
+                            // resolves `String.+`) — the staged substitution
+                            // joins on the member token's offset; an
+                            // unpromoted read answers its face unchanged.
+                            let ty = self
+                                .promotable_field_substitution(
+                                    &self.prop_promotion_rows,
+                                    row.range,
+                                    ty,
+                                )
+                                .unwrap_or(ty);
                             self.check_operator_expr_in(ty, row, member_container);
                         }
                     } else if let Some((op_text, op_range, kind, compound)) = adjacent {
@@ -3079,7 +3092,7 @@ impl<'a> Engine<'a> {
     /// (every shape in this family takes the method variant —
     /// messages.yaml's `uncheckedMethodInvocationOfNullableValue`, the
     /// compound/unary faces' oracle text).
-    fn adjacent_operator(
+    pub(crate) fn adjacent_operator(
         &self,
         row: &Row,
     ) -> Option<(&'static str, SourceRange, UncheckedNullableKind, bool)> {
@@ -3270,12 +3283,25 @@ impl<'a> Engine<'a> {
     /// covers the nullable spelling — resolves; `UnsafeSingle` (applicable
     /// through the non-null projection alone) keeps the unchecked report,
     /// the same split the member sites encode.
+    ///
+    /// The probe set is the row's own operator spellings — or, for the
+    /// compound/prefix/postfix operand row (a read intent, never
+    /// `Intent::Operator`), the adjacent token's base spelling: `x += 1`'s
+    /// `x` still resolves `operator +` through the same extension
+    /// application (`assignment_expression_resolver.dart`'s compound
+    /// consult).
     fn operator_face_extension_resolved(&mut self, ty: Ty, row: &Row) -> bool {
         let (read, write) = self.operator_spellings(row);
+        let adjacent = if read.is_none() && write.is_none() {
+            self.adjacent_operator(row)
+                .map(|(text, ..)| self.intern(text))
+        } else {
+            None
+        };
         let Ty::Named { name, .. } = ty else {
             return false;
         };
-        [read, write].into_iter().flatten().any(|spelling| {
+        [read, write, adjacent].into_iter().flatten().any(|spelling| {
             spelling == self.intern("==")
                 || matches!(
                     self.extension_application(name, ty, spelling, false, true),
@@ -6220,7 +6246,21 @@ impl<'a> Engine<'a> {
                         kind,
                         landing.map(|(file, origin)| (file, row.name, origin)),
                     );
-                    let ty = Self::member_result_ty(&entry);
+                    // The operator verdict resolves on the member read's
+                    // PROMOTED static type, not the declared result: a type
+                    // test `x._f is String` promotes the read, so `x._f + "s"`
+                    // resolves `String.+` — the receiver's own face stays
+                    // `A` for the walk (property_element_resolver.dart:
+                    // 2158-2166). `row.range` is already the member token the
+                    // substitution joins on; an unpromoted read answers the
+                    // declared result unchanged.
+                    let ty = self
+                        .promotable_field_substitution(
+                            &self.prop_promotion_rows,
+                            row.range,
+                            Self::member_result_ty(&entry),
+                        )
+                        .unwrap_or_else(|| Self::member_result_ty(&entry));
                     self.check_operator_expr_in(ty, row, Some(container));
                     return;
                 }
@@ -7192,7 +7232,16 @@ impl<'a> Engine<'a> {
                         kind,
                         landing.map(|(file, origin)| (file, row.name, origin)),
                     );
-                    let ty = Self::member_result_ty(&entry);
+                    // The same promoted-result substitution the plain member
+                    // arm applies: `super._f is String` gates the super read,
+                    // and `super._f + "s"` resolves on the promoted face.
+                    let ty = self
+                        .promotable_field_substitution(
+                            &self.prop_promotion_rows,
+                            row.range,
+                            Self::member_result_ty(&entry),
+                        )
+                        .unwrap_or_else(|| Self::member_result_ty(&entry));
                     self.check_operator_expr_in(ty, row, Some(container));
                 }
                 // The frozen faces decide a break on an unindexed SDK

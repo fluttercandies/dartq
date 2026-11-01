@@ -3436,7 +3436,9 @@ impl<'a> Engine<'a> {
         if matches!(read_ty, Ty::Unknown | Ty::Void) || matches!(to, Ty::Unknown | Ty::Void) {
             return;
         }
-        let Some((param, declared)) = self.binary_operator_sig(op, &target_row) else {
+        let Some((param, declared, extension_resolved)) =
+            self.compound_operator_sig(op, &target_row)
+        else {
             return;
         };
         let right_ty = self.equality_operand_ty(&rhs_row);
@@ -3457,8 +3459,7 @@ impl<'a> Engine<'a> {
         } else {
             right_ty
         };
-        let face = self.operand_face(&rhs_row, right_ty);
-        let from = self.refine_numeric_binary(op, read_ty, face, declared);
+        let from = self.compound_result_ty(op, read_ty, &rhs_row, right_ty, declared, extension_resolved);
         if matches!(from, Ty::Unknown | Ty::Void | Ty::Dynamic) || self.written_ty_invalid(from) {
             return;
         }
@@ -3502,6 +3503,97 @@ impl<'a> Engine<'a> {
             // (`.at(right)`).
             self.stage(StagedKind::Assignment, rhs_row.range, from, to, literal);
         }
+    }
+
+    /// The compound operator's resolved signature over `target_row`: the
+    /// `(param, declared result, extension-resolved)` triple
+    /// [`Self::check_compound_assignment`] and [`Self::compound_element_ty`]
+    /// share. The arm order mirrors the binary fold (`fold_binary`): an
+    /// applicable extension over the nullable receiver resolves the
+    /// operator FIRST, and an extension-declared signature is never
+    /// numerically refined — `_refineNumericInvocationTypeNullSafe` answers
+    /// the declared type unchanged for an `ExtensionElement` encloser
+    /// (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type_system.dart:2266-2277).
+    /// Reading the extension arm through the shared `binary_operator_sig`
+    /// would lose that provenance — the callers' `from` computation must
+    /// know which arm answered, so the extension consult stands alone here
+    /// and the generic path (which re-consults it internally and returns
+    /// `None` only when no arm did) carries the refine flag.
+    fn compound_operator_sig(
+        &mut self,
+        op: &str,
+        target_row: &Row,
+    ) -> Option<(Ty, Ty, bool)> {
+        let spelling = self.intern(op);
+        let recv = self.bound_face(self.equality_operand_ty(target_row));
+        if let Some((param, declared)) = self.nullable_extension_operator_sig(recv, spelling) {
+            return Some((param, declared, true));
+        }
+        let (param, declared) = self.binary_operator_sig(op, target_row)?;
+        Some((param, declared, false))
+    }
+
+    /// The compound expression's result type (`x op= e`'s static type —
+    /// `AssignmentExpressionImpl.staticType`, the resolved operator's
+    /// return): `declared` verbatim when the signature came from an
+    /// extension face (`x += null` over `on int? operator +` writes the
+    /// declared `int?` back, never the `double` the builtin `int.+`
+    /// refinement would invent), else the numeric refinement over the
+    /// operand faces.
+    fn compound_result_ty(
+        &mut self,
+        op: &str,
+        read_ty: Ty,
+        rhs_row: &Row,
+        right_ty: Ty,
+        declared: Ty,
+        extension_resolved: bool,
+    ) -> Ty {
+        if extension_resolved {
+            declared
+        } else {
+            let face = self.operand_face(rhs_row, right_ty);
+            self.refine_numeric_binary(op, read_ty, face, declared)
+        }
+    }
+
+    /// The `?e` element's value type when `e` is a compound assignment
+    /// (`?x += 1` — the oracle's `node.value2.staticType` is the
+    /// AssignmentExpression's resolved-operator result, `int?`, not the RHS
+    /// literal's `int` the tail row carries). `handle_null_aware_element`
+    /// consults this before the last-row fallback: a still-unfolded
+    /// compound leaves its operand and RHS as two rows with the `op=` token
+    /// between them, so the tail `[target(+adjacent compound op), rhs]`
+    /// resolves the augmented result through the same extension-first
+    /// signature the write-back verdict reads. `None` for every non-
+    /// compound tail — a plain `?e` element, a `??=` if-null write (not a
+    /// user operator), or a prefix `?-x`/`?x++` whose operand the verdict
+    /// already reads correctly.
+    pub(crate) fn compound_element_ty(&mut self) -> Option<Ty> {
+        let rhs_row = self.rows.last()?.clone();
+        let pos = self.rows.len() - 1;
+        // The operand row sits immediately before the RHS; the `op=` token
+        // rides `adjacent_operator` on it (`x += 1`'s `+` — the same probe
+        // `operator_face_extension_resolved` runs for the unchecked face).
+        let target_row = self.rows[..pos]
+            .iter()
+            .rev()
+            .find(|row| !matches!(row.shape, RowShape::Value))?
+            .clone();
+        let (text, .., compound) = self.adjacent_operator(&target_row)?;
+        if !compound {
+            return None;
+        }
+        let op = text;
+        let read_ty = self.receiver_static_ty(&target_row);
+        if matches!(read_ty, Ty::Unknown | Ty::Void) {
+            return None;
+        }
+        let (_, declared, extension_resolved) = self.compound_operator_sig(op, &target_row)?;
+        let right_ty = self.equality_operand_ty(&rhs_row);
+        let result = self.compound_result_ty(op, read_ty, &rhs_row, right_ty, declared, extension_resolved);
+        (!matches!(result, Ty::Unknown | Ty::Void)).then_some(result)
     }
 
     /// The variable-declaration initializer check
@@ -7192,18 +7284,14 @@ impl<'a> Engine<'a> {
         // type_system.dart:121-126): the `Function` head accepts every
         // function type (`subtype.dart`'s `T1.isDartCoreFunction` arm
         // answers the tear-off), so a non-nullable interface source with a
-        // `call` member assigns through the member's own type — and
+        // `call` method assigns through the member's own type — and
         // `isAssignableTo(callMethodType, Function)` is unconditional
         // (`call` is a function-typed member, `Function` its supertype):
         // a resolvable `call` means the pair accepts outright, whatever
-        // its signature. The final primitives reject — their member
-        // surface is compiler-known and carries no `call`; every other
-        // interface source keeps the under-report `None` (the slot also
-        // receives derived asks the oracle never makes — the covariant
-        // element walk's slot pairs — so a bare rejection there would
-        // report inference residue, the same posture
-        // [`Self::call_method_assignable`] documents for the shaped
-        // face).
+        // its signature. Both spellings — the bare head and a written
+        // instantiation — run the SAME proof, [`Self::call_tear_off_verdict`]
+        // (#3512: an args-conditioned second path is how the instantiated
+        // head drifted into a false `invalid_assignment`).
         if let Ty::Named {
             name,
             nullable: false,
@@ -7211,63 +7299,10 @@ impl<'a> Engine<'a> {
         } = to
             && name == self.intern("Function")
             && let Ty::Named {
-                name: from_name,
-                nullable: false,
-                args: from_args,
+                nullable: false, ..
             } = from
         {
-            if self.members.primitive_ids.contains(&from_name) {
-                return Some(false);
-            }
-            // The acceptance only needs `call` to resolve — upstream's
-            // `callMethodType` is non-null the moment the member exists
-            // (`getCallMethodType` substitutes the receiver's own type
-            // arguments; the verdict `isAssignableTo(callMethodType,
-            // Function)` is unconditional `true`, `call` being a
-            // function-typed member and `Function` its supertype), so the
-            // signature itself never enters this arm. The member walk
-            // proves existence on the instantiated spelling just as on
-            // the bare one — there is no `args == EMPTY` gate in
-            // `acceptsFunctionType`. The EMPTY-args read keeps
-            // [`Engine::implicit_call_face`]'s formals-capture proof (a
-            // `call` whose formals never interned reads the same miss the
-            // pre-change face gave).
-            let call_present = if from_args == ArgListId::EMPTY {
-                self.implicit_call_face(Ty::Named {
-                    name: from_name,
-                    nullable: false,
-                    args: from_args,
-                })
-                .is_some()
-            } else {
-                let call = self.intern("call");
-                matches!(
-                    self.walk_members(from_name, call),
-                    Walk::Found(entry)
-                        if entry.kind == MemberKind::Method && !entry.is_static
-                )
-            };
-            if call_present {
-                return Some(true);
-            }
-            // A resolvable container with provably no `call` member
-            // rejects: upstream's `callMethodType` is null there, so the
-            // arm falls through to `false` (type_system.dart:910-915 —
-            // `Function f = C()` reports where `C` declares no `call`).
-            // An UNRESOLVABLE head (a foreign spelling the index does not
-            // carry, or the derived-ask residue this slot also receives)
-            // keeps the under-report `None` — a bare rejection would
-            // report inference residue the oracle never asks about.
-            return resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                from_name,
-            )
-            .is_some()
-            .then_some(false);
+            return self.call_tear_off_verdict(from);
         }
         let (
             Ty::Named {
@@ -7409,6 +7444,73 @@ impl<'a> Engine<'a> {
             }
             Ty::Function { .. } | Ty::Record { .. } => true,
             _ => false,
+        }
+    }
+
+    /// The `call` tear-off verdict for a non-nullable interface source
+    /// facing the bare `Function` head — `isAssignableTo`'s callable
+    /// acceptance (type_system.dart:875-884 + `acceptsFunctionType`
+    /// :121-126). ONE proof serves the bare head and a written
+    /// instantiation alike.
+    ///
+    /// Upstream asks one fact — is `getCallMethodType` non-null
+    /// (type_system.dart:559-566: `call` looked up through the inheritance
+    /// chain and, being a member of the head, instantiated by the
+    /// receiver's own type arguments)? The follow-up
+    /// `isAssignableTo(callMethodType, Function)` is unconditional — `call`
+    /// is a function-typed member and `Function` the supertype of every
+    /// function type — so the signature this arm would have to substitute
+    /// never decides anything. The existence fact is likewise independent
+    /// of the written instantiation: `Function a = C0()` and
+    /// `Function b = C1<int>()` prove the same face. An args-conditioned
+    /// second path is exactly how the instantiated head drifted into a
+    /// false `invalid_assignment` (#3512), so both spellings come through
+    /// here.
+    ///
+    /// - `Some(true)`: a non-static `call` **method** resolves on the
+    ///   head's member face (alias spellings fold to the aliased head
+    ///   first). A getter there is no dispatch method upstream
+    ///   (`lookUpMethod` answers `InternalMethodElement?`,
+    ///   type.dart:1011-1040) and a static member is no instance face
+    ///   (`getMember3`) — `language/function/type_call_getter2_test` pins
+    ///   the rejection.
+    /// - `Some(false)`: the head resolves to a container whose member face
+    ///   provably carries no usable `call` — the final primitives included
+    ///   (their member surface is compiler-known and carries none).
+    /// - `None`: undecidable — an unresolvable head (a foreign spelling
+    ///   the index does not carry, or the derived-ask residue this slot
+    ///   also receives), or a broken supertype chain
+    ///   ([`Walk::ChainBroken`]: the member may live past the hop we
+    ///   cannot resolve). A bare rejection there would report a legal
+    ///   program, the same under-report posture
+    ///   [`Self::call_method_assignable`] documents for the shaped face.
+    fn call_tear_off_verdict(&self, from: Ty) -> Option<bool> {
+        let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = self.fold_alias_ty(from)
+        else {
+            return None;
+        };
+        if self.members.primitive_ids.contains(&name) {
+            return Some(false);
+        }
+        match self.walk_members(name, self.intern("call")) {
+            Walk::Found(entry) if entry.kind == MemberKind::Method && !entry.is_static => {
+                Some(true)
+            }
+            Walk::Found(_) | Walk::Missing => resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_some()
+            .then_some(false),
+            Walk::ChainBroken => None,
         }
     }
 

@@ -4323,6 +4323,12 @@ impl<'a> Engine<'a> {
             Receiver::Typed { type_name, .. } => (*type_name, false),
             Receiver::This { container, .. } => (*container, false),
             Receiver::Super { container, .. } => (*container, true),
+            // A creation result's member read (`C().m`): the walk answers
+            // the raw face — the created class's own parameters ride in
+            // the table walk, and the folded instance type's substitution
+            // stays out (the raw face keeps the nullability the null-aware
+            // junctions need; the documented generic under-report).
+            Receiver::Created { name, .. } => (*name, false),
             _ => return None,
         };
         let found = if super_walk {
@@ -6441,9 +6447,14 @@ impl<'a> Engine<'a> {
     /// prefixed container name in value position is a `TypeLiteral` (static
     /// type `Type`, upstream `TypeLiteralImpl.staticType`); a member or
     /// bare read resolves its declared accessor type
-    /// ([`Self::receiver_static_ty`]); a collection or closure literal row
-    /// resolves through the literal faces. Every other shape keeps the
-    /// suppress-everything sentinel.
+    /// ([`Self::receiver_static_ty`]), a tear-off spelling falling through
+    /// to the function faces (a ctor selector `C.new` via
+    /// [`Self::ctor_tear_off_ty`], a member read via
+    /// [`Self::member_tear_off_ty`], a bare function read via
+    /// [`Self::operand_tear_off_ty`] — the same dispatch
+    /// [`Self::type_check_operand_ty`] runs); a collection or closure
+    /// literal row resolves through the literal faces. Every other shape
+    /// keeps the suppress-everything sentinel.
     fn untyped_operand_ty(&self, row: &Row) -> Ty {
         match &row.shape {
             RowShape::Receiver(
@@ -6462,11 +6473,27 @@ impl<'a> Engine<'a> {
                 if self.prefixed_decl_is_container(*prefix, row.name) {
                     Ty::named(self.intern("Type"))
                 } else {
-                    Ty::UNKNOWN
+                    // A three-segment prefixed tear-off (`p.C.new`) falls
+                    // through to the function faces (the ctor table owns
+                    // the `PrefixedContainer` receiver).
+                    self.ctor_tear_off_ty(row).unwrap_or(Ty::UNKNOWN)
                 }
             }
             RowShape::Member { .. } | RowShape::Bare(BareInfo::Plain { .. }) => {
-                self.receiver_static_ty(row)
+                let ty = self.receiver_static_ty(row);
+                if ty != Ty::UNKNOWN {
+                    return ty;
+                }
+                // A READ spelled as a callable's name is a tear-off whose
+                // static type is its function face (`ConstructorReference`
+                // / `PropertyAccess` / `Identifier` `staticType`): the
+                // accessor face above answered getters/fields, so what
+                // remains is the ctor selector, the member walk, and the
+                // bare function signature.
+                self.ctor_tear_off_ty(row)
+                    .or_else(|| self.member_tear_off_ty(row))
+                    .or_else(|| self.operand_tear_off_ty(row))
+                    .unwrap_or(Ty::UNKNOWN)
             }
             RowShape::Value => self.value_operand_ty(row).unwrap_or(Ty::UNKNOWN),
             _ => Ty::UNKNOWN,
@@ -7805,7 +7832,7 @@ impl<'a> Engine<'a> {
     /// RESOLVED, and the member faces below would invent
     /// `undefined_operator`/`argument_type_not_assignable` rows against a
     /// face the oracle never consults.
-    fn nullable_extension_operator_sig(&mut self, recv: Ty, op: StringId) -> Option<(Ty, Ty)> {
+    pub(crate) fn nullable_extension_operator_sig(&mut self, recv: Ty, op: StringId) -> Option<(Ty, Ty)> {
         let Ty::Named {
             name,
             nullable: true,
@@ -8706,12 +8733,18 @@ impl<'a> Engine<'a> {
         if cast == Ty::Unknown || matched == Ty::Unknown {
             return;
         }
+        // Every `Null` spelling resolves to the one `NullType` upstream
+        // (`isDartCoreNull`'s identity), so the verdict reads canonical
+        // faces on both sides — a written `Null` capture must not masquerade
+        // as a non-nullable interface head.
+        let cast = self.normalized_null(cast);
+        let matched = self.normalized_null(matched);
         let null_face = matched == Ty::Null && matches!(cast, Ty::Named { nullable: false, .. });
         if self.name_subtype(matched, cast) {
             // The official gate is `isSubtypeOf && castType is not
             // InvalidType` — a `dynamic` target reports like any other.
             self.stage_usage(SemanticCode::UnnecessaryCastPattern, at, "");
-        } else if !self.name_can_be_subtype(matched, cast) {
+        } else if self.pattern_never_matches(matched, cast) {
             let a0 = self.ty_display(matched);
             let a1 = self.ty_display(cast);
             self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
@@ -8755,6 +8788,43 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// The `TypeSystem.isPotentiallyNullable` face the `canBeSubtypeOf`
+    /// Null arms read (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type_system.dart:147-159 over
+    /// :1161-1179): the top faces and `Null` itself, every `?`-suffixed
+    /// spelling, a `FutureOr` whose element is, and a `?`-less type
+    /// parameter whose bound is. [`Self::potentially_nullable`] is the
+    /// receiver gate's posture — it answers `dynamic`/`void`/`Null` false
+    /// because its consumers swap those rows — so the plain upstream
+    /// predicate recomposes over it and the `FutureOr` element walk.
+    fn potentially_nullable_face(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Null | Ty::Dynamic | Ty::Void => true,
+            Ty::Unknown | Ty::Never => false,
+            _ => self.potentially_nullable(ty) || self.future_or_potentially_nullable(ty),
+        }
+    }
+
+    /// `checkPatternNeverMatchesValueType`'s verdict — `!
+    /// typeSystem.canBeSubtypeOf(matchedValueType, requiredType)` (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/generated/resolver.dart:
+    /// 624-653): the Null arms first (type_system.dart:147-159 — a `Null`
+    /// face fits exactly the potentially-nullable opposite face and is
+    /// disjoint from every non-nullable one), then the name-level
+    /// mutual-exclusion companion. The arms decide over the [`Ty`] shape
+    /// because the name-level world cannot: the function/record sentinels,
+    /// the `?`-less parameter bound, and the `FutureOr` element are
+    /// [`Self::potentially_nullable_face`] questions.
+    fn pattern_never_matches(&self, matched: Ty, required: Ty) -> bool {
+        if matched == Ty::Null {
+            return !self.potentially_nullable_face(required);
+        }
+        if required == Ty::Null {
+            return !self.potentially_nullable_face(matched);
+        }
+        !self.name_can_be_subtype(matched, required)
+    }
+
     /// The [`Self::check_pattern_never_matches`] verdict over an EXPLICIT
     /// matched face: the open scrutinee for a root/logical-operand node, the
     /// property column for a deferred object-pattern field
@@ -8771,7 +8841,14 @@ impl<'a> Engine<'a> {
         if required == Ty::Unknown || required == Ty::Dynamic || matched == Ty::Unknown {
             return;
         }
-        if !self.name_can_be_subtype(matched, self.fold_alias_ty(required)) {
+        // Every `Null` spelling resolves to the one `NullType` upstream
+        // (`isDartCoreNull`'s identity): the written annotation capture
+        // spells `Named{Null}` where the inference face carries
+        // [`Ty::Null`], and the verdict must read canonical faces — the
+        // message keeps the written spellings.
+        let matched = self.normalized_null(matched);
+        let folded = self.normalized_null(self.fold_alias_ty(required));
+        if self.pattern_never_matches(matched, folded) {
             let a0 = self.ty_display(matched);
             let a1 = self.ty_display(required);
             self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);

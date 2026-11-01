@@ -22772,3 +22772,53 @@ mod ticket_3400_tests;
 #[cfg(test)]
 #[path = "ticket_3504_tests.rs"]
 mod ticket_3504_tests;
+
+// —— #3507 ——
+// The const collection element verdict table: the landed `for`-element
+// face (live) and the element-family gaps routed to their owning files.
+#[cfg(test)]
+
+// —— #3507 ——
+// The const collection element verdict table: the landed `for`-element
+// face (live) and the element-family gaps routed to their owning files.
+#[cfg(test)]
+#[path = "ticket_3507_tests.rs"]
+mod ticket_3507_tests;
+
+// —— #3502 —— an `on T?` extension applies to the operator and
+// —— compound-assignment faces of a nullable receiver: the operand row
+// —— carries a read intent, so the probe takes the adjacent token's base
+// —— spelling through the same `extension_application` (`Single` —
+// —— silent; `UnsafeSingle` keeps the unchecked row). Registered via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3502 —— an `on T?` extension applies to the operator and
+// —— compound-assignment faces of a nullable receiver: the operand row
+// —— carries a read intent, so the probe takes the adjacent token's base
+// —— spelling through the same `extension_application` (`Single` —
+// —— silent; `UnsafeSingle` keeps the unchecked row). Registered via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3502_tests.rs"]
+mod ticket_3502_tests;
+
+// —— #3503 ——
+// The null-aware element verdict reads the operand's tear-off face
+// (`untyped_operand_ty`'s ctor / member / bare-function fallback).
+#[cfg(test)]
+
+// —— #3503 ——
+// The null-aware element verdict reads the operand's tear-off face
+// (`untyped_operand_ty`'s ctor / member / bare-function fallback).
+#[cfg(test)]
+#[path = "ticket_3503_tests.rs"]
+mod ticket_3503_tests;
+
+// —— #3519 ——
+// The guarded-pattern scope faces: irrefutable destructure mismatch,
+// relational-operand enclosing-scope resolution (referenced-before-decl +
+// non-constant), guard assignment, and the shared-case-scope join.
+#[cfg(test)]
