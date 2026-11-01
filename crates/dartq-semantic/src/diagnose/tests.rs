@@ -18514,3 +18514,41 @@ mod ticket_3370_tests;
 #[cfg(test)]
 #[path = "ticket_3372_tests.rs"]
 mod ticket_3372_tests;
+
+// The #3373 pins (the enum member-set and mixin-application faces): one
+// repro + negative pair per face — the illegal concrete enum member
+// (declaration and inheritance arms), `illegal_enum_values` (both arms),
+// `enum_with_abstract_member` (the whole-declaration anchor),
+// `values_declaration_in_enum`, and the mixin-application `on`-constraint
+// face. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3373_tests.rs"]
+mod ticket_3373_tests;
+
+// The #3367 pins (the `undefined_*` EXTRA clusters the recon's C1–C3
+// table routes to `diagnose/row_resolution.rs`): the own-parameter `on`
+// head (`extension E<T> on T`) across named/function/record receivers and
+// its bounded admit/reject pair, plus the `p.dynamic` prefixed-core gate
+// and the `undefined_class` negative. The cascade-latch `Type` EXTRA and
+// the bare-`dynamic` MISSING direction are residual in `invocation.rs`/
+// `engine_core.rs` products. Registered here via `#[path]`; the module
+// stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3367_tests.rs"]
+mod ticket_3367_tests;
+
+// The #3382 pins (the collection-literal write-face predicate in
+// `diagnose/collection_literal.rs`): the list, set/map, `<T>`-prefixed and
+// `const`-prefixed heads, the head behind a comment (the probe now reads the
+// token table, so trivia between the operator and the literal no longer
+// hides it), and the nullable-operand negative. The recon's bucket I/H/U
+// element-typing faces need the literal's own element inference and a
+// write-face decision against it; they stay residual against their owning
+// lanes, and these pins hold the predicate's contract so that change cannot
+// regress it. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3382_tests.rs"]
+mod ticket_3382_tests;

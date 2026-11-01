@@ -771,19 +771,49 @@ impl<'a> Engine<'a> {
         false
     }
 
-    /// The explicit extension override's argument check
-    /// (`extension_member_resolver.dart:290-313`): the single argument is the
-    /// receiver, and `!isAssignableTo(receiverType, extendedType)` reports
-    /// `extension_override_argument_not_assignable` at the whole receiver
-    /// expression (`.at(receiverExpression)` — a `c.bad` operand anchors at
-    /// the property-access span). The `on` type is name-level (`on int` →
-    /// `int`); a qualified or generic `on` face keeps its bare head. A
-    /// missing/mistyped `on` suppresses (the inapplicable extension).
+    /// The explicit extension override's receiver check
+    /// (`extension_member_resolver.dart:288-313`): the single argument is
+    /// the receiver, reported first when it is `void` (`use_of_void_result`
+    /// — the `else if` keeps the not-assignable verdict off that argument);
+    /// otherwise `!isAssignableTo(receiverType, extendedType)` reports
+    /// `extension_override_argument_not_assignable`. Both anchor the WHOLE
+    /// receiver expression (`.at(receiverExpression)` — `E(f()).g` anchors
+    /// at `f()`, a `c.bad` operand at the property-access span). The `on`
+    /// type is name-level (`on int` → `int`); a qualified or generic `on`
+    /// face keeps its bare head. A missing/mistyped `on` suppresses (the
+    /// inapplicable extension).
     pub(crate) fn check_extension_override_argument(
         &mut self,
         name: StringId,
         args: &[(Option<StringId>, Ty, bool, SourceRange)],
     ) {
+        let [(_, arg_ty, literal, arg_range)] = args else {
+            return;
+        };
+        // The void receiver is upstream's first arm — `resolveOverride`'s
+        // `if (receiverType is VoidType)` reports before the `on`-type ask
+        // and before the assignability verdict below. The argument arrives
+        // as its own row (`f`), so the anchor widens to the expression the
+        // oracle reports over (`f()`, `c.bad`).
+        if *arg_ty == Ty::Void {
+            let range = self
+                .invocation_span(*arg_range)
+                .or_else(|| self.property_access_span(*arg_range))
+                .unwrap_or(*arg_range);
+            // One row per receiver expression (the contract
+            // [`Engine::emit_use_of_void_result`] enforces): the invocation
+            // seam stages this row at the receiver's own row span before
+            // the check runs here, so a staged row realigns to the widened
+            // anchor rather than a second row stacking beside it.
+            let staged = self.report.diagnostics.iter().position(|row| {
+                row.code.name == "use_of_void_result" && row.range.offset == arg_range.offset
+            });
+            match staged {
+                Some(index) => self.report.diagnostics[index].range = range,
+                None => self.emit(SemanticCode::UseOfVoidResult, range, "", ""),
+            }
+            return;
+        }
         let Some(on_type) = self
             .index
             .get(self.file)
@@ -817,15 +847,6 @@ impl<'a> Engine<'a> {
             }
             _ => Ty::named(on_type),
         };
-        let [(_, arg_ty, literal, arg_range)] = args else {
-            return;
-        };
-        // The void-receiver face is upstream's first arm
-        // (`use_of_void_result`, `extension_member_resolver.dart:290`) — the
-        // `else if` keeps the assignability row off a void argument.
-        if *arg_ty == Ty::Void {
-            return;
-        }
         let rejects = match self.assignable(*arg_ty, extended, *literal) {
             Some(verdict) => !verdict,
             // Name-level generic faces answer `None` (`on List<Book>`
@@ -874,7 +895,10 @@ impl<'a> Engine<'a> {
         if !rejects {
             return;
         }
-        let range = self.property_access_span(*arg_range).unwrap_or(*arg_range);
+        let range = self
+            .invocation_span(*arg_range)
+            .or_else(|| self.property_access_span(*arg_range))
+            .unwrap_or(*arg_range);
         let (a0, a1) = (self.ty_display(*arg_ty), self.ty_display(extended));
         // The why-not-promoted rows hang on the receiver expression's read
         // (#1877; upstream Dart SDK source,
@@ -6202,6 +6226,34 @@ impl<'a> Engine<'a> {
     /// with differing written arguments run the covariant element rule
     /// through the boundary pool ([`Engine::covariant_args`]). `None`
     /// suppresses (under-report).
+    /// The function-rule verdict over two function shapes — the arm
+    /// [`Engine::assignable`] runs on both the written pair and the folded
+    /// pair. The generic-instantiation arm: a generic function-typed
+    /// expression in a context position is not the un-instantiated
+    /// signature — the resolver's downward tear-off inference instantiates
+    /// it toward the context type before the assignability ask, so
+    /// `return g;` with `g: T Function<T>(T)` inside an `int Function(int)`
+    /// host reads `S = int Function(int)`, a clean pair
+    /// (`return_type_verifier.dart`'s `expression.staticType` is the
+    /// post-inference type). `_isFunctionSubtypeOf` itself refuses the
+    /// pair — its `relateTypeParameters` count gate (subtype.dart:338-345,
+    /// type_system.dart:1585-1590) never relates a generic source to a
+    /// non-generic target — so this arm answers the instantiation question
+    /// `fn_sig_subtype` cannot: bind each source-only signature leaf (the
+    /// parameter spellings) from the target's structurally-matching type,
+    /// then re-run the subtype checks over the substituted signature. An
+    /// arity the instantiation can never bridge (`U Function<U>(U, int)`
+    /// against `int Function(int)` — two required positionals where one is
+    /// wanted) reports through the same shape rules.
+    fn fn_shape_pair_verdict(&self, from_fn: &FnVarSig, to_fn: &FnVarSig) -> Option<bool> {
+        if from_fn.params.len() > to_fn.params.len() && to_fn.params.is_empty()
+            && let Some(verdict) = self.instantiated_fn_sig_subtype(from_fn, to_fn)
+        {
+            return Some(verdict);
+        }
+        self.fn_sig_subtype(from_fn, to_fn)
+    }
+
     pub(crate) fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
         // The structural-descent budget (#3333): a self-referential alias
         // pair — `typedef F = void Function(List<G>); typedef G = void
@@ -6228,34 +6280,10 @@ impl<'a> Engine<'a> {
         // pooled `Ty::Function` shape of a full fold drops). Both sides
         // function-shaped decides by the function rule and never reaches
         // the nominal fold below.
-        let from_fn = self.function_shape_sig(from);
-        let to_fn = self.function_shape_sig(to);
+        let mut from_fn = self.function_shape_sig(from);
+        let mut to_fn = self.function_shape_sig(to);
         if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
-            // The generic-instantiation arm: a generic function-typed
-            // expression in a context position is not the un-instantiated
-            // signature — the resolver's downward tear-off inference
-            // instantiates it toward the context type before the
-            // assignability ask, so `return g;` with `g: T Function<T>(T)`
-            // inside an `int Function(int)` host reads `S = int
-            // Function(int)`, a clean pair (`return_type_verifier.dart`'s
-            // `expression.staticType` is the post-inference type).
-            // `_isFunctionSubtypeOf` itself refuses the pair — its
-            // `relateTypeParameters` count gate (subtype.dart:338-345,
-            // type_system.dart:1585-1590) never relates a generic source
-            // to a non-generic target — so this arm answers the
-            // instantiation question `fn_sig_subtype` cannot: bind each
-            // source-only signature leaf (the parameter spellings) from
-            // the target's structurally-matching type, then re-run the
-            // subtype checks over the substituted signature. An arity the
-            // instantiation can never bridge (`U Function<U>(U, int)`
-            // against `int Function(int)` — two required positionals where
-            // one is wanted) reports through the same shape rules.
-            if from_fn.params.len() > to_fn.params.len() && to_fn.params.is_empty() {
-                if let Some(verdict) = self.instantiated_fn_sig_subtype(from_fn, to_fn) {
-                    return Some(verdict);
-                }
-            }
-            return self.fn_sig_subtype(from_fn, to_fn);
+            return self.fn_shape_pair_verdict(from_fn, to_fn);
         }
         // The alias unfold: the element model never carries a type-alias
         // head into a type question — a `TypeAliasElement` use resolves
@@ -6278,6 +6306,44 @@ impl<'a> Engine<'a> {
         let shallow_never = |ty: Ty| if self.is_never_ty(ty) { Ty::Never } else { ty };
         let from = shallow_never(self.fold_alias_verdict(from));
         let to = shallow_never(self.fold_alias_verdict(to));
+        // The folded-pair function read (#3368's foreign-alias face): the
+        // written-pair probe above only reaches a same-file alias capture
+        // ([`Engine::function_shape_sig`]'s Named arm answers through the
+        // parse-time `BoundsIndex` — file-local). A FOREIGN function-RHS
+        // typedef — `co19/Utils/lang_feature_check.dart`'s `typedef
+        // F<X> = void Function<Y extends X>();` — carries no capture here,
+        // but [`Engine::fold_alias_verdict`] resolves it through the
+        // element model (`instantiate_alias`'s `decl.var_ty` projection)
+        // and the folded face IS `Ty::Function`, `type_params_named`
+        // bounds substituted (`substitute_alias_rhs` rewrites inside the
+        // shape). Read the folded shapes the written probe missed, then
+        // decide by the same function rule the written pair takes —
+        // upstream runs the same order (`subtype.dart` unfolds the alias
+        // before `_isFunctionSubtypeOf`). A written-side capture keeps its
+        // signature (the parameterized-alias use-site bound spellings the
+        // pooled shape demotes); the fold adds only what the probe missed.
+        if from_fn.is_none() {
+            from_fn = self.function_shape_sig(from);
+        }
+        if to_fn.is_none() {
+            to_fn = self.function_shape_sig(to);
+        }
+        if from_fn.is_none() {
+            from_fn = self.function_shape_sig(from);
+        }
+        if to_fn.is_none() {
+            to_fn = self.function_shape_sig(to);
+        }
+        if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
+            let verdict = self.fn_shape_pair_verdict(from_fn, to_fn);
+            if std::env::var_os("DQ_PROBE").is_some() {
+                eprintln!(
+                    "DQ_PROBE folded-pair from={:?} to={:?} verdict={:?}",
+                    from, to, verdict
+                );
+            }
+            return verdict;
+        }
         // Right Bottom: no subtyping rule ever holds INTO `Never` but
         // reflexivity (upstream Dart SDK source, pkg/analyzer/lib/src/
         // dart/element/subtype.dart:74-77 answers the `Never` SOURCE; a
@@ -6672,31 +6738,45 @@ impl<'a> Engine<'a> {
             if self.members.primitive_ids.contains(&from_name) {
                 return Some(false);
             }
-            if self
-                .implicit_call_face(Ty::Named {
+            // The acceptance only needs `call` to resolve — upstream's
+            // `callMethodType` is non-null the moment the member exists
+            // (`getCallMethodType` substitutes the receiver's own type
+            // arguments; the verdict `isAssignableTo(callMethodType,
+            // Function)` is unconditional `true`, `call` being a
+            // function-typed member and `Function` its supertype), so the
+            // signature itself never enters this arm. The member walk
+            // proves existence on the instantiated spelling just as on
+            // the bare one — there is no `args == EMPTY` gate in
+            // `acceptsFunctionType`. The EMPTY-args read keeps
+            // [`Engine::implicit_call_face`]'s formals-capture proof (a
+            // `call` whose formals never interned reads the same miss the
+            // pre-change face gave).
+            let call_present = if from_args == ArgListId::EMPTY {
+                self.implicit_call_face(Ty::Named {
                     name: from_name,
                     nullable: false,
                     args: from_args,
                 })
                 .is_some()
-            {
+            } else {
+                let call = self.intern("call");
+                matches!(
+                    self.walk_members(from_name, call),
+                    Walk::Found(entry)
+                        if entry.kind == MemberKind::Method && !entry.is_static
+                )
+            };
+            if call_present {
                 return Some(true);
             }
             // A resolvable container with provably no `call` member
             // rejects: upstream's `callMethodType` is null there, so the
             // arm falls through to `false` (type_system.dart:910-915 —
             // `Function f = C()` reports where `C` declares no `call`).
-            // Only the EMPTY-args read proves the face — an instantiated
-            // source (`C<int>()`) substitutes its arguments into the
-            // member lookup [`Engine::implicit_call_face`] cannot spell,
-            // so a miss there is not the no-`call` fact. An UNRESOLVABLE
-            // head (a foreign spelling the index does not carry, or the
-            // derived-ask residue this slot also receives) keeps the
-            // under-report `None` — a bare rejection would report
-            // inference residue the oracle never asks about.
-            if from_args != ArgListId::EMPTY {
-                return None;
-            }
+            // An UNRESOLVABLE head (a foreign spelling the index does not
+            // carry, or the derived-ask residue this slot also receives)
+            // keeps the under-report `None` — a bare rejection would
+            // report inference residue the oracle never asks about.
             return resolve_container(
                 self.graph,
                 self.namespaces,
@@ -6851,6 +6931,141 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `call` member signature of a callable-class head, instantiated
+    /// by the written use's type arguments — `implicit_call_face`'s
+    /// EMPTY-args face plus the `getCallMethodType` substitution upstream
+    /// runs unconditionally (type_system.dart:876-885 reads
+    /// `callMethodType` with the receiver's own substitution; there is no
+    /// `args == EMPTY` gate in `acceptsFunctionType`). An EMPTY source
+    /// delegates to [`Engine::implicit_call_face`] unchanged. A written
+    /// instantiation (`C<int>`) resolves the head's declaration parameter
+    /// spellings, zips them against the written arguments, and substitutes
+    /// through the walked member's formals and return — `T call(T)` over
+    /// `class C<T>` reads `int call(int)` at the `C<int>` use. `None` when
+    /// the member lookup finds no `call` (the caller's resolvable-or-not
+    /// split decides) or when a signature leaf cannot take the
+    /// substitution ([`Engine::subst_params`]'s `None` — a nullable
+    /// parameter-lift the projection cannot spell, or a parameter the
+    /// declaring container's spellings never named, e.g. an inherited
+    /// `call` whose own container's parameters differ): the under-report
+    /// direction.
+    fn instantiated_call_face(
+        &self,
+        name: StringId,
+        args: ArgListId,
+    ) -> Option<(Formals, Ty, Box<[(StringId, Option<Ty>)]>)> {
+        if args == ArgListId::EMPTY {
+            return self.implicit_call_face(Ty::Named {
+                name,
+                nullable: false,
+                args,
+            });
+        }
+        let written: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+        let (container, _owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )?;
+        if container.type_param_names.len() != written.len() {
+            return None;
+        }
+        let call = self.intern("call");
+        let Walk::Found(entry) = self.walk_members(name, call) else {
+            return None;
+        };
+        if entry.kind != MemberKind::Method || entry.is_static {
+            return None;
+        }
+        // The container's own parameters bind the written use's
+        // arguments — minus any name the `call` method itself declares
+        // (`T call<T>(T)` shadows the class `T` inside its own
+        // signature; the class map must not touch it,
+        // `getCallMethodType`'s substitution keeps the method formals'
+        // own parameters intact).
+        let map: Vec<(StringId, Ty)> = container
+            .type_param_names
+            .iter()
+            .copied()
+            .zip(written)
+            .filter(|(param, _)| !entry.type_param_names.contains(param))
+            .collect();
+        let (formals, return_ty, params) = match &entry {
+            Projected::Own(e) => (
+                e.formals.as_deref()?.clone(),
+                e.return_ty,
+                e.type_param_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, param)| {
+                        (
+                            *param,
+                            e.type_param_bounds
+                                .get(index)
+                                .copied()
+                                .filter(|bound| *bound != Ty::Dynamic),
+                        )
+                    })
+                    .collect(),
+            ),
+            Projected::Foreign(e) => (
+                e.formals.as_deref()?.to_owned(),
+                e.return_ty,
+                e.type_param_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, param)| {
+                        (
+                            *param,
+                            e.type_param_bounds
+                                .get(index)
+                                .copied()
+                                .filter(|bound| *bound != Ty::Dynamic),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        let positional: Option<Box<[Formal]>> = formals
+            .positional
+            .iter()
+            .map(|formal| {
+                Some(Formal {
+                    name: formal.name,
+                    ty: self.subst_params(formal.ty, &map)?,
+                    required: formal.required,
+                    covariant: formal.covariant,
+                    default_value: formal.default_value,
+                })
+            })
+            .collect();
+        let named: Option<Box<[Formal]>> = formals
+            .named
+            .iter()
+            .map(|formal| {
+                Some(Formal {
+                    name: formal.name,
+                    ty: self.subst_params(formal.ty, &map)?,
+                    required: formal.required,
+                    covariant: formal.covariant,
+                    default_value: formal.default_value,
+                })
+            })
+            .collect();
+        let params: Box<[(StringId, Option<Ty>)]> = params;
+        Some((
+            Formals {
+                positional: positional?,
+                named: named?,
+            },
+            self.subst_params(return_ty, &map)?,
+            params,
+        ))
+    }
+
     /// The 'call' tearoff arm of the cross-family function face
     /// (`isAssignableTo`'s callable-class acceptance,
     /// type_system.dart:906-916): the non-nullable interface head `name`
@@ -6874,30 +7089,43 @@ impl<'a> Engine<'a> {
         args: ArgListId,
         to_fn: &FnVarSig,
     ) -> Option<bool> {
-        if args != ArgListId::EMPTY {
-            return None;
-        }
         if self.members.primitive_ids.contains(&name) {
             return Some(false);
         }
-        let Some((formals, return_ty, params)) = self.implicit_call_face(Ty::Named {
-            name,
-            nullable: false,
-            args,
-        }) else {
+        let Some((formals, return_ty, params)) = self.instantiated_call_face(name, args) else {
             // A resolvable container with provably no `call` member
             // rejects the written ask: upstream's `callMethodType` is
             // null there, so `isAssignableTo` falls through to `false`
             // (type_system.dart:910-915 — `String Function(String) f =
-            // C()` over `class C {}` reports). An EMPTY-args source is
-            // the only provable face — an instantiated `C<int>()`
-            // substitutes its arguments into a member lookup
-            // [`Engine::implicit_call_face`] cannot spell, so a miss
-            // there is not the no-`call` fact; an unresolvable head keeps
+            // C()` over `class C {}` reports). An UNRESOLVABLE head keeps
             // the under-report `None` (the derived-ask residue this slot
-            // also receives).
+            // also receives), as does an instantiated source whose
+            // member lookup cannot prove the face — a broken
+            // supertype chain, a `call` carried by an unindexed
+            // declaration, or a signature leaf [`Engine::subst_params`]
+            // cannot spell is not the no-`call` fact.
             if args != ArgListId::EMPTY {
-                return None;
+                let Some(_) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    name,
+                ) else {
+                    return None;
+                };
+                let call = self.intern("call");
+                return match self.walk_members(name, call) {
+                    // A clean miss — or a `call` that is no method
+                    // (a field, a getter) — is the null `callMethodType`
+                    // upstream falls to `false` on.
+                    Walk::Missing => Some(false),
+                    Walk::Found(entry) => {
+                        (entry.kind != MemberKind::Method || entry.is_static).then_some(false)
+                    }
+                    Walk::ChainBroken => None,
+                };
             }
             return resolve_container(
                 self.graph,
