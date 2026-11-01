@@ -20025,3 +20025,13 @@ mod ticket_3378_tests;
 #[cfg(test)]
 #[path = "ticket_3429_tests.rs"]
 mod ticket_3429_tests;
+
+// —— #3460 —— the application-order pins: an `augment` sees only the
+// —— fragments of units before its own unit in `unit_files` order (the
+// —— oracle's `allUnits` walk), plus the factory-body walk's matching
+// —— truncation. Registered here via `#[path]`; the module stays inside
+// —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3460_tests.rs"]
+mod ticket_3460_tests;

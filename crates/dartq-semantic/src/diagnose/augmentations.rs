@@ -17,14 +17,25 @@
 //! itself an augmentation (header checks run against it; the executable
 //! body checks bail — upstream `firstFragment.isAugmentation`).
 //!
+//! Visibility is the application order (upstream `ElementBuilder` links
+//! `previousFragment` in `allUnits` walk order — defining unit then each
+//! part): an augment sees only the fragments of units before its own
+//! unit in [`LibraryGraph::unit_files`], plus its own unit's preceding
+//! fragments. Within the diagnosing unit, augmentations resolve in source
+//! order; introductory declarations are all visible because the model
+//! keeps no per-declaration source offset, so the same-unit
+//! augment-before-intro shape is not refused (an orphan would also have
+//! to introduce its name — both arms need the offsets the model lacks).
+//!
 //! Model limitations, each silent or near-silent on the oracle sets:
 //! unnamed introductory formals do not join the formal tables (the
 //! collector's `capture_name` drops them — a pre-existing capture shape
 //! shared with the override faces), a `const` variable introduction is
 //! not distinguished from a plain one (the const-variable augmentation
-//! gate under-reports), and an `augment`-spelled named mixin application
+//! gate under-reports), an `augment`-spelled named mixin application
 //! keeps the plain-class merge rule (the augment side of
-//! `is_mixin_application` is not captured).
+//! `is_mixin_application` is not captured), and the same-unit
+//! augment-before-intro ordering is not applied.
 
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_resolution::{LibraryGraph, LibraryId};
@@ -315,9 +326,28 @@ pub(super) fn augmentation_diagnostics(
     if own.augmentations().is_empty() {
         return out;
     }
+    // The application order (upstream `ElementBuilder` walks
+    // `RuleContext.allUnits` — the defining unit, then each part in
+    // declaration order — and links `previousFragment` within that walk):
+    // an augment sees only the fragments of units at or before its own
+    // unit's position. `unit_files` answers that same order
+    // (library_graph.rs `unit_files_answer_defining_then_parts_per_library`);
+    // a diagnosing file outside the library's unit list keeps every entry
+    // visible — the pre-ordering behavior, which cannot arise in practice
+    // since the caller iterates the library's units.
+    let units = graph.unit_files(lib);
+    let own_pos = units
+        .iter()
+        .position(|&unit| unit == file)
+        .unwrap_or(units.len());
+    let unit_pos: FxHashMap<FileId, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(pos, &unit)| (unit, pos))
+        .collect();
     let mut table: FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>> =
         FxHashMap::default();
-    for &unit in graph.unit_files(lib) {
+    for &unit in units {
         if let Some(elements) = index.get(unit) {
             populate(&mut table, graph, index, lib, unit, elements, strings);
         }
@@ -331,15 +361,24 @@ pub(super) fn augmentation_diagnostics(
             continue;
         }
         let key = augment_key(aug, strings);
-        // Own-file augmentations resolve in source order: the chain visible
-        // to this augment is everything captured so far (cross-file
-        // augmentations joined at populate time).
+        // The chain visible to this augment: every fragment of an earlier
+        // unit, plus this unit's own preceding fragments — augmentations in
+        // source order (the `aug_index` walk), introductory declarations
+        // unconditionally (the model carries no per-declaration source
+        // offset, so the same-unit augment-before-intro shape stays
+        // unfiltered — see the module note).
         let chain: Vec<&Entry> = table
             .get(&key)
             .map(Vec::as_slice)
             .unwrap_or(&[])
             .iter()
-            .filter(|entry| !entry.is_augment || entry.unit != file || entry.aug_index < aug_index)
+            .filter(|entry| {
+                if entry.unit == file {
+                    !entry.is_augment || entry.aug_index < aug_index
+                } else {
+                    unit_pos.get(&entry.unit).is_some_and(|&pos| pos < own_pos)
+                }
+            })
             .collect();
         let variable_family = matches!(
             aug.kind,
@@ -1415,6 +1454,15 @@ fn factory_body_diagnostics(
     strings: &StringTable,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    // Only augmentations applied AFTER the introductory declaration join
+    // its chain (upstream `firstFragment.augmentations` — the
+    // `ElementBuilder` appends in `allUnits` walk order, so an augment
+    // in an earlier unit never reaches this intro).
+    let units = graph.unit_files(lib);
+    let after: &[FileId] = match units.iter().position(|&unit| unit == file) {
+        Some(pos) => &units[pos + 1..],
+        None => &[],
+    };
     for target in own.decl_kinds() {
         if target.kind != AugKind::Constructor || !target.is_factory || target.is_complete {
             continue;
@@ -1426,7 +1474,7 @@ fn factory_body_diagnostics(
         );
         let mut fragments = 0usize;
         let mut complete = false;
-        for &unit in graph.unit_files(lib) {
+        for &unit in after {
             let Some(elements) = index.get(unit) else {
                 continue;
             };
@@ -1437,6 +1485,23 @@ fn factory_body_diagnostics(
                 fragments += 1;
                 complete |= aug.is_complete;
             }
+        }
+        // The diagnosing unit's own augmentations count only when they
+        // follow the factory head in source order — `AugTarget::head_range`
+        // is the head's `errorRange` and `augment_kw` the augment keyword's
+        // offset, so the same-unit before/after relation is decidable for
+        // constructors.
+        for aug in own.augmentations() {
+            if augment_key(aug, strings) != key {
+                continue;
+            }
+            if let Some(head) = target.head_range
+                && aug.augment_kw.offset <= head.offset
+            {
+                continue;
+            }
+            fragments += 1;
+            complete |= aug.is_complete;
         }
         if complete {
             continue;
