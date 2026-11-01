@@ -103,19 +103,22 @@ fn null_eq_call_over_a_null_return_folds_true_with_the_staged_return() {
 }
 
 #[test]
-fn null_eq_call_without_the_staged_return_keeps_the_pre_fix_fold() {
-    // Control: the function-type read folds the comparison `false`, so the
-    // gate (not the lattice) is what the staged adoption changes.
+fn null_eq_call_without_the_staged_return_folds_nothing() {
+    // The unstaged control (#3422): the call's static type stays the
+    // callee's signature-less function head, whose non-nullability
+    // describes the CALLABLE, not the call's value — the equality fold
+    // never reads it, so neither branch dies. Only the real return tells
+    // `null == nf()` apart, and that answer rides the staged row (the
+    // sibling pin above).
     let unstaged = dead_of(NE_NULL, &facts_of(NE_NULL, None));
-    assert_eq!(unstaged.len(), 1, "{unstaged:?}");
-    assert!(unstaged[0].contains("print(1)"), "{unstaged:?}");
+    assert!(unstaged.is_empty(), "{unstaged:?}");
 }
 
 #[test]
 fn non_nullable_eq_call_folds_false_with_the_staged_return() {
-    // `int == Null` is always false: the THEN branch is the dead one, and
-    // without the staged return no row is produced at all (the function
-    // type is non-nullable too, so the fold has nothing to decide).
+    // `int == Null` is always false: the THEN branch is the dead one. The
+    // unstaged face folds nothing (the callable head carries no value
+    // nullability), so the staged return is what decides it.
     let at = EQ_NULL.find("nf()").expect("callee offset");
     assert!(dead_of(EQ_NULL, &facts_of(EQ_NULL, None)).is_empty());
     let staged = dead_of(EQ_NULL, &facts_of(EQ_NULL, Some(at)));

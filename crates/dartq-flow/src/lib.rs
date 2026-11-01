@@ -258,3 +258,6 @@ mod ticket_3397_tests;
 
 #[cfg(test)]
 mod ticket_3405_tests;
+
+#[cfg(test)]
+mod ticket_3422_tests;

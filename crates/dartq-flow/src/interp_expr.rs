@@ -2732,12 +2732,12 @@ impl Interp<'_> {
                     // or parameter reads as [`Base::Function`], which by
                     // contract spells the head only — its return type is
                     // the semantic layer's answer, so the staged row is
-                    // the sole source of the invocation's static type.
-                    // Without it the call keeps the function type itself:
-                    // `null == nf()` over a `Null Function()` parameter
-                    // folds the comparison `false` (then-branch dead where
-                    // the else is) and `v == nf()` over a non-nullable `v`
-                    // folds nothing at all. A null-shorted chain stays
+                    // the sole source of the invocation's static type; with
+                    // no staged row the call keeps the function head, whose
+                    // nullability the equality fold never reads — the head
+                    // spells the call, not the value, so a comparison over
+                    // it folds nothing ([`Interp::equality_check`]). A
+                    // null-shorted chain stays
                     // out: the official `?.`-call result carries the
                     // short's own `?` on top of the declared return, a
                     // face the staged row does not spell — keeping the
@@ -4087,6 +4087,21 @@ impl Interp<'_> {
         // only; in this pipeline the literal is the sole null-typed
         // expression without a promotable reference.
         let null_literal = |e: &Expr| e.ty.base == Base::Null && e.reference.is_none();
+        // The signature-less callable head is not a VALUE type. A call
+        // whose return the lattice cannot spell keeps the callee's
+        // [`Base::Function`] face, and that face's non-nullability
+        // describes the CALLABLE, never the value the call answers — so no
+        // comparison may fold on it. Reading it as a non-nullable value
+        // folded `null == nf()` over a `Null Function()` parameter to
+        // `false` and reported the dead THEN branch where the oracle
+        // reports the dead ELSE one, moving the row's whole extent: our
+        // `389:33|48` (the then block's braces) against the oracle's
+        // `391:12|55` (the else block's) on the sound-flow equality
+        // corpus. Both branches stay reachable, the under-report every
+        // unspellable return keeps.
+        let value_non_null = |e: &Expr| {
+            e.ty.base != Base::Function && self.classify(e.ty) == Classification::NonNullable
+        };
         let (left_null, right_null) = (null_ty(left.ty), null_ty(right.ty));
         if left_null && right_null {
             // Known equal: `null == null` kills the else-branch, `null
@@ -4094,8 +4109,8 @@ impl Interp<'_> {
             expr.bool_value = Some(!inverted);
             expr.branches = None;
         } else if self.sound_flow
-            && ((left_null && self.classify(right.ty) == Classification::NonNullable)
-                || (right_null && self.classify(left.ty) == Classification::NonNullable))
+            && ((left_null && value_non_null(right))
+                || (right_null && value_non_null(left)))
         {
             // Disjoint by nullability: known not-equal — `==` kills the
             // then-branch, `!=` the else-branch. The verdict is
