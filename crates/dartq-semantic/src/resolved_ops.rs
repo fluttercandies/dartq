@@ -60,8 +60,8 @@ use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use dartq_types::{
-    CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy, TypeId,
-    TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedRecord,
+    CoreDecls, NamedMember, ParamFacts, ParamFactsTable, RecordShapeId, TypeDeclId, TypeHierarchy,
+    TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedRecord,
     UninternedType, Variance, instantiate_type_formals_to_bounds,
     instantiate_type_formals_to_bounds_with,
 };
@@ -81,6 +81,15 @@ const FIRST_CONTAINER_RAW: u32 = 100;
 /// ([`ResolvedTypeOps::opaque_decl`]) — disjoint from the registry's
 /// allocation range (builtins + containers grow upward from 100).
 const FIRST_OPAQUE_RAW: u32 = 0x4000_0000;
+
+/// The recursion depth `isAlwaysExhaustive`'s shape walk spends — one
+/// unit per `FutureOr`/record unroll (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/element/type_system.dart:846-888). The
+/// official recurses over resolved elements unguarded (their types are
+/// well-founded); this face reads an interned graph, so the certified
+/// bound keeps the walk structurally terminating — an exhausted chain
+/// answers `false`, the under-report arm.
+const EXHAUSTIVE_DEPTH_LIMIT: u8 = 8;
 
 /// The curated `dart:core` face — the same fixed public-declaration table
 /// [`crate::bounds`]'s snapshot carries (`int`/`double` subtype `num`,
@@ -207,6 +216,20 @@ pub struct LibraryTypes {
     /// type-parameter spelling (`List<E>`'s `E`) can never capture a
     /// same-named user class in another file (#2510).
     type_param_scope: FxHashSet<(FileId, StringId)>,
+    /// `(declaring file, parameter spelling)` → the bound head every
+    /// declaration of that spelling in the file agrees on
+    /// (`class C<T extends E>` registers `(C's file, T) → E`). The
+    /// `TypeParameter` arm of `isAlwaysExhaustive` recurses into it
+    /// (type_system.dart:873-879), so a switch over an `E`-bounded
+    /// parameter closes. File-scoped for the same reason
+    /// [`Self::type_param_scope`] is: a parameter is visible only inside
+    /// the file that declares it. A spelling two declarations bound
+    /// differently never registers, and neither does one a declaration
+    /// merely *names* without a bound the element model carries (a
+    /// top-level function's group has spellings only) — the arm must
+    /// never close a switch over the unbounded twin (the under-report
+    /// direction).
+    type_param_bounds: FxHashMap<(FileId, StringId), StringId>,
     /// Every member name of every registered container — the
     /// bare-head-invocation over-approximation
     /// ([`TypeOps::call_head_unresolved`]): a spelling here may resolve as
@@ -383,6 +406,14 @@ const SDK_LIBRARY_TYPE_NAMES: &[(&str, &[&str])] = &[(
 )];
 
 impl LibraryTypes {
+    /// The bound head every declaration of `file` that spells `name` as a
+    /// type parameter agreed on ([`Self::type_param_bounds`]). `None` is
+    /// the under-report arm: unbounded, contradictory, or a bound the
+    /// element model never carried.
+    pub(crate) fn param_bound(&self, file: FileId, name: StringId) -> Option<StringId> {
+        self.type_param_bounds.get(&(file, name)).copied()
+    }
+
     /// [`LibraryTypes::build`] over the name-level clause names only —
     /// the pre-Phase-D face. Equivalent to [`Self::build_with_clauses`]
     /// over an empty [`ClauseTrees`].
@@ -545,6 +576,7 @@ impl LibraryTypes {
             fn_shapes: FxHashMap::default(),
             type_params,
             type_param_scope: FxHashSet::default(),
+            type_param_bounds: FxHashMap::default(),
             param_names,
             invokable_members: FxHashSet::default(),
             property_ty_heads: Vec::new(),
@@ -823,6 +855,7 @@ impl LibraryTypes {
             fn_shapes,
             type_params,
             type_param_scope,
+            type_param_bounds,
             param_names,
             invokable_members,
             property_ty_heads,
@@ -1119,6 +1152,10 @@ impl LibraryTypes {
             param_names,
             type_params,
             type_param_scope,
+            type_param_bounds: type_param_bounds
+                .into_iter()
+                .filter_map(|(key, head)| head.map(|head| (key, head)))
+                .collect(),
             invokable_members,
             invalid_property_tys,
             extension_erasures,
@@ -1206,6 +1243,12 @@ struct Registry {
     type_params: FxHashMap<StringId, TypeParamId>,
     /// See [`LibraryTypes::type_param_scope`].
     type_param_scope: FxHashSet<(FileId, StringId)>,
+    /// The file-scoped bound ledger under construction
+    /// ([`LibraryTypes::type_param_bounds`]): `Some(head)` while every
+    /// declaration of the spelling agrees, `None` once one disagrees or
+    /// names a bound this face cannot read — the poison the finished
+    /// snapshot drops.
+    type_param_bounds: FxHashMap<(FileId, StringId), Option<StringId>>,
     /// See [`LibraryTypes::param_names`].
     param_names: FxHashMap<TypeParamId, StringId>,
     /// See [`LibraryTypes::invokable_members`].
@@ -1251,6 +1294,18 @@ struct TypedefShape {
     defaults: Box<[TypeId]>,
 }
 
+/// The head of one declared type-parameter bound, when the bound is a
+/// spelled name — `T extends E` reads `E`. `None` for every shape the
+/// `isAlwaysExhaustive` head face cannot answer from a declaration alone:
+/// an unbounded parameter (the model's `dynamic`), a record or function
+/// bound.
+fn bound_head(bound: &Ty) -> Option<StringId> {
+    match *bound {
+        Ty::Named { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
 impl Registry {
     /// Declares every named container of one unit file into the snapshot
     /// (declaration order; first-wins on a shared name — a local shadows
@@ -1269,6 +1324,15 @@ impl Registry {
         let Some(elements) = index.get(file) else {
             return;
         };
+        // The extension declarations' parameter bounds first: every named
+        // and unnamed extension carries an application face, and a member
+        // body switching over an `St`-bounded parameter asks this ledger.
+        for face in elements.extension_faces() {
+            self.record_param_bounds(file, &face.type_param_names, &face.type_param_bounds);
+            for (_, entry) in face.members.iter() {
+                self.record_param_bounds(file, &entry.type_param_names, &entry.type_param_bounds);
+            }
+        }
         for &name in elements.container_order() {
             let Some(container) = elements.container(name) else {
                 continue;
@@ -1297,6 +1361,13 @@ impl Registry {
             self.registry.insert(name, decl);
             self.decl_params.insert(decl, param_ids.clone());
             self.decl_owner.insert(decl, (file, owner));
+            // The container's own group's declared bounds — the
+            // `TypeParameter` arm's input ([`LibraryTypes::type_param_bounds`]).
+            self.record_param_bounds(
+                file,
+                &container.type_param_names,
+                &container.type_param_bounds,
+            );
             // Every registered container's member names join the
             // invokable face as a whole — the over-approximation
             // `call_head_unresolved` refuses on (an instance or static
@@ -1308,6 +1379,10 @@ impl Registry {
             // whose head resolves nowhere makes the property sub-pattern
             // may-fail (see `LibraryTypes::invalid_property_tys`).
             for (member, entry) in container.members.iter() {
+                // A member's own group (`void m<T extends E>(T t)`) bounds
+                // exactly like the container's — the declaring file is the
+                // same one the body replays in.
+                self.record_param_bounds(file, &entry.type_param_names, &entry.type_param_bounds);
                 let ty = match entry.kind {
                     MemberKind::Field => entry.var_ty,
                     MemberKind::Getter | MemberKind::Method => entry.return_ty,
@@ -1345,6 +1420,12 @@ impl Registry {
         // `TypeParameter` ids below, one per name (declaration-scoped in
         // the element model, name-keyed here like the flow layer).
         for (name, decl) in elements.declarations() {
+            // A top-level function's or alias's group registers its
+            // spellings only — `TopDecl` carries no bound column — so a
+            // spelling such a declaration names can never be decided from
+            // this ledger: it poisons the spelling rather than letting a
+            // sibling declaration's bound speak for it.
+            self.poison_param_bounds(file, &decl.type_param_names);
             if self.registry.contains_key(&name) {
                 continue;
             }
@@ -1394,6 +1475,47 @@ impl Registry {
                         self.typedef_targets.insert(name, (rhs_name, rhs_nullable));
                     }
                     self.aliases.push((name, file));
+                }
+            }
+        }
+    }
+
+    /// Folds one declaration's type-parameter bounds into the file-scoped
+    /// ledger: each spelling maps to its written bound's head, or to the
+    /// unbounded poison when the declaration wrote none worth deciding on
+    /// (`dynamic`, a record shape, a function type — every bound whose
+    /// `isAlwaysExhaustive` the head face cannot answer).
+    fn record_param_bounds(&mut self, file: FileId, names: &[StringId], bounds: &[Ty]) {
+        for (position, &name) in names.iter().enumerate() {
+            let head = bounds.get(position).and_then(bound_head);
+            self.merge_param_bound(file, name, head);
+        }
+    }
+
+    /// Marks every spelling of one declaration as undecidable: the
+    /// element model carries a top-level declaration's parameter
+    /// *spellings* but not their bounds, so a spelling such a declaration
+    /// names keeps `false` even when a sibling declaration bounds it (the
+    /// under-report direction — the arm must never close a switch over
+    /// the unbounded twin).
+    fn poison_param_bounds(&mut self, file: FileId, names: &[StringId]) {
+        for &name in names {
+            self.merge_param_bound(file, name, None);
+        }
+    }
+
+    /// Merges one declaration's verdict into the ledger: the first
+    /// declarations establishes it, and any disagreement poisons the
+    /// spelling for the rest of the build.
+    fn merge_param_bound(&mut self, file: FileId, name: StringId, head: Option<StringId>) {
+        use std::collections::hash_map::Entry;
+        match self.type_param_bounds.entry((file, name)) {
+            Entry::Vacant(slot) => {
+                slot.insert(head);
+            }
+            Entry::Occupied(mut slot) => {
+                if *slot.get() != head {
+                    slot.insert(None);
                 }
             }
         }
@@ -4182,6 +4304,86 @@ impl<'a> ResolvedTypeOps<'a> {
         }
         false
     }
+
+    /// `isAlwaysExhaustive` over one interned snapshot type — the
+    /// official body arm for arm (type_system.dart:812-888): `Null`
+    /// splits completely, an interface by its declaration
+    /// ([`Self::always_exhaustive_decl`] — `bool`, enums, sealed classes,
+    /// extension-type erasure), `FutureOr<T>` into `T`, a type parameter
+    /// into its declared bound ([:873-879]) and a record into every field
+    /// ([:880-887]). `budget` spends one unit per unroll, so a
+    /// pathological chain bottoms out in the under-report `false` rather
+    /// than walking an unbounded graph.
+    fn always_exhaustive_ty(&self, ty: TypeId, budget: u8) -> bool {
+        if budget == 0 {
+            return false;
+        }
+        match self.snapshot.table.get(ty).kind() {
+            TypeKind::Null => true,
+            TypeKind::Interface { decl, .. } => self.always_exhaustive_decl(decl),
+            TypeKind::FutureOr { base } => self.always_exhaustive_ty(base, budget - 1),
+            TypeKind::TypeParameter { parameter } => self.always_exhaustive_param(parameter),
+            TypeKind::Record { shape } => self.always_exhaustive_record(shape, budget - 1),
+            // `Never`, `dynamic`, `void`, `Invalid`, `Function` — the
+            // official's open arms.
+            _ => false,
+        }
+    }
+
+    /// The `TypeParameterTypeImpl` arm (type_system.dart:873-879): the
+    /// declared bound decides. The promoted-bound half of the arm stays
+    /// unmodelled — promotion lives in the flow model this face lacks,
+    /// the same conservative subset the name-level walks keep. The bound
+    /// is the file-scoped spelling's ([`LibraryTypes::param_bound`]): an
+    /// unbounded parameter, one two declarations bound differently, and
+    /// one whose declaration the element model carries without its bound
+    /// all answer `false`, keeping the post-switch state live.
+    fn always_exhaustive_param(&self, parameter: TypeParamId) -> bool {
+        let Some(name) = self.param_name(parameter) else {
+            return false;
+        };
+        let Some(head) = self.snapshot.param_bound(self.file, name) else {
+            return false;
+        };
+        self.always_exhaustive_head(head)
+    }
+
+    /// The `RecordType` arm (type_system.dart:880-887): a record splits
+    /// completely exactly when every field does, so `(E, F)` over two
+    /// enums closes and `(int, E)` keeps the tail live. The field types
+    /// ride the snapshot's own pool (`RecordShapeData`), so the walk
+    /// needs no second table; the named column sorts by name and its
+    /// order is irrelevant to an `all`.
+    fn always_exhaustive_record(&self, shape: RecordShapeId, budget: u8) -> bool {
+        let table = &self.snapshot.table;
+        let shape = table.record_shape(shape);
+        table
+            .args(shape.positional)
+            .into_iter()
+            .chain(
+                table
+                    .named_members(shape.named)
+                    .into_iter()
+                    .map(|field| field.ty),
+            )
+            .all(|field| self.always_exhaustive_ty(field, budget))
+    }
+
+    /// One declared bound head's verdict: the registered declaration's
+    /// ([`Self::always_exhaustive_decl`]). A head the registry does not
+    /// hold — a type parameter (an `extends` chain this spelling-keyed
+    /// face cannot follow), a `dart:` class outside the builtin table —
+    /// and a lossy-overload spelling (a PREFIXED import target exports
+    /// it, so the bare head is not the resolved one) answer `false`.
+    fn always_exhaustive_head(&self, head: StringId) -> bool {
+        if self.snapshot.lossy_overloads.contains(&head) {
+            return false;
+        }
+        let Some(&decl) = self.snapshot.registry.get(&head) else {
+            return false;
+        };
+        self.always_exhaustive_decl(decl)
+    }
 }
 
 impl TypeOps for ResolvedTypeOps<'_> {
@@ -4293,11 +4495,14 @@ impl TypeOps for ResolvedTypeOps<'_> {
     }
 
     /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:812-888) over
-    /// the resolved hierarchy: `Null` splits completely, `bool`/enums and
-    /// sealed classes close by their element faces, an extension type
-    /// recurses into its representation ([:862-868]), and `FutureOr<T>`
-    /// recurses into `T`. A `Base::Name` spelling resolves through
-    /// `names` (populating the `name_ty` cache for the base ops); an
+    /// the resolved hierarchy — the arm order is
+    /// [`Self::always_exhaustive_ty`]'s: `Null` splits completely,
+    /// `bool`/enums and sealed classes close by their element faces, an
+    /// extension type recurses into its representation ([:862-868]),
+    /// `FutureOr<T>` into `T` ([:869-871]), a type parameter into its
+    /// declared bound ([:873-879]) and a record into every field
+    /// ([:880-887]). A `Base::Name` spelling resolves through `names`
+    /// (populating the `name_ty` cache for the base ops); an
     /// unresolvable spelling is the under-report `false`.
     fn is_always_exhaustive(
         &self,
@@ -4308,26 +4513,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
     ) -> bool {
         self.observe_names(names);
         let mapped = self.map_scrutinee(ty, args, arena, names);
-        match self.snapshot.table.get(mapped).kind() {
-            // `Null` splits completely — the official's `isDartCoreNull`
-            // arm. `Never?` interned as `Null` lands here too.
-            TypeKind::Null => true,
-            TypeKind::Interface { decl, .. } => self.always_exhaustive_decl(decl),
-            TypeKind::FutureOr { base } => match self.snapshot.table.get(base).kind() {
-                // `FutureOr<T>` recurses into `T` (type_system.dart:869-871):
-                // a closed base closes the `FutureOr` — `Null` splits
-                // completely, a sealed/enum base's decl answers.
-                TypeKind::Null => true,
-                TypeKind::Interface { decl, .. } => self.always_exhaustive_decl(decl),
-                // `FutureOr<FutureOr<…>>` unrolls one arm deeper than
-                // this single-level match reaches — under-report.
-                _ => false,
-            },
-            // `Never`, `dynamic`, `void`, `Invalid`, `Function`,
-            // `TypeParameter`, `Record` — the official's undecidable or
-            // open arms: `false` keeps the post-switch state live.
-            _ => false,
-        }
+        self.always_exhaustive_ty(mapped, EXHAUSTIVE_DEPTH_LIMIT)
     }
 
     /// Whether a pattern's written type resolves to `Invalid` (official
