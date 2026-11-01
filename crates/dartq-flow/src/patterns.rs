@@ -903,22 +903,20 @@ impl Interp<'_> {
             // non-nullable head (and the mirror pair) under sound flow.
             // The verdict is a classification question on the matched
             // value's STATIC type — upstream builds a synthetic reference
-            // from it — so a standalone context's non-reference scrutinee
-            // answers it too. It kills the MATCHED arm only: the
-            // `matchFailsIfWrongType` join below still feeds the failure
-            // path (upstream's `_current.setUnreachable()` sits beside,
-            // never instead of, the `_unmatched` join).
-            //
-            // The switch kinds are deliberately excluded: their chain and
-            // post-switch reachability are joined by the switch tracker
-            // (`interp_stmt.rs`'s `switch_exhaustive_verdict` join), which
-            // is outside this lane's file partition. Applying the verdict
-            // here without that join deads the code AFTER a
-            // non-exhaustive switch whose only clause cannot match —
-            // residual, tracked with the L-B report.
+            // from it — so a non-reference scrutinee answers it for a
+            // statement switch and a standalone context alike
+            // (`switch (0) { case Null(): … }`, `if (0 case Null v)`).
+            // It kills the MATCHED arm only: the `matchFailsIfWrongType`
+            // join below still feeds the failure path (upstream's
+            // `_current.setUnreachable()` sits beside, never instead of,
+            // the `_unmatched` join). A cannot-match pair is never a
+            // cover, so that join always runs and the clause chain — the
+            // switch's post-switch state among its consumers — stays as
+            // live as it stands: the case body dies, the code after a
+            // non-exhaustive switch does not.
             let live = self.current.clone();
             if self.sound_flow
-                && let Some((ty, _)) = self.standalone_scrutinee_ty()
+                && let Some((ty, _)) = self.matched_value_ty()
                 && self.disjoint_by_nullability(ty, known)
             {
                 self.unreachable_cur();
@@ -1292,15 +1290,31 @@ impl Interp<'_> {
 
     /// The standalone contexts' (if-case, pattern declaration) matched-value
     /// type — the peeked scrutinee expression's own `(ty, args)`. A switch
-    /// carries the same face on its frame ([`Self::frame_scrutinee_ty`]);
-    /// this accessor exists for the verdicts that must stay off the switch
-    /// path (see [`Self::non_var_invalid_scrutinee_covers`]'s `cannotMatch`
-    /// note).
+    /// carries the same face on its frame ([`Self::frame_scrutinee_ty`]).
     fn standalone_scrutinee_ty(&self) -> Option<(Ty, u32)> {
         self.pattern
             .as_ref()
             .filter(|p| matches!(p.kind, PatternKind::IfCase | PatternKind::Decl))
             .and_then(|p| p.scrutinee_ty)
+    }
+
+    /// The matched value's static type for the `cannotMatch` classification
+    /// (`promoteForPattern`'s `classifyType` legs) — the same question
+    /// [`Self::pattern_scrutinee`] answers for the promotion key, keyed on
+    /// the same kind split: the switch kinds read the frame's latched
+    /// scrutinee type, the standalone contexts their peeked expression's
+    /// own.
+    ///
+    /// Kind-gated on purpose: a standalone pattern nested inside a case
+    /// body must not borrow the enclosing switch's scrutinee type — the
+    /// frame lookup would find it ([`Self::frame_scrutinee_ty`] takes the
+    /// innermost switch frame), and a verdict taken on the wrong matched
+    /// value is a false dead row, not a conservative one.
+    fn matched_value_ty(&self) -> Option<(Ty, u32)> {
+        match self.pattern.as_ref().map(|p| p.kind) {
+            Some(PatternKind::Switch | PatternKind::SwitchExpr) => self.frame_scrutinee_ty(),
+            _ => self.standalone_scrutinee_ty(),
+        }
     }
 
     /// Whether the open standalone context (if-case, declaration) matches a
@@ -1340,12 +1354,12 @@ impl Interp<'_> {
     }
 
     /// A typed pattern over a NON-reference scrutinee (a select, a call):
-    /// the official's `promoteForPattern` still answers the coverage
-    /// question on the scrutinee's static type. When that type IS the
-    /// invalid face, the pattern covers vacuously and the case's
-    /// unmatched chain dies; every other scrutinee type keeps the
-    /// live-init posture (the may-fail question has no flow-visible
-    /// answer without a promotable reference).
+    /// the official's `promoteForPattern` still answers the coverage and
+    /// `cannotMatch` questions on the scrutinee's static type. When that
+    /// type IS the invalid face, the pattern covers vacuously and the
+    /// case's unmatched chain dies; every other scrutinee type keeps the
+    /// live-init posture for the coverage question (the may-fail question
+    /// has no flow-visible answer without a promotable reference).
     fn non_var_invalid_scrutinee_covers(&mut self, declared: Ty, declared_args: u32) {
         if let Some((ty, args)) = self.scrutinee_static_ty()
             && self.ops.is_invalid_typed(ty, args, self.args, self.names)
@@ -1366,15 +1380,15 @@ impl Interp<'_> {
         // matched value can never match a non-nullable required type (and
         // the mirror pair) under sound flow. Both legs are classification
         // questions on the matched value's STATIC type — no reference
-        // involved — so a standalone if-case's non-reference scrutinee
-        // answers them the same. The verdict kills the MATCHED arm only;
-        // the failure join below still runs on the pre-verdict state
-        // (upstream keeps the join beside `_current.setUnreachable()`,
-        // never behind it). Switch kinds are excluded for the reason given
-        // in [`Interp::matched_object_pattern`].
+        // involved — so a switch case's and a standalone if-case's
+        // non-reference scrutinee answer them the same. The verdict kills
+        // the MATCHED arm only; the failure join below still runs on the
+        // pre-verdict state (upstream keeps the join beside
+        // `_current.setUnreachable()`, never behind it), so a
+        // non-exhaustive switch keeps its post-switch state live.
         let live = self.current.clone();
         if self.sound_flow
-            && let Some((ty, _)) = self.standalone_scrutinee_ty()
+            && let Some((ty, _)) = self.matched_value_ty()
             && self.disjoint_by_nullability(ty, declared)
         {
             self.unreachable_cur();

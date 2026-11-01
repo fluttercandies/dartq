@@ -2230,10 +2230,19 @@ impl Interp<'_> {
         // window per member, never across groups.
         self.flow_end(crate::interp::Covered::Body);
         // Official `switch_afterCase` reads the LOCAL flag
-        // (flow_analysis.dart:8033): `switch_endAlternatives`' closing
-        // split resurrects it on purpose, so a dead group's body still
-        // joins its fall-through into the break model.
-        let reachable = self.reach.locally_reachable(self.current.reach);
+        // (flow_analysis.dart:8033): the official unsplits the body's
+        // checkpoint before joining it, so the fall-through it records
+        // carries the body's OVERALL reachability. The body open's split
+        // resurrects the local flag even under a dead parent (official
+        // `Reachability.split` hardcodes `locallyReachable: true`), so a
+        // local-only read here would hand the closing join a
+        // reachable-by-identity arm whose parent is the dead case entry:
+        // the switch's `unsplit` then walks back into that dead parent and
+        // reports the code after a NON-exhaustive switch as dead (a case
+        // body that `cannotMatch` killed, #3389). Both flags together are
+        // the pristine-fall-through question the official answers.
+        let reachable = self.reach.locally_reachable(self.current.reach)
+            && self.reach.overall_reachable(self.current.reach);
         if reachable {
             let exit = self.current.clone();
             let prior = match &mut self.stack[frame_index] {

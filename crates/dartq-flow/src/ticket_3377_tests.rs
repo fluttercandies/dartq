@@ -169,14 +169,14 @@ fn int_literal_against_null_pattern_deads_the_then() {
     assert_then_block_dead(&dead_of(src), "0 case Null v");
 }
 
-/// The switch-frame face is deliberately NOT carrying the `cannotMatch`
-/// verdict yet: a statement switch's post-switch reachability is joined by
-/// the switch tracker (`interp_stmt.rs`'s exhaustive-verdict join), which
-/// this lane does not own. Until that join lands, `switch (0) { case
-/// Null(): … }` keeps both the case body and the code after the switch
-/// live — the under-report posture, pinned so the residual is visible.
+/// The switch-frame face of the same verdict: `switch (0) { case
+/// Null(): … }` — the matched value is `int`, the head's required type
+/// `Null`. The case body dies; the clause's failed arm still joins the
+/// switch's unmatched chain, so the code after this NON-exhaustive switch
+/// stays live (the join that #3377 left to the switch-kind half, #3389 —
+/// `ticket_3389_tests.rs` carries the exhaustive mirror).
 #[test]
-fn switch_case_against_null_pattern_keeps_the_match_arm_live_for_now() {
+fn switch_case_against_null_pattern_deads_the_match_arm_only() {
     let src = concat!(
         "void g() {}\n",
         "void f() {\n",
@@ -188,7 +188,8 @@ fn switch_case_against_null_pattern_keeps_the_match_arm_live_for_now() {
         "}\n",
     );
     let rows = dead_of(src);
-    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].contains("notRun"), "{rows:?}");
 }
 
 // —— the posture boundaries ————————————————————————————————————————————————
