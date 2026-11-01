@@ -2271,7 +2271,16 @@ impl<'a> Engine<'a> {
                     && let RefTarget::Member { container } = self.refs[at].target
                 {
                     let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-                    if write {
+                    if write && self.init_rows.contains_key(&row.range.offset) {
+                        // A bare name written inside a constructor-initializer
+                        // list is the field-initializer LHS (`x = e`) — it
+                        // resolves through the dedicated initializer world
+                        // (`_checkForInvalidField`), never the implicit-`this`
+                        // member write face below (a `final` field there is
+                        // the legal initializing write, not
+                        // `assignment_to_final`).
+                        self.check_initializer_member_write(row, container);
+                    } else if write {
                         let setter = self.setter_spelling(row.name);
                         if self.member_found(container, setter, false) {
                             let landing = self.last_landing();
@@ -5878,37 +5887,7 @@ impl<'a> Engine<'a> {
         // redirect face shares).
         if self.init_rows.contains_key(&row.range.offset) {
             if matches!(row.intent, Intent::Write | Intent::ReadWrite) {
-                // `_checkForInvalidField`: the name must be a real field of
-                // the enclosing class — a miss or an accessor spelling
-                // codes the dedicated face; chain-broken receivers defer.
-                let reports = match self.walk_members(container, row.name) {
-                    Walk::Missing => true,
-                    Walk::Found(entry) => {
-                        // The initializer's field write resolved (#2618) —
-                        // the edge lands whatever the validity face says.
-                        let landing = self.last_landing();
-                        let kind = Self::member_ref_kind(&row.intent, entry.kind);
-                        self.note_member_ref(
-                            row,
-                            kind,
-                            landing.map(|(file, origin)| (file, row.name, origin)),
-                        );
-                        entry.kind != MemberKind::Field
-                    }
-                    Walk::ChainBroken => false,
-                };
-                if reports {
-                    let name_text = self.strings.resolve(row.name);
-                    // `.at(initializer)` — the whole node span (`x = 'foo'`,
-                    // `this.x = 0`), never the bare field name.
-                    let range = self.initializer_node_span(row.range);
-                    self.emit(
-                        SemanticCode::InitializerForNonExistentField,
-                        range,
-                        name_text,
-                        "",
-                    );
-                }
+                self.check_initializer_member_write(row, container);
             }
             return;
         }
@@ -8817,6 +8796,48 @@ impl<'a> Engine<'a> {
             base.trim_end_matches('?').to_string()
         } else {
             base
+        }
+    }
+
+    /// The constructor-initializer write face (`_checkForInvalidField`,
+    /// upstream Dart SDK source, `pkg/analyzer/lib/src/generated/
+    /// error_verifier.dart`): a `name = e` initializer resolves the name
+    /// against the enclosing class's own field set — a real field is the
+    /// legal initializing write (its `final` is the point of the
+    /// declaration, never `assignment_to_final`), while a miss or an
+    /// accessor spelling codes `initializer_for_non_existent_field` at the
+    /// whole initializer node. Called wherever a write pushed inside the
+    /// initializer list reaches the member arm: `this.x` through
+    /// [`Self::check_instance_member`]'s `init_rows` gate, a bare `x`
+    /// through [`Self::resolve_bare_row`]'s implicit-`this` arm.
+    fn check_initializer_member_write(&mut self, row: &Row, container: StringId) {
+        let reports = match self.walk_members(container, row.name) {
+            Walk::Missing => true,
+            Walk::Found(entry) => {
+                // The initializer's field write resolved (#2618) — the edge
+                // lands whatever the validity face says.
+                let landing = self.last_landing();
+                let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                self.note_member_ref(
+                    row,
+                    kind,
+                    landing.map(|(file, origin)| (file, row.name, origin)),
+                );
+                entry.kind != MemberKind::Field
+            }
+            Walk::ChainBroken => false,
+        };
+        if reports {
+            let name_text = self.strings.resolve(row.name);
+            // `.at(initializer)` — the whole node span (`x = 'foo'`,
+            // `this.x = 0`), never the bare field name.
+            let range = self.initializer_node_span(row.range);
+            self.emit(
+                SemanticCode::InitializerForNonExistentField,
+                range,
+                name_text,
+                "",
+            );
         }
     }
 

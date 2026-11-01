@@ -20062,3 +20062,14 @@ mod ticket_3428_tests;
 #[cfg(test)]
 #[path = "ticket_3425_tests.rs"]
 mod ticket_3425_tests;
+
+// —— #3459 —— the ctor-initializer write face: a bare `name = e` inside a
+// —— constructor-initializer list resolves through `init_rows`' dedicated
+// —— world (`_checkForInvalidField`), never the implicit-`this`
+// —— setter-less-write arm — the corpus's dominant `assignment_to_final`
+// —— extra shape. Registered here via `#[path]`; the module stays inside
+// —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3459_tests.rs"]
+mod ticket_3459_tests;
