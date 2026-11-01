@@ -1107,7 +1107,10 @@ pub(crate) use REGISTRATION_GATES as VERSION_GATES;
 /// `super_formal_provably_unmatched`,
 /// `collections::inferred_binding_type_face`,
 /// `expressions::unused_futures::check` — the `discarded_futures` /
-/// `unawaited_futures` shared walk, the flutter domain's
+/// `unawaited_futures` shared walk,
+/// `const_ability::spells_meta_library` — the `@literal`-gate resolution
+/// face shared by `prefer_const_constructors` and
+/// `prefer_const_literals_to_create_immutables`, the flutter domain's
 /// `spells_framework`/`resolves_user_container`/`chain_spells_root`
 /// refutation faces) — plus `use_build_context_synchronously`, which reads
 /// the fold's `AsyncContextUse` facts through
@@ -1122,6 +1125,7 @@ pub static SEMANTIC_RULES: &[&str] = &[
     "avoid_classes_with_only_static_members",
     "avoid_dynamic_calls",
     "avoid_function_literals_in_foreach_calls",
+    "avoid_futureor_void",
     "avoid_print",
     "avoid_renaming_method_parameters",
     "avoid_slow_async_io",
@@ -1148,7 +1152,10 @@ pub static SEMANTIC_RULES: &[&str] = &[
     "null_closures",
     "overridden_fields",
     "prefer_collection_literals",
+    "prefer_const_constructors",
+    "prefer_const_literals_to_create_immutables",
     "prefer_contains",
+    "prefer_final_fields",
     "prefer_for_elements_to_map_fromiterable",
     "prefer_initializing_formals",
     "prefer_int_literals",

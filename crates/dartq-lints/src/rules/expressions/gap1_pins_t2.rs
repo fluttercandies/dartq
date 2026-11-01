@@ -140,6 +140,21 @@ fn future_statement_rules_mount_the_semantic_face() {
     }
 }
 
+/// The #3530 sibling of the #3527 pair: `prefer_const_constructors` reads
+/// the fold through `const_ability::spells_meta_library` (the `@literal`
+/// gate's `is_meta_library` resolution), so the driver's
+/// [`crate::mounts_semantics`] gate must select it too. The gap shipped
+/// unnoticed because the rule degrades — the written-directive fallback
+/// keeps the plain-run posture answering — instead of going silent, so
+/// the mount pin is the load-bearing check.
+#[test]
+fn prefer_const_constructors_mounts_the_semantic_face() {
+    assert!(
+        crate::mounts_semantics(&one_rule("prefer_const_constructors")),
+        "prefer_const_constructors reads the fold but the mount gate skips it"
+    );
+}
+
 /// The sync-context faces: a `Future`-typed drop reports at the
 /// selector in a sync body — bare and member invocations — and the
 /// `FutureOr` shape reports its paired texts; an `async` body, an
